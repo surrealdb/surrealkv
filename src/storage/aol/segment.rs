@@ -1,10 +1,12 @@
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io;
 use std::io::{Seek, Write};
-use std::os::unix::fs::OpenOptionsExt; // Import Unix-specific extensions
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
-use crate::storage::aol::{read_field, write_field, Metadata, PAGE_SIZE};
+use crate::storage::aol::{
+    merge_slices, read_field, write_field, CompressionFormat, CompressionLevel, Metadata, PAGE_SIZE,
+};
 
 /// A `Page` is an in-memory buffer that stores data before it is flushed to disk. It is used to
 /// batch writes to improve performance by reducing the number of individual disk writes. If the
@@ -52,6 +54,10 @@ impl<const PAGE_SIZE: usize> Page<PAGE_SIZE> {
         self.alloc = 0;
         self.flushed = 0;
     }
+
+    fn unwritten(&self) -> usize {
+        self.alloc - self.flushed
+    }
 }
 
 /// Represents options for configuring a segment in a write-ahead log.
@@ -71,14 +77,14 @@ pub(crate) struct Options {
     /// If specified, this option sets the compression format that will be used to compress the
     /// data written to the segment. Compression can help save storage space but might introduce
     /// some overhead in terms of CPU usage during read and write operations.
-    compression_format: Option<u64>,
+    compression_format: Option<CompressionFormat>,
 
     /// The compression level to use with the selected compression format.
     ///
     /// This option specifies the compression level that will be applied when compressing the data.
     /// Higher levels usually provide better compression ratios but require more computational
     /// resources. If not specified, a default compression level will be used.
-    compression_level: Option<u64>,
+    compression_level: Option<CompressionLevel>,
 
     /// The metadata associated with the segment.
     ///
@@ -120,12 +126,12 @@ impl Options {
         self
     }
 
-    fn with_compression_format(mut self, compression_format: u64) -> Self {
+    fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
         self.compression_format = Some(compression_format);
         self
     }
 
-    fn with_compression_level(mut self, compression_level: u64) -> Self {
+    fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
         self.compression_level = Some(compression_level);
         self
     }
@@ -199,12 +205,11 @@ struct Segment {
 
 impl Segment {
     fn new(dir: &Path, id: u64, opts: &Options) -> io::Result<Self> {
-        // Create the segment directory if it doesn't exist
-        create_dir_all(dir)?;
-
         // Build the file path using the segment name and extension
         let extension = opts.extension.as_deref().unwrap_or("");
         let file_path = dir.join(Self::segment_name(id, extension));
+        let file_path_exists = file_path.exists();
+        let file_path_is_file = file_path.is_file();
 
         // Open the file with the specified options
         let mut file = Self::open_file(&file_path, opts)?;
@@ -213,11 +218,10 @@ impl Segment {
         let mut file_header_offset = 0;
 
         // If the file already exists
-        if file_path.exists() && file_path.is_file() {
+        if file_path_exists && file_path_is_file {
             // Handle existing file
             let header = Self::read_file_header(&mut file)?;
             file_header_offset += header.len();
-            // ...
         } else {
             // Create new file
             let header_len = Self::write_file_header(&mut file, id, opts)?;
@@ -231,7 +235,7 @@ impl Segment {
         Ok(Segment {
             file,
             file_header_offset: file_header_offset as u64,
-            file_offset,
+            file_offset: file_offset - file_header_offset as u64,
             dir: dir.to_path_buf(),
             id,
             closed: false,
@@ -260,8 +264,12 @@ impl Segment {
         // Write the header using write_field
         let mut meta = Metadata::new_file_header(
             id,
-            opts.compression_format.unwrap_or(0),
-            opts.compression_level.unwrap_or(0),
+            opts.compression_format
+                .as_ref()
+                .unwrap_or(&CompressionFormat::NoCompression),
+            opts.compression_level
+                .as_ref()
+                .unwrap_or(&CompressionLevel::BestSpeed),
         );
 
         if let Some(metadata) = &opts.metadata {
@@ -282,6 +290,9 @@ impl Segment {
     }
 
     fn segment_name(index: u64, ext: &str) -> String {
+        if ext.is_empty() {
+            return format!("{:020}", index);
+        }
         format!("{:020}.{}", index, ext)
     }
 
@@ -313,6 +324,7 @@ impl Segment {
 
         let n = self.file.write(&p.buf[p.flushed..p.alloc])?;
         p.flushed += n;
+        self.file_offset += n as u64;
 
         // We flushed an entire page, prepare a new one.
         if clear {
@@ -321,6 +333,11 @@ impl Segment {
         }
 
         Ok(())
+    }
+
+    // Returns the current offset within the segment.
+    fn offset(&self) -> u64 {
+        self.file_offset + self.page.unwritten() as u64
     }
 
     /// Appends data to the segment.
@@ -339,10 +356,14 @@ impl Segment {
     /// # Errors
     ///
     /// Returns an error if the segment is closed.
-    fn append(&mut self, mut buf: &[u8]) -> io::Result<usize> {
+    fn append(&mut self, mut rec: &[u8]) -> io::Result<usize> {
         // If the segment is closed, return an error
         if self.closed {
             return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+        }
+
+        if rec.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
         }
 
         // If the page is full, flush it
@@ -351,25 +372,89 @@ impl Segment {
         }
 
         let mut n = 0;
-        while !buf.is_empty() {
+        while !rec.is_empty() {
             let p = &mut self.page;
             // Find the number of bytes that can be written to the page
-            let l = std::cmp::min(p.remaining(), buf.len());
-            let part = &buf[..l];
-            let b = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
-            b.copy_from_slice(part); // Copy the content of 'part' into 'b'
+            let l = std::cmp::min(p.remaining(), rec.len());
+            let part = &rec[..l];
+            let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
+                                             // Copy the content of 'part' into 'b'
+            merge_slices(buf, part);
+
             p.alloc += part.len(); // Update the number of bytes allocated in the page
             if p.is_full() {
                 self.flush_page(true)?;
             }
 
-            buf = &buf[l..]; // Update the remaining bytes to be written
+            rec = &rec[l..]; // Update the remaining bytes to be written
             n += l;
         }
 
         // Write the remaining data to the page
         if self.page.alloc > 0 {
             self.flush_page(false)?;
+        }
+
+        Ok(n)
+    }
+
+    /// Reads data from the segment at the specified offset.
+    ///
+    /// This method reads data from the segment starting from the given offset. It reads
+    /// from the underlying file if the offset is beyond the current page's buffer. The
+    /// read data is then copied into the provided byte slice `bs`.
+    ///
+    /// # Parameters
+    ///
+    /// - `bs`: A byte slice to store the read data.
+    /// - `off`: The offset from which to start reading.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of bytes read and any encountered error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provided offset is negative or if there is an I/O error
+    /// during reading.
+    fn read_at(&mut self, bs: &mut [u8], off: u64) -> io::Result<(usize)> {
+        if off > self.offset() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Offset beyond current position",
+            ));
+        }
+
+        // Calculate buffer offset
+        let mut boff = 0;
+
+        let mut n = 0;
+        if off < self.file_offset {
+            // Read from the file
+            n = self.file.read_at(bs, self.file_header_offset + off)?;
+        } else {
+            boff = (off - self.file_offset) as usize;
+        }
+
+        let pending = bs.len() - n;
+        if pending > 0 {
+            let available = self.page.unwritten() - boff;
+            let read_chunk_size = std::cmp::min(pending, available);
+
+            if read_chunk_size > 0 {
+                let buf = &mut self.page.buf
+                    [self.page.alloc + boff..self.page.alloc + boff + read_chunk_size];
+                merge_slices(buf, bs);
+            }
+
+            if read_chunk_size == pending {
+                return Ok(n);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete read",
+                ));
+            }
         }
 
         Ok(n)
@@ -386,6 +471,7 @@ impl Drop for Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::TempDir;
 
     #[test]
     fn test_remaining() {
@@ -421,5 +507,49 @@ mod tests {
         assert_eq!(page.buf, [0; 4096]);
         assert_eq!(page.alloc, 0);
         assert_eq!(page.flushed, 0);
+    }
+
+    #[test]
+    fn test_append() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        let opts = Options::default();
+        let mut a = Segment::new(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        let sz = a.offset();
+        assert_eq!(0, sz);
+
+        let r = a.append(&[]);
+        assert!(r.is_err());
+
+        let r = a.append(&[0]);
+        assert!(r.is_ok());
+        assert_eq!(1, r.unwrap());
+
+        let r = a.append(&[1, 2, 3]);
+        assert!(r.is_ok());
+        assert_eq!(3, r.unwrap());
+
+        let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(7, r.unwrap());
+
+        let r = a.sync();
+        assert!(r.is_ok());
+
+        let mut bs = vec![0; 4];
+        let n = a.read_at(&mut bs, 0).expect("should read");
+        assert_eq!(4, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs);
+
+        let n = a.read_at(&mut bs, 7).expect("should read");
+        assert_eq!(4, n);
+        assert_eq!(&[7, 8, 9, 10].to_vec(), &bs);
+
+        let r = a.read_at(&mut bs, 1000);
+        assert!(r.is_err());
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
     }
 }

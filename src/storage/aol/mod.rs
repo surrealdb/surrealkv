@@ -30,6 +30,80 @@ const KEY_SEGMENT_ID: &str = "segment_id";
 const KEY_COMPRESSION_FORMAT: &str = "compression_format";
 const KEY_COMPRESSION_LEVEL: &str = "compression_level";
 
+/// Default file mode for newly created files, represented in octal format.
+/// The default mode is set to read and write permissions for the owner,
+/// and read-only permissions for the group and others.
+const DEFAULT_FILE_MODE: u32 = 0o644;
+
+/// Default compression format used for writing data.
+/// The data will be compressed using the `DefaultCompression` algorithm.
+const DEFAULT_COMPRESSION_FORMAT: CompressionFormat = CompressionFormat::NoCompression;
+
+/// Default compression level used for compression.
+/// The data will be compressed using the `DefaultCompression` level.
+const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
+
+// Enum to represent different compression formats
+pub enum CompressionFormat {
+    NoCompression = 0,
+    Flate = 1,
+    GZip = 2,
+    LZW = 3,
+    ZLib = 4,
+}
+
+impl CompressionFormat {
+    fn as_u64(&self) -> u64 {
+        match self {
+            CompressionFormat::NoCompression => 0,
+            CompressionFormat::Flate => 1,
+            CompressionFormat::GZip => 2,
+            CompressionFormat::LZW => 3,
+            CompressionFormat::ZLib => 4,
+        }
+    }
+
+    fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(CompressionFormat::NoCompression),
+            1 => Some(CompressionFormat::Flate),
+            2 => Some(CompressionFormat::GZip),
+            3 => Some(CompressionFormat::LZW),
+            4 => Some(CompressionFormat::ZLib),
+            _ => None,
+        }
+    }
+}
+
+// Enum to represent different compression levels
+pub enum CompressionLevel {
+    BestSpeed = 0,
+    BestCompression = 1,
+    DefaultCompression = 2,
+    HuffmanOnly = 3,
+}
+
+impl CompressionLevel {
+    fn as_u64(&self) -> u64 {
+        match *self {
+            CompressionLevel::BestSpeed => 0,
+            CompressionLevel::BestCompression => 1,
+            CompressionLevel::DefaultCompression => 2,
+            CompressionLevel::HuffmanOnly => 3,
+        }
+    }
+
+    fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(CompressionLevel::BestSpeed),
+            1 => Some(CompressionLevel::BestCompression),
+            2 => Some(CompressionLevel::DefaultCompression),
+            3 => Some(CompressionLevel::HuffmanOnly),
+            _ => None,
+        }
+    }
+}
+
 /// Represents metadata associated with a file.
 ///
 /// The `Metadata` struct defines a container for storing key-value pairs of metadata. This metadata
@@ -73,15 +147,15 @@ impl Metadata {
     /// # Returns
     ///
     /// Returns a `Metadata` instance containing the file header information.
-    fn new_file_header(id: u64, cf: u64, cl: u64) -> Self {
+    fn new_file_header(id: u64, cf: &CompressionFormat, cl: &CompressionLevel) -> Self {
         let mut buf = Metadata::new(None);
 
         // Set file header key-value pairs using constants
         buf.put_int(KEY_MAGIC, MAGIC);
         buf.put_int(KEY_VERSION, VERSION);
         buf.put_int(KEY_SEGMENT_ID, id);
-        buf.put_int(KEY_COMPRESSION_FORMAT, cf);
-        buf.put_int(KEY_COMPRESSION_LEVEL, cl);
+        buf.put_int(KEY_COMPRESSION_FORMAT, cf.as_u64());
+        buf.put_int(KEY_COMPRESSION_LEVEL, cl.as_u64());
 
         buf
     }
@@ -166,6 +240,16 @@ fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<(), std::io::Error>
     writer.write_all(&len_buf)?; // Write 4 bytes for the length
     writer.write_all(b)?; // Write the actual field bytes
     Ok(())
+}
+
+fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
+    let min_len = dest.len().min(src.len());
+
+    for (d, s) in dest.iter_mut().zip(src.iter()) {
+        *d = *s;
+    }
+
+    min_len
 }
 
 #[cfg(test)]
