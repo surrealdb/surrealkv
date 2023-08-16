@@ -54,8 +54,8 @@ const KEY_SEGMENT_ID: &str = "segment_id";
 const KEY_COMPRESSION_FORMAT: &str = "compression_format";
 const KEY_COMPRESSION_LEVEL: &str = "compression_level";
 
-
 // Enum to represent different compression formats
+#[derive(Clone)]
 pub enum CompressionFormat {
     NoCompression = 0,
     Flate = 1,
@@ -88,6 +88,7 @@ impl CompressionFormat {
 }
 
 // Enum to represent different compression levels
+#[derive(Clone)]
 pub enum CompressionLevel {
     BestSpeed = 0,
     BestCompression = 1,
@@ -121,7 +122,15 @@ impl CompressionLevel {
 /// The `Options` struct provides a way to customize various aspects of a write-ahead log segment,
 /// such as the file mode, compression settings, metadata, and extension. These options are used
 /// when creating a new segment to tailor its behavior according to application requirements.
-pub(crate) struct Options {
+#[derive(Clone)]
+pub struct Options {
+    /// The permission mode for creating directories.
+    ///
+    /// If specified, this option sets the permission mode for creating directories. It determines
+    /// the access rights for creating new directories. If not specified, the default directory
+    /// creation mode will be used.
+    dir_mode: Option<u32>,
+
     /// The file mode to set for the segment file.
     ///
     /// If specified, this option sets the permission mode for the segment file. It determines who
@@ -160,7 +169,7 @@ pub(crate) struct Options {
     /// If specified, this option sets the maximum size that the segment file is allowed to reach.
     /// Once the file reaches this size, additional writes will be prevented. If not specified,
     /// there is no maximum size limit for the file.
-    /// 
+    ///
     /// This is used by aol to cycle segments when the max file size is reached.
     max_file_size: Option<u64>,
 }
@@ -168,17 +177,19 @@ pub(crate) struct Options {
 impl Options {
     fn default() -> Self {
         Options {
-            file_mode: Some(0o644),   // default file mode
-            compression_format: None, // default compression format
-            compression_level: None,  // default compression level
-            metadata: None,           // default metadata
-            extension: None,          // default extension
-            max_file_size: None,      // default max file size
+            dir_mode: Some(0o750),        // default directory mode
+            file_mode: Some(0o640),       // default file mode
+            compression_format: None,     // default compression format
+            compression_level: None,      // default compression level
+            metadata: None,               // default metadata
+            extension: None,              // default extension
+            max_file_size: Some(1 << 26), // default max file size
         }
     }
 
     fn new() -> Self {
         Options {
+            dir_mode: None,
             file_mode: None,
             compression_format: None,
             compression_level: None,
@@ -217,14 +228,19 @@ impl Options {
         self.max_file_size = Some(max_file_size);
         self
     }
-}
 
+    fn with_dir_mode(mut self, dir_mode: u32) -> Self {
+        self.dir_mode = Some(dir_mode);
+        self
+    }
+}
 
 /// Represents metadata associated with a file.
 ///
 /// The `Metadata` struct defines a container for storing key-value pairs of metadata. This metadata
 /// can be used to hold additional information about a file. The data is stored in a hash map where
 /// each key is a string and each value is a vector of bytes.
+#[derive(Clone)]
 struct Metadata {
     /// The map holding key-value pairs of metadata.
     ///
@@ -353,10 +369,10 @@ impl Metadata {
 /// - `Last`: Denotes the final fragment of a record.
 enum RecordType {
     BlockTerm = 0, // Rest of block is empty.
-    Full = 1,     // Full record.
-    First = 2,    // First fragment of a record.
-    Middle = 3,   // Middle fragments of a record.
-    Last = 4,     // Final fragment of a record.
+    Full = 1,      // Full record.
+    First = 2,     // First fragment of a record.
+    Middle = 3,    // Middle fragments of a record.
+    Last = 4,      // Final fragment of a record.
 }
 
 /// Encodes a record with the provided information into the given buffer.
@@ -382,8 +398,8 @@ fn encode_record(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     };
 
     buf[0] = typ as u8;
-	// Explicitly zero Reserved bytes just in case
-	buf[1] = 0;
+    // Explicitly zero Reserved bytes just in case
+    buf[1] = 0;
     let crc = calculate_crc32(part);
     let len_part = part.len() as u16;
     buf[2..4].copy_from_slice(&len_part.to_be_bytes());
@@ -398,8 +414,6 @@ fn calculate_crc32(data: &[u8]) -> u32 {
     hasher.update(data);
     hasher.finalize()
 }
-
-
 
 // Reads a field from the given reader
 fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>, std::io::Error> {

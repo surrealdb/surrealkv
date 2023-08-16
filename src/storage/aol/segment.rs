@@ -1,15 +1,13 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Seek, Write};
+use std::num::ParseIntError;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::aol::{
-    Options,
-    merge_slices, read_field, write_field,
-    encode_record,
-    CompressionFormat, CompressionLevel, Metadata, 
-    BLOCK_SIZE, RECORD_HEADER_SIZE
+    encode_record, merge_slices, read_field, write_field, CompressionFormat, CompressionLevel,
+    Metadata, Options, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
 
 /// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
@@ -59,7 +57,6 @@ impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
         self.alloc - self.flushed
     }
 }
-
 
 /// Represents a segment in a write-ahead log.
 ///
@@ -117,7 +114,7 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
-    fn new(dir: &Path, id: u64, opts: &Options) -> io::Result<Self> {
+    pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> io::Result<Self> {
         // Build the file path using the segment name and extension
         let extension = opts.extension.as_deref().unwrap_or("");
         let file_path = dir.join(Self::segment_name(id, extension));
@@ -202,33 +199,55 @@ impl Segment {
         Ok(header.len())
     }
 
-    fn segment_name(index: u64, ext: &str) -> String {
+    pub(crate) fn segment_name(index: u64, ext: &str) -> String {
         if ext.is_empty() {
             return format!("{:020}", index);
         }
         format!("{:020}.{}", index, ext)
     }
 
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let bytes_written = self.file.write(buf)?;
-        self.file_offset += bytes_written as u64;
-        Ok(bytes_written)
+    pub(crate) fn parse_segment_name(name: &str) -> io::Result<(u64, Option<String>)> {
+        let parts: Vec<&str> = name.split('.').collect();
+
+        if parts.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid segment name format",
+            ));
+        }
+
+        let index: Result<u64, ParseIntError> = parts[0].parse();
+        if let Ok(index) = index {
+            if parts.len() == 1 {
+                return Ok((index, None));
+            } else if parts.len() == 2 {
+                return Ok((index, Some(parts[1].to_string())));
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid segment name format",
+        ))
     }
 
-    // Flushes the current block to disk. 
+    // Flushes the current block to disk.
     // This method also synchronize file metadata to the filesystem
     // hence it is a bit slower than fdatasync (sync_data).
-    fn sync(&mut self) -> io::Result<()> {
+    pub(crate) fn sync(&mut self) -> io::Result<()> {
+        if self.block.alloc > 0 {
+            self.flush_block(true)?;
+        }
         self.file.sync_all()
     }
 
-    fn close(&mut self) -> io::Result<()> {
+    pub(crate) fn close(&mut self) -> io::Result<()> {
         self.closed = true;
         self.file.sync_all()?;
         Ok(())
     }
 
-    fn flush_block(&mut self, clear: bool) -> io::Result<()> {
+    pub(crate) fn flush_block(&mut self, clear: bool) -> io::Result<()> {
         let mut p = &mut self.block;
         let clear = clear || p.is_full();
 
@@ -252,7 +271,7 @@ impl Segment {
     }
 
     // Returns the current offset within the segment.
-    fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.file_offset + self.block.unwritten() as u64
     }
 
@@ -272,7 +291,7 @@ impl Segment {
     /// # Errors
     ///
     /// Returns an error if the segment is closed.
-    fn append(&mut self, mut rec: &[u8]) -> io::Result<usize> {
+    pub(crate) fn append(&mut self, mut rec: &[u8]) -> io::Result<(u64, usize)> {
         // If the segment is closed, return an error
         if self.closed {
             return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
@@ -281,6 +300,8 @@ impl Segment {
         if rec.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
         }
+
+        let offset = self.offset();
 
         // If the block is full, flush it
         if self.block.is_full() {
@@ -308,7 +329,7 @@ impl Segment {
 
             n += l;
 
-            i+=1;
+            i += 1;
         }
 
         // Write the remaining data to the block
@@ -316,7 +337,7 @@ impl Segment {
             self.flush_block(false)?;
         }
 
-        Ok(n)
+        Ok((offset, n))
     }
 
     /// Reads data from the segment at the specified offset.
@@ -338,7 +359,7 @@ impl Segment {
     ///
     /// Returns an error if the provided offset is negative or if there is an I/O error
     /// during reading.
-    fn read_at(&mut self, bs: &mut [u8], off: u64) -> io::Result<usize> {
+    pub(crate) fn read_at(&self, bs: &mut [u8], off: u64) -> io::Result<usize> {
         if off > self.offset() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -363,9 +384,9 @@ impl Segment {
             let read_chunk_size = std::cmp::min(pending, available);
 
             if read_chunk_size > 0 {
-                let buf = &mut self.block.buf
+                let buf = &self.block.buf
                     [self.block.alloc + boff..self.block.alloc + boff + read_chunk_size];
-                merge_slices(buf, bs);
+                merge_slices(bs, buf);
             }
 
             if read_chunk_size == pending {
@@ -428,11 +449,47 @@ mod tests {
     }
 
     #[test]
+    fn test_segment_name_with_extension() {
+        let index = 42;
+        let ext = "log";
+        let expected = format!("{:020}.{}", index, ext);
+        assert_eq!(Segment::segment_name(index, ext), expected);
+    }
+
+    #[test]
+    fn test_segment_name_without_extension() {
+        let index = 42;
+        let expected = format!("{:020}", index);
+        assert_eq!(Segment::segment_name(index, ""), expected);
+    }
+
+    #[test]
+    fn test_parse_segment_name_with_extension() {
+        let name = "00000000000000000042.log";
+        let result = Segment::parse_segment_name(name).unwrap();
+        assert_eq!(result, (42, Some("log".to_string())));
+    }
+
+    #[test]
+    fn test_parse_segment_name_without_extension() {
+        let name = "00000000000000000042";
+        let result = Segment::parse_segment_name(name).unwrap();
+        assert_eq!(result, (42, None));
+    }
+
+    #[test]
+    fn test_parse_segment_name_invalid_format() {
+        let name = "invalid_name";
+        let result = Segment::parse_segment_name(name);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_append() {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         let opts = Options::default();
-        let mut a = Segment::new(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut a = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
 
         let sz = a.offset();
         assert_eq!(0, sz);
@@ -442,14 +499,18 @@ mod tests {
 
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap());
+        assert_eq!(4, r.unwrap().1);
 
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(7, r.unwrap());
+        assert_eq!(7, r.unwrap().1);
+
+        assert_eq!(a.offset(), 27);
 
         let r = a.sync();
         assert!(r.is_ok());
+
+        assert_eq!(a.offset(), 4096);
 
         let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
@@ -459,9 +520,10 @@ mod tests {
         let mut bs = vec![0; 15];
         let n = a.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
-        assert_eq!(&[4,5,6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
-        let r = a.read_at(&mut bs, 1000);
+        let mut bs = vec![0; 15];
+        let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
         // Cleanup: Drop the temp directory, which deletes its contents
