@@ -1,56 +1,56 @@
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Seek, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::aol::{
-    merge_slices, read_field, write_field, CompressionFormat, CompressionLevel, Metadata, PAGE_SIZE,
+    Options,
+    merge_slices, read_field, write_field,
+    encode_record,
+    CompressionFormat, CompressionLevel, Metadata, 
+    BLOCK_SIZE, RECORD_HEADER_SIZE
 };
 
-/// A `Page` is an in-memory buffer that stores data before it is flushed to disk. It is used to
+/// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
 /// batch writes to improve performance by reducing the number of individual disk writes. If the
-/// data to be written exceeds the `PAGE_SIZE`, it will be split and flushed separately. The `Page`
+/// data to be written exceeds the `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
 /// keeps track of the allocated space, flushed data, and other details related to the write process.
 /// It can also be used to align data to the size of a direct I/O block, if applicable.
 ///
 /// # Type Parameters
 ///
-/// - `PAGE_SIZE`: The size of the page in bytes.
-pub(crate) struct Page<const PAGE_SIZE: usize> {
-    /// The number of bytes currently allocated in the page.
+/// - `BLOCK_SIZE`: The size of the block in bytes.
+pub(crate) struct Block<const BLOCK_SIZE: usize> {
+    /// The number of bytes currently allocated in the block.
     alloc: usize,
 
     /// The number of bytes that have been flushed to disk.
     flushed: usize,
 
     /// The buffer that holds the actual data.
-    buf: [u8; PAGE_SIZE],
-
-    /// The current offset within the page's buffer.
-    offset: usize,
+    buf: [u8; BLOCK_SIZE],
 }
 
-impl<const PAGE_SIZE: usize> Page<PAGE_SIZE> {
+impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
     fn new() -> Self {
-        Page {
+        Block {
             alloc: 0,
             flushed: 0,
-            buf: [0; PAGE_SIZE],
-            offset: 0,
+            buf: [0; BLOCK_SIZE],
         }
     }
 
     fn remaining(&self) -> usize {
-        PAGE_SIZE - self.alloc
+        BLOCK_SIZE - self.alloc - RECORD_HEADER_SIZE
     }
 
     fn is_full(&self) -> bool {
-        PAGE_SIZE - self.alloc <= self.offset
+        BLOCK_SIZE - self.alloc <= RECORD_HEADER_SIZE
     }
 
     fn reset(&mut self) {
-        self.buf = [0u8; PAGE_SIZE];
+        self.buf = [0u8; BLOCK_SIZE];
         self.alloc = 0;
         self.flushed = 0;
     }
@@ -60,92 +60,6 @@ impl<const PAGE_SIZE: usize> Page<PAGE_SIZE> {
     }
 }
 
-/// Represents options for configuring a segment in a write-ahead log.
-///
-/// The `Options` struct provides a way to customize various aspects of a write-ahead log segment,
-/// such as the file mode, compression settings, metadata, and extension. These options are used
-/// when creating a new segment to tailor its behavior according to application requirements.
-pub(crate) struct Options {
-    /// The file mode to set for the segment file.
-    ///
-    /// If specified, this option sets the permission mode for the segment file. It determines who
-    /// can read, write, and execute the file. If not specified, the default file mode will be used.
-    file_mode: Option<u32>,
-
-    /// The compression format to apply to the segment's data.
-    ///
-    /// If specified, this option sets the compression format that will be used to compress the
-    /// data written to the segment. Compression can help save storage space but might introduce
-    /// some overhead in terms of CPU usage during read and write operations.
-    compression_format: Option<CompressionFormat>,
-
-    /// The compression level to use with the selected compression format.
-    ///
-    /// This option specifies the compression level that will be applied when compressing the data.
-    /// Higher levels usually provide better compression ratios but require more computational
-    /// resources. If not specified, a default compression level will be used.
-    compression_level: Option<CompressionLevel>,
-
-    /// The metadata associated with the segment.
-    ///
-    /// This option allows you to attach metadata to the segment. Metadata can be useful for storing
-    /// additional information about the segment's contents or usage. If not specified, no metadata
-    /// will be associated with the segment.
-    metadata: Option<Metadata>,
-
-    /// The extension to use for the segment file.
-    ///
-    /// If specified, this option sets the extension for the segment file. The extension is used
-    /// when creating the segment file on disk. If not specified, a default extension might be used.
-    extension: Option<String>,
-}
-
-impl Options {
-    fn default() -> Self {
-        Options {
-            file_mode: Some(0o644),   // default file mode
-            compression_format: None, // default compression format
-            compression_level: None,  // default compression level
-            metadata: None,           // default metadata
-            extension: None,          // default extension
-        }
-    }
-
-    fn new() -> Self {
-        Options {
-            file_mode: None,
-            compression_format: None,
-            compression_level: None,
-            metadata: None,
-            extension: None,
-        }
-    }
-
-    fn with_file_mode(mut self, file_mode: u32) -> Self {
-        self.file_mode = Some(file_mode);
-        self
-    }
-
-    fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
-        self.compression_format = Some(compression_format);
-        self
-    }
-
-    fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
-        self.compression_level = Some(compression_level);
-        self
-    }
-
-    fn with_metadata(mut self, metadata: Metadata) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    fn with_extension(mut self, extension: String) -> Self {
-        self.extension = Some(extension);
-        self
-    }
-}
 
 /// Represents a segment in a write-ahead log.
 ///
@@ -175,20 +89,19 @@ impl Options {
 ///     .                                                       |
 ///     .                                                       |
 ///     +------+------+------+------+------+------+------+------+
-/// */
-
-struct Segment {
+///
+pub(crate) struct Segment {
     /// The unique identifier of the segment.
     id: u64,
 
     /// The directory where the segment file is located.
     dir: PathBuf,
 
-    /// The active page for buffering data.
-    page: Page<PAGE_SIZE>,
+    /// The active block for buffering data.
+    block: Block<BLOCK_SIZE>,
 
-    /// The number of pages that have been written to the segment.
-    done_pages: usize,
+    /// The number of blocks that have been written to the segment.
+    written_blocks: usize,
 
     /// The underlying file for storing the segment's data.
     file: File,
@@ -239,8 +152,8 @@ impl Segment {
             dir: dir.to_path_buf(),
             id,
             closed: false,
-            done_pages: 0,
-            page: Page::new(),
+            written_blocks: 0,
+            block: Block::new(),
         })
     }
 
@@ -302,6 +215,9 @@ impl Segment {
         Ok(bytes_written)
     }
 
+    // Flushes the current block to disk. 
+    // This method also synchronize file metadata to the filesystem
+    // hence it is a bit slower than fdatasync (sync_data).
     fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
@@ -312,24 +228,24 @@ impl Segment {
         Ok(())
     }
 
-    fn flush_page(&mut self, clear: bool) -> io::Result<()> {
-        let mut p = &mut self.page;
+    fn flush_block(&mut self, clear: bool) -> io::Result<()> {
+        let mut p = &mut self.block;
         let clear = clear || p.is_full();
 
-        // No more data will fit into the page or an implicit clear.
+        // No more data will fit into the block or an implicit clear.
         // Enqueue and clear it.
         if clear {
-            p.alloc = PAGE_SIZE; // Write till end of page.
+            p.alloc = BLOCK_SIZE; // Write till end of block.
         }
 
         let n = self.file.write(&p.buf[p.flushed..p.alloc])?;
         p.flushed += n;
         self.file_offset += n as u64;
 
-        // We flushed an entire page, prepare a new one.
+        // We flushed an entire block, prepare a new one.
         if clear {
             p.reset();
-            self.done_pages += 1;
+            self.written_blocks += 1;
         }
 
         Ok(())
@@ -337,13 +253,13 @@ impl Segment {
 
     // Returns the current offset within the segment.
     fn offset(&self) -> u64 {
-        self.file_offset + self.page.unwritten() as u64
+        self.file_offset + self.block.unwritten() as u64
     }
 
     /// Appends data to the segment.
     ///
-    /// This method appends the given data to the segment. If the page is full, it is flushed
-    /// to disk. The data is written in chunks to the current page until the page is full.
+    /// This method appends the given data to the segment. If the block is full, it is flushed
+    /// to disk. The data is written in chunks to the current block until the block is full.
     ///
     /// # Parameters
     ///
@@ -366,33 +282,38 @@ impl Segment {
             return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
         }
 
-        // If the page is full, flush it
-        if self.page.is_full() {
-            self.flush_page(true)?;
+        // If the block is full, flush it
+        if self.block.is_full() {
+            self.flush_block(true)?;
         }
 
         let mut n = 0;
-        while !rec.is_empty() {
-            let p = &mut self.page;
-            // Find the number of bytes that can be written to the page
+        let mut i = 0;
+        while i == 0 || !rec.is_empty() {
+            let p = &mut self.block;
+            // Find the number of bytes that can be written to the block
             let l = std::cmp::min(p.remaining(), rec.len());
             let part = &rec[..l];
             let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
-                                             // Copy the content of 'part' into 'b'
-            merge_slices(buf, part);
 
-            p.alloc += part.len(); // Update the number of bytes allocated in the page
+            // Encode the content of 'part' into 'buf'
+            encode_record(buf, rec.len(), part, i);
+
+            p.alloc += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
             if p.is_full() {
-                self.flush_page(true)?;
+                self.flush_block(true)?;
             }
 
             rec = &rec[l..]; // Update the remaining bytes to be written
+
             n += l;
+
+            i+=1;
         }
 
-        // Write the remaining data to the page
-        if self.page.alloc > 0 {
-            self.flush_page(false)?;
+        // Write the remaining data to the block
+        if self.block.alloc > 0 {
+            self.flush_block(false)?;
         }
 
         Ok(n)
@@ -401,7 +322,7 @@ impl Segment {
     /// Reads data from the segment at the specified offset.
     ///
     /// This method reads data from the segment starting from the given offset. It reads
-    /// from the underlying file if the offset is beyond the current page's buffer. The
+    /// from the underlying file if the offset is beyond the current block's buffer. The
     /// read data is then copied into the provided byte slice `bs`.
     ///
     /// # Parameters
@@ -417,7 +338,7 @@ impl Segment {
     ///
     /// Returns an error if the provided offset is negative or if there is an I/O error
     /// during reading.
-    fn read_at(&mut self, bs: &mut [u8], off: u64) -> io::Result<(usize)> {
+    fn read_at(&mut self, bs: &mut [u8], off: u64) -> io::Result<usize> {
         if off > self.offset() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -438,12 +359,12 @@ impl Segment {
 
         let pending = bs.len() - n;
         if pending > 0 {
-            let available = self.page.unwritten() - boff;
+            let available = self.block.unwritten() - boff;
             let read_chunk_size = std::cmp::min(pending, available);
 
             if read_chunk_size > 0 {
-                let buf = &mut self.page.buf
-                    [self.page.alloc + boff..self.page.alloc + boff + read_chunk_size];
+                let buf = &mut self.block.buf
+                    [self.block.alloc + boff..self.block.alloc + boff + read_chunk_size];
                 merge_slices(buf, bs);
             }
 
@@ -475,38 +396,35 @@ mod tests {
 
     #[test]
     fn test_remaining() {
-        let page: Page<4096> = Page {
+        let block: Block<4096> = Block {
             alloc: 100,
             flushed: 0,
             buf: [0; 4096],
-            offset: 16,
         };
-        assert_eq!(page.remaining(), 3996);
+        assert_eq!(block.remaining(), 3996 - RECORD_HEADER_SIZE);
     }
 
     #[test]
     fn test_is_full() {
-        let page: Page<4096> = Page {
-            alloc: 4080,
+        let block: Block<4096> = Block {
+            alloc: 4096 - RECORD_HEADER_SIZE,
             flushed: 0,
             buf: [0; 4096],
-            offset: 16,
         };
-        assert!(page.is_full());
+        assert!(block.is_full());
     }
 
     #[test]
     fn test_reset() {
-        let mut page: Page<4096> = Page {
+        let mut block: Block<4096> = Block {
             alloc: 100,
             flushed: 0,
             buf: [1; 4096],
-            offset: 16,
         };
-        page.reset();
-        assert_eq!(page.buf, [0; 4096]);
-        assert_eq!(page.alloc, 0);
-        assert_eq!(page.flushed, 0);
+        block.reset();
+        assert_eq!(block.buf, [0; 4096]);
+        assert_eq!(block.alloc, 0);
+        assert_eq!(block.flushed, 0);
     }
 
     #[test]
@@ -522,13 +440,9 @@ mod tests {
         let r = a.append(&[]);
         assert!(r.is_err());
 
-        let r = a.append(&[0]);
+        let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(1, r.unwrap());
-
-        let r = a.append(&[1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(3, r.unwrap());
+        assert_eq!(4, r.unwrap());
 
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
@@ -537,14 +451,15 @@ mod tests {
         let r = a.sync();
         assert!(r.is_ok());
 
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs);
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
-        let n = a.read_at(&mut bs, 7).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[7, 8, 9, 10].to_vec(), &bs);
+        let mut bs = vec![0; 15];
+        let n = a.read_at(&mut bs, 12).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(&[4,5,6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         let r = a.read_at(&mut bs, 1000);
         assert!(r.is_err());

@@ -1,14 +1,25 @@
+pub mod aol;
 pub mod segment;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-/// The size of a single page in bytes.
+use crc32fast::Hasher;
+
+/// The size of a single block in bytes.
 ///
-/// The `PAGE_SIZE` constant represents the size of a page used for buffering disk writes in the
+/// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
-/// flushing to disk. Larger page sizes can improve write performance but might use more memory.
-const PAGE_SIZE: usize = 4096;
+/// flushing to disk. Larger block sizes can improve write performance but might use more memory.
+const BLOCK_SIZE: usize = 4096;
+
+/// Length of the record header in bytes.
+///
+/// This constant represents the length, in bytes, of the record header structure
+/// used in the write-ahead log. The record header contains information
+/// about the type of the record, the length of the payload, and a checksum value.
+/// The constant is set to 8, reflecting the size of the record header structure.
+pub const RECORD_HEADER_SIZE: usize = 8;
 
 /// The magic value for identifying file headers.
 ///
@@ -23,13 +34,6 @@ const MAGIC: u64 = 0xFB98F91D;
 /// segments. It provides information about the structure and layout of the data within the segment.
 const VERSION: u64 = 1;
 
-/// Constants for key names used in the file header.
-const KEY_MAGIC: &str = "magic";
-const KEY_VERSION: &str = "version";
-const KEY_SEGMENT_ID: &str = "segment_id";
-const KEY_COMPRESSION_FORMAT: &str = "compression_format";
-const KEY_COMPRESSION_LEVEL: &str = "compression_level";
-
 /// Default file mode for newly created files, represented in octal format.
 /// The default mode is set to read and write permissions for the owner,
 /// and read-only permissions for the group and others.
@@ -42,6 +46,14 @@ const DEFAULT_COMPRESSION_FORMAT: CompressionFormat = CompressionFormat::NoCompr
 /// Default compression level used for compression.
 /// The data will be compressed using the `DefaultCompression` level.
 const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
+
+/// Constants for key names used in the file header.
+const KEY_MAGIC: &str = "magic";
+const KEY_VERSION: &str = "version";
+const KEY_SEGMENT_ID: &str = "segment_id";
+const KEY_COMPRESSION_FORMAT: &str = "compression_format";
+const KEY_COMPRESSION_LEVEL: &str = "compression_level";
+
 
 // Enum to represent different compression formats
 pub enum CompressionFormat {
@@ -103,6 +115,110 @@ impl CompressionLevel {
         }
     }
 }
+
+/// Represents options for configuring a segment in a write-ahead log.
+///
+/// The `Options` struct provides a way to customize various aspects of a write-ahead log segment,
+/// such as the file mode, compression settings, metadata, and extension. These options are used
+/// when creating a new segment to tailor its behavior according to application requirements.
+pub(crate) struct Options {
+    /// The file mode to set for the segment file.
+    ///
+    /// If specified, this option sets the permission mode for the segment file. It determines who
+    /// can read, write, and execute the file. If not specified, the default file mode will be used.
+    file_mode: Option<u32>,
+
+    /// The compression format to apply to the segment's data.
+    ///
+    /// If specified, this option sets the compression format that will be used to compress the
+    /// data written to the segment. Compression can help save storage space but might introduce
+    /// some overhead in terms of CPU usage during read and write operations.
+    compression_format: Option<CompressionFormat>,
+
+    /// The compression level to use with the selected compression format.
+    ///
+    /// This option specifies the compression level that will be applied when compressing the data.
+    /// Higher levels usually provide better compression ratios but require more computational
+    /// resources. If not specified, a default compression level will be used.
+    compression_level: Option<CompressionLevel>,
+
+    /// The metadata associated with the segment.
+    ///
+    /// This option allows you to attach metadata to the segment. Metadata can be useful for storing
+    /// additional information about the segment's contents or usage. If not specified, no metadata
+    /// will be associated with the segment.
+    metadata: Option<Metadata>,
+
+    /// The extension to use for the segment file.
+    ///
+    /// If specified, this option sets the extension for the segment file. The extension is used
+    /// when creating the segment file on disk. If not specified, a default extension might be used.
+    extension: Option<String>,
+
+    /// The maximum size of the segment file.
+    ///
+    /// If specified, this option sets the maximum size that the segment file is allowed to reach.
+    /// Once the file reaches this size, additional writes will be prevented. If not specified,
+    /// there is no maximum size limit for the file.
+    /// 
+    /// This is used by aol to cycle segments when the max file size is reached.
+    max_file_size: Option<u64>,
+}
+
+impl Options {
+    fn default() -> Self {
+        Options {
+            file_mode: Some(0o644),   // default file mode
+            compression_format: None, // default compression format
+            compression_level: None,  // default compression level
+            metadata: None,           // default metadata
+            extension: None,          // default extension
+            max_file_size: None,      // default max file size
+        }
+    }
+
+    fn new() -> Self {
+        Options {
+            file_mode: None,
+            compression_format: None,
+            compression_level: None,
+            metadata: None,
+            extension: None,
+            max_file_size: None,
+        }
+    }
+
+    fn with_file_mode(mut self, file_mode: u32) -> Self {
+        self.file_mode = Some(file_mode);
+        self
+    }
+
+    fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
+        self.compression_format = Some(compression_format);
+        self
+    }
+
+    fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
+        self.compression_level = Some(compression_level);
+        self
+    }
+
+    fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    fn with_extension(mut self, extension: String) -> Self {
+        self.extension = Some(extension);
+        self
+    }
+
+    fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = Some(max_file_size);
+        self
+    }
+}
+
 
 /// Represents metadata associated with a file.
 ///
@@ -221,6 +337,69 @@ impl Metadata {
         self.data.get(key)
     }
 }
+
+/// Enum representing different types of records in a write-ahead log.
+///
+/// This enumeration defines different types of records that can be used in a write-ahead log.
+/// Each frame type indicates a particular state of a record in the log. The enum variants
+/// represent various stages of a record, including full records, fragments, and special cases.
+///
+/// # Variants
+///
+/// - `BlockTerm`: Indicates that the rest of the block is empty.
+/// - `Full`: Represents a full record.
+/// - `First`: Denotes the first fragment of a record.
+/// - `Middle`: Denotes middle fragments of a record.
+/// - `Last`: Denotes the final fragment of a record.
+enum RecordType {
+    BlockTerm = 0, // Rest of block is empty.
+    Full = 1,     // Full record.
+    First = 2,    // First fragment of a record.
+    Middle = 3,   // Middle fragments of a record.
+    Last = 4,     // Final fragment of a record.
+}
+
+/// Encodes a record with the provided information into the given buffer.
+///
+/// It has the following format:
+///
+///	    Record Header
+///
+///	    0      1      2      3      4      5      6      7      8
+///	    +------+----------+------+------+------+------+------+------+
+///	    | Type | Reserved |    Length   |         CRC32             |
+///	    +------+----------+------+------+------+------+------+------+
+///   
+fn encode_record(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
+    let typ = if i == 0 && part.len() == rec_len {
+        RecordType::Full
+    } else if part.len() == rec_len {
+        RecordType::Last
+    } else if i == 0 {
+        RecordType::First
+    } else {
+        RecordType::Middle
+    };
+
+    buf[0] = typ as u8;
+	// Explicitly zero Reserved bytes just in case
+	buf[1] = 0;
+    let crc = calculate_crc32(part);
+    let len_part = part.len() as u16;
+    buf[2..4].copy_from_slice(&len_part.to_be_bytes());
+    buf[4..8].copy_from_slice(&crc.to_be_bytes());
+
+    // Copy the 'part' into the buffer starting from the RECORD_HEADER_SIZE offset
+    merge_slices(&mut buf[RECORD_HEADER_SIZE..], part); // Pass a mutable reference to buf
+}
+
+fn calculate_crc32(data: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+
 
 // Reads a field from the given reader
 fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>, std::io::Error> {
