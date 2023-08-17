@@ -2,6 +2,7 @@ pub mod aol;
 pub mod segment;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, Read, Write};
 
 use crc32fast::Hasher;
@@ -177,13 +178,13 @@ pub struct Options {
 impl Options {
     fn default() -> Self {
         Options {
-            dir_mode: Some(0o750),        // default directory mode
-            file_mode: Some(0o640),       // default file mode
-            compression_format: None,     // default compression format
-            compression_level: None,      // default compression level
-            metadata: None,               // default metadata
-            extension: None,              // default extension
-            max_file_size: 1 << 26,       // default max file size
+            dir_mode: Some(0o750),    // default directory mode
+            file_mode: Some(0o640),   // default file mode
+            compression_format: None, // default compression format
+            compression_level: None,  // default compression level
+            metadata: None,           // default metadata
+            extension: None,          // default extension
+            max_file_size: 1 << 26,   // default max file size
         }
     }
 
@@ -207,10 +208,8 @@ impl Options {
             ));
         }
 
-
         Ok(())
     }
-
 
     fn with_file_mode(mut self, file_mode: u32) -> Self {
         self.file_mode = Some(file_mode);
@@ -254,7 +253,7 @@ impl Options {
 /// can be used to hold additional information about a file. The data is stored in a hash map where
 /// each key is a string and each value is a vector of bytes.
 #[derive(Clone)]
-struct Metadata {
+pub(crate) struct Metadata {
     /// The map holding key-value pairs of metadata.
     ///
     /// The `data` field is a hash map that allows associating arbitrary data with descriptive keys.
@@ -349,23 +348,20 @@ impl Metadata {
         self.put(key, &b); // Call the generic put method
     }
 
-
-    
     // Gets an integer value associated with a given key
     fn get_int(&self, key: &str) -> io::Result<u64> {
         // Use the generic get method to retrieve bytes
-        let value_bytes = self.get(key).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "Key not found")
-        })?;
-    
+        let value_bytes = self
+            .get(key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Key not found"))?;
+
         // Convert bytes to u64
         let int_value = u64::from_be_bytes(value_bytes.as_slice().try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "Failed to convert bytes to u64")
         })?);
-    
+
         Ok(int_value)
     }
-
 
     // fn get_int(&self, key: &str) -> Option<u64> {
     //     // Use the generic get method to retrieve bytes and convert to u64
@@ -465,6 +461,80 @@ fn write_field<W: Write>(b: &[u8], writer: &mut W) -> io::Result<()> {
     Ok(())
 }
 
+fn read_file_header(file: &mut File) -> io::Result<Vec<u8>> {
+    // Read the header using read_field
+    read_field(file)
+}
+
+fn write_file_header(file: &mut File, id: u64, opts: &Options) -> io::Result<usize> {
+    // Write the header using write_field
+    let mut meta = Metadata::new_file_header(
+        id,
+        opts.compression_format
+            .as_ref()
+            .unwrap_or(&CompressionFormat::NoCompression),
+        opts.compression_level
+            .as_ref()
+            .unwrap_or(&CompressionLevel::BestSpeed),
+    );
+
+    if let Some(metadata) = &opts.metadata {
+        let buf = metadata.bytes();
+        meta.read_from(&mut &buf[..])?;
+    }
+
+    let mut header = Vec::new();
+    write_field(&meta.bytes(), &mut header)?;
+
+    // Write header to the file
+    file.write_all(&header)?;
+
+    // Sync data to disk and flush metadata
+    file.sync_all()?;
+
+    Ok(header.len())
+}
+
+fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()> {
+    let mut meta = Metadata::new(None);
+    meta.read_from(&mut &header[..])?;
+
+    // Validate individual fields here
+    let magic = meta.get_int(KEY_MAGIC)?;
+    let version = meta.get_int(KEY_VERSION)?;
+    let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
+    let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
+    let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
+
+    if magic != MAGIC || version != VERSION || segment_id != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid header data",
+        ));
+    }
+
+    // Check the compression format and level against the provided options
+    if let Some(expected_cf) = &opts.compression_format {
+        if cf != expected_cf.as_u64() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid compression format",
+            ));
+        }
+    }
+
+    if let Some(expected_cl) = &opts.compression_level {
+        if cl != expected_cl.as_u64() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid compression format",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
     let min_len = dest.len().min(src.len());
 
@@ -520,5 +590,49 @@ mod tests {
         let data = b"XYZ";
         write_field(data, &mut output).unwrap();
         assert_eq!(&output, &[0, 0, 0, 3, 88, 89, 90]); // [0, 0, 0, 3] for length and "XYZ" bytes
+    }
+
+    #[test]
+    fn test_metadata_extension() {
+        let id = 12345;
+        let opts = Options::default();
+
+        // Create a new metadata using new_file_header
+        let mut meta = Metadata::new_file_header(
+            id,
+            opts.compression_format
+                .as_ref()
+                .unwrap_or(&CompressionFormat::NoCompression),
+            opts.compression_level
+                .as_ref()
+                .unwrap_or(&CompressionLevel::BestSpeed),
+        );
+
+        // Create an extended metadata
+        let mut extended_meta = Metadata::new(None);
+        extended_meta.put_int("key1", 123);
+        extended_meta.put_int("key2", 456);
+
+        // Serialize and extend the extended metadata using bytes
+        let extended_bytes = extended_meta.bytes();
+        meta.read_from(&mut &extended_bytes[..])
+            .expect("Failed to read from bytes");
+
+        // Check if keys from existing metadata are present in the extended metadata
+        assert_eq!(meta.get_int(KEY_MAGIC).unwrap(), MAGIC);
+        assert_eq!(meta.get_int(KEY_VERSION).unwrap(), VERSION);
+        assert_eq!(meta.get_int(KEY_SEGMENT_ID).unwrap(), id);
+        assert_eq!(
+            meta.get_int(KEY_COMPRESSION_FORMAT).unwrap(),
+            CompressionFormat::NoCompression.as_u64()
+        );
+        assert_eq!(
+            meta.get_int(KEY_COMPRESSION_LEVEL).unwrap(),
+            CompressionLevel::BestSpeed.as_u64()
+        );
+
+        // Check if keys from the extended metadata are present in the extended metadata
+        assert_eq!(meta.get_int("key1").unwrap(), 123);
+        assert_eq!(meta.get_int("key1").unwrap(), 123);
     }
 }

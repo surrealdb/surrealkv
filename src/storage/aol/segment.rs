@@ -6,8 +6,8 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::aol::{
-    encode_record, merge_slices, read_field, write_field, CompressionFormat, CompressionLevel,
-    Metadata, Options, BLOCK_SIZE, RECORD_HEADER_SIZE,
+    encode_record, merge_slices, read_file_header, validate_file_header, write_file_header,
+    Options, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
 
 /// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
@@ -133,11 +133,14 @@ impl Segment {
         // If the file already exists
         if file_path_exists && file_path_is_file {
             // Handle existing file
-            let header = Self::read_file_header(&mut file)?;
-            file_header_offset += header.len();
+            let header = read_file_header(&mut file)?;
+            validate_file_header(&header, id, opts)?;
+
+            file_header_offset += (4 + header.len());
+            // TODO: take id etc from existing header
         } else {
-            // Create new file
-            let header_len = Self::write_file_header(&mut file, id, opts)?;
+            // Write new file header
+            let header_len = write_file_header(&mut file, id, opts)?;
             file_header_offset += header_len;
         }
 
@@ -159,47 +162,17 @@ impl Segment {
 
     fn open_file(file_path: &Path, opts: &Options) -> io::Result<File> {
         let mut open_options = OpenOptions::new();
-        open_options.read(true).write(true).create(true);
+        open_options.read(true).write(true);
 
         if let Some(file_mode) = opts.file_mode {
             open_options.mode(file_mode);
         }
 
-        open_options.open(file_path)
-    }
-
-    fn read_file_header(file: &mut File) -> io::Result<Vec<u8>> {
-        // Read the header using read_field
-        read_field(file)
-    }
-
-    fn write_file_header(file: &mut File, id: u64, opts: &Options) -> io::Result<usize> {
-        // Write the header using write_field
-        let mut meta = Metadata::new_file_header(
-            id,
-            opts.compression_format
-                .as_ref()
-                .unwrap_or(&CompressionFormat::NoCompression),
-            opts.compression_level
-                .as_ref()
-                .unwrap_or(&CompressionLevel::BestSpeed),
-        );
-
-        if let Some(metadata) = &opts.metadata {
-            let buf = metadata.bytes();
-            meta.read_from(&mut &buf[..])?;
+        if !file_path.exists() {
+            open_options.create(true); // Create the file if it doesn't exist
         }
 
-        let mut header = Vec::new();
-        write_field(&meta.bytes(), &mut header)?;
-
-        // Write header to the file
-        file.write_all(&header)?;
-
-        // Sync data to disk and flush metadata
-        file.sync_all()?;
-
-        Ok(header.len())
+        open_options.open(file_path)
     }
 
     pub(crate) fn segment_name(index: u64, ext: &str) -> String {
@@ -246,7 +219,7 @@ impl Segment {
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
         self.closed = true;
-        self.file.sync_all()?;
+        self.sync()?;
         Ok(())
     }
 
@@ -409,7 +382,7 @@ impl Segment {
 impl Drop for Segment {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
-        self.sync().ok();
+        self.close().ok();
     }
 }
 
@@ -491,85 +464,249 @@ mod tests {
     fn test_append() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
-    
+
         // Create segment options and open a segment
         let opts = Options::default();
         let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-    
+
         // Test initial offset
         let sz = segment.offset();
         assert_eq!(0, sz);
-    
+
         // Test appending an empty buffer
         let r = segment.append(&[]);
         assert!(r.is_err());
-    
+
         // Test appending a non-empty buffer
         let r = segment.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().1);
-    
+
         // Test appending another buffer
         let r = segment.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().1);
-    
+
         // Validate offset after appending
         // 8 + 4 + 8 + 7 = 27
         assert_eq!(segment.offset(), 27);
-    
+
         // Test syncing segment
         let r = segment.sync();
         assert!(r.is_ok());
-    
+
         // Validate offset after syncing
         assert_eq!(segment.offset(), 4096);
-    
+
         // Test reading from segment
         let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 0).expect("should read");
         assert_eq!(12, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
-    
+
         // Test reading another portion of data from segment
         let mut bs = vec![0; 15];
         let n = segment.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
-    
+
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
         let r = segment.read_at(&mut bs, 4097);
         assert!(r.is_err());
-    
+
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().1);
-    
+
         // Validate offset after appending
         // 4096 + 8 + 4 = 4108
         assert_eq!(segment.offset(), 4108);
-    
+
         // Test reading from segment after appending
         let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 4096).expect("should read");
         assert_eq!(12, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
-    
+
         // Test syncing segment again
         let r = segment.sync();
         assert!(r.is_ok());
-    
+
         // Validate offset after syncing again
         assert_eq!(segment.offset(), 4096 * 2);
-    
-        // Todo: Add more tests
-        // Todo: Test write and read_at with offset beyond current block
-        // Todo: Test open, close, then open again
-    
+
+        // Test closing segment
+        assert!(segment.close().is_ok());
+
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(temp_dir);
     }
-    
+
+    #[test]
+    fn test_reopen_empty_file() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options and open a segment
+        let opts = Options::default();
+        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        assert_eq!(0, segment.offset());
+
+        drop(segment);
+
+        // Reopen segment should pass
+        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        assert_eq!(0, segment.offset());
+    }
+
+    #[test]
+    fn test_reopen() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options and open a segment
+        let opts = Options::default();
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        assert_eq!(0, segment.offset());
+
+        // Test appending a non-empty buffer
+        let r = segment.append(&[0, 1, 2, 3]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        // Test appending another buffer
+        let r = segment.append(&[4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(7, r.unwrap().1);
+
+        // Validate offset after appending
+        // 8 + 4 + 8 + 7 = 27
+        assert_eq!(segment.offset(), 27);
+
+        // Test syncing segment
+        assert!(segment.sync().is_ok());
+
+        // Validate offset after syncing
+        assert_eq!(segment.offset(), 4096);
+
+        // Test closing segment
+        assert!(segment.close().is_ok());
+
+        drop(segment);
+
+        // Reopen segment
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        assert_eq!(segment.offset(), 4096);
+
+        // Test reading from segment
+        let mut bs = vec![0; 12];
+        let n = segment.read_at(&mut bs, 0).expect("should read");
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+
+        // Test reading another portion of data from segment
+        let mut bs = vec![0; 15];
+        let n = segment.read_at(&mut bs, 12).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+
+        // Test reading beyond segment's current size
+        let mut bs = vec![0; 15];
+        let r = segment.read_at(&mut bs, 4097);
+        assert!(r.is_err());
+
+        // Test appending another buffer after syncing
+        let r = segment.append(&[11, 12, 13, 14]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        // Validate offset after appending
+        // 4096 + 8 + 4 = 4108
+        assert_eq!(segment.offset(), 4108);
+
+        // Test reading from segment after appending
+        let mut bs = vec![0; 12];
+        let n = segment.read_at(&mut bs, 4096).expect("should read");
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+
+        // Test closing segment
+        assert!(segment.close().is_ok());
+
+        // Reopen segment
+        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        // Test initial offset
+        assert_eq!(segment.offset(), 4096 * 2);
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(segment);
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_open_file() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        let opts = Options::default();
+        let file_path = temp_dir.path().join("test_file.txt");
+
+        // Initially, the file doesn't exist
+        assert!(!file_path.exists());
+
+        // Open the file using open_file
+        let file_result = Segment::open_file(&file_path, &opts);
+        assert!(file_result.is_ok());
+
+        // Now, the file should exist
+        assert!(file_path.exists());
+
+        // Clean up: Delete the temporary directory and its contents
+        temp_dir.close().expect("should delete temp dir");
+    }
+
+    #[test]
+    fn test_corrupted_metadata() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options
+        let opts = Options::default();
+
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Close the segment
+        segment.close().expect("should close segment");
+
+        // Corrupt the segment's metadata by overwriting the first few bytes
+        let segment_path = temp_dir.path().join("00000000000000000000");
+        let mut corrupted_data = vec![0; 4];
+
+        // Open the file for writing before writing to it
+        let mut corrupted_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment_path)
+            .expect("should open corrupted file");
+
+        corrupted_file
+            .write_all(&mut corrupted_data)
+            .expect("should write corrupted data to file");
+
+        // Attempt to reopen the segment with corrupted metadata
+        let reopened_segment = Segment::open(&temp_dir.path(), 0, &opts);
+        assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
+    }
 }
