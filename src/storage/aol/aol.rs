@@ -320,48 +320,87 @@ mod tests {
 
     #[test]
     fn test_append() {
+        // Create a temporary directory
         let temp_dir = create_temp_directory();
-
+    
+        // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = AOL::open(&temp_dir.path(), &opts).expect("should create segment");
-
+        let mut a = AOL::open(&temp_dir.path(), &opts).expect("should create aol");
+    
+        // Test initial offset
         let sz = a.offset();
         assert_eq!(0, sz);
-
+    
+        // Test appending an empty buffer
         let r = a.append(&[]);
         assert!(r.is_err());
-
+    
+        // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().1);
-
+    
+        // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().1);
-
+    
+        // Validate offset after appending
         // 8 + 4 + 8 + 7 = 27
         assert_eq!(a.offset(), 27);
-
+    
+        // Test syncing segment
         let r = a.sync();
         assert!(r.is_ok());
-
+    
+        // Validate offset after syncing
         assert_eq!(a.offset(), 4096);
-
+    
+        // Test reading from segment
         let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
         assert_eq!(12, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
-
+    
+        // Test reading another portion of data from segment
         let mut bs = vec![0; 15];
         let n = a.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
-
+    
+        // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
         let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
-
+    
+        // Test appending another buffer after syncing
+        let r = a.append(&[11, 12, 13, 14]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+    
+        // Validate offset after appending
+        // 4096 + 8 + 4 = 4108
+        assert_eq!(a.offset(), 4108);
+    
+        // Test reading from segment after appending
+        let mut bs = vec![0; 12];
+        let n = a.read_at(&mut bs, 4096).expect("should read");
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+    
+        // Test syncing segment again
+        let r = a.sync();
+        assert!(r.is_ok());
+    
+        // Validate offset after syncing again
+        assert_eq!(a.offset(), 4096 * 2);
+    
+        // Todo: Add more tests
+        // Todo: Test write and read_at with offset beyond current block
+        // Todo: Test open, close, then open again
+    
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(temp_dir);
     }
+    
 }
