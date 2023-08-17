@@ -5,13 +5,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use crate::storage::aol::segment::Segment;
 use crate::storage::Options;
+use crate::storage::wal::segment::Segment;
 
-/// Append-Only Log (AOL) is a data structure used to sequentially store records
+/// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like write-ahead logging.
-pub struct AOL {
+pub struct WAL {
     /// The currently active segment where data is being written.
     active_segment: Segment,
 
@@ -21,26 +21,26 @@ pub struct AOL {
     /// The directory where the segment files are located.
     dir: PathBuf,
 
-    /// Configuration options for the AOL instance.
+    /// Configuration options for the WAL instance.
     opts: Options,
 
-    /// A flag indicating whether the AOL instance is closed or not.
+    /// A flag indicating whether the WAL instance is closed or not.
     closed: bool,
 
-    /// A read-write lock used to synchronize concurrent access to the AOL instance.
+    /// A read-write lock used to synchronize concurrent access to the WAL instance.
     mutex: RwLock<()>,
 }
 
-impl AOL {
-    /// Opens or creates a new AOL instance associated with the specified directory and segment ID.
+impl WAL {
+    /// Opens or creates a new WAL instance associated with the specified directory and segment ID.
     ///
-    /// This function prepares the AOL instance by creating the necessary directory,
+    /// This function prepares the WAL instance by creating the necessary directory,
     /// determining the active segment ID, and initializing the active segment.
     ///
     /// # Parameters
     ///
     /// - `dir`: The directory where segment files are located.
-    /// - `opts`: Configuration options for the AOL instance.
+    /// - `opts`: Configuration options for the WAL instance.
     pub fn open(dir: &Path, opts: &Options) -> io::Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
@@ -233,7 +233,7 @@ impl AOL {
     }
 }
 
-impl Drop for AOL {
+impl Drop for WAL {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -276,6 +276,8 @@ fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::RECORD_HEADER_SIZE;
+
     use super::*;
     use std::fs::File;
     use std::io::Write;
@@ -321,7 +323,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = AOL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -342,8 +344,8 @@ mod tests {
         assert_eq!(7, r.unwrap().1);
 
         // Validate offset after appending
-        // 4 + 7 = 11
-        assert_eq!(a.offset(), 11);
+        // 8 + 4 + 8 + 7 = 27
+        assert_eq!(a.offset(), 27);
 
         // Test syncing segment
         let r = a.sync();
@@ -353,16 +355,16 @@ mod tests {
         assert_eq!(a.offset(), 4096);
 
         // Test reading from segment
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 7];
-        let n = a.read_at(&mut bs, 4).expect("should read");
-        assert_eq!(7, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
+        let mut bs = vec![0; 15];
+        let n = a.read_at(&mut bs, 12).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
@@ -375,14 +377,14 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 4 = 4100
-        assert_eq!(a.offset(), 4100);
+        // 4096 + 8 + 4 = 4108
+        assert_eq!(a.offset(), 4108);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test syncing segment again
         let r = a.sync();

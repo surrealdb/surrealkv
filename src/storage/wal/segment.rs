@@ -6,8 +6,8 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::{
-    merge_slices, read_file_header, validate_file_header, write_file_header,
-    Options, BLOCK_SIZE,
+    encode_record, merge_slices, read_file_header, validate_file_header, write_file_header,
+    Options, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
 
 /// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
@@ -40,11 +40,11 @@ impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
     }
 
     fn remaining(&self) -> usize {
-        BLOCK_SIZE - self.alloc
+        BLOCK_SIZE - self.alloc - RECORD_HEADER_SIZE
     }
 
     fn is_full(&self) -> bool {
-        BLOCK_SIZE - self.alloc <= 0
+        BLOCK_SIZE - self.alloc <= RECORD_HEADER_SIZE
     }
 
     fn reset(&mut self) {
@@ -292,22 +292,27 @@ impl Segment {
         }
 
         let mut n = 0;
-        while !rec.is_empty() {
+        let mut i = 0;
+        while i == 0 || !rec.is_empty() {
             let p = &mut self.block;
             // Find the number of bytes that can be written to the block
             let l = std::cmp::min(p.remaining(), rec.len());
             let part = &rec[..l];
             let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
-                                             // Copy the content of 'part' into 'b'
-            merge_slices(buf, part);
 
-            p.alloc += part.len(); // Update the number of bytes allocated in the block
+            // Encode the content of 'part' into 'buf'
+            encode_record(buf, rec.len(), part, i);
+
+            p.alloc += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
             if p.is_full() {
                 self.flush_block(true)?;
             }
 
             rec = &rec[l..]; // Update the remaining bytes to be written
+
             n += l;
+
+            i += 1;
         }
 
         // Write the remaining data to the block
@@ -404,13 +409,13 @@ mod tests {
             flushed: 0,
             buf: [0; 4096],
         };
-        assert_eq!(block.remaining(), 3996);
+        assert_eq!(block.remaining(), 3996 - RECORD_HEADER_SIZE);
     }
 
     #[test]
     fn test_is_full() {
         let block: Block<4096> = Block {
-            alloc: 4096,
+            alloc: 4096 - RECORD_HEADER_SIZE,
             flushed: 0,
             buf: [0; 4096],
         };
@@ -494,8 +499,8 @@ mod tests {
         assert_eq!(7, r.unwrap().1);
 
         // Validate offset after appending
-        // 4 + 7 = 11
-        assert_eq!(segment.offset(), 11);
+        // 8 + 4 + 8 + 7 = 27
+        assert_eq!(segment.offset(), 27);
 
         // Test syncing segment
         let r = segment.sync();
@@ -505,16 +510,16 @@ mod tests {
         assert_eq!(segment.offset(), 4096);
 
         // Test reading from segment
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 7];
-        let n = segment.read_at(&mut bs, 4).expect("should read");
-        assert_eq!(7, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
+        let mut bs = vec![0; 15];
+        let n = segment.read_at(&mut bs, 12).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
@@ -527,14 +532,14 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 4 = 4100
-        assert_eq!(segment.offset(), 4100);
+        // 4096 + 8 + 4 = 4108
+        assert_eq!(segment.offset(), 4108);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test syncing segment again
         let r = segment.sync();
@@ -594,8 +599,8 @@ mod tests {
         assert_eq!(7, r.unwrap().1);
 
         // Validate offset after appending
-        // 4 + 7 = 11
-        assert_eq!(segment.offset(), 11);
+        // 8 + 4 + 8 + 7 = 27
+        assert_eq!(segment.offset(), 27);
 
         // Test syncing segment
         assert!(segment.sync().is_ok());
@@ -615,16 +620,16 @@ mod tests {
         assert_eq!(segment.offset(), 4096);
 
         // Test reading from segment
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 7];
-        let n = segment.read_at(&mut bs, 4).expect("should read");
-        assert_eq!(7, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
+        let mut bs = vec![0; 15];
+        let n = segment.read_at(&mut bs, 12).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
@@ -637,14 +642,14 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 4 = 4100
-        assert_eq!(segment.offset(), 4100);
+        // 4096 + 8 + 4 = 4108
+        assert_eq!(segment.offset(), 4108);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 12];
         let n = segment.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(4, n);
-        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         // Test closing segment
         assert!(segment.close().is_ok());
