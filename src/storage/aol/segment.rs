@@ -211,6 +211,10 @@ impl Segment {
     // This method also synchronize file metadata to the filesystem
     // hence it is a bit slower than fdatasync (sync_data).
     pub(crate) fn sync(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+        }
+
         if self.block.alloc > 0 {
             self.flush_block(true)?;
         }
@@ -218,8 +222,11 @@ impl Segment {
     }
 
     pub(crate) fn close(&mut self) -> io::Result<()> {
-        self.closed = true;
+        if self.closed {
+            return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+        }
         self.sync()?;
+        self.closed = true;
         Ok(())
     }
 
@@ -336,6 +343,10 @@ impl Segment {
     /// Returns an error if the provided offset is negative or if there is an I/O error
     /// during reading.
     pub(crate) fn read_at(&self, bs: &mut [u8], off: u64) -> io::Result<usize> {
+        if self.closed {
+            return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+        }
+
         if off > self.offset() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -705,6 +716,42 @@ mod tests {
         // Attempt to reopen the segment with corrupted metadata
         let reopened_segment = Segment::open(&temp_dir.path(), 0, &opts);
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_closed_segment_operations() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options
+        let opts = Options::default();
+
+        // Create a new segment file and open it
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Close the segment
+        segment.close().expect("should close segment");
+
+        // Try to perform operations on the closed segment
+        let r = segment.append(&[0, 1, 2, 3]);
+        assert!(r.is_err()); // Appending should fail
+
+        let r = segment.sync();
+        assert!(r.is_err()); // Syncing should fail
+
+        let mut bs = vec![0; 12];
+        let n = segment.read_at(&mut bs, 0);
+        assert!(n.is_err()); // Reading should fail
+
+        // Reopen the closed segment
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should reopen segment");
+
+        // Try to perform operations on the reopened segment
+        let r = segment.append(&[4, 5, 6, 7]);
+        assert!(r.is_ok()); // Appending should succeed on reopened segment
 
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(temp_dir);

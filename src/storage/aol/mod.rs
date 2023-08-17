@@ -61,8 +61,7 @@ pub enum CompressionFormat {
     NoCompression = 0,
     Flate = 1,
     GZip = 2,
-    LZW = 3,
-    ZLib = 4,
+    ZLib = 3,
 }
 
 impl CompressionFormat {
@@ -71,8 +70,7 @@ impl CompressionFormat {
             CompressionFormat::NoCompression => 0,
             CompressionFormat::Flate => 1,
             CompressionFormat::GZip => 2,
-            CompressionFormat::LZW => 3,
-            CompressionFormat::ZLib => 4,
+            CompressionFormat::ZLib => 3,
         }
     }
 
@@ -81,8 +79,7 @@ impl CompressionFormat {
             0 => Some(CompressionFormat::NoCompression),
             1 => Some(CompressionFormat::Flate),
             2 => Some(CompressionFormat::GZip),
-            3 => Some(CompressionFormat::LZW),
-            4 => Some(CompressionFormat::ZLib),
+            3 => Some(CompressionFormat::ZLib),
             _ => None,
         }
     }
@@ -446,7 +443,6 @@ fn read_field<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0; 4];
     reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
     let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
-
     let mut fb = vec![0u8; len];
     reader.read_exact(&mut fb)?; // Read the actual field bytes
     Ok(fb)
@@ -548,7 +544,10 @@ fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Cursor;
+    use std::io::Seek;
+    use tempdir::TempDir;
 
     #[test]
     fn test_new_empty() {
@@ -634,5 +633,74 @@ mod tests {
         // Check if keys from the extended metadata are present in the extended metadata
         assert_eq!(meta.get_int("key1").unwrap(), 123);
         assert_eq!(meta.get_int("key1").unwrap(), 123);
+    }
+
+    #[test]
+    fn test_validate_file_header() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options
+        let opts = Options::default();
+
+        // Create a new segment file and write the header
+        let segment_path = temp_dir.path().join("00000000000000000000");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&segment_path)
+            .expect("should create file");
+
+        let id = 0;
+        write_file_header(&mut file, id, &opts).expect("should write header");
+        file.seek(io::SeekFrom::Start(0))
+            .expect("should seek to start"); // Reset the cursor
+
+        // Read the header from the file
+        let header = read_file_header(&mut file).expect("should read header");
+
+        // Validate the file header
+        let result = validate_file_header(&header, id, &opts);
+        assert!(result.is_ok());
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_bad_file_header() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options
+        let mut opts = Options::default();
+
+        // Create a new segment file and write the header
+        let segment_path = temp_dir.path().join("00000000000000000000");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&segment_path)
+            .expect("should create file");
+
+        let id = 0;
+        write_file_header(&mut file, id, &opts).expect("should write header");
+        file.seek(io::SeekFrom::Start(0))
+            .expect("should seek to start"); // Reset the cursor
+
+        // Read the header from the file
+        let header = read_file_header(&mut file).expect("should read header");
+
+        // Modify the compression level to an unexpected value
+        opts.compression_level = Some(CompressionLevel::BestCompression); // This doesn't match the default compression level
+
+        // Validate the file header, expecting an error due to mismatched compression level
+        let result = validate_file_header(&header, id, &opts);
+        assert!(result.is_err()); // Header validation should throw an error
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
     }
 }
