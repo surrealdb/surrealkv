@@ -2,7 +2,7 @@ pub mod aol;
 pub mod segment;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 use crc32fast::Hasher;
 
@@ -171,7 +171,7 @@ pub struct Options {
     /// there is no maximum size limit for the file.
     ///
     /// This is used by aol to cycle segments when the max file size is reached.
-    max_file_size: Option<u64>,
+    max_file_size: u64,
 }
 
 impl Options {
@@ -183,7 +183,7 @@ impl Options {
             compression_level: None,      // default compression level
             metadata: None,               // default metadata
             extension: None,              // default extension
-            max_file_size: Some(1 << 26), // default max file size
+            max_file_size: 1 << 26,       // default max file size
         }
     }
 
@@ -195,9 +195,22 @@ impl Options {
             compression_level: None,
             metadata: None,
             extension: None,
-            max_file_size: None,
+            max_file_size: 0,
         }
     }
+
+    pub fn validate(&self) -> io::Result<()> {
+        if self.max_file_size <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid max_file_size",
+            ));
+        }
+
+
+        Ok(())
+    }
+
 
     fn with_file_mode(mut self, file_mode: u32) -> Self {
         self.file_mode = Some(file_mode);
@@ -225,7 +238,7 @@ impl Options {
     }
 
     fn with_max_file_size(mut self, max_file_size: u64) -> Self {
-        self.max_file_size = Some(max_file_size);
+        self.max_file_size = max_file_size;
         self
     }
 
@@ -300,7 +313,7 @@ impl Metadata {
     }
 
     // Reads Metadata from a given reader
-    fn read_from<R: Read>(&mut self, reader: &mut R) -> Result<(), std::io::Error> {
+    fn read_from<R: Read>(&mut self, reader: &mut R) -> io::Result<()> {
         let mut len_buf = [0; 4];
         reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
         let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
@@ -316,7 +329,7 @@ impl Metadata {
     }
 
     // Writes Metadata to a given writer
-    fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut len_buf = [0; 4];
         len_buf.copy_from_slice(&(self.data.len() as u32).to_be_bytes());
         writer.write_all(&len_buf)?; // Write length
@@ -336,12 +349,29 @@ impl Metadata {
         self.put(key, &b); // Call the generic put method
     }
 
+
+    
     // Gets an integer value associated with a given key
-    fn get_int(&self, key: &str) -> Option<u64> {
-        // Use the generic get method to retrieve bytes and convert to u64
-        self.get(key)
-            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+    fn get_int(&self, key: &str) -> io::Result<u64> {
+        // Use the generic get method to retrieve bytes
+        let value_bytes = self.get(key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Key not found")
+        })?;
+    
+        // Convert bytes to u64
+        let int_value = u64::from_be_bytes(value_bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Failed to convert bytes to u64")
+        })?);
+    
+        Ok(int_value)
     }
+
+
+    // fn get_int(&self, key: &str) -> Option<u64> {
+    //     // Use the generic get method to retrieve bytes and convert to u64
+    //     self.get(key)
+    //         .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
+    // }
 
     // Generic method to put a key-value pair into the data HashMap
     fn put(&mut self, key: &str, value: &[u8]) {
@@ -416,7 +446,7 @@ fn calculate_crc32(data: &[u8]) -> u32 {
 }
 
 // Reads a field from the given reader
-fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>, std::io::Error> {
+fn read_field<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0; 4];
     reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
     let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
@@ -427,7 +457,7 @@ fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>, std::io::Error> {
 }
 
 // Writes a field to the given writer
-fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<(), std::io::Error> {
+fn write_field<W: Write>(b: &[u8], writer: &mut W) -> io::Result<()> {
     let mut len_buf = [0; 4];
     len_buf.copy_from_slice(&(b.len() as u32).to_be_bytes());
     writer.write_all(&len_buf)?; // Write 4 bytes for the length
@@ -460,7 +490,7 @@ mod tests {
     fn test_put_and_get_int() {
         let mut metadata = Metadata::new(None);
         metadata.put_int("age", 25);
-        assert_eq!(metadata.get_int("age"), Some(25));
+        assert_eq!(metadata.get_int("age").unwrap(), 25);
     }
 
     #[test]
@@ -472,8 +502,8 @@ mod tests {
         let bytes = metadata.bytes();
         let restored_metadata = Metadata::new(Some(bytes));
 
-        assert_eq!(restored_metadata.get_int("age"), Some(30));
-        assert_eq!(restored_metadata.get_int("num"), Some(40));
+        assert_eq!(restored_metadata.get_int("age").unwrap(), 30);
+        assert_eq!(restored_metadata.get_int("num").unwrap(), 40);
     }
 
     #[test]

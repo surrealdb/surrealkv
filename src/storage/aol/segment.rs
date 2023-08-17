@@ -115,6 +115,9 @@ pub(crate) struct Segment {
 
 impl Segment {
     pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> io::Result<Self> {
+        // Ensure the options are valid
+        opts.validate()?;
+
         // Build the file path using the segment name and extension
         let extension = opts.extension.as_deref().unwrap_or("");
         let file_path = dir.join(Self::segment_name(id, extension));
@@ -184,7 +187,7 @@ impl Segment {
 
         if let Some(metadata) = &opts.metadata {
             let buf = metadata.bytes();
-            meta.read_from(&mut &buf[..]).unwrap();
+            meta.read_from(&mut &buf[..])?;
         }
 
         let mut header = Vec::new();
@@ -505,6 +508,7 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().1);
 
+        // 8 + 4 + 8 + 7 = 27
         assert_eq!(a.offset(), 27);
 
         let r = a.sync();
@@ -525,6 +529,9 @@ mod tests {
         let mut bs = vec![0; 15];
         let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
+
+        // Todo: Test write and read_at with offset beyond current block
+        // Todo: write tests for open, close then open
 
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(temp_dir);

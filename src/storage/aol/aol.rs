@@ -3,7 +3,6 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::RwLock;
 
 use crate::storage::aol::segment::Segment;
@@ -43,6 +42,9 @@ impl AOL {
     /// - `dir`: The directory where segment files are located.
     /// - `opts`: Configuration options for the AOL instance.
     pub fn open(dir: &Path, opts: &Options) -> io::Result<Self> {
+        // Ensure the options are valid
+        opts.validate()?;
+
         // Ensure the directory exists with proper permissions
         Self::prepare_directory(&dir, &opts)?;
 
@@ -120,7 +122,7 @@ impl AOL {
 
         while n < rec.len() {
             // Calculate available space in the active segment
-            available = opts.max_file_size.unwrap() - self.active_segment.offset();
+            available = opts.max_file_size - self.active_segment.offset();
 
             // If space is not available, create a new segment
             if available <= 0 {
@@ -136,7 +138,7 @@ impl AOL {
                 self.active_segment = new_segment;
 
                 // Calculate available space in the new segment
-                available = opts.max_file_size.unwrap();
+                available = opts.max_file_size;
             }
 
             // Calculate the amount of data to append
@@ -156,7 +158,7 @@ impl AOL {
 
     // Helper function to calculate offset
     fn calculate_offset(&self) -> u64 {
-        self.active_segment_id * self.opts.max_file_size.unwrap()
+        self.active_segment_id * self.opts.max_file_size
     }
 
     /// Reads data from the segment at the specified offset into the provided buffer.
@@ -188,8 +190,8 @@ impl AOL {
         let mut r = 0;
         while r < buf.len() {
             let offset = off + r as u64;
-            let segment_id = off / self.opts.max_file_size.unwrap();
-            let read_offset = offset % self.opts.max_file_size.unwrap();
+            let segment_id = off / self.opts.max_file_size;
+            let read_offset = offset % self.opts.max_file_size;
 
             // Read data from the appropriate segment
             r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
@@ -232,6 +234,14 @@ impl AOL {
     }
 }
 
+impl Drop for AOL {
+    /// Attempt to fsync data on drop, in case we're running without sync.
+    fn drop(&mut self) {
+        self.sync().ok();
+    }
+}
+
+
 /// Gets the range of segment IDs present in the specified directory.
 ///
 /// This function returns a tuple containing the minimum and maximum segment IDs
@@ -268,6 +278,8 @@ fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::aol::RECORD_HEADER_SIZE;
+
     use super::*;
     use std::fs::File;
     use std::io::Write;
@@ -327,6 +339,7 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().1);
 
+        // 8 + 4 + 8 + 7 = 27
         assert_eq!(a.offset(), 27);
 
         let r = a.sync();
@@ -337,12 +350,12 @@ mod tests {
         let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
         assert_eq!(12, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[8..]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         let mut bs = vec![0; 15];
         let n = a.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[8..]);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
 
         let mut bs = vec![0; 15];
         let r = a.read_at(&mut bs, 4097);
