@@ -6,8 +6,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::{
-    merge_slices, read_file_header, validate_file_header, write_file_header,
-    Options, BLOCK_SIZE,
+    merge_slices, read_file_header, validate_file_header, write_file_header, Options, BLOCK_SIZE,
 };
 
 /// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to

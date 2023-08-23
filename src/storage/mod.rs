@@ -175,13 +175,13 @@ pub struct Options {
 impl Options {
     fn default() -> Self {
         Options {
-            dir_mode: Some(0o750),    // default directory mode
-            file_mode: Some(DEFAULT_FILE_MODE),   // default file mode
-            compression_format: None, // default compression format
-            compression_level: None,  // default compression level
-            metadata: None,           // default metadata
-            extension: None,          // default extension
-            max_file_size: 1 << 26,   // default max file size
+            dir_mode: Some(0o750),              // default directory mode
+            file_mode: Some(DEFAULT_FILE_MODE), // default file mode
+            compression_format: None,           // default compression format
+            compression_level: None,            // default compression level
+            metadata: None,                     // default metadata
+            extension: None,                    // default extension
+            max_file_size: 1 << 26,             // default max file size
         }
     }
 

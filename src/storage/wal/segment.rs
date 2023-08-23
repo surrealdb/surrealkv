@@ -3,7 +3,7 @@ use std::io;
 use std::io::{Seek, Write};
 use std::num::ParseIntError;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::{Path, PathBuf}; // Import Unix-specific extensions
+use std::path::{Path, PathBuf};
 
 use crate::storage::{
     encode_record, merge_slices, read_file_header, validate_file_header, write_file_header,
@@ -91,8 +91,8 @@ pub(crate) struct Segment {
     /// The unique identifier of the segment.
     id: u64,
 
-    /// The directory where the segment file is located.
-    dir: PathBuf,
+    /// The path where the segment file is located.
+    pub(crate) file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE>,
@@ -104,7 +104,7 @@ pub(crate) struct Segment {
     file: File,
 
     /// The base offset of the file.
-    file_header_offset: u64,
+    pub(crate) file_header_offset: u64,
 
     /// The current offset within the file.
     file_offset: u64,
@@ -152,7 +152,7 @@ impl Segment {
             file,
             file_header_offset: file_header_offset as u64,
             file_offset: file_offset - file_header_offset as u64,
-            dir: dir.to_path_buf(),
+            file_path: file_path,
             id,
             closed: false,
             written_blocks: 0,
@@ -349,7 +349,7 @@ impl Segment {
 
         if off > self.offset() {
             return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::Other,
                 "Offset beyond current position",
             ));
         }

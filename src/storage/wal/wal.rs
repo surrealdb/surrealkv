@@ -5,8 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use crate::storage::Options;
 use crate::storage::wal::segment::Segment;
+use crate::storage::Options;
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -180,10 +180,7 @@ impl WAL {
     /// during the reading process.
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
         if buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Buffer is empty",
-            ));
+            return Err(io::Error::new(io::ErrorKind::Other, "Buffer is empty"));
         }
 
         let mut r = 0;
