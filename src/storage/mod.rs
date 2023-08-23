@@ -385,17 +385,34 @@ impl Metadata {
 ///
 /// # Variants
 ///
-/// - `BlockTerm`: Indicates that the rest of the block is empty.
+/// - `Empty`: Indicates that the rest of the block is empty.
 /// - `Full`: Represents a full record.
 /// - `First`: Denotes the first fragment of a record.
 /// - `Middle`: Denotes middle fragments of a record.
 /// - `Last`: Denotes the final fragment of a record.
+#[derive(PartialEq)]
 enum RecordType {
-    BlockTerm = 0, // Rest of block is empty.
-    Full = 1,      // Full record.
-    First = 2,     // First fragment of a record.
-    Middle = 3,    // Middle fragments of a record.
-    Last = 4,      // Final fragment of a record.
+    Term = 0,   // Rest of block is empty.
+    Full = 1,   // Full record.
+    First = 2,  // First fragment of a record.
+    Middle = 3, // Middle fragments of a record.
+    Last = 4,   // Final fragment of a record.
+}
+
+impl RecordType {
+    fn from_u8(value: u8) -> Result<Self, std::io::Error> {
+        match value {
+            0 => Ok(RecordType::Term),
+            1 => Ok(RecordType::Full),
+            2 => Ok(RecordType::First),
+            3 => Ok(RecordType::Middle),
+            4 => Ok(RecordType::Last),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid Record Type",
+            )),
+        }
+    }
 }
 
 /// Encodes a record with the provided information into the given buffer.
@@ -404,7 +421,7 @@ enum RecordType {
 ///
 ///	    Record Header
 ///
-///	    0      1      2      3      4      5      6      7      8
+///	    0      1          2      3      4      5      6      7      8
 ///	    +------+----------+------+------+------+------+------+------+
 ///	    | Type | Reserved |    Length   |         CRC32             |
 ///	    +------+----------+------+------+------+------+------+------+
@@ -430,12 +447,6 @@ fn encode_record(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
 
     // Copy the 'part' into the buffer starting from the RECORD_HEADER_SIZE offset
     merge_slices(&mut buf[RECORD_HEADER_SIZE..], part); // Pass a mutable reference to buf
-}
-
-fn calculate_crc32(data: &[u8]) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
 }
 
 // Reads a field from the given reader
@@ -491,25 +502,46 @@ fn write_file_header(file: &mut File, id: u64, opts: &Options) -> io::Result<usi
     Ok(header.len())
 }
 
-fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()> {
+fn validate_magic_version(header: &[u8]) -> io::Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
 
-    // Validate individual fields here
     let magic = meta.get_int(KEY_MAGIC)?;
     let version = meta.get_int(KEY_VERSION)?;
-    let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
-    let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
-    let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
 
-    if magic != MAGIC || version != VERSION || segment_id != id {
+    if magic != MAGIC || version != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid header data",
         ));
     }
 
-    // Check the compression format and level against the provided options
+    Ok(())
+}
+
+fn validate_segment_id(header: &[u8], id: u64) -> io::Result<()> {
+    let mut meta = Metadata::new(None);
+    meta.read_from(&mut &header[..])?;
+
+    let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
+
+    if segment_id != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid segment ID",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_compression(header: &[u8], opts: &Options) -> io::Result<()> {
+    let mut meta = Metadata::new(None);
+    meta.read_from(&mut &header[..])?;
+
+    let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
+    let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
+
     if let Some(expected_cf) = &opts.compression_format {
         if cf != expected_cf.as_u64() {
             return Err(io::Error::new(
@@ -523,12 +555,115 @@ fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()
         if cl != expected_cl.as_u64() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid compression format",
+                "Invalid compression level",
             ));
         }
     }
 
     Ok(())
+}
+
+fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()> {
+    validate_magic_version(header)?;
+    validate_segment_id(header, id)?;
+    validate_compression(header, opts)?;
+
+    Ok(())
+}
+
+// fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()> {
+//     let mut meta = Metadata::new(None);
+//     meta.read_from(&mut &header[..])?;
+
+//     // Validate individual fields here
+//     let magic = meta.get_int(KEY_MAGIC)?;
+//     let version = meta.get_int(KEY_VERSION)?;
+//     let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
+//     let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
+//     let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
+
+//     if magic != MAGIC || version != VERSION || segment_id != id {
+//         return Err(io::Error::new(
+//             io::ErrorKind::InvalidData,
+//             "Invalid header data",
+//         ));
+//     }
+
+//     // Check the compression format and level against the provided options
+//     if let Some(expected_cf) = &opts.compression_format {
+//         if cf != expected_cf.as_u64() {
+//             return Err(io::Error::new(
+//                 io::ErrorKind::InvalidData,
+//                 "Invalid compression format",
+//             ));
+//         }
+//     }
+
+//     if let Some(expected_cl) = &opts.compression_level {
+//         if cl != expected_cl.as_u64() {
+//             return Err(io::Error::new(
+//                 io::ErrorKind::InvalidData,
+//                 "Invalid compression format",
+//             ));
+//         }
+//     }
+
+//     Ok(())
+// }
+
+fn validate_record(record_type: &RecordType, i: usize) -> Result<(), io::Error> {
+    match record_type {
+        RecordType::Full => {
+            if i != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected full record",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        RecordType::First => {
+            if i != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected first record, dropping buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        RecordType::Middle => {
+            if i == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected middle record, dropping buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        RecordType::Last => {
+            if i == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected last record, dropping buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "invalid last record type",
+        )),
+    }
+}
+
+fn calculate_crc32(data: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {

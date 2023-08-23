@@ -1,16 +1,61 @@
-use std::fs::File;
+use std::fs::{read_dir, File, OpenOptions};
 use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
-use crate::storage::BLOCK_SIZE;
+use crate::storage::wal::segment::Segment;
+use crate::storage::{
+    calculate_crc32, read_file_header, validate_magic_version, validate_record,
+    validate_segment_id, RecordType, BLOCK_SIZE, RECORD_HEADER_SIZE,
+};
 
 struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
     /// The base offset of the file.
     pub(crate) file_header_offset: u64,
+    /// The unique identifier of the segment.
+    pub(crate) id: u64,
+}
+
+impl SegmentRef {
+    /// Creates a vector of SegmentRef instances by reading segments in the specified directory.
+    pub fn read_segments_from_directory(
+        directory_path: &Path,
+    ) -> Result<Vec<SegmentRef>, io::Error> {
+        let mut segment_refs = Vec::new();
+
+        // Read the directory and iterate through its entries
+        let files = read_dir(directory_path)?;
+        for file in files {
+            let entry = file?;
+            if entry.file_type()?.is_file() {
+                let file_path = entry.path();
+                let fn_name = entry.file_name();
+                let fn_str = fn_name.to_string_lossy();
+                let (index, _) = Segment::parse_segment_name(&fn_str)?;
+
+                let mut file = OpenOptions::new().read(true).open(&file_path)?;
+                let header = read_file_header(&mut file)?;
+                validate_magic_version(&header)?;
+                validate_segment_id(&header, index)?;
+
+                // Create a SegmentRef instance
+                let segment_ref = SegmentRef {
+                    file_path,
+                    file_header_offset: (4 + header.len()) as u64, // You need to set the correct offset here
+                    id: index,
+                };
+
+                segment_refs.push(segment_ref);
+            }
+        }
+
+        segment_refs.sort_by(|a, b| a.id.cmp(&b.id));
+
+        Ok(segment_refs)
+    }
 }
 
 pub struct MultiSegmentReader {
@@ -111,9 +156,116 @@ impl Read for MultiSegmentReader {
     }
 }
 
+pub struct Reader {
+    rdr: MultiSegmentReader,
+    rec: Vec<u8>,
+    buf: [u8; BLOCK_SIZE],
+    total_read: usize,
+    cur_rec_type: RecordType,
+}
+
+impl Reader {
+    fn new(rdr: MultiSegmentReader) -> Self {
+        Reader {
+            rdr,
+            rec: Vec::new(),
+            buf: [0u8; BLOCK_SIZE],
+            total_read: 0,
+            cur_rec_type: RecordType::Term,
+        }
+    }
+
+    fn next(&mut self) -> Result<(), io::Error> {
+        self.rec.clear();
+        let mut i = 0;
+
+        loop {
+            if self.rdr.read_exact(&mut self.buf[0..1]).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "read first header byte",
+                ));
+            }
+            self.total_read += 1;
+            self.cur_rec_type = RecordType::from_u8(self.buf[0])?;
+
+            // Read zero bytes.
+            if self.cur_rec_type == RecordType::Term {
+                let buf = &mut self.buf[1..];
+                let k = (BLOCK_SIZE - (self.total_read % BLOCK_SIZE)) as usize;
+                if k == BLOCK_SIZE as usize {
+                    continue; // Initial 0 byte was last page byte.
+                }
+                if self.rdr.read_exact(&mut buf[..k]).is_err() {
+                    return Err(io::Error::new(io::ErrorKind::Other, "read remaining zeros"));
+                }
+                self.total_read += k;
+
+                if !self.buf[RECORD_HEADER_SIZE..k].iter().all(|&c| c == 0) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "unexpected non-zero byte in padded page",
+                    ));
+                }
+                continue;
+            }
+
+            if self
+                .rdr
+                .read_exact(&mut self.buf[1..RECORD_HEADER_SIZE])
+                .is_err()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "read remaining header",
+                ));
+            }
+            self.total_read += (RECORD_HEADER_SIZE - 1);
+
+            let length = u16::from_be_bytes([self.buf[2], self.buf[3]]);
+            let crc = u32::from_be_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]]);
+
+            if self
+                .rdr
+                .read_exact(
+                    &mut self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
+                )
+                .is_err()
+            {
+                return Err(io::Error::new(io::ErrorKind::Other, "read record data"));
+            }
+            self.total_read += length as usize;
+
+            let calculated_crc = calculate_crc32(
+                &self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
+            );
+            if calculated_crc != crc {
+                return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
+            }
+
+            self.rec.extend_from_slice(
+                &self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
+            );
+
+            validate_record(&self.cur_rec_type, i)?;
+
+            if self.cur_rec_type == RecordType::Last || self.cur_rec_type == RecordType::Full {
+                break; // RecLast or RecFull
+            }
+
+            i += 1;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
+
     use crate::storage::wal::segment::Segment;
     use crate::storage::{Options, RECORD_HEADER_SIZE};
     use tempdir::TempDir;
@@ -140,19 +292,66 @@ mod tests {
         }
     }
 
+    // BufferReader does not return EOF when the underlying reader returns 0 bytes read.
+    #[test]
+    fn test_bufreader_eof_and_error() {
+        // Create a temporary directory to hold the file
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a sample file and populate it with data
+        let file_path = temp_dir.path().join("test.txt");
+        let mut file = File::create(&file_path).expect("should create file");
+        file.write_all(b"Hello, World!").expect("should write data");
+        drop(file);
+
+        // Open the file for reading using BufReader
+        let file = File::open(&file_path).expect("should open file");
+        let mut buf_reader = BufReader::new(file);
+
+        // Read into a buffer
+        let mut read_buffer = [0u8; 5];
+        let bytes_read = buf_reader.read(&mut read_buffer).expect("should read");
+
+        // Verify the data read
+        assert_eq!(&read_buffer[..bytes_read], b"Hello");
+
+        // Try reading more bytes than available
+        let mut read_buffer = [0u8; 10];
+        let bytes_read = buf_reader.read(&mut read_buffer).expect("should read");
+        assert_eq!(bytes_read, 8); // Only "World!" left to read
+        assert_eq!(&read_buffer[..bytes_read], b", World!");
+
+        // Try reading more bytes again than available
+        let mut read_buffer = [0u8; 1000];
+        let bytes_read = buf_reader.read(&mut read_buffer).expect("should read");
+        assert_eq!(bytes_read, 0); // Only "World!" left to read
+    }
+
+    fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
+        let opts = Options::default();
+        let mut segment =
+            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+        let r = segment.append(data);
+        assert!(r.is_ok());
+        assert_eq!(data.len(), r.unwrap().1);
+        segment
+    }
+
+    fn create_test_segment_ref(segment: &Segment) -> SegmentRef {
+        SegmentRef {
+            file_path: segment.file_path.clone(),
+            file_header_offset: segment.file_header_offset,
+            id: segment.id,
+        }
+    }
+
     #[test]
     fn test_single_segment() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let opts = Options::default();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        let mut segment = create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
 
         // Test appending another buffer
         let r = segment.append(&[4, 5, 6, 7]);
@@ -160,11 +359,7 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Create a Vec of segments containing our sample segment
-        let mut segments: Vec<SegmentRef> = Vec::new();
-        segments.push(SegmentRef {
-            file_path: segment.file_path.clone(),
-            file_header_offset: segment.file_header_offset,
-        });
+        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
 
         // Create a MultiSegmentReader for testing
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
@@ -212,15 +407,10 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Create a Vec of segments containing our sample segment
-        let mut segments: Vec<SegmentRef> = Vec::new();
-        segments.push(SegmentRef {
-            file_path: segment1.file_path.clone(),
-            file_header_offset: segment1.file_header_offset,
-        });
-        segments.push(SegmentRef {
-            file_path: segment2.file_path.clone(),
-            file_header_offset: segment2.file_header_offset,
-        });
+        let segments: Vec<SegmentRef> = vec![
+            create_test_segment_ref(&segment1),
+            create_test_segment_ref(&segment2),
+        ];
 
         // Create a MultiSegmentReader for testing
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
@@ -261,11 +451,7 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Create a Vec of segments containing our sample segment
-        let mut segments: Vec<SegmentRef> = Vec::new();
-        segments.push(SegmentRef {
-            file_path: segment.file_path.clone(),
-            file_header_offset: segment.file_header_offset,
-        });
+        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
 
         // Create a MultiSegmentReader for testing
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
@@ -312,12 +498,7 @@ mod tests {
         assert!(segment.sync().is_ok());
 
         // Create a Vec of segments containing our sample segment
-        let mut segments: Vec<SegmentRef> = Vec::new();
-        segments.push(SegmentRef {
-            file_path: segment.file_path.clone(),
-            file_header_offset: segment.file_header_offset,
-        });
-
+        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
         // Create a MultiSegmentReader for testing
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
 
@@ -364,15 +545,10 @@ mod tests {
         assert!(segment2.sync().is_ok());
 
         // Create a Vec of segments containing our sample segment
-        let mut segments: Vec<SegmentRef> = Vec::new();
-        segments.push(SegmentRef {
-            file_path: segment1.file_path.clone(),
-            file_header_offset: segment1.file_header_offset,
-        });
-        segments.push(SegmentRef {
-            file_path: segment2.file_path.clone(),
-            file_header_offset: segment2.file_header_offset,
-        });
+        let segments: Vec<SegmentRef> = vec![
+            create_test_segment_ref(&segment1),
+            create_test_segment_ref(&segment2),
+        ];
 
         // Create a MultiSegmentReader for testing
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
@@ -396,5 +572,58 @@ mod tests {
         assert!(segment1.close().is_ok());
         assert!(segment2.close().is_ok());
         drop(temp_dir);
+    }
+
+    #[test]
+    fn test_segment_ref() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create sample segment files and populate it with data
+        let mut segment1 = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
+        let mut segment2 = create_test_segment(&temp_dir, 6, &[5, 6]);
+        let mut segment3 = create_test_segment(&temp_dir, 8, &[7, 8, 9]);
+        assert!(segment1.close().is_ok());
+        assert!(segment2.close().is_ok());
+        assert!(segment3.close().is_ok());
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+        assert!(sr.len() == 3);
+        assert!(sr[0].id == 4);
+        assert!(sr[1].id == 6);
+        assert!(sr[2].id == 8);
+
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_reader() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create sample segment files and populate it with data
+        let mut segment1 = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
+        let mut segment2 = create_test_segment(&temp_dir, 6, &[5, 6]);
+        let mut segment3 = create_test_segment(&temp_dir, 8, &[7, 8, 9]);
+        assert!(segment1.close().is_ok());
+        assert!(segment2.close().is_ok());
+        assert!(segment3.close().is_ok());
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+
+        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+        reader.next().expect("should read");
+        assert_eq!(reader.rec, vec![1, 2, 3, 4]);
+        assert_eq!(reader.total_read, 12);
+
+        reader.next().expect("should read");
+        assert_eq!(reader.rec, vec![5, 6]);
+        assert_eq!(reader.total_read, 4106);
+
+        reader.next().expect("should read");
+        assert_eq!(reader.rec, vec![7, 8, 9]);
+        assert_eq!(reader.total_read, 8203);
     }
 }

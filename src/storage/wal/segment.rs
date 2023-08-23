@@ -89,7 +89,7 @@ impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
 ///
 pub(crate) struct Segment {
     /// The unique identifier of the segment.
-    id: u64,
+    pub(crate) id: u64,
 
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
@@ -120,7 +120,8 @@ impl Segment {
 
         // Build the file path using the segment name and extension
         let extension = opts.extension.as_deref().unwrap_or("");
-        let file_path = dir.join(Self::segment_name(id, extension));
+        let file_name = Self::segment_name(id, extension);
+        let file_path = dir.join(&file_name);
         let file_path_exists = file_path.exists();
         let file_path_is_file = file_path.is_file();
 
@@ -137,6 +138,13 @@ impl Segment {
             validate_file_header(&header, id, opts)?;
 
             file_header_offset += (4 + header.len());
+            let (index, _) = Self::parse_segment_name(&file_name)?;
+            if index != id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid segment id",
+                ));
+            }
             // TODO: take id etc from existing header
         } else {
             // Write new file header
@@ -285,33 +293,11 @@ impl Segment {
         }
 
         let offset = self.offset();
-
-        // If the block is full, flush it
-        if self.block.is_full() {
-            self.flush_block(true)?;
-        }
-
         let mut n = 0;
         let mut i = 0;
+
         while i == 0 || !rec.is_empty() {
-            let p = &mut self.block;
-            // Find the number of bytes that can be written to the block
-            let l = std::cmp::min(p.remaining(), rec.len());
-            let part = &rec[..l];
-            let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
-
-            // Encode the content of 'part' into 'buf'
-            encode_record(buf, rec.len(), part, i);
-
-            p.alloc += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
-            if p.is_full() {
-                self.flush_block(true)?;
-            }
-
-            rec = &rec[l..]; // Update the remaining bytes to be written
-
-            n += l;
-
+            n += self.write_record(&mut rec, i)?;
             i += 1;
         }
 
@@ -322,6 +308,72 @@ impl Segment {
 
         Ok((offset, n))
     }
+
+    fn write_record(&mut self, rec: &mut &[u8], i: usize) -> io::Result<usize> {
+        let p = &mut self.block;
+        let l = std::cmp::min(p.remaining(), rec.len());
+        let part = &rec[..l];
+        let buf = &mut p.buf[p.alloc..];
+
+        encode_record(buf, rec.len(), part, i);
+
+        p.alloc += part.len() + RECORD_HEADER_SIZE;
+        if p.is_full() {
+            self.flush_block(true)?;
+        }
+
+        *rec = &rec[l..];
+        Ok(l)
+    }
+
+    // pub(crate) fn append(&mut self, mut rec: &[u8]) -> io::Result<(u64, usize)> {
+    //     // If the segment is closed, return an error
+    //     if self.closed {
+    //         return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+    //     }
+
+    //     if rec.is_empty() {
+    //         return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
+    //     }
+
+    //     let offset = self.offset();
+
+    //     // If the block is full, flush it
+    //     if self.block.is_full() {
+    //         self.flush_block(true)?;
+    //     }
+
+    //     let mut n = 0;
+    //     let mut i = 0;
+    //     while i == 0 || !rec.is_empty() {
+    //         let p = &mut self.block;
+    //         // Find the number of bytes that can be written to the block
+    //         let l = std::cmp::min(p.remaining(), rec.len());
+    //         let part = &rec[..l];
+    //         let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
+
+    //         // Encode the content of 'part' into 'buf'
+    //         encode_record(buf, rec.len(), part, i);
+
+    //         p.alloc += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
+    //         if p.is_full() {
+    //             self.flush_block(true)?;
+    //         }
+
+    //         rec = &rec[l..]; // Update the remaining bytes to be written
+
+    //         n += l;
+
+    //         i += 1;
+    //     }
+
+    //     // Write the remaining data to the block
+    //     if self.block.alloc > 0 {
+    //         self.flush_block(false)?;
+    //     }
+
+    //     Ok((offset, n))
+    // }
 
     /// Reads data from the segment at the specified offset.
     ///
@@ -613,8 +665,11 @@ mod tests {
 
         drop(segment);
 
+        // Reopen segment with wrong id should fail
+        Segment::open(&temp_dir.path(), 1, &opts).expect("should not open segment");
+
         // Reopen segment
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should open segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 4096);
