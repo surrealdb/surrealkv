@@ -9,7 +9,6 @@ use crate::storage::{
     validate_file_header, write_file_header, Options, BLOCK_SIZE, RECORD_HEADER_SIZE, Block,
 };
 
-
 /// Represents a segment in a write-ahead log.
 ///
 /// A `Segment` represents a portion of the write-ahead log. It holds information about the file
@@ -33,7 +32,6 @@ use crate::storage::{
 ///     | Compression Level                                     |
 ///     +------+------+------+------+------+------+------+------+
 ///     | Metadata                                              |
-///     +------+------+------+------+------+------+------+------+
 ///     .                                                       |
 ///     .                                                       |
 ///     .                                                       |

@@ -32,7 +32,6 @@ use crate::storage::{
 ///     | Compression Level                                     |
 ///     +------+------+------+------+------+------+------+------+
 ///     | Metadata                                              |
-///     +------+------+------+------+------+------+------+------+
 ///     .                                                       |
 ///     .                                                       |
 ///     .                                                       |
@@ -43,7 +42,7 @@ pub(crate) struct Segment {
     id: u64,
 
     /// The directory where the segment file is located.
-    dir: PathBuf,
+    file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, 0>,
@@ -103,7 +102,7 @@ impl Segment {
             file,
             file_header_offset: file_header_offset as u64,
             file_offset: file_offset - file_header_offset as u64,
-            dir: dir.to_path_buf(),
+            file_path: file_path,
             id,
             closed: false,
             written_blocks: 0,
@@ -212,21 +211,7 @@ impl Segment {
 
         let mut n = 0;
         while !rec.is_empty() {
-            let p = &mut self.block;
-            // Find the number of bytes that can be written to the block
-            let l = std::cmp::min(p.remaining(), rec.len());
-            let part = &rec[..l];
-            let buf = &mut p.buf[p.written..]; // Create a mutable slice starting from p.written
-                                             // Copy the content of 'part' into 'b'
-            merge_slices(buf, part);
-
-            p.written += part.len(); // Update the number of bytes allocated in the block
-            if p.is_full() {
-                self.flush_block(true)?;
-            }
-
-            rec = &rec[l..]; // Update the remaining bytes to be written
-            n += l;
+            n += self.write_record(&mut rec)?;
         }
 
         // Write the remaining data to the block
@@ -236,6 +221,24 @@ impl Segment {
 
         Ok((offset, n))
     }
+
+    fn write_record(&mut self, rec: &mut &[u8]) -> io::Result<usize> {
+        let p = &mut self.block;
+        let l = std::cmp::min(p.remaining(), rec.len());
+        let part = &rec[..l];
+        let buf = &mut p.buf[p.written..];
+
+        merge_slices(buf, part);
+
+        p.written += part.len();
+        if p.is_full() {
+            self.flush_block(true)?;
+        }
+
+        *rec = &rec[l..];
+        Ok(l)
+    }
+
 
     /// Reads data from the segment at the specified offset.
     ///
