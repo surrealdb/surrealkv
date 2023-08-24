@@ -5,10 +5,9 @@ use std::vec::Vec;
 
 use crate::storage::wal::CorruptionError;
 use crate::storage::{
-    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE, RECORD_HEADER_SIZE,
+    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
 };
 
-// TODO: Figure out how to close segment files once they are read and rotated.
 pub struct MultiSegmentReader {
     buf: BufReader<File>,  // Buffer for reading from the current segment.
     segs: Vec<SegmentRef>, // List of segments to read from.
@@ -149,7 +148,7 @@ impl Reader {
         rdr: &mut R,
         buf: &mut [u8],
     ) -> Result<(u16, u32), io::Error> {
-        if rdr.read_exact(&mut buf[1..RECORD_HEADER_SIZE]).is_err() {
+        if rdr.read_exact(&mut buf[1..WAL_RECORD_HEADER_SIZE]).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "error reading remaining header bytes",
@@ -167,7 +166,7 @@ impl Reader {
         length: u16,
         crc: u32,
     ) -> Result<(usize, usize), io::Error> {
-        let record_start = RECORD_HEADER_SIZE;
+        let record_start = WAL_RECORD_HEADER_SIZE;
         let record_end = record_start + length as usize;
         if rdr.read_exact(&mut buf[record_start..record_end]).is_err() {
             return Err(io::Error::new(
@@ -243,7 +242,7 @@ impl Reader {
 
             // Read the rest of the header.
             let (length, crc) = Self::read_remaining_header(&mut self.rdr, &mut self.buf)?;
-            self.total_read += (RECORD_HEADER_SIZE - 1);
+            self.total_read += (WAL_RECORD_HEADER_SIZE - 1);
 
             // Read the record data.
             let (record_start, record_end) =
@@ -271,9 +270,8 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
-    use crate::storage::wal::segment::Segment;
     use crate::storage::wal::wal::WAL;
-    use crate::storage::{Options, RECORD_HEADER_SIZE};
+    use crate::storage::{Options, Segment, WAL_RECORD_HEADER_SIZE};
     use tempdir::TempDir;
 
     // Create a mock file that implements Read and Seek traits for testing
@@ -334,7 +332,7 @@ mod tests {
     }
 
     fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment =
             Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
         let r = segment.append(data);
@@ -374,13 +372,13 @@ mod tests {
         let mut bs = [0u8; 12];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 12);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read second record from the MultiSegmentReader
         let mut bs = [0u8; 12];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 12);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
@@ -396,7 +394,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment1 =
             Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
         let mut segment2 =
@@ -425,13 +423,13 @@ mod tests {
         let mut bs = [0u8; 12];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 12);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read second record from the MultiSegmentReader
         let mut bs = [0u8; 12];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 12);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
@@ -448,7 +446,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
@@ -466,7 +464,7 @@ mod tests {
         let mut bs = [0u8; 50];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
         assert_eq!(buf_reader.off, 50);
 
         let mut read_buffer = [0u8; 50];
@@ -493,7 +491,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
@@ -512,7 +510,7 @@ mod tests {
         let mut bs = [0u8; 50];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
         assert_eq!(buf_reader.off, 50);
 
         let mut read_buffer = [0u8; 50];
@@ -532,7 +530,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment1 =
             Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
         let mut segment2 =
@@ -563,13 +561,13 @@ mod tests {
         let mut bs = [0u8; BLOCK_SIZE];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
 
         // Read second record from the MultiSegmentReader
         let mut bs = [0u8; BLOCK_SIZE];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
 
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
@@ -634,7 +632,7 @@ mod tests {
     }
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut segment =
             Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
 
@@ -706,7 +704,7 @@ mod tests {
         // Create aol options and open a aol file
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
-        let opts = Options::default().with_max_file_size(4096 * 10);
+        let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
         let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
 
         // Define the size of each record

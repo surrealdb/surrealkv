@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use crate::storage::wal::reader::{MultiSegmentReader, Reader};
-use crate::storage::wal::segment::Segment;
-use crate::storage::{get_segment_range, Options, SegmentRef};
+use crate::storage::{get_segment_range, Options, Segment, SegmentRef};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -298,8 +297,8 @@ impl WAL {
             self.append(data)?;
         }
 
-        // Flush the active segment
-        self.active_segment.flush_block(true)?;
+        // Flush and close the active segment
+        self.active_segment.close()?;
 
         // Remove the repaired segment file
         std::fs::remove_file(&repaired_segment_path)?;
@@ -322,7 +321,7 @@ impl Drop for WAL {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::RECORD_HEADER_SIZE;
+    use crate::storage::WAL_RECORD_HEADER_SIZE;
 
     use super::*;
     use tempdir::TempDir;
@@ -337,7 +336,7 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default();
+        let opts = Options::default().with_wal();
         let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
@@ -373,13 +372,13 @@ mod tests {
         let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 0).expect("should read");
         assert_eq!(12, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 15];
         let n = a.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
@@ -399,7 +398,7 @@ mod tests {
         let mut bs = vec![0; 12];
         let n = a.read_at(&mut bs, 4096).expect("should read");
         assert_eq!(12, n);
-        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[RECORD_HEADER_SIZE..]);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test syncing segment again
         let r = a.sync();
