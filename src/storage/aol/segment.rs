@@ -6,56 +6,8 @@ use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::{
     merge_slices, read_file_header, segment_name, validate_file_header, write_file_header, Options,
-    BLOCK_SIZE,
+    BLOCK_SIZE, Block,
 };
-
-/// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
-/// batch writes to improve performance by reducing the number of individual disk writes. If the
-/// data to be written exceeds the `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
-/// keeps track of the allocated space, flushed data, and other details related to the write process.
-/// It can also be used to align data to the size of a direct I/O block, if applicable.
-///
-/// # Type Parameters
-///
-/// - `BLOCK_SIZE`: The size of the block in bytes.
-pub(crate) struct Block<const BLOCK_SIZE: usize> {
-    /// The number of bytes currently allocated in the block.
-    alloc: usize,
-
-    /// The number of bytes that have been flushed to disk.
-    flushed: usize,
-
-    /// The buffer that holds the actual data.
-    buf: [u8; BLOCK_SIZE],
-}
-
-impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
-    fn new() -> Self {
-        Block {
-            alloc: 0,
-            flushed: 0,
-            buf: [0; BLOCK_SIZE],
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        BLOCK_SIZE - self.alloc
-    }
-
-    fn is_full(&self) -> bool {
-        BLOCK_SIZE - self.alloc <= 0
-    }
-
-    fn reset(&mut self) {
-        self.buf = [0u8; BLOCK_SIZE];
-        self.alloc = 0;
-        self.flushed = 0;
-    }
-
-    fn unwritten(&self) -> usize {
-        self.alloc - self.flushed
-    }
-}
 
 /// Represents a segment in a write-ahead log.
 ///
@@ -94,7 +46,7 @@ pub(crate) struct Segment {
     dir: PathBuf,
 
     /// The active block for buffering data.
-    block: Block<BLOCK_SIZE>,
+    block: Block<BLOCK_SIZE, 0>,
 
     /// The number of blocks that have been written to the segment.
     written_blocks: usize,
@@ -182,7 +134,7 @@ impl Segment {
             return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
         }
 
-        if self.block.alloc > 0 {
+        if self.block.written > 0 {
             self.flush_block(true)?;
         }
         self.file.sync_all()
@@ -204,10 +156,10 @@ impl Segment {
         // No more data will fit into the block or an implicit clear.
         // Enqueue and clear it.
         if clear {
-            p.alloc = BLOCK_SIZE; // Write till end of block.
+            p.written = BLOCK_SIZE; // Write till end of block.
         }
 
-        let n = self.file.write(&p.buf[p.flushed..p.alloc])?;
+        let n = self.file.write(&p.buf[p.flushed..p.written])?;
         p.flushed += n;
         self.file_offset += n as u64;
 
@@ -264,11 +216,11 @@ impl Segment {
             // Find the number of bytes that can be written to the block
             let l = std::cmp::min(p.remaining(), rec.len());
             let part = &rec[..l];
-            let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
+            let buf = &mut p.buf[p.written..]; // Create a mutable slice starting from p.written
                                              // Copy the content of 'part' into 'b'
             merge_slices(buf, part);
 
-            p.alloc += part.len(); // Update the number of bytes allocated in the block
+            p.written += part.len(); // Update the number of bytes allocated in the block
             if p.is_full() {
                 self.flush_block(true)?;
             }
@@ -278,7 +230,7 @@ impl Segment {
         }
 
         // Write the remaining data to the block
-        if self.block.alloc > 0 {
+        if self.block.written > 0 {
             self.flush_block(false)?;
         }
 
@@ -334,7 +286,7 @@ impl Segment {
 
             if read_chunk_size > 0 {
                 let buf = &self.block.buf
-                    [self.block.alloc + boff..self.block.alloc + boff + read_chunk_size];
+                    [self.block.written + boff..self.block.written + boff + read_chunk_size];
                 merge_slices(bs, buf);
             }
 
@@ -364,38 +316,6 @@ mod tests {
     use super::*;
     use tempdir::TempDir;
 
-    #[test]
-    fn test_remaining() {
-        let block: Block<4096> = Block {
-            alloc: 100,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert_eq!(block.remaining(), 3996);
-    }
-
-    #[test]
-    fn test_is_full() {
-        let block: Block<4096> = Block {
-            alloc: 4096,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert!(block.is_full());
-    }
-
-    #[test]
-    fn test_reset() {
-        let mut block: Block<4096> = Block {
-            alloc: 100,
-            flushed: 0,
-            buf: [1; 4096],
-        };
-        block.reset();
-        assert_eq!(block.buf, [0; 4096]);
-        assert_eq!(block.alloc, 0);
-        assert_eq!(block.flushed, 0);
-    }
 
     #[test]
     fn test_append() {

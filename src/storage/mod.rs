@@ -120,6 +120,56 @@ impl CompressionLevel {
     }
 }
 
+
+/// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
+/// batch writes to improve performance by reducing the number of individual disk writes. If the
+/// data to be written exceeds the `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
+/// keeps track of the allocated space, flushed data, and other details related to the write process.
+/// It can also be used to align data to the size of a direct I/O block, if applicable.
+///
+/// # Type Parameters
+///
+/// - `BLOCK_SIZE`: The size of the block in bytes.
+pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> {
+    /// The number of bytes currently written in the block.
+    written: usize,
+
+    /// The number of bytes that have been flushed to disk.
+    flushed: usize,
+
+    /// The buffer that holds the actual data.
+    buf: [u8; BLOCK_SIZE],
+}
+
+impl<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> Block<BLOCK_SIZE, RECORD_SIZE> {
+    fn new() -> Self {
+        Block {
+            written: 0,
+            flushed: 0,
+            buf: [0; BLOCK_SIZE],
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        BLOCK_SIZE - self.written - RECORD_SIZE
+    }
+
+    fn is_full(&self) -> bool {
+        BLOCK_SIZE - self.written <= RECORD_SIZE
+    }
+
+    fn reset(&mut self) {
+        self.buf = [0u8; BLOCK_SIZE];
+        self.written = 0;
+        self.flushed = 0;
+    }
+
+    fn unwritten(&self) -> usize {
+        self.written - self.flushed
+    }
+}
+
+
 /// Represents options for configuring a segment in a write-ahead log.
 ///
 /// The `Options` struct provides a way to customize various aspects of a write-ahead log segment,
@@ -979,4 +1029,71 @@ mod tests {
         let mut file = File::create(file_path).unwrap();
         file.write_all(b"dummy content").unwrap();
     }
+
+    #[test]
+    fn test_remaining() {
+        let block: Block<4096, RECORD_HEADER_SIZE> = Block {
+            written: 100,
+            flushed: 0,
+            buf: [0; 4096],
+        };
+        assert_eq!(block.remaining(), 3996 - RECORD_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_is_full() {
+        let block: Block<4096, RECORD_HEADER_SIZE> = Block {
+            written: 4096 - RECORD_HEADER_SIZE,
+            flushed: 0,
+            buf: [0; 4096],
+        };
+        assert!(block.is_full());
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut block: Block<4096, RECORD_HEADER_SIZE> = Block {
+            written: 100,
+            flushed: 0,
+            buf: [1; 4096],
+        };
+        block.reset();
+        assert_eq!(block.buf, [0; 4096]);
+        assert_eq!(block.written, 0);
+        assert_eq!(block.flushed, 0);
+    }
+
+    // #[test]
+    // fn test_remaining() {
+    //     let block: Block<4096> = Block {
+    //         alloc: 100,
+    //         flushed: 0,
+    //         buf: [0; 4096],
+    //     };
+    //     assert_eq!(block.remaining(), 3996);
+    // }
+
+    // #[test]
+    // fn test_is_full() {
+    //     let block: Block<4096> = Block {
+    //         alloc: 4096,
+    //         flushed: 0,
+    //         buf: [0; 4096],
+    //     };
+    //     assert!(block.is_full());
+    // }
+
+    // #[test]
+    // fn test_reset() {
+    //     let mut block: Block<4096> = Block {
+    //         alloc: 100,
+    //         flushed: 0,
+    //         buf: [1; 4096],
+    //     };
+    //     block.reset();
+    //     assert_eq!(block.buf, [0; 4096]);
+    //     assert_eq!(block.written, 0);
+    //     assert_eq!(block.flushed, 0);
+    // }
+
 }
