@@ -397,7 +397,7 @@ impl Metadata {
 /// - `Last`: Denotes the final fragment of a record.
 #[derive(PartialEq)]
 enum RecordType {
-    Empty = 0,   // Rest of block is empty.
+    Empty = 0,  // Rest of block is empty.
     Full = 1,   // Full record.
     First = 2,  // First fragment of a record.
     Middle = 3, // Middle fragments of a record.

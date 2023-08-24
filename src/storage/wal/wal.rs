@@ -143,7 +143,6 @@ impl WAL {
         offset = off + self.calculate_offset();
 
         Ok((offset, rec.len()))
-
     }
 
     // Helper function to calculate offset

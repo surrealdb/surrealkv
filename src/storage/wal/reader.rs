@@ -125,36 +125,85 @@ impl Reader {
         }
     }
 
+    fn read_first_header_byte<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<(u8), io::Error> {
+        if rdr.read_exact(&mut buf[0..1]).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "error reading first header byte",
+            ));
+        }
+        Ok((buf[0]))
+    }
+
+    fn read_remaining_header<R: Read>(
+        rdr: &mut R,
+        buf: &mut [u8],
+    ) -> Result<(u16, u32), io::Error> {
+        if rdr.read_exact(&mut buf[1..RECORD_HEADER_SIZE]).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "error reading remaining header bytes",
+            ));
+        }
+
+        let length = u16::from_be_bytes([buf[2], buf[3]]);
+        let crc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        Ok((length, crc))
+    }
+
+    fn read_and_validate_record<R: Read>(
+        rdr: &mut R,
+        buf: &mut [u8],
+        length: u16,
+        crc: u32,
+    ) -> Result<(usize, usize), io::Error> {
+        let record_start = RECORD_HEADER_SIZE;
+        let record_end = record_start + length as usize;
+        if rdr.read_exact(&mut buf[record_start..record_end]).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "error reading record data",
+            ));
+        }
+
+        // Validate the checksum.
+        let calculated_crc = calculate_crc32(&buf[record_start..record_end]);
+        if calculated_crc != crc {
+            return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
+        }
+
+        Ok((record_start, record_end))
+    }
+
     // TODO: return segment id and offset in error
     fn next(&mut self) -> Result<(), io::Error> {
         self.rec.clear();
         let mut i = 0;
 
         loop {
-            // Read first byte of header.
-            if self.rdr.read_exact(&mut self.buf[0..1]).is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "error reading first header byte",
-                ));
-            }
+            // Read first byte of header to determine record type.
+            let first_byte = Self::read_first_header_byte(&mut self.rdr, &mut self.buf[0..1])?;
             self.total_read += 1;
-            self.cur_rec_type = RecordType::from_u8(self.buf[0])?;
+            self.cur_rec_type = RecordType::from_u8(first_byte)?;
 
             // If the first byte is 0, it's a padded page.
             // Read the rest of the page of zeros and continue.
             if self.cur_rec_type == RecordType::Empty {
-                let zeros = &mut self.buf[1..];
-                let k = (BLOCK_SIZE - (self.total_read % BLOCK_SIZE)) as usize;
-                if k == BLOCK_SIZE as usize {
-                    continue; // Initial 0 byte was last page byte.
+                let remaining = (BLOCK_SIZE - (self.total_read % BLOCK_SIZE)) as usize;
+                if remaining == BLOCK_SIZE as usize {
+                    continue;
                 }
-                if self.rdr.read_exact(&mut zeros[..k]).is_err() {
-                    return Err(io::Error::new(io::ErrorKind::Other, "read remaining zeros"));
-                }
-                self.total_read += k;
 
-                if !zeros[..k].iter().all(|&c| c == 0) {
+                let zeros = &mut self.buf[1..remaining + 1];
+                if self.rdr.read_exact(zeros).is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "error reading remaining zeros",
+                    ));
+                }
+                self.total_read += remaining;
+
+                if !zeros.iter().all(|&c| c == 0) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         "unexpected non-zero byte in padded block",
@@ -163,49 +212,21 @@ impl Reader {
                 continue;
             }
 
-            // Read the rest of the header.
-            if self
-                .rdr
-                .read_exact(&mut self.buf[1..RECORD_HEADER_SIZE])
-                .is_err()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "error reading remaining header bytes",
-                ));
-            }
-            self.total_read += (RECORD_HEADER_SIZE - 1);
-
-            let length = u16::from_be_bytes([self.buf[2], self.buf[3]]);
-            let crc = u32::from_be_bytes([self.buf[4], self.buf[5], self.buf[6], self.buf[7]]);
-
-            // Read the record data.
-            if self
-                .rdr
-                .read_exact(
-                    &mut self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
-                )
-                .is_err()
-            {
-                return Err(io::Error::new(io::ErrorKind::Other, "error reading record data"));
-            }
-            self.total_read += length as usize;
-
-            // Validate the checksum.
-            let calculated_crc = calculate_crc32(
-                &self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
-            );
-            if calculated_crc != crc {
-                return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
-            }
-
-            // Copy the record data to the output buffer.
-            self.rec.extend_from_slice(
-                &self.buf[RECORD_HEADER_SIZE..(RECORD_HEADER_SIZE + length as usize)],
-            );
-
             // Validate the record type.
             validate_record(&self.cur_rec_type, i)?;
+
+            // Read the rest of the header.
+            let (length, crc) = Self::read_remaining_header(&mut self.rdr, &mut self.buf)?;
+            self.total_read += (RECORD_HEADER_SIZE - 1);
+
+            // Read the record data.
+            let (record_start, record_end) =
+                Self::read_and_validate_record(&mut self.rdr, &mut self.buf, length, crc)?;
+            self.total_read += length as usize;
+
+            // Copy the record data to the output buffer.
+            self.rec
+                .extend_from_slice(&self.buf[record_start..record_end]);
 
             if self.cur_rec_type == RecordType::Last || self.cur_rec_type == RecordType::Full {
                 break;
