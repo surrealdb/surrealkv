@@ -5,8 +5,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use crate::storage::wal::reader::{MultiSegmentReader, Reader};
 use crate::storage::wal::segment::Segment;
-use crate::storage::{get_segment_range, Options};
+use crate::storage::{get_segment_range, Options, SegmentRef};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -116,12 +117,10 @@ impl WAL {
 
         // Get options and initialize variables
         let opts = &self.opts;
-        let mut n = 0usize;
-        let mut available = 0;
         let mut offset = 0;
 
         // Calculate available space in the active segment
-        available = opts.max_file_size - self.active_segment.offset();
+        let available = opts.max_file_size - self.active_segment.offset();
 
         // If space is not available, create a new segment
         if rec.len() as u64 > available {
@@ -134,9 +133,6 @@ impl WAL {
             self.active_segment_id += 1;
             let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
             self.active_segment = new_segment;
-
-            // Calculate available space in the new segment
-            available = opts.max_file_size;
         }
 
         let (off, _) = self.active_segment.append(&rec)?;
@@ -217,6 +213,103 @@ impl WAL {
     pub fn offset(&self) -> u64 {
         let _lock = self.mutex.read().unwrap();
         self.active_segment.offset()
+    }
+
+    /// Repairs the corrupted segment identified by `corrupted_segment_id` and ensures that
+    /// the records up to `corrupted_offset_marker` are appended correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `corrupted_segment_id` - The ID of the corrupted segment to be repaired.
+    /// * `corrupted_offset_marker` - The offset marker indicating the point up to which records are to be repaired.
+    ///
+    /// # Returns
+    ///
+    /// Returns an `io::Result` indicating the success of the repair operation.
+    pub fn repair(
+        &mut self,
+        corrupted_segment_id: u64,
+        corrupted_offset_marker: u64,
+    ) -> io::Result<()> {
+        // Read the list of segments from the directory
+        let segs = SegmentRef::read_segments_from_directory(&self.dir)?;
+
+        // Prepare to store information about the corrupted segment
+        let mut corrupted_segment_info = None;
+
+        // Loop through the segments
+        for s in &segs {
+            // Close the active segment if its ID matches
+            if s.id == self.active_segment_id {
+                self.active_segment.close()?;
+            }
+
+            // Store information about the corrupted segment
+            if s.id == corrupted_segment_id {
+                corrupted_segment_info = Some((s.file_path.clone(), s.file_header_offset));
+            }
+
+            // Remove segments newer than the corrupted segment
+            if s.id > corrupted_segment_id {
+                std::fs::remove_file(&s.file_path)?;
+            }
+        }
+
+        // If information about the corrupted segment is not available, return an error
+        if corrupted_segment_info.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Corrupted segment not found",
+            ));
+        }
+
+        // Retrieve the information about the corrupted segment
+        let (corrupted_segment_path, corrupted_segment_file_header_offset) =
+            corrupted_segment_info.unwrap();
+
+        // Prepare the repaired segment path
+        let repaired_segment_path = corrupted_segment_path.clone().with_extension("repair");
+
+        // Rename the corrupted segment to the repaired segment
+        std::fs::rename(&corrupted_segment_path, &repaired_segment_path)?;
+
+        // Open a new segment as the active segment
+        let new_segment = Segment::open(&self.dir, corrupted_segment_id, &self.opts)?;
+        self.active_segment = new_segment;
+        self.active_segment_id = corrupted_segment_id;
+
+        // Create a segment reader for the repaired segment
+        let segments: Vec<SegmentRef> = vec![SegmentRef {
+            file_path: repaired_segment_path.clone(),
+            file_header_offset: corrupted_segment_file_header_offset,
+            id: corrupted_segment_id,
+        }];
+        let segment_reader = MultiSegmentReader::new(segments)?;
+
+        // Initialize a reader for the segment
+        let mut reader = Reader::new(segment_reader);
+
+        // Read records until the offset marker is reached
+        while let Ok((data, cur_offset)) = reader.read() {
+            if cur_offset >= corrupted_offset_marker {
+                break;
+            }
+
+            self.append(data)?;
+        }
+
+        // Flush the active segment
+        self.active_segment.flush_block(true)?;
+
+        // Remove the repaired segment file
+        std::fs::remove_file(&repaired_segment_path)?;
+
+        // Open the next segment and make it active
+        self.active_segment_id += 1;
+        let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+        self.active_segment = new_segment;
+
+        Ok(())
     }
 }
 

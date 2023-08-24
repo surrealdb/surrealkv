@@ -19,8 +19,8 @@ use crate::storage::{
 ///
 /// - `BLOCK_SIZE`: The size of the block in bytes.
 pub(crate) struct Block<const BLOCK_SIZE: usize> {
-    /// The number of bytes currently allocated in the block.
-    alloc: usize,
+    /// The number of bytes currently written in the block.
+    written: usize,
 
     /// The number of bytes that have been flushed to disk.
     flushed: usize,
@@ -32,28 +32,28 @@ pub(crate) struct Block<const BLOCK_SIZE: usize> {
 impl<const BLOCK_SIZE: usize> Block<BLOCK_SIZE> {
     fn new() -> Self {
         Block {
-            alloc: 0,
+            written: 0,
             flushed: 0,
             buf: [0; BLOCK_SIZE],
         }
     }
 
     fn remaining(&self) -> usize {
-        BLOCK_SIZE - self.alloc - RECORD_HEADER_SIZE
+        BLOCK_SIZE - self.written - RECORD_HEADER_SIZE
     }
 
     fn is_full(&self) -> bool {
-        BLOCK_SIZE - self.alloc <= RECORD_HEADER_SIZE
+        BLOCK_SIZE - self.written <= RECORD_HEADER_SIZE
     }
 
     fn reset(&mut self) {
         self.buf = [0u8; BLOCK_SIZE];
-        self.alloc = 0;
+        self.written = 0;
         self.flushed = 0;
     }
 
     fn unwritten(&self) -> usize {
-        self.alloc - self.flushed
+        self.written - self.flushed
     }
 }
 
@@ -190,7 +190,7 @@ impl Segment {
             return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
         }
 
-        if self.block.alloc > 0 {
+        if self.block.written > 0 {
             self.flush_block(true)?;
         }
         self.file.sync_all()
@@ -212,10 +212,10 @@ impl Segment {
         // No more data will fit into the block or an implicit clear.
         // Enqueue and clear it.
         if clear {
-            p.alloc = BLOCK_SIZE; // Write till end of block.
+            p.written = BLOCK_SIZE; // Write till end of block.
         }
 
-        let n = self.file.write(&p.buf[p.flushed..p.alloc])?;
+        let n = self.file.write(&p.buf[p.flushed..p.written])?;
         p.flushed += n;
         self.file_offset += n as u64;
 
@@ -269,7 +269,7 @@ impl Segment {
         }
 
         // Write the remaining data to the block
-        if self.block.alloc > 0 {
+        if self.block.written > 0 {
             self.flush_block(false)?;
         }
 
@@ -280,11 +280,11 @@ impl Segment {
         let p = &mut self.block;
         let l = std::cmp::min(p.remaining(), rec.len());
         let part = &rec[..l];
-        let buf = &mut p.buf[p.alloc..];
+        let buf = &mut p.buf[p.written..];
 
         encode_record(buf, rec.len(), part, i);
 
-        p.alloc += part.len() + RECORD_HEADER_SIZE;
+        p.written += part.len() + RECORD_HEADER_SIZE;
         if p.is_full() {
             self.flush_block(true)?;
         }
@@ -317,12 +317,12 @@ impl Segment {
     //         // Find the number of bytes that can be written to the block
     //         let l = std::cmp::min(p.remaining(), rec.len());
     //         let part = &rec[..l];
-    //         let buf = &mut p.buf[p.alloc..]; // Create a mutable slice starting from p.alloc
+    //         let buf = &mut p.buf[p.written..]; // Create a mutable slice starting from p.written
 
     //         // Encode the content of 'part' into 'buf'
     //         encode_record(buf, rec.len(), part, i);
 
-    //         p.alloc += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
+    //         p.written += part.len() + RECORD_HEADER_SIZE; // Update the number of bytes allocated in the block
     //         if p.is_full() {
     //             self.flush_block(true)?;
     //         }
@@ -335,7 +335,7 @@ impl Segment {
     //     }
 
     //     // Write the remaining data to the block
-    //     if self.block.alloc > 0 {
+    //     if self.block.written > 0 {
     //         self.flush_block(false)?;
     //     }
 
@@ -391,7 +391,7 @@ impl Segment {
 
             if read_chunk_size > 0 {
                 let buf = &self.block.buf
-                    [self.block.alloc + boff..self.block.alloc + boff + read_chunk_size];
+                    [self.block.written + boff..self.block.written + boff + read_chunk_size];
                 merge_slices(bs, buf);
             }
 
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_remaining() {
         let block: Block<4096> = Block {
-            alloc: 100,
+            written: 100,
             flushed: 0,
             buf: [0; 4096],
         };
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn test_is_full() {
         let block: Block<4096> = Block {
-            alloc: 4096 - RECORD_HEADER_SIZE,
+            written: 4096 - RECORD_HEADER_SIZE,
             flushed: 0,
             buf: [0; 4096],
         };
@@ -444,13 +444,13 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut block: Block<4096> = Block {
-            alloc: 100,
+            written: 100,
             flushed: 0,
             buf: [1; 4096],
         };
         block.reset();
         assert_eq!(block.buf, [0; 4096]);
-        assert_eq!(block.alloc, 0);
+        assert_eq!(block.written, 0);
         assert_eq!(block.flushed, 0);
     }
 

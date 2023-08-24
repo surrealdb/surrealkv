@@ -700,7 +700,7 @@ fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(refs)
 }
 
-struct SegmentRef {
+pub(crate) struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
     /// The base offset of the file.

@@ -3,24 +3,26 @@ use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
+use crate::storage::wal::CorruptionError;
 use crate::storage::{
     calculate_crc32, validate_record, RecordType, SegmentRef, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
 
+// TODO: Figure out how to close segment files once they are read and rotated.
 pub struct MultiSegmentReader {
-    buf: BufReader<File>,
-    segs: Vec<SegmentRef>,
-    cur: usize, // Index of current segment in segs.
-    off: usize, // Offset in current segment.
+    buf: BufReader<File>,  // Buffer for reading from the current segment.
+    segs: Vec<SegmentRef>, // List of segments to read from.
+    cur: usize,            // Index of current segment in segs.
+    off: usize,            // Offset in current segment.
 }
 
 impl MultiSegmentReader {
-    fn new(segs: Vec<SegmentRef>) -> Result<MultiSegmentReader, Box<dyn std::error::Error>> {
+    pub(crate) fn new(segs: Vec<SegmentRef>) -> Result<MultiSegmentReader, io::Error> {
         if segs.is_empty() {
-            return Err(Box::new(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Empty segment list",
-            )));
+            ));
         }
 
         let cur = 0;
@@ -115,7 +117,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    fn new(rdr: MultiSegmentReader) -> Self {
+    pub(crate) fn new(rdr: MultiSegmentReader) -> Self {
         Reader {
             rdr,
             rec: Vec::new(),
@@ -125,7 +127,7 @@ impl Reader {
         }
     }
 
-    fn read_first_header_byte<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<(u8), io::Error> {
+    fn read_first_header_byte<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<u8, io::Error> {
         if rdr.read_exact(&mut buf[0..1]).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -151,6 +153,7 @@ impl Reader {
         Ok((length, crc))
     }
 
+    
     fn read_and_validate_record<R: Read>(
         rdr: &mut R,
         buf: &mut [u8],
@@ -175,7 +178,24 @@ impl Reader {
         Ok((record_start, record_end))
     }
 
-    // TODO: return segment id and offset in error
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64), CorruptionError> {
+        match self.next() {
+            Ok(_) => (),
+            Err(e) => {
+                let (segment_id, offset) = (self.rdr.segs[self.rdr.cur].id, self.rdr.off);
+                return Err(CorruptionError::new(
+                    e.kind(),
+                    e.to_string().as_str(),
+                    segment_id,
+                    offset,
+                ));
+            }
+        }
+        Ok((&self.rec, self.rdr.off as u64))
+    }
+
+
+    // TODO: prevent reads when error is encountered
     fn next(&mut self) -> Result<(), io::Error> {
         self.rec.clear();
         let mut i = 0;
@@ -194,7 +214,7 @@ impl Reader {
                     continue;
                 }
 
-                let zeros = &mut self.buf[1..remaining + 1];
+                let zeros = &mut self.buf[1..remaining+1];
                 if self.rdr.read_exact(zeros).is_err() {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
