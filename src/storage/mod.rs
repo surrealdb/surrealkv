@@ -2,8 +2,10 @@ pub mod aol;
 pub mod wal;
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{read_dir, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::ParseIntError;
+use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher;
 
@@ -47,6 +49,9 @@ const DEFAULT_COMPRESSION_FORMAT: CompressionFormat = CompressionFormat::NoCompr
 /// Default compression level used for compression.
 /// The data will be compressed using the `DefaultCompression` level.
 const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
+
+/// Default maximum size of the segment file.
+const DEFAULT_FILE_SIZE: u64 = 4096 * 256 * 20; // 20mb
 
 /// Constants for key names used in the file header.
 const KEY_MAGIC: &str = "magic";
@@ -181,7 +186,7 @@ impl Options {
             compression_level: None,            // default compression level
             metadata: None,                     // default metadata
             extension: None,                    // default extension
-            max_file_size: 1 << 26,             // default max file size
+            max_file_size: DEFAULT_FILE_SIZE,   // default max file size (20mb)
         }
     }
 
@@ -571,93 +576,46 @@ fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()
     Ok(())
 }
 
-// fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()> {
-//     let mut meta = Metadata::new(None);
-//     meta.read_from(&mut &header[..])?;
-
-//     // Validate individual fields here
-//     let magic = meta.get_int(KEY_MAGIC)?;
-//     let version = meta.get_int(KEY_VERSION)?;
-//     let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
-//     let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
-//     let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
-
-//     if magic != MAGIC || version != VERSION || segment_id != id {
-//         return Err(io::Error::new(
-//             io::ErrorKind::InvalidData,
-//             "Invalid header data",
-//         ));
-//     }
-
-//     // Check the compression format and level against the provided options
-//     if let Some(expected_cf) = &opts.compression_format {
-//         if cf != expected_cf.as_u64() {
-//             return Err(io::Error::new(
-//                 io::ErrorKind::InvalidData,
-//                 "Invalid compression format",
-//             ));
-//         }
-//     }
-
-//     if let Some(expected_cl) = &opts.compression_level {
-//         if cl != expected_cl.as_u64() {
-//             return Err(io::Error::new(
-//                 io::ErrorKind::InvalidData,
-//                 "Invalid compression format",
-//             ));
-//         }
-//     }
-
-//     Ok(())
-// }
-
 fn validate_record(record_type: &RecordType, i: usize) -> Result<(), io::Error> {
     match record_type {
         RecordType::Full => {
             if i != 0 {
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected full record",
-                ))
-            } else {
-                Ok(())
+                    "Unexpected full record: first record expected",
+                ));
             }
         }
         RecordType::First => {
             if i != 0 {
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected first record, dropping buffer",
-                ))
-            } else {
-                Ok(())
+                    "Unexpected first record: no previous records expected",
+                ));
             }
         }
         RecordType::Middle => {
             if i == 0 {
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected middle record, dropping buffer",
-                ))
-            } else {
-                Ok(())
+                    "Unexpected middle record: missing previous records",
+                ));
             }
         }
         RecordType::Last => {
             if i == 0 {
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected last record, dropping buffer",
-                ))
-            } else {
-                Ok(())
+                    "Unexpected last record: missing previous records",
+                ));
             }
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::Other,
-            "invalid last record type",
-        )),
+        _ => {
+            return Err(io::Error::new(io::ErrorKind::Other, "Invalid record type"));
+        }
     }
+
+    Ok(())
 }
 
 fn calculate_crc32(data: &[u8]) -> u32 {
@@ -674,6 +632,120 @@ fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
     }
 
     min_len
+}
+
+fn parse_segment_name(name: &str) -> io::Result<(u64, Option<String>)> {
+    let parts: Vec<&str> = name.split('.').collect();
+
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid segment name format",
+        ));
+    }
+
+    let index: Result<u64, ParseIntError> = parts[0].parse();
+    if let Ok(index) = index {
+        if parts.len() == 1 {
+            return Ok((index, None));
+        } else if parts.len() == 2 {
+            return Ok((index, Some(parts[1].to_string())));
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Invalid segment name format",
+    ))
+}
+
+pub(crate) fn segment_name(index: u64, ext: &str) -> String {
+    if ext.is_empty() {
+        return format!("{:020}", index);
+    }
+    format!("{:020}.{}", index, ext)
+}
+
+/// Gets the range of segment IDs present in the specified directory.
+///
+/// This function returns a tuple containing the minimum and maximum segment IDs
+/// found in the directory. If no segments are found, the tuple will contain (0, 0).
+fn get_segment_range(dir: &Path) -> io::Result<(u64, u64)> {
+    let refs = list_segment_ids(dir)?;
+    if refs.is_empty() {
+        return Ok((0, 0));
+    }
+    Ok((refs[0], refs[refs.len() - 1]))
+}
+
+/// Lists the segment IDs found in the specified directory.
+///
+/// This function reads the names of segment files in the directory and extracts the segment IDs.
+/// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
+/// vector is returned.
+fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
+    let mut refs: Vec<u64> = Vec::new();
+    let files = read_dir(dir)?;
+
+    for file in files {
+        let entry = file?;
+        let fn_name = entry.file_name();
+        let fn_str = fn_name.to_string_lossy();
+        let (index, _) = parse_segment_name(&fn_str)?;
+        refs.push(index);
+    }
+
+    refs.sort_by(|a, b| a.cmp(&b));
+
+    Ok(refs)
+}
+
+struct SegmentRef {
+    /// The path where the segment file is located.
+    pub(crate) file_path: PathBuf,
+    /// The base offset of the file.
+    pub(crate) file_header_offset: u64,
+    /// The unique identifier of the segment.
+    pub(crate) id: u64,
+}
+
+impl SegmentRef {
+    /// Creates a vector of SegmentRef instances by reading segments in the specified directory.
+    pub fn read_segments_from_directory(
+        directory_path: &Path,
+    ) -> Result<Vec<SegmentRef>, io::Error> {
+        let mut segment_refs = Vec::new();
+
+        // Read the directory and iterate through its entries
+        let files = read_dir(directory_path)?;
+        for file in files {
+            let entry = file?;
+            if entry.file_type()?.is_file() {
+                let file_path = entry.path();
+                let fn_name = entry.file_name();
+                let fn_str = fn_name.to_string_lossy();
+                let (index, _) = parse_segment_name(&fn_str)?;
+
+                let mut file = OpenOptions::new().read(true).open(&file_path)?;
+                let header = read_file_header(&mut file)?;
+                validate_magic_version(&header)?;
+                validate_segment_id(&header, index)?;
+
+                // Create a SegmentRef instance
+                let segment_ref = SegmentRef {
+                    file_path,
+                    file_header_offset: (4 + header.len()) as u64, // You need to set the correct offset here
+                    id: index,
+                };
+
+                segment_refs.push(segment_ref);
+            }
+        }
+
+        segment_refs.sort_by(|a, b| a.id.cmp(&b.id));
+
+        Ok(segment_refs)
+    }
 }
 
 #[cfg(test)]
@@ -837,5 +909,74 @@ mod tests {
 
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(temp_dir);
+    }
+
+    #[test]
+    fn test_segment_name_with_extension() {
+        let index = 42;
+        let ext = "log";
+        let expected = format!("{:020}.{}", index, ext);
+        assert_eq!(segment_name(index, ext), expected);
+    }
+
+    #[test]
+    fn test_segment_name_without_extension() {
+        let index = 42;
+        let expected = format!("{:020}", index);
+        assert_eq!(segment_name(index, ""), expected);
+    }
+
+    #[test]
+    fn test_parse_segment_name_with_extension() {
+        let name = "00000000000000000042.log";
+        let result = parse_segment_name(name).unwrap();
+        assert_eq!(result, (42, Some("log".to_string())));
+    }
+
+    #[test]
+    fn test_parse_segment_name_without_extension() {
+        let name = "00000000000000000042";
+        let result = parse_segment_name(name).unwrap();
+        assert_eq!(result, (42, None));
+    }
+
+    #[test]
+    fn test_parse_segment_name_invalid_format() {
+        let name = "invalid_name";
+        let result = parse_segment_name(name);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_segments_empty_directory() {
+        let temp_dir = create_temp_directory();
+        let dir = temp_dir.path().to_path_buf();
+
+        let result = get_segment_range(&dir).unwrap();
+        assert_eq!(result, (0, 0));
+    }
+
+    #[test]
+    fn test_segments_non_empty_directory() {
+        let temp_dir = create_temp_directory();
+        let dir = temp_dir.path().to_path_buf();
+
+        create_segment_file(&dir, "00000000000000000001.log");
+        create_segment_file(&dir, "00000000000000000003.log");
+        create_segment_file(&dir, "00000000000000000002.log");
+        create_segment_file(&dir, "00000000000000000004.log");
+
+        let result = get_segment_range(&dir).unwrap();
+        assert_eq!(result, (1, 4));
+    }
+
+    fn create_temp_directory() -> TempDir {
+        TempDir::new("test").unwrap()
+    }
+
+    fn create_segment_file(dir: &PathBuf, name: &str) {
+        let file_path = dir.join(name);
+        let mut file = File::create(file_path).unwrap();
+        file.write_all(b"dummy content").unwrap();
     }
 }

@@ -1,68 +1,17 @@
-use std::fs::{read_dir, File, OpenOptions};
+use std::fs::File;
 use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
-use crate::storage::wal::segment::Segment;
 use crate::storage::{
-    calculate_crc32, read_file_header, validate_magic_version, validate_record,
-    validate_segment_id, RecordType, BLOCK_SIZE, RECORD_HEADER_SIZE,
+    calculate_crc32, validate_record, RecordType, SegmentRef, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
-
-struct SegmentRef {
-    /// The path where the segment file is located.
-    pub(crate) file_path: PathBuf,
-    /// The base offset of the file.
-    pub(crate) file_header_offset: u64,
-    /// The unique identifier of the segment.
-    pub(crate) id: u64,
-}
-
-impl SegmentRef {
-    /// Creates a vector of SegmentRef instances by reading segments in the specified directory.
-    pub fn read_segments_from_directory(
-        directory_path: &Path,
-    ) -> Result<Vec<SegmentRef>, io::Error> {
-        let mut segment_refs = Vec::new();
-
-        // Read the directory and iterate through its entries
-        let files = read_dir(directory_path)?;
-        for file in files {
-            let entry = file?;
-            if entry.file_type()?.is_file() {
-                let file_path = entry.path();
-                let fn_name = entry.file_name();
-                let fn_str = fn_name.to_string_lossy();
-                let (index, _) = Segment::parse_segment_name(&fn_str)?;
-
-                let mut file = OpenOptions::new().read(true).open(&file_path)?;
-                let header = read_file_header(&mut file)?;
-                validate_magic_version(&header)?;
-                validate_segment_id(&header, index)?;
-
-                // Create a SegmentRef instance
-                let segment_ref = SegmentRef {
-                    file_path,
-                    file_header_offset: (4 + header.len()) as u64, // You need to set the correct offset here
-                    id: index,
-                };
-
-                segment_refs.push(segment_ref);
-            }
-        }
-
-        segment_refs.sort_by(|a, b| a.id.cmp(&b.id));
-
-        Ok(segment_refs)
-    }
-}
 
 pub struct MultiSegmentReader {
     buf: BufReader<File>,
     segs: Vec<SegmentRef>,
-    cur: usize, // Index into segs.
-    off: usize, // Offset of read data into current segment.
+    cur: usize, // Index of current segment in segs.
+    off: usize, // Offset in current segment.
 }
 
 impl MultiSegmentReader {
@@ -147,6 +96,7 @@ impl Read for MultiSegmentReader {
             return Ok(0);
         }
 
+        // TODO: could create a problem when reading a partial block spread over multiple segments
         if !self.is_eof()? {
             return self.read_to_buffer(buf);
         } else {
@@ -175,6 +125,7 @@ impl Reader {
         }
     }
 
+    // TODO: return segment id and offset in error
     fn next(&mut self) -> Result<(), io::Error> {
         self.rec.clear();
         let mut i = 0;

@@ -1,12 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Seek, Write};
-use std::num::ParseIntError;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf}; // Import Unix-specific extensions
 
 use crate::storage::{
-    merge_slices, read_file_header, validate_file_header, write_file_header, Options, BLOCK_SIZE,
+    merge_slices, read_file_header, segment_name, validate_file_header, write_file_header, Options,
+    BLOCK_SIZE,
 };
 
 /// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
@@ -119,7 +119,7 @@ impl Segment {
 
         // Build the file path using the segment name and extension
         let extension = opts.extension.as_deref().unwrap_or("");
-        let file_path = dir.join(Self::segment_name(id, extension));
+        let file_path = dir.join(segment_name(id, extension));
         let file_path_exists = file_path.exists();
         let file_path_is_file = file_path.is_file();
 
@@ -172,38 +172,6 @@ impl Segment {
         }
 
         open_options.open(file_path)
-    }
-
-    pub(crate) fn segment_name(index: u64, ext: &str) -> String {
-        if ext.is_empty() {
-            return format!("{:020}", index);
-        }
-        format!("{:020}.{}", index, ext)
-    }
-
-    pub(crate) fn parse_segment_name(name: &str) -> io::Result<(u64, Option<String>)> {
-        let parts: Vec<&str> = name.split('.').collect();
-
-        if parts.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid segment name format",
-            ));
-        }
-
-        let index: Result<u64, ParseIntError> = parts[0].parse();
-        if let Ok(index) = index {
-            if parts.len() == 1 {
-                return Ok((index, None));
-            } else if parts.len() == 2 {
-                return Ok((index, Some(parts[1].to_string())));
-            }
-        }
-
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Invalid segment name format",
-        ))
     }
 
     // Flushes the current block to disk.
@@ -427,42 +395,6 @@ mod tests {
         assert_eq!(block.buf, [0; 4096]);
         assert_eq!(block.alloc, 0);
         assert_eq!(block.flushed, 0);
-    }
-
-    #[test]
-    fn test_segment_name_with_extension() {
-        let index = 42;
-        let ext = "log";
-        let expected = format!("{:020}.{}", index, ext);
-        assert_eq!(Segment::segment_name(index, ext), expected);
-    }
-
-    #[test]
-    fn test_segment_name_without_extension() {
-        let index = 42;
-        let expected = format!("{:020}", index);
-        assert_eq!(Segment::segment_name(index, ""), expected);
-    }
-
-    #[test]
-    fn test_parse_segment_name_with_extension() {
-        let name = "00000000000000000042.log";
-        let result = Segment::parse_segment_name(name).unwrap();
-        assert_eq!(result, (42, Some("log".to_string())));
-    }
-
-    #[test]
-    fn test_parse_segment_name_without_extension() {
-        let name = "00000000000000000042";
-        let result = Segment::parse_segment_name(name).unwrap();
-        assert_eq!(result, (42, None));
-    }
-
-    #[test]
-    fn test_parse_segment_name_invalid_format() {
-        let name = "invalid_name";
-        let result = Segment::parse_segment_name(name);
-        assert!(result.is_err());
     }
 
     #[test]

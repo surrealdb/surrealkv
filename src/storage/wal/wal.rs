@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use crate::storage::wal::segment::Segment;
-use crate::storage::Options;
+use crate::storage::{get_segment_range, Options};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -237,80 +237,15 @@ impl Drop for WAL {
     }
 }
 
-/// Gets the range of segment IDs present in the specified directory.
-///
-/// This function returns a tuple containing the minimum and maximum segment IDs
-/// found in the directory. If no segments are found, the tuple will contain (0, 0).
-fn get_segment_range(dir: &Path) -> io::Result<(u64, u64)> {
-    let refs = list_segment_ids(dir)?;
-    if refs.is_empty() {
-        return Ok((0, 0));
-    }
-    Ok((refs[0], refs[refs.len() - 1]))
-}
-
-/// Lists the segment IDs found in the specified directory.
-///
-/// This function reads the names of segment files in the directory and extracts the segment IDs.
-/// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
-/// vector is returned.
-fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
-    let mut refs: Vec<u64> = Vec::new();
-    let files = fs::read_dir(dir)?;
-
-    for file in files {
-        let entry = file?;
-        let fn_name = entry.file_name();
-        let fn_str = fn_name.to_string_lossy();
-        let (index, _) = Segment::parse_segment_name(&fn_str)?;
-        refs.push(index);
-    }
-
-    refs.sort_by(|a, b| a.cmp(&b));
-
-    Ok(refs)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::storage::RECORD_HEADER_SIZE;
 
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
     use tempdir::TempDir;
-
-    #[test]
-    fn test_segments_empty_directory() {
-        let temp_dir = create_temp_directory();
-        let dir = temp_dir.path().to_path_buf();
-
-        let result = get_segment_range(&dir).unwrap();
-        assert_eq!(result, (0, 0));
-    }
-
-    #[test]
-    fn test_segments_non_empty_directory() {
-        let temp_dir = create_temp_directory();
-        let dir = temp_dir.path().to_path_buf();
-
-        create_segment_file(&dir, "00000000000000000001.log");
-        create_segment_file(&dir, "00000000000000000003.log");
-        create_segment_file(&dir, "00000000000000000002.log");
-        create_segment_file(&dir, "00000000000000000004.log");
-
-        let result = get_segment_range(&dir).unwrap();
-        assert_eq!(result, (1, 4));
-    }
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
-    }
-
-    fn create_segment_file(dir: &PathBuf, name: &str) {
-        let file_path = dir.join(name);
-        let mut file = File::create(file_path).unwrap();
-        file.write_all(b"dummy content").unwrap();
     }
 
     #[test]
