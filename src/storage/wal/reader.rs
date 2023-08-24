@@ -5,7 +5,7 @@ use std::vec::Vec;
 
 use crate::storage::wal::CorruptionError;
 use crate::storage::{
-    calculate_crc32, validate_record, RecordType, SegmentRef, BLOCK_SIZE, RECORD_HEADER_SIZE,
+    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE, RECORD_HEADER_SIZE,
 };
 
 // TODO: Figure out how to close segment files once they are read and rotated.
@@ -108,6 +108,14 @@ impl Read for MultiSegmentReader {
     }
 }
 
+// Reader reads records from a MultiSegmentReader. The records are returned in the order they were written.
+// The current implementation of Reader is inspired by prometheus reader implementation for the WAL, and
+// is also inspired by levelDB's log reader. Since the WAL is append-only, the records are written in frames
+// of BLOCK_SIZE bytes. The first byte of each frame is the record type, followed by a reserved byte, followed
+// by the record length (2 bytes) and the CRC32 checksum (4 bytes). The record data follows the checksum. The
+// frame structure in the WAL for rocksdb, pebble and prometheus are very similar to levelDB's log format.
+// No partial writes are allowed. If the segment is not full, and the record can't fit in the remaining space, the
+// segment is padded with zeros. This is important for the reader to be able to read the records in BLOCK_SIZE chunks.
 pub struct Reader {
     rdr: MultiSegmentReader,
     rec: Vec<u8>,
@@ -153,7 +161,6 @@ impl Reader {
         Ok((length, crc))
     }
 
-    
     fn read_and_validate_record<R: Read>(
         rdr: &mut R,
         buf: &mut [u8],
@@ -194,7 +201,6 @@ impl Reader {
         Ok((&self.rec, self.rdr.off as u64))
     }
 
-
     // TODO: prevent reads when error is encountered
     fn next(&mut self) -> Result<(), io::Error> {
         self.rec.clear();
@@ -214,7 +220,7 @@ impl Reader {
                     continue;
                 }
 
-                let zeros = &mut self.buf[1..remaining+1];
+                let zeros = &mut self.buf[1..remaining + 1];
                 if self.rdr.read_exact(zeros).is_err() {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
@@ -233,7 +239,7 @@ impl Reader {
             }
 
             // Validate the record type.
-            validate_record(&self.cur_rec_type, i)?;
+            validate_record_type(&self.cur_rec_type, i)?;
 
             // Read the rest of the header.
             let (length, crc) = Self::read_remaining_header(&mut self.rdr, &mut self.buf)?;
@@ -266,6 +272,7 @@ mod tests {
     use std::io::Write;
 
     use crate::storage::wal::segment::Segment;
+    use crate::storage::wal::wal::WAL;
     use crate::storage::{Options, RECORD_HEADER_SIZE};
     use tempdir::TempDir;
 
@@ -625,4 +632,112 @@ mod tests {
         assert_eq!(reader.rec, vec![7, 8, 9]);
         assert_eq!(reader.total_read, 8203);
     }
+
+    fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
+        let opts = Options::default();
+        let mut segment =
+            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+
+        let record_size = 4;
+        let num_records = 1000;
+
+        for _ in 0..num_records {
+            let data: Vec<u8> = (0..record_size).map(|i| (i & 0xFF) as u8).collect();
+            let r = segment.append(&data);
+            assert!(r.is_ok());
+            assert_eq!(data.len(), r.unwrap().1);
+        }
+
+        segment
+    }
+
+    #[test]
+    fn test_reader_with_single_segment_and_multiple_records() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create sample segment files and populate it with data
+        let mut segment1 = create_test_segment_with_data(&temp_dir, 4);
+        assert!(segment1.close().is_ok());
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+
+        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+
+        let mut i = 0;
+        while let Ok((data, _)) = reader.read() {
+            assert_eq!(data, vec![0, 1, 2, 3]);
+            i += 1;
+        }
+
+        assert_eq!(i, 1000);
+    }
+
+    #[test]
+    fn test_reader_with_multiple_segments_and_multiple_records() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create sample segment files and populate it with data
+        let mut segment1 = create_test_segment_with_data(&temp_dir, 4);
+        let mut segment2 = create_test_segment_with_data(&temp_dir, 6);
+        let mut segment3 = create_test_segment_with_data(&temp_dir, 8);
+        assert!(segment1.close().is_ok());
+        assert!(segment2.close().is_ok());
+        assert!(segment3.close().is_ok());
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+
+        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+
+        let mut i = 0;
+        while let Ok((data, _)) = reader.read() {
+            assert_eq!(data, vec![0, 1, 2, 3]);
+            i += 1;
+        }
+
+        assert_eq!(i, 3000);
+    }
+
+    #[test]
+    fn test_reader_with_wal() {
+        // Create aol options and open a aol file
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        let opts = Options::default().with_max_file_size(4096 * 10);
+        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+
+        // Define the size of each record
+        let record_size = 4; // Choose an appropriate record size
+
+        // Define the number of records to append
+        let num_records = 10000; // Choose an appropriate number of records
+
+        for _ in 0..num_records {
+            let data: Vec<u8> = (0..record_size).map(|i| (i & 0xFF) as u8).collect();
+            let r = a.append(&data);
+            assert!(r.is_ok());
+            assert_eq!(data.len(), r.unwrap().1);
+        }
+
+        a.sync().expect("should sync");
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+
+        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+
+        let mut i = 0;
+        while let Ok((data, _)) = reader.read() {
+            assert_eq!(data, vec![0, 1, 2, 3]);
+            i += 1;
+        }
+
+        assert_eq!(i, num_records);
+    }
+
+    // TODO: add test with wal
+    // TODO: add test for wal repair
 }

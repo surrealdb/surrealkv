@@ -576,7 +576,7 @@ fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> io::Result<()
     Ok(())
 }
 
-fn validate_record(record_type: &RecordType, i: usize) -> Result<(), io::Error> {
+fn validate_record_type(record_type: &RecordType, i: usize) -> Result<(), io::Error> {
     match record_type {
         RecordType::Full => {
             if i != 0 {
