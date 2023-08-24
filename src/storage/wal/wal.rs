@@ -120,39 +120,30 @@ impl WAL {
         let mut available = 0;
         let mut offset = 0;
 
-        while n < rec.len() {
-            // Calculate available space in the active segment
-            available = opts.max_file_size - self.active_segment.offset();
+        // Calculate available space in the active segment
+        available = opts.max_file_size - self.active_segment.offset();
 
-            // If space is not available, create a new segment
-            if available <= 0 {
-                // Rotate to a new segment
+        // If space is not available, create a new segment
+        if rec.len() as u64 > available {
+            // Rotate to a new segment
 
-                // Sync and close the active segment
-                self.active_segment.close()?;
+            // Sync and close the active segment
+            self.active_segment.close()?;
 
-                // Update the active segment id and create a new segment
-                self.active_segment_id += 1;
-                let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
-                self.active_segment = new_segment;
+            // Update the active segment id and create a new segment
+            self.active_segment_id += 1;
+            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+            self.active_segment = new_segment;
 
-                // Calculate available space in the new segment
-                available = opts.max_file_size;
-            }
-
-            // Calculate the amount of data to append
-            let d = std::cmp::min(available as usize, rec.len() - n);
-            let (off, _) = self.active_segment.append(&rec[n..n + d])?;
-
-            // Calculate offset only for the first chunk of data
-            if n == 0 {
-                offset = off + self.calculate_offset();
-            }
-
-            n += d;
+            // Calculate available space in the new segment
+            available = opts.max_file_size;
         }
 
-        Ok((offset, n))
+        let (off, _) = self.active_segment.append(&rec)?;
+        offset = off + self.calculate_offset();
+
+        Ok((offset, rec.len()))
+
     }
 
     // Helper function to calculate offset
