@@ -4,7 +4,7 @@ pub mod wal;
 use std::fmt;
 use std::io;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct CorruptionError {
     kind: io::ErrorKind,
     message: String,

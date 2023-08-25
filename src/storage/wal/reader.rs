@@ -90,6 +90,14 @@ impl MultiSegmentReader {
 
         Ok(())
     }
+
+    fn current_segment_id(&self) -> u64 {
+        self.segs[self.cur].id
+    }
+
+    fn current_offset(&self) -> usize {
+        self.off
+    }
 }
 
 impl Read for MultiSegmentReader {
@@ -122,6 +130,7 @@ pub struct Reader {
     buf: [u8; BLOCK_SIZE],
     total_read: usize,
     cur_rec_type: RecordType,
+    err: Option<CorruptionError>,
 }
 
 impl Reader {
@@ -132,6 +141,7 @@ impl Reader {
             buf: [0u8; BLOCK_SIZE],
             total_read: 0,
             cur_rec_type: RecordType::Empty,
+            err: None,
         }
     }
 
@@ -186,19 +196,22 @@ impl Reader {
     }
 
     pub(crate) fn read(&mut self) -> Result<(&[u8], u64), CorruptionError> {
+        if let Some(err) = self.err.as_ref() {
+            return Err(err.clone());
+        }
+
         match self.next() {
             Ok(_) => (),
             Err(e) => {
-                let (segment_id, offset) = (self.rdr.segs[self.rdr.cur].id, self.rdr.off);
-                return Err(CorruptionError::new(
-                    e.kind(),
-                    e.to_string().as_str(),
-                    segment_id,
-                    offset,
-                ));
+                let (segment_id, offset) =
+                    (self.rdr.current_segment_id(), self.rdr.current_offset());
+                let err =
+                    CorruptionError::new(e.kind(), e.to_string().as_str(), segment_id, offset);
+                self.err = Some(err.clone());
+                return Err(err);
             }
         }
-        Ok((&self.rec, self.rdr.off as u64))
+        Ok((&self.rec, self.rdr.current_offset() as u64))
     }
 
     // TODO: prevent reads when error is encountered
@@ -268,34 +281,13 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Seek, Write};
+    use std::vec::Vec;
 
     use crate::storage::wal::wal::WAL;
-    use crate::storage::{Options, Segment, WAL_RECORD_HEADER_SIZE};
+    use crate::storage::{read_file_header, Options, Segment, WAL_RECORD_HEADER_SIZE};
     use tempdir::TempDir;
-
-    // Create a mock file that implements Read and Seek traits for testing
-    struct MockFile {
-        data: Vec<u8>,
-        position: usize,
-    }
-
-    impl Read for MockFile {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let bytes_read = buf.len().min(self.data.len() - self.position);
-            buf[..bytes_read]
-                .copy_from_slice(&self.data[self.position..self.position + bytes_read]);
-            self.position += bytes_read;
-            Ok(bytes_read)
-        }
-    }
-
-    impl Seek for MockFile {
-        fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
-            Ok(0)
-        }
-    }
 
     // BufferReader does not return EOF when the underlying reader returns 0 bytes read.
     #[test]
@@ -630,6 +622,8 @@ mod tests {
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![7, 8, 9]);
         assert_eq!(reader.total_read, 8203);
+
+        drop(temp_dir);
     }
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
@@ -671,6 +665,8 @@ mod tests {
         }
 
         assert_eq!(i, 1000);
+
+        drop(temp_dir);
     }
 
     #[test]
@@ -698,6 +694,8 @@ mod tests {
         }
 
         assert_eq!(i, 3000);
+
+        drop(temp_dir);
     }
 
     #[test]
@@ -708,11 +706,10 @@ mod tests {
         let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
         let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
 
-        // Define the size of each record
-        let record_size = 4; // Choose an appropriate record size
+        let record_size = 4;
 
         // Define the number of records to append
-        let num_records = 10000; // Choose an appropriate number of records
+        let num_records = 10000;
 
         for _ in 0..num_records {
             let data: Vec<u8> = (0..record_size).map(|i| (i & 0xFF) as u8).collect();
@@ -735,8 +732,60 @@ mod tests {
         }
 
         assert_eq!(i, num_records);
+
+        drop(temp_dir);
     }
 
-    // TODO: add test with wal
-    // TODO: add test for wal repair
+    #[test]
+    fn test_reader_for_corrupt_record() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create sample segment file and populate it with data
+        let mut segment1 = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
+        segment1.append(&[5, 6, 7, 8]).expect("should append");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&segment1.file_path)
+            .expect("should open");
+
+        // Read the file header and move the cursor to the first record
+        read_file_header(&mut file).expect("should read");
+
+        let offset_to_edit = 162; // The Checksum is at offset 162
+        let new_byte_value = 0x55; // Corrupt the byte at the offset
+
+        // Seek to the desired offset
+        file.seek(SeekFrom::Start(offset_to_edit as u64))
+            .expect("should seek");
+
+        // Write the new byte value at the offset
+        file.write_all(&[new_byte_value]).expect("should write");
+
+        assert!(segment1.close().is_ok());
+
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+            .expect("should read segments");
+
+        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+        let rec = reader.read().expect("should read");
+        assert_eq!(rec.0, vec![1, 2, 3, 4]);
+        assert_eq!(reader.total_read, 12);
+
+        let err = reader.read().expect_err("should get checksum error");
+        assert_eq!(err.message, "unexpected checksum");
+        assert_eq!(err.segment_id, 4);
+        assert_eq!(err.offset, 24);
+
+        let err = reader.read().expect_err("should not read further");
+        assert_eq!(err.message, "unexpected checksum");
+        assert_eq!(err.segment_id, 4);
+        assert_eq!(err.offset, 24);
+
+        drop(temp_dir);
+    }
+
+    // TODO: add tests for wal repair
 }

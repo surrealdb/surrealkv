@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use crate::storage::wal::reader::{MultiSegmentReader, Reader};
+use crate::storage::WAL_RECORD_HEADER_SIZE;
 use crate::storage::{get_segment_range, Options, Segment, SegmentRef};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
@@ -28,7 +29,7 @@ pub struct WAL {
     closed: bool,
 
     /// A read-write lock used to synchronize concurrent access to the WAL instance.
-    mutex: RwLock<()>,
+    mutex: RwLock<()>, // TODO: Lock only the active segment
 }
 
 impl WAL {
@@ -121,8 +122,12 @@ impl WAL {
         // Calculate available space in the active segment
         let available = opts.max_file_size - self.active_segment.offset();
 
+        // The WAL record header size is added to the record length to account for the
+        // header that is prepended to each record when it is written to the segment.
+        let rec_len = rec.len() as u64 + WAL_RECORD_HEADER_SIZE as u64;
+
         // If space is not available, create a new segment
-        if rec.len() as u64 > available {
+        if rec_len > available {
             // Rotate to a new segment
 
             // Sync and close the active segment
