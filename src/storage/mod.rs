@@ -1371,12 +1371,26 @@ mod tests {
             buf: [0; 4096],
         };
         assert_eq!(block.remaining(), 3996 - WAL_RECORD_HEADER_SIZE);
+
+        let block: Block<4096, 0> = Block {
+            written: 100,
+            flushed: 0,
+            buf: [0; 4096],
+        };
+        assert_eq!(block.remaining(), 3996);
     }
 
     #[test]
     fn test_is_full() {
         let block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
             written: 4096 - WAL_RECORD_HEADER_SIZE,
+            flushed: 0,
+            buf: [0; 4096],
+        };
+        assert!(block.is_full());
+
+        let block: Block<4096, 0> = Block {
+            written: 4096,
             flushed: 0,
             buf: [0; 4096],
         };
@@ -1395,39 +1409,6 @@ mod tests {
         assert_eq!(block.written, 0);
         assert_eq!(block.flushed, 0);
     }
-
-    // #[test]
-    // fn test_remaining() {
-    //     let block: Block<4096> = Block {
-    //         alloc: 100,
-    //         flushed: 0,
-    //         buf: [0; 4096],
-    //     };
-    //     assert_eq!(block.remaining(), 3996);
-    // }
-
-    // #[test]
-    // fn test_is_full() {
-    //     let block: Block<4096> = Block {
-    //         alloc: 4096,
-    //         flushed: 0,
-    //         buf: [0; 4096],
-    //     };
-    //     assert!(block.is_full());
-    // }
-
-    // #[test]
-    // fn test_reset() {
-    //     let mut block: Block<4096> = Block {
-    //         alloc: 100,
-    //         flushed: 0,
-    //         buf: [1; 4096],
-    //     };
-    //     block.reset();
-    //     assert_eq!(block.buf, [0; 4096]);
-    //     assert_eq!(block.written, 0);
-    //     assert_eq!(block.flushed, 0);
-    // }
 
     #[test]
     fn test_aol_append() {
@@ -1763,7 +1744,10 @@ mod tests {
         let mut bs = vec![0; 15];
         let n = segment.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
+        assert_eq!(
+            &[4, 5, 6, 7, 8, 9, 10].to_vec(),
+            &bs[WAL_RECORD_HEADER_SIZE..]
+        );
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];

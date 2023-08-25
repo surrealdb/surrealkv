@@ -378,7 +378,10 @@ mod tests {
         let mut bs = vec![0; 15];
         let n = a.read_at(&mut bs, 12).expect("should read");
         assert_eq!(15, n);
-        assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
+        assert_eq!(
+            &[4, 5, 6, 7, 8, 9, 10].to_vec(),
+            &bs[WAL_RECORD_HEADER_SIZE..]
+        );
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];

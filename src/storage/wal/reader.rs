@@ -5,7 +5,8 @@ use std::vec::Vec;
 
 use crate::storage::wal::CorruptionError;
 use crate::storage::{
-    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
+    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE,
+    WAL_RECORD_HEADER_SIZE,
 };
 
 pub struct MultiSegmentReader {
