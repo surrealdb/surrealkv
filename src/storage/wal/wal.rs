@@ -142,7 +142,7 @@ impl WAL {
         let (off, _) = self.active_segment.append(&rec)?;
         offset = off + self.calculate_offset();
 
-        Ok((offset, rec.len()))
+        Ok((offset, rec.len() + WAL_RECORD_HEADER_SIZE))
     }
 
     // Helper function to calculate offset
@@ -355,12 +355,12 @@ mod tests {
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(12, r.unwrap().1);
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(7, r.unwrap().1);
+        assert_eq!(15, r.unwrap().1);
 
         // Validate offset after appending
         // 8 + 4 + 8 + 7 = 27
@@ -396,7 +396,7 @@ mod tests {
         // Test appending another buffer after syncing
         let r = a.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(12, r.unwrap().1);
 
         // Validate offset after appending
         // 4096 + 8 + 4 = 4108
@@ -415,7 +415,78 @@ mod tests {
         // Validate offset after syncing again
         assert_eq!(a.offset(), 4096 * 2);
 
-        // Test closing segment
+        // Test closing wal
+        assert!(a.close().is_ok());
+
+        // Cleanup: Drop the temp directory, which deletes its contents
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_wal_reopen() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let opts = Options::default().with_wal();
+        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+
+        // Test appending a non-empty buffer
+        let r = a.append(&[0, 1, 2, 3]);
+        assert!(r.is_ok());
+        assert_eq!(12, r.unwrap().1);
+
+        // Test closing wal
+        assert!(a.close().is_ok());
+
+        // Reopen the wal
+        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should open aol");
+
+        // Test appending another buffer
+        let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(15, r.unwrap().1);
+
+        // Validate offset after appending
+        // 4096 + 8 + 7 = 4111
+        assert_eq!(a.offset(), 4111);
+
+        // Test reading from segment
+        let mut bs = vec![0; 12];
+        let n = a.read_at(&mut bs, 0).expect("should read");
+        assert_eq!(12, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
+
+        // Test reading another portion of data from segment
+        let mut bs = vec![0; 15];
+        let n = a.read_at(&mut bs, 4096).expect("should read");
+        assert_eq!(15, n);
+        assert_eq!(
+            &[4, 5, 6, 7, 8, 9, 10].to_vec(),
+            &bs[WAL_RECORD_HEADER_SIZE..]
+        );
+
+        // Test reading beyond segment's current size
+        let mut bs = vec![0; 15];
+        let r = a.read_at(&mut bs, 4097);
+        assert!(r.is_err());
+
+        // Test appending another buffer after syncing
+        let r = a.append(&[11, 12, 13, 14]);
+        assert!(r.is_ok());
+        assert_eq!(12, r.unwrap().1);
+
+        // Validate offset after appending
+        // 4111 + 8 + 4 = 4123
+        assert_eq!(a.offset(), 4123);
+
+        // Test reading from segment after appending
+        let mut bs = vec![0; 12];
+        let n = a.read_at(&mut bs, 4111).expect("should read");
+        assert_eq!(12, n);
+        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
+
+        // Test closing wal
         assert!(a.close().is_ok());
 
         // Cleanup: Drop the temp directory, which deletes its contents

@@ -214,7 +214,6 @@ impl Reader {
         Ok((&self.rec, self.rdr.current_offset() as u64))
     }
 
-    // TODO: prevent reads when error is encountered
     fn next(&mut self) -> Result<(), io::Error> {
         self.rec.clear();
         let mut i = 0;
@@ -376,9 +375,7 @@ mod tests {
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
 
-        // Cleanup: Drop the temp directory, which deletes its contents
         assert!(segment.close().is_ok());
-        drop(temp_dir);
     }
 
     #[test]
@@ -427,10 +424,8 @@ mod tests {
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
 
-        // Cleanup: Drop the temp directory, which deletes its contents
         assert!(segment1.close().is_ok());
         assert!(segment2.close().is_ok());
-        drop(temp_dir);
     }
 
     #[test]
@@ -473,9 +468,7 @@ mod tests {
         assert_eq!(bytes_read, 50);
         assert_eq!(buf_reader.off, 100);
 
-        // Cleanup: Drop the temp directory, which deletes its contents
         assert!(segment.close().is_ok());
-        drop(temp_dir);
     }
 
     #[test]
@@ -512,9 +505,7 @@ mod tests {
         assert_eq!(buf_reader.off, 100);
         assert!(read_buffer.iter().all(|&byte| byte == 0));
 
-        // Cleanup: Drop the temp directory, which deletes its contents
         assert!(segment.close().is_ok());
-        drop(temp_dir);
     }
 
     #[test]
@@ -565,10 +556,8 @@ mod tests {
         let mut bs = [0u8; 12];
         buf_reader.read(&mut bs).expect_err("should not read");
 
-        // Cleanup: Drop the temp directory, which deletes its contents
         assert!(segment1.close().is_ok());
         assert!(segment2.close().is_ok());
-        drop(temp_dir);
     }
 
     #[test]
@@ -590,8 +579,6 @@ mod tests {
         assert!(sr[0].id == 4);
         assert!(sr[1].id == 6);
         assert!(sr[2].id == 8);
-
-        drop(temp_dir);
     }
 
     #[test]
@@ -622,8 +609,6 @@ mod tests {
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![7, 8, 9]);
         assert_eq!(reader.total_read, 8203);
-
-        drop(temp_dir);
     }
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
@@ -665,8 +650,6 @@ mod tests {
         }
 
         assert_eq!(i, 1000);
-
-        drop(temp_dir);
     }
 
     #[test]
@@ -694,8 +677,6 @@ mod tests {
         }
 
         assert_eq!(i, 3000);
-
-        drop(temp_dir);
     }
 
     #[test]
@@ -715,7 +696,7 @@ mod tests {
             let data: Vec<u8> = (0..record_size).map(|i| (i & 0xFF) as u8).collect();
             let r = a.append(&data);
             assert!(r.is_ok());
-            assert_eq!(data.len(), r.unwrap().1);
+            assert_eq!(data.len() + WAL_RECORD_HEADER_SIZE, r.unwrap().1);
         }
 
         a.sync().expect("should sync");
@@ -732,60 +713,107 @@ mod tests {
         }
 
         assert_eq!(i, num_records);
-
-        drop(temp_dir);
     }
 
     #[test]
-    fn test_reader_for_corrupt_record() {
+    fn test_wal_repair() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create sample segment file and populate it with data
-        let mut segment1 = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
-        segment1.append(&[5, 6, 7, 8]).expect("should append");
+        let mut segment = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
+        segment.append(&[5, 6, 7, 8]).expect("should append");
 
+        // Open the segment file for reading and writing
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&segment1.file_path)
+            .open(&segment.file_path)
             .expect("should open");
 
         // Read the file header and move the cursor to the first record
         read_file_header(&mut file).expect("should read");
 
-        let offset_to_edit = 162; // The Checksum is at offset 162
-        let new_byte_value = 0x55; // Corrupt the byte at the offset
-
-        // Seek to the desired offset
+        // Corrupt the checksum of the second record
+        let offset_to_edit = 162;
+        let new_byte_value = 0x55;
         file.seek(SeekFrom::Start(offset_to_edit as u64))
             .expect("should seek");
-
-        // Write the new byte value at the offset
         file.write_all(&[new_byte_value]).expect("should write");
 
-        assert!(segment1.close().is_ok());
+        // Close the segment file
+        assert!(segment.close().is_ok());
 
-        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
-            .expect("should read segments");
+        // Read and repair the corrupted segment
+        let corrupted_segment_id;
+        let corrupted_offset_marker;
 
-        let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
-        let rec = reader.read().expect("should read");
-        assert_eq!(rec.0, vec![1, 2, 3, 4]);
-        assert_eq!(reader.total_read, 12);
+        {
+            let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+                .expect("should read segments");
 
-        let err = reader.read().expect_err("should get checksum error");
-        assert_eq!(err.message, "unexpected checksum");
-        assert_eq!(err.segment_id, 4);
-        assert_eq!(err.offset, 24);
+            let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
 
-        let err = reader.read().expect_err("should not read further");
-        assert_eq!(err.message, "unexpected checksum");
-        assert_eq!(err.segment_id, 4);
-        assert_eq!(err.offset, 24);
+            // Read the valid records before corruption
+            let rec = reader.read().expect("should read");
+            assert_eq!(rec.0, vec![1, 2, 3, 4]);
+            assert_eq!(reader.total_read, 12);
 
-        drop(temp_dir);
+            // Simulate a checksum error
+            let err = reader.read().expect_err("should get checksum error");
+            assert_eq!(err.message, "unexpected checksum");
+            assert_eq!(err.segment_id, 4);
+            assert_eq!(err.offset, 24);
+
+            corrupted_segment_id = err.segment_id;
+            corrupted_offset_marker = err.offset as u64;
+        }
+
+        // Repair the corrupted segment
+        let opts = Options::default().with_wal();
+        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create wal");
+        a.repair(corrupted_segment_id, corrupted_offset_marker)
+            .expect("should repair");
+
+        // Verify the repaired segment
+        {
+            let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+                .expect("should read segments");
+
+            let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+
+            // Read the valid records after repair
+            let rec = reader.read().expect("should read");
+            assert_eq!(rec.0, vec![1, 2, 3, 4]);
+            assert_eq!(reader.total_read, 12);
+
+            // Ensure no further records can be read
+            reader.read().expect_err("should not read");
+        }
+
+        // Append new data to the repaired segment
+        let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(15, r.unwrap().1);
+        assert!(a.close().is_ok());
+
+        // Verify the appended data
+        {
+            let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+                .expect("should read segments");
+
+            let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
+
+            // Read the valid records after append
+            let rec = reader.read().expect("should read");
+            assert_eq!(rec.0, vec![1, 2, 3, 4]);
+            assert_eq!(reader.total_read, 12);
+
+            let rec = reader.read().expect("should read");
+            assert_eq!(rec.0, vec![4, 5, 6, 7, 8, 9, 10]);
+            assert_eq!(reader.total_read, 4111);
+        }
     }
 
-    // TODO: add tests for wal repair
+    // TODO: add more tests for wal repair
 }
