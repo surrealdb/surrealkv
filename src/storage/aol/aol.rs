@@ -50,13 +50,13 @@ impl AOL {
         opts.validate()?;
 
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(&dir, &opts)?;
+        Self::prepare_directory(dir, opts)?;
 
         // Determine the active segment ID
-        let active_segment_id = Self::calculate_active_segment_id(&dir)?;
+        let active_segment_id = Self::calculate_active_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(&dir, active_segment_id, &opts)?;
+        let active_segment = Segment::open(dir, active_segment_id, opts)?;
 
         Ok(Self {
             active_segment,
@@ -70,12 +70,12 @@ impl AOL {
 
     // Helper function to prepare the directory with proper permissions
     fn prepare_directory(dir: &Path, opts: &Options) -> io::Result<()> {
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir)?;
 
-        if let Ok(metadata) = fs::metadata(&dir) {
+        if let Ok(metadata) = fs::metadata(dir) {
             let mut permissions = metadata.permissions();
             permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-            fs::set_permissions(&dir, permissions)?;
+            fs::set_permissions(dir, permissions)?;
         }
 
         Ok(())
@@ -83,7 +83,7 @@ impl AOL {
 
     // Helper function to calculate the active segment ID
     fn calculate_active_segment_id(dir: &Path) -> io::Result<u64> {
-        let (_, last) = get_segment_range(&dir)?;
+        let (_, last) = get_segment_range(dir)?;
         Ok(if last > 0 { last + 1 } else { 0 })
     }
 
@@ -121,12 +121,11 @@ impl AOL {
         // Get options and initialize variables
         let opts = &self.opts;
         let mut n = 0usize;
-        let mut available = 0;
         let mut offset = 0;
 
         while n < rec.len() {
             // Calculate available space in the active segment
-            available = opts.max_file_size - self.active_segment.offset();
+            let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
 
             // If space is not available, create a new segment
             if available <= 0 {
@@ -139,9 +138,6 @@ impl AOL {
                 self.active_segment_id += 1;
                 let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
                 self.active_segment = new_segment;
-
-                // Calculate available space in the new segment
-                available = opts.max_file_size;
             }
 
             // Calculate the amount of data to append
@@ -260,7 +256,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = AOL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -332,8 +328,5 @@ mod tests {
 
         // Test closing segment
         assert!(a.close().is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 }

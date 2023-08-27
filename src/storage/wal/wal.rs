@@ -47,13 +47,13 @@ impl WAL {
         opts.validate()?;
 
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(&dir, &opts)?;
+        Self::prepare_directory(dir, opts)?;
 
         // Determine the active segment ID
-        let active_segment_id = Self::calculate_active_segment_id(&dir)?;
+        let active_segment_id = Self::calculate_active_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(&dir, active_segment_id, &opts)?;
+        let active_segment = Segment::open(dir, active_segment_id, opts)?;
 
         Ok(Self {
             active_segment,
@@ -67,12 +67,12 @@ impl WAL {
 
     // Helper function to prepare the directory with proper permissions
     fn prepare_directory(dir: &Path, opts: &Options) -> io::Result<()> {
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir)?;
 
-        if let Ok(metadata) = fs::metadata(&dir) {
+        if let Ok(metadata) = fs::metadata(dir) {
             let mut permissions = metadata.permissions();
             permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-            fs::set_permissions(&dir, permissions)?;
+            fs::set_permissions(dir, permissions)?;
         }
 
         Ok(())
@@ -80,7 +80,7 @@ impl WAL {
 
     // Helper function to calculate the active segment ID
     fn calculate_active_segment_id(dir: &Path) -> io::Result<u64> {
-        let (_, last) = get_segment_range(&dir)?;
+        let (_, last) = get_segment_range(dir)?;
         Ok(if last > 0 { last + 1 } else { 0 })
     }
 
@@ -139,7 +139,7 @@ impl WAL {
             self.active_segment = new_segment;
         }
 
-        let (off, _) = self.active_segment.append(&rec)?;
+        let (off, _) = self.active_segment.append(rec)?;
         offset = off + self.calculate_offset();
 
         Ok((offset, rec.len() + WAL_RECORD_HEADER_SIZE))
@@ -272,7 +272,7 @@ impl WAL {
             corrupted_segment_info.unwrap();
 
         // Prepare the repaired segment path
-        let repaired_segment_path = corrupted_segment_path.clone().with_extension("repair");
+        let repaired_segment_path = corrupted_segment_path.with_extension("repair");
 
         // Rename the corrupted segment to the repaired segment
         std::fs::rename(&corrupted_segment_path, &repaired_segment_path)?;
@@ -342,7 +342,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -417,9 +417,6 @@ mod tests {
 
         // Test closing wal
         assert!(a.close().is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -429,7 +426,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
@@ -440,7 +437,7 @@ mod tests {
         assert!(a.close().is_ok());
 
         // Reopen the wal
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should open aol");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should open aol");
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
@@ -488,8 +485,5 @@ mod tests {
 
         // Test closing wal
         assert!(a.close().is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 }

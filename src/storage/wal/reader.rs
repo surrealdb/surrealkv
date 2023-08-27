@@ -108,10 +108,10 @@ impl Read for MultiSegmentReader {
 
         // TODO: could create a problem when reading a partial block spread over multiple segments
         if !self.is_eof()? {
-            return self.read_to_buffer(buf);
+            self.read_to_buffer(buf)
         } else {
             self.load_next_segment()?;
-            return self.read_to_buffer(buf);
+            self.read_to_buffer(buf)
         }
     }
 }
@@ -152,7 +152,7 @@ impl Reader {
                 "error reading first header byte",
             ));
         }
-        Ok((buf[0]))
+        Ok(buf[0])
     }
 
     fn read_remaining_header<R: Read>(
@@ -227,8 +227,8 @@ impl Reader {
             // If the first byte is 0, it's a padded page.
             // Read the rest of the page of zeros and continue.
             if self.cur_rec_type == RecordType::Empty {
-                let remaining = (BLOCK_SIZE - (self.total_read % BLOCK_SIZE)) as usize;
-                if remaining == BLOCK_SIZE as usize {
+                let remaining = BLOCK_SIZE - (self.total_read % BLOCK_SIZE);
+                if remaining == BLOCK_SIZE {
                     continue;
                 }
 
@@ -255,7 +255,7 @@ impl Reader {
 
             // Read the rest of the header.
             let (length, crc) = Self::read_remaining_header(&mut self.rdr, &mut self.buf)?;
-            self.total_read += (WAL_RECORD_HEADER_SIZE - 1);
+            self.total_read += WAL_RECORD_HEADER_SIZE - 1;
 
             // Read the record data.
             let (record_start, record_end) =
@@ -325,8 +325,7 @@ mod tests {
 
     fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
         let opts = Options::default().with_wal();
-        let mut segment =
-            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
         let r = segment.append(data);
         assert!(r.is_ok());
         assert_eq!(data.len(), r.unwrap().1);
@@ -385,10 +384,8 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment1 =
-            Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 =
-            Segment::open(&temp_dir.path(), 1, &opts).expect("should create segment");
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment1.append(&[0, 1, 2, 3]);
@@ -435,7 +432,7 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment.append(&[1, 2, 3, 4]);
@@ -478,7 +475,7 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment.append(&[1, 2, 3, 4]);
@@ -515,10 +512,8 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment1 =
-            Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 =
-            Segment::open(&temp_dir.path(), 1, &opts).expect("should create segment");
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment1.append(&[0, 1, 2, 3]);
@@ -613,8 +608,7 @@ mod tests {
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
         let opts = Options::default().with_wal();
-        let mut segment =
-            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 
         let record_size = 4;
         let num_records = 1000;
@@ -685,7 +679,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
 
         let record_size = 4;
 
@@ -771,7 +765,7 @@ mod tests {
 
         // Repair the corrupted segment
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create wal");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create wal");
         a.repair(corrupted_segment_id, corrupted_offset_marker)
             .expect("should repair");
 
