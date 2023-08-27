@@ -130,7 +130,8 @@ impl CompressionLevel {
 /// # Type Parameters
 ///
 /// - `BLOCK_SIZE`: The size of the block in bytes.
-pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> {
+/// - `RECORD_HEADER_SIZE`: The size of the record header in bytes.
+pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize> {
     /// The number of bytes currently written in the block.
     written: usize,
 
@@ -141,7 +142,7 @@ pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> {
     buf: [u8; BLOCK_SIZE],
 }
 
-impl<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> Block<BLOCK_SIZE, RECORD_SIZE> {
+impl<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize> Block<BLOCK_SIZE, RECORD_HEADER_SIZE> {
     fn new() -> Self {
         Block {
             written: 0,
@@ -151,11 +152,11 @@ impl<const BLOCK_SIZE: usize, const RECORD_SIZE: usize> Block<BLOCK_SIZE, RECORD
     }
 
     fn remaining(&self) -> usize {
-        BLOCK_SIZE - self.written - RECORD_SIZE
+        BLOCK_SIZE - self.written - RECORD_HEADER_SIZE
     }
 
     fn is_full(&self) -> bool {
-        BLOCK_SIZE - self.written <= RECORD_SIZE
+        BLOCK_SIZE - self.written <= RECORD_HEADER_SIZE
     }
 
     fn reset(&mut self) {
@@ -431,11 +432,6 @@ impl Metadata {
         Ok(int_value)
     }
 
-    // fn get_int(&self, key: &str) -> Option<u64> {
-    //     // Use the generic get method to retrieve bytes and convert to u64
-    //     self.get(key)
-    //         .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
-    // }
 
     // Generic method to put a key-value pair into the data HashMap
     fn put(&mut self, key: &str, value: &[u8]) {
@@ -451,7 +447,7 @@ impl Metadata {
 /// Enum representing different types of records in a write-ahead log.
 ///
 /// This enumeration defines different types of records that can be used in a write-ahead log.
-/// Each frame type indicates a particular state of a record in the log. The enum variants
+/// Each record type indicates a particular state of a record in the log. The enum variants
 /// represent various stages of a record, including full records, fragments, and special cases.
 ///
 /// # Variants
@@ -497,7 +493,7 @@ impl RecordType {
 ///	    | Type | Reserved |    Length   |         CRC32             |
 ///	    +------+----------+------+------+------+------+------+------+
 ///   
-fn encode_record(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
+fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     let typ = if i == 0 && part.len() == rec_len {
         RecordType::Full
     } else if part.len() == rec_len {
@@ -515,9 +511,6 @@ fn encode_record(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     let len_part = part.len() as u16;
     buf[2..4].copy_from_slice(&len_part.to_be_bytes());
     buf[4..8].copy_from_slice(&crc.to_be_bytes());
-
-    // Copy the 'part' into the buffer starting from the WAL_RECORD_HEADER_SIZE offset
-    merge_slices(&mut buf[WAL_RECORD_HEADER_SIZE..], part); // Pass a mutable reference to buf
 }
 
 // Reads a field from the given reader
@@ -999,11 +992,11 @@ impl Segment {
     ///
     /// # Parameters
     ///
-    /// - `buf`: The data to be appended.
+    /// - `rec`: The data to be appended.
     ///
     /// # Returns
     ///
-    /// Returns the number of bytes successfully appended.
+    /// Returns the offset, and the number of bytes successfully appended.
     ///
     /// # Errors
     ///
@@ -1042,7 +1035,9 @@ impl Segment {
         let buf = &mut active_block.buf[active_block.written..];
 
         if self.is_wal {
-            encode_record(buf, rec.len(), partial_record, i);
+            encode_record_header(buf, rec.len(), partial_record, i);
+            // Copy the 'partial_record' into the buffer starting from the WAL_RECORD_HEADER_SIZE offset
+            merge_slices(&mut buf[WAL_RECORD_HEADER_SIZE..], partial_record);
             active_block.written += partial_record.len() + WAL_RECORD_HEADER_SIZE;
         } else {
             merge_slices(buf, partial_record);

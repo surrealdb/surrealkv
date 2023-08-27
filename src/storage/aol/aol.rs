@@ -9,7 +9,12 @@ use crate::storage::{get_segment_range, Options, Segment};
 
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
-/// making it suitable for use cases like write-ahead logging.
+/// making it suitable for use cases like storing large amounts of data and 
+/// writing data in a sequential manner. This is useful for applications which
+/// need to store large amounts of data separately in a variety of files, and
+/// store only the offsets of the files in the main data structure. Useful for
+/// WISCKEY implementation where we need to store the key-value pairs in a
+/// separate file and store only the offsets in the main data structure.
 pub struct AOL {
     /// The currently active segment where data is being written.
     active_segment: Segment,
