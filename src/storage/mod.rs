@@ -507,9 +507,10 @@ fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     buf[0] = typ as u8;
     // Explicitly zero Reserved bytes just in case
     buf[1] = 0;
-    let crc = calculate_crc32(part);
     let len_part = part.len() as u16;
     buf[2..4].copy_from_slice(&len_part.to_be_bytes());
+    // calculate the CRC32 checksum based on the record type and data
+    let crc = calculate_crc32(&buf[0..1], part);
     buf[4..8].copy_from_slice(&crc.to_be_bytes());
 }
 
@@ -677,8 +678,9 @@ fn validate_record_type(record_type: &RecordType, i: usize) -> Result<(), io::Er
     Ok(())
 }
 
-fn calculate_crc32(data: &[u8]) -> u32 {
+fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
+    hasher.update(record_type);
     hasher.update(data);
     hasher.finalize()
 }

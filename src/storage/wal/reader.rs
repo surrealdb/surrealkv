@@ -187,7 +187,7 @@ impl Reader {
         }
 
         // Validate the checksum.
-        let calculated_crc = calculate_crc32(&buf[record_start..record_end]);
+        let calculated_crc = calculate_crc32(&buf[0..1],&buf[record_start..record_end]);
         if calculated_crc != crc {
             return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
         }
