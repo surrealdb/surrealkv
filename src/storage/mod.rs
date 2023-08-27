@@ -267,7 +267,7 @@ impl Options {
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.max_file_size <= 0 {
+        if self.max_file_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid max_file_size",
@@ -756,7 +756,7 @@ fn list_segment_ids(dir: &Path) -> io::Result<Vec<u64>> {
         refs.push(index);
     }
 
-    refs.sort_by(|a, b| a.cmp(&b));
+    refs.sort();
 
     Ok(refs)
 }
@@ -847,9 +847,6 @@ pub(crate) struct Segment {
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, WAL_RECORD_HEADER_SIZE>,
 
-    /// The number of blocks that have been written to the segment.
-    written_blocks: usize,
-
     /// The underlying file for storing the segment's data.
     file: File,
 
@@ -889,7 +886,7 @@ impl Segment {
             let header = read_file_header(&mut file)?;
             validate_file_header(&header, id, opts)?;
 
-            file_header_offset += (4 + header.len());
+            file_header_offset += 4 + header.len();
             let (index, _) = parse_segment_name(&file_name)?;
             if index != id {
                 return Err(io::Error::new(
@@ -912,10 +909,9 @@ impl Segment {
             file,
             file_header_offset: file_header_offset as u64,
             file_offset: file_offset - file_header_offset as u64,
-            file_path: file_path,
+            file_path,
             id,
             closed: false,
-            written_blocks: 0,
             block: Block::new(),
             is_wal: opts.is_wal,
         })
@@ -976,7 +972,6 @@ impl Segment {
         // We flushed an entire block, prepare a new one.
         if clear {
             p.reset();
-            self.written_blocks += 1;
         }
 
         Ok(())
@@ -1236,7 +1231,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
-            .open(&segment_path)
+            .open(segment_path)
             .expect("should create file");
 
         let id = 0;
@@ -1250,9 +1245,6 @@ mod tests {
         // Validate the file header
         let result = validate_file_header(&header, id, &opts);
         assert!(result.is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -1269,7 +1261,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
-            .open(&segment_path)
+            .open(segment_path)
             .expect("should create file");
 
         let id = 0;
@@ -1286,9 +1278,6 @@ mod tests {
         // Validate the file header, expecting an error due to mismatched compression level
         let result = validate_file_header(&header, id, &opts);
         assert!(result.is_err()); // Header validation should throw an error
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -1414,7 +1403,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1486,9 +1475,6 @@ mod tests {
 
         // Test closing segment
         assert!(segment.close().is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -1498,7 +1484,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1506,7 +1492,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1519,7 +1505,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1550,7 +1536,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 4096);
@@ -1591,7 +1577,7 @@ mod tests {
         assert!(segment.close().is_ok());
 
         // Reopen segment
-        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
         // Test initial offset
         assert_eq!(segment.offset(), 4096 * 2);
 
@@ -1607,7 +1593,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1615,7 +1601,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1629,7 +1615,7 @@ mod tests {
         // Create segment options
         let opts = Options::default();
 
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1642,7 +1628,7 @@ mod tests {
         let mut corrupted_file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&segment_path)
+            .open(segment_path)
             .expect("should open corrupted file");
 
         corrupted_file
@@ -1650,11 +1636,8 @@ mod tests {
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
-        let reopened_segment = Segment::open(&temp_dir.path(), 0, &opts);
+        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts);
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -1666,7 +1649,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1683,14 +1666,11 @@ mod tests {
         assert!(n.is_err()); // Reading should fail
 
         // Reopen the closed segment
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should reopen segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
 
         // Try to perform operations on the reopened segment
         let r = segment.append(&[4, 5, 6, 7]);
         assert!(r.is_ok()); // Appending should succeed on reopened segment
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 
     #[test]
@@ -1700,7 +1680,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1775,8 +1755,5 @@ mod tests {
 
         // Test closing segment
         assert!(segment.close().is_ok());
-
-        // Cleanup: Drop the temp directory, which deletes its contents
-        drop(temp_dir);
     }
 }

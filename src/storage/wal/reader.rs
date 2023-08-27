@@ -11,14 +11,14 @@ use crate::storage::{
 
 pub struct MultiSegmentReader {
     buf: BufReader<File>,  // Buffer for reading from the current segment.
-    segs: Vec<SegmentRef>, // List of segments to read from.
-    cur: usize,            // Index of current segment in segs.
+    segments: Vec<SegmentRef>, // List of segments to read from.
+    cur: usize,            // Index of current segment in segments.
     off: usize,            // Offset in current segment.
 }
 
 impl MultiSegmentReader {
-    pub(crate) fn new(segs: Vec<SegmentRef>) -> Result<MultiSegmentReader, io::Error> {
-        if segs.is_empty() {
+    pub(crate) fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader, io::Error> {
+        if segments.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Empty segment list",
@@ -29,14 +29,14 @@ impl MultiSegmentReader {
         let off = 0;
 
         // Open the first segment's file for reading
-        let mut file = File::open(&segs[cur].file_path)?;
-        file.seek(SeekFrom::Start(segs[cur].file_header_offset))?;
+        let mut file = File::open(&segments[cur].file_path)?;
+        file.seek(SeekFrom::Start(segments[cur].file_header_offset))?;
 
         let buf = BufReader::new(file);
 
         Ok(MultiSegmentReader {
             buf,
-            segs,
+            segments,
             cur,
             off,
         })
@@ -74,15 +74,15 @@ impl MultiSegmentReader {
     }
 
     fn load_next_segment(&mut self) -> io::Result<()> {
-        if self.cur + 1 >= self.segs.len() {
+        if self.cur + 1 >= self.segments.len() {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
 
         self.cur += 1;
         self.off = 0;
 
-        let next_file = File::open(&self.segs[self.cur].file_path)?;
-        let header_offset = self.segs[self.cur].file_header_offset;
+        let next_file = File::open(&self.segments[self.cur].file_path)?;
+        let header_offset = self.segments[self.cur].file_header_offset;
         let mut next_buf_reader = BufReader::new(next_file);
         next_buf_reader.seek(SeekFrom::Start(header_offset))?;
 
@@ -92,7 +92,7 @@ impl MultiSegmentReader {
     }
 
     fn current_segment_id(&self) -> u64 {
-        self.segs[self.cur].id
+        self.segments[self.cur].id
     }
 
     fn current_offset(&self) -> usize {
@@ -102,26 +102,26 @@ impl MultiSegmentReader {
 
 impl Read for MultiSegmentReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.cur >= self.segs.len() {
+        if self.cur >= self.segments.len() {
             return Ok(0);
         }
 
         // TODO: could create a problem when reading a partial block spread over multiple segments
         if !self.is_eof()? {
-            return self.read_to_buffer(buf);
+            self.read_to_buffer(buf)
         } else {
             self.load_next_segment()?;
-            return self.read_to_buffer(buf);
+            self.read_to_buffer(buf)
         }
     }
 }
 
 // Reader reads records from a MultiSegmentReader. The records are returned in the order they were written.
-// The current implementation of Reader is inspired by prometheus reader implementation for the WAL, and
-// is also inspired by levelDB's log reader. Since the WAL is append-only, the records are written in frames
-// of BLOCK_SIZE bytes. The first byte of each frame is the record type, followed by a reserved byte, followed
-// by the record length (2 bytes) and the CRC32 checksum (4 bytes). The record data follows the checksum. The
-// frame structure in the WAL for rocksdb, pebble and prometheus are very similar to levelDB's log format.
+// The current implementation of Reader is inspired by levelDB and prometheus implementation for WAL.
+// Since the WAL is append-only, the records are written in frames of BLOCK_SIZE bytes. The first byte of 
+// each frame is the record type, followed by a reserved byte, followed by the record length (2 bytes) and 
+// the CRC32 checksum (4 bytes). The record data follows the checksum.
+//
 // No partial writes are allowed. If the segment is not full, and the record can't fit in the remaining space, the
 // segment is padded with zeros. This is important for the reader to be able to read the records in BLOCK_SIZE chunks.
 pub struct Reader {
@@ -152,7 +152,7 @@ impl Reader {
                 "error reading first header byte",
             ));
         }
-        Ok((buf[0]))
+        Ok(buf[0])
     }
 
     fn read_remaining_header<R: Read>(
@@ -176,7 +176,13 @@ impl Reader {
         buf: &mut [u8],
         length: u16,
         crc: u32,
+        rec_type: &RecordType,
+        current_index: usize,
     ) -> Result<(usize, usize), io::Error> {
+        // Validate the record type.
+        validate_record_type(rec_type, current_index)?;
+
+
         let record_start = WAL_RECORD_HEADER_SIZE;
         let record_end = record_start + length as usize;
         if rdr.read_exact(&mut buf[record_start..record_end]).is_err() {
@@ -227,8 +233,8 @@ impl Reader {
             // If the first byte is 0, it's a padded page.
             // Read the rest of the page of zeros and continue.
             if self.cur_rec_type == RecordType::Empty {
-                let remaining = (BLOCK_SIZE - (self.total_read % BLOCK_SIZE)) as usize;
-                if remaining == BLOCK_SIZE as usize {
+                let remaining = BLOCK_SIZE - (self.total_read % BLOCK_SIZE);
+                if remaining == BLOCK_SIZE {
                     continue;
                 }
 
@@ -244,22 +250,19 @@ impl Reader {
                 if !zeros.iter().all(|&c| c == 0) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
-                        "unexpected non-zero byte in padded block",
+                        "non-zero byte in current block",
                     ));
                 }
                 continue;
             }
 
-            // Validate the record type.
-            validate_record_type(&self.cur_rec_type, i)?;
-
             // Read the rest of the header.
             let (length, crc) = Self::read_remaining_header(&mut self.rdr, &mut self.buf)?;
-            self.total_read += (WAL_RECORD_HEADER_SIZE - 1);
+            self.total_read += WAL_RECORD_HEADER_SIZE - 1;
 
             // Read the record data.
             let (record_start, record_end) =
-                Self::read_and_validate_record(&mut self.rdr, &mut self.buf, length, crc)?;
+                Self::read_and_validate_record(&mut self.rdr, &mut self.buf, length, crc, &self.cur_rec_type, i)?;
             self.total_read += length as usize;
 
             // Copy the record data to the output buffer.
@@ -325,8 +328,7 @@ mod tests {
 
     fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
         let opts = Options::default().with_wal();
-        let mut segment =
-            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
         let r = segment.append(data);
         assert!(r.is_ok());
         assert_eq!(data.len(), r.unwrap().1);
@@ -385,10 +387,8 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment1 =
-            Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 =
-            Segment::open(&temp_dir.path(), 1, &opts).expect("should create segment");
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment1.append(&[0, 1, 2, 3]);
@@ -435,7 +435,7 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment.append(&[1, 2, 3, 4]);
@@ -478,7 +478,7 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment.append(&[1, 2, 3, 4]);
@@ -515,10 +515,8 @@ mod tests {
 
         // Create a sample segment file and populate it with data
         let opts = Options::default().with_wal();
-        let mut segment1 =
-            Segment::open(&temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 =
-            Segment::open(&temp_dir.path(), 1, &opts).expect("should create segment");
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
 
         // Test appending a non-empty buffer
         let r = segment1.append(&[0, 1, 2, 3]);
@@ -613,8 +611,7 @@ mod tests {
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
         let opts = Options::default().with_wal();
-        let mut segment =
-            Segment::open(&temp_dir.path(), id, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 
         let record_size = 4;
         let num_records = 1000;
@@ -685,7 +682,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
 
         let record_size = 4;
 
@@ -771,7 +768,7 @@ mod tests {
 
         // Repair the corrupted segment
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(&temp_dir.path(), &opts).expect("should create wal");
+        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create wal");
         a.repair(corrupted_segment_id, corrupted_offset_marker)
             .expect("should repair");
 
