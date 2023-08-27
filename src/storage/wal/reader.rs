@@ -166,8 +166,8 @@ impl Reader {
             ));
         }
 
-        let length = u16::from_be_bytes([buf[2], buf[3]]);
-        let crc = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let length = u16::from_be_bytes([buf[1], buf[2]]);
+        let crc = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
         Ok((length, crc))
     }
 
@@ -187,7 +187,7 @@ impl Reader {
         }
 
         // Validate the checksum.
-        let calculated_crc = calculate_crc32(&buf[0..1],&buf[record_start..record_end]);
+        let calculated_crc = calculate_crc32(&buf[0..1], &buf[record_start..record_end]);
         if calculated_crc != crc {
             return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
         }
@@ -361,18 +361,18 @@ mod tests {
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
 
         // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 12);
+        assert_eq!(bytes_read, 11);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read second record from the MultiSegmentReader
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 12);
+        assert_eq!(bytes_read, 11);
         assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");
 
         assert!(segment.close().is_ok());
@@ -410,18 +410,18 @@ mod tests {
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
 
         // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 12);
+        assert_eq!(bytes_read, 11);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read second record from the MultiSegmentReader
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 12);
+        assert_eq!(bytes_read, 11);
         assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");
 
         assert!(segment1.close().is_ok());
@@ -452,7 +452,7 @@ mod tests {
         let mut bs = [0u8; 50];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
         assert_eq!(buf_reader.off, 50);
 
         let mut read_buffer = [0u8; 50];
@@ -496,7 +496,7 @@ mod tests {
         let mut bs = [0u8; 50];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
         assert_eq!(buf_reader.off, 50);
 
         let mut read_buffer = [0u8; 50];
@@ -545,15 +545,15 @@ mod tests {
         let mut bs = [0u8; BLOCK_SIZE];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
 
         // Read second record from the MultiSegmentReader
         let mut bs = [0u8; BLOCK_SIZE];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..12]);
+        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
 
-        let mut bs = [0u8; 12];
+        let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");
 
         assert!(segment1.close().is_ok());
@@ -600,15 +600,15 @@ mod tests {
         let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![1, 2, 3, 4]);
-        assert_eq!(reader.total_read, 12);
+        assert_eq!(reader.total_read, 11);
 
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![5, 6]);
-        assert_eq!(reader.total_read, 4106);
+        assert_eq!(reader.total_read, 4105);
 
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![7, 8, 9]);
-        assert_eq!(reader.total_read, 8203);
+        assert_eq!(reader.total_read, 8202);
     }
 
     fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
@@ -757,13 +757,13 @@ mod tests {
             // Read the valid records before corruption
             let rec = reader.read().expect("should read");
             assert_eq!(rec.0, vec![1, 2, 3, 4]);
-            assert_eq!(reader.total_read, 12);
+            assert_eq!(reader.total_read, 11);
 
             // Simulate a checksum error
             let err = reader.read().expect_err("should get checksum error");
             assert_eq!(err.message, "unexpected checksum");
             assert_eq!(err.segment_id, 4);
-            assert_eq!(err.offset, 24);
+            assert_eq!(err.offset, 22);
 
             corrupted_segment_id = err.segment_id;
             corrupted_offset_marker = err.offset as u64;
@@ -785,7 +785,7 @@ mod tests {
             // Read the valid records after repair
             let rec = reader.read().expect("should read");
             assert_eq!(rec.0, vec![1, 2, 3, 4]);
-            assert_eq!(reader.total_read, 12);
+            assert_eq!(reader.total_read, 11);
 
             // Ensure no further records can be read
             reader.read().expect_err("should not read");
@@ -794,7 +794,7 @@ mod tests {
         // Append new data to the repaired segment
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(15, r.unwrap().1);
+        assert_eq!(14, r.unwrap().1);
         assert!(a.close().is_ok());
 
         // Verify the appended data
@@ -807,11 +807,11 @@ mod tests {
             // Read the valid records after append
             let rec = reader.read().expect("should read");
             assert_eq!(rec.0, vec![1, 2, 3, 4]);
-            assert_eq!(reader.total_read, 12);
+            assert_eq!(reader.total_read, 11);
 
             let rec = reader.read().expect("should read");
             assert_eq!(rec.0, vec![4, 5, 6, 7, 8, 9, 10]);
-            assert_eq!(reader.total_read, 4111);
+            assert_eq!(reader.total_read, 4110);
         }
     }
 

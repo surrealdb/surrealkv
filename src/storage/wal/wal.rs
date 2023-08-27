@@ -355,16 +355,16 @@ mod tests {
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(12, r.unwrap().1);
+        assert_eq!(11, r.unwrap().1);
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(15, r.unwrap().1);
+        assert_eq!(14, r.unwrap().1);
 
         // Validate offset after appending
-        // 8 + 4 + 8 + 7 = 27
-        assert_eq!(a.offset(), 27);
+        // 7 + 4 + 7 + 7 = 25
+        assert_eq!(a.offset(), 25);
 
         // Test syncing segment
         let r = a.sync();
@@ -374,38 +374,38 @@ mod tests {
         assert_eq!(a.offset(), 4096);
 
         // Test reading from segment
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = a.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(12, n);
+        assert_eq!(11, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 15];
-        let n = a.read_at(&mut bs, 12).expect("should read");
-        assert_eq!(15, n);
+        let mut bs = vec![0; 14];
+        let n = a.read_at(&mut bs, 11).expect("should read");
+        assert_eq!(14, n);
         assert_eq!(
             &[4, 5, 6, 7, 8, 9, 10].to_vec(),
             &bs[WAL_RECORD_HEADER_SIZE..]
         );
 
         // Test reading beyond segment's current size
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
         let r = a.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
-        assert_eq!(12, r.unwrap().1);
+        assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 8 + 4 = 4108
-        assert_eq!(a.offset(), 4108);
+        // 4096 + 7 + 4 = 4107
+        assert_eq!(a.offset(), 4107);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = a.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(12, n);
+        assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test syncing segment again
@@ -434,7 +434,7 @@ mod tests {
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(12, r.unwrap().1);
+        assert_eq!(11, r.unwrap().1);
 
         // Test closing wal
         assert!(a.close().is_ok());
@@ -445,45 +445,45 @@ mod tests {
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(15, r.unwrap().1);
+        assert_eq!(14, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 8 + 7 = 4111
-        assert_eq!(a.offset(), 4111);
+        // 4096 + 7 + 7 = 4110
+        assert_eq!(a.offset(), 4110);
 
         // Test reading from segment
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = a.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(12, n);
+        assert_eq!(11, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let n = a.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(15, n);
+        assert_eq!(14, n);
         assert_eq!(
             &[4, 5, 6, 7, 8, 9, 10].to_vec(),
             &bs[WAL_RECORD_HEADER_SIZE..]
         );
 
         // Test reading beyond segment's current size
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
         let r = a.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
-        assert_eq!(12, r.unwrap().1);
+        assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4111 + 8 + 4 = 4123
-        assert_eq!(a.offset(), 4123);
+        // 4110 + 7 + 4 = 4121
+        assert_eq!(a.offset(), 4121);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 12];
-        let n = a.read_at(&mut bs, 4111).expect("should read");
-        assert_eq!(12, n);
+        let mut bs = vec![0; 11];
+        let n = a.read_at(&mut bs, 4110).expect("should read");
+        assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test closing wal

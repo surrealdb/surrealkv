@@ -22,8 +22,8 @@ const BLOCK_SIZE: usize = 4096;
 /// This constant represents the length, in bytes, of the record header structure
 /// used in the write-ahead log. The record header contains information
 /// about the type of the record, the length of the payload, and a checksum value.
-/// The constant is set to 8, reflecting the size of the record header structure.
-pub const WAL_RECORD_HEADER_SIZE: usize = 8;
+/// The constant is set to 7, reflecting the size of the record header structure.
+pub const WAL_RECORD_HEADER_SIZE: usize = 7;
 
 /// The magic value for identifying file headers.
 ///
@@ -142,7 +142,9 @@ pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize
     buf: [u8; BLOCK_SIZE],
 }
 
-impl<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize> Block<BLOCK_SIZE, RECORD_HEADER_SIZE> {
+impl<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize>
+    Block<BLOCK_SIZE, RECORD_HEADER_SIZE>
+{
     fn new() -> Self {
         Block {
             written: 0,
@@ -432,7 +434,6 @@ impl Metadata {
         Ok(int_value)
     }
 
-
     // Generic method to put a key-value pair into the data HashMap
     fn put(&mut self, key: &str, value: &[u8]) {
         self.data.insert(key.to_string(), value.to_vec());
@@ -482,17 +483,18 @@ impl RecordType {
     }
 }
 
-/// Encodes a record with the provided information into the given buffer.
-///
-/// It has the following format:
-///
-///	    Record Header
-///
-///	    0      1          2      3      4      5      6      7      8
-///	    +------+----------+------+------+------+------+------+------+
-///	    | Type | Reserved |    Length   |         CRC32             |
-///	    +------+----------+------+------+------+------+------+------+
-///   
+/*
+    Encodes a record with the provided information into the given buffer.
+
+    It has the following format:
+
+    Record Header
+
+        0      1      2      3      4      5      6      7
+        +------+------+------+------+------+------+------+------+------+------+
+        | Type |    Length   |         CRC32             |       Payload      |
+        +------+------+------+------+------+------+------+------+------+------+
+*/
 fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     let typ = if i == 0 && part.len() == rec_len {
         RecordType::Full
@@ -505,13 +507,11 @@ fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
     };
 
     buf[0] = typ as u8;
-    // Explicitly zero Reserved bytes just in case
-    buf[1] = 0;
     let len_part = part.len() as u16;
-    buf[2..4].copy_from_slice(&len_part.to_be_bytes());
+    buf[1..3].copy_from_slice(&len_part.to_be_bytes());
     // calculate the CRC32 checksum based on the record type and data
     let crc = calculate_crc32(&buf[0..1], part);
-    buf[4..8].copy_from_slice(&crc.to_be_bytes());
+    buf[3..7].copy_from_slice(&crc.to_be_bytes());
 }
 
 // Reads a field from the given reader
@@ -809,34 +809,34 @@ impl SegmentRef {
     }
 }
 
-/// Represents a segment in a write-ahead log.
-///
-/// A `Segment` represents a portion of the write-ahead log. It holds information about the file
-/// that stores the log entries, as well as details related to the segment's data and state.
-///
-/// A segment header is stored at the beginning of the segment file. It has the following format:
-///
-///
-///   File Header
-///
-///     0      1      2      3      4      5      6      7      8
-///     +------+------+------+------+------+------+------+------+
-///     | Magic                                                 |
-///     +------+------+------+------+------+------+------+------+
-///     | Version                                               |
-///     +------+------+------+------+------+------+------+------+
-///     | SegmentID                                             |
-///     +------+------+------+------+------+------+------+------+
-///     | Compression                                           |
-///     +------+------+------+------+------+------+------+------+
-///     | Compression Level                                     |
-///     +------+------+------+------+------+------+------+------+
-///     | Metadata                                              |
-///     .                                                       |
-///     .                                                       |
-///     .                                                       |
-///     +------+------+------+------+------+------+------+------+
-///
+/*
+    Represents a segment in a write-ahead log.
+
+    A `Segment` represents a portion of the write-ahead log. It holds information about the file
+    that stores the log entries, as well as details related to the segment's data and state.
+
+    A segment header is stored at the beginning of the segment file. It has the following format:
+
+    File Header
+
+     0      1      2      3      4      5      6      7      8
+     +------+------+------+------+------+------+------+------+
+     | Magic                                                 |
+     +------+------+------+------+------+------+------+------+
+     | Version                                               |
+     +------+------+------+------+------+------+------+------+
+     | SegmentID                                             |
+     +------+------+------+------+------+------+------+------+
+     | Compression                                           |
+     +------+------+------+------+------+------+------+------+
+     | Compression Level                                     |
+     +------+------+------+------+------+------+------+------+
+     | Metadata                                              |
+     .                                                       |
+     .                                                       |
+     .                                                       |
+     +------+------+------+------+------+------+------+------+
+*/
 pub(crate) struct Segment {
     /// The unique identifier of the segment.
     pub(crate) id: u64,
@@ -1458,7 +1458,7 @@ mod tests {
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
@@ -1568,7 +1568,7 @@ mod tests {
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
@@ -1678,7 +1678,7 @@ mod tests {
         let r = segment.sync();
         assert!(r.is_err()); // Syncing should fail
 
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = segment.read_at(&mut bs, 0);
         assert!(n.is_err()); // Reading should fail
 
@@ -1721,8 +1721,8 @@ mod tests {
         assert_eq!(7, r.unwrap().1);
 
         // Validate offset after appending
-        // 8 + 4 + 8 + 7 = 27
-        assert_eq!(segment.offset(), 27);
+        // 7 + 4 + 7 + 7 = 25
+        assert_eq!(segment.offset(), 25);
 
         // Test syncing segment
         let r = segment.sync();
@@ -1732,22 +1732,22 @@ mod tests {
         assert_eq!(segment.offset(), 4096);
 
         // Test reading from segment
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = segment.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(12, n);
+        assert_eq!(11, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test reading another portion of data from segment
-        let mut bs = vec![0; 15];
-        let n = segment.read_at(&mut bs, 12).expect("should read");
-        assert_eq!(15, n);
+        let mut bs = vec![0; 14];
+        let n = segment.read_at(&mut bs, 11).expect("should read");
+        assert_eq!(14, n);
         assert_eq!(
             &[4, 5, 6, 7, 8, 9, 10].to_vec(),
             &bs[WAL_RECORD_HEADER_SIZE..]
         );
 
         // Test reading beyond segment's current size
-        let mut bs = vec![0; 15];
+        let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
@@ -1757,13 +1757,13 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 8 + 4 = 4108
-        assert_eq!(segment.offset(), 4108);
+        // 4096 + 7 + 4 = 4107
+        assert_eq!(segment.offset(), 4107);
 
         // Test reading from segment after appending
-        let mut bs = vec![0; 12];
+        let mut bs = vec![0; 11];
         let n = segment.read_at(&mut bs, 4096).expect("should read");
-        assert_eq!(12, n);
+        assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Test syncing segment again
