@@ -4,11 +4,11 @@
 //! ```
 //! use async_runtime::spawning::spawn_transaction;
 //! use futures_lite::future;
-//! 
+//!
 //! async fn transaction() {
 //!    // Do some async work here
 //! }
-//! 
+//!
 //! let task_handle = spawn_transaction(transaction());
 //! let outcome = future::block_on(task_handle);
 //! ```
@@ -17,11 +17,11 @@
 //! ```
 //! use async_runtime::spawning::send_to_commit_pipeline;
 //! use futures_lite::future;
-//! 
+//!
 //! async fn commit() {
 //!   // Do some async work here
 //! }
-//! 
+//!
 //! let task_handle = send_to_commit_pipeline(commit());
 //! let outcome = future::block_on(task_handle);
 //! ```
@@ -30,11 +30,11 @@
 //! ```
 //! use async_runtime::spawning::spawn_transaction;
 //! use futures_lite::future;
-//! 
+//!
 //! async fn transaction() {
 //!    // Do some async work here
 //! }
-//! 
+//!
 //! spawn_transaction(transaction()).detach();
 //! ```
 //! We can also spawn a commit task within the transaction task so we never have to await for the results and block threads for them. With our own custom poll
@@ -44,14 +44,13 @@ use std::{future::Future, panic::catch_unwind, thread};
 use async_task::{Runnable, Task};
 use once_cell::sync::Lazy;
 
-
 /// Spawns a new async task for a transaction and returns a handle to it. The number of threads processing transactions in a queue is
 /// defined by the `THREAD_NUM` environment variable. If this variable is not set, then the default number of threads is 1.
-/// 
+///
 /// # Arguments
 /// * `future` - The future to be spawned. These can be async functions or structs that implement the Future trait and have their own poll function
 /// which we can use to create our own async logic for blocking code that we want to run asynchronously.
-/// 
+///
 /// # Returns
 /// * A handle to the spawned task where you can block your current thread to await for the result.
 pub fn spawn_transaction<F, T>(future: F) -> Task<T>
@@ -79,7 +78,6 @@ where
             });
         }
         tx
-
     });
 
     // create the schedule function that will be used to send the task to the queue
@@ -91,18 +89,16 @@ where
     // schedule the task on the queue (this will now be processed by one of the threads in the queue even if we do not wait for it)
     runnable.schedule();
     // return the handle to the task to block a thread to wait for a result
-    return task
-
+    return task;
 }
-
 
 /// This is a special function for sending a task to the commit pipeline. This is used for sending the commit task to the commit pipeline.
 /// There will only be one thread processing this queue. This is because we want to ensure that the commit task is processed in the order.
-/// 
+///
 /// # Arguments
 /// * `future` - The future to be spawned. These can be async functions or structs that implement the Future trait and have their own poll function which
 /// can help us with the ordering or ditching of commits if we need to.
-/// 
+///
 /// # Returns
 /// * A handle to the spawned task where you can block your current thread to await for the result.
 pub fn send_to_commit_pipeline<F, T>(future: F) -> Task<T>
@@ -119,12 +115,11 @@ where
             }
         });
         tx
-
     });
 
     let schedule = |runnable| QUEUE.send(runnable).unwrap();
     let (runnable, task) = async_task::spawn(future, schedule);
 
     runnable.schedule();
-    return task
+    return task;
 }
