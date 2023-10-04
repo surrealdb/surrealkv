@@ -10,10 +10,10 @@ use crate::storage::{
 };
 
 pub struct MultiSegmentReader {
-    buf: BufReader<File>,  // Buffer for reading from the current segment.
+    buf: BufReader<File>,      // Buffer for reading from the current segment.
     segments: Vec<SegmentRef>, // List of segments to read from.
-    cur: usize,            // Index of current segment in segments.
-    off: usize,            // Offset in current segment.
+    cur: usize,                // Index of current segment in segments.
+    off: usize,                // Offset in current segment.
 }
 
 impl MultiSegmentReader {
@@ -118,8 +118,8 @@ impl Read for MultiSegmentReader {
 
 // Reader reads records from a MultiSegmentReader. The records are returned in the order they were written.
 // The current implementation of Reader is inspired by levelDB and prometheus implementation for WAL.
-// Since the WAL is append-only, the records are written in frames of BLOCK_SIZE bytes. The first byte of 
-// each frame is the record type, followed by a reserved byte, followed by the record length (2 bytes) and 
+// Since the WAL is append-only, the records are written in frames of BLOCK_SIZE bytes. The first byte of
+// each frame is the record type, followed by a reserved byte, followed by the record length (2 bytes) and
 // the CRC32 checksum (4 bytes). The record data follows the checksum.
 //
 // No partial writes are allowed. If the segment is not full, and the record can't fit in the remaining space, the
@@ -181,7 +181,6 @@ impl Reader {
     ) -> Result<(usize, usize), io::Error> {
         // Validate the record type.
         validate_record_type(rec_type, current_index)?;
-
 
         let record_start = WAL_RECORD_HEADER_SIZE;
         let record_end = record_start + length as usize;
@@ -261,8 +260,14 @@ impl Reader {
             self.total_read += WAL_RECORD_HEADER_SIZE - 1;
 
             // Read the record data.
-            let (record_start, record_end) =
-                Self::read_and_validate_record(&mut self.rdr, &mut self.buf, length, crc, &self.cur_rec_type, i)?;
+            let (record_start, record_end) = Self::read_and_validate_record(
+                &mut self.rdr,
+                &mut self.buf,
+                length,
+                crc,
+                &self.cur_rec_type,
+                i,
+            )?;
             self.total_read += length as usize;
 
             // Copy the record data to the output buffer.

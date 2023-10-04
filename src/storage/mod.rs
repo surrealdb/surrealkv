@@ -1,4 +1,6 @@
 pub mod aol;
+pub mod index;
+pub mod kv;
 pub mod wal;
 
 use std::collections::HashMap;
