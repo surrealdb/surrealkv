@@ -16,7 +16,7 @@ pub trait NodeTrait<N> {
     fn replace_child(&self, key: u8, node: Rc<N>) -> Self;
 }
 
-pub trait VersionTimestamp {
+pub trait Version {
     fn version(&self) -> u64;
 }
 
@@ -32,11 +32,12 @@ pub struct TwigNode<K: KeyTrait + Clone, V: Clone> {
 pub struct LeafValue<V: Clone> {
     pub(crate) value: V,
     pub(crate) version: u64,
+    pub(crate) ts: u64,
 }
 
 impl<V: Clone> LeafValue<V> {
-    pub fn new(value: V, version: u64) -> Self {
-        LeafValue { value, version }
+    pub fn new(value: V, version: u64, ts: u64) -> Self {
+        LeafValue { value, version, ts }
     }
 }
 
@@ -67,10 +68,10 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
             .unwrap_or(self.version)
     }
 
-    pub fn insert(&self, value: V, version: u64) -> TwigNode<K, V> {
+    pub fn insert(&self, value: V, version: u64, ts: u64) -> TwigNode<K, V> {
         let mut new_values = self.values.clone();
 
-        let new_leaf_value = LeafValue::new(value, version);
+        let new_leaf_value = LeafValue::new(value, version, ts);
 
         // Insert new LeafValue in sorted order
         let insertion_index = match new_values.binary_search_by(|v| v.version.cmp(&new_leaf_value.version)) {
@@ -93,8 +94,8 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
         }
     }
 
-    pub fn insert_mut(&mut self, value: V, version: u64) {
-        let new_leaf_value = LeafValue::new(value, version);
+    pub fn insert_mut(&mut self, value: V, version: u64, ts: u64) {
+        let new_leaf_value = LeafValue::new(value, version, ts);
 
         // Insert new LeafValue in sorted order
         let insertion_index = match self
@@ -133,7 +134,7 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
     }
 }
 
-impl<K: KeyTrait + Clone, V: Clone> VersionTimestamp for TwigNode<K, V> {
+impl<K: KeyTrait + Clone, V: Clone> Version for TwigNode<K, V> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -155,7 +156,7 @@ impl<K: KeyTrait + Clone, V: Clone> VersionTimestamp for TwigNode<K, V> {
 // keys are stored in a parallel array. The keys are stored in sorted order, so
 // binary search can be used to find a particular key. The FlatNode is used for
 // storing Node4 and Node16 since they have identical layouts.
-pub struct FlatNode<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> {
+pub struct FlatNode<P: KeyTrait + Clone, N: Version, const WIDTH: usize> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
     keys: [u8; WIDTH],
@@ -163,7 +164,7 @@ pub struct FlatNode<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize
     num_children: u8,
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> FlatNode<P, N, WIDTH> {
+impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> {
     pub fn new(prefix: P) -> Self {
         Self {
             prefix,
@@ -266,7 +267,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> FlatNode<P, N
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> NodeTrait<N> for FlatNode<P, N, WIDTH> {
+impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatNode<P, N, WIDTH> {
     fn clone(&self) -> Self {
         let mut new_node = Self::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
@@ -341,7 +342,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> NodeTrait<N> 
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> VersionTimestamp for FlatNode<P, N, WIDTH> {
+impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Version for FlatNode<P, N, WIDTH> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -357,7 +358,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp, const WIDTH: usize> VersionTimest
 // A Node48 is a 256-entry array of pointers to children. The pointers are stored in
 // a Vector Array, which is a Vector of length WIDTH (48) that stores the pointers.
 
-pub struct Node48<P: KeyTrait + Clone, N: VersionTimestamp> {
+pub struct Node48<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
     child_ptr_indexes: Box<SparseArray<u8, 256>>,
@@ -365,7 +366,7 @@ pub struct Node48<P: KeyTrait + Clone, N: VersionTimestamp> {
     num_children: u8,
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> Node48<P, N> {
+impl<P: KeyTrait + Clone, N: Version> Node48<P, N> {
     pub fn new(prefix: P) -> Self {
         Self {
             prefix,
@@ -442,7 +443,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> Node48<P, N> {
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> NodeTrait<N> for Node48<P, N> {
+impl<P: KeyTrait + Clone, N: Version> NodeTrait<N> for Node48<P, N> {
     fn clone(&self) -> Self {
         Node48 {
             prefix: self.prefix.clone(),
@@ -499,7 +500,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> NodeTrait<N> for Node48<P, N> {
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> VersionTimestamp for Node48<P, N> {
+impl<P: KeyTrait + Clone, N: Version> Version for Node48<P, N> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -514,15 +515,15 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> VersionTimestamp for Node48<P, N>
 //
 // A Node256 is a 256-entry array of pointers to children. The pointers are stored in
 // a Vector Array, which is a Vector of length WIDTH (256) that stores the pointers.
-pub struct Node256<P: KeyTrait + Clone, N: VersionTimestamp> {
+pub struct Node256<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P, // Prefix associated with the node
-    pub(crate) version: u64,   // VersionTimestamp for node256
+    pub(crate) version: u64,   // Version for node256
 
     children: Box<SparseArray<Rc<N>, 256>>,
     num_children: usize,
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> Node256<P, N> {
+impl<P: KeyTrait + Clone, N: Version> Node256<P, N> {
     pub fn new(prefix: P) -> Self {
         Self {
             prefix,
@@ -584,7 +585,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> Node256<P, N> {
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> NodeTrait<N> for Node256<P, N> {
+impl<P: KeyTrait + Clone, N: Version> NodeTrait<N> for Node256<P, N> {
     fn clone(&self) -> Self {
         Self {
             prefix: self.prefix.clone(),
@@ -641,7 +642,7 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> NodeTrait<N> for Node256<P, N> {
     }
 }
 
-impl<P: KeyTrait + Clone, N: VersionTimestamp> VersionTimestamp for Node256<P, N> {
+impl<P: KeyTrait + Clone, N: Version> Version for Node256<P, N> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -651,13 +652,13 @@ impl<P: KeyTrait + Clone, N: VersionTimestamp> VersionTimestamp for Node256<P, N
 mod tests {
     use crate::storage::index::ArrayKey;
 
-    use super::{FlatNode, Node256, Node48, NodeTrait, VersionTimestamp, TwigNode};
+    use super::{FlatNode, Node256, Node48, NodeTrait, Version, TwigNode};
     use std::rc::Rc;
 
     macro_rules! impl_timestamp {
         ($($t:ty),*) => {
             $(
-                impl VersionTimestamp for $t {
+                impl Version for $t {
                     fn version(&self) -> u64 {
                         *self as u64
                     }
@@ -1031,7 +1032,7 @@ mod tests {
 
         let node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
 
-        let new_node = node.insert(42, 123);
+        let new_node = node.insert(42, 123, 0);
         assert_eq!(node.values.len(), 0);
         assert_eq!(new_node.values.len(), 1);
         assert_eq!(new_node.values[0].value, 42);
@@ -1045,7 +1046,7 @@ mod tests {
         let mut node =
             TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
 
-        node.insert_mut(42, 123);
+        node.insert_mut(42, 123, 0);
         assert_eq!(node.values.len(), 1);
         assert_eq!(node.values[0].value, 42);
         assert_eq!(node.values[0].version, 123);
@@ -1056,8 +1057,8 @@ mod tests {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node =
             TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
-        node.insert_mut(42, 123);
-        node.insert_mut(43, 124);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
         let latest_leaf = node.get_latest_leaf();
         assert_eq!(latest_leaf.unwrap().value, 43);
     }
@@ -1067,8 +1068,8 @@ mod tests {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node =
             TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
-        node.insert_mut(42, 123);
-        node.insert_mut(43, 124);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
         let latest_value = node.get_latest_value();
         assert_eq!(latest_value.unwrap(), 43);
     }
@@ -1078,8 +1079,8 @@ mod tests {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node =
             TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
-        node.insert_mut(42, 123);
-        node.insert_mut(43, 124);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
         let leaf_by_ts = node.get_leaf_by_version(123);
         assert_eq!(leaf_by_ts.unwrap().value, 42);
         let leaf_by_ts = node.get_leaf_by_version(124);
@@ -1091,8 +1092,8 @@ mod tests {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node =
             TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
-        node.insert_mut(42, 123);
-        node.insert_mut(43, 124);
+        node.insert_mut(42, 123, 0);
+        node.insert_mut(43, 124, 1);
         let mut iter = node.iter();
         assert_eq!(iter.next().unwrap().value, 42);
         assert_eq!(iter.next().unwrap().value, 43);
