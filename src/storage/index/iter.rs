@@ -66,7 +66,7 @@ impl<'a, P: KeyTrait, V: Clone> Iterator for NodeIter<'a, P, V> {
 
 /// An iterator over key-value pairs in the Trie.
 pub struct Iter<'a, P: KeyTrait + 'a, V: Clone> {
-    inner: Box<dyn Iterator<Item = (Vec<u8>, &'a V, &'a u64)> + 'a>,
+    inner: Box<dyn Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)> + 'a>,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -93,7 +93,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iter<'a, P, V> {
 }
 
 impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for Iter<'a, P, V> {
-    type Item = (Vec<u8>, &'a V, &'a u64);
+    type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
@@ -103,7 +103,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for Iter<'a, P, V> {
 /// An internal state for the Iter iterator.
 struct IterState<'a, P: KeyTrait + 'a, V: Clone> {
     node_iter: Vec<NodeIter<'a, P, V>>,
-    leafs: VecDeque<(&'a P, &'a V, &'a u64)>,
+    leafs: VecDeque<(&'a P, &'a V, &'a u64, &'a u64)>,
 }
 
 impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
@@ -125,7 +125,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
 }
 
 impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
-    type Item = (Vec<u8>, &'a V, &'a u64);
+    type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
         'outer: while let Some(node) = self.node_iter.last_mut() {
@@ -143,7 +143,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
                             };
 
                             for v in twig.iter() {
-                                self.leafs.push_back((&twig.key, &v.value, &v.version));
+                                self.leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
                             }
                             break 'outer;
                         } else {
@@ -157,14 +157,14 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
 
         self.leafs
             .pop_front()
-            .map(|leaf| (leaf.0.as_slice().to_vec(), leaf.1, leaf.2))
+            .map(|leaf| (leaf.0.as_slice().to_vec(), leaf.1, leaf.2, leaf.3))
     }
 }
 
 /// An enum representing the result of a range operation.
 enum RangeResult<'a, V: Clone> {
     Continue,
-    Yield(Option<(Vec<u8>, &'a V, &'a u64)>),
+    Yield(Option<(Vec<u8>, &'a V, &'a u64, &'a u64)>),
 }
 
 /// An iterator for the Range operation.
@@ -208,15 +208,15 @@ impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V
     fn next(&mut self) -> RangeResult<'a, V> {
         let next_item = self.iter.next();
         match next_item {
-            Some((key, value, ts)) => {
+            Some((key, value, version, ts)) => {
                 let next_key_slice = key.as_slice();
                 match &self.end_bound {
                     Bound::Included(k) if next_key_slice == k.as_slice() => RangeResult::Continue,
                     Bound::Excluded(k) if next_key_slice == k.as_slice() => {
                         RangeResult::Yield(None)
                     }
-                    Bound::Unbounded => RangeResult::Yield(Some((key, value, ts))),
-                    _ => RangeResult::Yield(Some((key, value, ts))),
+                    Bound::Unbounded => RangeResult::Yield(Some((key, value, version, ts))),
+                    _ => RangeResult::Yield(Some((key, value, version, ts))),
                 }
             }
             None => RangeResult::Yield(None),
@@ -225,9 +225,9 @@ impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V
 }
 
 impl<'a, K: KeyTrait, P: KeyTrait + 'a, V: Clone + 'a> Iterator for Range<'a, K, P, V> {
-    type Item = (Vec<u8>, &'a V, &'a u64);
+    type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
-    fn next(&mut self) -> Option<(Vec<u8>, &'a V, &'a u64)> {
+    fn next(&mut self) -> Option<(Vec<u8>, &'a V, &'a u64, &'a u64)> {
         match self.inner.next() {
             RangeResult::Continue => {
                 let res = self.next();

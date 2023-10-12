@@ -32,17 +32,17 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &P, value: V) -> Result<()> {
-        self.snap.insert(key, value)?;
+    pub fn set(&mut self, key: &P, value: V, ts: u64) -> Result<()> {
+        self.snap.insert(key, value, ts)?;
         Ok(())
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
     pub fn get(&self, key: &P) -> Result<ValueRef<P, V>> {
-        let (val, ts) = self.snap.get(key, self.ts)?;
+        let (val, version, _) = self.snap.get(key, self.ts)?;
         let mut val_ref = ValueRef::new(self.store.clone());
         let val_bytes_ref: &Bytes = val.as_ref();
-        val_ref.decode(ts, val_bytes_ref)?;
+        val_ref.decode(version, val_bytes_ref)?;
         Ok(val_ref)
     }
 

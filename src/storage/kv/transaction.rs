@@ -192,7 +192,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
                 vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
             let indexed_value_bytes = Bytes::from(indexed_value);
             self.snapshot
-                .set(&e.key[..].into(), indexed_value_bytes.into())?;
+                .set(&e.key[..].into(), indexed_value_bytes.into(), self.read_ts)?;
         }
 
         // Add the entry to pending writes

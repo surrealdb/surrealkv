@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::index::art::{Node, TrieError};
 use crate::storage::index::iter::IterationPointer;
-use crate::storage::index::node::VersionTimestamp;
+use crate::storage::index::node::Version;
 use crate::storage::index::KeyTrait;
 
 /// Represents a snapshot of the data within the Trie.
@@ -32,12 +32,12 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     }
 
     /// Inserts a key-value pair into the snapshot.
-    pub fn insert(&mut self, key: &P, value: V) -> Result<(), TrieError> {
+    pub fn insert(&mut self, key: &P, value: V, ts: u64) -> Result<(), TrieError> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
         // Insert the key-value pair into the root node using a recursive function
-        let (new_node, _) = match Node::insert_recurse(&self.root, key, value, self.ts, 0) {
+        let (new_node, _) = match Node::insert_recurse(&self.root, key, value, self.ts,ts, 0) {
             Ok((new_node, old_node)) => (new_node, old_node),
             Err(err) => {
                 return Err(err);
@@ -51,12 +51,12 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &P, ts: u64) -> Result<(V, u64), TrieError> {
+    pub fn get(&self, key: &P, ts: u64) -> Result<(V, u64, u64), TrieError> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
         // Use a recursive function to get the value and timestamp from the root node
-        Node::get_recurse(self.root.as_ref(), key, ts).map(|(_, value, ts)| (value, ts))
+        Node::get_recurse(self.root.as_ref(), key, ts).map(|(_, value, version, ts)| (value, version, ts))
     }
 
     /// Returns the version of the snapshot.
@@ -125,12 +125,12 @@ mod tests {
         let keys = ["key_1", "key_2", "key_3"];
 
         for key in keys.iter() {
-            assert!(tree.insert(&VectorKey::from_str(key), 1, 0).is_ok());
+            assert!(tree.insert(&VectorKey::from_str(key), 1, 0, 0).is_ok());
         }
 
         let mut snap1 = tree.create_snapshot().unwrap();
         let key_to_insert = "key_1";
-        assert!(snap1.insert(&VectorKey::from_str(key_to_insert), 1).is_ok());
+        assert!(snap1.insert(&VectorKey::from_str(key_to_insert), 1, 0).is_ok());
 
         let expected_snap_ts = keys.len() as u64 + 1;
         assert_eq!(snap1.version(), expected_snap_ts);
@@ -148,31 +148,31 @@ mod tests {
         let key_3_snap1 = VectorKey::from_str("key_3_snap1");
         let key_3_snap2 = VectorKey::from_str("key_3_snap2");
 
-        assert!(tree.insert(&key_1, 1, 0).is_ok());
+        assert!(tree.insert(&key_1, 1, 0, 0).is_ok());
         let initial_version = tree.version();
 
         // Keys inserted before snapshot creation should be visible
         let mut snap1 = tree.create_snapshot().unwrap();
         assert_eq!(snap1.id, 0);
-        assert_eq!(snap1.get(&key_1, initial_version).unwrap(), (1, 1));
+        assert_eq!(snap1.get(&key_1, initial_version).unwrap(), (1, 1, 0));
 
         let mut snap2 = tree.create_snapshot().unwrap();
         assert_eq!(snap2.id, 1);
-        assert_eq!(snap2.get(&key_1, initial_version).unwrap(), (1, 1));
+        assert_eq!(snap2.get(&key_1, initial_version).unwrap(), (1, 1, 0));
 
         assert_eq!(tree.snapshot_count(), 2);
 
         // Keys inserted after snapshot creation should not be visible to other snapshots
-        assert!(tree.insert(&key_2, 1, 0).is_ok());
+        assert!(tree.insert(&key_2, 1, 0, 0).is_ok());
         assert!(snap1.get(&key_2, snap1.version()).is_err());
         assert!(snap2.get(&key_2, snap2.version()).is_err());
 
         // Keys inserted after snapshot creation should be visible to the snapshot that inserted them
-        assert!(snap1.insert(&key_3_snap1, 2).is_ok());
-        assert_eq!(snap1.get(&key_3_snap1, snap1.version()).unwrap(), (2, 2));
+        assert!(snap1.insert(&key_3_snap1, 2, 0).is_ok());
+        assert_eq!(snap1.get(&key_3_snap1, snap1.version()).unwrap(), (2, 2, 0));
 
-        assert!(snap2.insert(&key_3_snap2, 3).is_ok());
-        assert_eq!(snap2.get(&key_3_snap2, snap2.version()).unwrap(), (3, 2));
+        assert!(snap2.insert(&key_3_snap2, 3, 0).is_ok());
+        assert_eq!(snap2.get(&key_3_snap2, snap2.version()).unwrap(), (3, 2, 0));
 
         // Keys inserted after snapshot creation should not be visible to other snapshots
         assert!(snap1.get(&key_3_snap2, snap1.version()).is_err());
@@ -195,12 +195,12 @@ mod tests {
         let key_3 = VectorKey::from_str("key_3");
         let key_4 = VectorKey::from_str("key_4");
 
-        assert!(tree.insert(&key_1, 1, 0).is_ok());
-        assert!(tree.insert(&key_2, 1, 0).is_ok());
-        assert!(tree.insert(&key_3, 1, 0).is_ok());
+        assert!(tree.insert(&key_1, 1, 0, 0).is_ok());
+        assert!(tree.insert(&key_2, 1, 0, 0).is_ok());
+        assert!(tree.insert(&key_3, 1, 0, 0).is_ok());
 
         let mut snap = tree.create_snapshot().unwrap();
-        assert!(snap.insert(&key_4, 1).is_ok());
+        assert!(snap.insert(&key_4, 1, 0).is_ok());
 
         // Reader 1
         let reader1 = snap.new_reader().unwrap();
