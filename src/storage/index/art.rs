@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::index::iter::{Iter, Range};
-use crate::storage::index::node::{FlatNode, Node256, Node48, NodeTrait, Version, TwigNode};
+use crate::storage::index::node::{FlatNode, Node256, Node48, NodeTrait, TwigNode, Version};
 use crate::storage::index::snapshot::Snapshot;
 use crate::storage::index::KeyTrait;
 
@@ -797,8 +797,14 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
         let k = key_prefix[longest_common_prefix];
         let child_for_key = cur_node.find_child(k);
         if let Some(child) = child_for_key {
-            match Node::insert_recurse(child, key, value, commit_version,ts, depth + longest_common_prefix)
-            {
+            match Node::insert_recurse(
+                child,
+                key,
+                value,
+                commit_version,
+                ts,
+                depth + longest_common_prefix,
+            ) {
                 Ok((new_child, old_value)) => {
                     let new_node = cur_node.replace_child(k, new_child);
                     return Ok((Rc::new(new_node), old_value));
@@ -891,7 +897,11 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     ///
     /// Returns a result containing the prefix, value, and version if the key is found, or Error if not.
     ///
-    pub fn get_recurse(cur_node: &Node<P, V>, key: &P, version: u64) -> Result<(P, V, u64, u64), TrieError> {
+    pub fn get_recurse(
+        cur_node: &Node<P, V>,
+        key: &P,
+        version: u64,
+    ) -> Result<(P, V, u64, u64), TrieError> {
         // Initialize the traversal variables.
         let mut cur_node = cur_node;
         let mut depth = 0;
@@ -985,7 +995,13 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
     ///
     /// Returns an error if the given version is older than the root's current version.
     ///
-    pub fn insert(&mut self, key: &P, value: V, version: u64, ts: u64) -> Result<Option<V>, TrieError> {
+    pub fn insert(
+        &mut self,
+        key: &P,
+        value: V,
+        version: u64,
+        ts: u64,
+    ) -> Result<Option<V>, TrieError> {
         // Check if the tree is already closed
         self.is_closed()?;
 
@@ -1018,7 +1034,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
                         "given version is older than root's current version".to_string(),
                     ));
                 }
-                match Node::insert_recurse(root, key, value, commit_version,ts, 0) {
+                match Node::insert_recurse(root, key, value, commit_version, ts, 0) {
                     Ok((new_node, old_node)) => (new_node, old_node),
                     Err(err) => {
                         return Err(err);
@@ -1622,8 +1638,8 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq)]
     struct KVT {
-        k: Vec<u8>, // Key
-        version: u64,    // version
+        k: Vec<u8>,   // Key
+        version: u64, // version
     }
 
     #[test]
@@ -1659,8 +1675,14 @@ mod tests {
 
         // Insertion
         for (idx, kvt) in kvts.iter().enumerate() {
-            let ts = if kvt.version == 0 { idx as u64 + 1 } else { kvt.version };
-            assert!(tree.insert(&VectorKey::from(kvt.k.clone()), 1, ts, 0).is_ok());
+            let ts = if kvt.version == 0 {
+                idx as u64 + 1
+            } else {
+                kvt.version
+            };
+            assert!(tree
+                .insert(&VectorKey::from(kvt.k.clone()), 1, ts, 0)
+                .is_ok());
         }
 
         // Verification
@@ -1860,7 +1882,11 @@ mod tests {
                 continue;
             }
 
-            if tree.insert(&random_key, random_val, 0, 0).unwrap().is_none() {
+            if tree
+                .insert(&random_key, random_val, 0, 0)
+                .unwrap()
+                .is_none()
+            {
                 keys_inserted.insert(random_val, random_val);
             }
         }

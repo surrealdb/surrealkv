@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::entry::{MAX_TX_METADATA_SIZE, MAX_KV_METADATA_SIZE};
+use super::entry::{MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE};
 
 #[derive(Clone)]
 pub struct Options {
@@ -42,11 +42,10 @@ impl Default for Options {
             max_batch_count: 1000,
             max_batch_size: 4 * 1024 * 1024,
             wal_disabled: false,
-            max_tx_entries: 1<<10,
+            max_tx_entries: 1 << 10,
         }
     }
 }
-
 
 impl Options {
     /// Creates a new set of options with default values.
@@ -54,12 +53,11 @@ impl Options {
         Self::default()
     }
 
-
     pub(crate) fn max_tx_size(&self) -> usize {
         let u16_size = std::mem::size_of::<u16>();
         let u32_size = std::mem::size_of::<u32>();
         let u64_size = std::mem::size_of::<u64>();
-    
+
         // fn max_tx_size(max_tx_entries: usize, max_key_len: usize, max_tx_metadata_len: usize, max_kv_metadata_len: usize) -> usize {
         //      let u16_size = std::mem::size_of::<u16>();
         //      let u32_size = std::mem::size_of::<u32>();
@@ -70,10 +68,19 @@ impl Options {
         // u64_size + u64_size + u16_size + u16_size + max_tx_metadata_len + u32_size +
         //    max_tx_entries * (u16_size + max_kv_metadata_len + u16_size + max_key_len + u32_size + u64_size)
 
-
         // tx_id + ts + version + tx_md_len + max_tx_md_len + entries_size + max_tx_entries * (kv_md_len + max_kv_md_len + key_len + max_key_len + value_len + value_offset_size)
-        u64_size + u64_size + u16_size + u16_size + MAX_TX_METADATA_SIZE + u32_size +
-            self.max_tx_entries * (u16_size + MAX_KV_METADATA_SIZE + u16_size + self.max_key_size as usize + u32_size + u64_size)
+        u64_size
+            + u64_size
+            + u16_size
+            + u16_size
+            + MAX_TX_METADATA_SIZE
+            + u32_size
+            + self.max_tx_entries
+                * (u16_size
+                    + MAX_KV_METADATA_SIZE
+                    + u16_size
+                    + self.max_key_size as usize
+                    + u32_size
+                    + u64_size)
     }
-    
 }

@@ -74,10 +74,11 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
         let new_leaf_value = LeafValue::new(value, version, ts);
 
         // Insert new LeafValue in sorted order
-        let insertion_index = match new_values.binary_search_by(|v| v.version.cmp(&new_leaf_value.version)) {
-            Ok(index) => index,
-            Err(index) => index,
-        };
+        let insertion_index =
+            match new_values.binary_search_by(|v| v.version.cmp(&new_leaf_value.version)) {
+                Ok(index) => index,
+                Err(index) => index,
+            };
         new_values.insert(insertion_index, Rc::new(new_leaf_value));
 
         let new_version = new_values
@@ -111,7 +112,10 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
     }
 
     pub fn get_latest_leaf(&self) -> Option<Rc<LeafValue<V>>> {
-        self.values.iter().max_by_key(|value| value.version).cloned()
+        self.values
+            .iter()
+            .max_by_key(|value| value.version)
+            .cloned()
     }
 
     pub fn get_latest_value(&self) -> Option<V> {
@@ -516,8 +520,8 @@ impl<P: KeyTrait + Clone, N: Version> Version for Node48<P, N> {
 // A Node256 is a 256-entry array of pointers to children. The pointers are stored in
 // a Vector Array, which is a Vector of length WIDTH (256) that stores the pointers.
 pub struct Node256<P: KeyTrait + Clone, N: Version> {
-    pub(crate) prefix: P, // Prefix associated with the node
-    pub(crate) version: u64,   // Version for node256
+    pub(crate) prefix: P,    // Prefix associated with the node
+    pub(crate) version: u64, // Version for node256
 
     children: Box<SparseArray<Rc<N>, 256>>,
     num_children: usize,
@@ -652,7 +656,7 @@ impl<P: KeyTrait + Clone, N: Version> Version for Node256<P, N> {
 mod tests {
     use crate::storage::index::ArrayKey;
 
-    use super::{FlatNode, Node256, Node48, NodeTrait, Version, TwigNode};
+    use super::{FlatNode, Node256, Node48, NodeTrait, TwigNode, Version};
     use std::rc::Rc;
 
     macro_rules! impl_timestamp {

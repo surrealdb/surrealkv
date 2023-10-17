@@ -143,7 +143,8 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
                             };
 
                             for v in twig.iter() {
-                                self.leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
+                                self.leafs
+                                    .push_back((&twig.key, &v.value, &v.version, &v.ts));
                             }
                             break 'outer;
                         } else {

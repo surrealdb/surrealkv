@@ -37,7 +37,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Insert the key-value pair into the root node using a recursive function
-        let (new_node, _) = match Node::insert_recurse(&self.root, key, value, self.ts,ts, 0) {
+        let (new_node, _) = match Node::insert_recurse(&self.root, key, value, self.ts, ts, 0) {
             Ok((new_node, old_node)) => (new_node, old_node),
             Err(err) => {
                 return Err(err);
@@ -56,7 +56,8 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Use a recursive function to get the value and timestamp from the root node
-        Node::get_recurse(self.root.as_ref(), key, ts).map(|(_, value, version, ts)| (value, version, ts))
+        Node::get_recurse(self.root.as_ref(), key, ts)
+            .map(|(_, value, version, ts)| (value, version, ts))
     }
 
     /// Returns the version of the snapshot.
@@ -130,7 +131,9 @@ mod tests {
 
         let mut snap1 = tree.create_snapshot().unwrap();
         let key_to_insert = "key_1";
-        assert!(snap1.insert(&VectorKey::from_str(key_to_insert), 1, 0).is_ok());
+        assert!(snap1
+            .insert(&VectorKey::from_str(key_to_insert), 1, 0)
+            .is_ok());
 
         let expected_snap_ts = keys.len() as u64 + 1;
         assert_eq!(snap1.version(), expected_snap_ts);
