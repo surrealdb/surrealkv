@@ -109,6 +109,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         }
     }
 
+    // TODO: Draw ascii diagram for encode format
     /// Encode the valueRef into a byte representation.
     pub(crate) fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
@@ -141,6 +142,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         buf.freeze()
     }
 
+    // TODO: Draw ascii diagram for decode format
     /// Decode the byte representation into a valueRef.
     pub(crate) fn decode(&mut self, ts: u64, encoded_bytes: &Bytes) -> Result<()> {
         let mut cursor = Cursor::new(encoded_bytes);
@@ -196,6 +198,14 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
     }
 }
 
+// Encode returns the slice after the entry be encoded.
+//
+//	the entry stored format:
+//	|----------------------------------------------------------------------------------------------------------------|
+//	|  crc  | timestamp | ksz | valueSize | flag  | TTL  |bucketSize| status | ds   | txId |  bucket |  key  | value |
+//	|----------------------------------------------------------------------------------------------------------------|
+//	| uint32| uint64  |uint32 |  uint32 | uint16  | uint32| uint32 | uint16 | uint16 |uint64 |[]byte|[]byte | []byte |
+//	|----------------------------------------------------------------------------------------------------------------|
 pub(crate) struct Tx {
     header: TxHeader,
     entries: Vec<TxEntry>,
@@ -286,9 +296,6 @@ impl TxHeader {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,7 +327,7 @@ mod tests {
 
         // Decode the encoded bytes into a new valueRef
         let mut decoded_value_ref = ValueRef::new(store);
-        decoded_value_ref.decode(0,&encoded_bytes).unwrap();
+        decoded_value_ref.decode(0, &encoded_bytes).unwrap();
 
         // Check if the decoded valueRef matches the original
         assert_eq!(decoded_value_ref.version, value_ref.version);

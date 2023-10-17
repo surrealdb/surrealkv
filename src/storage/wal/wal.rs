@@ -7,7 +7,7 @@ use std::sync::RwLock;
 
 use crate::storage::wal::reader::{MultiSegmentReader, Reader};
 use crate::storage::WAL_RECORD_HEADER_SIZE;
-use crate::storage::{get_segment_range, Options, Segment, SegmentRef};
+use crate::storage::{get_segment_range, Error, IOError, Options, Result, Segment, SegmentRef};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -42,7 +42,7 @@ impl WAL {
     ///
     /// - `dir`: The directory where segment files are located.
     /// - `opts`: Configuration options for the WAL instance.
-    pub fn open(dir: &Path, opts: &Options) -> io::Result<Self> {
+    pub fn open(dir: &Path, opts: &Options) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
@@ -66,7 +66,7 @@ impl WAL {
     }
 
     // Helper function to prepare the directory with proper permissions
-    fn prepare_directory(dir: &Path, opts: &Options) -> io::Result<()> {
+    fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
         fs::create_dir_all(dir)?;
 
         if let Ok(metadata) = fs::metadata(dir) {
@@ -79,7 +79,7 @@ impl WAL {
     }
 
     // Helper function to calculate the active segment ID
-    fn calculate_active_segment_id(dir: &Path) -> io::Result<u64> {
+    fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
         Ok(if last > 0 { last + 1 } else { 0 })
     }
@@ -104,13 +104,19 @@ impl WAL {
     ///
     /// This function may return an error if the active segment is closed, the provided record
     /// is empty, or any I/O error occurs during the appending process.
-    pub fn append(&mut self, rec: &[u8]) -> io::Result<(u64, usize)> {
+    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
         if self.closed {
-            return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Segment is closed",
+            )));
         }
 
         if rec.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "buf is empty",
+            )));
         }
 
         let _lock = self.mutex.write().unwrap();
@@ -168,9 +174,12 @@ impl WAL {
     ///
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
-    pub fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
         if buf.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Buffer is empty"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Buffer is empty",
+            )));
         }
 
         let mut r = 0;
@@ -192,7 +201,7 @@ impl WAL {
         buf: &mut [u8],
         segment_id: u64,
         read_offset: u64,
-    ) -> io::Result<usize> {
+    ) -> Result<usize> {
         if segment_id == self.active_segment_id {
             self.active_segment.read_at(buf, read_offset)
         } else {
@@ -201,13 +210,13 @@ impl WAL {
         }
     }
 
-    pub fn close(&mut self) -> io::Result<()> {
+    pub fn close(&mut self) -> Result<()> {
         let _lock = self.mutex.write().unwrap();
         self.active_segment.close()?;
         Ok(())
     }
 
-    pub fn sync(&mut self) -> io::Result<()> {
+    pub fn sync(&mut self) -> Result<()> {
         let _lock = self.mutex.write().unwrap();
         self.active_segment.sync()?;
         Ok(())
@@ -229,12 +238,12 @@ impl WAL {
     ///
     /// # Returns
     ///
-    /// Returns an `io::Result` indicating the success of the repair operation.
+    /// Returns an `Result` indicating the success of the repair operation.
     pub fn repair(
         &mut self,
         corrupted_segment_id: u64,
         corrupted_offset_marker: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         // Read the list of segments from the directory
         let segs = SegmentRef::read_segments_from_directory(&self.dir)?;
 
@@ -261,10 +270,10 @@ impl WAL {
 
         // If information about the corrupted segment is not available, return an error
         if corrupted_segment_info.is_none() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Corrupted segment not found",
-            ));
+            )));
         }
 
         // Retrieve the information about the corrupted segment
