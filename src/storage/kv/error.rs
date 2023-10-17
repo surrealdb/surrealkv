@@ -9,7 +9,7 @@ use crate::storage::index::art::TrieError;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error type for the storage module
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Error {
     Abort,
     Io(Arc<io::Error>),

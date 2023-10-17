@@ -32,8 +32,8 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &P, value: V, ts: u64) -> Result<()> {
-        self.snap.insert(key, value, ts)?;
+    pub fn set(&mut self, key: &P, value: V) -> Result<()> {
+        self.snap.insert(key, value, self.ts)?;
         Ok(())
     }
 

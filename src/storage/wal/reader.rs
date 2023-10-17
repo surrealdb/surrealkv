@@ -3,10 +3,9 @@ use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
-use crate::storage::wal::CorruptionError;
 use crate::storage::{
-    calculate_crc32, validate_record_type, RecordType, SegmentRef, BLOCK_SIZE,
-    WAL_RECORD_HEADER_SIZE,
+    calculate_crc32, validate_record_type, CorruptionError, Error, IOError, RecordType, Result,
+    SegmentRef, BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
 };
 
 pub struct MultiSegmentReader {
@@ -17,12 +16,12 @@ pub struct MultiSegmentReader {
 }
 
 impl MultiSegmentReader {
-    pub(crate) fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader, io::Error> {
+    pub(crate) fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader> {
         if segments.is_empty() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::InvalidInput,
                 "Empty segment list",
-            ));
+            )));
         }
 
         let cur = 0;
@@ -130,7 +129,7 @@ pub struct Reader {
     buf: [u8; BLOCK_SIZE],
     total_read: usize,
     cur_rec_type: RecordType,
-    err: Option<CorruptionError>,
+    err: Option<Error>,
 }
 
 impl Reader {
@@ -145,25 +144,22 @@ impl Reader {
         }
     }
 
-    fn read_first_header_byte<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<u8, io::Error> {
+    fn read_first_header_byte<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<u8> {
         if rdr.read_exact(&mut buf[0..1]).is_err() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "error reading first header byte",
-            ));
+            )));
         }
         Ok(buf[0])
     }
 
-    fn read_remaining_header<R: Read>(
-        rdr: &mut R,
-        buf: &mut [u8],
-    ) -> Result<(u16, u32), io::Error> {
+    fn read_remaining_header<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<(u16, u32)> {
         if rdr.read_exact(&mut buf[1..WAL_RECORD_HEADER_SIZE]).is_err() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "error reading remaining header bytes",
-            ));
+            )));
         }
 
         let length = u16::from_be_bytes([buf[1], buf[2]]);
@@ -178,30 +174,33 @@ impl Reader {
         crc: u32,
         rec_type: &RecordType,
         current_index: usize,
-    ) -> Result<(usize, usize), io::Error> {
+    ) -> Result<(usize, usize)> {
         // Validate the record type.
         validate_record_type(rec_type, current_index)?;
 
         let record_start = WAL_RECORD_HEADER_SIZE;
         let record_end = record_start + length as usize;
         if rdr.read_exact(&mut buf[record_start..record_end]).is_err() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "error reading record data",
-            ));
+            )));
         }
 
         // Validate the checksum.
         let calculated_crc = calculate_crc32(&buf[0..1], &buf[record_start..record_end]);
         if calculated_crc != crc {
-            return Err(io::Error::new(io::ErrorKind::Other, "unexpected checksum"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "unexpected checksum",
+            )));
         }
 
         Ok((record_start, record_end))
     }
 
-    pub(crate) fn read(&mut self) -> Result<(&[u8], u64), CorruptionError> {
-        if let Some(err) = self.err.as_ref() {
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
+        if let Some(err) = &self.err {
             return Err(err.clone());
         }
 
@@ -210,16 +209,20 @@ impl Reader {
             Err(e) => {
                 let (segment_id, offset) =
                     (self.rdr.current_segment_id(), self.rdr.current_offset());
-                let err =
-                    CorruptionError::new(e.kind(), e.to_string().as_str(), segment_id, offset);
+                let err = Error::Corruption(CorruptionError::new(
+                    io::ErrorKind::Other,
+                    e.to_string().as_str(),
+                    segment_id,
+                    offset,
+                ));
                 self.err = Some(err.clone());
-                return Err(err);
+                return Err(err.clone());
             }
         }
         Ok((&self.rec, self.rdr.current_offset() as u64))
     }
 
-    fn next(&mut self) -> Result<(), io::Error> {
+    fn next(&mut self) -> Result<()> {
         self.rec.clear();
         let mut i = 0;
 
@@ -239,18 +242,18 @@ impl Reader {
 
                 let zeros = &mut self.buf[1..remaining + 1];
                 if self.rdr.read_exact(zeros).is_err() {
-                    return Err(io::Error::new(
+                    return Err(Error::IO(IOError::new(
                         io::ErrorKind::Other,
                         "error reading remaining zeros",
-                    ));
+                    )));
                 }
                 self.total_read += remaining;
 
                 if !zeros.iter().all(|&c| c == 0) {
-                    return Err(io::Error::new(
+                    return Err(Error::IO(IOError::new(
                         io::ErrorKind::Other,
                         "non-zero byte in current block",
-                    ));
+                    )));
                 }
                 continue;
             }
@@ -293,7 +296,9 @@ mod tests {
     use std::vec::Vec;
 
     use crate::storage::wal::wal::WAL;
-    use crate::storage::{read_file_header, Options, Segment, WAL_RECORD_HEADER_SIZE};
+    use crate::storage::{
+        read_file_header, CorruptionError, Options, Segment, WAL_RECORD_HEADER_SIZE,
+    };
     use tempdir::TempDir;
 
     // BufferReader does not return EOF when the underlying reader returns 0 bytes read.
@@ -763,12 +768,16 @@ mod tests {
 
             // Simulate a checksum error
             let err = reader.read().expect_err("should get checksum error");
-            assert_eq!(err.message, "unexpected checksum");
-            assert_eq!(err.segment_id, 4);
-            assert_eq!(err.offset, 22);
-
-            corrupted_segment_id = err.segment_id;
-            corrupted_offset_marker = err.offset as u64;
+            match err {
+                Error::Corruption(corruption_error) => {
+                    assert_eq!(corruption_error.message, "unexpected checksum");
+                    assert_eq!(corruption_error.segment_id, 4);
+                    assert_eq!(corruption_error.offset, 22);
+                    corrupted_segment_id = corruption_error.segment_id;
+                    corrupted_offset_marker = corruption_error.offset as u64;
+                }
+                _ => panic!("Expected a CorruptionError, but got a different error"),
+            }
         }
 
         // Repair the corrupted segment
