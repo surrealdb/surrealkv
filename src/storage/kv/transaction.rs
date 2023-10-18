@@ -52,7 +52,7 @@ impl Mode {
     }
 }
 
-pub struct Transaction<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
     /// The read timestamp of the transaction.
     pub(crate) read_ts: u64,
 
@@ -68,16 +68,16 @@ pub struct Transaction<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>
     store: Arc<MVCCStore<P, V>>,
 
     /// The pending writes for the transaction.
-    write_set: HashMap<Bytes, Entry>,
+    write_set: HashMap<&'a Bytes, Entry<'a>>,
 
     // The keys that are read in the transaction from the snapshot.
-    read_set: Mutex<Vec<(Bytes, u64)>>,
+    read_set: Mutex<Vec<(&'a Bytes, u64)>>,
 
     // The transaction is closed.
     closed: bool,
 }
 
-impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V> {
+impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<'a, P, V> {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<MVCCStore<P, V>>, mode: Mode) -> Result<Self> {
         if store.closed {
@@ -106,14 +106,14 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
     }
 
     /// Adds a key-value pair to the store.
-    pub fn set(&mut self, key: Bytes, value: Bytes) -> Result<()> {
+    pub fn set(&mut self, key: &'a Bytes, value: Bytes) -> Result<()> {
         let entry = Entry::new(key, value);
         self.write(entry)?;
         Ok(())
     }
 
     /// Deletes a key from the store.
-    pub fn delete(&mut self, key: Bytes) -> Result<()> {
+    pub fn delete(&mut self, key: &'a Bytes) -> Result<()> {
         let mut entry = Entry::new(key, Bytes::new());
         entry.mark_delete();
         self.write(entry)?;
@@ -122,7 +122,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
 
     /// Gets a value for a key, if it exists.
     // pub fn get(&self, key: &Bytes) -> Result<Entry> {
-    pub fn get(&self, key: &Bytes) -> Result<ValueRef<P, V>> {
+    pub fn get(&self, key: &'a Bytes) -> Result<ValueRef<P, V>> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
@@ -136,7 +136,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
         match self.snapshot.get(&key[..].into()) {
             Ok(val_ref) => {
                 if !self.mode.is_read_only() && val_ref.ts > 0 {
-                    self.read_set.lock()?.push((key.clone(), val_ref.ts));
+                    self.read_set.lock()?.push((key, val_ref.ts));
                 }
 
                 Ok(val_ref)
@@ -152,7 +152,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
                                 // because in snapshot isolation mode, this key could be added by another transaction
                                 // and keeping track of this key will help detect conflicts.
                                 if !self.mode.is_read_only() {
-                                    self.read_set.lock()?.push((key.clone(), 0));
+                                    self.read_set.lock()?.push((key, 0));
                                 }
                             }
                             _ => {}
@@ -169,7 +169,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
     }
 
     /// Writes a value for a key. None is used for deletion.
-    fn write(&mut self, e: Entry) -> Result<()> {
+    fn write(&mut self, e: Entry<'a>) -> Result<()> {
         if !self.mode.mutable() {
             return Err(Error::TxnReadOnly);
         }
@@ -196,7 +196,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
         }
 
         // Add the entry to pending writes
-        self.write_set.insert(e.key.clone(), e);
+        self.write_set.insert(&e.key, e);
 
         Ok(())
     }
@@ -303,7 +303,7 @@ impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<P, V
     }
 }
 
-impl<P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Drop for Transaction<P, V> {
+impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Drop for Transaction<'a, P, V> {
     fn drop(&mut self) {
         let _ = self.rollback();
     }

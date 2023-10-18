@@ -40,13 +40,13 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> 
         }
     }
 
-    pub fn begin(self: &Arc<Self>) -> Result<Transaction<P, V>> {
+    pub fn begin<'a>(self: &'a Arc<Self>) -> Result<Transaction<'a, P, V>> {
         let mut txn = Transaction::new(self.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn begin_with_mode(self: &Arc<Self>, mode: Mode) -> Result<Transaction<P, V>> {
+    pub fn begin_with_mode<'a>(self: &'a Arc<Self>, mode: Mode) -> Result<Transaction<'a, P, V>> {
         let mut txn = Transaction::new(self.clone(), mode)?;
         txn.read_ts = self.oracle.read_ts();
         Ok(txn)
