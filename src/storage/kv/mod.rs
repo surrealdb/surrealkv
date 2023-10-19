@@ -9,14 +9,12 @@ pub mod transaction;
 pub mod util;
 use crc32fast::Hasher;
 
-
 fn calculate_crc32(a1: &[u8], a2: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(a1);
     hasher.update(a2);
     hasher.finalize()
 }
-
 
 // use crate::storage::kv::error::Result;
 // use crate::storage::index::snapshot::Snapshot;

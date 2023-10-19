@@ -1,71 +1,72 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::storage::kv::error::Result;
+use crate::storage::kv::error::{Error, Result};
 
-// Enumeration representing different types of attributes
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum AttributeType {
+enum Attribute {
     Deleted,
+    // Add more variants for other attribute types
 }
 
-impl AttributeType {
-    fn from_u8(value: u8) -> Option<Box<dyn Attribute>> {
+impl Attribute {
+    fn from_u8(value: u8) -> Option<Attribute> {
         match value {
-            0 => Some(Box::new(DeletedAttribute)),
+            0 => Some(Attribute::Deleted),
+            // Add matching for other variants
             _ => None,
+        }
+    }
+
+    fn kind(&self) -> u8 {
+        match self {
+            Attribute::Deleted => 0,
+            // Add matching for other variants
+        }
+    }
+
+    fn serialize(&self) -> Bytes {
+        match self {
+            Attribute::Deleted => Bytes::new(),
+            // Add matching for other variants
+        }
+    }
+
+    fn deserialize(&self, bytes: &mut &[u8]) -> Result<Attribute> {
+        if bytes.is_empty() {
+            return Ok(Attribute::Deleted);
+        }
+
+        let value = bytes[0];
+        *bytes = &bytes[1..]; // Consume the attribute byte
+        match value {
+            // Add matching for other variants
+            _ => Err(Error::UnknownAttributeType),
         }
     }
 }
 
-// Trait defining the behavior of an attribute
-trait Attribute {
-    fn kind(&self) -> AttributeType;
-    fn serialize(&self) -> Bytes;
-    fn deserialize(&mut self, bytes: &mut &[u8]) -> Result<usize>;
-}
-
-// Implementation for a deleted attribute
-struct DeletedAttribute;
-
-impl Attribute for DeletedAttribute {
-    fn kind(&self) -> AttributeType {
-        AttributeType::Deleted
-    }
-
-    fn serialize(&self) -> Bytes {
-        Bytes::new()
-    }
-
-    fn deserialize(&mut self, _: &mut &[u8]) -> Result<usize> {
-        Ok(0)
-    }
-}
-
 // Structure representing metadata for a key-value pair
+#[derive(Clone, Debug)]
 pub(crate) struct Metadata {
-    attributes: HashMap<AttributeType, Box<dyn Attribute>>,
+    attributes: HashSet<Attribute>,
 }
 
 impl Metadata {
     // Create a new metadata instance
     pub(crate) fn new() -> Self {
         Metadata {
-            attributes: HashMap::new(),
+            attributes: HashSet::new(),
         }
     }
 
     // Set the 'deleted' attribute based on the provided flag
     pub(crate) fn as_deleted(&mut self, deleted: bool) -> Result<()> {
-        if !deleted {
-            self.attributes.remove(&AttributeType::Deleted);
-            return Ok(());
-        }
-
-        if !self.attributes.contains_key(&AttributeType::Deleted) {
-            self.attributes
-                .insert(AttributeType::Deleted, Box::new(DeletedAttribute));
+        if deleted {
+            self.attributes.insert(Attribute::Deleted);
+        } else {
+            self.attributes.remove(&Attribute::Deleted);
         }
 
         Ok(())
@@ -73,15 +74,15 @@ impl Metadata {
 
     // Check if the 'deleted' attribute is present
     pub(crate) fn deleted(&self) -> bool {
-        self.attributes.contains_key(&AttributeType::Deleted)
+        self.attributes.contains(&Attribute::Deleted)
     }
 
     // Serialize metadata into a byte vector
     pub(crate) fn bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
-        for (&attr_kind, attr) in &self.attributes {
-            buf.extend_from_slice(&[attr_kind as u8]);
+        for attr in &self.attributes {
+            buf.extend_from_slice(&[attr.kind() as u8]);
             buf.extend_from_slice(&attr.serialize());
         }
 
@@ -90,15 +91,15 @@ impl Metadata {
 
     // Deserialize metadata from Bytes into a Metadata instance
     pub(crate) fn from_bytes(encoded_bytes: &[u8]) -> Result<Self> {
-        let mut attributes = HashMap::new();
+        let mut attributes = HashSet::new();
         let mut cursor = encoded_bytes;
 
         while !cursor.is_empty() {
             let attr_kind = cursor[0];
             cursor = &cursor[1..]; // Move cursor to the next byte
-            if let Some(mut attr) = AttributeType::from_u8(attr_kind) {
+            if let Some(attr) = Attribute::from_u8(attr_kind) {
                 attr.deserialize(&mut cursor)?;
-                attributes.insert(attr.kind(), attr);
+                attributes.insert(attr);
             }
         }
 
@@ -139,7 +140,7 @@ mod tests {
         metadata.as_deleted(true).unwrap();
         let bytes = metadata.bytes();
         assert_eq!(bytes.len(), 1);
-        assert_eq!(bytes[0], AttributeType::Deleted as u8);
+        assert_eq!(bytes[0], Attribute::Deleted as u8);
 
         // Test serialization without 'deleted' attribute
         metadata.as_deleted(false).unwrap();

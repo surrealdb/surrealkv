@@ -5,9 +5,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use crate::storage::wal::reader::{MultiSegmentReader, Reader};
-use crate::storage::WAL_RECORD_HEADER_SIZE;
-use crate::storage::{get_segment_range, Error, IOError, Options, Result, Segment, SegmentRef};
+use crate::storage::log::wal::reader::{MultiSegmentReader, Reader};
+use crate::storage::log::WAL_RECORD_HEADER_SIZE;
+use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment, SegmentRef};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -42,18 +42,21 @@ impl WAL {
     ///
     /// - `dir`: The directory where segment files are located.
     /// - `opts`: Configuration options for the WAL instance.
-    pub fn open(dir: &Path, opts: &Options) -> Result<Self> {
+    pub fn open(dir: &Path, opts: Options) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
+        // Ensure the WAL option is enabled
+        let opts = opts.with_wal();
+
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(dir, opts)?;
+        Self::prepare_directory(dir, &opts)?;
 
         // Determine the active segment ID
         let active_segment_id = Self::calculate_active_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts)?;
+        let active_segment = Segment::open(dir, active_segment_id, &opts)?;
 
         Ok(Self {
             active_segment,
@@ -335,7 +338,7 @@ impl Drop for WAL {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::WAL_RECORD_HEADER_SIZE;
+    use crate::storage::log::WAL_RECORD_HEADER_SIZE;
 
     use super::*;
     use tempdir::TempDir;
@@ -350,8 +353,8 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Options::default();
+        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -434,8 +437,8 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Options::default();
+        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
@@ -446,7 +449,8 @@ mod tests {
         assert!(a.close().is_ok());
 
         // Reopen the wal
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should open aol");
+        let opts = Options::default();
+        let mut a = WAL::open(temp_dir.path(), opts).expect("should open aol");
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);

@@ -37,6 +37,7 @@ pub enum TrieError {
     NotFound,
     KeyNotFound,
     SnapshotNotFound,
+    SnapshotEmpty,
     SnapshotNotClosed,
     SnapshotAlreadyClosed,
     SnapshotReadersNotClosed,
@@ -61,6 +62,7 @@ impl fmt::Display for TrieError {
             }
             TrieError::TreeAlreadyClosed => write!(f, "Tree already closed"),
             TrieError::Other(ref message) => write!(f, "Other error: {}", message),
+            TrieError::SnapshotEmpty => write!(f, "Snapshot is empty"),
         }
     }
 }
@@ -1118,12 +1120,6 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         // Check if the tree is already closed
         self.is_closed()?;
 
-        if self.root.is_none() {
-            return Err(TrieError::Other(
-                "cannot create snapshot from empty tree".to_string(),
-            ));
-        }
-
         let max_snapshot_id = self.max_snapshot_id.load(Ordering::SeqCst);
         if max_snapshot_id >= self.max_active_snapshots {
             return Err(TrieError::Other(
@@ -1135,8 +1131,9 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         let new_snapshot_id = self.max_snapshot_id.fetch_add(1, Ordering::SeqCst);
         self.snapshots.insert(new_snapshot_id);
 
-        let root = self.root.as_ref().unwrap();
-        let new_snapshot = Snapshot::new(new_snapshot_id, root.clone(), root.version() + 1);
+        let root = self.root.as_ref().map_or(None, |root| Some(root.clone()));
+        let version = self.root.as_ref().map_or(1, |root| root.version() + 1);
+        let new_snapshot = Snapshot::new(new_snapshot_id, root, version);
 
         Ok(new_snapshot)
     }
