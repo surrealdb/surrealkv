@@ -10,7 +10,7 @@ use std::sync::RwLock;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
-use crate::storage::{get_segment_range, Error, IOError, Options, Result, Segment};
+use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,

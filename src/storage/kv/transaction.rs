@@ -13,7 +13,7 @@ use crate::storage::kv::entry::{
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
 
-use super::entry::ValueRef;
+use super::entry::{TxRecord, ValueRef};
 use super::store::MVCCStore;
 
 /// An MVCC transaction mode.
@@ -83,13 +83,13 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         if store.closed {
             return Err(Error::StoreClosed);
         }
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Error with time, went backwards");
-        let snapshot = Snapshot::take(store.clone(), ts.as_secs())?;
+
+        // TODO!! This should be the max txID of the index, get this from oracle
+        let read_ts = store.oracle.read_ts();
+        let snapshot = Snapshot::take(store.clone(), read_ts)?;
 
         Ok(Self {
-            read_ts: ts.as_secs(),
+            read_ts: read_ts,
             mode,
             snapshot,
             buf: BytesMut::with_capacity(store.opts.max_tx_size()),
@@ -120,8 +120,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         Ok(())
     }
 
-    /// Gets a value for a key, if it exists.
-    // pub fn get(&self, key: &Bytes) -> Result<Entry> {
+    /// Gets a value for a key if it exists.
     pub fn get(&self, key: &'a Bytes) -> Result<ValueRef<P, V>> {
         if self.closed {
             return Err(Error::TxnClosed);
@@ -130,11 +129,13 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             return Err(Error::EmptyKey);
         }
 
-        // RYOW: Read your own writes
+        // Read Your Own Writes (RYOW) semantics.
 
-        // Check if the key is in the snapshot
+        // Check if the key is in the snapshot.
         match self.snapshot.get(&key[..].into()) {
             Ok(val_ref) => {
+                // If the transaction is not read-only and the value reference has a timestamp greater than 0,
+                // add the key and its timestamp to the read set for conflict detection.
                 if !self.mode.is_read_only() && val_ref.ts > 0 {
                     self.read_set.lock()?.push((key, val_ref.ts));
                 }
@@ -143,14 +144,14 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             }
             Err(e) => {
                 match &e {
-                    // Handle specific error cases
+                    // Handle specific error cases.
                     Error::IndexError(trie_error) => {
-                        // Handle key not found
                         match trie_error {
+                            // Handle the case where the key is not found.
                             TrieError::KeyNotFound => {
-                                // The key is added to the snapshot reads if the transaction is not read-only
-                                // because in snapshot isolation mode, this key could be added by another transaction
-                                // and keeping track of this key will help detect conflicts.
+                                // If the transaction is not read-only, add the key to the read set.
+                                // In snapshot isolation mode, this key could be added by another transaction,
+                                // and keeping track of this key helps detect conflicts.
                                 if !self.mode.is_read_only() {
                                     self.read_set.lock()?.push((key, 0));
                                 }
@@ -160,7 +161,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
                         return Err(e);
                     }
                     _ => {
-                        // Handle other error cases
+                        // Handle other error cases.
                         return Err(e);
                     }
                 }
@@ -213,6 +214,8 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         }
 
         // This is the scenario of snapshot isolation where the transaction is in read-write mode.
+        // Currently, only optimistic concurrency control (OCC) is supported.
+        // TODO: add support for pessimistic concurrency control (serializable snapshot isolation)
         // The following steps are performed:
         //      1. Take the latest snapshot from the store
         //      2. Check if the read keys in the transaction are still valid in the latest snapshot, and
@@ -258,17 +261,10 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         Ok(())
     }
 
-    /// Commits the transaction, by writing all pending entries to the store.
-    pub fn commit(&mut self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
-
-        if !self.mode.is_write_only() {
-            self.snapshot.close()?;
-        }
-
-        self.closed = true;
 
         if self.mode.is_read_only() {
             return Err(Error::TxnReadOnly);
@@ -280,13 +276,86 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
 
         self.check_conflict()?;
 
-        let orc = self.store.oracle.clone();
-        let commit_ts = orc.new_commit_ts();
+        Ok(())
+    }
 
+    // precommit the transaction to WAL
+    pub fn precommit(&mut self) -> Result<()> {
+        if self.store.opts.wal_disabled {
+            return Ok(());
+        }
+
+        todo!();
+    }
+
+    /// Commits the transaction, by writing all pending entries to the store.
+    pub fn commit(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(Error::TxnClosed);
+        }
+
+        if self.mode.is_read_only() {
+            return Err(Error::TxnReadOnly);
+        }
+
+        if self.write_set.is_empty() {
+            return Ok(());
+        }
+
+        // Prepare for the commit
+        self.prepare_commit()?;
+
+        // Add transaction records to the log
+        self.add_to_transaction_log()?;
+
+        // Commit to the store index
+        self.commit_to_index()?;
+
+        Ok(())
+    }
+
+    /// Prepares for the commit by assigning commit timestamps and preparing records.
+    fn prepare_commit(&mut self) -> Result<()> {
+        if !self.mode.is_write_only() {
+            self.snapshot.close()?;
+        }
+
+        self.closed = true;
+        self.assign_commit_timestamps();
+        Ok(())
+    }
+
+    /// Assigns commit timestamps to transaction entries.
+    fn assign_commit_timestamps(&mut self) {
+        let commit_ts = self.store.oracle.new_commit_ts();
         self.write_set.iter_mut().for_each(|(_, entry)| {
             entry.ts = commit_ts;
         });
+    }
 
+    /// Adds transaction records to the transaction log.
+    fn add_to_transaction_log(&mut self) -> Result<()> {
+        let entries: Vec<Entry> = self.write_set.values().cloned().collect();
+        let tx_record = TxRecord::new_from_entries(entries);
+        tx_record.encode(&mut self.buf);
+
+        let mut tlog = self.store.tlog.write()?;
+        tlog.append(&self.buf.as_ref())?;
+        Ok(())
+    }
+
+    /// Commits transaction changes to the store index.
+    fn commit_to_index(&mut self) -> Result<()> {
+        let commit_ts = self.store.oracle.new_commit_ts();
+        let mut index = self.store.index.write()?;
+        for (_, entry) in self.write_set.iter() {
+            index.insert(
+                &entry.key[..].into(),
+                entry.value.clone().into(),
+                commit_ts,
+                commit_ts,
+            )?;
+        }
         Ok(())
     }
 
@@ -306,5 +375,41 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
 impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Drop for Transaction<'a, P, V> {
     fn drop(&mut self) {
         let _ = self.rollback();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    use crate::storage::index::VectorKey;
+    use crate::storage::kv::option::Options;
+    use crate::storage::kv::store::MVCCStore;
+    use crate::storage::kv::transaction::{Mode, Transaction};
+    use crate::storage::kv::util::NoopValue;
+
+    use tempdir::TempDir;
+
+    fn create_temp_directory() -> TempDir {
+        TempDir::new("test").unwrap()
+    }
+
+    #[test]
+    fn test_transaction() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Arc::new(MVCCStore::<VectorKey, NoopValue>::new(opts));
+        assert_eq!(store.closed, false);
+
+        let key = Bytes::from("foo");
+        let key_clone = key.clone();
+        let value = Bytes::from("baz");
+
+        let mut txn = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+        txn.set(&key_clone, value).unwrap();
+        txn.commit().unwrap();
     }
 }

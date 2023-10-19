@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::storage::index::art::TrieError;
+use crate::storage::log::Error as LogError;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
@@ -13,6 +14,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     Abort,
     Io(Arc<io::Error>),
+    Log(LogError),
     EmptyKey,
     PoisonError(String),
     TxnClosed,
@@ -26,6 +28,8 @@ pub enum Error {
     CorruptedIndex,
     TxnReadConflict,
     StoreClosed,
+    InvalidAttributeData,
+    UnknownAttributeType,
 }
 
 /// Error structure for encoding errors
@@ -75,6 +79,9 @@ impl fmt::Display for Error {
             Error::CorruptedIndex => write!(f, "Corrupted index"),
             Error::TxnReadConflict => write!(f, "Transaction read conflict"),
             Error::StoreClosed => write!(f, "Store closed"),
+            Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
+            Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
+            Error::Log(log_error) => write!(f, "Log error: {}", log_error),
         }
     }
 }
@@ -99,5 +106,11 @@ impl<T: Sized> From<PoisonError<T>> for Error {
 impl From<TrieError> for Error {
     fn from(trie_error: TrieError) -> Self {
         Error::IndexError(trie_error)
+    }
+}
+
+impl From<LogError> for Error {
+    fn from(log_error: LogError) -> Self {
+        Error::Log(log_error)
     }
 }
