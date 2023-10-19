@@ -5,9 +5,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-use crate::storage::log::wal::reader::{MultiSegmentReader, Reader};
-use crate::storage::log::WAL_RECORD_HEADER_SIZE;
-use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment, SegmentRef};
+use crate::storage::log::wal::reader::Reader;
+use crate::storage::log::{
+    get_segment_range, Error, IOError, MultiSegmentReader, Options, Result, Segment, SegmentRef,
+    WAL_RECORD_HEADER_SIZE,
+};
 
 /// Write-Ahead Log (WAL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
