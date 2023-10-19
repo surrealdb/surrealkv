@@ -4,10 +4,10 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::storage::index::KeyTrait;
+use crate::storage::kv::calculate_crc32;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::MVCCStore;
-use crate::storage::kv::calculate_crc32;
 
 pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
 pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
@@ -16,6 +16,7 @@ pub(crate) const VERSION_SIZE: usize = 1; // Size of version in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
 pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
 
+#[derive(Clone)]
 pub(crate) struct Entry<'a> {
     pub(crate) key: &'a Bytes,
     pub(crate) metadata: Option<Metadata>,
@@ -53,19 +54,17 @@ impl<'a> Entry<'a> {
     }
 }
 
-
-
 // Tx struct encoded format:
 //
 // +---------------------------------------------------------+
 // |                     Tx (Transaction)                     |
 // |---------------------------------------------------------|
-// | header: TxHeader                                        |
-// | entries: Vec<TxEntry>                                   |
+// | header: TxRecordHeader                                        |
+// | entries: Vec<TxRecordEntry>                                   |
 // +---------------------------------------------------------+
 
 // +---------------------------------------------------------+
-// |                     TxHeader                             |
+// |                     TxRecordHeader                             |
 // |---------------------------------------------------------|
 // | id: u64                                                 |
 // | ts: u64                                                 |
@@ -75,7 +74,7 @@ impl<'a> Entry<'a> {
 // +---------------------------------------------------------+
 
 // +---------------------------------------------------------+
-// |                     TxEntry                              |
+// |                     TxRecordEntry                              |
 // |---------------------------------------------------------|
 // | key: Bytes                                              |
 // | key_len: u32                                            |
@@ -88,29 +87,56 @@ impl<'a> Entry<'a> {
 // Tx encoded format:
 //
 //   |----------------------------------|
-//   |   TxHeader   |     TxEntry[]    |
+//   |   TxRecordHeader   |     TxRecordEntry[]    |
 //   |--------------|-------------------|
 //   | id(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata | ...entries... |
 //   |----------------------------------|
 //
-// TxHeader struct encoded format:
+// TxRecordHeader struct encoded format:
 //
 //   |------------------------------------------|
 //   |   id(8)   |   ts(8)   | version(2) | num_entries(2) | metadata_len(2) | metadata |
 //   |-----------|-----------|------------|----------------|----------------|----------|
 //
-// TxEntry struct encoded format:
+// TxRecordEntry struct encoded format:
 //
 //   |----------------------------------|
 //   | crc(4) | key_len(4) | key | value_len(4) | value | metadata_len(4) | metadata |
 //   |----------------------------------|
 
-pub(crate) struct Tx {
-    header: TxHeader,
-    entries: Vec<TxEntry>,
+pub(crate) struct TxRecord {
+    header: TxRecordHeader,
+    entries: Vec<TxRecordEntry>,
 }
 
-impl Tx {
+impl TxRecord {
+    pub(crate) fn new() -> Self {
+        TxRecord {
+            header: TxRecordHeader::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn new_from_entries(entries: Vec<Entry>) -> Self {
+        let mut tx_record = TxRecord::new();
+        for entry in entries {
+            tx_record.add_entry(entry);
+        }
+        tx_record
+    }
+
+    pub(crate) fn add_entry(&mut self, entry: Entry) {
+        let tx_record_entry = TxRecordEntry {
+            key: entry.key.clone(),
+            key_len: entry.key.len() as u32,
+            md: entry.metadata,
+            value_len: entry.value.len() as u32,
+            value: entry.value.clone(),
+        };
+        self.entries.push(tx_record_entry);
+        self.header.num_entries += 1;
+    }
+
     // TODO!!: use same allocated buffer for all tx encoding
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
         // Encode header
@@ -136,7 +162,7 @@ impl Tx {
     }
 }
 
-pub(crate) struct TxHeader {
+pub(crate) struct TxRecordHeader {
     id: u64,
     ts: u64,
     version: u16,
@@ -144,7 +170,35 @@ pub(crate) struct TxHeader {
     num_entries: u16,
 }
 
-pub(crate) struct TxEntry {
+impl TxRecordHeader {
+    pub(crate) fn new() -> Self {
+        TxRecordHeader {
+            id: 0,
+            ts: 0,
+            version: 0,
+            metadata: None,
+            num_entries: 0,
+        }
+    }
+
+    pub(crate) fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
+    pub(crate) fn set_ts(&mut self, ts: u64) {
+        self.ts = ts;
+    }
+
+    pub(crate) fn set_version(&mut self, version: u16) {
+        self.version = version;
+    }
+
+    pub(crate) fn set_metadata(&mut self, metadata: Option<Metadata>) {
+        self.metadata = metadata;
+    }
+}
+
+pub(crate) struct TxRecordEntry {
     key: Bytes,
     key_len: u32,
     md: Option<Metadata>,
@@ -152,7 +206,7 @@ pub(crate) struct TxEntry {
     value: Bytes,
 }
 
-impl TxHeader {
+impl TxRecordHeader {
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
         let (md_len, md_bytes) = match &self.metadata {
             Some(metadata) => {
@@ -223,7 +277,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         self.transaction_metadata.as_ref()
     }
 
-    fn key_value_metadata(&self) -> Option<&Metadata> {
+    pub(crate) fn key_value_metadata(&self) -> Option<&Metadata> {
         self.key_value_metadata.as_ref()
     }
 
@@ -332,7 +386,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {

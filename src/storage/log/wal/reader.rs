@@ -3,7 +3,7 @@ use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
-use crate::storage::{
+use crate::storage::log::{
     calculate_crc32, validate_record_type, CorruptionError, Error, IOError, RecordType, Result,
     SegmentRef, BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
 };
@@ -295,10 +295,8 @@ mod tests {
     use std::io::{Read, Seek, Write};
     use std::vec::Vec;
 
-    use crate::storage::wal::wal::WAL;
-    use crate::storage::{
-        read_file_header, CorruptionError, Options, Segment, WAL_RECORD_HEADER_SIZE,
-    };
+    use crate::storage::log::wal::wal::WAL;
+    use crate::storage::log::{read_file_header, Options, Segment, WAL_RECORD_HEADER_SIZE};
     use tempdir::TempDir;
 
     // BufferReader does not return EOF when the underlying reader returns 0 bytes read.
@@ -692,7 +690,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
 
         let record_size = 4;
 
@@ -782,7 +780,7 @@ mod tests {
 
         // Repair the corrupted segment
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create wal");
+        let mut a = WAL::open(temp_dir.path(), opts).expect("should create wal");
         a.repair(corrupted_segment_id, corrupted_offset_marker)
             .expect("should repair");
 

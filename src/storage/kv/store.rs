@@ -2,14 +2,15 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::storage::aol::aol::AOL;
+use crate::storage::log::aol::aol::AOL;
 use crate::storage::index::art::Tree as tart;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::Result;
 use crate::storage::kv::option::Options;
 use crate::storage::kv::oracle::Oracle;
 use crate::storage::kv::transaction::{Mode, Transaction};
-use crate::storage::wal::wal::WAL;
+use crate::storage::log::wal::wal::WAL;
+use crate::storage::log::Options as LogOptions;
 
 /// An MVCC-based transactional key-value store.
 pub struct MVCCStore<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
@@ -18,10 +19,10 @@ pub struct MVCCStore<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> 
     /// Options for store.
     pub(crate) opts: Options,
     /// WAL for store.
-    pub(crate) wal: Arc<Option<WAL>>,
-    /// Value log for store.
-    pub(crate) vlog: Arc<Option<AOL>>,
-    /// Timestamp Oracle for store.
+    pub(crate) wal: Arc<WAL>,
+    /// Transaction log for store.
+    pub(crate) tlog: Arc<RwLock<AOL>>,
+    /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Flag to indicate if store is closed.
     pub(crate) closed: bool,
@@ -30,12 +31,22 @@ pub struct MVCCStore<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> {
     /// Creates a new MVCC key-value store with the given key-value store for storage.
     pub fn new(opts: Options) -> Self {
+        let lopts = LogOptions::default();
+        let topts = LogOptions::default();
+        // TODO: remove expect
+        let wal = WAL::open(&opts.dir, lopts).expect("failed to open WAL");
+        let tlog = AOL::open(&opts.dir, &topts).expect("failed to open transaction log");
+
+        // TODO:: set it to max tx id from tx log
+        let oracle = Oracle::new();
+        oracle.set_txn_id(1);
+
         Self {
             index: RwLock::new(tart::new()),
             opts,
-            wal: Arc::new(None),
-            vlog: Arc::new(None),
-            oracle: Arc::new(Oracle::new()),
+            wal: Arc::new(wal),
+            tlog: Arc::new(RwLock::new(tlog)),
+            oracle: Arc::new(oracle),
             closed: false,
         }
     }

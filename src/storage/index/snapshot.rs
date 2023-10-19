@@ -12,7 +12,7 @@ use crate::storage::index::KeyTrait;
 pub struct Snapshot<P: KeyTrait, V: Clone> {
     pub(crate) id: u64,
     pub(crate) ts: u64,
-    pub(crate) root: Rc<Node<P, V>>,
+    pub(crate) root: Option<Rc<Node<P, V>>>,
     pub(crate) readers: HashSet<u64>,
     pub(crate) max_active_readers: AtomicU64,
     pub(crate) closed: bool,
@@ -20,7 +20,7 @@ pub struct Snapshot<P: KeyTrait, V: Clone> {
 
 impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     /// Creates a new Snapshot instance with the provided snapshot_id and root node.
-    pub(crate) fn new(id: u64, root: Rc<Node<P, V>>, ts: u64) -> Self {
+    pub(crate) fn new(id: u64, root: Option<Rc<Node<P, V>>>, ts: u64) -> Self {
         Snapshot {
             id,
             ts: ts,
@@ -37,15 +37,28 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Insert the key-value pair into the root node using a recursive function
-        let (new_node, _) = match Node::insert_recurse(&self.root, key, value, self.ts, ts, 0) {
-            Ok((new_node, old_node)) => (new_node, old_node),
-            Err(err) => {
-                return Err(err);
+        match &self.root {
+            Some(root) => {
+                let (new_node, _) = match Node::insert_recurse(root, key, value, self.ts, ts, 0) {
+                    Ok((new_node, old_node)) => (new_node, old_node),
+                    Err(err) => {
+                        return Err(err);
+                    }
+                };
+
+                // Update the root node with the new node after insertion
+                self.root = Some(new_node);
+            }
+            None => {
+                self.root = Some(Rc::new(Node::new_twig(
+                    key.as_slice().into(),
+                    key.as_slice().into(),
+                    value,
+                    self.ts,
+                    ts,
+                )))
             }
         };
-
-        // Update the root node with the new node after insertion
-        self.root = new_node;
 
         Ok(())
     }
@@ -56,13 +69,17 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Use a recursive function to get the value and timestamp from the root node
-        Node::get_recurse(self.root.as_ref(), key, ts)
-            .map(|(_, value, version, ts)| (value, version, ts))
+        match self.root.as_ref() {
+            Some(root) => {
+                Node::get_recurse(root, key, ts).map(|(_, value, version, ts)| (value, version, ts))
+            }
+            None => Err(TrieError::KeyNotFound),
+        }
     }
 
     /// Returns the version of the snapshot.
     pub fn version(&self) -> u64 {
-        self.root.version()
+        self.root.as_ref().map_or(0, |root| root.version())
     }
 
     fn is_closed(&self) -> Result<(), TrieError> {
@@ -92,9 +109,16 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
+        if self.root.is_none() {
+            return Err(TrieError::SnapshotEmpty);
+        }
+
         let reader_id = self.max_active_readers.fetch_add(1, Ordering::SeqCst);
         self.readers.insert(reader_id);
-        Ok(IterationPointer::new(self.root.clone(), reader_id))
+        Ok(IterationPointer::new(
+            self.root.as_ref().unwrap().clone(),
+            reader_id,
+        ))
     }
 
     pub fn active_readers(&self) -> Result<u64, TrieError> {
