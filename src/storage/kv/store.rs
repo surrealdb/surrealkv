@@ -2,13 +2,13 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::storage::log::aol::aol::AOL;
 use crate::storage::index::art::Tree as tart;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::Result;
 use crate::storage::kv::option::Options;
 use crate::storage::kv::oracle::Oracle;
 use crate::storage::kv::transaction::{Mode, Transaction};
+use crate::storage::log::aol::aol::AOL;
 use crate::storage::log::wal::wal::WAL;
 use crate::storage::log::Options as LogOptions;
 
