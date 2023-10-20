@@ -985,7 +985,22 @@ impl Segment {
                 "Segment is closed",
             )));
         }
-        self.sync()?;
+        // self.sync()?;
+        if self.block.written > 0 {
+            // Flush the full block to disk if it is a WAL with zero padded
+            // to the end of the last block. This is done to avoid writing
+            // partial records to the WAL, and for detecting corruption.
+            //
+            // Else flush the block as it is without zero padding.
+            if self.is_wal{
+                self.flush_block(true)?;
+            } else {
+                self.flush_block(false)?;
+            }
+        }
+
+        self.file.sync_all()?;
+
         self.closed = true;
         Ok(())
     }
@@ -1369,7 +1384,9 @@ impl Read for MultiSegmentReader {
             return Ok(0);
         }
 
-        // TODO: could create a problem when reading a partial block spread over multiple segments
+        // Note: This could create a problem when reading a partial block 
+        // spread over multiple segments. Currently aol and wal do not
+        // write partial blocks spanning multiple segments.
         if !self.is_eof()? {
             self.read_to_buffer(buf)
         } else {
@@ -1835,7 +1852,7 @@ mod tests {
         // Reopen segment
         let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
         // Test initial offset
-        assert_eq!(segment.offset(), 4096 * 2);
+        assert_eq!(segment.offset(), 4100);
 
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(segment);
