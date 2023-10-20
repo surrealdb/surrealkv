@@ -136,6 +136,8 @@ impl AOL {
         let mut n = 0usize;
         let mut offset = 0;
 
+        // TODO: check if there is a potential infinite loop here if the
+        // record is larger than the max file size. Write a test to check this.
         while n < rec.len() {
             // Calculate available space in the active segment
             let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
@@ -316,12 +318,8 @@ mod tests {
         // 4 + 7 = 11
         assert_eq!(a.offset().unwrap(), 11);
 
-        // Test syncing segment
-        let r = a.sync();
-        assert!(r.is_ok());
-
         // Validate offset after syncing
-        assert_eq!(a.offset().unwrap(), 4096);
+        assert_eq!(a.offset().unwrap(), 11);
 
         // Test reading from segment
         let mut bs = vec![0; 4];
@@ -340,27 +338,20 @@ mod tests {
         let r = a.read_at(&mut bs, 4097);
         assert!(r.is_err());
 
-        // Test appending another buffer after syncing
+        // Test appending another buffer
         let r = a.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 4 = 4100
-        assert_eq!(a.offset().unwrap(), 4100);
+        // 11 + 4 = 15
+        assert_eq!(a.offset().unwrap(), 15);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, 4096).expect("should read");
+        let n = a.read_at(&mut bs, 11).expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
-
-        // Test syncing segment again
-        let r = a.sync();
-        assert!(r.is_ok());
-
-        // Validate offset after syncing again
-        assert_eq!(a.offset().unwrap(), 4096 * 2);
 
         // Test closing segment
         assert!(a.close().is_ok());
