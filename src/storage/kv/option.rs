@@ -5,7 +5,8 @@ use super::entry::{MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE};
 #[derive(Clone)]
 pub struct Options {
     // Required options.
-    pub dir: PathBuf, // Directory path for storing the database files.
+    pub dir: PathBuf,     // Directory path for storing the database files.
+    pub wal_dir: PathBuf, // Directory path for storing the write-ahead log.
 
     // Usually modified options.
     pub sync_writes: bool,           // Whether to perform fsync after writes.
@@ -30,6 +31,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             dir: PathBuf::from(""),
+            wal_dir: PathBuf::from("./wal"),
             sync_writes: false,
             num_versions_to_keep: 1,
             max_key_size: 1024,
