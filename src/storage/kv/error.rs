@@ -30,6 +30,8 @@ pub enum Error {
     StoreClosed,
     InvalidAttributeData,
     UnknownAttributeType,
+    CorruptedTxRecord,
+    CorruptedTxHeader,
 }
 
 /// Error structure for encoding errors
@@ -82,6 +84,8 @@ impl fmt::Display for Error {
             Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
             Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
             Error::Log(log_error) => write!(f, "Log error: {}", log_error),
+            Error::CorruptedTxRecord => write!(f, "Corrupted transaction record"),
+            Error::CorruptedTxHeader => write!(f, "Corrupted transaction header"),
         }
     }
 }

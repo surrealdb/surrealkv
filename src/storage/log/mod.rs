@@ -18,7 +18,7 @@ use crc32fast::Hasher;
 /// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
 /// flushing to disk. Larger block sizes can improve write performance but might use more memory.
-const BLOCK_SIZE: usize = 4096;
+pub(crate) const BLOCK_SIZE: usize = 4096;
 
 /// Length of the record header in bytes.
 ///
@@ -992,7 +992,7 @@ impl Segment {
             // partial records to the WAL, and for detecting corruption.
             //
             // Else flush the block as it is without zero padding.
-            if self.is_wal{
+            if self.is_wal {
                 self.flush_block(true)?;
             } else {
                 self.flush_block(false)?;
@@ -1287,11 +1287,17 @@ impl fmt::Display for CorruptionError {
 // Implementation of Error trait for CorruptionError
 impl std::error::Error for CorruptionError {}
 
+// MultiSegmentReader is a buffered reader that reads in multiples of BLOCK_SIZE.
+// It is used by Reader to read from multiple segments. It is used by WAL to
+// track multiple segment and offset for corruption detection. Since data is
+// written to WAL in multiples of BLOCK_SIZE, non-block aligned segments
+// are padded with zeros. This is done to avoid partial reads from the WAL.
 pub struct MultiSegmentReader {
     buf: BufReader<File>,      // Buffer for reading from the current segment.
     segments: Vec<SegmentRef>, // List of segments to read from.
     cur: usize,                // Index of current segment in segments.
     off: usize,                // Offset in current segment.
+    read_block_aligned: bool, // Flag indicating whether the reader is reading block aligned segments.
 }
 
 impl MultiSegmentReader {
@@ -1317,11 +1323,14 @@ impl MultiSegmentReader {
             segments,
             cur,
             off,
+            read_block_aligned: true,
         })
     }
-}
 
-impl MultiSegmentReader {
+    fn set_read_block_aligned(&mut self, status: bool) {
+        self.read_block_aligned = status;
+    }
+
     fn is_eof(&mut self) -> io::Result<bool> {
         let is_eof = self.buf.fill_buf()?;
         Ok(is_eof.is_empty())
@@ -1331,12 +1340,17 @@ impl MultiSegmentReader {
         let bytes_read = self.buf.read(buf)?;
         self.off += bytes_read;
 
-        // If we read less than the buffer size, we've reached the end of the current segment.
-        if self.off % BLOCK_SIZE != 0 {
-            // Fill the rest of the buffer with zeros.
-            let i = self.fill_with_zeros(buf, bytes_read);
-            self.off += i;
-            return Ok(bytes_read + i);
+        // If this flag is set, we are reading block aligned segments. Else just return the bytes read.
+        if self.read_block_aligned {
+            // If we read less than the buffer size, we've reached the end of the current segment.
+            // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
+            // This is to avoid detecting the wrong segment as corrupt.
+            if self.off % BLOCK_SIZE != 0 {
+                // Fill the rest of the buffer with zeros.
+                let i = self.fill_with_zeros(buf, bytes_read);
+                self.off += i;
+                return Ok(bytes_read + i);
+            }
         }
 
         Ok(bytes_read)
@@ -1384,7 +1398,7 @@ impl Read for MultiSegmentReader {
             return Ok(0);
         }
 
-        // Note: This could create a problem when reading a partial block 
+        // Note: This could create a problem when reading a partial block
         // spread over multiple segments. Currently aol and wal do not
         // write partial blocks spanning multiple segments.
         if !self.is_eof()? {

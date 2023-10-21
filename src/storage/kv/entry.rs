@@ -126,7 +126,9 @@ impl TxRecord {
     }
 
     pub(crate) fn add_entry(&mut self, entry: Entry) {
+        let crc = calculate_crc32(entry.key.as_ref(), entry.value.as_ref());
         let tx_record_entry = TxRecordEntry {
+            crc: crc,
             key: entry.key.clone(),
             key_len: entry.key.len() as u32,
             md: entry.metadata,
@@ -144,30 +146,30 @@ impl TxRecord {
 
         // Encode entries
         for entry in &self.entries {
-            let crc = calculate_crc32(entry.key.as_ref(), entry.value.as_ref());
-            buf.put_u32(crc);
+            if let Some(metadata) = &entry.md {
+                let md_bytes = metadata.bytes();
+                let md_len = md_bytes.len() as u16;
+                buf.put_u16(md_len);
+                buf.put(md_bytes);
+            } else {
+                buf.put_u16(0);
+            }
+            buf.put_u32(entry.crc);
             buf.put_u32(entry.key_len);
             buf.put(entry.key.as_ref());
             buf.put_u32(entry.value_len);
             buf.put(entry.value.as_ref());
-            if let Some(metadata) = &entry.md {
-                let md_bytes = metadata.bytes();
-                let md_len = md_bytes.len() as u32;
-                buf.put_u32(md_len);
-                buf.put(md_bytes);
-            } else {
-                buf.put_u32(0);
-            }
         }
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct TxRecordHeader {
-    id: u64,
-    ts: u64,
-    version: u16,
-    metadata: Option<Metadata>,
-    num_entries: u16,
+    pub(crate) id: u64,
+    pub(crate) ts: u64,
+    pub(crate) version: u16,
+    pub(crate) metadata: Option<Metadata>,
+    pub(crate) num_entries: u16,
 }
 
 impl TxRecordHeader {
@@ -198,12 +200,15 @@ impl TxRecordHeader {
     }
 }
 
+
+#[derive(Debug)]
 pub(crate) struct TxRecordEntry {
-    key: Bytes,
-    key_len: u32,
-    md: Option<Metadata>,
-    value_len: u32,
-    value: Bytes,
+    pub(crate) crc: u32,
+    pub(crate) key: Bytes,
+    pub(crate) key_len: u32,
+    pub(crate) md: Option<Metadata>,
+    pub(crate) value_len: u32,
+    pub(crate) value: Bytes,
 }
 
 impl TxRecordHeader {

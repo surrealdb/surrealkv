@@ -21,27 +21,27 @@ pub trait Version {
 }
 
 #[derive(Clone)]
-pub struct TwigNode<K: KeyTrait + Clone, V: Clone> {
+pub struct TwigNode<K: KeyTrait + Clone, V> {
     pub(crate) prefix: K,
     pub(crate) key: K,
     pub(crate) values: Vec<Rc<LeafValue<V>>>,
     pub(crate) version: u64, // Version for the twig node
 }
 
-#[derive(Clone)]
-pub struct LeafValue<V: Clone> {
+#[derive(Copy, Clone)]
+pub struct LeafValue<V> {
     pub(crate) value: V,
     pub(crate) version: u64,
     pub(crate) ts: u64,
 }
 
-impl<V: Clone> LeafValue<V> {
+impl<V> LeafValue<V> {
     pub fn new(value: V, version: u64, ts: u64) -> Self {
         LeafValue { value, version, ts }
     }
 }
 
-impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
+impl<K: KeyTrait + Clone, V> TwigNode<K, V> {
     pub fn new(prefix: K, key: K) -> Self {
         TwigNode {
             prefix,
@@ -118,11 +118,11 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
             .cloned()
     }
 
-    pub fn get_latest_value(&self) -> Option<V> {
+    pub fn get_latest_value(&self) -> Option<&V> {
         self.values
             .iter()
             .max_by_key(|value| value.version)
-            .map(|value| value.value.clone())
+            .map(|value| &value.value)
     }
 
     pub fn get_leaf_by_version(&self, version: u64) -> Option<Rc<LeafValue<V>>> {
@@ -138,7 +138,7 @@ impl<K: KeyTrait + Clone, V: Clone> TwigNode<K, V> {
     }
 }
 
-impl<K: KeyTrait + Clone, V: Clone> Version for TwigNode<K, V> {
+impl<K: KeyTrait + Clone, V> Version for TwigNode<K, V> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -1075,7 +1075,7 @@ mod tests {
         node.insert_mut(42, 123, 0);
         node.insert_mut(43, 124, 1);
         let latest_value = node.get_latest_value();
-        assert_eq!(latest_value.unwrap(), 43);
+        assert_eq!(*latest_value.unwrap(), 43);
     }
 
     #[test]

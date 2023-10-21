@@ -62,6 +62,7 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     /// The snapshot that the transaction is running in.
     snapshot: Snapshot<P, V>,
 
+    // Reusable buffer for encoding transaction records.
     buf: BytesMut,
 
     /// The underlying store for the transaction. Shared between transactions using a mutex.
@@ -92,7 +93,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             read_ts: read_ts,
             mode,
             snapshot,
-            buf: BytesMut::with_capacity(store.opts.max_tx_size()),
+            buf: BytesMut::new(),
             store,
             write_set: HashMap::new(),
             read_set: Mutex::new(Vec::new()),
@@ -339,6 +340,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let tx_record = TxRecord::new_from_entries(entries);
         tx_record.encode(&mut self.buf);
 
+        println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
         tlog.append(&self.buf.as_ref())?;
         Ok(())
@@ -385,9 +387,12 @@ mod tests {
 
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
+    use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::MVCCStore;
     use crate::storage::kv::transaction::{Mode, Transaction};
     use crate::storage::kv::util::NoopValue;
+    use crate::storage::log::aol::aol::AOL;
+    use crate::storage::log::Options as LogOptions;
 
     use tempdir::TempDir;
 
@@ -411,5 +416,32 @@ mod tests {
         let mut txn = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
         txn.set(&key_clone, value).unwrap();
         txn.commit().unwrap();
+
+        let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
+        println!("offset: {:?}", a.offset());
+
+        let r = Reader::new_from(a, 0, 3).unwrap();
+        let mut txr = TxReader::new(r).unwrap();
+        let hdr = txr.read_header().unwrap();
+        println!("hdr: {:?}", hdr);
+
+        let val = txr.read_entry().unwrap();
+        println!("val: {:?}", val);
+
+        // let bs = r.read_uint64().unwrap();
+        // println!("bs: {:?}", bs);
+        // let bs = r.read_uint64().unwrap();
+        // println!("bs: {:?}", bs);
+        // let bs = r.read_uint16().unwrap();
+        // println!("bs: {:?}", bs);
+        // let bs = r.read_uint16().unwrap();
+        // println!("bs: {:?}", bs);
+        // let bs = r.read_uint16().unwrap();
+        // println!("bs: {:?}", bs);
+
+        // let bs = r.read_uint32().unwrap();
+        // println!("bs: {:?}", bs);
+        // let bs = r.read_uint32().unwrap();
+        // println!("bs: {:?}", bs);
     }
 }
