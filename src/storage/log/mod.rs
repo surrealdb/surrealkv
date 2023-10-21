@@ -1157,22 +1157,24 @@ impl Segment {
         let pending = bs.len() - n;
         if pending > 0 {
             let available = self.block.unwritten() - boff;
-            let read_chunk_size = std::cmp::min(pending, available);
+            let remaining = std::cmp::min(pending, available);
 
-            if read_chunk_size > 0 {
+            if remaining > 0 {
                 let buf = &self.block.buf
-                    [self.block.written + boff..self.block.written + boff + read_chunk_size];
+                    [self.block.written + boff..self.block.written + boff + remaining];
                 merge_slices(bs, buf);
+                n += remaining;
             }
 
-            if read_chunk_size == pending {
-                return Ok(n);
-            } else {
-                return Err(Error::IO(IOError::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Incomplete read",
-                )));
-            }
+            return Ok(n);
+            // if read_chunk_size == pending {
+            //     return Ok(n);
+            // } else {
+            //     return Err(Error::IO(IOError::new(
+            //         io::ErrorKind::UnexpectedEof,
+            //         "Incomplete read",
+            //     )));
+            // }
         }
 
         Ok(n)
@@ -1241,7 +1243,7 @@ pub struct IOError {
 }
 
 impl IOError {
-    fn new(kind: io::ErrorKind, message: &str) -> Self {
+    pub(crate) fn new(kind: io::ErrorKind, message: &str) -> Self {
         IOError {
             kind,
             message: message.to_string(),
@@ -1297,7 +1299,6 @@ pub struct MultiSegmentReader {
     segments: Vec<SegmentRef>, // List of segments to read from.
     cur: usize,                // Index of current segment in segments.
     off: usize,                // Offset in current segment.
-    read_block_aligned: bool, // Flag indicating whether the reader is reading block aligned segments.
 }
 
 impl MultiSegmentReader {
@@ -1323,34 +1324,26 @@ impl MultiSegmentReader {
             segments,
             cur,
             off,
-            read_block_aligned: true,
         })
     }
 
-    fn set_read_block_aligned(&mut self, status: bool) {
-        self.read_block_aligned = status;
-    }
-
     fn is_eof(&mut self) -> io::Result<bool> {
-        let is_eof = self.buf.fill_buf()?;
-        Ok(is_eof.is_empty())
+        let bytes_read = self.buf.fill_buf()?;
+        Ok(bytes_read.is_empty())
     }
 
     fn read_to_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let bytes_read = self.buf.read(buf)?;
         self.off += bytes_read;
 
-        // If this flag is set, we are reading block aligned segments. Else just return the bytes read.
-        if self.read_block_aligned {
-            // If we read less than the buffer size, we've reached the end of the current segment.
-            // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
-            // This is to avoid detecting the wrong segment as corrupt.
-            if self.off % BLOCK_SIZE != 0 {
-                // Fill the rest of the buffer with zeros.
-                let i = self.fill_with_zeros(buf, bytes_read);
-                self.off += i;
-                return Ok(bytes_read + i);
-            }
+        // If we read less than the buffer size, we've reached the end of the current segment.
+        // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
+        // This is to avoid detecting the wrong segment as corrupt.
+        if self.off % BLOCK_SIZE != 0 {
+            // Fill the rest of the buffer with zeros.
+            let i = self.fill_with_zeros(buf, bytes_read);
+            self.off += i;
+            return Ok(bytes_read + i);
         }
 
         Ok(bytes_read)
