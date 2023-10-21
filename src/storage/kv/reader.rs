@@ -14,7 +14,7 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
-    pub(crate) fn new_from(mut r_at: AOL, off: u64, size: usize) -> Result<Self> {
+    pub(crate) fn new_from(r_at: AOL, off: u64, size: usize) -> Result<Self> {
         Ok(Reader {
             r_at,
             data: vec![0; size],
@@ -108,7 +108,15 @@ impl TxReader {
     pub(crate) fn read_header(&mut self) -> Result<TxRecordHeader> {
         let mut header = TxRecordHeader::new();
 
-        header.id = self.r.read_uint64()?;
+        let id = self.r.read_uint64()?;
+
+        // Either the header is corrupted or we have reached the end of the file
+        // and encountered the padded zeros towards the end of the file.
+        if id == 0 {
+            return Err(Error::InvalidTxRecordID);
+        }
+
+        header.id = id;
         header.ts = self.r.read_uint64()?;
         header.version = self.r.read_uint16()?;
         header.num_entries = self.r.read_uint16()?;
@@ -128,7 +136,6 @@ impl TxReader {
         }
 
         header.metadata = txmd;
-
 
         Ok(header)
     }
@@ -153,7 +160,6 @@ impl TxReader {
         let v_len = self.r.read_uint32()? as usize;
         let mut v = vec![0; v_len];
         self.r.read(&mut v)?;
-        println!("done {}", v_len);
 
         Ok(TxRecordEntry {
             crc: crc,

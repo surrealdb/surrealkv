@@ -10,6 +10,7 @@ use std::sync::RwLock;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+use crate::storage::log;
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
@@ -220,7 +221,18 @@ impl AOL {
             let read_offset = offset % self.opts.max_file_size;
 
             // Read data from the appropriate segment
-            r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
+            let bytes_read = self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
+            // Is zero bytes read imply eof? Just continue as long as r is > 0
+            // TODO:: check if this reads across multiple segments
+            if bytes_read == 0 {
+                // log::debug!("read_at: zero bytes read");
+                // return Err(Error::IO(IOError::new(
+                //     io::ErrorKind::UnexpectedEof,
+                //     "No more data to read",
+                // )));
+                break;
+            }
+            r += bytes_read;
         }
 
         Ok(r)

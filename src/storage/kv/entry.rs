@@ -117,8 +117,10 @@ impl TxRecord {
         }
     }
 
-    pub(crate) fn new_from_entries(entries: Vec<Entry>) -> Self {
+    pub(crate) fn new_from_entries(entries: Vec<Entry>, tx_id: u64) -> Self {
         let mut tx_record = TxRecord::new();
+        tx_record.header.id = tx_id;
+
         for entry in entries {
             tx_record.add_entry(entry);
         }
@@ -199,7 +201,6 @@ impl TxRecordHeader {
         self.metadata = metadata;
     }
 }
-
 
 #[derive(Debug)]
 pub(crate) struct TxRecordEntry {

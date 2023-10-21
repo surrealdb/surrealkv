@@ -304,10 +304,10 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         }
 
         // Prepare for the commit
-        self.prepare_commit()?;
+        let tx_id = self.prepare_commit()?;
 
         // Add transaction records to the log
-        self.add_to_transaction_log()?;
+        self.add_to_transaction_log(tx_id)?;
 
         // Commit to the store index
         self.commit_to_index()?;
@@ -316,28 +316,29 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<()> {
+    fn prepare_commit(&mut self) -> Result<u64> {
         if !self.mode.is_write_only() {
             self.snapshot.close()?;
         }
 
         self.closed = true;
-        self.assign_commit_timestamps();
-        Ok(())
+        let commit_ts = self.assign_commit_timestamp();
+        Ok(commit_ts)
     }
 
     /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_timestamps(&mut self) {
+    fn assign_commit_timestamp(&mut self) -> u64 {
         let commit_ts = self.store.oracle.new_commit_ts();
         self.write_set.iter_mut().for_each(|(_, entry)| {
-            entry.ts = commit_ts;
+            entry.ts = commit_ts; // this should be time.now(), not txID
         });
+        commit_ts
     }
 
     /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self) -> Result<()> {
+    fn add_to_transaction_log(&mut self, tx_id: u64) -> Result<()> {
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
-        let tx_record = TxRecord::new_from_entries(entries);
+        let tx_record = TxRecord::new_from_entries(entries, tx_id);
         tx_record.encode(&mut self.buf);
 
         println!("buf: {:?}", self.buf.as_ref());
@@ -420,7 +421,7 @@ mod tests {
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
         println!("offset: {:?}", a.offset());
 
-        let r = Reader::new_from(a, 0, 3).unwrap();
+        let r = Reader::new_from(a, 0, 10).unwrap();
         let mut txr = TxReader::new(r).unwrap();
         let hdr = txr.read_header().unwrap();
         println!("hdr: {:?}", hdr);
