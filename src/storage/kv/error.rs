@@ -13,7 +13,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     Abort,
-    Io(Arc<io::Error>),
+    IO(Arc<io::Error>),
     Log(LogError),
     EmptyKey,
     PoisonError(String),
@@ -32,6 +32,7 @@ pub enum Error {
     UnknownAttributeType,
     CorruptedTxRecord,
     CorruptedTxHeader,
+    InvalidTxRecordID,
 }
 
 /// Error structure for encoding errors
@@ -65,7 +66,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Abort => write!(f, "Operation aborted"),
-            Error::Io(err) => write!(f, "IO error: {}", err),
+            Error::IO(err) => write!(f, "IO error: {}", err),
             Error::EmptyKey => write!(f, "Empty key"),
             Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
             Error::TxnClosed => {
@@ -86,6 +87,7 @@ impl fmt::Display for Error {
             Error::Log(log_error) => write!(f, "Log error: {}", log_error),
             Error::CorruptedTxRecord => write!(f, "Corrupted transaction record"),
             Error::CorruptedTxHeader => write!(f, "Corrupted transaction header"),
+            Error::InvalidTxRecordID => write!(f, "Invalid transaction record ID"),
         }
     }
 }
@@ -96,7 +98,7 @@ impl std::error::Error for Error {}
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
-        Error::Io(Arc::new(e))
+        Error::IO(Arc::new(e))
     }
 }
 
