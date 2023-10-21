@@ -11,11 +11,25 @@ pub mod util;
 
 use crc32fast::Hasher;
 
+const NULL_BYTE: [u8; 1] = [0];
+
+
 fn calculate_crc32(a1: &[u8], a2: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(a1);
     hasher.update(a2);
     hasher.finalize()
+}
+
+fn terminate_with_null(key: &[u8]) -> Vec<u8> {
+    if !key.ends_with(&NULL_BYTE) {
+        let mut terminated_key = Vec::with_capacity(key.len() + 1);
+        terminated_key.extend_from_slice(key);
+        terminated_key.push(0);
+        terminated_key
+    } else {
+        key.to_vec()
+    }
 }
 
 // use crate::storage::kv::error::Result;

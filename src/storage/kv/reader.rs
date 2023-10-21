@@ -5,52 +5,47 @@ use crate::storage::log::aol::aol::AOL;
 
 pub(crate) struct Reader {
     r_at: AOL,
-    data: Vec<u8>,
-    data_index: usize,
+    buffer: Vec<u8>,
+    read: usize,
+    start: usize,
     eof: bool,
-    read_index: usize,
     offset: u64,
-    read_count: u64, // total number of read bytes
 }
 
 impl Reader {
     pub(crate) fn new_from(r_at: AOL, off: u64, size: usize) -> Result<Self> {
         Ok(Reader {
             r_at,
-            data: vec![0; size],
-            data_index: 0,
+            buffer: vec![0; size],
+            read: 0,
+            start: 0,
             eof: false,
-            read_index: 0,
             offset: off,
-            read_count: 0,
         })
     }
 
     fn reset(&mut self) {
-        self.data_index = 0;
+        self.read = 0;
         self.eof = false;
-        self.read_index = 0;
         self.offset = 0;
-        self.read_count = 0;
+        self.start = 0;
     }
 
     fn offset(&self) -> u64 {
         self.offset
     }
 
-    fn read_count(&self) -> u64 {
-        self.read_count
-    }
 
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut n = 0;
-        while n < buf.len() {
-            let bn = std::cmp::min(self.data_index - self.read_index, buf.len() - n);
-            buf[n..n + bn].copy_from_slice(&self.data[self.read_index..self.read_index + bn]);
-            self.read_index += bn;
-            n += bn;
+        let buf_len = buf.len();
 
-            if n == buf.len() {
+        while n < buf_len {
+            let bn = std::cmp::min(self.read - self.start, buf_len - n);
+            buf[n..n + bn].copy_from_slice(&self.buffer[self.start..self.start + bn]);
+            self.start += bn;
+            n += bn;
+            if n == buf_len {
                 break;
             }
 
@@ -58,9 +53,9 @@ impl Reader {
                 return Ok(n);
             }
 
-            let rn = self.r_at.read_at(&mut self.data, self.offset)?;
-            self.data_index = rn;
-            self.read_index = 0;
+            let rn = self.r_at.read_at(&mut self.buffer[..buf_len], self.offset)?;
+            self.read = rn;
+            self.start = 0;
             self.offset += rn as u64;
 
             if rn == 0 {
@@ -175,7 +170,7 @@ impl TxReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::log::{Options, BLOCK_SIZE};
+    use crate::storage::log::Options;
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
@@ -210,9 +205,9 @@ mod tests {
         let a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
         println!("offset: {:?}", a.offset());
 
-        let mut r = Reader::new_from(a, 0, BLOCK_SIZE).unwrap();
+        let mut r = Reader::new_from(a, 0, 200000).unwrap();
 
-        let mut bs = vec![0; 4];
+        let mut bs = vec![0; 2];
         let n = r.read(&mut bs).expect("should read");
         println!("bs: {:?}", bs);
         let n = r.read(&mut bs).expect("should read");

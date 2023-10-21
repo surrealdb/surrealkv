@@ -1166,15 +1166,11 @@ impl Segment {
                 n += remaining;
             }
 
-            return Ok(n);
-            // if read_chunk_size == pending {
-            //     return Ok(n);
-            // } else {
-            //     return Err(Error::IO(IOError::new(
-            //         io::ErrorKind::UnexpectedEof,
-            //         "Incomplete read",
-            //     )));
-            // }
+            if remaining == pending {
+                return Ok(n);
+            } else {
+                return Err(Error::IncompleteRead);
+            }
         }
 
         Ok(n)
@@ -1200,6 +1196,7 @@ pub enum Error {
     EOFError,
     IO(IOError),
     PoisonError(String),
+    IncompleteRead,
 }
 
 // Implementation of Display trait for Error
@@ -1212,6 +1209,7 @@ impl fmt::Display for Error {
             Error::IO(err) => write!(f, "IO error: {}", err),
             Error::EOFError => write!(f, "EOF error"),
             Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::IncompleteRead => write!(f, "Incomplete read"),
         }
     }
 }

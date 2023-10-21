@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::storage::index::{KeyTrait, SparseArray};
+use crate::storage::index::{KeyTrait, SparseVector};
 
 /*
     Immutable nodes
@@ -365,8 +365,8 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Version for FlatNode<P
 pub struct Node48<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
-    child_ptr_indexes: Box<SparseArray<u8, 256>>,
-    children: Box<SparseArray<Rc<N>, 48>>,
+    child_ptr_indexes: Box<SparseVector<u8, 256>>,
+    children: Box<SparseVector<Rc<N>, 48>>,
     num_children: u8,
 }
 
@@ -375,8 +375,8 @@ impl<P: KeyTrait + Clone, N: Version> Node48<P, N> {
         Self {
             prefix,
             version: 0,
-            child_ptr_indexes: Box::new(SparseArray::new()),
-            children: Box::new(SparseArray::new()),
+            child_ptr_indexes: Box::new(SparseVector::new()),
+            children: Box::new(SparseVector::new()),
             num_children: 0,
         }
     }
@@ -523,7 +523,7 @@ pub struct Node256<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P,    // Prefix associated with the node
     pub(crate) version: u64, // Version for node256
 
-    children: Box<SparseArray<Rc<N>, 256>>,
+    children: Box<SparseVector<Rc<N>, 256>>,
     num_children: usize,
 }
 
@@ -532,7 +532,7 @@ impl<P: KeyTrait + Clone, N: Version> Node256<P, N> {
         Self {
             prefix,
             version: 0,
-            children: Box::new(SparseArray::new()),
+            children: Box::new(SparseVector::new()),
             num_children: 0,
         }
     }

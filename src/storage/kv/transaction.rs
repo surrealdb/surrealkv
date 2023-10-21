@@ -193,8 +193,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             let indexed_value: Vec<u8> =
                 vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
             let indexed_value_bytes = Bytes::from(indexed_value);
-            self.snapshot
-                .set(&e.key[..].into(), indexed_value_bytes.into())?;
+            self.snapshot.set(&e.key[..].into(), indexed_value_bytes.into())?;
         }
 
         // Add the entry to pending writes
@@ -410,18 +409,21 @@ mod tests {
         let store = Arc::new(MVCCStore::<VectorKey, NoopValue>::new(opts));
         assert_eq!(store.closed, false);
 
-        let key = Bytes::from("foo");
-        let key_clone = key.clone();
+        let key1 = Bytes::from("foo1");
+        let key1_clone = key1.clone();
+        let key2 = Bytes::from("foo2");
+        let key2_clone = key2.clone();
         let value = Bytes::from("baz");
 
         let mut txn = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn.set(&key_clone, value).unwrap();
+        txn.set(&key1_clone, value.clone()).unwrap();
+        txn.set(&key2_clone, value).unwrap();
         txn.commit().unwrap();
 
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
         println!("offset: {:?}", a.offset());
 
-        let r = Reader::new_from(a, 0, 10).unwrap();
+        let r = Reader::new_from(a, 0, 100).unwrap();
         let mut txr = TxReader::new(r).unwrap();
         let hdr = txr.read_header().unwrap();
         println!("hdr: {:?}", hdr);
@@ -429,6 +431,8 @@ mod tests {
         let val = txr.read_entry().unwrap();
         println!("val: {:?}", val);
 
+        let val = txr.read_entry().unwrap();
+        println!("val: {:?}", val);
         // let bs = r.read_uint64().unwrap();
         // println!("bs: {:?}", bs);
         // let bs = r.read_uint64().unwrap();
