@@ -1408,6 +1408,31 @@ mod tests {
         // Verification
         assert!(tree.get(&key, 0).is_err());
     }
+
+    #[test]
+    fn test_foo() {
+        let key1 = VectorKey::from_str("foo");
+        let key2 = VectorKey::from_str("foo2");
+
+        let mut tree = Tree::<VectorKey, i32>::new();
+
+        // Insertion
+        tree.insert(&key1, 1, 0, 0);
+        tree.insert(&key2, 1, 0, 0);
+
+        // Removal
+        assert!(tree.remove(&key1).unwrap());
+
+        // Root verification
+        if let Some(root) = &tree.root {
+            assert_eq!(root.node_type_name(), "Node1");
+        } else {
+            panic!("Tree root is None");
+        }
+    }
+
+
+
     // Inserting Two values into the tree and removing one of them
     // should result in a tree root of type twig
     #[test]
