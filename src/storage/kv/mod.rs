@@ -3,10 +3,12 @@ pub mod error;
 pub mod meta;
 pub mod option;
 pub mod oracle;
+pub mod reader;
 pub mod snapshot;
 pub mod store;
 pub mod transaction;
 pub mod util;
+
 use crc32fast::Hasher;
 
 fn calculate_crc32(a1: &[u8], a2: &[u8]) -> u32 {
