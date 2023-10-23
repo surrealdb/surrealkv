@@ -3,6 +3,8 @@ use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::log::aol::aol::AOL;
 
+use super::entry::TxRecord;
+
 pub(crate) struct Reader {
     r_at: AOL,
     buffer: Vec<u8>,
@@ -101,9 +103,7 @@ impl TxReader {
         Ok(TxReader { r })
     }
 
-    pub(crate) fn read_header(&mut self) -> Result<TxRecordHeader> {
-        let mut header = TxRecordHeader::new();
-
+    pub(crate) fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
         let id = self.r.read_uint64()?;
 
         // Either the header is corrupted or we have reached the end of the file
@@ -112,10 +112,10 @@ impl TxReader {
             return Err(Error::InvalidTxRecordID);
         }
 
-        header.id = id;
-        header.ts = self.r.read_uint64()?;
-        header.version = self.r.read_uint16()?;
-        header.num_entries = self.r.read_uint16()?;
+        tx.header.id = id;
+        tx.header.ts = self.r.read_uint64()?;
+        tx.header.version = self.r.read_uint16()?;
+        tx.header.num_entries = self.r.read_uint16()?;
 
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_TX_METADATA_SIZE {
@@ -131,12 +131,12 @@ impl TxReader {
             txmd = Some(metadata);
         }
 
-        header.metadata = txmd;
+        tx.header.metadata = txmd;
 
-        Ok(header)
+        Ok(())
     }
 
-    pub(crate) fn read_entry(&mut self) -> Result<TxRecordEntry> {
+    pub(crate) fn read_entry(&mut self, tx: &mut TxRecordEntry) -> Result<()> {
         let md_len = self.r.read_uint16()?;
         let mut kvmd: Option<Metadata> = None;
         if md_len > 0 {
@@ -157,14 +157,29 @@ impl TxReader {
         let mut v = vec![0; v_len];
         self.r.read(&mut v)?;
 
-        Ok(TxRecordEntry {
-            crc: crc,
-            md: kvmd,
-            key: k.into(),
-            value: v.into(),
-            value_len: v_len as u32,
-            key_len: k_len as u32,
-        })
+        tx.crc = crc;
+        tx.md = kvmd;
+        tx.key = k.into();
+        tx.value = v.into();
+        tx.value_len = v_len as u32;
+        tx.key_len = k_len as u32;
+
+        Ok(())
+    }
+
+    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<()>{
+        self.read_header(tx)?;
+
+        for i in 0..tx.header.num_entries as usize {
+            if let Some(entry) = tx.entries.get_mut(i) {
+                self.read_entry(entry)?;
+            } else {
+                tx.entries.insert(i, TxRecordEntry::new());
+
+                self.read_entry(tx.entries.get_mut(i).unwrap())?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -395,6 +395,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::index::VectorKey;
+    use crate::storage::kv::entry::TxRecord;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
@@ -422,26 +423,45 @@ mod tests {
         let key1_clone = key1.clone();
         let key2 = Bytes::from("foo2");
         let key2_clone = key2.clone();
-        let value = Bytes::from("baz");
+        let value1 = Bytes::from("baz");
+        let value2 = Bytes::from("bar");
 
-        let mut txn = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn.set(&key1_clone, value.clone()).unwrap();
-        txn.set(&key2_clone, value).unwrap();
-        txn.commit().unwrap();
+        let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+        txn1.set(&key1_clone, value1.clone()).unwrap();
+        txn1.set(&key2_clone, value1).unwrap();
+        txn1.commit().unwrap();
+
+        let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+        txn2.set(&key1_clone, value2.clone()).unwrap();
+        txn2.set(&key2_clone, value2).unwrap();
+        txn2.commit().unwrap();
 
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
         println!("offset: {:?}", a.offset());
 
         let r = Reader::new_from(a, 0, 100).unwrap();
         let mut txr = TxReader::new(r).unwrap();
-        let hdr = txr.read_header().unwrap();
-        println!("hdr: {:?}", hdr);
 
-        let val = txr.read_entry().unwrap();
-        println!("val: {:?}", val);
+        let mut tx = TxRecord::new(2);
+        for _ in 0..2{
+            txr.read_into(&mut tx).unwrap();
+            println!("tx: {:?}", tx);
+        }
 
-        let val = txr.read_entry().unwrap();
-        println!("val: {:?}", val);
+
+        // tx.read_from(txr).unwrap();
+        // println!("hdr: {:?}", tx.header);
+        // println!("entries: {:?}", tx.entries);
+
+        // let mut txr = TxReader::new(r).unwrap();
+        // let hdr = txr.read_header().unwrap();
+        // println!("hdr: {:?}", hdr);
+
+        // let val = txr.read_entry().unwrap();
+        // println!("val: {:?}", val);
+
+        // let val = txr.read_entry().unwrap();
+        // println!("val: {:?}", val);
         // let bs = r.read_uint64().unwrap();
         // println!("bs: {:?}", bs);
         // let bs = r.read_uint64().unwrap();
