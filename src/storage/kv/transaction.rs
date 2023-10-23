@@ -5,16 +5,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::index::art::TrieError;
-use crate::storage::index::KeyTrait;
+use super::entry::{TxRecord, ValueRef};
+use super::store::Core;
 use crate::storage::kv::entry::{
     Entry, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
 };
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
+use crate::storage::index::KeyTrait;
+use crate::storage::index::art::TrieError;
+use crate::storage::index::art::KV;
 
-use super::entry::{TxRecord, ValueRef};
-use super::store::Core;
 
 /// An MVCC transaction mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -351,14 +352,21 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     fn commit_to_index(&mut self) -> Result<()> {
         let commit_ts = self.store.oracle.new_commit_ts();
         let mut index = self.store.indexer.write()?;
+
+        let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
         for (_, entry) in self.write_set.iter() {
-            index.insert(
-                &entry.key[..].into(),
-                entry.value.clone().into(),
-                commit_ts,
-                commit_ts,
-            )?;
+            kv_pairs.push(
+                KV{
+                    key: entry.key[..].into(),
+                    value: entry.value.clone().into(),
+                    version: commit_ts,
+                    ts: commit_ts,
+                }
+            );
         }
+        index.bulk_insert(&kv_pairs)?;
+
+
         Ok(())
     }
 
