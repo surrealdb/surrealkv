@@ -21,6 +21,7 @@ impl Oracle {
     }
 
     pub(crate) fn read_ts(&self) -> u64 {
-        self.next_tx_id.load(Ordering::SeqCst) - 1
+        // self.next_tx_id.load(Ordering::SeqCst) - 1
+        self.next_tx_id.load(Ordering::SeqCst)
     }
 }

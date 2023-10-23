@@ -167,7 +167,7 @@ impl TxReader {
         Ok(())
     }
 
-    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<()>{
+    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<()> {
         self.read_header(tx)?;
 
         for i in 0..tx.header.num_entries as usize {

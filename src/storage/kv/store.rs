@@ -2,7 +2,6 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
-use crate::storage::index::art::Tree as tart;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::Result;
 use crate::storage::kv::indexer::Indexer;
