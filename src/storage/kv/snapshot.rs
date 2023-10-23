@@ -20,9 +20,7 @@ pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     pub(crate) fn take(store: Arc<Core<P, V>>, ts: u64) -> Result<Self> {
-        let mut index = store.index.write()?;
-        let snapshot = index.create_snapshot()?;
-        std::mem::drop(index);
+        let snapshot = store.indexer.write()?.snapshot()?;
 
         Ok(Self {
             ts,

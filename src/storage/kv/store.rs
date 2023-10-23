@@ -5,6 +5,7 @@ use bytes::Bytes;
 use crate::storage::index::art::Tree as tart;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::Result;
+use crate::storage::kv::indexer::Indexer;
 use crate::storage::kv::option::Options;
 use crate::storage::kv::oracle::Oracle;
 use crate::storage::kv::transaction::{Mode, Transaction};
@@ -62,20 +63,19 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> 
     }
 }
 
-
 pub struct Core<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-        /// Index for store.
-        pub(crate) index: RwLock<tart<P, V>>,
-        /// Options for store.
-        pub(crate) opts: Options,
-        /// WAL for store.
-        pub(crate) wal: Arc<WAL>,
-        /// Transaction log for store.
-        pub(crate) tlog: Arc<RwLock<AOL>>,
-        /// Transaction ID Oracle for store.
-        pub(crate) oracle: Arc<Oracle>,
-        /// Flag to indicate if store is closed.
-        pub(crate) closed: bool,    
+    /// Index for store.
+    pub(crate) indexer: RwLock<Indexer<P, V>>,
+    /// Options for store.
+    pub(crate) opts: Options,
+    /// WAL for store.
+    pub(crate) wal: Arc<WAL>,
+    /// Transaction log for store.
+    pub(crate) tlog: Arc<RwLock<AOL>>,
+    /// Transaction ID Oracle for store.
+    pub(crate) oracle: Arc<Oracle>,
+    /// Flag to indicate if store is closed.
+    pub(crate) closed: bool,
 }
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Core<P, V> {
@@ -92,8 +92,8 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Core<P, V> {
         oracle.set_txn_id(1);
 
         Self {
-            index: RwLock::new(tart::new()),
-            opts,
+            indexer: RwLock::new(Indexer::new()),
+            opts: opts,
             wal: Arc::new(wal),
             tlog: Arc::new(RwLock::new(tlog)),
             oracle: Arc::new(oracle),
