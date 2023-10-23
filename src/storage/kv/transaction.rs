@@ -350,7 +350,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     /// Commits transaction changes to the store index.
     fn commit_to_index(&mut self) -> Result<()> {
         let commit_ts = self.store.oracle.new_commit_ts();
-        let mut index = self.store.index.write()?;
+        let mut index = self.store.indexer.write()?;
         for (_, entry) in self.write_set.iter() {
             index.insert(
                 &entry.key[..].into(),
