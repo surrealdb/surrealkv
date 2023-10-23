@@ -130,58 +130,6 @@ pub(crate) enum NodeType<P: KeyTrait + Clone, V: Clone> {
     Node256(Node256<P, Node<P, V>>),   // Node with 256 keys and 256 children
 }
 
-/// A struct representing an Adaptive Radix Trie.
-///
-/// The `Tree` struct encompasses the entire adaptive radix trie data structure.
-/// It manages the root node of the tree, maintains snapshots of the tree's state,
-/// and keeps track of various properties related to snapshot management.
-///
-/// # Type Parameters
-///
-/// - `P`: A type implementing the `KeyTrait` trait, defining the prefix traits for nodes.
-/// - `V`: The type of value associated with nodes.
-///
-/// # Fields
-///
-/// - `root`: An optional shared reference (using `Rc`) to the root node of the tree.
-/// - `snapshots`: A `HashSet` storing snapshots of the tree's state, mapped by snapshot IDs.
-/// - `max_snapshot_id`: An `AtomicU64` representing the maximum snapshot ID assigned.
-/// - `max_active_snapshots`: The maximum number of active snapshots allowed.
-///
-pub struct Tree<P: KeyTrait, V: Clone> {
-    /// An optional shared reference to the root node of the tree.
-    pub(crate) root: Option<Rc<Node<P, V>>>,
-    /// A mapping of snapshot IDs to their corresponding snapshots.
-    pub(crate) snapshots: HashSet<u64>,
-    /// An atomic value indicating the maximum snapshot ID assigned.
-    pub(crate) max_snapshot_id: AtomicU64,
-    /// The maximum number of active snapshots allowed.
-    pub(crate) max_active_snapshots: u64,
-    /// A flag indicating whether the tree is closed.
-    pub(crate) closed: bool,
-}
-
-impl<P: KeyTrait + Clone, V: Clone> NodeType<P, V> {
-    fn clone(&self) -> Self {
-        match self {
-            // twig value not actually cloned
-            NodeType::Twig(twig) => NodeType::Twig(twig.clone()),
-            NodeType::Node1(n) => NodeType::Node1(n.clone()),
-            NodeType::Node4(n) => NodeType::Node4(n.clone()),
-            NodeType::Node16(n) => NodeType::Node16(n.clone()),
-            NodeType::Node48(n) => NodeType::Node48(n.clone()),
-            NodeType::Node256(n) => NodeType::Node256(n.clone()),
-        }
-    }
-}
-
-// Default implementation for the Tree struct
-impl<P: KeyTrait, V: Clone> Default for Tree<P, V> {
-    fn default() -> Self {
-        Tree::new()
-    }
-}
-
 impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     /// Creates a new Twig node with a given prefix, key, value, and version.
     ///
@@ -965,6 +913,76 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     }
 }
 
+/// A struct representing an Adaptive Radix Trie.
+///
+/// The `Tree` struct encompasses the entire adaptive radix trie data structure.
+/// It manages the root node of the tree, maintains snapshots of the tree's state,
+/// and keeps track of various properties related to snapshot management.
+///
+/// # Type Parameters
+///
+/// - `P`: A type implementing the `KeyTrait` trait, defining the prefix traits for nodes.
+/// - `V`: The type of value associated with nodes.
+///
+/// # Fields
+///
+/// - `root`: An optional shared reference (using `Rc`) to the root node of the tree.
+/// - `snapshots`: A `HashSet` storing snapshots of the tree's state, mapped by snapshot IDs.
+/// - `max_snapshot_id`: An `AtomicU64` representing the maximum snapshot ID assigned.
+/// - `max_active_snapshots`: The maximum number of active snapshots allowed.
+///
+pub struct Tree<P: KeyTrait, V: Clone> {
+    /// An optional shared reference to the root node of the tree.
+    pub(crate) root: Option<Rc<Node<P, V>>>,
+    /// A mapping of snapshot IDs to their corresponding snapshots.
+    pub(crate) snapshots: HashSet<u64>,
+    /// An atomic value indicating the maximum snapshot ID assigned.
+    pub(crate) max_snapshot_id: AtomicU64,
+    /// The maximum number of active snapshots allowed.
+    pub(crate) max_active_snapshots: u64,
+    /// A flag indicating whether the tree is closed.
+    pub(crate) closed: bool,
+}
+
+pub struct KV<P, V> {
+    pub key: P,
+    pub value: V,
+    pub version: u64,
+    pub ts: u64,
+}
+
+impl<P: KeyTrait, V: Clone> KV<P, V> {
+    pub fn new(key: P, value: V, version: u64, timestamp: u64) -> Self {
+        KV {
+            key: key,
+            value: value,
+            version: version,
+            ts: timestamp,
+        }
+    }
+}
+
+impl<P: KeyTrait + Clone, V: Clone> NodeType<P, V> {
+    fn clone(&self) -> Self {
+        match self {
+            // twig value not actually cloned
+            NodeType::Twig(twig) => NodeType::Twig(twig.clone()),
+            NodeType::Node1(n) => NodeType::Node1(n.clone()),
+            NodeType::Node4(n) => NodeType::Node4(n.clone()),
+            NodeType::Node16(n) => NodeType::Node16(n.clone()),
+            NodeType::Node48(n) => NodeType::Node48(n.clone()),
+            NodeType::Node256(n) => NodeType::Node256(n.clone()),
+        }
+    }
+}
+
+// Default implementation for the Tree struct
+impl<P: KeyTrait, V: Clone> Default for Tree<P, V> {
+    fn default() -> Self {
+        Tree::new()
+    }
+}
+
 impl<P: KeyTrait, V: Clone> Tree<P, V> {
     pub fn new() -> Self {
         Tree {
@@ -1047,6 +1065,69 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
 
         self.root = Some(new_root);
         Ok(old_node)
+    }
+
+    pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, V>]) -> Result<(), TrieError> {
+        // Check if the tree is already closed
+        self.is_closed()?;
+
+        let curr_version = self.version();
+        let mut new_version = 0;
+
+        for kv in kv_pairs {
+            let k = kv.key.clone(); // Clone the key
+            let v = kv.value.clone(); // Clone the value
+            let mut t = kv.version;
+    
+            if t == 0 {
+                // Zero-valued timestamps are associated with current time plus one
+                t = curr_version + 1;
+            } else if kv.version < curr_version {
+                return Err(TrieError::Other(
+                    "given version is older than root's current version".to_string(),
+                ));
+            }
+    
+            // Create a new KV instance
+            let new_kv = KV {
+                key: k,
+                value: v,
+                version: t,
+                ts: kv.ts,
+            };
+    
+            // Insert the new KV instance using the insert function
+            // self.insert(&new_kv.key, new_kv.value, new_kv.version, new_kv.ts)?;
+            match &self.root{
+                None => {
+                    self.root = Some(Rc::new(Node::new_twig(
+                        new_kv.key.as_slice().into(),
+                        new_kv.key.as_slice().into(),
+                        new_kv.value,
+                        new_kv.version,
+                        new_kv.ts,
+                    )))
+
+                },
+                Some(root) => {
+                    match Node::insert_recurse(root, &new_kv.key, new_kv.value, new_kv.version, new_kv.ts, 0) {
+                        Ok((new_node, _)) => {
+                            self.root = Some(new_node);
+                        },
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+    
+            // Update new_version if necessary
+            if t > new_version {
+                new_version = t;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn remove(&mut self, key: &P) -> Result<bool, TrieError> {
@@ -1273,7 +1354,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::Tree;
+    use super::{Tree, KV};
     use crate::storage::index::{ArrayKey, VectorKey};
 
     use rand::{thread_rng, Rng};
@@ -1770,7 +1851,7 @@ mod tests {
         // Attempt update with non-increasing version
         assert!(tree.insert(&key1, 1, 2, 0).is_err());
         assert_eq!(initial_version_key1, tree.version());
-        let (_, val, version, ts) = tree.get(&key1, 0).unwrap();
+        let (_, val, version, _) = tree.get(&key1, 0).unwrap();
         assert_eq!(val, 1);
         assert_eq!(version, 10);
 
@@ -1949,5 +2030,65 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn test_bulk_insert() {
+        let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
+        let curr_version = tree.version();
+        // Create a vector of KV<P, V>
+        let kv_pairs = vec![
+            KV {
+                key: VectorKey::from_str("key_1"),
+                value: 1,
+                version: 0,
+                ts: 0,
+            },
+            KV {
+                key: VectorKey::from_str("key_2"),
+                value: 1,
+                version: 2,
+                ts: 0,
+            },
+            KV {
+                key: VectorKey::from_str("key_3"),
+                value: 1,
+                version: curr_version + 1,
+                ts: 0,
+            },
+            KV {
+                key: VectorKey::from_str("key_4"),
+                value: 1,
+                version: curr_version + 1,
+                ts: 0,
+            },
+            KV {
+                key: VectorKey::from_str("key_5"),
+                value: 1,
+                version: curr_version + 2,
+                ts: 0,
+            },
+            KV {
+                key: VectorKey::from_str("key_6"),
+                value: 1,
+                version: 0,
+                ts: 0,
+            }
+        ];
+
+        assert!(tree.bulk_insert(&kv_pairs).is_ok());
+        assert!(tree.version() == curr_version + 2);
+
+        for kv in kv_pairs {
+            let (_, val, version, _) = tree.get(&kv.key, 0).unwrap();
+            assert_eq!(val, kv.value);
+            if kv.version == 0 {
+                assert_eq!(version, curr_version + 1);
+            } else {
+                assert_eq!(version, kv.version);
+            }
+        }
+        assert!(tree.insert(&VectorKey::from_str("key_7"), 1, 0, 0).is_ok());
+        assert!(tree.version() == curr_version + 3);
     }
 }
