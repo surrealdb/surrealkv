@@ -15,7 +15,7 @@ pub fn default_hash(h: &impl Hash) -> u64 {
     hasher.finish()
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct NoopValue {
     data: Bytes,
 }

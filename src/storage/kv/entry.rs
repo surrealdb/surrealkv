@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -8,7 +9,6 @@ use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::Core;
 use crate::storage::kv::util::calculate_crc32;
-use crate::storage::kv::reader::{Reader, TxReader};
 
 pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
 pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
@@ -118,7 +118,7 @@ impl TxRecord {
         }
     }
 
-    pub(crate) fn new_from_entries(entries: Vec<Entry>, tx_id: u64) -> Self {
+    pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64) -> Self {
         let mut tx_record = TxRecord::new(entries.len());
         tx_record.header.id = tx_id;
 
@@ -143,12 +143,18 @@ impl TxRecord {
     }
 
     // TODO!!: use same allocated buffer for all tx encoding
-    pub(crate) fn encode(&self, buf: &mut BytesMut) {
+    pub(crate) fn encode(&self, buf: &mut BytesMut, offset_tracker: &mut HashMap<Bytes, usize> ) -> Result<()> {
         // Encode header
         self.header.encode(buf);
-
-        // Encode entries
+    
+        // Encode entries and store offsets
+        let mut offset = buf.len();
+    
         for entry in &self.entries {
+            // Store the offset for the current entry
+            offset_tracker.insert(entry.key.clone(), offset);
+    
+            // Encode metadata, if present
             if let Some(metadata) = &entry.md {
                 let md_bytes = metadata.bytes();
                 let md_len = md_bytes.len() as u16;
@@ -157,12 +163,21 @@ impl TxRecord {
             } else {
                 buf.put_u16(0);
             }
+    
+            // Encode CRC, key length, key, value length, and value
             buf.put_u32(entry.crc);
             buf.put_u32(entry.key_len);
             buf.put(entry.key.as_ref());
             buf.put_u32(entry.value_len);
             buf.put(entry.value.as_ref());
+    
+            offset += buf.len();
         }
+    
+        // Debug output for offsets
+        println!("offsets: {:?}", offset_tracker);
+    
+        Ok(())
     }
 }
 
@@ -202,7 +217,6 @@ impl TxRecordHeader {
         self.metadata = metadata;
     }
 }
-
 
 impl TxRecordHeader {
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
@@ -270,16 +284,14 @@ impl TxRecordEntry {
             value: Bytes::new(),
         }
     }
-    
 }
 
 /// Value reference implementation.
 pub struct ValueRef<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
     pub(crate) version: u8,
     pub(crate) ts: u64,
-    pub(crate) value_offset: i64,
+    pub(crate) value_offset: u64,
     pub(crate) value_length: usize,
-    pub(crate) transaction_metadata: Option<Metadata>,
     pub(crate) key_value_metadata: Option<Metadata>,
     /// The underlying store for the transaction.
     store: Arc<Core<P, V>>,
@@ -293,10 +305,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
 
     fn transaction_id(&self) -> u64 {
         self.ts
-    }
-
-    fn transaction_metadata(&self) -> Option<&Metadata> {
-        self.transaction_metadata.as_ref()
     }
 
     pub(crate) fn key_value_metadata(&self) -> Option<&Metadata> {
@@ -315,7 +323,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
             ts: 0,
             value_offset: 0,
             value_length: 0,
-            transaction_metadata: None,
             key_value_metadata: None,
             store,
         }
@@ -324,21 +331,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
     /// Encode the valueRef into a byte representation.
     pub(crate) fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
-
-        // Encode version, value length, and value offset
-        buf.extend_from_slice(&(self.version as u8).to_be_bytes());
-        buf.extend_from_slice(&(self.value_length as u32).to_be_bytes());
-        buf.extend_from_slice(&(self.value_offset as i64).to_be_bytes());
-
-        // Encode transaction metadata
-        if let Some(tx_metadata) = &self.transaction_metadata {
-            let tx_metadata_bytes = tx_metadata.bytes();
-            let tx_metadata_len = tx_metadata_bytes.len() as u16;
-            buf.extend_from_slice(&(tx_metadata_len as u16).to_be_bytes());
-            buf.extend_from_slice(&tx_metadata_bytes);
-        } else {
-            buf.extend_from_slice(&0u16.to_be_bytes());
-        }
 
         // Encode key-value metadata
         if let Some(kv_metadata) = &self.key_value_metadata {
@@ -349,6 +341,14 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         } else {
             buf.extend_from_slice(&0u16.to_be_bytes());
         }
+
+
+        // Encode version, value length, and value offset
+        buf.extend_from_slice(&(self.version as u8).to_be_bytes());
+        buf.extend_from_slice(&(self.value_length as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.value_offset as u64).to_be_bytes());
+
+
 
         buf.freeze()
     }
@@ -361,32 +361,14 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
         // Set ts
         self.ts = ts;
 
-        // Decode version, value length, and value offset
-        self.version = cursor.get_u8();
-        self.value_length = cursor.get_u32() as usize;
-        self.value_offset = cursor.get_i64();
-
-        // Decode transaction metadata
-        if encoded_bytes.len() < cursor.position() as usize + 2 * MD_SIZE {
-            return Err(Error::CorruptedIndex);
-        }
-        let tx_metadata_len = cursor.get_u16() as usize;
-        if tx_metadata_len > 0 {
-            if encoded_bytes.len() < cursor.position() as usize + tx_metadata_len {
-                return Err(Error::CorruptedIndex);
-            }
-            let tx_metadata_bytes =
-                cursor.get_ref()[cursor.position() as usize..][..tx_metadata_len].as_ref();
-            cursor.advance(tx_metadata_len);
-            self.transaction_metadata = Some(Metadata::from_bytes(tx_metadata_bytes)?);
-        } else {
-            self.transaction_metadata = None;
-        }
-
         // Decode key-value metadata
         if encoded_bytes.len() < cursor.position() as usize + MD_SIZE {
             return Err(Error::CorruptedIndex);
         }
+
+        // Decode version, value length, and value offset
+        self.value_length = cursor.get_u32() as usize;
+        self.value_offset = cursor.get_u64();
         let kv_metadata_len = cursor.get_u16() as usize;
         if kv_metadata_len > 0 {
             if encoded_bytes.len() < cursor.position() as usize + kv_metadata_len {
@@ -432,7 +414,6 @@ mod tests {
         value_ref.version = 42;
         value_ref.value_length = 100;
         value_ref.value_offset = 200;
-        value_ref.transaction_metadata = Some(txmd);
         value_ref.key_value_metadata = Some(kvmd);
 
         // Encode the valueRef
@@ -446,10 +427,6 @@ mod tests {
         assert_eq!(decoded_value_ref.version, value_ref.version);
         assert_eq!(decoded_value_ref.value_length, value_ref.value_length);
         assert_eq!(decoded_value_ref.value_offset, value_ref.value_offset);
-        assert_eq!(
-            decoded_value_ref.transaction_metadata.unwrap().deleted(),
-            value_ref.transaction_metadata.unwrap().deleted()
-        );
         assert_eq!(
             decoded_value_ref.key_value_metadata.unwrap().deleted(),
             value_ref.key_value_metadata.unwrap().deleted()
