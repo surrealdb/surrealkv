@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
 use crate::storage::index::art::Tree as tart;
+use crate::storage::index::art::KV;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::KeyTrait;
-use crate::storage::index::art::KV;
 use crate::storage::kv::error::Result;
 
 pub(crate) struct Indexer<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
@@ -30,7 +30,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Indexer<P, V> {
         Ok(())
     }
 
-    pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, V>]) -> Result<()>{
+    pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, V>]) -> Result<()> {
         self.index.bulk_insert(&kv_pairs)?;
         Ok(())
     }

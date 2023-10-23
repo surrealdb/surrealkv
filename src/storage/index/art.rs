@@ -1078,7 +1078,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
             let k = kv.key.clone(); // Clone the key
             let v = kv.value.clone(); // Clone the value
             let mut t = kv.version;
-    
+
             if t == 0 {
                 // Zero-valued timestamps are associated with current time plus one
                 t = curr_version + 1;
@@ -1087,7 +1087,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
                     "given version is older than root's current version".to_string(),
                 ));
             }
-    
+
             // Create a new KV instance
             let new_kv = KV {
                 key: k,
@@ -1095,10 +1095,10 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
                 version: t,
                 ts: kv.ts,
             };
-    
+
             // Insert the new KV instance using the insert function
             // self.insert(&new_kv.key, new_kv.value, new_kv.version, new_kv.ts)?;
-            match &self.root{
+            match &self.root {
                 None => {
                     self.root = Some(Rc::new(Node::new_twig(
                         new_kv.key.as_slice().into(),
@@ -1107,20 +1107,26 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
                         new_kv.version,
                         new_kv.ts,
                     )))
-
-                },
+                }
                 Some(root) => {
-                    match Node::insert_recurse(root, &new_kv.key, new_kv.value, new_kv.version, new_kv.ts, 0) {
+                    match Node::insert_recurse(
+                        root,
+                        &new_kv.key,
+                        new_kv.value,
+                        new_kv.version,
+                        new_kv.ts,
+                        0,
+                    ) {
                         Ok((new_node, _)) => {
                             self.root = Some(new_node);
-                        },
+                        }
                         Err(err) => {
                             return Err(err);
                         }
                     }
                 }
             }
-    
+
             // Update new_version if necessary
             if t > new_version {
                 new_version = t;
@@ -2073,7 +2079,7 @@ mod tests {
                 value: 1,
                 version: 0,
                 ts: 0,
-            }
+            },
         ];
 
         assert!(tree.bulk_insert(&kv_pairs).is_ok());

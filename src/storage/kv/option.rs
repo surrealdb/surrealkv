@@ -16,7 +16,7 @@ pub struct Options {
     pub max_tx_entries: usize,
     pub max_key_size: u64,          // Maximum size in bytes for key.
     pub max_value_size: u64,        // Maximum size in bytes for value.
-    pub value_threshold: usize, // Threshold to decide value storage in LSM tree or log value files.
+    pub max_value_threshold: usize, // Threshold to decide value storage in LSM tree or log value files.
     pub value_log_file_size: u64, // Maximum size of a single value log file segment.
     pub detect_conflicts: bool, // Whether to check transactions for conflicts.
     pub managed_txns: bool,     // Transaction timestamps managed by end-user.
@@ -36,7 +36,6 @@ impl Default for Options {
             num_versions_to_keep: 1,
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            value_threshold: 1024,
             value_log_file_size: 1 * 1024 * 1024 * 1024,
             detect_conflicts: true,
             managed_txns: true,
@@ -45,6 +44,7 @@ impl Default for Options {
             max_batch_size: 4 * 1024 * 1024,
             wal_disabled: false,
             max_tx_entries: 1 << 10,
+            max_value_threshold: 64, // 64 bytes
         }
     }
 }

@@ -2,20 +2,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
+use crate::storage::index::art::TrieError;
+use crate::storage::index::art::KV;
+use crate::storage::index::KeyTrait;
 use crate::storage::kv::entry::{
     Entry, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
 };
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
-use crate::storage::index::KeyTrait;
-use crate::storage::index::art::TrieError;
-use crate::storage::index::art::KV;
-
 
 /// An MVCC transaction mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +74,9 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     // The keys that are read in the transaction from the snapshot.
     read_set: Mutex<Vec<(&'a Bytes, u64)>>,
 
+    // The value offsets for the transaction post commit to the transaction log.
+    value_offsets: HashMap<Bytes, usize>,
+
     // The transaction is closed.
     closed: bool,
 }
@@ -98,6 +100,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             store,
             write_set: HashMap::new(),
             read_set: Mutex::new(Vec::new()),
+            value_offsets: HashMap::new(),
             closed: false,
         })
     }
@@ -308,10 +311,10 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let tx_id = self.prepare_commit()?;
 
         // Add transaction records to the log
-        self.add_to_transaction_log(tx_id)?;
+        let tx_offset = self.add_to_transaction_log(tx_id)?;
 
         // Commit to the store index
-        self.commit_to_index()?;
+        self.commit_to_index(tx_offset)?;
 
         Ok(())
     }
@@ -337,39 +340,70 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self, tx_id: u64) -> Result<()> {
+    fn add_to_transaction_log(&mut self, tx_id: u64) -> Result<(u64)> {
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
-        let tx_record = TxRecord::new_from_entries(entries, tx_id);
-        tx_record.encode(&mut self.buf);
+        let tx_record = TxRecord::new_with_entries(entries, tx_id);
+        tx_record.encode(&mut self.buf, &mut self.value_offsets)?;
 
         println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
-        tlog.append(&self.buf.as_ref())?;
-        Ok(())
+        let (tx_offset, _) = tlog.append(&self.buf.as_ref())?;
+        Ok((tx_offset))
     }
 
     /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self) -> Result<()> {
+    fn commit_to_index(&mut self, tx_offset: u64) -> Result<()> {
         let commit_ts = self.store.oracle.new_commit_ts();
         let mut index = self.store.indexer.write()?;
-
-        let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
-        for (_, entry) in self.write_set.iter() {
-            kv_pairs.push(
-                KV{
-                    key: entry.key[..].into(),
-                    value: entry.value.clone().into(),
-                    version: commit_ts,
-                    ts: commit_ts,
-                }
-            );
-        }
+        let kv_pairs = self.build_kv_pairs(commit_ts);
+    
         index.bulk_insert(&kv_pairs)?;
-
-
         Ok(())
     }
-
+    
+    fn build_kv_pairs(&self, commit_ts: u64) -> Vec<KV<P, V>> {
+        let mut kv_pairs = Vec::new();
+    
+        for (_, entry) in self.write_set.iter() {
+            let index_value = self.build_index_value(entry);
+            let key = entry.key[..].into();
+    
+            kv_pairs.push(KV {
+                key,
+                value: index_value.into(),
+                version: commit_ts,
+                ts: commit_ts,
+            });
+        }
+    
+        kv_pairs
+    }
+    
+    fn build_index_value(&self, entry: &Entry) -> Bytes {
+        let mut index_value = BytesMut::new();
+    
+        if entry.value.len() <= self.store.opts.max_value_threshold {
+            index_value.put_u8(1);
+            index_value.put(entry.value.clone());
+        } else {
+            index_value.put_u8(0);
+            index_value.put_u32(entry.value.len() as u32);
+            let val_off = self.value_offsets.get(entry.key).unwrap();
+            index_value.put_u64(*val_off as u64);
+        }
+    
+        if let Some(metadata) = &entry.metadata {
+            let md_bytes = metadata.bytes();
+            let md_len = md_bytes.len() as u16;
+            index_value.put_u16(md_len);
+            index_value.put(md_bytes);
+        } else {
+            index_value.put_u16(0);
+        }
+    
+        index_value.freeze()
+    }
+    
     /// Rolls back the transaction, by removing all updated entries.
     pub fn rollback(&mut self) -> Result<()> {
         if self.closed {
@@ -443,12 +477,17 @@ mod tests {
         let mut txr = TxReader::new(r).unwrap();
 
         let mut tx = TxRecord::new(2);
-        for _ in 0..2{
+        for _ in 0..2 {
             txr.read_into(&mut tx).unwrap();
             println!("tx: {:?}", tx);
         }
 
 
+        // TODO: fix valueref decode
+
+        // let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
+        // let val = txn3.get(&key1_clone).unwrap();
+        // println!("val: {:?}", val.ts);
         // tx.read_from(txr).unwrap();
         // println!("hdr: {:?}", tx.header);
         // println!("entries: {:?}", tx.entries);
