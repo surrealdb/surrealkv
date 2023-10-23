@@ -14,52 +14,25 @@ use crate::storage::log::Options as LogOptions;
 
 /// An MVCC-based transactional key-value store.
 pub struct MVCCStore<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-    /// Index for store.
-    pub(crate) index: RwLock<tart<P, V>>,
-    /// Options for store.
-    pub(crate) opts: Options,
-    /// WAL for store.
-    pub(crate) wal: Arc<WAL>,
-    /// Transaction log for store.
-    pub(crate) tlog: Arc<RwLock<AOL>>,
-    /// Transaction ID Oracle for store.
-    pub(crate) oracle: Arc<Oracle>,
-    /// Flag to indicate if store is closed.
-    pub(crate) closed: bool,
+    pub(crate) core: Arc<Core<P, V>>,
 }
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> {
     /// Creates a new MVCC key-value store with the given key-value store for storage.
     pub fn new(opts: Options) -> Self {
-        let lopts = LogOptions::default();
-        let topts = LogOptions::default();
-        // TODO: remove expect
-        let wal = WAL::open(&opts.dir, lopts).expect("failed to open WAL");
-        let tlog = AOL::open(&opts.dir, &topts).expect("failed to open transaction log");
-
-        // TODO:: set it to max tx id from tx log
-        let oracle = Oracle::new();
-        oracle.set_txn_id(1);
-
-        Self {
-            index: RwLock::new(tart::new()),
-            opts,
-            wal: Arc::new(wal),
-            tlog: Arc::new(RwLock::new(tlog)),
-            oracle: Arc::new(oracle),
-            closed: false,
-        }
+        let core = Arc::new(Core::new(opts));
+        Self { core }
     }
 
     pub fn begin<'a>(self: &'a Arc<Self>) -> Result<Transaction<'a, P, V>> {
-        let mut txn = Transaction::new(self.clone(), Mode::ReadWrite)?;
-        txn.read_ts = self.oracle.read_ts();
+        let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
+        txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
     pub fn begin_with_mode<'a>(self: &'a Arc<Self>, mode: Mode) -> Result<Transaction<'a, P, V>> {
-        let mut txn = Transaction::new(self.clone(), mode)?;
-        txn.read_ts = self.oracle.read_ts();
+        let mut txn = Transaction::new(self.core.clone(), mode)?;
+        txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
@@ -83,6 +56,50 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> 
 
         Ok(())
     }
+
+    pub fn closed(&self) -> bool {
+        self.core.closed
+    }
+}
+
+
+pub struct Core<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+        /// Index for store.
+        pub(crate) index: RwLock<tart<P, V>>,
+        /// Options for store.
+        pub(crate) opts: Options,
+        /// WAL for store.
+        pub(crate) wal: Arc<WAL>,
+        /// Transaction log for store.
+        pub(crate) tlog: Arc<RwLock<AOL>>,
+        /// Transaction ID Oracle for store.
+        pub(crate) oracle: Arc<Oracle>,
+        /// Flag to indicate if store is closed.
+        pub(crate) closed: bool,    
+}
+
+impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Core<P, V> {
+    /// Creates a new MVCC key-value store with the given key-value store for storage.
+    pub fn new(opts: Options) -> Self {
+        let lopts = LogOptions::default();
+        let topts = LogOptions::default();
+        // TODO: remove expect
+        let wal = WAL::open(&opts.dir, lopts).expect("failed to open WAL");
+        let tlog = AOL::open(&opts.dir, &topts).expect("failed to open transaction log");
+
+        // TODO:: set it to max tx id from tx log
+        let oracle = Oracle::new();
+        oracle.set_txn_id(1);
+
+        Self {
+            index: RwLock::new(tart::new()),
+            opts,
+            wal: Arc::new(wal),
+            tlog: Arc::new(RwLock::new(tlog)),
+            oracle: Arc::new(oracle),
+            closed: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +113,6 @@ mod tests {
     fn test_new_store() {
         let opts = Options::new();
         let store = MVCCStore::<VectorKey, NoopValue>::new(opts);
-        assert_eq!(store.closed, false);
+        assert_eq!(store.closed(), false);
     }
 }

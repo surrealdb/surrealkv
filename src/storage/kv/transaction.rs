@@ -14,7 +14,7 @@ use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
 
 use super::entry::{TxRecord, ValueRef};
-use super::store::MVCCStore;
+use super::store::Core;
 
 /// An MVCC transaction mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,7 +66,7 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     buf: BytesMut,
 
     /// The underlying store for the transaction. Shared between transactions using a mutex.
-    store: Arc<MVCCStore<P, V>>,
+    store: Arc<Core<P, V>>,
 
     /// The pending writes for the transaction.
     write_set: HashMap<&'a Bytes, Entry<'a>>,
@@ -80,7 +80,7 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
 
 impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<'a, P, V> {
     /// Prepare a new transaction in the given mode.
-    pub fn new(store: Arc<MVCCStore<P, V>>, mode: Mode) -> Result<Self> {
+    pub fn new(store: Arc<Core<P, V>>, mode: Mode) -> Result<Self> {
         if store.closed {
             return Err(Error::StoreClosed);
         }
@@ -193,7 +193,8 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             let indexed_value: Vec<u8> =
                 vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
             let indexed_value_bytes = Bytes::from(indexed_value);
-            self.snapshot.set(&e.key[..].into(), indexed_value_bytes.into())?;
+            self.snapshot
+                .set(&e.key[..].into(), indexed_value_bytes.into())?;
         }
 
         // Add the entry to pending writes
@@ -388,7 +389,7 @@ mod tests {
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::reader::{Reader, TxReader};
-    use crate::storage::kv::store::MVCCStore;
+    use crate::storage::kv::store::Core;
     use crate::storage::kv::transaction::{Mode, Transaction};
     use crate::storage::kv::util::NoopValue;
     use crate::storage::log::aol::aol::AOL;
@@ -406,7 +407,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(MVCCStore::<VectorKey, NoopValue>::new(opts));
+        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts));
         assert_eq!(store.closed, false);
 
         let key1 = Bytes::from("foo1");

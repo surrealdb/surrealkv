@@ -4,10 +4,10 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::storage::index::KeyTrait;
-use crate::storage::kv::calculate_crc32;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
-use crate::storage::kv::store::MVCCStore;
+use crate::storage::kv::store::Core;
+use crate::storage::kv::util::calculate_crc32;
 
 pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
 pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
@@ -266,7 +266,7 @@ pub struct ValueRef<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
     pub(crate) transaction_metadata: Option<Metadata>,
     pub(crate) key_value_metadata: Option<Metadata>,
     /// The underlying store for the transaction.
-    store: Arc<MVCCStore<P, V>>,
+    store: Arc<Core<P, V>>,
 }
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
@@ -293,7 +293,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
 }
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
-    pub(crate) fn new(store: Arc<MVCCStore<P, V>>) -> Self {
+    pub(crate) fn new(store: Arc<Core<P, V>>) -> Self {
         ValueRef {
             version: 0,
             ts: 0,
@@ -398,14 +398,14 @@ mod tests {
     use super::*;
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::MVCCStore;
+    use crate::storage::kv::store::Core;
     use crate::storage::kv::util::NoopValue;
 
     #[test]
     fn test_encode_decode() {
         // Create a sample valueRef instance
         let opts = Options::new();
-        let store = Arc::new(MVCCStore::<VectorKey, NoopValue>::new(opts));
+        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts));
 
         let mut txmd = Metadata::new();
         txmd.as_deleted(true).expect("failed to set deleted");
