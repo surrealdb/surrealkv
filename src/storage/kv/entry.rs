@@ -8,6 +8,7 @@ use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::Core;
 use crate::storage::kv::util::calculate_crc32;
+use crate::storage::kv::reader::{Reader, TxReader};
 
 pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
 pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
@@ -103,22 +104,22 @@ impl<'a> Entry<'a> {
 //   |----------------------------------|
 //   | crc(4) | key_len(4) | key | value_len(4) | value | metadata_len(4) | metadata |
 //   |----------------------------------|
-
+#[derive(Debug)]
 pub(crate) struct TxRecord {
-    header: TxRecordHeader,
-    entries: Vec<TxRecordEntry>,
+    pub(crate) header: TxRecordHeader,
+    pub(crate) entries: Vec<TxRecordEntry>,
 }
 
 impl TxRecord {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(max_entries: usize) -> Self {
         TxRecord {
             header: TxRecordHeader::new(),
-            entries: Vec::new(),
+            entries: Vec::with_capacity(max_entries),
         }
     }
 
     pub(crate) fn new_from_entries(entries: Vec<Entry>, tx_id: u64) -> Self {
-        let mut tx_record = TxRecord::new();
+        let mut tx_record = TxRecord::new(entries.len());
         tx_record.header.id = tx_id;
 
         for entry in entries {
@@ -202,15 +203,6 @@ impl TxRecordHeader {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct TxRecordEntry {
-    pub(crate) crc: u32,
-    pub(crate) key: Bytes,
-    pub(crate) key_len: u32,
-    pub(crate) md: Option<Metadata>,
-    pub(crate) value_len: u32,
-    pub(crate) value: Bytes,
-}
 
 impl TxRecordHeader {
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
@@ -255,6 +247,30 @@ impl TxRecordHeader {
 
         Ok(())
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct TxRecordEntry {
+    pub(crate) crc: u32,
+    pub(crate) key: Bytes,
+    pub(crate) key_len: u32,
+    pub(crate) md: Option<Metadata>,
+    pub(crate) value_len: u32,
+    pub(crate) value: Bytes,
+}
+
+impl TxRecordEntry {
+    pub(crate) fn new() -> Self {
+        TxRecordEntry {
+            crc: 0,
+            key: Bytes::new(),
+            key_len: 0,
+            md: None,
+            value_len: 0,
+            value: Bytes::new(),
+        }
+    }
+    
 }
 
 /// Value reference implementation.
