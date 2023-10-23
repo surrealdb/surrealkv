@@ -35,7 +35,6 @@ impl Reader {
         self.offset
     }
 
-
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut n = 0;
         let buf_len = buf.len();
@@ -53,7 +52,9 @@ impl Reader {
                 return Ok(n);
             }
 
-            let rn = self.r_at.read_at(&mut self.buffer[..buf_len], self.offset)?;
+            let rn = self
+                .r_at
+                .read_at(&mut self.buffer[..buf_len], self.offset)?;
             self.read = rn;
             self.start = 0;
             self.offset += rn as u64;

@@ -6,7 +6,7 @@ use super::entry::ValueRef;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::store::MVCCStore;
+use crate::storage::kv::store::Core;
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
@@ -15,11 +15,11 @@ pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     /// pairs or to filter out key-value pairs based on the snapshot timestamp.
     ts: u64,
     snap: TartSnapshot<P, V>,
-    store: Arc<MVCCStore<P, V>>,
+    store: Arc<Core<P, V>>,
 }
 
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
-    pub(crate) fn take(store: Arc<MVCCStore<P, V>>, ts: u64) -> Result<Self> {
+    pub(crate) fn take(store: Arc<Core<P, V>>, ts: u64) -> Result<Self> {
         let mut index = store.index.write()?;
         let snapshot = index.create_snapshot()?;
         std::mem::drop(index);

@@ -1431,8 +1431,6 @@ mod tests {
         }
     }
 
-
-
     // Inserting Two values into the tree and removing one of them
     // should result in a tree root of type twig
     #[test]
