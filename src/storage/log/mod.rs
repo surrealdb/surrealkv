@@ -1169,7 +1169,7 @@ impl Segment {
             if remaining == pending {
                 return Ok(n);
             } else {
-                return Err(Error::IncompleteRead);
+                return Err(Error::EOF);
             }
         }
 
@@ -1193,10 +1193,9 @@ pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
     EmptyBuffer,
-    EOFError,
+    EOF,
     IO(IOError),
     PoisonError(String),
-    IncompleteRead,
 }
 
 // Implementation of Display trait for Error
@@ -1207,9 +1206,8 @@ impl fmt::Display for Error {
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
             Error::IO(err) => write!(f, "IO error: {}", err),
-            Error::EOFError => write!(f, "EOF error"),
+            Error::EOF => write!(f, "EOF error"),
             Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
-            Error::IncompleteRead => write!(f, "Incomplete read"),
         }
     }
 }

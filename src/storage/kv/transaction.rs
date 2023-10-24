@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
 use super::entry::{TxRecord, ValueRef};
@@ -345,7 +345,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let tx_record = TxRecord::new_with_entries(entries, tx_id);
         tx_record.encode(&mut self.buf, &mut self.value_offsets)?;
 
-        println!("buf: {:?}", self.buf.as_ref());
+        // println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
         let (tx_offset, _) = tlog.append(&self.buf.as_ref())?;
         Ok((tx_offset))
@@ -356,18 +356,18 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let commit_ts = self.store.oracle.new_commit_ts();
         let mut index = self.store.indexer.write()?;
         let kv_pairs = self.build_kv_pairs(commit_ts);
-    
+
         index.bulk_insert(&kv_pairs)?;
         Ok(())
     }
-    
+
     fn build_kv_pairs(&self, commit_ts: u64) -> Vec<KV<P, V>> {
-        let mut kv_pairs = Vec::new();
-    
+        let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
+
         for (_, entry) in self.write_set.iter() {
             let index_value = self.build_index_value(entry);
             let key = entry.key[..].into();
-    
+
             kv_pairs.push(KV {
                 key,
                 value: index_value.into(),
@@ -375,35 +375,43 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
                 ts: commit_ts,
             });
         }
-    
+
         kv_pairs
     }
-    
+
     fn build_index_value(&self, entry: &Entry) -> Bytes {
-        let mut index_value = BytesMut::new();
-    
-        if entry.value.len() <= self.store.opts.max_value_threshold {
-            index_value.put_u8(1);
-            index_value.put(entry.value.clone());
-        } else {
-            index_value.put_u8(0);
-            index_value.put_u32(entry.value.len() as u32);
-            let val_off = self.value_offsets.get(entry.key).unwrap();
-            index_value.put_u64(*val_off as u64);
-        }
-    
-        if let Some(metadata) = &entry.metadata {
-            let md_bytes = metadata.bytes();
-            let md_len = md_bytes.len() as u16;
-            index_value.put_u16(md_len);
-            index_value.put(md_bytes);
-        } else {
-            index_value.put_u16(0);
-        }
-    
-        index_value.freeze()
+        let index_value = ValueRef::<P, V>::encode(
+            entry.key,
+            &entry.value,
+            entry.metadata.as_ref(),
+            &self.value_offsets,
+            self.store.opts.max_value_threshold,
+        );
+        index_value
+        // let mut index_value = BytesMut::new();
+
+        // if entry.value.len() <= self.store.opts.max_value_threshold {
+        //     index_value.put_u8(1);
+        //     index_value.put(entry.value.clone());
+        // } else {
+        //     index_value.put_u8(0);
+        //     index_value.put_u32(entry.value.len() as u32);
+        //     let val_off = self.value_offsets.get(entry.key).unwrap();
+        //     index_value.put_u64(*val_off as u64);
+        // }
+
+        // if let Some(metadata) = &entry.metadata {
+        //     let md_bytes = metadata.bytes();
+        //     let md_len = md_bytes.len() as u16;
+        //     index_value.put_u16(md_len);
+        //     index_value.put(md_bytes);
+        // } else {
+        //     index_value.put_u16(0);
+        // }
+
+        // index_value.freeze()
     }
-    
+
     /// Rolls back the transaction, by removing all updated entries.
     pub fn rollback(&mut self) -> Result<()> {
         if self.closed {
@@ -450,7 +458,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts));
+        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
         assert_eq!(store.closed, false);
 
         let key1 = Bytes::from("foo1");
@@ -482,12 +490,20 @@ mod tests {
             println!("tx: {:?}", tx);
         }
 
+        drop(store);
+
+        println!("restarting----------------------->");
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
+        assert_eq!(store.closed, false);
 
         // TODO: fix valueref decode
 
-        // let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
-        // let val = txn3.get(&key1_clone).unwrap();
-        // println!("val: {:?}", val.ts);
+        let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
+        let val = txn3.get(&key1_clone).unwrap();
+        println!("val: {:?}", val.ts);
+
         // tx.read_from(txr).unwrap();
         // println!("hdr: {:?}", tx.header);
         // println!("entries: {:?}", tx.entries);

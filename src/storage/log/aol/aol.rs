@@ -270,6 +270,13 @@ impl AOL {
         let _lock = self.mutex.read()?;
         Ok(self.active_segment.offset())
     }
+
+    pub fn size(&self) -> Result<u64> {
+        let _lock = self.mutex.read()?;
+        let cur_segment_size = self.active_segment.file_offset;
+        let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
+        Ok(total_size)
+    }
 }
 
 impl Drop for AOL {
