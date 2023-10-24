@@ -17,13 +17,13 @@ pub struct Options {
     pub max_key_size: u64,          // Maximum size in bytes for key.
     pub max_value_size: u64,        // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value storage in LSM tree or log value files.
-    pub value_log_file_size: u64, // Maximum size of a single value log file segment.
-    pub detect_conflicts: bool, // Whether to check transactions for conflicts.
-    pub managed_txns: bool,     // Transaction timestamps managed by end-user.
+    pub value_log_file_size: u64,   // Maximum size of a single value log file segment.
+    pub detect_conflicts: bool,     // Whether to check transactions for conflicts.
+    pub managed_txns: bool,         // Transaction timestamps managed by end-user.
     pub create_if_not_exists: bool, // Create the directory if the provided open path doesn't exist.
-    pub max_batch_count: u64,   // Maximum entries in a batch.
-    pub max_batch_size: u64,    // Maximum batch size in bytes.
-    pub wal_disabled: bool,     // Whether to disable the write-ahead log.
+    pub max_batch_count: u64,       // Maximum entries in a batch.
+    pub max_batch_size: u64,        // Maximum batch size in bytes.
+    pub wal_disabled: bool,         // Whether to disable the write-ahead log.
 }
 
 impl Default for Options {

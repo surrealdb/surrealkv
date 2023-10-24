@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::storage::kv::entry::{TxRecordEntry, TxRecordHeader, MAX_TX_METADATA_SIZE};
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
@@ -158,7 +160,7 @@ impl TxReader {
         self.r.read(&mut v)?;
 
         tx.crc = crc;
-        tx.md = kvmd;
+        tx.metadata = kvmd;
         tx.key = k.into();
         tx.value = v.into();
         tx.value_len = v_len as u32;
@@ -167,10 +169,16 @@ impl TxReader {
         Ok(())
     }
 
-    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<()> {
+    pub(crate) fn read_into(
+        &mut self,
+        tx: &mut TxRecord,
+    ) -> Result<(u64, HashMap<bytes::Bytes, usize>)> {
+        let tx_offset = self.r.offset();
         self.read_header(tx)?;
 
+        let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
         for i in 0..tx.header.num_entries as usize {
+            let offset = self.r.offset();
             if let Some(entry) = tx.entries.get_mut(i) {
                 self.read_entry(entry)?;
             } else {
@@ -178,8 +186,10 @@ impl TxReader {
 
                 self.read_entry(tx.entries.get_mut(i).unwrap())?;
             }
+            let key = tx.entries.get(i).unwrap().key.clone();
+            value_offsets.insert(key, offset as usize);
         }
-        Ok(())
+        Ok((tx_offset, value_offsets))
     }
 }
 

@@ -20,10 +20,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Indexer<P, V> {
         Ok(snapshot)
     }
 
-    pub(crate) fn version(&self) -> Result<u64> {
-        Ok(self.index.version())
-    }
-
     /// Set a key-value pair into the snapshot.
     pub fn insert(&mut self, key: &P, value: V, version: u64, ts: u64) -> Result<()> {
         self.index.insert(key, value, version, ts)?;
@@ -33,5 +29,9 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Indexer<P, V> {
     pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, V>]) -> Result<()> {
         self.index.bulk_insert(&kv_pairs)?;
         Ok(())
+    }
+
+    pub fn version(&self) -> u64 {
+        self.index.version()
     }
 }
