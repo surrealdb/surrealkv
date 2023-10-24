@@ -1,5 +1,5 @@
-use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
@@ -94,7 +94,7 @@ where
         let mut indexer = Indexer::new();
 
         if tlog.size()? > 0 {
-            Core::load_index(&opts,  &mut indexer)?;
+            Core::load_index(&opts, &mut indexer)?;
         }
 
         let oracle = Oracle::new();
@@ -110,10 +110,7 @@ where
         })
     }
 
-    fn load_index(
-        opts: &Options,
-        indexer: &mut Indexer<P, V>,
-    ) -> Result<()> {
+    fn load_index(opts: &Options, indexer: &mut Indexer<P, V>) -> Result<()> {
         let tlog = AOL::open(&opts.dir, &LogOptions::default())?;
         let reader = Reader::new_from(tlog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
@@ -144,8 +141,8 @@ where
         tx: &TxRecord,
         opts: &Options,
         value_offsets: &HashMap<Bytes, usize>,
-        indexer: &mut Indexer<P,V>,
-    ) -> Result<()>{
+        indexer: &mut Indexer<P, V>,
+    ) -> Result<()> {
         let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
 
         for entry in &tx.entries {
@@ -168,7 +165,6 @@ where
         indexer.bulk_insert(&kv_pairs)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,7 @@ use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::store::Core;
+use crate::storage::index::art::TrieError;
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
@@ -77,7 +78,7 @@ fn ignore_deleted<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>(
     let md = val_ref.key_value_metadata();
     if let Some(md) = md {
         if md.deleted() {
-            return Err(Error::KeyNotFound);
+            return Err(Error::Index(TrieError::KeyNotFound));
         }
     }
     Ok(())
