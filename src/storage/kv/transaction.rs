@@ -14,6 +14,7 @@ use crate::storage::kv::entry::{
 };
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
+use crate::storage::kv::util::current_timestamp;
 
 /// An MVCC transaction mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,8 +74,8 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     // The keys that are read in the transaction from the snapshot.
     read_set: Mutex<Vec<(&'a Bytes, u64)>>,
 
-    // The value offsets for the transaction post commit to the transaction log.
-    value_offsets: HashMap<Bytes, usize>,
+    // The offsets of values in the transaction post commit to the transaction log.
+    committed_values_offsets: HashMap<Bytes, usize>,
 
     // The transaction is closed.
     closed: bool,
@@ -99,7 +100,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             store,
             write_set: HashMap::new(),
             read_set: Mutex::new(Vec::new()),
-            value_offsets: HashMap::new(),
+            committed_values_offsets: HashMap::new(),
             closed: false,
         })
     }
@@ -307,31 +308,33 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         self.check_conflict()?;
 
         // Prepare for the commit
-        let tx_id = self.prepare_commit()?;
+        let (tx_id, commit_ts) = self.prepare_commit()?;
 
         // Add transaction records to the log
-        let tx_offset = self.add_to_transaction_log(tx_id)?;
+        let tx_offset = self.add_to_transaction_log(tx_id, commit_ts)?;
 
         // Commit to the store index
-        self.commit_to_index(tx_id, tx_offset)?;
+        self.commit_to_index(tx_id, commit_ts, tx_offset)?;
 
         Ok(())
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<u64> {
+    fn prepare_commit(&mut self) -> Result<(u64, u64)> {
         if !self.mode.is_write_only() {
             self.snapshot.close()?;
         }
 
         self.closed = true;
+        let tx_id = self.store.oracle.new_commit_ts();
         let commit_ts = self.assign_commit_timestamp();
-        Ok(commit_ts)
+        Ok((tx_id, commit_ts))
     }
 
     /// Assigns commit timestamps to transaction entries.
     fn assign_commit_timestamp(&mut self) -> u64 {
-        let commit_ts = self.store.oracle.new_commit_ts();
+        let commit_ts = current_timestamp();
+        println!("commit_ts: {}", commit_ts);
         self.write_set.iter_mut().for_each(|(_, entry)| {
             entry.ts = commit_ts; // this should be time.now(), not txID
         });
@@ -339,10 +342,10 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self, tx_id: u64) -> Result<(u64)> {
+    fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<(u64)> {
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
-        let tx_record = TxRecord::new_with_entries(entries, tx_id);
-        tx_record.encode(&mut self.buf, &mut self.value_offsets)?;
+        let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
+        tx_record.encode(&mut self.buf, &mut self.committed_values_offsets)?;
 
         // println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
@@ -351,9 +354,9 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_id: u64, tx_offset: u64) -> Result<()> {
+    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64, tx_offset: u64) -> Result<()> {
         let mut index = self.store.indexer.write()?;
-        let kv_pairs = self.build_kv_pairs(tx_id, tx_id);
+        let kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
 
         index.bulk_insert(&kv_pairs)?;
         Ok(())
@@ -382,7 +385,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             entry.key,
             &entry.value,
             entry.metadata.as_ref(),
-            &self.value_offsets,
+            &self.committed_values_offsets,
             self.store.opts.max_value_threshold,
         );
         index_value
@@ -419,6 +422,7 @@ mod tests {
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
     use crate::storage::kv::transaction::{Mode, Transaction};
+    use crate::storage::kv::util::current_timestamp;
     use crate::storage::kv::util::NoopValue;
     use crate::storage::log::aol::aol::AOL;
     use crate::storage::log::Options as LogOptions;

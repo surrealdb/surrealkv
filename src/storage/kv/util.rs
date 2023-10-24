@@ -1,3 +1,4 @@
+use chrono::Utc;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -39,7 +40,7 @@ pub(crate) fn calculate_crc32(a1: &[u8], a2: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn terminate_with_null(key: &[u8]) -> Vec<u8> {
+pub(crate) fn terminate_with_null(key: &[u8]) -> Vec<u8> {
     if !key.ends_with(&NULL_BYTE) {
         let mut terminated_key = Vec::with_capacity(key.len() + 1);
         terminated_key.extend_from_slice(key);
@@ -48,4 +49,11 @@ fn terminate_with_null(key: &[u8]) -> Vec<u8> {
     } else {
         key.to_vec()
     }
+}
+
+pub(crate) fn current_timestamp() -> u64 {
+    let utc_now = Utc::now();
+    let timestamp = utc_now.timestamp_nanos_opt().unwrap();
+    assert!(timestamp > 0);
+    timestamp as u64
 }
