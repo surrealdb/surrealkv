@@ -9,6 +9,7 @@ edition = "2021"
 crc32fast = "1.3.2"
 crossbeam = "0.8.2"
 lru = "0.12.0"
+chrono = "0.4.31"
 
 # below is for the async runtime
 async-task = "4.4.0"

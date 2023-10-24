@@ -118,9 +118,10 @@ impl TxRecord {
         }
     }
 
-    pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64) -> Self {
+    pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
         let mut tx_record = TxRecord::new(entries.len());
         tx_record.header.id = tx_id;
+        tx_record.header.ts = commit_ts;
 
         for entry in entries {
             tx_record.add_entry(entry);
