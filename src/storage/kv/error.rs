@@ -21,7 +21,7 @@ pub enum Error {
     NonExpirable,
     CorruptedMetadata,
     TxnReadOnly,
-    IndexError(TrieError), // New variant to hold TrieError
+    Index(TrieError), // New variant to hold TrieError
     MaxKeyLengthExceeded,
     MaxValueLengthExceeded,
     KeyNotFound,
@@ -75,7 +75,7 @@ impl fmt::Display for Error {
             Error::NonExpirable => write!(f, "This entry cannot be expired"),
             Error::CorruptedMetadata => write!(f, "Corrupted metadata"),
             Error::TxnReadOnly => write!(f, "This transaction is read-only"),
-            Error::IndexError(trie_error) => write!(f, "Index error: {}", trie_error),
+            Error::Index(trie_error) => write!(f, "Index error: {}", trie_error),
             Error::MaxKeyLengthExceeded => write!(f, "Max Key length exceeded"),
             Error::MaxValueLengthExceeded => write!(f, "Max Value length exceeded"),
             Error::KeyNotFound => write!(f, "Key not found"),
@@ -111,7 +111,7 @@ impl<T: Sized> From<PoisonError<T>> for Error {
 
 impl From<TrieError> for Error {
     fn from(trie_error: TrieError) -> Self {
-        Error::IndexError(trie_error)
+        Error::Index(trie_error)
     }
 }
 
