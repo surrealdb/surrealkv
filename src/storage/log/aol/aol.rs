@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::mem;
@@ -10,7 +9,6 @@ use std::sync::RwLock;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
-use crate::storage::log;
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
@@ -23,10 +21,10 @@ use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Se
 /// separate file and store only the offsets in the main data structure.
 pub struct AOL {
     /// The currently active segment where data is being written.
-    active_segment: Segment,
+    current_write_segment: Segment,
 
     /// The ID of the currently active segment.
-    active_segment_id: u64,
+    current_write_segment_id: u64,
 
     /// The directory where the segment files are located.
     dir: PathBuf,
@@ -41,7 +39,7 @@ pub struct AOL {
     mutex: RwLock<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RefCell<LruCache<u64, Segment>>,
+    segment_cache: RwLock<LruCache<u64, Segment>>,
 }
 
 impl AOL {
@@ -62,23 +60,23 @@ impl AOL {
         Self::prepare_directory(dir, opts)?;
 
         // Determine the active segment ID
-        let active_segment_id = Self::calculate_active_segment_id(dir)?;
+        let current_write_segment_id = Self::calculate_current_write_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts)?;
+        let current_write_segment = Segment::open(dir, current_write_segment_id, opts)?;
 
         // Create the segment cache
         // TODO: fix unwrap and return error
         let cache = LruCache::new(NonZeroUsize::new(opts.max_open_files).unwrap());
 
         Ok(Self {
-            active_segment,
-            active_segment_id,
+            current_write_segment,
+            current_write_segment_id,
             dir: dir.to_path_buf(),
             opts: opts.clone(),
             closed: false,
             mutex: RwLock::new(()),
-            segment_cache: RefCell::new(cache),
+            segment_cache: RwLock::new(cache),
         })
     }
 
@@ -96,7 +94,7 @@ impl AOL {
     }
 
     // Helper function to calculate the active segment ID
-    fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
+    fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
         Ok(if last > 0 { last + 1 } else { 0 })
     }
@@ -141,7 +139,7 @@ impl AOL {
         // record is larger than the max file size. Write a test to check this.
         while n < rec.len() {
             // Calculate available space in the active segment
-            let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+            let available = opts.max_file_size as i64 - self.current_write_segment.offset() as i64;
 
             // If space is not available, create a new segment
             if available <= 0 {
@@ -151,26 +149,27 @@ impl AOL {
                 // Note that closing the segment will
                 // not close the underlying file until
                 // it is dropped.
-                self.active_segment.close()?;
+                self.current_write_segment.close()?;
 
                 // Increment the active segment id
-                self.active_segment_id += 1;
+                self.current_write_segment_id += 1;
 
                 // Open a new segment for writing
-                let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+                let new_segment =
+                    Segment::open(&self.dir, self.current_write_segment_id, &self.opts)?;
 
                 // Retrieve the previous active segment and replace it with the new one
-                let previous_segment_id = self.active_segment_id - 1;
-                let previous_segment = mem::replace(&mut self.active_segment, new_segment);
+                let previous_segment_id = self.current_write_segment_id - 1;
+                let previous_segment = mem::replace(&mut self.current_write_segment, new_segment);
 
                 // Cache the previous segment
-                let mut cache = self.segment_cache.borrow_mut();
+                let mut cache = self.segment_cache.write()?;
                 cache.put(previous_segment_id, previous_segment);
             }
 
             // Calculate the amount of data to append
             let d = std::cmp::min(available as usize, rec.len() - n);
-            let (off, _) = self.active_segment.append(&rec[n..n + d])?;
+            let (off, _) = self.current_write_segment.append(&rec[n..n + d])?;
 
             // Calculate offset only for the first chunk of data
             if n == 0 {
@@ -185,7 +184,7 @@ impl AOL {
 
     // Helper function to calculate offset
     fn calculate_offset(&self) -> u64 {
-        self.active_segment_id * self.opts.max_file_size
+        self.current_write_segment_id * self.opts.max_file_size
     }
 
     /// Reads data from the segment at the specified offset into the provided buffer.
@@ -214,6 +213,8 @@ impl AOL {
             )));
         }
 
+        let _lock = self.mutex.read()?;
+
         let mut r = 0;
         while r < buf.len() {
             let offset = off + r as u64;
@@ -236,45 +237,42 @@ impl AOL {
     ) -> Result<usize> {
         // During read, we acquire a lock to not allow concurrent writes and reads
         // to the active segment file to avoid seek errors.
-        let _lock = self.mutex.write()?;
-
-        if segment_id == self.active_segment_id {
-            self.active_segment.read_at(buf, read_offset)
+        let mut cache = self.segment_cache.write()?;
+        let reader = cache.get(&segment_id);
+        if reader.is_none() {
+            let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
+            let read_bytes = segment.read_at(buf, read_offset)?;
+            cache.put(segment_id, segment);
+            Ok(read_bytes)
         } else {
-            let mut cache = self.segment_cache.borrow_mut();
-            let reader = cache.get(&segment_id);
-            if reader.is_none() {
-                let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
-                segment.read_at(buf, read_offset)
-            } else {
-                let segment = reader.unwrap();
-                segment.read_at(buf, read_offset)
-            }
+            let segment = reader.unwrap();
+            segment.read_at(buf, read_offset)
         }
     }
 
     pub fn close(&mut self) -> Result<()> {
         let _lock = self.mutex.write()?;
-        self.active_segment.close()?;
+        self.current_write_segment.close()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
         let _lock = self.mutex.write()?;
-        self.active_segment.sync()?;
+        self.current_write_segment.sync()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
         let _lock = self.mutex.read()?;
-        Ok(self.active_segment.offset())
+        Ok(self.current_write_segment.offset())
     }
 
     pub fn size(&self) -> Result<u64> {
         let _lock = self.mutex.read()?;
-        let cur_segment_size = self.active_segment.file_offset;
-        let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
+        let cur_segment_size = self.current_write_segment.file_offset;
+        let total_size =
+            (self.current_write_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
     }
 }
