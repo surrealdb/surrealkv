@@ -178,9 +178,6 @@ impl TxRecord {
             offset += buf.len();
         }
 
-        // Debug output for offsets
-        println!("offsets: {:?}", offset_tracker);
-
         Ok(())
     }
 }

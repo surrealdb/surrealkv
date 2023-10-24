@@ -1,6 +1,5 @@
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -150,7 +149,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             Err(e) => {
                 match &e {
                     // Handle specific error cases.
-                    Error::IndexError(trie_error) => {
+                    Error::Index(trie_error) => {
                         match trie_error {
                             // Handle the case where the key is not found.
                             TrieError::KeyNotFound => {
@@ -229,10 +228,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         //      3. If the read keys are still valid, then there is no conflict
         //      4. If the read keys are not valid, then there is a conflict
         //
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Error with time, went backwards");
-        let current_snapshot = Snapshot::take(self.store.clone(), ts.as_secs())?;
+        let current_snapshot = Snapshot::take(self.store.clone(), self.store.oracle.read_ts())?;
 
         let read_set = self.read_set.lock().unwrap();
 
@@ -245,7 +241,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
                 }
                 Err(e) => {
                     match &e {
-                        Error::IndexError(trie_error) => {
+                        Error::Index(trie_error) => {
                             // Handle key not found
                             match trie_error {
                                 TrieError::KeyNotFound => {
@@ -306,6 +302,9 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         if self.write_set.is_empty() {
             return Ok(());
         }
+
+        // Check for conflicts
+        self.check_conflict()?;
 
         // Prepare for the commit
         let tx_id = self.prepare_commit()?;
@@ -438,6 +437,7 @@ mod tests {
 
     use crate::storage::index::VectorKey;
     use crate::storage::kv::entry::TxRecord;
+    use crate::storage::kv::error::Error;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
@@ -467,6 +467,7 @@ mod tests {
         let key2_clone = key2.clone();
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
+        let value2_clone = value2.clone();
 
         let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
         txn1.set(&key1_clone, value1.clone()).unwrap();
@@ -502,35 +503,105 @@ mod tests {
 
         let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
         let val = txn3.get(&key1_clone).unwrap();
-        println!("val: {:?}", val.ts);
+        assert_eq!(val.value.unwrap().as_ref(), value2_clone.as_ref());
+    }
 
-        // tx.read_from(txr).unwrap();
-        // println!("hdr: {:?}", tx.header);
-        // println!("entries: {:?}", tx.entries);
+    #[test]
+    fn test_mvcc_snapshot_isolation() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
 
-        // let mut txr = TxReader::new(r).unwrap();
-        // let hdr = txr.read_header().unwrap();
-        // println!("hdr: {:?}", hdr);
+        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
+        assert_eq!(store.closed, false);
 
-        // let val = txr.read_entry().unwrap();
-        // println!("val: {:?}", val);
+        let key1 = Bytes::from("key1");
+        let key1_clone = key1.clone();
+        let key2 = Bytes::from("key2");
+        let key2_clone = key2.clone();
+        let value1 = Bytes::from("baz");
+        let value2 = Bytes::from("bar");
 
-        // let val = txr.read_entry().unwrap();
-        // println!("val: {:?}", val);
-        // let bs = r.read_uint64().unwrap();
-        // println!("bs: {:?}", bs);
-        // let bs = r.read_uint64().unwrap();
-        // println!("bs: {:?}", bs);
-        // let bs = r.read_uint16().unwrap();
-        // println!("bs: {:?}", bs);
-        // let bs = r.read_uint16().unwrap();
-        // println!("bs: {:?}", bs);
-        // let bs = r.read_uint16().unwrap();
-        // println!("bs: {:?}", bs);
+        // no read conflict
+        {
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
 
-        // let bs = r.read_uint32().unwrap();
-        // println!("bs: {:?}", bs);
-        // let bs = r.read_uint32().unwrap();
-        // println!("bs: {:?}", bs);
+            txn1.set(&key1_clone, value1.clone()).unwrap();
+            txn1.commit().unwrap();
+
+            assert!(txn2.get(&key2_clone).is_err());
+            txn2.set(&key2_clone, value2.clone()).unwrap();
+            txn2.commit().unwrap();
+        }
+
+        // blind writes should succeed if key wasn't read first
+        {
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key1_clone, value1.clone()).unwrap();
+
+            txn2.set(&key1_clone, value2.clone()).unwrap();
+
+            txn1.commit().unwrap();
+            txn2.commit().unwrap();
+
+            let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
+            let val = txn3.get(&key1_clone).unwrap();
+            assert_eq!(val.value.unwrap().as_ref(), value2.as_ref());
+        }
+
+        {
+            let key = Bytes::from("key3");
+
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key, value1.clone()).unwrap();
+            txn1.commit().unwrap();
+
+            assert!(txn2.get(&key).is_err());
+            txn2.set(&key, value1.clone()).unwrap();
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+
+        {
+            let key = Bytes::from("key4");
+
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key, value1.clone()).unwrap();
+            txn1.commit().unwrap();
+
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn2.delete(&key).unwrap();
+            assert!(txn2.commit().is_ok());
+
+            assert!(txn3.get(&key).is_ok());
+            txn3.set(&key, value2.clone()).unwrap();
+            assert!(match txn3.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+
     }
 }
