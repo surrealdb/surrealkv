@@ -3,11 +3,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::entry::ValueRef;
+use crate::storage::index::art::TrieError;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::store::Core;
-use crate::storage::index::art::TrieError;
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
@@ -22,7 +22,7 @@ pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
 impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     pub(crate) fn take(store: Arc<Core<P, V>>, ts: u64) -> Result<Self> {
         let snapshot = store.indexer.write()?.snapshot()?;
-        println!("snapshot: {:?} {}", snapshot.version(), ts);
+        // println!("snapshot: {:?} {}", snapshot.version(), ts);
 
         Ok(Self {
             ts,
