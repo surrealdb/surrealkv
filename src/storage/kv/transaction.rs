@@ -313,7 +313,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let tx_offset = self.add_to_transaction_log(tx_id)?;
 
         // Commit to the store index
-        self.commit_to_index(tx_offset)?;
+        self.commit_to_index(tx_id, tx_offset)?;
 
         Ok(())
     }
@@ -351,16 +351,15 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_offset: u64) -> Result<()> {
-        let commit_ts = self.store.oracle.new_commit_ts();
+    fn commit_to_index(&mut self, tx_id: u64, tx_offset: u64) -> Result<()> {
         let mut index = self.store.indexer.write()?;
-        let kv_pairs = self.build_kv_pairs(commit_ts);
+        let kv_pairs = self.build_kv_pairs(tx_id, tx_id);
 
         index.bulk_insert(&kv_pairs)?;
         Ok(())
     }
 
-    fn build_kv_pairs(&self, commit_ts: u64) -> Vec<KV<P, V>> {
+    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<P, V>> {
         let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
 
         for (_, entry) in self.write_set.iter() {
@@ -387,28 +386,6 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             self.store.opts.max_value_threshold,
         );
         index_value
-        // let mut index_value = BytesMut::new();
-
-        // if entry.value.len() <= self.store.opts.max_value_threshold {
-        //     index_value.put_u8(1);
-        //     index_value.put(entry.value.clone());
-        // } else {
-        //     index_value.put_u8(0);
-        //     index_value.put_u32(entry.value.len() as u32);
-        //     let val_off = self.value_offsets.get(entry.key).unwrap();
-        //     index_value.put_u64(*val_off as u64);
-        // }
-
-        // if let Some(metadata) = &entry.metadata {
-        //     let md_bytes = metadata.bytes();
-        //     let md_len = md_bytes.len() as u16;
-        //     index_value.put_u16(md_len);
-        //     index_value.put(md_bytes);
-        // } else {
-        //     index_value.put_u16(0);
-        // }
-
-        // index_value.freeze()
     }
 
     /// Rolls back the transaction, by removing all updated entries.
@@ -579,7 +556,6 @@ mod tests {
             let key = Bytes::from("key4");
 
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-
             txn1.set(&key, value1.clone()).unwrap();
             txn1.commit().unwrap();
 
@@ -602,6 +578,5 @@ mod tests {
                 _ => false,
             });
         }
-
     }
 }
