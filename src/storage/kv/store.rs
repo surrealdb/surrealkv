@@ -77,7 +77,7 @@ pub struct Core<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
     /// Transaction log for store.
     pub(crate) tlog: Arc<RwLock<AOL>>,
     /// Transaction ID Oracle for store.
-    pub(crate) oracle: Arc<Oracle>,
+    pub(crate) oracle: Arc<Oracle<P, V>>,
     /// Flag to indicate if store is closed.
     pub(crate) closed: bool,
 }
