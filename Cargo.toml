@@ -10,6 +10,8 @@ crc32fast = "1.3.2"
 crossbeam = "0.8.2"
 lru = "0.12.0"
 chrono = "0.4.31"
+crossbeam-channel = "0.5.8"
+threadpool = "1.8.1"
 
 # below is for the async runtime
 async-task = "4.4.0"
