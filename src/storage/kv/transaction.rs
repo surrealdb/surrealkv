@@ -60,19 +60,19 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     mode: Mode,
 
     /// The snapshot that the transaction is running in.
-    snapshot: Snapshot<P, V>,
+    pub(crate) snapshot: Snapshot<P, V>,
 
     // Reusable buffer for encoding transaction records.
     buf: BytesMut,
 
     /// The underlying store for the transaction. Shared between transactions using a mutex.
-    store: Arc<Core<P, V>>,
+    pub(crate) store: Arc<Core<P, V>>,
 
     /// The pending writes for the transaction.
-    write_set: HashMap<&'a Bytes, Entry<'a>>,
+    pub(crate) write_set: HashMap<&'a Bytes, Entry<'a>>,
 
     // The keys that are read in the transaction from the snapshot.
-    read_set: Mutex<Vec<(&'a Bytes, u64)>>,
+    pub(crate) read_set: Mutex<Vec<(&'a Bytes, u64)>>,
 
     // The offsets of values in the transaction post commit to the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
@@ -207,80 +207,6 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         Ok(())
     }
 
-    // TODO!!!: handle read locks on snapshot
-    // TODO!!! This should be called with lock on the index
-    pub fn check_conflict(&self) -> Result<()> {
-        // If the transaction is write-only, there is no need to check for conflicts
-        // This can lead to the scenario of blind writes where the transaction is not aware of
-        // any conflicts and will overwrite any existing values. In case of concurrent transactions,
-        // this can lead to lost updates, and the last transaction to commit will win.
-        if self.mode.is_write_only() {
-            return Ok(());
-        }
-
-        // This is the scenario of snapshot isolation where the transaction is in read-write mode.
-        // Currently, only optimistic concurrency control (OCC) is supported.
-        // TODO: add support for pessimistic concurrency control (serializable snapshot isolation)
-        // The following steps are performed:
-        //      1. Take the latest snapshot from the store
-        //      2. Check if the read keys in the transaction are still valid in the latest snapshot, and
-        //      the timestamp of the read keys in the transaction matches the timestamp of the latest snapshot.
-        //      If the timestamp does not match, then there is a conflict.
-        //      3. If the read keys are still valid, then there is no conflict
-        //      4. If the read keys are not valid, then there is a conflict
-        //
-        let current_snapshot = Snapshot::take(self.store.clone(), self.store.oracle.read_ts())?;
-
-        let read_set = self.read_set.lock().unwrap();
-
-        for (key, ts) in read_set.iter() {
-            match current_snapshot.get(&key[..].into()) {
-                Ok(val_ref) => {
-                    if *ts != val_ref.ts {
-                        return Err(Error::TxnReadConflict);
-                    }
-                }
-                Err(e) => {
-                    match &e {
-                        Error::Index(trie_error) => {
-                            // Handle key not found
-                            match trie_error {
-                                TrieError::KeyNotFound => {
-                                    if *ts > 0 {
-                                        return Err(Error::TxnReadConflict);
-                                    }
-                                    continue;
-                                }
-                                _ => return Err(e),
-                            }
-                        }
-                        _ => return Err(e),
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn validate(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(Error::TxnClosed);
-        }
-
-        if self.mode.is_read_only() {
-            return Err(Error::TxnReadOnly);
-        }
-
-        if self.write_set.is_empty() {
-            return Ok(());
-        }
-
-        self.check_conflict()?;
-
-        Ok(())
-    }
-
     // precommit the transaction to WAL
     pub fn precommit(&mut self) -> Result<()> {
         if self.store.opts.wal_disabled {
@@ -304,9 +230,6 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             return Ok(());
         }
 
-        // Check for conflicts
-        self.check_conflict()?;
-
         // Prepare for the commit
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
@@ -326,15 +249,16 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         }
 
         self.closed = true;
-        let tx_id = self.store.oracle.new_commit_ts();
-        let commit_ts = self.assign_commit_timestamp();
+
+        let oracle = self.store.oracle.clone();
+        let tx_id = oracle.new_commit_ts(self)?;
+        let commit_ts = self.assign_commit_ts();
         Ok((tx_id, commit_ts))
     }
 
     /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_timestamp(&mut self) -> u64 {
+    fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = current_timestamp();
-        println!("commit_ts: {}", commit_ts);
         self.write_set.iter_mut().for_each(|(_, entry)| {
             entry.ts = commit_ts; // this should be time.now(), not txID
         });
@@ -350,7 +274,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         // println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
         let (tx_offset, _) = tlog.append(&self.buf.as_ref())?;
-        Ok((tx_offset))
+        Ok(tx_offset)
     }
 
     /// Commits transaction changes to the store index.
@@ -372,7 +296,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             kv_pairs.push(KV {
                 key,
                 value: index_value.into(),
-                version: commit_ts,
+                version: tx_id,
                 ts: commit_ts,
             });
         }
@@ -422,7 +346,6 @@ mod tests {
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
     use crate::storage::kv::transaction::{Mode, Transaction};
-    use crate::storage::kv::util::current_timestamp;
     use crate::storage::kv::util::NoopValue;
     use crate::storage::log::aol::aol::AOL;
     use crate::storage::log::Options as LogOptions;
@@ -522,7 +445,6 @@ mod tests {
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
 
             txn1.set(&key1_clone, value1.clone()).unwrap();
-
             txn2.set(&key1_clone, value2.clone()).unwrap();
 
             txn1.commit().unwrap();
