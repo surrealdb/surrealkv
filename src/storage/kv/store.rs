@@ -18,43 +18,37 @@ use crate::storage::log::Error as LogError;
 use crate::storage::log::{Options as LogOptions, BLOCK_SIZE};
 
 /// An MVCC-based transactional key-value store.
-pub struct MVCCStore<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-    pub(crate) core: Arc<Core<P, V>>,
+pub struct MVCCStore<P: KeyTrait> {
+    pub(crate) core: Arc<Core<P>>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> {
+impl<P: KeyTrait> MVCCStore<P> {
     /// Creates a new MVCC key-value store with the given key-value store for storage.
     pub fn new(opts: Options) -> Result<Self> {
         let core = Arc::new(Core::new(opts)?);
         Ok(Self { core })
     }
 
-    pub fn begin<'a>(self: &'a Arc<Self>) -> Result<Transaction<'a, P, V>> {
+    pub fn begin<'a>(self: &'a Arc<Self>) -> Result<Transaction<'a, P>> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn begin_with_mode<'a>(self: &'a Arc<Self>, mode: Mode) -> Result<Transaction<'a, P, V>> {
+    pub fn begin_with_mode<'a>(self: &'a Arc<Self>, mode: Mode) -> Result<Transaction<'a, P>> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn view(
-        self: Arc<Self>,
-        f: impl FnOnce(&mut Transaction<P, V>) -> Result<()>,
-    ) -> Result<()> {
+    pub fn view(self: Arc<Self>, f: impl FnOnce(&mut Transaction<P>) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
 
         Ok(())
     }
 
-    pub fn write(
-        self: Arc<Self>,
-        f: impl FnOnce(&mut Transaction<P, V>) -> Result<()>,
-    ) -> Result<()> {
+    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction<P>) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
         txn.commit()?;
@@ -67,9 +61,9 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> MVCCStore<P, V> 
     }
 }
 
-pub struct Core<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub struct Core<P: KeyTrait> {
     /// Index for store.
-    pub(crate) indexer: RwLock<Indexer<P, V>>,
+    pub(crate) indexer: RwLock<Indexer<P>>,
     /// Options for store.
     pub(crate) opts: Options,
     /// WAL for store.
@@ -77,15 +71,14 @@ pub struct Core<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
     /// Transaction log for store.
     pub(crate) tlog: Arc<RwLock<AOL>>,
     /// Transaction ID Oracle for store.
-    pub(crate) oracle: Arc<Oracle<P, V>>,
+    pub(crate) oracle: Arc<Oracle<P>>,
     /// Flag to indicate if store is closed.
     pub(crate) closed: bool,
 }
 
-impl<P, V> Core<P, V>
+impl<P> Core<P>
 where
     P: KeyTrait,
-    V: Clone + AsRef<Bytes> + From<bytes::Bytes>,
 {
     pub fn new(opts: Options) -> Result<Self> {
         let topts = LogOptions::default();
@@ -110,7 +103,7 @@ where
         })
     }
 
-    fn load_index(opts: &Options, indexer: &mut Indexer<P, V>) -> Result<()> {
+    fn load_index(opts: &Options, indexer: &mut Indexer<P>) -> Result<()> {
         let tlog = AOL::open(&opts.dir, &LogOptions::default())?;
         let reader = Reader::new_from(tlog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
@@ -141,12 +134,12 @@ where
         tx: &TxRecord,
         opts: &Options,
         value_offsets: &HashMap<Bytes, usize>,
-        indexer: &mut Indexer<P, V>,
+        indexer: &mut Indexer<P>,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
+        let mut kv_pairs: Vec<KV<P, Bytes>> = Vec::new();
 
         for entry in &tx.entries {
-            let index_value = ValueRef::<P, V>::encode(
+            let index_value = ValueRef::<P>::encode(
                 &entry.key,
                 &entry.value,
                 entry.metadata.as_ref(),
@@ -171,12 +164,11 @@ mod tests {
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::MVCCStore;
-    use crate::storage::kv::util::NoopValue;
 
     #[test]
     fn test_new_store() {
         let opts = Options::new();
-        let store = MVCCStore::<VectorKey, NoopValue>::new(opts).expect("should create store");
+        let store = MVCCStore::<VectorKey>::new(opts).expect("should create store");
         assert_eq!(store.closed(), false);
     }
 }

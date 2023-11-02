@@ -52,7 +52,7 @@ impl Mode {
     }
 }
 
-pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub struct Transaction<'a, P: KeyTrait> {
     /// The read timestamp of the transaction.
     pub(crate) read_ts: u64,
 
@@ -60,13 +60,13 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     mode: Mode,
 
     /// The snapshot that the transaction is running in.
-    pub(crate) snapshot: Snapshot<P, V>,
+    pub(crate) snapshot: Snapshot<P>,
 
     // Reusable buffer for encoding transaction records.
     buf: BytesMut,
 
     /// The underlying store for the transaction. Shared between transactions using a mutex.
-    pub(crate) store: Arc<Core<P, V>>,
+    pub(crate) store: Arc<Core<P>>,
 
     /// The pending writes for the transaction.
     pub(crate) write_set: HashMap<&'a Bytes, Entry<'a>>,
@@ -81,9 +81,9 @@ pub struct Transaction<'a, P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::By
     closed: bool,
 }
 
-impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<'a, P, V> {
+impl<'a, P: KeyTrait> Transaction<'a, P> {
     /// Prepare a new transaction in the given mode.
-    pub fn new(store: Arc<Core<P, V>>, mode: Mode) -> Result<Self> {
+    pub fn new(store: Arc<Core<P>>, mode: Mode) -> Result<Self> {
         if store.closed {
             return Err(Error::StoreClosed);
         }
@@ -126,7 +126,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &'a Bytes) -> Result<ValueRef<P, V>> {
+    pub fn get(&self, key: &'a Bytes) -> Result<ValueRef<P>> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
@@ -230,6 +230,11 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
             return Ok(());
         }
 
+        // TODO: Use a commit pipeline to avoid blocking calls.
+        // Lock the oracle to serialize commits to the transaction log.
+        let oracle = self.store.oracle.clone();
+        let _lock = oracle.write_lock.lock()?;
+
         // Prepare for the commit
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
@@ -238,6 +243,8 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
 
         // Commit to the store index
         self.commit_to_index(tx_id, commit_ts, tx_offset)?;
+
+        oracle.committed_upto(tx_id);
 
         Ok(())
     }
@@ -271,7 +278,6 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
         tx_record.encode(&mut self.buf, &mut self.committed_values_offsets)?;
 
-        // println!("buf: {:?}", self.buf.as_ref());
         let mut tlog = self.store.tlog.write()?;
         let (tx_offset, _) = tlog.append(&self.buf.as_ref())?;
         Ok(tx_offset)
@@ -286,8 +292,8 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
         Ok(())
     }
 
-    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<P, V>> {
-        let mut kv_pairs: Vec<KV<P, V>> = Vec::new();
+    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<P, Bytes>> {
+        let mut kv_pairs: Vec<KV<P, Bytes>> = Vec::new();
 
         for (_, entry) in self.write_set.iter() {
             let index_value = self.build_index_value(entry);
@@ -305,7 +311,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 
     fn build_index_value(&self, entry: &Entry) -> Bytes {
-        let index_value = ValueRef::<P, V>::encode(
+        let index_value = ValueRef::<P>::encode(
             entry.key,
             &entry.value,
             entry.metadata.as_ref(),
@@ -328,7 +334,7 @@ impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Transaction<
     }
 }
 
-impl<'a, P: KeyTrait, V: Clone + From<bytes::Bytes> + AsRef<Bytes>> Drop for Transaction<'a, P, V> {
+impl<'a, P: KeyTrait> Drop for Transaction<'a, P> {
     fn drop(&mut self) {
         let _ = self.rollback();
     }
@@ -346,7 +352,6 @@ mod tests {
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
     use crate::storage::kv::transaction::{Mode, Transaction};
-    use crate::storage::kv::util::NoopValue;
     use crate::storage::log::aol::aol::AOL;
     use crate::storage::log::Options as LogOptions;
 
@@ -362,7 +367,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
         assert_eq!(store.closed, false);
 
         let key1 = Bytes::from("foo1");
@@ -400,7 +405,7 @@ mod tests {
         println!("restarting----------------------->");
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
         assert_eq!(store.closed, false);
 
         // TODO: fix valueref decode
@@ -416,7 +421,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
         assert_eq!(store.closed, false);
 
         let key1 = Bytes::from("key1");
