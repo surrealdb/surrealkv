@@ -16,23 +16,6 @@ pub fn default_hash(h: &impl Hash) -> u64 {
     hasher.finish()
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct NoopValue {
-    data: Bytes,
-}
-
-impl AsRef<Bytes> for NoopValue {
-    fn as_ref(&self) -> &Bytes {
-        &self.data
-    }
-}
-
-impl From<Bytes> for NoopValue {
-    fn from(bytes: Bytes) -> Self {
-        NoopValue { data: bytes }
-    }
-}
-
 pub(crate) fn calculate_crc32(a1: &[u8], a2: &[u8]) -> u32 {
     let mut hasher = crc32Hasher::new();
     hasher.update(a1);

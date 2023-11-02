@@ -58,14 +58,14 @@ impl<'a> Entry<'a> {
 // Tx struct encoded format:
 //
 // +---------------------------------------------------------+
-// |                     Tx (Transaction)                     |
+// |                     Tx (Transaction)                    |
 // |---------------------------------------------------------|
-// | header: TxRecordHeader                                        |
-// | entries: Vec<TxRecordEntry>                                   |
+// | header: TxRecordHeader                                  |
+// | entries: Vec<TxRecordEntry>                             |
 // +---------------------------------------------------------+
 
 // +---------------------------------------------------------+
-// |                     TxRecordHeader                             |
+// |                     TxRecordHeader                      |
 // |---------------------------------------------------------|
 // | id: u64                                                 |
 // | ts: u64                                                 |
@@ -75,7 +75,7 @@ impl<'a> Entry<'a> {
 // +---------------------------------------------------------+
 
 // +---------------------------------------------------------+
-// |                     TxRecordEntry                              |
+// |                     TxRecordEntry                       |
 // |---------------------------------------------------------|
 // | key: Bytes                                              |
 // | key_len: u32                                            |
@@ -87,23 +87,24 @@ impl<'a> Entry<'a> {
 //
 // Tx encoded format:
 //
-//   |----------------------------------|
+//   |---------------------------------------------|
 //   |   TxRecordHeader   |     TxRecordEntry[]    |
-//   |--------------|-------------------|
+//   |-------|-------|------------|----------------|-----------------|----------|---------------|
 //   | id(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata | ...entries... |
-//   |----------------------------------|
+//   |-------|-------|------------|----------------|-----------------|----------|---------------|
 //
 // TxRecordHeader struct encoded format:
 //
-//   |------------------------------------------|
-//   |   id(8)   |   ts(8)   | version(2) | num_entries(2) | metadata_len(2) | metadata |
-//   |-----------|-----------|------------|----------------|----------------|----------|
+//   |-----------|-----------|------------|----------------|-----------------|-----------|
+//   |   id(8)   |   ts(8)   | version(2) | num_entries(2) | metadata_len(2) | metadata  |
+//   |-----------|-----------|------------|----------------|-----------------|-----------|
 //
 // TxRecordEntry struct encoded format:
 //
-//   |----------------------------------|
+//   |---------------------------|--------------|-------|-----------------|----------|
 //   | crc(4) | key_len(4) | key | value_len(4) | value | metadata_len(4) | metadata |
-//   |----------------------------------|
+//   |---------------------------|--------------|-------|-----------------|----------|
+//
 #[derive(Debug)]
 pub(crate) struct TxRecord {
     pub(crate) header: TxRecordHeader,
@@ -289,19 +290,19 @@ impl TxRecordEntry {
 }
 
 /// Value reference implementation.
-pub struct ValueRef<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub struct ValueRef<P: KeyTrait> {
     pub(crate) version: u8,
     pub(crate) flag: u8,
     pub(crate) ts: u64,
     pub(crate) value_offset: u64,
     pub(crate) value_length: usize,
-    pub(crate) value: Option<V>,
+    pub(crate) value: Option<Bytes>,
     pub(crate) key_value_metadata: Option<Metadata>,
     /// The underlying store for the transaction.
-    store: Arc<Core<P, V>>,
+    store: Arc<Core<P>>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
+impl<P: KeyTrait> ValueRef<P> {
     fn resolve(&self) -> Result<Vec<u8>> {
         // Implement the resolve functionality.
         unimplemented!("resolve");
@@ -320,8 +321,8 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
     }
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
-    pub(crate) fn new(store: Arc<Core<P, V>>) -> Self {
+impl<P: KeyTrait> ValueRef<P> {
+    pub(crate) fn new(store: Arc<Core<P>>) -> Self {
         ValueRef {
             version: 0,
             ts: 0,
@@ -385,7 +386,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> ValueRef<P, V> {
                 cursor.get_ref()[cursor.position() as usize..][..self.value_length].as_ref();
             cursor.advance(self.value_length);
 
-            self.value = Some(V::from(Bytes::copy_from_slice(value_bytes)));
+            self.value = Some(Bytes::copy_from_slice(value_bytes));
         } else {
             // Decode version, value length, and value offset
             self.value_offset = cursor.get_u64();
@@ -427,14 +428,12 @@ mod tests {
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Core;
-    use crate::storage::kv::util::NoopValue;
 
     #[test]
     fn test_encode_decode() {
         // Create a sample valueRef instance
         let opts = Options::new();
-        let store =
-            Arc::new(Core::<VectorKey, NoopValue>::new(opts).expect("failed to create store"));
+        let store = Arc::new(Core::<VectorKey>::new(opts).expect("failed to create store"));
 
         let mut txmd = Metadata::new();
         txmd.as_deleted(true).expect("failed to set deleted");
