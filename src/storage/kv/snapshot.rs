@@ -10,19 +10,18 @@ use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::store::Core;
 
 /// A versioned snapshot for snapshot isolation.
-pub(crate) struct Snapshot<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub(crate) struct Snapshot<P: KeyTrait> {
     /// The timestamp of the snapshot. This is used to determine the visibility of the
     /// key-value pairs in the snapshot. It can be used to filter out expired key-value
     /// pairs or to filter out key-value pairs based on the snapshot timestamp.
     ts: u64,
-    snap: TartSnapshot<P, V>,
-    store: Arc<Core<P, V>>,
+    snap: TartSnapshot<P, Bytes>,
+    store: Arc<Core<P>>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
-    pub(crate) fn take(store: Arc<Core<P, V>>, ts: u64) -> Result<Self> {
+impl<P: KeyTrait> Snapshot<P> {
+    pub(crate) fn take(store: Arc<Core<P>>, ts: u64) -> Result<Self> {
         let snapshot = store.indexer.write()?.snapshot()?;
-        // println!("snapshot: {:?} {}", snapshot.version(), ts);
 
         Ok(Self {
             ts,
@@ -32,26 +31,26 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &P, value: V) -> Result<()> {
+    pub fn set(&mut self, key: &P, value: Bytes) -> Result<()> {
         self.snap.insert(key, value, self.ts)?;
         Ok(())
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &P) -> Result<ValueRef<P, V>> {
+    pub fn get(&self, key: &P) -> Result<ValueRef<P>> {
         // Create a slice with your filter function if needed, e.g., [ignore_deleted]
-        let filters: Vec<fn(&ValueRef<P, V>, u64) -> Result<()>> = vec![ignore_deleted];
+        let filters: Vec<fn(&ValueRef<P>, u64) -> Result<()>> = vec![ignore_deleted];
 
         self.get_with_filters(key, &filters)
     }
 
-    pub fn get_with_filters<F>(&self, key: &P, filters: &[F]) -> Result<ValueRef<P, V>>
+    pub fn get_with_filters<F>(&self, key: &P, filters: &[F]) -> Result<ValueRef<P>>
     where
-        F: FilterFn<P, V>,
+        F: FilterFn<P>,
     {
         let (val, version, _) = self.snap.get(key, self.ts)?;
         let mut val_ref = ValueRef::new(self.store.clone());
-        let val_bytes_ref: &Bytes = val.as_ref();
+        let val_bytes_ref: &Bytes = &val;
         val_ref.decode(version, val_bytes_ref)?;
 
         for filter in filters {
@@ -67,14 +66,11 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Snapshot<P, V> {
     }
 }
 
-pub(crate) trait FilterFn<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-    fn apply(&self, val_ref: &ValueRef<P, V>, ts: u64) -> Result<()>;
+pub(crate) trait FilterFn<P: KeyTrait> {
+    fn apply(&self, val_ref: &ValueRef<P>, ts: u64) -> Result<()>;
 }
 
-fn ignore_deleted<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>(
-    val_ref: &ValueRef<P, V>,
-    _: u64,
-) -> Result<()> {
+fn ignore_deleted<P: KeyTrait>(val_ref: &ValueRef<P>, _: u64) -> Result<()> {
     let md = val_ref.key_value_metadata();
     if let Some(md) = md {
         if md.deleted() {
@@ -84,11 +80,11 @@ fn ignore_deleted<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>(
     Ok(())
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>, F> FilterFn<P, V> for F
+impl<P: KeyTrait, F> FilterFn<P> for F
 where
-    F: Fn(&ValueRef<P, V>, u64) -> Result<()>,
+    F: Fn(&ValueRef<P>, u64) -> Result<()>,
 {
-    fn apply(&self, val_ref: &ValueRef<P, V>, ts: u64) -> Result<()> {
+    fn apply(&self, val_ref: &ValueRef<P>, ts: u64) -> Result<()> {
         self(val_ref, ts)
     }
 }

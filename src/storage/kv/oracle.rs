@@ -1,8 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
-    cmp::Reverse,
+    collections::HashMap,
     collections::HashSet,
-    collections::{BinaryHeap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -12,25 +11,25 @@ use std::{
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::storage::index::KeyTrait;
-use crate::storage::kv::transaction::Transaction;
-use crate::storage::kv::snapshot::Snapshot;
-use crate::storage::kv::error::{Error, Result};
 use crate::storage::index::art::TrieError;
+use crate::storage::index::KeyTrait;
+use crate::storage::kv::error::{Error, Result};
+use crate::storage::kv::snapshot::Snapshot;
+use crate::storage::kv::transaction::Transaction;
 
-pub(crate) enum IsolationLevel<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-    SnapshotIsolation(SnapshotIsolation<P, V>),
-    SerializableSnapshotIsolation(SerializableSnapshotIsolation<P, V>),
+pub(crate) enum IsolationLevel<P: KeyTrait> {
+    SnapshotIsolation(SnapshotIsolation<P>),
+    SerializableSnapshotIsolation(SerializableSnapshotIsolation<P>),
 }
 
-// impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Default for IsolationLevel<P, V> {
+// impl<P: KeyTrait> Default for IsolationLevel<P> {
 //     fn default() -> Self {
 //         IsolationLevel::SerializableSnapshotIsolation(SerializableSnapshotIsolation::default())
 //     }
 // }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> IsolationLevel<P, V> {
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P, V>) -> Result<u64> {
+impl<P: KeyTrait> IsolationLevel<P> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
         match self {
             IsolationLevel::SnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
             IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
@@ -52,20 +51,20 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> IsolationLevel<P
     }
 }
 
-pub(crate) struct Oracle<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
-    lock: Mutex<()>,
-    isolation: IsolationLevel<P, V>,
+pub(crate) struct Oracle<P: KeyTrait> {
+    pub(crate) write_lock: Mutex<()>,
+    isolation: IsolationLevel<P>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Oracle<P, V> {
+impl<P: KeyTrait> Oracle<P> {
     pub(crate) fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
             isolation: IsolationLevel::SnapshotIsolation(SnapshotIsolation::new()),
         }
     }
 
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P, V>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
         self.isolation.new_commit_ts(txn)
     }
 
@@ -76,14 +75,23 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> Oracle<P, V> {
     pub(crate) fn set_txn_id(&self, txn_id: u64) {
         self.isolation.set_txn_id(txn_id);
     }
+
+    pub(crate) fn committed_upto(&self, txn_id: u64) {
+        match &self.isolation {
+            IsolationLevel::SnapshotIsolation(_) => {}
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => {
+                oracle.txn_mark.done_upto(txn_id);
+            }
+        }
+    }
 }
 
-pub(crate) struct SnapshotIsolation<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+pub(crate) struct SnapshotIsolation<P: KeyTrait> {
     next_tx_id: AtomicU64,
-    _phantom: std::marker::PhantomData<(P, V)>,
+    _phantom: std::marker::PhantomData<P>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> SnapshotIsolation<P, V> {
+impl<P: KeyTrait> SnapshotIsolation<P> {
     pub(crate) fn new() -> Self {
         Self {
             next_tx_id: AtomicU64::new(0),
@@ -95,7 +103,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> SnapshotIsolatio
         self.next_tx_id.store(txn_id, Ordering::SeqCst);
     }
 
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P, V>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
         // This is the scenario of snapshot isolation where the transaction is in read-write mode.
         // Currently, only optimistic concurrency control (OCC) is supported.
         // TODO: add support for pessimistic concurrency control (serializable snapshot isolation)
@@ -138,8 +146,6 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> SnapshotIsolatio
             }
         }
 
-
-
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
         Ok(self.next_tx_id.load(Ordering::SeqCst))
     }
@@ -156,15 +162,15 @@ struct CommitMarker {
 }
 
 #[derive(Default)]
-struct CommitTracker<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> {
+struct CommitTracker<P: KeyTrait> {
     next_txn_ts: u64,
     committed_txns: Vec<CommitMarker>,
     last_cleanup_ts: u64,
 
-    _phantom: std::marker::PhantomData<(P, V)>,
+    _phantom: std::marker::PhantomData<(P)>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> CommitTracker<P, V> {
+impl<P: KeyTrait> CommitTracker<P> {
     fn cleanup_committed_transactions(&mut self, max_read_ts: u64) {
         assert!(max_read_ts >= self.last_cleanup_ts);
 
@@ -176,7 +182,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> CommitTracker<P,
         self.committed_txns.retain(|txn| txn.ts > max_read_ts);
     }
 
-    fn has_conflict(&self, txn: &Transaction<P, V>) -> bool {
+    fn has_conflict(&self, txn: &Transaction<P>) -> bool {
         let read_set = txn.read_set.lock().unwrap();
         if read_set.is_empty() {
             false
@@ -193,22 +199,16 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>> CommitTracker<P,
     }
 }
 
-pub(crate) struct SerializableSnapshotIsolation<
-    P: KeyTrait,
-    V: Clone + AsRef<Bytes> + From<bytes::Bytes>,
-> {
-    commit_tracker: Mutex<CommitTracker<P, V>>,
+pub(crate) struct SerializableSnapshotIsolation<P: KeyTrait> {
+    commit_tracker: Mutex<CommitTracker<P>>,
 
     /// Used to block `new_transaction`, so all previous commits are visible to a new read.
     txn_mark: Arc<WaterMark>,
 
-    /// Used by DB.
     read_mark: Arc<WaterMark>,
 }
 
-impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>
-    SerializableSnapshotIsolation<P, V>
-{
+impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
     pub(crate) fn read_ts(&self) -> u64 {
         let commit_tracker = self.commit_tracker.lock().unwrap();
         let read_ts = commit_tracker.next_txn_ts - 1;
@@ -217,7 +217,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>
         read_ts
     }
 
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P, V>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
         let mut commit_tracker = self.commit_tracker.lock().unwrap();
         if commit_tracker.has_conflict(txn) {
             return Err(Error::TxnReadConflict);
@@ -233,8 +233,7 @@ impl<P: KeyTrait, V: Clone + AsRef<Bytes> + From<bytes::Bytes>>
 
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
-        commit_tracker.committed_txns.push(
-            CommitMarker {
+        commit_tracker.committed_txns.push(CommitMarker {
             ts,
             conflict_keys: txn.write_set.keys().map(|&k| k.clone()).collect(),
         });
@@ -319,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_waiters_hub() {
-        let mut hub = WaterMark::new(0);
+        let hub = WaterMark::new(0);
 
         hub.done_upto(10);
         let t2 = hub.done_until();

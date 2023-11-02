@@ -9,7 +9,6 @@ pub mod snapshot;
 pub mod store;
 pub mod transaction;
 pub mod util;
-pub mod watcher;
 
 // use crate::storage::kv::error::Result;
 // use crate::storage::index::snapshot::Snapshot;
