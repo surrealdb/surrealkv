@@ -263,7 +263,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
     fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
         self.write_set.iter_mut().for_each(|(_, entry)| {
-            entry.ts = commit_ts; // this should be time.now(), not txID
+            entry.ts = commit_ts;
         });
         commit_ts
     }

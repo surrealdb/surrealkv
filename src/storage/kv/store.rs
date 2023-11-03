@@ -19,11 +19,11 @@ use crate::storage::log::Error as LogError;
 use crate::storage::log::{Options as LogOptions, BLOCK_SIZE};
 
 /// An MVCC-based transactional key-value store.
-pub struct MVCCStore<P: KeyTrait> {
+pub struct Store<P: KeyTrait> {
     pub(crate) core: Arc<Core<P>>,
 }
 
-impl<P: KeyTrait> MVCCStore<P> {
+impl<P: KeyTrait> Store<P> {
     /// Creates a new MVCC key-value store with the given key-value store for storage.
     pub fn new(opts: Options) -> Result<Self> {
         let core = Arc::new(Core::new(opts)?);
@@ -111,8 +111,13 @@ where
         let mut tx = TxRecord::new(opts.max_tx_entries);
 
         loop {
-            let res = tx_reader.read_into(&mut tx);
+            // Reset the transaction record before reading into it.
+            // Keeping the same transaction record instance avoids
+            // unnecessary allocations.
+            tx.reset();
 
+            // Read the next transaction record from the log.
+            let res = tx_reader.read_into(&mut tx);
             if let Err(e) = res {
                 if let Error::Log(log_error) = &e {
                     match log_error {
@@ -164,12 +169,12 @@ where
 mod tests {
     use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::MVCCStore;
+    use crate::storage::kv::store::Store;
 
     #[test]
     fn test_new_store() {
         let opts = Options::new();
-        let store = MVCCStore::<VectorKey>::new(opts).expect("should create store");
+        let store = Store::<VectorKey>::new(opts).expect("should create store");
         assert!(!store.closed());
     }
 }
