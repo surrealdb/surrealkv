@@ -227,7 +227,7 @@ impl<P: KeyTrait> CommitTracker<P> {
                     // Check if there are any conflict keys in the read set.
                     read_set
                         .iter()
-                        .any(|read| committed_txn.conflict_keys.contains(read.0))
+                        .any(|read| committed_txn.conflict_keys.contains(&read.0))
                 })
         }
     }
@@ -318,7 +318,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
         // Add the transaction to the list of committed transactions with conflict keys.
         commit_tracker.committed_transactions.push(CommitMarker {
             ts,
-            conflict_keys: txn.write_set.keys().map(|&k| k.clone()).collect(),
+            conflict_keys: txn.write_set.keys().map(|k| k.clone()).collect(),
         });
 
         Ok(ts)

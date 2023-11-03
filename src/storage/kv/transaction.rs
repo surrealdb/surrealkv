@@ -53,7 +53,7 @@ impl Mode {
     }
 }
 
-pub struct Transaction<'a, P: KeyTrait> {
+pub struct Transaction<P: KeyTrait> {
     /// The read timestamp of the transaction.
     pub(crate) read_ts: u64,
 
@@ -70,10 +70,10 @@ pub struct Transaction<'a, P: KeyTrait> {
     pub(crate) store: Arc<Core<P>>,
 
     /// The pending writes for the transaction.
-    pub(crate) write_set: HashMap<&'a Bytes, Entry<'a>>,
+    pub(crate) write_set: HashMap<Bytes, Entry>,
 
     // The keys that are read in the transaction from the snapshot.
-    pub(crate) read_set: Mutex<Vec<(&'a Bytes, u64)>>,
+    pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
     // The offsets of values in the transaction post commit to the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
@@ -82,7 +82,7 @@ pub struct Transaction<'a, P: KeyTrait> {
     closed: bool,
 }
 
-impl<'a, P: KeyTrait> Transaction<'a, P> {
+impl<P: KeyTrait> Transaction<P> {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<Core<P>>, mode: Mode) -> Result<Self> {
         if store.closed {
@@ -112,22 +112,23 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
     }
 
     /// Adds a key-value pair to the store.
-    pub fn set(&mut self, key: &'a Bytes, value: Bytes) -> Result<()> {
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let entry = Entry::new(key, value);
         self.write(entry)?;
         Ok(())
     }
 
     /// Deletes a key from the store.
-    pub fn delete(&mut self, key: &'a Bytes) -> Result<()> {
-        let mut entry = Entry::new(key, Bytes::new());
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        let value = Bytes::new();
+        let mut entry = Entry::new(key, &value);
         entry.mark_delete();
         self.write(entry)?;
         Ok(())
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &'a Bytes) -> Result<ValueRef<P>> {
+    pub fn get(&self, key: &[u8]) -> Result<ValueRef<P>> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
@@ -138,7 +139,8 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         // Read Your Own Writes (RYOW) semantics.
 
         // Check if the key is in the snapshot.
-        match self.snapshot.get(&key[..].into()) {
+        let key = Bytes::copy_from_slice(key);
+        match self.snapshot.get(&key.as_ref().into()) {
             Ok(val_ref) => {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
@@ -172,7 +174,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
     }
 
     /// Writes a value for a key. None is used for deletion.
-    fn write(&mut self, e: Entry<'a>) -> Result<()> {
+    fn write(&mut self, e: Entry) -> Result<()> {
         if !self.mode.mutable() {
             return Err(Error::TxnReadOnly);
         }
@@ -198,7 +200,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         }
 
         // Add the entry to pending writes
-        self.write_set.insert(e.key, e);
+        self.write_set.insert(e.key.clone(), e);
 
         Ok(())
     }
@@ -308,7 +310,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
 
     fn build_index_value(&self, entry: &Entry) -> Bytes {
         let index_value = ValueRef::<P>::encode(
-            entry.key,
+            &entry.key,
             &entry.value,
             entry.metadata.as_ref(),
             &self.committed_values_offsets,
@@ -333,7 +335,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
     }
 }
 
-impl<'a, P: KeyTrait> Drop for Transaction<'a, P> {
+impl<P: KeyTrait> Drop for Transaction<P> {
     fn drop(&mut self) {
         let _ = self.rollback();
     }
@@ -377,23 +379,20 @@ mod tests {
 
         // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
-        let key1_clone = key1;
         let key2 = Bytes::from("foo2");
-        let key2_clone = key2;
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
-        let value2_clone = value2.clone();
 
         // Start a new read-write transaction (txn1)
         let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn1.set(&key1_clone, value1.clone()).unwrap();
-        txn1.set(&key2_clone, value1).unwrap();
+        txn1.set(&key1, &value1).unwrap();
+        txn1.set(&key2, &value1).unwrap();
         txn1.commit().unwrap();
 
         // Start another read-write transaction (txn2)
         let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn2.set(&key1_clone, value2.clone()).unwrap();
-        txn2.set(&key2_clone, value2).unwrap();
+        txn2.set(&key1, &value2).unwrap();
+        txn2.set(&key2, &value2).unwrap();
         txn2.commit().unwrap();
 
         // Open an AOL (Append-Only Log) from the temporary directory
@@ -424,10 +423,10 @@ mod tests {
 
         // Start a read-only transaction (txn3)
         let txn3 = Transaction::new(store, Mode::ReadOnly).unwrap();
-        let val = txn3.get(&key1_clone).unwrap();
+        let val = txn3.get(&key1).unwrap();
 
         // Assert that the value retrieved in txn3 matches value2_clone
-        assert_eq!(val.value.unwrap().as_ref(), value2_clone.as_ref());
+        assert_eq!(val.value.unwrap().as_ref(), value2.as_ref());
     }
 
     #[test]
@@ -440,9 +439,7 @@ mod tests {
         assert!(!store.closed);
 
         let key1 = Bytes::from("key1");
-        let key1_clone = key1;
         let key2 = Bytes::from("key2");
-        let key2_clone = key2;
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
 
@@ -451,11 +448,11 @@ mod tests {
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
 
-            txn1.set(&key1_clone, value1.clone()).unwrap();
+            txn1.set(&key1, &value1).unwrap();
             txn1.commit().unwrap();
 
-            assert!(txn2.get(&key2_clone).is_err());
-            txn2.set(&key2_clone, value2.clone()).unwrap();
+            assert!(txn2.get(&key2).is_err());
+            txn2.set(&key2, &value2).unwrap();
             txn2.commit().unwrap();
         }
 
@@ -464,14 +461,14 @@ mod tests {
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
 
-            txn1.set(&key1_clone, value1.clone()).unwrap();
-            txn2.set(&key1_clone, value2.clone()).unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn2.set(&key1, &value2).unwrap();
 
             txn1.commit().unwrap();
             txn2.commit().unwrap();
 
             let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
-            let val = txn3.get(&key1_clone).unwrap();
+            let val = txn3.get(&key1).unwrap();
             assert_eq!(val.value.unwrap().as_ref(), value2.as_ref());
         }
 
@@ -481,11 +478,11 @@ mod tests {
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
 
-            txn1.set(&key, value1.clone()).unwrap();
+            txn1.set(&key, &value1).unwrap();
             txn1.commit().unwrap();
 
             assert!(txn2.get(&key).is_err());
-            txn2.set(&key, value1.clone()).unwrap();
+            txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit() {
                 Err(err) => {
                     if let Error::TxnReadConflict = err {
@@ -502,7 +499,7 @@ mod tests {
             let key = Bytes::from("key4");
 
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            txn1.set(&key, value1).unwrap();
+            txn1.set(&key, &value1).unwrap();
             txn1.commit().unwrap();
 
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
@@ -512,7 +509,7 @@ mod tests {
             assert!(txn2.commit().is_ok());
 
             assert!(txn3.get(&key).is_ok());
-            txn3.set(&key, value2).unwrap();
+            txn3.set(&key, &value2).unwrap();
             assert!(match txn3.commit() {
                 Err(err) => {
                     if let Error::TxnReadConflict = err {

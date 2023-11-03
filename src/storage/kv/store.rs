@@ -30,13 +30,13 @@ impl<P: KeyTrait> Store<P> {
         Ok(Self { core })
     }
 
-    pub fn begin<'a>(self: &'a Arc<Self>) -> Result<Transaction<'a, P>> {
+    pub fn begin(self: &Arc<Self>) -> Result<Transaction<P>> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn begin_with_mode<'a>(self: &'a Arc<Self>, mode: Mode) -> Result<Transaction<'a, P>> {
+    pub fn begin_with_mode(self: &Arc<Self>, mode: Mode) -> Result<Transaction<P>> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)

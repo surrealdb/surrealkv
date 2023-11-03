@@ -18,19 +18,19 @@ pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value m
 pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
 
 #[derive(Clone)]
-pub(crate) struct Entry<'a> {
-    pub(crate) key: &'a Bytes,
+pub(crate) struct Entry {
+    pub(crate) key: Bytes,
     pub(crate) metadata: Option<Metadata>,
     pub(crate) value: Bytes,
     pub(crate) ts: u64,
 }
 
-impl<'a> Entry<'a> {
-    pub(crate) fn new(key: &'a Bytes, value: Bytes) -> Self {
+impl Entry {
+    pub(crate) fn new(key: &[u8], value: &[u8]) -> Self {
         Entry {
-            key,
+            key: Bytes::copy_from_slice(key),
             metadata: None,
-            value,
+            value: Bytes::copy_from_slice(value),
             ts: 0,
         }
     }
@@ -139,8 +139,8 @@ impl TxRecord {
         let crc = calculate_crc32(entry.key.as_ref(), entry.value.as_ref());
         let tx_record_entry = TxRecordEntry {
             crc,
-            key: entry.key.clone(),
             key_len: entry.key.len() as u32,
+            key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
