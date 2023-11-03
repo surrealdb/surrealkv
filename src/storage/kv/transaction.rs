@@ -9,7 +9,7 @@ use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
 use crate::storage::index::art::TrieError;
 use crate::storage::index::art::KV;
-use crate::storage::index::KeyTrait;
+use crate::storage::index::VectorKey;
 use crate::storage::kv::entry::{
     Entry, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
 };
@@ -53,7 +53,7 @@ impl Mode {
     }
 }
 
-pub struct Transaction<P: KeyTrait> {
+pub struct Transaction {
     /// The read timestamp of the transaction.
     pub(crate) read_ts: u64,
 
@@ -61,13 +61,13 @@ pub struct Transaction<P: KeyTrait> {
     mode: Mode,
 
     /// The snapshot that the transaction is running in.
-    pub(crate) snapshot: Snapshot<P>,
+    pub(crate) snapshot: Snapshot,
 
     // Reusable buffer for encoding transaction records.
     buf: BytesMut,
 
     /// The underlying store for the transaction. Shared between transactions using a mutex.
-    pub(crate) store: Arc<Core<P>>,
+    pub(crate) store: Arc<Core>,
 
     /// The pending writes for the transaction.
     pub(crate) write_set: HashMap<Bytes, Entry>,
@@ -82,9 +82,9 @@ pub struct Transaction<P: KeyTrait> {
     closed: bool,
 }
 
-impl<P: KeyTrait> Transaction<P> {
+impl Transaction {
     /// Prepare a new transaction in the given mode.
-    pub fn new(store: Arc<Core<P>>, mode: Mode) -> Result<Self> {
+    pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
         if store.closed {
             return Err(Error::StoreClosed);
         }
@@ -128,7 +128,7 @@ impl<P: KeyTrait> Transaction<P> {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &[u8]) -> Result<ValueRef<P>> {
+    pub fn get(&self, key: &[u8]) -> Result<ValueRef> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
@@ -140,7 +140,7 @@ impl<P: KeyTrait> Transaction<P> {
 
         // Check if the key is in the snapshot.
         let key = Bytes::copy_from_slice(key);
-        match self.snapshot.get(&key.as_ref().into()) {
+        match self.snapshot.get(&key[..].into()) {
             Ok(val_ref) => {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
@@ -284,21 +284,20 @@ impl<P: KeyTrait> Transaction<P> {
     /// Commits transaction changes to the store index.
     fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
         let mut index = self.store.indexer.write();
-        let kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
+        let mut kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
 
-        index.bulk_insert(&kv_pairs)?;
+        index.bulk_insert(&mut kv_pairs)?;
         Ok(())
     }
 
-    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<P, Bytes>> {
-        let mut kv_pairs: Vec<KV<P, Bytes>> = Vec::new();
+    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VectorKey, Bytes>> {
+        let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
 
         for (_, entry) in self.write_set.iter() {
             let index_value = self.build_index_value(entry);
-            let key = entry.key[..].into();
 
             kv_pairs.push(KV {
-                key,
+                key: entry.key[..].into(),
                 value: index_value,
                 version: tx_id,
                 ts: commit_ts,
@@ -309,7 +308,7 @@ impl<P: KeyTrait> Transaction<P> {
     }
 
     fn build_index_value(&self, entry: &Entry) -> Bytes {
-        let index_value = ValueRef::<P>::encode(
+        let index_value = ValueRef::encode(
             &entry.key,
             &entry.value,
             entry.metadata.as_ref(),
@@ -335,7 +334,7 @@ impl<P: KeyTrait> Transaction<P> {
     }
 }
 
-impl<P: KeyTrait> Drop for Transaction<P> {
+impl Drop for Transaction {
     fn drop(&mut self) {
         let _ = self.rollback();
     }
@@ -346,7 +345,6 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
 
-    use crate::storage::index::VectorKey;
     use crate::storage::kv::entry::TxRecord;
     use crate::storage::kv::error::Error;
     use crate::storage::kv::option::Options;
@@ -372,7 +370,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new Core instance with VectorKey as the key type
-        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::new(opts).expect("should create store"));
 
         // Assert that the store is not closed
         assert!(!store.closed);
@@ -416,7 +414,7 @@ mod tests {
         // Create a new Core instance with VectorKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::new(opts).expect("should create store"));
 
         // Assert that the new store is not closed
         assert!(!store.closed);
@@ -435,7 +433,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
+        let store = Arc::new(Core::new(opts).expect("should create store"));
         assert!(!store.closed);
 
         let key1 = Bytes::from("key1");
