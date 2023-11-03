@@ -214,6 +214,13 @@ impl VectorKey {
         &self.data
     }
 
+    pub fn terminate(&self) -> Self {
+        let mut data = Vec::with_capacity(self.data.len() + 1);
+        data.extend_from_slice(&self.data);
+        data.push(0);
+        Self { data }
+    }
+
     pub fn from_string(s: &String) -> Self {
         let mut data = Vec::with_capacity(s.len() + 1);
         data.extend_from_slice(s.as_bytes());
