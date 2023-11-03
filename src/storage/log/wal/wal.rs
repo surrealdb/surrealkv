@@ -3,7 +3,8 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use crate::storage::log::wal::reader::Reader;
 use crate::storage::log::{
@@ -124,7 +125,7 @@ impl WAL {
             )));
         }
 
-        let _lock = self.mutex.write().unwrap();
+        let _lock = self.mutex.write();
 
         // Get options and initialize variables
         let opts = &self.opts;
@@ -215,20 +216,20 @@ impl WAL {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let _lock = self.mutex.write().unwrap();
+        let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        let _lock = self.mutex.write().unwrap();
+        let _lock = self.mutex.write();
         self.active_segment.sync()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> u64 {
-        let _lock = self.mutex.read().unwrap();
+        let _lock = self.mutex.read();
         self.active_segment.offset()
     }
 
