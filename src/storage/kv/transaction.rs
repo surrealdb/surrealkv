@@ -14,7 +14,7 @@ use crate::storage::kv::entry::{
 };
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::Snapshot;
-use crate::storage::kv::util::current_timestamp;
+use crate::storage::kv::util::now;
 
 /// An MVCC transaction mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,7 +265,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
 
     /// Assigns commit timestamps to transaction entries.
     fn assign_commit_ts(&mut self) -> u64 {
-        let commit_ts = current_timestamp();
+        let commit_ts = now();
         self.write_set.iter_mut().for_each(|(_, entry)| {
             entry.ts = commit_ts; // this should be time.now(), not txID
         });
@@ -362,14 +362,21 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction() {
+    fn test_basic_transaction() {
+        // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
+        // Create a new Core instance with VectorKey as the key type
         let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
+
+        // Assert that the store is not closed
         assert_eq!(store.closed, false);
 
+        // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
         let key1_clone = key1.clone();
         let key2 = Bytes::from("foo2");
@@ -378,40 +385,49 @@ mod tests {
         let value2 = Bytes::from("bar");
         let value2_clone = value2.clone();
 
+        // Start a new read-write transaction (txn1)
         let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
         txn1.set(&key1_clone, value1.clone()).unwrap();
         txn1.set(&key2_clone, value1).unwrap();
         txn1.commit().unwrap();
 
+        // Start another read-write transaction (txn2)
         let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
         txn2.set(&key1_clone, value2.clone()).unwrap();
         txn2.set(&key2_clone, value2).unwrap();
         txn2.commit().unwrap();
 
+        // Open an AOL (Append-Only Log) from the temporary directory
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
-        println!("offset: {:?}", a.offset());
 
+        // Create a reader for the AOL
         let r = Reader::new_from(a, 0, 100).unwrap();
         let mut txr = TxReader::new(r).unwrap();
 
-        let mut tx = TxRecord::new(2);
-        for _ in 0..2 {
+        // Read and assert the two transaction records from the reader
+        for i in 1..3 {
+            let mut tx = TxRecord::new(2);
             txr.read_into(&mut tx).unwrap();
-            println!("tx: {:?}", tx);
+            assert_eq!(tx.header.id, i);
+            assert_eq!(tx.entries.len(), 2);
         }
 
+        // Drop the store to simulate closing it
         drop(store);
 
-        println!("restarting----------------------->");
+        // Create a new Core instance with VectorKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
         let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
+
+        // Assert that the new store is not closed
         assert_eq!(store.closed, false);
 
-        // TODO: fix valueref decode
-
+        // Start a read-only transaction (txn3)
         let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
         let val = txn3.get(&key1_clone).unwrap();
+
+        // Assert that the value retrieved in txn3 matches value2_clone
         assert_eq!(val.value.unwrap().as_ref(), value2_clone.as_ref());
     }
 
