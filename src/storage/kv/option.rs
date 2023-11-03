@@ -11,6 +11,7 @@ pub struct Options {
     // Usually modified options.
     pub sync_writes: bool,           // Whether to perform fsync after writes.
     pub num_versions_to_keep: usize, // Maximum versions to keep per key.
+    pub isolation_level: IsolationLevel, // Isolation level for transactions.
 
     // Fine tuning options.
     pub max_tx_entries: usize,
@@ -45,6 +46,7 @@ impl Default for Options {
             wal_disabled: false,
             max_tx_entries: 1 << 10,
             max_value_threshold: 64, // 64 bytes
+            isolation_level: IsolationLevel::SnapshotIsolation,
         }
     }
 }
@@ -59,16 +61,6 @@ impl Options {
         let u16_size = std::mem::size_of::<u16>();
         let u32_size = std::mem::size_of::<u32>();
         let u64_size = std::mem::size_of::<u64>();
-
-        // fn max_tx_size(max_tx_entries: usize, max_key_len: usize, max_tx_metadata_len: usize, max_kv_metadata_len: usize) -> usize {
-        //      let u16_size = std::mem::size_of::<u16>();
-        //      let u32_size = std::mem::size_of::<u32>();
-        //      let u64_size = std::mem::size_of::<u64>();
-        // }
-        //
-        // tx_id + ts + version + tx_md_len + max_tx_md_len + entries_size + max_tx_entries * (kv_md_len + max_kv_md_len + key_len + max_key_len + value_len + value_offset_size)
-        // u64_size + u64_size + u16_size + u16_size + max_tx_metadata_len + u32_size +
-        //    max_tx_entries * (u16_size + max_kv_metadata_len + u16_size + max_key_len + u32_size + u64_size)
 
         // tx_id + ts + version + tx_md_len + max_tx_md_len + entries_size + max_tx_entries * (kv_md_len + max_kv_md_len + key_len + max_key_len + value_len + value_offset_size)
         u64_size
@@ -85,4 +77,10 @@ impl Options {
                     + u32_size
                     + u64_size)
     }
+}
+
+#[derive(Clone)]
+pub enum IsolationLevel {
+    SnapshotIsolation = 1,
+    SerializableSnapshotIsolation = 2,
 }
