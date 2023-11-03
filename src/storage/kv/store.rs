@@ -5,7 +5,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 
 use crate::storage::index::art::KV;
-use crate::storage::index::KeyTrait;
+use crate::storage::index::VectorKey;
 use crate::storage::kv::entry::{TxRecord, ValueRef};
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::indexer::Indexer;
@@ -19,37 +19,37 @@ use crate::storage::log::Error as LogError;
 use crate::storage::log::{Options as LogOptions, BLOCK_SIZE};
 
 /// An MVCC-based transactional key-value store.
-pub struct Store<P: KeyTrait> {
-    pub(crate) core: Arc<Core<P>>,
+pub struct Store {
+    pub(crate) core: Arc<Core>,
 }
 
-impl<P: KeyTrait> Store<P> {
+impl Store {
     /// Creates a new MVCC key-value store with the given key-value store for storage.
     pub fn new(opts: Options) -> Result<Self> {
         let core = Arc::new(Core::new(opts)?);
         Ok(Self { core })
     }
 
-    pub fn begin(self: &Arc<Self>) -> Result<Transaction<P>> {
+    pub fn begin(self: &Arc<Self>) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn begin_with_mode(self: &Arc<Self>, mode: Mode) -> Result<Transaction<P>> {
+    pub fn begin_with_mode(self: &Arc<Self>, mode: Mode) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn view(self: Arc<Self>, f: impl FnOnce(&mut Transaction<P>) -> Result<()>) -> Result<()> {
+    pub fn view(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
 
         Ok(())
     }
 
-    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction<P>) -> Result<()>) -> Result<()> {
+    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
         txn.commit()?;
@@ -62,9 +62,9 @@ impl<P: KeyTrait> Store<P> {
     }
 }
 
-pub struct Core<P: KeyTrait> {
+pub struct Core {
     /// Index for store.
-    pub(crate) indexer: RwLock<Indexer<P>>,
+    pub(crate) indexer: RwLock<Indexer>,
     /// Options for store.
     pub(crate) opts: Options,
     /// WAL for store.
@@ -72,15 +72,12 @@ pub struct Core<P: KeyTrait> {
     /// Transaction log for store.
     pub(crate) tlog: Arc<RwLock<AOL>>,
     /// Transaction ID Oracle for store.
-    pub(crate) oracle: Arc<Oracle<P>>,
+    pub(crate) oracle: Arc<Oracle>,
     /// Flag to indicate if store is closed.
     pub(crate) closed: bool,
 }
 
-impl<P> Core<P>
-where
-    P: KeyTrait,
-{
+impl Core {
     pub fn new(opts: Options) -> Result<Self> {
         let topts = LogOptions::default();
 
@@ -104,7 +101,7 @@ where
         })
     }
 
-    fn load_index(opts: &Options, indexer: &mut Indexer<P>) -> Result<()> {
+    fn load_index(opts: &Options, indexer: &mut Indexer) -> Result<()> {
         let tlog = AOL::open(&opts.dir, &LogOptions::default())?;
         let reader = Reader::new_from(tlog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
@@ -140,12 +137,12 @@ where
         tx: &TxRecord,
         opts: &Options,
         value_offsets: &HashMap<Bytes, usize>,
-        indexer: &mut Indexer<P>,
+        indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<P, Bytes>> = Vec::new();
+        let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
 
         for entry in &tx.entries {
-            let index_value = ValueRef::<P>::encode(
+            let index_value = ValueRef::encode(
                 &entry.key,
                 &entry.value,
                 entry.metadata.as_ref(),
@@ -161,20 +158,19 @@ where
             });
         }
 
-        indexer.bulk_insert(&kv_pairs)
+        indexer.bulk_insert(&mut kv_pairs)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
 
     #[test]
     fn test_new_store() {
         let opts = Options::new();
-        let store = Store::<VectorKey>::new(opts).expect("should create store");
+        let store = Store::new(opts).expect("should create store");
         assert!(!store.closed());
     }
 }

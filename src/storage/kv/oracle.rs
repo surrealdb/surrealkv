@@ -12,18 +12,17 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::index::art::TrieError;
-use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::option::Options;
 use crate::storage::kv::snapshot::Snapshot;
 use crate::storage::kv::transaction::Transaction;
 
-pub(crate) struct Oracle<P: KeyTrait> {
+pub(crate) struct Oracle {
     pub(crate) write_lock: Mutex<()>,
-    isolation: IsolationLevel<P>,
+    isolation: IsolationLevel,
 }
 
-impl<P: KeyTrait> Oracle<P> {
+impl Oracle {
     pub(crate) fn new(opts: &Options) -> Self {
         let isolation = match opts.isolation_level {
             crate::storage::kv::option::IsolationLevel::SnapshotIsolation => {
@@ -40,7 +39,7 @@ impl<P: KeyTrait> Oracle<P> {
         }
     }
 
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         self.isolation.new_commit_ts(txn)
     }
 
@@ -63,13 +62,13 @@ impl<P: KeyTrait> Oracle<P> {
     }
 }
 
-pub(crate) enum IsolationLevel<P: KeyTrait> {
-    SnapshotIsolation(SnapshotIsolation<P>),
-    SerializableSnapshotIsolation(SerializableSnapshotIsolation<P>),
+pub(crate) enum IsolationLevel {
+    SnapshotIsolation(SnapshotIsolation),
+    SerializableSnapshotIsolation(SerializableSnapshotIsolation),
 }
 
-impl<P: KeyTrait> IsolationLevel<P> {
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
+impl IsolationLevel {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         match self {
             IsolationLevel::SnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
             IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
@@ -98,16 +97,14 @@ impl<P: KeyTrait> IsolationLevel<P> {
     }
 }
 
-pub(crate) struct SnapshotIsolation<P: KeyTrait> {
+pub(crate) struct SnapshotIsolation {
     next_tx_id: AtomicU64,
-    _phantom: std::marker::PhantomData<P>,
 }
 
-impl<P: KeyTrait> SnapshotIsolation<P> {
+impl SnapshotIsolation {
     pub(crate) fn new() -> Self {
         Self {
             next_tx_id: AtomicU64::new(0),
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -115,7 +112,7 @@ impl<P: KeyTrait> SnapshotIsolation<P> {
         self.next_tx_id.store(ts, Ordering::SeqCst);
     }
 
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         // This is the scenario of snapshot isolation where the transaction is in read-write mode.
         // Currently, only optimistic concurrency control (OCC) is supported.
         // TODO: add support for pessimistic concurrency control (serializable snapshot isolation)
@@ -177,20 +174,18 @@ struct CommitMarker {
 }
 
 #[derive(Default)]
-struct CommitTracker<P: KeyTrait> {
+struct CommitTracker {
     next_ts: u64,
     committed_transactions: Vec<CommitMarker>,
     last_cleanup_ts: u64,
-    _phantom: std::marker::PhantomData<P>,
 }
 
-impl<P: KeyTrait> CommitTracker<P> {
+impl CommitTracker {
     fn new() -> Self {
         Self {
             next_ts: 0,
             committed_transactions: Vec::new(),
             last_cleanup_ts: 0,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -211,7 +206,7 @@ impl<P: KeyTrait> CommitTracker<P> {
             .retain(|txn| txn.ts > max_read_ts);
     }
 
-    fn has_conflict(&self, txn: &Transaction<P>) -> bool {
+    fn has_conflict(&self, txn: &Transaction) -> bool {
         // Acquire a lock on the read set.
         let read_set = txn.read_set.lock();
 
@@ -259,9 +254,9 @@ impl<P: KeyTrait> CommitTracker<P> {
 /// - `read_mark` is another watermark that marks the visibility of read operations to other transactions.
 ///
 /// The serializable snapshot isolation (SSI) algorithm implemented here is inspired from BadgerDB.
-pub(crate) struct SerializableSnapshotIsolation<P: KeyTrait> {
+pub(crate) struct SerializableSnapshotIsolation {
     // The `commit_tracker` keeps track of committed transactions and their timestamps.
-    commit_tracker: Mutex<CommitTracker<P>>,
+    commit_tracker: Mutex<CommitTracker>,
 
     // The `txn_mark` and `read_mark` are used to manage visibility of transactions.
     // `txn_mark` blocks `new_transaction` to ensure previous commits are visible to new reads.
@@ -270,7 +265,7 @@ pub(crate) struct SerializableSnapshotIsolation<P: KeyTrait> {
     read_mark: Arc<WaterMark>,
 }
 
-impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
+impl SerializableSnapshotIsolation {
     // Create a new instance of `SerializableSnapshotIsolation`.
     pub(crate) fn new() -> Self {
         Self {
@@ -293,7 +288,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
     }
 
     // Generate a new commit timestamp for a transaction.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         let mut commit_tracker = self.commit_tracker.lock();
 
         // Check for conflicts between the transaction and committed transactions.

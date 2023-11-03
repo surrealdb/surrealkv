@@ -3,30 +3,30 @@ use bytes::Bytes;
 use crate::storage::index::art::Tree as tart;
 use crate::storage::index::art::KV;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
-use crate::storage::index::KeyTrait;
+use crate::storage::index::VectorKey;
 use crate::storage::kv::error::Result;
 
-pub(crate) struct Indexer<P: KeyTrait> {
-    pub(crate) index: tart<P, Bytes>,
+pub(crate) struct Indexer {
+    pub(crate) index: tart<VectorKey, Bytes>,
 }
 
-impl<P: KeyTrait> Indexer<P> {
+impl Indexer {
     pub(crate) fn new() -> Self {
         Self { index: tart::new() }
     }
 
-    pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<P, Bytes>> {
+    pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<VectorKey, Bytes>> {
         let snapshot = self.index.create_snapshot()?;
         Ok(snapshot)
     }
 
-    /// Set a key-value pair into the snapshot.
-    pub fn insert(&mut self, key: &P, value: Bytes, version: u64, ts: u64) -> Result<()> {
-        self.index.insert(key, value, version, ts)?;
-        Ok(())
-    }
-
-    pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, Bytes>]) -> Result<()> {
+    pub fn bulk_insert(&mut self, kv_pairs: &mut [KV<VectorKey, Bytes>]) -> Result<()> {
+        // TODO: need to fix this to avoid cloning the key
+        // This happens because the VectorKey transfrom from
+        // a &[u8] does not terminate the key with a null byte.
+        kv_pairs.iter_mut().for_each(|kv| {
+            kv.key = kv.key.terminate();
+        });
         self.index.bulk_insert(kv_pairs)?;
         Ok(())
     }

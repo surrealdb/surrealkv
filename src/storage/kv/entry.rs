@@ -285,7 +285,7 @@ impl TxRecordEntry {
 }
 
 /// Value reference implementation.
-pub struct ValueRef<P: KeyTrait> {
+pub struct ValueRef {
     pub(crate) version: u8,
     pub(crate) flag: u8,
     pub(crate) ts: u64,
@@ -294,10 +294,10 @@ pub struct ValueRef<P: KeyTrait> {
     pub(crate) value: Option<Bytes>,
     pub(crate) key_value_metadata: Option<Metadata>,
     /// The underlying store for the transaction.
-    store: Arc<Core<P>>,
+    store: Arc<Core>,
 }
 
-impl<P: KeyTrait> ValueRef<P> {
+impl ValueRef {
     fn resolve(&self) -> Result<Vec<u8>> {
         // Implement the resolve functionality.
         unimplemented!("resolve");
@@ -316,8 +316,8 @@ impl<P: KeyTrait> ValueRef<P> {
     }
 }
 
-impl<P: KeyTrait> ValueRef<P> {
-    pub(crate) fn new(store: Arc<Core<P>>) -> Self {
+impl ValueRef {
+    pub(crate) fn new(store: Arc<Core>) -> Self {
         ValueRef {
             version: 0,
             ts: 0,
@@ -420,7 +420,6 @@ impl<P: KeyTrait> ValueRef<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::index::VectorKey;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Core;
 
@@ -428,7 +427,7 @@ mod tests {
     fn test_encode_decode() {
         // Create a sample valueRef instance
         let opts = Options::new();
-        let store = Arc::new(Core::<VectorKey>::new(opts).expect("failed to create store"));
+        let store = Arc::new(Core::new(opts).expect("failed to create store"));
 
         let mut txmd = Metadata::new();
         txmd.as_deleted(true).expect("failed to set deleted");
