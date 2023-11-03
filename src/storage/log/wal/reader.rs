@@ -107,7 +107,7 @@ impl Reader {
                     offset,
                 ));
                 self.err = Some(err.clone());
-                return Err(err.clone());
+                return Err(err);
             }
         }
         Ok((&self.rec, self.rdr.current_offset() as u64))

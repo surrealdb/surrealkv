@@ -64,7 +64,7 @@ impl WAL {
             active_segment,
             active_segment_id,
             dir: dir.to_path_buf(),
-            opts: opts.clone(),
+            opts,
             closed: false,
             mutex: RwLock::new(()),
         })
@@ -128,7 +128,6 @@ impl WAL {
 
         // Get options and initialize variables
         let opts = &self.opts;
-        let mut offset = 0;
 
         // Calculate available space in the active segment
         let available = opts.max_file_size - self.active_segment.offset();
@@ -151,7 +150,7 @@ impl WAL {
         }
 
         let (off, _) = self.active_segment.append(rec)?;
-        offset = off + self.calculate_offset();
+        let offset = off + self.calculate_offset();
 
         Ok((offset, rec.len() + WAL_RECORD_HEADER_SIZE))
     }

@@ -123,8 +123,8 @@ where
                 }
             }
 
-            let (tx_offset, value_offsets) = res.unwrap();
-            Core::process_entries(&tx, &opts, &value_offsets, indexer)?;
+            let (_tx_offset, value_offsets) = res.unwrap();
+            Core::process_entries(&tx, opts, &value_offsets, indexer)?;
         }
 
         Ok(())
@@ -149,7 +149,7 @@ where
 
             kv_pairs.push(KV {
                 key: entry.key[..].into(),
-                value: index_value.into(),
+                value: index_value,
                 version: tx.header.id,
                 ts: tx.header.ts,
             });
@@ -169,6 +169,6 @@ mod tests {
     fn test_new_store() {
         let opts = Options::new();
         let store = MVCCStore::<VectorKey>::new(opts).expect("should create store");
-        assert_eq!(store.closed(), false);
+        assert!(!store.closed());
     }
 }

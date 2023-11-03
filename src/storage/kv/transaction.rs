@@ -93,7 +93,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         let snapshot = Snapshot::take(store.clone(), read_ts)?;
 
         Ok(Self {
-            read_ts: read_ts,
+            read_ts,
             mode,
             snapshot,
             buf: BytesMut::new(),
@@ -151,23 +151,19 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
                 match &e {
                     // Handle specific error cases.
                     Error::Index(trie_error) => {
-                        match trie_error {
-                            // Handle the case where the key is not found.
-                            TrieError::KeyNotFound => {
-                                // If the transaction is not read-only, add the key to the read set.
-                                // In snapshot isolation mode, this key could be added by another transaction,
-                                // and keeping track of this key helps detect conflicts.
-                                if !self.mode.is_read_only() {
-                                    self.read_set.lock()?.push((key, 0));
-                                }
+                        if let TrieError::KeyNotFound = trie_error {
+                            // If the transaction is not read-only, add the key to the read set.
+                            // In snapshot isolation mode, this key could be added by another transaction,
+                            // and keeping track of this key helps detect conflicts.
+                            if !self.mode.is_read_only() {
+                                self.read_set.lock()?.push((key, 0));
                             }
-                            _ => {}
                         }
-                        return Err(e);
+                        Err(e)
                     }
                     _ => {
                         // Handle other error cases.
-                        return Err(e);
+                        Err(e)
                     }
                 }
             }
@@ -197,12 +193,11 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
             let indexed_value: Vec<u8> =
                 vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
             let indexed_value_bytes = Bytes::from(indexed_value);
-            self.snapshot
-                .set(&e.key[..].into(), indexed_value_bytes.into())?;
+            self.snapshot.set(&e.key[..].into(), indexed_value_bytes)?;
         }
 
         // Add the entry to pending writes
-        self.write_set.insert(&e.key, e);
+        self.write_set.insert(e.key, e);
 
         Ok(())
     }
@@ -273,18 +268,18 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
     }
 
     /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<(u64)> {
+    fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
         let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
         tx_record.encode(&mut self.buf, &mut self.committed_values_offsets)?;
 
         let mut tlog = self.store.tlog.write()?;
-        let (tx_offset, _) = tlog.append(&self.buf.as_ref())?;
+        let (tx_offset, _) = tlog.append(self.buf.as_ref())?;
         Ok(tx_offset)
     }
 
     /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64, tx_offset: u64) -> Result<()> {
+    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64, _tx_offset: u64) -> Result<()> {
         let mut index = self.store.indexer.write()?;
         let kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
 
@@ -301,7 +296,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
 
             kv_pairs.push(KV {
                 key,
-                value: index_value.into(),
+                value: index_value,
                 version: tx_id,
                 ts: commit_ts,
             });
@@ -374,13 +369,13 @@ mod tests {
         let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
 
         // Assert that the store is not closed
-        assert_eq!(store.closed, false);
+        assert!(!store.closed);
 
         // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
-        let key1_clone = key1.clone();
+        let key1_clone = key1;
         let key2 = Bytes::from("foo2");
-        let key2_clone = key2.clone();
+        let key2_clone = key2;
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
         let value2_clone = value2.clone();
@@ -421,10 +416,10 @@ mod tests {
         let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
 
         // Assert that the new store is not closed
-        assert_eq!(store.closed, false);
+        assert!(!store.closed);
 
         // Start a read-only transaction (txn3)
-        let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
+        let txn3 = Transaction::new(store, Mode::ReadOnly).unwrap();
         let val = txn3.get(&key1_clone).unwrap();
 
         // Assert that the value retrieved in txn3 matches value2_clone
@@ -438,12 +433,12 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         let store = Arc::new(Core::<VectorKey>::new(opts).expect("should create store"));
-        assert_eq!(store.closed, false);
+        assert!(!store.closed);
 
         let key1 = Bytes::from("key1");
-        let key1_clone = key1.clone();
+        let key1_clone = key1;
         let key2 = Bytes::from("key2");
-        let key2_clone = key2.clone();
+        let key2_clone = key2;
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
 
@@ -503,17 +498,17 @@ mod tests {
             let key = Bytes::from("key4");
 
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            txn1.set(&key, value1.clone()).unwrap();
+            txn1.set(&key, value1).unwrap();
             txn1.commit().unwrap();
 
             let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn3 = Transaction::new(store, Mode::ReadWrite).unwrap();
 
             txn2.delete(&key).unwrap();
             assert!(txn2.commit().is_ok());
 
             assert!(txn3.get(&key).is_ok());
-            txn3.set(&key, value2.clone()).unwrap();
+            txn3.set(&key, value2).unwrap();
             assert!(match txn3.commit() {
                 Err(err) => {
                     if let Error::TxnReadConflict = err {

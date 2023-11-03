@@ -1006,7 +1006,7 @@ impl Segment {
     }
 
     pub(crate) fn flush_block(&mut self, clear: bool) -> Result<()> {
-        let mut p = &mut self.block;
+        let p = &mut self.block;
         let clear = clear || p.is_full();
 
         // No more data will fit into the block. Clear it and write to disk.

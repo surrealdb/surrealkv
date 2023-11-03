@@ -89,7 +89,7 @@ where
     // schedule the task on the queue (this will now be processed by one of the threads in the queue even if we do not wait for it)
     runnable.schedule();
     // return the handle to the task to block a thread to wait for a result
-    return task;
+    task
 }
 
 /// This is a special function for sending a task to the commit pipeline. This is used for sending the commit task to the commit pipeline.
@@ -121,5 +121,5 @@ where
     let (runnable, task) = async_task::spawn(future, schedule);
 
     runnable.schedule();
-    return task;
+    task
 }

@@ -201,7 +201,7 @@ impl VectorKey {
         let mut data = Vec::with_capacity(src.len() + 1);
         data.extend_from_slice(src);
         data.push(0);
-        Self { data: data }
+        Self { data }
     }
 
     pub fn from_slice(src: &[u8]) -> Self {

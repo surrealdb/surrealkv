@@ -431,9 +431,8 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
             NodeType::Node1(n) => {
                 // Delete the child node from the Node1 instance and update the NodeType.
                 let node = NodeType::Node1(n.delete_child(key));
-                let mut new_node = Self { node_type: node };
 
-                new_node
+                Self { node_type: node }
             }
             NodeType::Node4(n) => {
                 // Delete the child node from the Node4 instance and update the NodeType.
@@ -954,9 +953,9 @@ pub struct KV<P, V> {
 impl<P: KeyTrait, V: Clone> KV<P, V> {
     pub fn new(key: P, value: V, version: u64, timestamp: u64) -> Self {
         KV {
-            key: key,
-            value: value,
-            version: version,
+            key,
+            value,
+            version,
             ts: timestamp,
         }
     }
@@ -1218,7 +1217,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         let new_snapshot_id = self.max_snapshot_id.fetch_add(1, Ordering::SeqCst);
         self.snapshots.insert(new_snapshot_id);
 
-        let root = self.root.as_ref().map_or(None, |root| Some(root.clone()));
+        let root = self.root.as_ref().cloned();
         let version = self.root.as_ref().map_or(1, |root| root.version() + 1);
         let new_snapshot = Snapshot::new(new_snapshot_id, root, version);
 
@@ -1383,20 +1382,20 @@ mod tests {
         if let Ok(words) = read_words_from_file(file_path) {
             // Insertion phase
             for word in &words {
-                let key = &VectorKey::from_str(&word);
+                let key = &VectorKey::from_str(word);
                 tree.insert(key, 1, 0, 0);
             }
 
             // Search phase
             for word in &words {
-                let key = VectorKey::from_str(&word);
+                let key = VectorKey::from_str(word);
                 let (_, val, _, _) = tree.get(&key, 0).unwrap();
                 assert_eq!(val, 1);
             }
 
             // Deletion phase
             for word in &words {
-                let key = VectorKey::from_str(&word);
+                let key = VectorKey::from_str(word);
                 assert!(tree.remove(&key).unwrap());
             }
         } else if let Err(err) = read_words_from_file(file_path) {
@@ -1796,7 +1795,7 @@ mod tests {
         let mut curr_version = 1;
         for kvt in &kvts {
             let key = VectorKey::from(kvt.k.clone());
-            let (_, val, version, ts) = tree.get(&key, 0).unwrap();
+            let (_, val, version, _ts) = tree.get(&key, 0).unwrap();
             assert_eq!(val, 1);
 
             if kvt.version == 0 {
@@ -1868,7 +1867,7 @@ mod tests {
         // Attempt update with non-increasing version for the second key
         assert!(tree.insert(&key2, 1, 11, 0).is_err());
         assert_eq!(initial_version_key2, tree.version());
-        let (_, val, version, ts) = tree.get(&key2, 0).unwrap();
+        let (_, val, version, _ts) = tree.get(&key2, 0).unwrap();
         assert_eq!(val, 1);
         assert_eq!(version, 15);
 
@@ -1981,11 +1980,11 @@ mod tests {
         let mut keys_inserted = BTreeMap::new();
 
         // Insertion and tracking of keys inserted
-        for i in 0..count {
+        for _i in 0..count {
             let random_val = rng.gen_range(0..count);
             let random_key: ArrayKey<16> = random_val.into();
 
-            if let Ok(_) = tree.get(&random_key, 0) {
+            if tree.get(&random_key, 0).is_ok() {
                 continue;
             }
 

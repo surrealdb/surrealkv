@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::storage::kv::entry::{TxRecordEntry, TxRecordHeader, MAX_TX_METADATA_SIZE};
+use crate::storage::kv::entry::{TxRecordEntry, MAX_TX_METADATA_SIZE};
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::log::aol::aol::AOL;
@@ -234,9 +234,9 @@ mod tests {
         let mut r = Reader::new_from(a, 0, 200000).unwrap();
 
         let mut bs = vec![0; 2];
-        let n = r.read(&mut bs).expect("should read");
+        let _n = r.read(&mut bs).expect("should read");
         println!("bs: {:?}", bs);
-        let n = r.read(&mut bs).expect("should read");
+        let _n = r.read(&mut bs).expect("should read");
         println!("bs: {:?}", bs);
         // assert_eq!(4, n);
         // assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
