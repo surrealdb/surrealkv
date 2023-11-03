@@ -34,7 +34,7 @@ pub(crate) fn terminate_with_null(key: &[u8]) -> Vec<u8> {
     }
 }
 
-pub(crate) fn current_timestamp() -> u64 {
+pub(crate) fn now() -> u64 {
     let utc_now = Utc::now();
     let timestamp = utc_now.timestamp_nanos_opt().unwrap();
     assert!(timestamp > 0);

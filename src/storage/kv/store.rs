@@ -90,8 +90,8 @@ where
             Core::load_index(&opts, &mut indexer)?;
         }
 
-        let oracle = Oracle::new();
-        oracle.set_txn_id(indexer.version());
+        let oracle = Oracle::new(&opts);
+        oracle.set_ts(indexer.version());
 
         Ok(Self {
             indexer: RwLock::new(indexer),
