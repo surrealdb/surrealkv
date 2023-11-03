@@ -119,6 +119,11 @@ impl TxRecord {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.header.reset();
+        self.entries.clear();
+    }
+
     pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
         let mut tx_record = TxRecord::new(entries.len());
         tx_record.header.id = tx_id;
@@ -203,9 +208,15 @@ impl TxRecordHeader {
             num_entries: 0,
         }
     }
-}
 
-impl TxRecordHeader {
+    pub(crate) fn reset(&mut self) {
+        self.id = 0;
+        self.ts = 0;
+        self.version = 0;
+        self.metadata = None;
+        self.num_entries = 0;
+    }
+
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
         let (md_len, md_bytes) = match &self.metadata {
             Some(metadata) => {

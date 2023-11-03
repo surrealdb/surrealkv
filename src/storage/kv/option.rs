@@ -20,7 +20,6 @@ pub struct Options {
     pub max_value_threshold: usize, // Threshold to decide value storage in LSM tree or log value files.
     pub value_log_file_size: u64,   // Maximum size of a single value log file segment.
     pub detect_conflicts: bool,     // Whether to check transactions for conflicts.
-    pub managed_txns: bool,         // Transaction timestamps managed by end-user.
     pub create_if_not_exists: bool, // Create the directory if the provided open path doesn't exist.
     pub max_batch_count: u64,       // Maximum entries in a batch.
     pub max_batch_size: u64,        // Maximum batch size in bytes.
@@ -39,7 +38,6 @@ impl Default for Options {
             max_value_size: 1024 * 1024,
             value_log_file_size: 1024 * 1024 * 1024,
             detect_conflicts: true,
-            managed_txns: true,
             create_if_not_exists: true,
             max_batch_count: 1000,
             max_batch_size: 4 * 1024 * 1024,
