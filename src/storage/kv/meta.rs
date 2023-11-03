@@ -14,7 +14,6 @@ impl Attribute {
     fn from_u8(value: u8) -> Option<Attribute> {
         match value {
             0 => Some(Attribute::Deleted),
-            // Add matching for other variants
             _ => None,
         }
     }
@@ -22,14 +21,12 @@ impl Attribute {
     fn kind(&self) -> u8 {
         match self {
             Attribute::Deleted => 0,
-            // Add matching for other variants
         }
     }
 
     fn serialize(&self) -> Bytes {
         match self {
             Attribute::Deleted => Bytes::new(),
-            // Add matching for other variants
         }
     }
 
@@ -38,12 +35,9 @@ impl Attribute {
             return Ok(Attribute::Deleted);
         }
 
-        let value = bytes[0];
+        let _value = bytes[0];
         *bytes = &bytes[1..]; // Consume the attribute byte
-        match value {
-            // Add matching for other variants
-            _ => Err(Error::UnknownAttributeType),
-        }
+        Err(Error::UnknownAttributeType)
     }
 }
 
@@ -82,7 +76,7 @@ impl Metadata {
         let mut buf = BytesMut::new();
 
         for attr in &self.attributes {
-            buf.extend_from_slice(&[attr.kind() as u8]);
+            buf.extend_from_slice(&[attr.kind()]);
             buf.extend_from_slice(&attr.serialize());
         }
 

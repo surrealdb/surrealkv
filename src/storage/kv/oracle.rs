@@ -418,9 +418,7 @@ impl WaterMark {
 
         if should_insert {
             let mut mark = self.mark.write().unwrap();
-            if !mark.waiters.contains_key(&t) {
-                mark.waiters.insert(t, Mark::new());
-            }
+            mark.waiters.entry(t).or_insert_with(Mark::new);
             drop(mark);
         }
 

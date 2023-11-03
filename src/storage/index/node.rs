@@ -754,7 +754,7 @@ mod tests {
         }
 
         // Additional test for adding and deleting children
-        let mut node = FlatNode::<ArrayKey<8>, usize, 4>::new(dummy_prefix.clone());
+        let mut node = FlatNode::<ArrayKey<8>, usize, 4>::new(dummy_prefix);
         node = node.add_child(1, 1);
         node = node.add_child(2, 2);
         node = node.add_child(3, 3);
@@ -1034,7 +1034,7 @@ mod tests {
     fn test_twig_insert() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
-        let node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
 
         let new_node = node.insert(42, 123, 0);
         assert_eq!(node.values.len(), 0);
@@ -1047,8 +1047,7 @@ mod tests {
     fn test_twig_insert_mut() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
-        let mut node =
-            TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
 
         node.insert_mut(42, 123, 0);
         assert_eq!(node.values.len(), 1);
@@ -1059,8 +1058,7 @@ mod tests {
     #[test]
     fn test_twig_get_latest_leaf() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
-        let mut node =
-            TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
         node.insert_mut(43, 124, 1);
         let latest_leaf = node.get_latest_leaf();
@@ -1070,8 +1068,7 @@ mod tests {
     #[test]
     fn test_twig_get_latest_value() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
-        let mut node =
-            TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
         node.insert_mut(43, 124, 1);
         let latest_value = node.get_latest_value();
@@ -1081,8 +1078,7 @@ mod tests {
     #[test]
     fn test_twig_get_leaf_by_version() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
-        let mut node =
-            TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
         node.insert_mut(43, 124, 1);
         let leaf_by_ts = node.get_leaf_by_version(123);
@@ -1094,8 +1090,7 @@ mod tests {
     #[test]
     fn test_twig_iter() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
-        let mut node =
-            TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix.clone());
+        let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
         node.insert_mut(43, 124, 1);
         let mut iter = node.iter();
@@ -1128,7 +1123,7 @@ mod tests {
         }
 
         // Create and test Node256
-        let mut n256 = Node256::new(dummy_prefix.clone());
+        let mut n256 = Node256::new(dummy_prefix);
         for i in 0..255 {
             n256 = n256.add_child(i, i);
         }

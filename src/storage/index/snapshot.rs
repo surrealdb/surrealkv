@@ -23,8 +23,8 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     pub(crate) fn new(id: u64, root: Option<Rc<Node<P, V>>>, ts: u64) -> Self {
         Snapshot {
             id,
-            ts: ts,
-            root: root,
+            ts,
+            root,
             readers: HashSet::new(),
             max_active_readers: AtomicU64::new(0),
             closed: false,
