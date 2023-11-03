@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 
 use crate::storage::index::art::KV;
 use crate::storage::index::KeyTrait;

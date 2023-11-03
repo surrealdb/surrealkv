@@ -3,12 +3,13 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc,
     },
 };
 
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use parking_lot::{Mutex, RwLock};
 
 use crate::storage::index::art::TrieError;
 use crate::storage::index::KeyTrait;
@@ -127,7 +128,7 @@ impl<P: KeyTrait> SnapshotIsolation<P> {
         //      4. If the read keys are not valid, then there is a conflict
         //
         let current_snapshot = Snapshot::take(txn.store.clone(), self.read_ts())?;
-        let read_set = txn.read_set.lock()?;
+        let read_set = txn.read_set.lock();
 
         for (key, ts) in read_set.iter() {
             match current_snapshot.get(&key[..].into()) {
@@ -212,7 +213,7 @@ impl<P: KeyTrait> CommitTracker<P> {
 
     fn has_conflict(&self, txn: &Transaction<P>) -> bool {
         // Acquire a lock on the read set.
-        let read_set = txn.read_set.lock().unwrap();
+        let read_set = txn.read_set.lock();
 
         // If the read set is empty, there are no conflicts.
         if read_set.is_empty() {
@@ -283,7 +284,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
 
     // Retrieve the read timestamp for a new read operation.
     pub(crate) fn read_ts(&self) -> u64 {
-        let commit_tracker = self.commit_tracker.lock().unwrap();
+        let commit_tracker = self.commit_tracker.lock();
         let read_ts = commit_tracker.next_ts - 1;
 
         // Wait for the current read timestamp to be visible to new transactions.
@@ -293,7 +294,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
 
     // Generate a new commit timestamp for a transaction.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction<P>) -> Result<u64> {
-        let mut commit_tracker = self.commit_tracker.lock().unwrap();
+        let mut commit_tracker = self.commit_tracker.lock();
 
         // Check for conflicts between the transaction and committed transactions.
         if commit_tracker.has_conflict(txn) {
@@ -325,7 +326,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
 
     // Set the global timestamp for the system.
     pub(crate) fn set_ts(&self, ts: u64) {
-        self.commit_tracker.lock().unwrap().next_ts = ts;
+        self.commit_tracker.lock().next_ts = ts;
 
         // Mark that read operations are done up to the given timestamp.
         self.txn_mark.done_upto(ts);
@@ -336,7 +337,7 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
 
     // Increment the global timestamp for the system.
     pub(crate) fn increment_ts(&self) {
-        let mut commit_info = self.commit_tracker.lock().unwrap();
+        let mut commit_info = self.commit_tracker.lock();
         commit_info.next_ts += 1;
     }
 }
@@ -376,7 +377,7 @@ impl Mark {
     }
 
     fn take(&self) -> Sender<()> {
-        self.ch.lock().unwrap().take().unwrap()
+        self.ch.lock().take().unwrap()
     }
 }
 
@@ -390,7 +391,7 @@ impl WaterMark {
 
     /// Marks transactions as done up to the specified timestamp.
     fn done_upto(&self, t: u64) {
-        let mut mark = self.mark.write().unwrap();
+        let mut mark = self.mark.write();
 
         let done_upto = mark.done_upto;
         if done_upto >= t {
@@ -409,7 +410,7 @@ impl WaterMark {
 
     /// Waits for transactions to be done up to the specified timestamp.
     fn wait_for(&self, t: u64) {
-        let mark = self.mark.read().unwrap();
+        let mark = self.mark.read();
         if mark.done_upto >= t {
             return;
         }
@@ -417,12 +418,12 @@ impl WaterMark {
         drop(mark);
 
         if should_insert {
-            let mut mark = self.mark.write().unwrap();
+            let mut mark = self.mark.write();
             mark.waiters.entry(t).or_insert_with(Mark::new);
             drop(mark);
         }
 
-        let mark = self.mark.read().unwrap(); // Re-acquire the read lock.
+        let mark = self.mark.read(); // Re-acquire the read lock.
         let wp = mark.waiters.get(&t).unwrap().clone();
         drop(mark);
         matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
@@ -430,7 +431,7 @@ impl WaterMark {
 
     /// Gets the highest completed timestamp.
     fn done_until(&self) -> u64 {
-        let mark = self.mark.read().unwrap();
+        let mark = self.mark.read();
         mark.done_upto
     }
 }
