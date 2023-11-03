@@ -4,9 +4,9 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
 
 use lru::LruCache;
+use parking_lot::RwLock;
 use std::num::NonZeroUsize;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
@@ -128,7 +128,7 @@ impl AOL {
             return Err(Error::EmptyBuffer);
         }
 
-        let _lock = self.mutex.write()?;
+        let _lock = self.mutex.write();
 
         // Get options and initialize variables
         let opts = &self.opts;
@@ -163,7 +163,7 @@ impl AOL {
                 let previous_segment = mem::replace(&mut self.current_write_segment, new_segment);
 
                 // Cache the previous segment
-                let mut cache = self.segment_cache.write()?;
+                let mut cache = self.segment_cache.write();
                 cache.put(previous_segment_id, previous_segment);
             }
 
@@ -213,7 +213,7 @@ impl AOL {
             )));
         }
 
-        let _lock = self.mutex.read()?;
+        let _lock = self.mutex.read();
 
         let mut r = 0;
         while r < buf.len() {
@@ -237,7 +237,7 @@ impl AOL {
     ) -> Result<usize> {
         // During read, we acquire a lock to not allow concurrent writes and reads
         // to the active segment file to avoid seek errors.
-        let mut cache = self.segment_cache.write()?;
+        let mut cache = self.segment_cache.write();
         let reader = cache.get(&segment_id);
         if reader.is_none() {
             let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
@@ -251,25 +251,25 @@ impl AOL {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let _lock = self.mutex.write()?;
+        let _lock = self.mutex.write();
         self.current_write_segment.close()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        let _lock = self.mutex.write()?;
+        let _lock = self.mutex.write();
         self.current_write_segment.sync()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
-        let _lock = self.mutex.read()?;
+        let _lock = self.mutex.read();
         Ok(self.current_write_segment.offset())
     }
 
     pub fn size(&self) -> Result<u64> {
-        let _lock = self.mutex.read()?;
+        let _lock = self.mutex.read();
         let cur_segment_size = self.current_write_segment.file_offset;
         let total_size =
             (self.current_write_segment_id * self.opts.max_file_size) + cur_segment_size;

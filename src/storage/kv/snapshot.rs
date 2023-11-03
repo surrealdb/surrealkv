@@ -21,7 +21,7 @@ pub(crate) struct Snapshot<P: KeyTrait> {
 
 impl<P: KeyTrait> Snapshot<P> {
     pub(crate) fn take(store: Arc<Core<P>>, ts: u64) -> Result<Self> {
-        let snapshot = store.indexer.write()?.snapshot()?;
+        let snapshot = store.indexer.write().snapshot()?;
 
         Ok(Self {
             ts,

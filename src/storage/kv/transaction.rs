@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -142,7 +143,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
                 if !self.mode.is_read_only() && val_ref.ts > 0 {
-                    self.read_set.lock()?.push((key, val_ref.ts));
+                    self.read_set.lock().push((key, val_ref.ts));
                 }
 
                 Ok(val_ref)
@@ -156,7 +157,7 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
                             // In snapshot isolation mode, this key could be added by another transaction,
                             // and keeping track of this key helps detect conflicts.
                             if !self.mode.is_read_only() {
-                                self.read_set.lock()?.push((key, 0));
+                                self.read_set.lock().push((key, 0));
                             }
                         }
                         Err(e)
@@ -228,16 +229,16 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         // TODO: Use a commit pipeline to avoid blocking calls.
         // Lock the oracle to serialize commits to the transaction log.
         let oracle = self.store.oracle.clone();
-        let _lock = oracle.write_lock.lock()?;
+        let _lock = oracle.write_lock.lock();
 
         // Prepare for the commit
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
         // Add transaction records to the log
-        let tx_offset = self.add_to_transaction_log(tx_id, commit_ts)?;
+        self.add_to_transaction_log(tx_id, commit_ts)?;
 
         // Commit to the store index
-        self.commit_to_index(tx_id, commit_ts, tx_offset)?;
+        self.commit_to_index(tx_id, commit_ts)?;
 
         oracle.committed_upto(tx_id);
 
@@ -273,14 +274,14 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
         tx_record.encode(&mut self.buf, &mut self.committed_values_offsets)?;
 
-        let mut tlog = self.store.tlog.write()?;
+        let mut tlog = self.store.tlog.write();
         let (tx_offset, _) = tlog.append(self.buf.as_ref())?;
         Ok(tx_offset)
     }
 
     /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64, _tx_offset: u64) -> Result<()> {
-        let mut index = self.store.indexer.write()?;
+    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
+        let mut index = self.store.indexer.write();
         let kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
 
         index.bulk_insert(&kv_pairs)?;
@@ -323,7 +324,10 @@ impl<'a, P: KeyTrait> Transaction<'a, P> {
         }
 
         self.closed = true;
+        self.committed_values_offsets.clear();
+        self.buf.clear();
         self.write_set.clear();
+        self.read_set.lock().clear();
 
         Ok(())
     }
