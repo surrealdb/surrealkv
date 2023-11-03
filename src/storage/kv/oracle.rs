@@ -1,10 +1,9 @@
 use std::{
-    cell::{Cell, RefCell},
     collections::HashMap,
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -276,9 +275,9 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
         Self {
             commit_tracker: Mutex::new(CommitTracker::new()),
             // Create a watermark for transactions.
-            txn_mark: Arc::new(WaterMark::new(0)),
+            txn_mark: Arc::new(WaterMark::new()),
             // Create a watermark for read operations.
-            read_mark: Arc::new(WaterMark::new(0)),
+            read_mark: Arc::new(WaterMark::new()),
         }
     }
 
@@ -344,88 +343,132 @@ impl<P: KeyTrait> SerializableSnapshotIsolation<P> {
 
 /// `WaterMark` is a synchronization mechanism for managing transaction timestamps.
 struct WaterMark {
-    done_upto: Cell<u64>,                 // The highest completed timestamp.
-    mutex: Mutex<()>,                     // Mutex for synchronizing access to the watermark.
-    waiters: RefCell<HashMap<u64, Mark>>, // Keeps track of waiters for specific timestamps.
+    mark: RwLock<WaterMarkState>, // Keeps track of waiters for specific timestamps.
+}
+
+struct WaterMarkState {
+    done_upto: u64,
+    waiters: HashMap<u64, Arc<Mark>>,
+}
+
+impl WaterMarkState {
+    fn new() -> Self {
+        Self {
+            done_upto: 0,
+            waiters: HashMap::new(),
+        }
+    }
 }
 
 /// Represents a waiter for a specific timestamp.
 struct Mark {
-    ch: Option<Sender<()>>, // Sender for notifying the waiter.
-    closer: Receiver<()>,   // Receiver for detecting closure.
+    ch: Mutex<Option<Sender<()>>>, // Sender for notifying the waiter.
+    closer: Receiver<()>,          // Receiver for detecting closure.
+}
+
+impl Mark {
+    fn new() -> Arc<Self> {
+        let (tx, rx) = bounded(1);
+        Arc::new(Self {
+            ch: Mutex::new(Some(tx)),
+            closer: rx,
+        })
+    }
+
+    fn take(&self) -> Sender<()> {
+        self.ch.lock().unwrap().take().unwrap()
+    }
 }
 
 impl WaterMark {
     /// Creates a new `WaterMark` with the given initial done timestamp.
-    fn new(done_upto: u64) -> Self {
+    fn new() -> Self {
         WaterMark {
-            waiters: RefCell::new(HashMap::new()),
-            done_upto: Cell::new(done_upto),
-            mutex: Mutex::new(()),
+            mark: RwLock::new(WaterMarkState::new()),
         }
     }
 
     /// Marks transactions as done up to the specified timestamp.
     fn done_upto(&self, t: u64) {
-        let mut _guard = self.mutex.lock().unwrap();
+        let mut mark = self.mark.write().unwrap();
 
-        let done_upto = self.done_upto.get();
+        let done_upto = mark.done_upto;
         if done_upto >= t {
             return;
         }
 
         for i in (done_upto + 1)..=t {
-            let mut waiters = self.waiters.borrow_mut();
-            if let Some(wp) = waiters.get_mut(&i) {
-                wp.ch.take();
-                waiters.remove(&i);
+            if let Some(wp) = mark.waiters.get(&i) {
+                wp.take();
+                mark.waiters.remove(&i);
             }
         }
 
-        self.done_upto.set(t);
+        mark.done_upto = t;
     }
 
     /// Waits for transactions to be done up to the specified timestamp.
     fn wait_for(&self, t: u64) {
-        let mut _guard = self.mutex.lock().unwrap();
-
-        if self.done_upto.get() >= t {
+        let mark = self.mark.read().unwrap();
+        if mark.done_upto >= t {
             return;
         }
+        let should_insert = !mark.waiters.contains_key(&t);
+        drop(mark);
 
-        let mut waiters = self.waiters.borrow_mut();
-        let wp = waiters.entry(t).or_insert_with(|| {
-            let (tx, rx) = bounded(1);
-            Mark {
-                ch: Some(tx),
-                closer: rx,
+        if should_insert {
+            let mut mark = self.mark.write().unwrap();
+            if !mark.waiters.contains_key(&t) {
+                mark.waiters.insert(t, Mark::new());
             }
-        });
+            drop(mark);
+        }
 
-        drop(_guard);
-
+        let mark = self.mark.read().unwrap(); // Re-acquire the read lock.
+        let wp = mark.waiters.get(&t).unwrap().clone();
+        drop(mark);
         matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
     }
 
     /// Gets the highest completed timestamp.
     fn done_until(&self) -> u64 {
-        let _guard = self.mutex.lock().unwrap();
-        self.done_upto.get()
+        let mark = self.mark.read().unwrap();
+        mark.done_upto
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
-    fn test_waiters_hub() {
-        let hub = WaterMark::new(0);
+    fn test_waiters_new() {
+        let hub = WaterMark::new();
 
         hub.done_upto(10);
         let t2 = hub.done_until();
         assert_eq!(t2, 10);
-        hub.wait_for(1);
+
+        for i in 1..=10 {
+            hub.wait_for(i);
+        }
+    }
+
+    #[test]
+    fn test_waiters_async() {
+        let hub = Arc::new(WaterMark::new());
+        let hub_clone = Arc::clone(&hub);
+
+        // Spawn a thread to complete timestamp 1.
+        thread::spawn(move || {
+            // Wait for a while and then complete timestamp 1.
+            thread::sleep(std::time::Duration::from_millis(10)); // Wait for 1 second
+            hub_clone.done_upto(10);
+        });
+
+        // Now, wait for timestamp 1 in the main thread.
         hub.wait_for(10);
     }
 }
