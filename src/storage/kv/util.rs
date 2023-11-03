@@ -6,8 +6,6 @@ use std::{
 
 use crc32fast::Hasher as crc32Hasher;
 
-use bytes::Bytes;
-
 const NULL_BYTE: [u8; 1] = [0];
 
 pub fn default_hash(h: &impl Hash) -> u64 {

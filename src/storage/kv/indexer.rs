@@ -27,7 +27,7 @@ impl<P: KeyTrait> Indexer<P> {
     }
 
     pub fn bulk_insert(&mut self, kv_pairs: &[KV<P, Bytes>]) -> Result<()> {
-        self.index.bulk_insert(&kv_pairs)?;
+        self.index.bulk_insert(kv_pairs)?;
         Ok(())
     }
 

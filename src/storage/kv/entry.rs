@@ -133,12 +133,12 @@ impl TxRecord {
     pub(crate) fn add_entry(&mut self, entry: Entry) {
         let crc = calculate_crc32(entry.key.as_ref(), entry.value.as_ref());
         let tx_record_entry = TxRecordEntry {
-            crc: crc,
+            crc,
             key: entry.key.clone(),
             key_len: entry.key.len() as u32,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
-            value: entry.value.clone(),
+            value: entry.value,
         };
         self.entries.push(tx_record_entry);
         self.header.num_entries += 1;
@@ -203,22 +203,6 @@ impl TxRecordHeader {
             num_entries: 0,
         }
     }
-
-    pub(crate) fn set_id(&mut self, id: u64) {
-        self.id = id;
-    }
-
-    pub(crate) fn set_ts(&mut self, ts: u64) {
-        self.ts = ts;
-    }
-
-    pub(crate) fn set_version(&mut self, version: u16) {
-        self.version = version;
-    }
-
-    pub(crate) fn set_metadata(&mut self, metadata: Option<Metadata>) {
-        self.metadata = metadata;
-    }
 }
 
 impl TxRecordHeader {
@@ -254,7 +238,7 @@ impl TxRecordHeader {
         if md_len > 0 {
             let metadata_bytes = cursor.get_ref()[cursor.position() as usize..][..md_len].as_ref();
             cursor.advance(md_len);
-            let metadata = Metadata::from_bytes(&metadata_bytes)?;
+            let metadata = Metadata::from_bytes(metadata_bytes)?;
             self.metadata = Some(metadata);
         } else {
             self.metadata = None;
@@ -440,7 +424,7 @@ mod tests {
         let mut kvmd = Metadata::new();
         kvmd.as_deleted(true).expect("failed to set deleted");
 
-        let mut value_ref = ValueRef::new(store.clone());
+        let mut value_ref = ValueRef::new(store);
         value_ref.version = 42;
         value_ref.value_length = 100;
         value_ref.value_offset = 200;

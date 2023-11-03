@@ -37,7 +37,7 @@ impl Default for Options {
             num_versions_to_keep: 1,
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            value_log_file_size: 1 * 1024 * 1024 * 1024,
+            value_log_file_size: 1024 * 1024 * 1024,
             detect_conflicts: true,
             managed_txns: true,
             create_if_not_exists: true,
