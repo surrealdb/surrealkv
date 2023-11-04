@@ -248,12 +248,6 @@ impl Transaction {
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
     fn prepare_commit(&mut self) -> Result<(u64, u64)> {
-        if !self.mode.is_write_only() {
-            self.snapshot.close()?;
-        }
-
-        self.closed = true;
-
         let oracle = self.store.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
         let commit_ts = self.assign_commit_ts();
@@ -330,12 +324,6 @@ impl Transaction {
         self.read_set.lock().clear();
 
         Ok(())
-    }
-}
-
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        let _ = self.rollback();
     }
 }
 

@@ -37,4 +37,9 @@ impl Indexer {
     pub fn version(&self) -> u64 {
         self.index.version()
     }
+
+    pub(crate) fn close_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
+        self.index.close_snapshot(snapshot_id)?;
+        Ok(())
+    }
 }

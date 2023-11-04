@@ -166,10 +166,86 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
 
+    use bytes::Bytes;
+    use tempdir::TempDir;
+
+    fn create_temp_directory() -> TempDir {
+        TempDir::new("test").unwrap()
+    }
+
     #[test]
     fn test_new_store() {
         let opts = Options::new();
         let store = Store::new(opts).expect("should create store");
         assert!(!store.closed());
+    }
+
+    #[test]
+    fn test_bulk_insert() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VectorKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Assert that the store is not closed
+        assert!(!store.closed());
+
+        // Number of keys to generate
+        let num_keys = 10000;
+
+        // Initialize a counter
+        let mut counter = 0u32;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for _ in 1..=num_keys {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Increment the counter
+            counter += 1;
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Write the keys to the store
+        for (index, key) in keys.iter().enumerate() {
+            println!("Key {}: {:?}", index, key);
+            // Start a new read-write transaction
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &default_value).unwrap();
+            txn.commit().unwrap();
+            drop(txn)
+        }
+
+        // Drop the store to simulate closing it
+        drop(store);
+
+        // Create a new Core instance with VectorKey after dropping the previous one
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Store::new(opts).expect("should create store");
+
+        // Assert that the new store is not closed
+        assert!(!store.closed());
+
+        // Read the keys to the store
+        for (index, key) in keys.iter().enumerate() {
+            println!("Key {}: {:?}", index, key);
+            // Start a new read-write transaction
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap();
+            // Assert that the value retrieved in txn3 matches default_value
+            assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
+        }
     }
 }
