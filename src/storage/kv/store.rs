@@ -30,19 +30,19 @@ impl Store {
         Ok(Self { core })
     }
 
-    pub fn begin(self: &Arc<Self>) -> Result<Transaction> {
+    pub fn begin(&self) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn begin_with_mode(self: &Arc<Self>, mode: Mode) -> Result<Transaction> {
+    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
-    pub fn view(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+    pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
 
@@ -79,11 +79,10 @@ pub struct Core {
 
 impl Core {
     pub fn new(opts: Options) -> Result<Self> {
+        let mut indexer = Indexer::new(&opts);
+
         let topts = LogOptions::default();
-
         let tlog = AOL::open(&opts.dir, &topts)?;
-        let mut indexer = Indexer::new();
-
         if tlog.size()? > 0 {
             Core::load_index(&opts, &mut indexer)?;
         }
