@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::entry::{MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE};
+use crate::storage::index::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS;
 
 #[derive(Clone)]
 pub struct Options {
@@ -24,6 +25,7 @@ pub struct Options {
     pub max_batch_count: u64,       // Maximum entries in a batch.
     pub max_batch_size: u64,        // Maximum batch size in bytes.
     pub wal_disabled: bool,         // Whether to disable the write-ahead log.
+    pub max_active_snapshots: u64,  // Maximum number of active snapshots.
 }
 
 impl Default for Options {
@@ -45,6 +47,7 @@ impl Default for Options {
             max_tx_entries: 1 << 10,
             max_value_threshold: 64, // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
+            max_active_snapshots: DEFAULT_MAX_ACTIVE_SNAPSHOTS,
         }
     }
 }

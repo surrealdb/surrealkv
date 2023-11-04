@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::storage::index::KeyTrait;
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::Core;
