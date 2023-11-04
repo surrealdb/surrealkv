@@ -5,14 +5,17 @@ use crate::storage::index::art::KV;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::VectorKey;
 use crate::storage::kv::error::Result;
+use crate::storage::kv::option::Options;
 
 pub(crate) struct Indexer {
     pub(crate) index: tart<VectorKey, Bytes>,
 }
 
 impl Indexer {
-    pub(crate) fn new() -> Self {
-        Self { index: tart::new() }
+    pub(crate) fn new(opts: &Options) -> Self {
+        let mut index = tart::new();
+        index.set_max_active_snapshots(opts.max_active_snapshots);
+        Self { index }
     }
 
     pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<VectorKey, Bytes>> {

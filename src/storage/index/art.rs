@@ -28,7 +28,7 @@ const NODE48MAX: usize = 48;
 const NODE256MIN: usize = NODE48MAX + 1;
 
 // Maximum number of active snapshots
-const DEFAULT_MAX_ACTIVE_SNAPSHOTS: u64 = 100;
+pub(crate) const DEFAULT_MAX_ACTIVE_SNAPSHOTS: u64 = 100;
 
 // Define a custom error enum representing different error cases for the Trie
 #[derive(Clone, Debug)]
@@ -991,6 +991,10 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
             max_active_snapshots: DEFAULT_MAX_ACTIVE_SNAPSHOTS,
             closed: false,
         }
+    }
+
+    pub fn set_max_active_snapshots(&mut self, max_active_snapshots: u64) {
+        self.max_active_snapshots = max_active_snapshots;
     }
 
     /// Inserts a new key-value pair with the specified version into the Trie.

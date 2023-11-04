@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
 
 use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
@@ -18,7 +17,7 @@ use crate::storage::kv::snapshot::Snapshot;
 use crate::storage::kv::util::now;
 
 /// An MVCC transaction mode.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
     /// A read-write transaction.
     ReadWrite,
