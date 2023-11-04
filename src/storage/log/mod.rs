@@ -860,7 +860,7 @@ impl SegmentRef {
      .                                                       |
      +------+------+------+------+------+------+------+------+
 */
-pub(crate) struct Segment {
+pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
@@ -868,7 +868,7 @@ pub(crate) struct Segment {
     pub(crate) file_path: PathBuf,
 
     /// The active block for buffering data.
-    block: Block<BLOCK_SIZE, WAL_RECORD_HEADER_SIZE>,
+    block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
 
     /// The underlying file for storing the segment's data.
     file: File,
@@ -886,7 +886,7 @@ pub(crate) struct Segment {
     is_wal: bool,
 }
 
-impl Segment {
+impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
     pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
@@ -1177,7 +1177,7 @@ impl Segment {
     }
 }
 
-impl Drop for Segment {
+impl<const RECORD_HEADER_SIZE: usize>  Drop for Segment<RECORD_HEADER_SIZE> {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -1679,7 +1679,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1760,7 +1760,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1768,7 +1768,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1781,7 +1781,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1812,7 +1812,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 4096);
@@ -1853,7 +1853,7 @@ mod tests {
         assert!(segment.close().is_ok());
 
         // Reopen segment
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
         // Test initial offset
         assert_eq!(segment.offset(), 4100);
 
@@ -1869,7 +1869,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1877,7 +1877,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1891,7 +1891,7 @@ mod tests {
         // Create segment options
         let opts = Options::default();
 
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1912,7 +1912,7 @@ mod tests {
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
-        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts);
+        let reopened_segment: std::result::Result<Segment<0>, Error> = Segment::open(temp_dir.path(), 0, &opts);
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
     }
 
@@ -1925,7 +1925,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1942,7 +1942,7 @@ mod tests {
         assert!(n.is_err()); // Reading should fail
 
         // Reopen the closed segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
 
         // Try to perform operations on the reopened segment
         let r = segment.append(&[4, 5, 6, 7]);
@@ -1956,7 +1956,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default().with_wal();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<WAL_RECORD_HEADER_SIZE> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -2042,7 +2042,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment: Segment<0> = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Append data to the segment
         let append_result = segment.append(&[0, 1, 2, 3]);
@@ -2069,7 +2069,7 @@ mod tests {
         segment.close().expect("should close segment");
     }
 
-    fn create_test_segment_ref(segment: &Segment) -> SegmentRef {
+    fn create_test_segment_ref(segment: &Segment<WAL_RECORD_HEADER_SIZE>) -> SegmentRef {
         SegmentRef {
             file_path: segment.file_path.clone(),
             file_header_offset: segment.file_header_offset,
@@ -2077,7 +2077,7 @@ mod tests {
         }
     }
 
-    fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
+    fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment<WAL_RECORD_HEADER_SIZE> {
         let opts = Options::default().with_wal();
         let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
         let r = segment.append(data);
@@ -2092,7 +2092,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create a sample segment file and populate it with data
-        let mut segment = create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
+        let mut segment: Segment<WAL_RECORD_HEADER_SIZE> = create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
 
         // Test appending another buffer
         let r = segment.append(&[4, 5, 6, 7]);

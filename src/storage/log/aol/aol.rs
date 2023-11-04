@@ -11,6 +11,8 @@ use std::num::NonZeroUsize;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
+const RECORD_HEADER_SIZE : usize = 0;
+
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
@@ -21,7 +23,7 @@ use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Se
 /// separate file and store only the offsets in the main data structure.
 pub struct AOL {
     /// The currently active segment where data is being written.
-    current_write_segment: Segment,
+    current_write_segment: Segment<RECORD_HEADER_SIZE>,
 
     /// The ID of the currently active segment.
     current_write_segment_id: u64,
@@ -39,7 +41,7 @@ pub struct AOL {
     mutex: RwLock<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RwLock<LruCache<u64, Segment>>,
+    segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
 }
 
 impl AOL {
