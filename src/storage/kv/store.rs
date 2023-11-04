@@ -218,13 +218,20 @@ mod tests {
         let default_value = Bytes::from("default_value".to_string());
 
         // Write the keys to the store
-        for (index, key) in keys.iter().enumerate() {
-            println!("Key {}: {:?}", index, key);
-            // Start a new read-write transaction
+        for (_, key) in keys.iter().enumerate() {
+            // Start a new write transaction
             let mut txn = store.begin().unwrap();
             txn.set(&key, &default_value).unwrap();
             txn.commit().unwrap();
-            drop(txn)
+        }
+
+        // Read the keys to the store
+        for (_, key) in keys.iter().enumerate() {
+            // Start a new read transaction
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap();
+            // Assert that the value retrieved in txn3 matches default_value
+            assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
         }
 
         // Drop the store to simulate closing it
@@ -239,9 +246,8 @@ mod tests {
         assert!(!store.closed());
 
         // Read the keys to the store
-        for (index, key) in keys.iter().enumerate() {
-            println!("Key {}: {:?}", index, key);
-            // Start a new read-write transaction
+        for (_, key) in keys.iter().enumerate() {
+            // Start a new read transaction
             let txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap();
             // Assert that the value retrieved in txn3 matches default_value

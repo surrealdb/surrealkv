@@ -17,7 +17,7 @@ use crate::storage::log::{
 /// making it suitable for use cases like write-ahead logging.
 pub struct WAL {
     /// The currently active segment where data is being written.
-    active_segment: Segment,
+    active_segment: Segment<WAL_RECORD_HEADER_SIZE>,
 
     /// The ID of the currently active segment.
     active_segment_id: u64,
@@ -210,7 +210,7 @@ impl WAL {
         if segment_id == self.active_segment_id {
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
+            let segment: Segment<WAL_RECORD_HEADER_SIZE> = Segment::open(&self.dir, segment_id, &self.opts)?;
             segment.read_at(buf, read_offset)
         }
     }
