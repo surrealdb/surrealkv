@@ -69,8 +69,18 @@ impl Snapshot {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.snap.close()?;
+        let mut indexer = self.store.indexer.write();
+        indexer.close_snapshot(self.snap.id)?;
         Ok(())
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let err = self.close();
+        if err.is_err() {
+            panic!("failed to close snapshot: {:?}", err);
+        }
     }
 }
 

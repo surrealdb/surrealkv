@@ -1210,8 +1210,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         // Check if the tree is already closed
         self.is_closed()?;
 
-        let max_snapshot_id = self.max_snapshot_id.load(Ordering::SeqCst);
-        if max_snapshot_id >= self.max_active_snapshots {
+        if self.snapshots.len() >= self.max_active_snapshots as usize {
             return Err(TrieError::Other(
                 "max number of snapshots reached".to_string(),
             ));
