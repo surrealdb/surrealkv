@@ -79,7 +79,8 @@ fn sequential_insert_read(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches, bulk_insert,
+    benches,
+    bulk_insert,
     // sequential_insert_read
 );
 criterion_main!(benches);
