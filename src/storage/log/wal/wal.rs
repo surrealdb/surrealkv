@@ -210,7 +210,8 @@ impl WAL {
         if segment_id == self.active_segment_id {
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let segment: Segment<WAL_RECORD_HEADER_SIZE> = Segment::open(&self.dir, segment_id, &self.opts)?;
+            let segment: Segment<WAL_RECORD_HEADER_SIZE> =
+                Segment::open(&self.dir, segment_id, &self.opts)?;
             segment.read_at(buf, read_offset)
         }
     }
