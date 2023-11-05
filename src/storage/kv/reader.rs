@@ -172,8 +172,7 @@ impl TxReader {
     pub(crate) fn read_into(
         &mut self,
         tx: &mut TxRecord,
-    ) -> Result<(u64, HashMap<bytes::Bytes, usize>)> {
-        let tx_offset = self.r.offset();
+    ) -> Result<HashMap<bytes::Bytes, usize>> {
         self.read_header(tx)?;
 
         let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
@@ -189,7 +188,7 @@ impl TxReader {
             let key = tx.entries.get(i).unwrap().key.clone();
             value_offsets.insert(key, offset as usize);
         }
-        Ok((tx_offset, value_offsets))
+        Ok(value_offsets)
     }
 }
 

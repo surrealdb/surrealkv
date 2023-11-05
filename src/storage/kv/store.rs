@@ -56,9 +56,14 @@ impl Store {
 
         Ok(())
     }
+}
 
-    pub fn closed(&self) -> bool {
-        self.core.closed
+impl Drop for Store {
+    fn drop(&mut self) {
+        let err = self.core.close();
+        if err.is_err() {
+            panic!("failed to close core: {:?}", err);
+        }
     }
 }
 
@@ -68,13 +73,11 @@ pub struct Core {
     /// Options for store.
     pub(crate) opts: Options,
     /// WAL for store.
-    pub(crate) wal: Option<Arc<WAL>>,
+    pub(crate) wal: Arc<Option<WAL>>,
     /// Transaction log for store.
     pub(crate) tlog: Arc<RwLock<AOL>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
-    /// Flag to indicate if store is closed.
-    pub(crate) closed: bool,
 }
 
 impl Core {
@@ -93,10 +96,9 @@ impl Core {
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
-            wal: None,
+            wal: Arc::new(None),
             tlog: Arc::new(RwLock::new(tlog)),
             oracle: Arc::new(oracle),
-            closed: false,
         })
     }
 
@@ -125,7 +127,8 @@ impl Core {
                 }
             }
 
-            let (_tx_offset, value_offsets) = res.unwrap();
+
+            let value_offsets = res.unwrap();
             Core::process_entries(&tx, opts, &value_offsets, indexer)?;
         }
 
@@ -159,6 +162,14 @@ impl Core {
 
         indexer.bulk_insert(&mut kv_pairs)
     }
+
+    fn close(&self) -> Result<()> {
+        self.indexer.write().close()?;
+        // TODO: wait on oracle till latest txn commit ts
+        self.tlog.write().close()?;
+        // TODO: close the wal
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -174,13 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_store() {
-        let opts = Options::new();
-        let store = Store::new(opts).expect("should create store");
-        assert!(!store.closed());
-    }
-
-    #[test]
     fn test_bulk_insert() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
@@ -191,9 +195,6 @@ mod tests {
 
         // Create a new store instance with VectorKey as the key type
         let store = Store::new(opts).expect("should create store");
-
-        // Assert that the store is not closed
-        assert!(!store.closed());
 
         // Number of keys to generate
         let num_keys = 10000;
@@ -242,15 +243,12 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
 
-        // Assert that the new store is not closed
-        assert!(!store.closed());
-
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap();
-            // Assert that the value retrieved in txn3 matches default_value
+            // Assert that the value retrieved in txn matches default_value
             assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
         }
     }
