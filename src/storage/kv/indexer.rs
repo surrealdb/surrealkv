@@ -42,4 +42,9 @@ impl Indexer {
         self.index.close_snapshot(snapshot_id)?;
         Ok(())
     }
+
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.index.close()?;
+        Ok(())
+    }
 }

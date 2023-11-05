@@ -84,10 +84,6 @@ pub struct Transaction {
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
-        if store.closed {
-            return Err(Error::StoreClosed);
-        }
-
         // TODO!! This should be the max txID of the index, get this from oracle
         let read_ts = store.oracle.read_ts();
         let snapshot = Snapshot::take(store.clone(), read_ts)?;
@@ -337,6 +333,7 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
+    use crate::storage::kv::store::Store;
     use crate::storage::kv::transaction::{Mode, Transaction};
     use crate::storage::log::aol::aol::AOL;
     use crate::storage::log::Options as LogOptions;
@@ -357,10 +354,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new Core instance with VectorKey as the key type
-        let store = Arc::new(Core::new(opts).expect("should create store"));
-
-        // Assert that the store is not closed
-        assert!(!store.closed);
+        let store = Store::new(opts).expect("should create store");
 
         // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
@@ -368,17 +362,24 @@ mod tests {
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
 
-        // Start a new read-write transaction (txn1)
-        let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn1.set(&key1, &value1).unwrap();
-        txn1.set(&key2, &value1).unwrap();
-        txn1.commit().unwrap();
+        {
+            // Start a new read-write transaction (txn1)
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn1.set(&key2, &value1).unwrap();
+            txn1.commit().unwrap();
+        }
 
-        // Start another read-write transaction (txn2)
-        let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-        txn2.set(&key1, &value2).unwrap();
-        txn2.set(&key2, &value2).unwrap();
-        txn2.commit().unwrap();
+        {
+            // Start another read-write transaction (txn2)
+            let mut txn2 = store.begin().unwrap();
+            txn2.set(&key1, &value2).unwrap();
+            txn2.set(&key2, &value2).unwrap();
+            txn2.commit().unwrap();
+        }
+
+        // Drop the store to simulate closing it
+        drop(store);
 
         // Open an AOL (Append-Only Log) from the temporary directory
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
@@ -395,19 +396,13 @@ mod tests {
             assert_eq!(tx.entries.len(), 2);
         }
 
-        // Drop the store to simulate closing it
-        drop(store);
-
         // Create a new Core instance with VectorKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        let store = Arc::new(Core::new(opts).expect("should create store"));
-
-        // Assert that the new store is not closed
-        assert!(!store.closed);
+        let store = Store::new(opts).expect("should create store");
 
         // Start a read-only transaction (txn3)
-        let txn3 = Transaction::new(store, Mode::ReadOnly).unwrap();
+        let txn3 = store.begin().unwrap();
         let val = txn3.get(&key1).unwrap();
 
         // Assert that the value retrieved in txn3 matches value2_clone
@@ -421,7 +416,6 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         let store = Arc::new(Core::new(opts).expect("should create store"));
-        assert!(!store.closed);
 
         let key1 = Bytes::from("key1");
         let key2 = Bytes::from("key2");

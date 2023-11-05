@@ -1345,7 +1345,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         self.is_closed()?;
 
         // Check if there are any active readers for the snapshot
-        if self.max_active_snapshots > 0 {
+        if self.snapshot_count() > 0 {
             return Err(TrieError::SnapshotNotClosed);
         }
 

@@ -228,7 +228,11 @@ mod tests {
         assert_eq!(bytes_read, 0); // Only "World!" left to read
     }
 
-    fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment<WAL_RECORD_HEADER_SIZE> {
+    fn create_test_segment(
+        temp_dir: &TempDir,
+        id: u64,
+        data: &[u8],
+    ) -> Segment<WAL_RECORD_HEADER_SIZE> {
         let opts = Options::default().with_wal();
         let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
         let r = segment.append(data);
@@ -267,7 +271,10 @@ mod tests {
         assert_eq!(reader.total_read, 8202);
     }
 
-    fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment<WAL_RECORD_HEADER_SIZE> {
+    fn create_test_segment_with_data(
+        temp_dir: &TempDir,
+        id: u64,
+    ) -> Segment<WAL_RECORD_HEADER_SIZE> {
         let opts = Options::default().with_wal();
         let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 
@@ -379,6 +386,9 @@ mod tests {
         let mut segment = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
         segment.append(&[5, 6, 7, 8]).expect("should append");
 
+        // Close the segment file
+        assert!(segment.close().is_ok());
+
         // Open the segment file for reading and writing
         let mut file = OpenOptions::new()
             .read(true)
@@ -395,9 +405,6 @@ mod tests {
         file.seek(SeekFrom::Start(offset_to_edit as u64))
             .expect("should seek");
         file.write_all(&[new_byte_value]).expect("should write");
-
-        // Close the segment file
-        assert!(segment.close().is_ok());
 
         // Read and repair the corrupted segment
         let corrupted_segment_id;
