@@ -74,8 +74,8 @@ pub struct Core {
     pub(crate) opts: Options,
     /// WAL for store.
     pub(crate) wal: Arc<Option<WAL>>,
-    /// Transaction log for store.
-    pub(crate) tlog: Arc<RwLock<AOL>>,
+    /// Commit log for store.
+    pub(crate) clog: Arc<RwLock<AOL>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
 }
@@ -85,8 +85,8 @@ impl Core {
         let mut indexer = Indexer::new(&opts);
 
         let topts = LogOptions::default();
-        let tlog = AOL::open(&opts.dir, &topts)?;
-        if tlog.size()? > 0 {
+        let clog = AOL::open(&opts.dir, &topts)?;
+        if clog.size()? > 0 {
             Core::load_index(&opts, &mut indexer)?;
         }
 
@@ -97,14 +97,14 @@ impl Core {
             indexer: RwLock::new(indexer),
             opts,
             wal: Arc::new(None),
-            tlog: Arc::new(RwLock::new(tlog)),
+            clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
         })
     }
 
     fn load_index(opts: &Options, indexer: &mut Indexer) -> Result<()> {
-        let tlog = AOL::open(&opts.dir, &LogOptions::default())?;
-        let reader = Reader::new_from(tlog, 0, BLOCK_SIZE)?;
+        let clog = AOL::open(&opts.dir, &LogOptions::default())?;
+        let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
         let mut tx = TxRecord::new(opts.max_tx_entries);
 
@@ -126,7 +126,6 @@ impl Core {
                     return Err(e);
                 }
             }
-
 
             let value_offsets = res.unwrap();
             Core::process_entries(&tx, opts, &value_offsets, indexer)?;
@@ -166,7 +165,7 @@ impl Core {
     fn close(&self) -> Result<()> {
         self.indexer.write().close()?;
         // TODO: wait on oracle till latest txn commit ts
-        self.tlog.write().close()?;
+        self.clog.write().close()?;
         // TODO: close the wal
         Ok(())
     }
