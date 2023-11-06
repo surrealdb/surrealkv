@@ -114,8 +114,7 @@ impl SnapshotIsolation {
 
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         // This is the scenario of snapshot isolation where the transaction is in read-write mode.
-        // Currently, only optimistic concurrency control (OCC) is supported.
-        // TODO: add support for pessimistic concurrency control (serializable snapshot isolation)
+        // In this mode, optimistic concurrency control (OCC) is supported.
         // The following steps are performed:
         //      1. Take the latest snapshot from the store
         //      2. Check if the read keys in the transaction are still valid in the latest snapshot, and
@@ -235,16 +234,9 @@ impl CommitTracker {
 /// category of "serializable" isolation levels. It provides serializability while allowing for
 /// a higher degree of concurrency compared to traditional serializability mechanisms.
 ///
-/// SSI introduces timestamps and versioning to track the visibility of data items and maintain a
-/// consistent snapshot of the database for each transaction. It uses timestamps to ensure that
-/// transactions do not read or write data in a way that would result in an inconsistent view of
-/// the database.
-///
 /// SSI allows for "snapshot isolation" semantics, where a transaction sees a consistent snapshot of
 /// the database as of its start time. It uses timestamps to control the order in which transactions
 /// read and write data, preventing anomalies like write skew and lost updates.
-///
-/// SSI can detect and prevent read-write conflicts, while still allowing a high degree of concurrency.
 ///
 /// This struct manages the coordination of read and write operations by maintaining timestamps
 /// for transactions and tracking committed transactions.

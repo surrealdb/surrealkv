@@ -169,10 +169,7 @@ impl TxReader {
         Ok(())
     }
 
-    pub(crate) fn read_into(
-        &mut self,
-        tx: &mut TxRecord,
-    ) -> Result<HashMap<bytes::Bytes, usize>> {
+    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
         self.read_header(tx)?;
 
         let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();

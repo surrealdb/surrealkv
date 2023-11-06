@@ -86,11 +86,11 @@ impl Entry {
 //
 // Tx encoded format:
 //
-//   |---------------------------------------------|
-//   |   TxRecordHeader   |     TxRecordEntry[]    |
-//   |-------|-------|------------|----------------|-----------------|----------|---------------|
-//   | id(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata | ...entries... |
-//   |-------|-------|------------|----------------|-----------------|----------|---------------|
+//   |---------------------------------------------------------------------------------------------|
+//   |                              TxRecordHeader                              | TxRecordEntry[]  |                                            |
+//   |-------|-------|------------|----------------|-----------------|----------|------------------|
+//   | id(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata |  ...entries...   |
+//   |-------|-------|------------|----------------|-----------------|----------|------------------|
 //
 // TxRecordHeader struct encoded format:
 //
@@ -152,18 +152,14 @@ impl TxRecord {
     pub(crate) fn encode(
         &self,
         buf: &mut BytesMut,
+        current_offset: u64,
         offset_tracker: &mut HashMap<Bytes, usize>,
     ) -> Result<()> {
         // Encode header
         self.header.encode(buf);
 
         // Encode entries and store offsets
-        let mut offset = buf.len();
-
         for entry in &self.entries {
-            // Store the offset for the current entry
-            offset_tracker.insert(entry.key.clone(), offset);
-
             // Encode metadata, if present
             if let Some(metadata) = &entry.metadata {
                 let md_bytes = metadata.bytes();
@@ -179,9 +175,12 @@ impl TxRecord {
             buf.put_u32(entry.key_len);
             buf.put(entry.key.as_ref());
             buf.put_u32(entry.value_len);
+
+            let offset = current_offset as usize + buf.len();
             buf.put(entry.value.as_ref());
 
-            offset += buf.len();
+            // Store the offset for the current entry
+            offset_tracker.insert(entry.key.clone(), offset);
         }
 
         Ok(())
@@ -227,7 +226,6 @@ impl TxRecordHeader {
         };
 
         // tx_id(8) + ts(8) + version(2) + num_entries(2) + meta_data_len(2) + metadata
-        // let mut buf = BytesMut::with_capacity(20 + md_len as usize + md_bytes.len());
         buf.put_u64(self.id);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
@@ -285,11 +283,10 @@ impl TxRecordEntry {
 
 /// Value reference implementation.
 pub struct ValueRef {
-    pub(crate) version: u8,
     pub(crate) flag: u8,
     pub(crate) ts: u64,
-    pub(crate) value_offset: u64,
     pub(crate) value_length: usize,
+    pub(crate) value_offset: Option<u64>,
     pub(crate) value: Option<Bytes>,
     pub(crate) key_value_metadata: Option<Metadata>,
     /// The underlying store for the transaction.
@@ -298,8 +295,16 @@ pub struct ValueRef {
 
 impl ValueRef {
     fn resolve(&self) -> Result<Vec<u8>> {
-        // Implement the resolve functionality.
-        unimplemented!("resolve");
+        if let Some(value) = &self.value {
+            Ok(value.to_vec())
+        } else if let Some(value_offset) = self.value_offset {
+            let mut buf = vec![0; self.value_length];
+            let vlog = self.store.clog.read();
+            vlog.read_at(&mut buf, value_offset)?;
+            Ok(buf)
+        } else {
+            Err(Error::EmptyValue)
+        }
     }
 
     fn transaction_id(&self) -> u64 {
@@ -318,10 +323,9 @@ impl ValueRef {
 impl ValueRef {
     pub(crate) fn new(store: Arc<Core>) -> Self {
         ValueRef {
-            version: 0,
             ts: 0,
             flag: 0,
-            value_offset: 0,
+            value_offset: None,
             value_length: 0,
             value: None,
             key_value_metadata: None,
@@ -340,7 +344,7 @@ impl ValueRef {
         let mut buf = BytesMut::new();
 
         if value.len() <= max_value_threshold {
-            buf.put_u8(1);
+            buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
             buf.put_u32(value.len() as u32);
             buf.put(value.as_ref());
         } else {
@@ -383,7 +387,7 @@ impl ValueRef {
             self.value = Some(Bytes::copy_from_slice(value_bytes));
         } else {
             // Decode version, value length, and value offset
-            self.value_offset = cursor.get_u64();
+            self.value_offset = Some(cursor.get_u64());
         }
 
         // Decode key-value metadata
@@ -421,6 +425,13 @@ mod tests {
     use super::*;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Core;
+    use crate::storage::kv::store::Store;
+
+    use tempdir::TempDir;
+
+    fn create_temp_directory() -> TempDir {
+        TempDir::new("test").unwrap()
+    }
 
     #[test]
     fn test_encode_decode() {
@@ -434,9 +445,8 @@ mod tests {
         kvmd.as_deleted(true).expect("failed to set deleted");
 
         let mut value_ref = ValueRef::new(store);
-        value_ref.version = 42;
         value_ref.value_length = 100;
-        value_ref.value_offset = 200;
+        value_ref.value_offset = Some(200);
         value_ref.key_value_metadata = Some(kvmd);
 
         // // Encode the valueRef
@@ -454,5 +464,140 @@ mod tests {
         //     decoded_value_ref.key_value_metadata.unwrap().deleted(),
         //     value_ref.key_value_metadata.unwrap().deleted()
         // );
+    }
+
+    #[test]
+    fn test_txn_with_value_read_from_clog() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 2;
+
+        // Create a new Core instance with VectorKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Define test keys and value
+        let key1 = Bytes::from("foo1");
+        let key2 = Bytes::from("foo2");
+        let key3 = Bytes::from("foo3");
+        let value = Bytes::from("bar");
+
+        {
+            // Start a new write transaction (txn)
+            let mut txn = store.begin().unwrap();
+
+            // Set key1 and key2 with the same value
+            txn.set(&key1, &value).unwrap();
+            txn.set(&key2, &value).unwrap();
+
+            // Commit the transaction
+            txn.commit().unwrap();
+        }
+
+        {
+            // Start a new read-only transaction
+            let txn = store.begin().unwrap();
+
+            // Retrieve the value associated with key1
+            let val = txn.get(&key1).unwrap();
+            let val = val.resolve().unwrap();
+
+            // Assert that the value retrieved in txn matches the expected value
+            assert_eq!(&val[..], value.as_ref());
+        }
+
+        {
+            // Start a new read-only transaction
+            let txn = store.begin().unwrap();
+
+            // Retrieve the value associated with key2
+            let val = txn.get(&key2).unwrap();
+            let val = val.resolve().unwrap();
+
+            // Assert that the value retrieved in txn matches the expected value
+            assert_eq!(val, value);
+        }
+
+        {
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+
+            // Set key3 with the same value
+            txn.set(&key3, &value).unwrap();
+
+            // Commit the transaction
+            txn.commit().unwrap();
+        }
+
+        {
+            // Start a new read-only transaction
+            let txn = store.begin().unwrap();
+
+            // Retrieve the value associated with key3
+            let val = txn.get(&key3).unwrap();
+            let val = val.resolve().unwrap();
+
+            // Assert that the value retrieved in txn matches the expected value
+            assert_eq!(val, value);
+        }
+    }
+
+    #[test]
+    fn test_txn_with_value_read_from_memory() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 40;
+
+        // Create a new Core instance with VectorKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Define test keys and value
+        let key1 = Bytes::from("foo1");
+        let key2 = Bytes::from("foo2");
+        let key3 = Bytes::from("foo3");
+        let value = Bytes::from("bar");
+
+        {
+            // Start a new write transaction (txn)
+            let mut txn = store.begin().unwrap();
+
+            // Set key1 and key2 with the same value
+            txn.set(&key1, &value).unwrap();
+            txn.set(&key2, &value).unwrap();
+
+            // Commit the transaction
+            txn.commit().unwrap();
+        }
+
+        {
+            // Start a new read-only transaction
+            let txn = store.begin().unwrap();
+
+            // Retrieve the value associated with key1
+            let val = txn.get(&key1).unwrap();
+            let val = val.resolve().unwrap();
+
+            // Assert that the value retrieved in txn matches the expected value
+            assert_eq!(&val[..], value.as_ref());
+        }
+
+        {
+            // Start a new read-only transaction
+            let txn = store.begin().unwrap();
+
+            // Retrieve the value associated with key2
+            let val = txn.get(&key2).unwrap();
+            let val = val.resolve().unwrap();
+
+            // Assert that the value retrieved in txn matches the expected value
+            assert_eq!(val, value);
+        }
     }
 }
