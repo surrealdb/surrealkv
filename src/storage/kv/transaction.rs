@@ -261,12 +261,17 @@ impl Transaction {
 
     /// Adds transaction records to the transaction log.
     fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
+        let current_offset = self.store.clog.read().offset()?;
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
         let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
-        tx_record.encode(&mut self.buf, &mut self.committed_values_offsets)?;
+        tx_record.encode(
+            &mut self.buf,
+            current_offset,
+            &mut self.committed_values_offsets,
+        )?;
 
-        let mut tlog = self.store.tlog.write();
-        let (tx_offset, _) = tlog.append(self.buf.as_ref())?;
+        let mut clog = self.store.clog.write();
+        let (tx_offset, _) = clog.append(self.buf.as_ref())?;
         Ok(tx_offset)
     }
 
