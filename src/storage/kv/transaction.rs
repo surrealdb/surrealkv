@@ -147,7 +147,6 @@ impl Transaction {
             }
             Err(e) => {
                 match &e {
-                    // Handle specific error cases.
                     Error::Index(trie_error) => {
                         if let TrieError::KeyNotFound = trie_error {
                             // If the transaction is not read-only, add the key to the read set.
@@ -159,10 +158,7 @@ impl Transaction {
                         }
                         Err(e)
                     }
-                    _ => {
-                        // Handle other error cases.
-                        Err(e)
-                    }
+                    _ => Err(e),
                 }
             }
         }
