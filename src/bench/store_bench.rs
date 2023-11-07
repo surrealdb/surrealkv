@@ -27,7 +27,6 @@ fn bulk_insert(c: &mut Criterion) {
 
     let mut bench = |key_len, val_len| {
         let mut opts = Options::new();
-        opts.max_active_snapshots = 100000000;
         opts.dir = create_temp_directory().path().to_path_buf();
         let db = Store::new(opts).expect("should create store");
 
@@ -52,8 +51,8 @@ fn bulk_insert(c: &mut Criterion) {
 }
 
 fn sequential_insert_read(c: &mut Criterion) {
+    let mut max_count = 0_u32;
     let mut opts = Options::new();
-    opts.max_active_snapshots = 100000000;
     opts.dir = create_temp_directory().path().to_path_buf();
     let db = Store::new(opts).expect("should create store");
 
@@ -65,15 +64,20 @@ fn sequential_insert_read(c: &mut Criterion) {
             txn.set(count.to_be_bytes()[..].into(), vec![][..].into())
                 .unwrap();
             txn.commit().unwrap();
-        })
+            if count > max_count {
+                max_count = count;
+            }
+        });
     });
 
     c.bench_function("sequential gets", |b| {
         let mut count = 0_u32;
         b.iter(|| {
             count += 1;
-            let txn = db.begin().unwrap();
-            txn.get(count.to_be_bytes()[..].into()).unwrap();
+            if count <= max_count {
+                let txn = db.begin().unwrap();
+                txn.get(count.to_be_bytes()[..].into()).unwrap();
+            }
         })
     });
 }
@@ -81,6 +85,6 @@ fn sequential_insert_read(c: &mut Criterion) {
 criterion_group!(
     benches,
     bulk_insert,
-    // sequential_insert_read
+    sequential_insert_read
 );
 criterion_main!(benches);
