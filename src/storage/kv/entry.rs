@@ -16,7 +16,7 @@ pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
 pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Entry {
     pub(crate) key: Bytes,
     pub(crate) metadata: Option<Metadata>,
