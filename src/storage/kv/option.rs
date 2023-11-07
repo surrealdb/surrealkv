@@ -18,7 +18,7 @@ pub struct Options {
     pub value_log_file_size: u64,   // Maximum size of a single value log file segment.
     pub detect_conflicts: bool,     // Whether to check transactions for conflicts.
     pub create_if_not_exists: bool, // Create the directory if the provided open path doesn't exist.
-    pub max_tx_entries: usize,          // Maximum entries in a transaction.
+    pub max_tx_entries: usize,      // Maximum entries in a transaction.
     pub wal_disabled: bool,         // Whether to disable the write-ahead log.
     pub max_active_snapshots: u64,  // Maximum number of active snapshots.
 }

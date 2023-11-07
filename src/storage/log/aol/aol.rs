@@ -141,7 +141,7 @@ impl AOL {
         // record is larger than the max file size. Write a test to check this.
         while n < rec.len() {
             // Calculate available space in the active segment
-            let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+            let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
 
             // If space is not available, create a new segment
             if available <= 0 {
@@ -166,6 +166,8 @@ impl AOL {
                 // Cache the previous segment
                 let mut cache = self.segment_cache.write();
                 cache.put(previous_segment_id, previous_segment);
+
+                available = opts.max_file_size as i64;
             }
 
             // Calculate the amount of data to append
