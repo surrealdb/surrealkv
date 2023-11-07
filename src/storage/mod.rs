@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering::SeqCst;
 
 const MAX_FREQUENCY_LIMIT: u8 = 3;
 
+
 struct Entry<K, V> {
     key: K,
     value: V,
@@ -41,7 +42,7 @@ where
     K: PartialEq,
 {
     pub fn new(cache_size: usize) -> Self {
-        assert!(cache_size >= 10);
+        assert!(cache_size > 0);
         let min_eviction_size = cache_size / 10;
 
         Self {
@@ -127,9 +128,92 @@ where
                     self.insert_m(tail);
                 } else {
                     self.insert_g(tail);
-                    evicted = false;
+                    evicted = true;
                 }
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use super::*;
+
+    fn assert_opt_eq<V: PartialEq + Debug>(opt: Option<&V>, v: V) {
+        assert!(opt.is_some());
+        assert_eq!(opt.unwrap(), &v);
+    }
+
+    #[test]
+    fn test_insert_and_read() {
+        let mut cache = Cache::new(2);
+
+        cache.insert("apple", "red");
+        cache.insert("banana", "yellow");
+
+        assert_opt_eq(cache.read(&"apple"), "red");
+        assert_opt_eq(cache.read(&"banana"), "yellow");
+    }
+
+    #[test]
+    fn test_insert_removes_oldest() {
+        let mut cache = Cache::new(2);
+
+        cache.insert("apple", "red");
+        cache.insert("banana", "yellow");
+        cache.insert("orange", "orange");
+
+        assert!(cache.read(&"apple").is_none());
+        assert_opt_eq(cache.read(&"banana"), "yellow");
+        assert_opt_eq(cache.read(&"orange"), "orange");
+
+        // "apple" should been removed from the cache.
+        cache.insert("apple", "orange");
+        cache.insert("tomato", "red");
+
+        assert!(cache.read(&"orange").is_none());
+        assert_opt_eq(cache.read(&"apple"), "orange");
+        assert_opt_eq(cache.read(&"tomato"), "red");
+    }
+
+    #[test]
+    fn test_send() {
+        use std::thread;
+
+        let mut cache = Cache::new(2);
+        cache.insert(1, "a");
+
+        let handle = thread::spawn(move || {
+            assert_eq!(cache.read(&1), Some(&"a"));
+        });
+
+        assert!(handle.join().is_ok());
+    }
+
+    #[test]
+    fn test_no_memory_leaks() {
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropCounter;
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, SeqCst);
+            }
+        }
+
+        let n = 100;
+        for _ in 0..n {
+            let mut cache = Cache::new(2);
+            for i in 0..n {
+                cache.insert(i, DropCounter {});
+            }
+        }
+        assert_eq!(DROP_COUNT.load(SeqCst), n * n);
     }
 }
