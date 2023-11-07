@@ -390,7 +390,7 @@ mod tests {
         let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
 
         // Create a reader for the AOL
-        let r = Reader::new_from(a, 0, 100).unwrap();
+        let r = Reader::new_from(a, 0, 10000).unwrap();
         let mut txr = TxReader::new(r).unwrap();
 
         // Read and assert the two transaction records from the reader

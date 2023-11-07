@@ -4,10 +4,12 @@ use std::mem;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-
-use lru::LruCache;
-use parking_lot::RwLock;
 use std::num::NonZeroUsize;
+
+use crate::storage::Cache;
+
+
+use parking_lot::RwLock;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -41,7 +43,7 @@ pub struct AOL {
     mutex: RwLock<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
+    segment_cache: RwLock<Cache<u64, Segment<RECORD_HEADER_SIZE>>>,
 }
 
 impl AOL {
@@ -69,7 +71,7 @@ impl AOL {
 
         // Create the segment cache
         // TODO: fix unwrap and return error
-        let cache = LruCache::new(NonZeroUsize::new(opts.max_open_files).unwrap());
+        let cache = Cache::new(opts.max_open_files);
 
         Ok(Self {
             active_segment,
@@ -165,7 +167,7 @@ impl AOL {
 
                 // Cache the previous segment
                 let mut cache = self.segment_cache.write();
-                cache.put(previous_segment_id, previous_segment);
+                cache.insert(previous_segment_id, previous_segment);
 
                 available = opts.max_file_size as i64;
             }
@@ -243,11 +245,11 @@ impl AOL {
             self.active_segment.read_at(buf, read_offset)
         } else {
             let mut cache = self.segment_cache.write();
-            let reader = cache.get(&segment_id);
+            let reader = cache.read(&segment_id);
             if reader.is_none() {
                 let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
                 let read_bytes = segment.read_at(buf, read_offset)?;
-                cache.put(segment_id, segment);
+                cache.insert(segment_id, segment);
                 Ok(read_bytes)
             } else {
                 let segment = reader.unwrap();
