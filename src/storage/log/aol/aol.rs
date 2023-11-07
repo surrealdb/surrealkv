@@ -1,13 +1,12 @@
 use std::fs;
 use std::io;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::num::NonZeroUsize;
 
 use crate::storage::Cache;
-
 
 use parking_lot::RwLock;
 
