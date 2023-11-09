@@ -71,27 +71,18 @@ const KEY_COMPRESSION_LEVEL: &str = "compression_level";
 #[derive(Clone)]
 pub enum CompressionFormat {
     NoCompression = 0,
-    Flate = 1,
-    GZip = 2,
-    ZLib = 3,
 }
 
 impl CompressionFormat {
     fn as_u64(&self) -> u64 {
         match self {
             CompressionFormat::NoCompression => 0,
-            CompressionFormat::Flate => 1,
-            CompressionFormat::GZip => 2,
-            CompressionFormat::ZLib => 3,
         }
     }
 
     fn from_u64(value: u64) -> Option<Self> {
         match value {
             0 => Some(CompressionFormat::NoCompression),
-            1 => Some(CompressionFormat::Flate),
-            2 => Some(CompressionFormat::GZip),
-            3 => Some(CompressionFormat::ZLib),
             _ => None,
         }
     }
