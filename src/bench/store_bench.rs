@@ -74,6 +74,7 @@ fn sequential_insert_read(c: &mut Criterion) {
         let mut count = 0_u32;
         b.iter(|| {
             count += 1;
+            // not sure why this exceeds the max_count
             if count <= max_count {
                 let txn = db.begin().unwrap();
                 txn.get(count.to_be_bytes()[..].into()).unwrap();
@@ -82,9 +83,5 @@ fn sequential_insert_read(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    bulk_insert,
-    sequential_insert_read
-);
+criterion_group!(benches, bulk_insert, sequential_insert_read);
 criterion_main!(benches);

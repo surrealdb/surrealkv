@@ -163,10 +163,18 @@ impl Core {
     }
 
     fn close(&self) -> Result<()> {
-        self.indexer.write().close()?;
-        // TODO: wait on oracle till latest txn commit ts
-        self.clog.write().close()?;
+        // Wait for the oracle to catch up to the latest commit transaction.
+        let oracle = self.oracle.clone();
+        let last_commit_ts = oracle.read_ts();
+        oracle.wait_for(last_commit_ts);
+
         // TODO: close the wal
+
+        // Close the indexer
+        self.indexer.write().close()?;
+
+        // Close the commit log
+        self.clog.write().close()?;
         Ok(())
     }
 }
