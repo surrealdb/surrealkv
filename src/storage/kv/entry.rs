@@ -561,7 +561,6 @@ mod tests {
         // Define test keys and value
         let key1 = Bytes::from("foo1");
         let key2 = Bytes::from("foo2");
-        let key3 = Bytes::from("foo3");
         let value = Bytes::from("bar");
 
         {

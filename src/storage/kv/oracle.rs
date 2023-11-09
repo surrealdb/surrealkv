@@ -60,6 +60,15 @@ impl Oracle {
             }
         }
     }
+
+    pub(crate) fn wait_for(&self, ts: u64) {
+        match &self.isolation {
+            IsolationLevel::SnapshotIsolation(_) => {}
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => {
+                oracle.txn_mark.wait_for(ts);
+            }
+        }
+    }
 }
 
 pub(crate) enum IsolationLevel {
