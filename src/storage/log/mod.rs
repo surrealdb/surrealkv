@@ -66,6 +66,7 @@ const KEY_VERSION: &str = "version";
 const KEY_SEGMENT_ID: &str = "segment_id";
 const KEY_COMPRESSION_FORMAT: &str = "compression_format";
 const KEY_COMPRESSION_LEVEL: &str = "compression_level";
+const KEY_ADDITIONAL_METADATA: &str = "additional_metadata";
 
 // Enum to represent different compression formats
 #[derive(Clone)]
@@ -370,15 +371,27 @@ impl Metadata {
     /// # Returns
     ///
     /// Returns a `Metadata` instance containing the file header information.
-    fn new_file_header(id: u64, cf: &CompressionFormat, cl: &CompressionLevel) -> Self {
+    fn new_file_header(id: u64, opts: &Options) -> Self {
         let mut buf = Metadata::new(None);
 
         // Set file header key-value pairs using constants
+        let cf = opts
+            .compression_format
+            .as_ref()
+            .unwrap_or(&CompressionFormat::NoCompression);
+        let cl = opts
+            .compression_level
+            .as_ref()
+            .unwrap_or(&CompressionLevel::BestSpeed);
+
         buf.put_int(KEY_MAGIC, MAGIC);
         buf.put_int(KEY_VERSION, VERSION);
         buf.put_int(KEY_SEGMENT_ID, id);
         buf.put_int(KEY_COMPRESSION_FORMAT, cf.as_u64());
         buf.put_int(KEY_COMPRESSION_LEVEL, cl.as_u64());
+        if let Some(md) = opts.metadata.as_ref() {
+            buf.put(KEY_ADDITIONAL_METADATA, &md.bytes());
+        }
 
         buf
     }
@@ -552,32 +565,51 @@ fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
 }
 
 fn write_file_header(file: &mut File, id: u64, opts: &Options) -> Result<usize> {
+    // Create a buffer to hold the header
+    let mut buf = Vec::new();
+
     // Write the header using write_field
-    let mut meta = Metadata::new_file_header(
-        id,
-        opts.compression_format
-            .as_ref()
-            .unwrap_or(&DEFAULT_COMPRESSION_FORMAT),
-        opts.compression_level
-            .as_ref()
-            .unwrap_or(&DEFAULT_COMPRESSION_LEVEL),
-    );
-
-    if let Some(metadata) = &opts.metadata {
-        let buf = metadata.bytes();
-        meta.read_from(&mut &buf[..])?;
-    }
-
-    let mut header = Vec::new();
-    write_field(&meta.bytes(), &mut header)?;
+    let meta = Metadata::new_file_header(id, opts);
+    write_field(&meta.bytes(), &mut buf)?;
 
     // Write header to the file
-    file.write_all(&header)?;
+    file.write_all(&buf)?;
 
     // Sync data to disk and flush metadata
     file.sync_all()?;
 
-    Ok(header.len())
+    Ok(buf.len())
+}
+
+fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> Result<()> {
+    validate_magic_version(header)?;
+    validate_segment_id(header, id)?;
+    validate_compression(header, opts)?;
+    validate_metadata(header, opts)?;
+
+    Ok(())
+}
+
+fn validate_metadata(header: &[u8], opts: &Options) -> Result<()> {
+    let mut meta = Metadata::new(None);
+    meta.read_from(&mut &header[..])?;
+    let additional_md = meta.get(KEY_ADDITIONAL_METADATA);
+
+    match (additional_md, &opts.metadata) {
+        (Some(md), Some(expected_md)) if *md != expected_md.bytes() => {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::InvalidData,
+                "Corrupted metadata",
+            )));
+        }
+        (None, Some(_)) | (Some(_), None) => {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::InvalidData,
+                "Invalid metadata",
+            )));
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_magic_version(header: &[u8]) -> Result<()> {
@@ -637,14 +669,6 @@ fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
             )));
         }
     }
-
-    Ok(())
-}
-
-fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> Result<()> {
-    validate_magic_version(header)?;
-    validate_segment_id(header, id)?;
-    validate_compression(header, opts)?;
 
     Ok(())
 }
@@ -856,7 +880,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     pub(crate) id: u64,
 
     /// The path where the segment file is located.
-    pub(crate) file_path: PathBuf,
+    file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
@@ -909,7 +933,6 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
                     "Invalid segment id",
                 )));
             }
-            // TODO: take id etc from existing header
         } else {
             // Write new file header
             let header_len = write_file_header(&mut file, id, opts)?;
@@ -1441,15 +1464,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new metadata using new_file_header
-        let mut meta = Metadata::new_file_header(
-            id,
-            opts.compression_format
-                .as_ref()
-                .unwrap_or(&CompressionFormat::NoCompression),
-            opts.compression_level
-                .as_ref()
-                .unwrap_or(&CompressionLevel::BestSpeed),
-        );
+        let mut meta = Metadata::new_file_header(id, &opts);
 
         // Create an extended metadata
         let mut extended_meta = Metadata::new(None);
@@ -1476,7 +1491,7 @@ mod tests {
 
         // Check if keys from the extended metadata are present in the extended metadata
         assert_eq!(meta.get_int("key1").unwrap(), 123);
-        assert_eq!(meta.get_int("key1").unwrap(), 123);
+        assert_eq!(meta.get_int("key2").unwrap(), 456);
     }
 
     #[test]
@@ -1485,7 +1500,13 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options
-        let opts = Options::default();
+        let mut opts = Options::default();
+
+        // Add optional metadata
+        let mut metadata = Metadata::new(None);
+        metadata.put_int("key1", 123);
+        metadata.put_int("key2", 456);
+        opts.metadata = Some(metadata);
 
         // Create a new segment file and write the header
         let segment_path = temp_dir.path().join("00000000000000000000");

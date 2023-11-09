@@ -459,7 +459,7 @@ mod tests {
         // Spawn a thread to complete timestamp 1.
         thread::spawn(move || {
             // Wait for a while and then complete timestamp 1.
-            thread::sleep(std::time::Duration::from_millis(10)); // Wait for 1 second
+            thread::sleep(std::time::Duration::from_millis(10));
             hub_clone.done_upto(10);
         });
 
