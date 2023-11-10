@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
-    collections::HashSet,
+    collections::{BinaryHeap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    cmp::Reverse,
 };
 
 use bytes::Bytes;
@@ -263,7 +264,7 @@ pub(crate) struct SerializableSnapshotIsolation {
     // `txn_mark` blocks `new_transaction` to ensure previous commits are visible to new reads.
     txn_mark: Arc<WaterMark>,
     // `read_mark` marks the visibility of read operations to other transactions.
-    read_mark: Arc<WaterMark>,
+    read_mark: Arc<RwLock<BinaryHeap<Reverse<u64>>>>,
 }
 
 impl SerializableSnapshotIsolation {
@@ -274,7 +275,7 @@ impl SerializableSnapshotIsolation {
             // Create a watermark for transactions.
             txn_mark: Arc::new(WaterMark::new()),
             // Create a watermark for read operations.
-            read_mark: Arc::new(WaterMark::new()),
+            read_mark: Arc::new(RwLock::new(BinaryHeap::new())),
         }
     }
 
@@ -282,6 +283,9 @@ impl SerializableSnapshotIsolation {
     pub(crate) fn read_ts(&self) -> u64 {
         let commit_tracker = self.commit_tracker.lock();
         let read_ts = commit_tracker.next_ts - 1;
+
+        // Keep track of the read timestamp for active transactions.
+        self.read_mark.write().push(Reverse(read_ts));
 
         // Wait for the current read timestamp to be visible to new transactions.
         self.txn_mark.wait_for(read_ts);
@@ -299,10 +303,12 @@ impl SerializableSnapshotIsolation {
 
         let ts = {
             // Mark that read operations are done up to the transaction's read timestamp.
-            self.read_mark.done_upto(txn.read_ts);
+            self.read_mark
+                .write()
+                .retain(|&read_ts| read_ts.0 > txn.read_ts);
 
             // Clean up committed transactions up to the current read mark.
-            commit_tracker.cleanup_committed_transactions(self.read_mark.done_until());
+            commit_tracker.cleanup_committed_transactions(self.read_mark.read().peek().unwrap().0);
 
             let txn_ts = commit_tracker.next_ts;
             commit_tracker.next_ts += 1;
@@ -328,7 +334,7 @@ impl SerializableSnapshotIsolation {
         self.txn_mark.done_upto(ts);
 
         // Mark that reads are done up to the given timestamp.
-        self.read_mark.done_upto(ts);
+        self.read_mark.write().retain(|&read_ts| read_ts.0 > ts);
     }
 
     // Increment the global timestamp for the system.
