@@ -127,7 +127,8 @@ impl Core {
     }
 
     fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
-        let clog = AOL::open(&opts.dir, copts)?;
+        let clog_subdir = opts.dir.join("clog");
+        let clog = AOL::open(&clog_subdir, copts)?;
         let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
         let mut tx = TxRecord::new(opts.max_tx_entries);
@@ -319,7 +320,7 @@ mod tests {
             let txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap();
             // Assert that the value retrieved in txn3 matches default_value
-            assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
+            assert_eq!(val, default_value.as_ref());
         }
 
         // Drop the store to simulate closing it
@@ -336,7 +337,7 @@ mod tests {
             let txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap();
             // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
+            assert_eq!(val, default_value.as_ref());
         }
     }
 

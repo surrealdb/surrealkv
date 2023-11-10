@@ -226,16 +226,11 @@ mod tests {
         a.close().expect("should close aol");
 
         let a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
-        println!("offset: {:?}", a.offset());
-
         let mut r = Reader::new_from(a, 0, 200000).unwrap();
 
-        let mut bs = vec![0; 2];
-        let _n = r.read(&mut bs).expect("should read");
-        println!("bs: {:?}", bs);
-        let _n = r.read(&mut bs).expect("should read");
-        println!("bs: {:?}", bs);
-        // assert_eq!(4, n);
-        // assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
+        let mut bs = vec![0; 4];
+        let n = r.read(&mut bs).expect("should read");
+        assert_eq!(4, n);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
     }
 }

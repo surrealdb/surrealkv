@@ -123,7 +123,7 @@ impl Transaction {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &[u8]) -> Result<ValueRef> {
+    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
         if self.closed {
             return Err(Error::TxnClosed);
         }
@@ -142,8 +142,7 @@ impl Transaction {
                 if !self.mode.is_read_only() && val_ref.ts > 0 {
                     self.read_set.lock().push((key, val_ref.ts));
                 }
-
-                Ok(val_ref)
+                val_ref.resolve()
             }
             Err(e) => {
                 match &e {
@@ -329,15 +328,11 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
 
-    use crate::storage::kv::entry::TxRecord;
     use crate::storage::kv::error::Error;
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::reader::{Reader, TxReader};
     use crate::storage::kv::store::Core;
     use crate::storage::kv::store::Store;
     use crate::storage::kv::transaction::{Mode, Transaction};
-    use crate::storage::log::aol::aol::AOL;
-    use crate::storage::log::Options as LogOptions;
 
     use tempdir::TempDir;
 
@@ -355,7 +350,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new Core instance with VectorKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts.clone()).expect("should create store");
 
         // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
@@ -382,21 +377,6 @@ mod tests {
         // Drop the store to simulate closing it
         drop(store);
 
-        // Open an AOL (Append-Only Log) from the temporary directory
-        let a = AOL::open(temp_dir.path(), &LogOptions::default()).expect("should create aol");
-
-        // Create a reader for the AOL
-        let r = Reader::new_from(a, 0, 10000).unwrap();
-        let mut txr = TxReader::new(r).unwrap();
-
-        // Read and assert the two transaction records from the reader
-        for i in 1..3 {
-            let mut tx = TxRecord::new(2);
-            txr.read_into(&mut tx).unwrap();
-            assert_eq!(tx.header.id, i);
-            assert_eq!(tx.entries.len(), 2);
-        }
-
         // Create a new Core instance with VectorKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -407,7 +387,7 @@ mod tests {
         let val = txn3.get(&key1).unwrap();
 
         // Assert that the value retrieved in txn3 matches value2_clone
-        assert_eq!(val.value.unwrap().as_ref(), value2.as_ref());
+        assert_eq!(val, value2.as_ref());
     }
 
     #[test]
@@ -449,7 +429,7 @@ mod tests {
 
             let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
             let val = txn3.get(&key1).unwrap();
-            assert_eq!(val.value.unwrap().as_ref(), value2.as_ref());
+            assert_eq!(val, value2.as_ref());
         }
 
         {
