@@ -1,11 +1,11 @@
 pub mod entry;
 pub mod error;
-pub mod indexer;
-pub mod meta;
+pub(crate) mod indexer;
+pub(crate) mod meta;
 pub mod option;
 pub mod oracle;
-pub mod reader;
+pub(crate) mod reader;
 pub mod snapshot;
 pub mod store;
 pub mod transaction;
-pub mod util;
+pub(crate) mod util;

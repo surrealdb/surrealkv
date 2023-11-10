@@ -34,6 +34,7 @@ pub enum Error {
     CorruptedTxHeader,
     InvalidTxRecordID,
     EmptyValue,
+    ManifestNotFound,
 }
 
 /// Error structure for encoding errors
@@ -90,6 +91,7 @@ impl fmt::Display for Error {
             Error::CorruptedTxHeader => write!(f, "Corrupted transaction header"),
             Error::InvalidTxRecordID => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
+            Error::ManifestNotFound => write!(f, "Manifest not found"),
         }
     }
 }

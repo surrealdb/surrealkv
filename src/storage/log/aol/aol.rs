@@ -1,7 +1,6 @@
 use std::fs;
 use std::io;
 use std::mem;
-use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,11 +16,7 @@ const RECORD_HEADER_SIZE: usize = 0;
 /// Append-Only Log (AOL) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
-/// writing data in a sequential manner. This is useful for applications which
-/// need to store large amounts of data separately in a variety of files, and
-/// store only the offsets of the files in the main data structure. Useful for
-/// WISCKEY implementation where we need to store the key-value pairs in a
-/// separate file and store only the offsets in the main data structure.
+/// writing data in a sequential manner.
 pub struct AOL {
     /// The currently active segment where data is being written.
     active_segment: Segment<RECORD_HEADER_SIZE>,

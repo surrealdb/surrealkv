@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::vec;
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -15,8 +16,8 @@ use crate::storage::kv::reader::{Reader, TxReader};
 use crate::storage::kv::transaction::{Mode, Transaction};
 use crate::storage::log::aol::aol::AOL;
 use crate::storage::log::wal::wal::WAL;
-use crate::storage::log::Error as LogError;
-use crate::storage::log::{Options as LogOptions, BLOCK_SIZE};
+use crate::storage::log::{write_field, Options as LogOptions, BLOCK_SIZE};
+use crate::storage::log::{Error as LogError, Metadata};
 
 /// An MVCC-based transactional key-value store.
 pub struct Store {
@@ -76,34 +77,57 @@ pub struct Core {
     pub(crate) wal: Arc<Option<WAL>>,
     /// Commit log for store.
     pub(crate) clog: Arc<RwLock<AOL>>,
+    /// Manifest for store to track Store state.
+    pub(crate) manifest: AOL,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
 }
 
 impl Core {
     pub fn new(opts: Options) -> Result<Self> {
+        // Initialize a new Indexer with the provided options.
         let mut indexer = Indexer::new(&opts);
 
-        let topts = LogOptions::default();
-        let clog = AOL::open(&opts.dir, &topts)?;
+        // Determine options for the manifest file and open or create it.
+        let manifest_subdir = opts.dir.join("manifest");
+        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
+        let mut manifest = AOL::open(&manifest_subdir, &mopts)?;
+
+        // Load or create metadata from the manifest file.
+        let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest)?;
+
+        // Update options with the loaded metadata.
+        let opts = Options::from_metadata(metadata, opts.dir.clone())?;
+
+        // Determine options for the commit log file and open or create it.
+        let clog_subdir = opts.dir.join("clog");
+        let copts = LogOptions::default()
+            .with_max_file_size(opts.max_segment_size)
+            .with_file_extension("clog".to_string());
+        let clog = AOL::open(&clog_subdir, &copts)?;
+
+        // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &mut indexer)?;
+            Core::load_index(&opts, &copts, &mut indexer)?;
         }
 
+        // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
 
+        // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
+            manifest,
             wal: Arc::new(None),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
         })
     }
 
-    fn load_index(opts: &Options, indexer: &mut Indexer) -> Result<()> {
-        let clog = AOL::open(&opts.dir, &LogOptions::default())?;
+    fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
+        let clog = AOL::open(&opts.dir, copts)?;
         let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
         let mut tx = TxRecord::new(opts.max_tx_entries);
@@ -160,6 +184,62 @@ impl Core {
         }
 
         indexer.bulk_insert(&mut kv_pairs)
+    }
+
+    fn load_or_create_metadata(
+        opts: &Options,
+        mopts: &LogOptions,
+        manifest: &mut AOL,
+    ) -> Result<Metadata> {
+        let current_metadata = opts.to_metadata();
+        let existing_metadata = if !manifest.size()? > 0 {
+            Core::load_manifest(&opts, &mopts)?
+        } else {
+            None
+        };
+
+        match existing_metadata {
+            Some(existing) if existing == current_metadata => Ok(current_metadata),
+            _ => {
+                let md_bytes = current_metadata.bytes();
+                let mut buf = Vec::new();
+                write_field(&md_bytes, &mut buf)?;
+                manifest.append(&buf)?;
+
+                Ok(current_metadata)
+            }
+        }
+    }
+
+    fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
+        let manifest_subdir = opts.dir.join("manifest");
+        let mlog = AOL::open(&manifest_subdir, mopts)?;
+        let mut reader = Reader::new_from(mlog, 0, BLOCK_SIZE)?;
+
+        let mut md: Option<Metadata> = None; // Initialize with None
+
+        loop {
+            // Read the next transaction record from the log.
+            let mut len_buf = [0; 4];
+            let res = reader.read(&mut len_buf); // Read 4 bytes for the length
+            if let Err(e) = res {
+                if let Error::Log(log_error) = &e {
+                    match log_error {
+                        LogError::EOF => break,
+                        _ => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+
+            let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
+            let mut md_bytes = vec![0u8; len];
+            reader.read(&mut md_bytes)?; // Read the actual metadata
+            md = Some(Metadata::new(Some(md_bytes))); // Update md with the new metadata
+        }
+
+        Ok(md)
     }
 
     fn close(&self) -> Result<()> {
@@ -258,5 +338,27 @@ mod tests {
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val.value.unwrap().as_ref(), default_value.as_ref());
         }
+    }
+
+    #[test]
+    fn test_store_open_and_reload_options() {
+        // // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VectorKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        drop(store);
+
+        // Create a new store instance with VectorKey as the key type
+        let mut opts = opts.clone();
+        opts.max_active_snapshots = 10;
+        let store = Store::new(opts.clone()).expect("should create store");
+        let store_opts = store.core.opts.clone();
+        assert_eq!(store_opts, opts);
     }
 }
