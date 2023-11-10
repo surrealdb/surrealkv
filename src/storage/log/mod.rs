@@ -66,6 +66,7 @@ const KEY_VERSION: &str = "version";
 const KEY_SEGMENT_ID: &str = "segment_id";
 const KEY_COMPRESSION_FORMAT: &str = "compression_format";
 const KEY_COMPRESSION_LEVEL: &str = "compression_level";
+const KEY_MAX_FILE_SIZE: &str = "max_file_size";
 const KEY_ADDITIONAL_METADATA: &str = "additional_metadata";
 
 // Enum to represent different compression formats
@@ -215,7 +216,7 @@ pub struct Options {
     ///
     /// If specified, this option sets the extension for the segment file. The extension is used
     /// when creating the segment file on disk. If not specified, a default extension might be used.
-    extension: Option<String>,
+    file_extension: Option<String>,
 
     /// The maximum size of the segment file.
     ///
@@ -252,7 +253,7 @@ impl Default for Options {
             compression_format: Some(DEFAULT_COMPRESSION_FORMAT), // default compression format
             compression_level: Some(DEFAULT_COMPRESSION_LEVEL),   // default compression level
             metadata: None,                                       // default metadata
-            extension: None,                                      // default extension
+            file_extension: None,                                 // default extension
             max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
             is_wal: false,
             max_open_files: DEFAULT_MAX_OPEN_FILES,
@@ -268,7 +269,7 @@ impl Options {
             compression_format: None,
             compression_level: None,
             metadata: None,
-            extension: None,
+            file_extension: None,
             max_file_size: 0,
             is_wal: false,
             max_open_files: 0,
@@ -286,42 +287,42 @@ impl Options {
         Ok(())
     }
 
-    fn with_file_mode(mut self, file_mode: u32) -> Self {
+    pub fn with_file_mode(mut self, file_mode: u32) -> Self {
         self.file_mode = Some(file_mode);
         self
     }
 
-    fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
+    pub fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
         self.compression_format = Some(compression_format);
         self
     }
 
-    fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
+    pub fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
         self.compression_level = Some(compression_level);
         self
     }
 
-    fn with_metadata(mut self, metadata: Metadata) -> Self {
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
-    fn with_extension(mut self, extension: String) -> Self {
-        self.extension = Some(extension);
+    pub fn with_file_extension(mut self, extension: String) -> Self {
+        self.file_extension = Some(extension);
         self
     }
 
-    fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
         self
     }
 
-    fn with_dir_mode(mut self, dir_mode: u32) -> Self {
+    pub fn with_dir_mode(mut self, dir_mode: u32) -> Self {
         self.dir_mode = Some(dir_mode);
         self
     }
 
-    fn with_wal(mut self) -> Self {
+    pub fn with_wal(mut self) -> Self {
         self.is_wal = true;
         self
     }
@@ -332,8 +333,8 @@ impl Options {
 /// The `Metadata` struct defines a container for storing key-value pairs of metadata. This metadata
 /// can be used to hold additional information about a file. The data is stored in a hash map where
 /// each key is a string and each value is a vector of bytes.
-#[derive(Clone)]
-pub(crate) struct Metadata {
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Metadata {
     /// The map holding key-value pairs of metadata.
     ///
     /// The `data` field is a hash map that allows associating arbitrary data with descriptive keys.
@@ -343,7 +344,7 @@ pub(crate) struct Metadata {
 
 impl Metadata {
     // Constructor for Metadata, reads data from bytes if provided
-    fn new(b: Option<Vec<u8>>) -> Self {
+    pub(crate) fn new(b: Option<Vec<u8>>) -> Self {
         let mut metadata = Metadata {
             data: HashMap::new(),
         };
@@ -389,6 +390,7 @@ impl Metadata {
         buf.put_int(KEY_SEGMENT_ID, id);
         buf.put_int(KEY_COMPRESSION_FORMAT, cf.as_u64());
         buf.put_int(KEY_COMPRESSION_LEVEL, cl.as_u64());
+        buf.put_int(KEY_MAX_FILE_SIZE, opts.max_file_size);
         if let Some(md) = opts.metadata.as_ref() {
             buf.put(KEY_ADDITIONAL_METADATA, &md.bytes());
         }
@@ -397,14 +399,14 @@ impl Metadata {
     }
 
     // Returns the serialized bytes representation of Metadata
-    fn bytes(&self) -> Vec<u8> {
+    pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         self.write_to(&mut b).unwrap();
         b
     }
 
     // Reads Metadata from a given reader
-    fn read_from<R: Read>(&mut self, reader: &mut R) -> Result<()> {
+    pub(crate) fn read_from<R: Read>(&mut self, reader: &mut R) -> Result<()> {
         let mut len_buf = [0; 4];
         reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
         let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
@@ -435,13 +437,13 @@ impl Metadata {
     }
 
     // Puts an integer value with a given key
-    fn put_int(&mut self, key: &str, n: u64) {
+    pub(crate) fn put_int(&mut self, key: &str, n: u64) {
         let b = n.to_be_bytes(); // Convert integer to big-endian bytes
         self.put(key, &b); // Call the generic put method
     }
 
     // Gets an integer value associated with a given key
-    fn get_int(&self, key: &str) -> Result<u64> {
+    pub(crate) fn get_int(&self, key: &str) -> Result<u64> {
         // // Use the generic get method to retrieve bytes
         let value_bytes = self.get(key).ok_or(Error::IO(IOError::new(
             io::ErrorKind::NotFound,
@@ -460,13 +462,23 @@ impl Metadata {
         Ok(int_value)
     }
 
+    pub(crate) fn put_bool(&mut self, key: &str, b: bool) {
+        let value = if b { 1 } else { 0 };
+        self.put_int(key, value);
+    }
+
+    pub(crate) fn get_bool(&self, key: &str) -> Result<bool> {
+        let value = self.get_int(key)?;
+        Ok(value == 1)
+    }
+
     // Generic method to put a key-value pair into the data HashMap
-    fn put(&mut self, key: &str, value: &[u8]) {
+    pub(crate) fn put(&mut self, key: &str, value: &[u8]) {
         self.data.insert(key.to_string(), value.to_vec());
     }
 
     // Generic method to get the value associated with a given key
-    fn get(&self, key: &str) -> Option<&Vec<u8>> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Vec<u8>> {
         self.data.get(key)
     }
 }
@@ -541,7 +553,7 @@ fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
 }
 
 // Reads a field from the given reader
-fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+pub(crate) fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0; 4];
     reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
     let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
@@ -551,7 +563,7 @@ fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 }
 
 // Writes a field to the given writer
-fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
+pub(crate) fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
     let mut len_buf = [0; 4];
     len_buf.copy_from_slice(&(b.len() as u32).to_be_bytes());
     writer.write_all(&len_buf)?; // Write 4 bytes for the length
@@ -786,21 +798,24 @@ fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 /// vector is returned.
 fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
     let mut refs: Vec<u64> = Vec::new();
-    let files = read_dir(dir)?;
+    let entries = read_dir(dir)?;
 
-    for file in files {
-        let entry = file?;
-        let fn_name = entry.file_name();
-        let fn_str = fn_name.to_string_lossy();
-        let (index, _) = parse_segment_name(&fn_str)?;
-        refs.push(index);
+    for entry in entries {
+        let file = entry?;
+
+        // Check if the entry is a file
+        if std::fs::metadata(file.path())?.is_file() {
+            let fn_name = file.file_name();
+            let fn_str = fn_name.to_string_lossy();
+            let (index, _) = parse_segment_name(&fn_str)?;
+            refs.push(index);
+        }
     }
 
     refs.sort();
 
     Ok(refs)
 }
-
 pub(crate) struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
@@ -907,7 +922,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         opts.validate()?;
 
         // Build the file path using the segment name and extension
-        let extension = opts.extension.as_deref().unwrap_or("");
+        let extension = opts.file_extension.as_deref().unwrap_or("");
         let file_name = segment_name(id, extension);
         let file_path = dir.join(&file_name);
         let file_path_exists = file_path.exists();
@@ -1427,6 +1442,13 @@ mod tests {
         let mut metadata = Metadata::new(None);
         metadata.put_int("age", 25);
         assert_eq!(metadata.get_int("age").unwrap(), 25);
+    }
+
+    #[test]
+    fn test_put_and_get_bool() {
+        let mut metadata = Metadata::new(None);
+        metadata.put_bool("is_active", true);
+        assert_eq!(metadata.get_bool("is_active").unwrap(), true);
     }
 
     #[test]
