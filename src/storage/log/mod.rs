@@ -385,12 +385,12 @@ impl Metadata {
             .as_ref()
             .unwrap_or(&CompressionLevel::BestSpeed);
 
-        buf.put_int(KEY_MAGIC, MAGIC);
-        buf.put_int(KEY_VERSION, VERSION);
-        buf.put_int(KEY_SEGMENT_ID, id);
-        buf.put_int(KEY_COMPRESSION_FORMAT, cf.as_u64());
-        buf.put_int(KEY_COMPRESSION_LEVEL, cl.as_u64());
-        buf.put_int(KEY_MAX_FILE_SIZE, opts.max_file_size);
+        buf.put_uint(KEY_MAGIC, MAGIC);
+        buf.put_uint(KEY_VERSION, VERSION);
+        buf.put_uint(KEY_SEGMENT_ID, id);
+        buf.put_uint(KEY_COMPRESSION_FORMAT, cf.as_u64());
+        buf.put_uint(KEY_COMPRESSION_LEVEL, cl.as_u64());
+        buf.put_uint(KEY_MAX_FILE_SIZE, opts.max_file_size);
         if let Some(md) = opts.metadata.as_ref() {
             buf.put(KEY_ADDITIONAL_METADATA, &md.bytes());
         }
@@ -437,13 +437,13 @@ impl Metadata {
     }
 
     // Puts an integer value with a given key
-    pub(crate) fn put_int(&mut self, key: &str, n: u64) {
+    pub(crate) fn put_uint(&mut self, key: &str, n: u64) {
         let b = n.to_be_bytes(); // Convert integer to big-endian bytes
         self.put(key, &b); // Call the generic put method
     }
 
     // Gets an integer value associated with a given key
-    pub(crate) fn get_int(&self, key: &str) -> Result<u64> {
+    pub(crate) fn get_uint(&self, key: &str) -> Result<u64> {
         // // Use the generic get method to retrieve bytes
         let value_bytes = self.get(key).ok_or(Error::IO(IOError::new(
             io::ErrorKind::NotFound,
@@ -464,11 +464,11 @@ impl Metadata {
 
     pub(crate) fn put_bool(&mut self, key: &str, b: bool) {
         let value = if b { 1 } else { 0 };
-        self.put_int(key, value);
+        self.put_uint(key, value);
     }
 
     pub(crate) fn get_bool(&self, key: &str) -> Result<bool> {
-        let value = self.get_int(key)?;
+        let value = self.get_uint(key)?;
         Ok(value == 1)
     }
 
@@ -628,8 +628,8 @@ fn validate_magic_version(header: &[u8]) -> Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
 
-    let magic = meta.get_int(KEY_MAGIC)?;
-    let version = meta.get_int(KEY_VERSION)?;
+    let magic = meta.get_uint(KEY_MAGIC)?;
+    let version = meta.get_uint(KEY_VERSION)?;
 
     if magic != MAGIC || version != VERSION {
         return Err(Error::IO(IOError::new(
@@ -645,7 +645,7 @@ fn validate_segment_id(header: &[u8], id: u64) -> Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
 
-    let segment_id = meta.get_int(KEY_SEGMENT_ID)?;
+    let segment_id = meta.get_uint(KEY_SEGMENT_ID)?;
 
     if segment_id != id {
         return Err(Error::IO(IOError::new(
@@ -661,8 +661,8 @@ fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
 
-    let cf = meta.get_int(KEY_COMPRESSION_FORMAT)?;
-    let cl = meta.get_int(KEY_COMPRESSION_LEVEL)?;
+    let cf = meta.get_uint(KEY_COMPRESSION_FORMAT)?;
+    let cl = meta.get_uint(KEY_COMPRESSION_LEVEL)?;
 
     if let Some(expected_cf) = &opts.compression_format {
         if cf != expected_cf.as_u64() {
@@ -1438,10 +1438,10 @@ mod tests {
     }
 
     #[test]
-    fn test_put_and_get_int() {
+    fn test_put_and_get_uint() {
         let mut metadata = Metadata::new(None);
-        metadata.put_int("age", 25);
-        assert_eq!(metadata.get_int("age").unwrap(), 25);
+        metadata.put_uint("age", 25);
+        assert_eq!(metadata.get_uint("age").unwrap(), 25);
     }
 
     #[test]
@@ -1454,14 +1454,14 @@ mod tests {
     #[test]
     fn test_bytes_roundtrip() {
         let mut metadata = Metadata::new(None);
-        metadata.put_int("age", 30);
-        metadata.put_int("num", 40);
+        metadata.put_uint("age", 30);
+        metadata.put_uint("num", 40);
 
         let bytes = metadata.bytes();
         let restored_metadata = Metadata::new(Some(bytes));
 
-        assert_eq!(restored_metadata.get_int("age").unwrap(), 30);
-        assert_eq!(restored_metadata.get_int("num").unwrap(), 40);
+        assert_eq!(restored_metadata.get_uint("age").unwrap(), 30);
+        assert_eq!(restored_metadata.get_uint("num").unwrap(), 40);
     }
 
     #[test]
@@ -1490,8 +1490,8 @@ mod tests {
 
         // Create an extended metadata
         let mut extended_meta = Metadata::new(None);
-        extended_meta.put_int("key1", 123);
-        extended_meta.put_int("key2", 456);
+        extended_meta.put_uint("key1", 123);
+        extended_meta.put_uint("key2", 456);
 
         // Serialize and extend the extended metadata using bytes
         let extended_bytes = extended_meta.bytes();
@@ -1499,21 +1499,21 @@ mod tests {
             .expect("Failed to read from bytes");
 
         // Check if keys from existing metadata are present in the extended metadata
-        assert_eq!(meta.get_int(KEY_MAGIC).unwrap(), MAGIC);
-        assert_eq!(meta.get_int(KEY_VERSION).unwrap(), VERSION);
-        assert_eq!(meta.get_int(KEY_SEGMENT_ID).unwrap(), id);
+        assert_eq!(meta.get_uint(KEY_MAGIC).unwrap(), MAGIC);
+        assert_eq!(meta.get_uint(KEY_VERSION).unwrap(), VERSION);
+        assert_eq!(meta.get_uint(KEY_SEGMENT_ID).unwrap(), id);
         assert_eq!(
-            meta.get_int(KEY_COMPRESSION_FORMAT).unwrap(),
+            meta.get_uint(KEY_COMPRESSION_FORMAT).unwrap(),
             CompressionFormat::NoCompression.as_u64()
         );
         assert_eq!(
-            meta.get_int(KEY_COMPRESSION_LEVEL).unwrap(),
+            meta.get_uint(KEY_COMPRESSION_LEVEL).unwrap(),
             CompressionLevel::BestSpeed.as_u64()
         );
 
         // Check if keys from the extended metadata are present in the extended metadata
-        assert_eq!(meta.get_int("key1").unwrap(), 123);
-        assert_eq!(meta.get_int("key2").unwrap(), 456);
+        assert_eq!(meta.get_uint("key1").unwrap(), 123);
+        assert_eq!(meta.get_uint("key2").unwrap(), 456);
     }
 
     #[test]
@@ -1526,8 +1526,8 @@ mod tests {
 
         // Add optional metadata
         let mut metadata = Metadata::new(None);
-        metadata.put_int("key1", 123);
-        metadata.put_int("key2", 456);
+        metadata.put_uint("key1", 123);
+        metadata.put_uint("key2", 456);
         opts.metadata = Some(metadata);
 
         // Create a new segment file and write the header

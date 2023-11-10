@@ -55,7 +55,7 @@ where
         }
     }
 
-    pub fn read(&self, key: &K) -> Option<&V> {
+    pub fn get(&self, key: &K) -> Option<&V> {
         if let Some(entry) = self
             .small
             .iter()
@@ -156,8 +156,8 @@ mod tests {
         cache.insert("apple", "red");
         cache.insert("banana", "yellow");
 
-        assert_opt_eq(cache.read(&"apple"), "red");
-        assert_opt_eq(cache.read(&"banana"), "yellow");
+        assert_opt_eq(cache.get(&"apple"), "red");
+        assert_opt_eq(cache.get(&"banana"), "yellow");
     }
 
     #[test]
@@ -168,17 +168,17 @@ mod tests {
         cache.insert("banana", "yellow");
         cache.insert("orange", "orange");
 
-        assert!(cache.read(&"apple").is_none());
-        assert_opt_eq(cache.read(&"banana"), "yellow");
-        assert_opt_eq(cache.read(&"orange"), "orange");
+        assert!(cache.get(&"apple").is_none());
+        assert_opt_eq(cache.get(&"banana"), "yellow");
+        assert_opt_eq(cache.get(&"orange"), "orange");
 
         // "apple" should been removed from the cache.
         cache.insert("apple", "orange");
         cache.insert("tomato", "red");
 
-        assert!(cache.read(&"orange").is_none());
-        assert_opt_eq(cache.read(&"apple"), "orange");
-        assert_opt_eq(cache.read(&"tomato"), "red");
+        assert!(cache.get(&"orange").is_none());
+        assert_opt_eq(cache.get(&"apple"), "orange");
+        assert_opt_eq(cache.get(&"tomato"), "red");
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
         cache.insert(1, "a");
 
         let handle = thread::spawn(move || {
-            assert_eq!(cache.read(&1), Some(&"a"));
+            assert_eq!(cache.get(&1), Some(&"a"));
         });
 
         assert!(handle.join().is_ok());
