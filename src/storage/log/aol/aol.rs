@@ -239,7 +239,7 @@ impl AOL {
             self.active_segment.read_at(buf, read_offset)
         } else {
             let mut cache = self.segment_cache.write();
-            let reader = cache.read(&segment_id);
+            let reader = cache.get(&segment_id);
             if reader.is_none() {
                 let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
                 let read_bytes = segment.read_at(buf, read_offset)?;

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 
 use crate::storage::kv::entry::{TxRecordEntry, MAX_TX_METADATA_SIZE};
 use crate::storage::kv::error::{Error, Result};

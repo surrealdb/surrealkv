@@ -18,6 +18,7 @@ use crate::storage::log::aol::aol::AOL;
 use crate::storage::log::wal::wal::WAL;
 use crate::storage::log::{write_field, Options as LogOptions, BLOCK_SIZE};
 use crate::storage::log::{Error as LogError, Metadata};
+use crate::storage::Cache;
 
 /// An MVCC-based transactional key-value store.
 pub struct Store {
@@ -81,6 +82,11 @@ pub struct Core {
     pub(crate) manifest: AOL,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
+    /// Value cache for store.
+    /// The assumption for this cache is that it could be useful for
+    /// storing offsets that are frequently accessed (especially in
+    /// the case of range scans)
+    pub(crate) value_cache: Arc<RwLock<Cache<u64, Bytes>>>,
 }
 
 impl Core {
@@ -115,6 +121,9 @@ impl Core {
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
 
+        // Create and initialize value cache.
+        let value_cache = Arc::new(RwLock::new(Cache::new(opts.max_cache_size as usize)));
+
         // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
@@ -123,6 +132,7 @@ impl Core {
             wal: Arc::new(None),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
+            value_cache: value_cache,
         })
     }
 
@@ -355,9 +365,11 @@ mod tests {
 
         drop(store);
 
-        // Create a new store instance with VectorKey as the key type
+        // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
         opts.max_active_snapshots = 10;
+        opts.max_cache_size = 5;
+
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.core.opts.clone();
         assert_eq!(store_opts, opts);
