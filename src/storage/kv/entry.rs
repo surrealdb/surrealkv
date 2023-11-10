@@ -9,7 +9,7 @@ use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::Core;
 use crate::storage::kv::util::calculate_crc32;
 
-pub(crate) const MD_SIZE: usize = 2; // Size of txmdLen and kvmdLen in bytes
+pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
 pub(crate) const VERSION_SIZE: usize = 1; // Size of version in bytes
 pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
 pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
@@ -295,7 +295,7 @@ pub struct ValueRef {
 }
 
 impl ValueRef {
-    fn resolve(&self) -> Result<Vec<u8>> {
+    pub(crate) fn resolve(&self) -> Result<Vec<u8>> {
         if let Some(value) = &self.value {
             Ok(value.to_vec())
         } else if let Some(value_offset) = self.value_offset {
@@ -504,7 +504,6 @@ mod tests {
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap();
-            let val = val.resolve().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -516,7 +515,6 @@ mod tests {
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap();
-            let val = val.resolve().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -539,7 +537,6 @@ mod tests {
 
             // Retrieve the value associated with key3
             let val = txn.get(&key3).unwrap();
-            let val = val.resolve().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -582,7 +579,6 @@ mod tests {
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap();
-            let val = val.resolve().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -594,7 +590,6 @@ mod tests {
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap();
-            let val = val.resolve().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
