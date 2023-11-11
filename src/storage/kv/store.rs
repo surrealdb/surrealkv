@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::vec;
 
 use bytes::Bytes;
+use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::storage::index::art::KV;
@@ -18,7 +20,6 @@ use crate::storage::log::aol::aol::AOL;
 use crate::storage::log::wal::wal::WAL;
 use crate::storage::log::{write_field, Options as LogOptions, BLOCK_SIZE};
 use crate::storage::log::{Error as LogError, Metadata};
-use crate::storage::Cache;
 
 /// An MVCC-based transactional key-value store.
 pub struct Store {
@@ -86,7 +87,7 @@ pub struct Core {
     /// The assumption for this cache is that it could be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Arc<RwLock<Cache<u64, Bytes>>>,
+    pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
 }
 
 impl Core {
@@ -122,7 +123,8 @@ impl Core {
         oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
-        let value_cache = Arc::new(RwLock::new(Cache::new(opts.max_cache_size as usize)));
+        let cache_size = NonZeroUsize::new(opts.max_cache_size as usize).unwrap();
+        let value_cache = Arc::new(RwLock::new(LruCache::new(cache_size)));
 
         // Construct and return the Core instance.
         Ok(Self {

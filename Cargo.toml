@@ -11,6 +11,8 @@ crossbeam = "0.8.2"
 chrono = "0.4.31"
 crossbeam-channel = "0.5.8"
 parking_lot = "0.12.1"
+hashbrown = "0.14.2"
+lru = "0.12.0"
 
 # below is for the async runtime
 async-task = "4.4.0"
@@ -27,5 +29,8 @@ jemallocator = "0.3.2"
 
 [[bench]]
 name = "store_bench"
-path = "src/bench/store_bench.rs"
+harness = false
+
+[[bench]]
+name = "s3fifo_bench"
 harness = false
