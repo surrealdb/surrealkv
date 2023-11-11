@@ -9,23 +9,13 @@ use crate::storage::cache::queue::Queue;
 
 const MAX_FREQUENCY_LIMIT: u8 = 3;
 
-struct Entry<K: Debug, V: Debug> {
+struct Entry<K, V> {
     key: K,
     value: V,
     freq: AtomicU8,
 }
 
-impl<K: Debug, V: Debug> Debug for Entry<K, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Entry")
-            .field("key", &self.key)
-            .field("value", &self.value)
-            .field("freq", &self.freq)
-            .finish()
-    }
-}
-
-impl<K: Debug, V: Debug> Entry<K, V> {
+impl<K, V> Entry<K, V> {
     pub fn new(key: K, value: V) -> Self {
         Self {
             key,
@@ -40,7 +30,7 @@ impl<K: Debug, V: Debug> Entry<K, V> {
 pub struct Cache<K, V>
 where
     K: PartialEq + Eq + Hash + Clone + Debug,
-    V: Debug + Clone,
+    V: Clone,
 {
     min_eviction_size: usize,
     max_cache_size: usize,
@@ -53,7 +43,7 @@ where
 impl<K, V> Cache<K, V>
 where
     K: PartialEq + Eq + Hash + Clone + Debug,
-    V: Debug + Clone,
+    V: Clone,
 {
     pub fn new(cache_size: usize) -> Self {
         assert!(cache_size > 0);
@@ -93,14 +83,14 @@ where
         }
     }
 
-    fn push_m(&mut self, tail: Entry<K, V>) {
+    fn insert_m(&mut self, tail: Entry<K, V>) {
         self.main.push(tail);
         if self.main.len() >= self.max_cache_size {
             self.evict_m();
         }
     }
 
-    fn push_g(&mut self, tail: Entry<K, V>) {
+    fn insert_g(&mut self, tail: Entry<K, V>) {
         if self.ghost.len() >= self.max_cache_size {
             let key = self.ghost.pop().unwrap();
             self.table.remove(&key);
@@ -140,9 +130,9 @@ where
         while !evicted && self.small.len() > 0 {
             if let Some(tail) = self.small.pop() {
                 if tail.freq.load(Relaxed) > 1 {
-                    self.push_m(tail);
+                    self.insert_m(tail);
                 } else {
-                    self.push_g(tail);
+                    self.insert_g(tail);
                     evicted = true;
                 }
             }
