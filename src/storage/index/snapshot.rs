@@ -1,7 +1,8 @@
 //! This module defines the Snapshot struct for managing snapshots within a Trie structure.
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use hashbrown::HashSet;
 
 use crate::storage::index::art::{Node, TrieError};
 use crate::storage::index::iter::IterationPointer;

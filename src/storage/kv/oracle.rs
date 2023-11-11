@@ -1,7 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::HashMap,
-    collections::{BinaryHeap, HashSet},
+    collections::BinaryHeap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -10,6 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::index::art::TrieError;

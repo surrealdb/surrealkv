@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use crate::storage::kv::entry::{TxRecordEntry, MAX_TX_METADATA_SIZE};
 use crate::storage::kv::error::{Error, Result};
