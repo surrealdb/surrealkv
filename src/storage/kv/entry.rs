@@ -316,7 +316,7 @@ impl ValueRef {
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
     fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
         // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.read().get(&value_offset) {
+        if let Some(value) = self.store.value_cache.write().get(&value_offset) {
             return Ok(value.to_vec());
         }
 
@@ -329,7 +329,7 @@ impl ValueRef {
         self.store
             .value_cache
             .write()
-            .insert(value_offset, Bytes::from(buf.clone()));
+            .push(value_offset, Bytes::from(buf.clone()));
 
         Ok(buf)
     }

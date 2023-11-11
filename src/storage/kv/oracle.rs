@@ -1,11 +1,11 @@
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     collections::{BinaryHeap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    cmp::Reverse,
 };
 
 use bytes::Bytes;
