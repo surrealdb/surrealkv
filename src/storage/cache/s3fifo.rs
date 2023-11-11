@@ -33,6 +33,7 @@ where
     V: Clone,
 {
     min_eviction_size: usize,
+    max_ghost_size: usize,
     max_cache_size: usize,
     small: Queue<Entry<K, V>>,
     main: Queue<Entry<K, V>>,
@@ -45,13 +46,15 @@ where
     K: PartialEq + Eq + Hash + Clone + Debug,
     V: Clone,
 {
-    pub fn new(cache_size: usize) -> Self {
-        assert!(cache_size > 0);
-        let min_eviction_size = cache_size / 10;
+    pub fn new(max_cache_size: usize) -> Self {
+        assert!(max_cache_size > 0);
+        let min_eviction_size = max_cache_size / 10;
+        let max_ghost_size = max_cache_size - min_eviction_size;
 
         Self {
             min_eviction_size,
-            max_cache_size: cache_size,
+            max_ghost_size,
+            max_cache_size,
             small: Queue::new(),
             main: Queue::new(),
             ghost: Queue::new(),
@@ -91,7 +94,7 @@ where
     }
 
     fn insert_g(&mut self, tail: Entry<K, V>) {
-        if self.ghost.len() >= self.max_cache_size {
+        if self.ghost.len() >= self.max_ghost_size {
             let key = self.ghost.pop().unwrap();
             self.table.remove(&key);
         }
