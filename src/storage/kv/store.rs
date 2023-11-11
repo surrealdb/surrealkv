@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::vec;

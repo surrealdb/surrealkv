@@ -1,6 +1,5 @@
-use std::collections::HashSet;
-
 use bytes::{Bytes, BytesMut};
+use hashbrown::HashSet;
 
 use crate::storage::kv::error::{Error, Result};
 

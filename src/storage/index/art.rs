@@ -1,11 +1,13 @@
 use core::panic;
 use std::cmp::min;
-use std::collections::{Bound, HashSet};
+use std::collections::Bound;
 use std::error::Error;
 use std::fmt;
 use std::ops::RangeBounds;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use hashbrown::HashSet;
 
 use crate::storage::index::iter::{Iter, Range};
 use crate::storage::index::node::{FlatNode, Node256, Node48, NodeTrait, TwigNode, Version};

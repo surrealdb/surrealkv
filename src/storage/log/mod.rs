@@ -1,7 +1,6 @@
 pub mod aol;
 pub mod wal;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
@@ -12,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
 use crc32fast::Hasher;
+use hashbrown::HashMap;
 
 /// The size of a single block in bytes.
 ///

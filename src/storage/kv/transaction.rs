@@ -1,8 +1,8 @@
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use hashbrown::HashMap;
+use parking_lot::Mutex;
 
 use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
