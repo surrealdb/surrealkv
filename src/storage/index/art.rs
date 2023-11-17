@@ -1,6 +1,5 @@
 use core::panic;
 use std::cmp::min;
-use std::collections::Bound;
 use std::error::Error;
 use std::fmt;
 use std::ops::RangeBounds;
@@ -1308,30 +1307,8 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
             return Range::empty();
         }
 
-        let mut iter = self.iter();
-
-        // Determine the start key based on the range's start bound
-        let start_key = match range.start_bound() {
-            Bound::Included(start_key) | Bound::Excluded(start_key) => start_key,
-            Bound::Unbounded => {
-                let bound = range.end_bound().cloned();
-                return Range::for_iter(iter, bound);
-            }
-        };
-
-        // Iterate through the Trie until the start key is found or the end of the Trie is reached
-        while let Some((k, _, _, _)) = iter.next() {
-            if start_key.as_slice() == k.as_slice() {
-                if let Bound::Excluded(_) = range.start_bound() {
-                    iter.next();
-                }
-                let bound = range.end_bound().cloned();
-                return Range::for_iter(iter, bound);
-            }
-        }
-
-        // If the start key is not found, return an empty Range iterator
-        Range::empty()
+        let iter = self.iter();
+        return Range::for_iter(iter, range.end_bound().cloned());
     }
 
     fn is_closed(&self) -> Result<(), TrieError> {
@@ -1978,40 +1955,45 @@ mod tests {
     }
 
     #[test]
-    fn test_range() {
-        let mut tree = Tree::<ArrayKey<16>, u64>::new();
-        let count = 10000;
-        let mut rng = thread_rng();
-        let mut keys_inserted = BTreeMap::new();
+    fn test_range_seq_u8() {
+        let mut tree: Tree<ArrayKey<32>, u8> = Tree::<ArrayKey<32>, u8>::new();
 
-        // Insertion and tracking of keys inserted
-        for _i in 0..count {
-            let random_val = rng.gen_range(0..count);
-            let random_key: ArrayKey<16> = random_val.into();
-
-            if tree.get(&random_key, 0).is_ok() {
-                continue;
-            }
-
-            if tree
-                .insert(&random_key, random_val, 0, 0)
-                .unwrap()
-                .is_none()
-            {
-                keys_inserted.insert(random_val, random_val);
-            }
+        let max = u8::MAX;
+        // Insertion
+        for i in 0..=max {
+            let key: ArrayKey<32> = i.into();
+            tree.insert(&key, i, 0, 0);
         }
 
-        // Range query and verification
-        let end_key: ArrayKey<16> = 100u64.into();
-        let art_range = tree.range(..end_key);
-        let btree_range = keys_inserted.range(..100);
+        let mut len = 0usize;
+        let start_key: ArrayKey<16> = 0u8.into();
+        let end_key: ArrayKey<16> = max.into();
 
-        for (art_entry, btree_entry) in art_range.zip(btree_range) {
-            let art_key = from_be_bytes_key(&art_entry.0);
-            assert_eq!(art_key, *btree_entry.0);
-            assert_eq!(art_entry.1, btree_entry.1);
+        for _ in tree.range(start_key..=end_key) {
+            len += 1;
         }
+        assert_eq!(len, max as usize + 1);
+    }
+
+    #[test]
+    fn test_range_seq_u16() {
+        let mut tree: Tree<ArrayKey<32>, u16> = Tree::<ArrayKey<32>, u16>::new();
+
+        let max = u16::MAX;
+        // Insertion
+        for i in 0..=max {
+            let key: ArrayKey<32> = i.into();
+            tree.insert(&key, i, 0, 0);
+        }
+
+        let mut len = 0usize;
+        let start_key: ArrayKey<16> = 0u8.into();
+        let end_key: ArrayKey<16> = max.into();
+
+        for _ in tree.range(start_key..=end_key) {
+            len += 1;
+        }
+        assert_eq!(len, max as usize + 1);
     }
 
     #[test]

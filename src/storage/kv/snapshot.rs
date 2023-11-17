@@ -4,10 +4,14 @@ use bytes::Bytes;
 
 use super::entry::ValueRef;
 use crate::storage::index::art::TrieError;
+use crate::storage::index::iter::IterationPointer;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
 use crate::storage::index::VectorKey;
+
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::store::Core;
+
+pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
@@ -42,14 +46,11 @@ impl Snapshot {
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
     pub fn get(&self, key: &VectorKey) -> Result<ValueRef> {
-        // Create a slice with your filter function if needed, e.g., [ignore_deleted]
-        let filters: Vec<fn(&ValueRef, u64) -> Result<()>> = vec![ignore_deleted];
-
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VectorKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.get_with_filters(key, &filters)
+        self.get_with_filters(key, &FILTERS)
     }
 
     pub fn get_with_filters<F>(&self, key: &VectorKey, filters: &[F]) -> Result<ValueRef>
@@ -66,6 +67,10 @@ impl Snapshot {
         }
 
         Ok(val_ref)
+    }
+
+    pub fn new_reader<'a>(&'a mut self) -> Result<IterationPointer<VectorKey, Bytes>> {
+        Ok(self.snap.new_reader()?)
     }
 
     pub fn close(&mut self) -> Result<()> {

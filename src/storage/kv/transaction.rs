@@ -1,8 +1,9 @@
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
@@ -13,7 +14,7 @@ use crate::storage::kv::entry::{
     Entry, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
 };
 use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::snapshot::Snapshot;
+use crate::storage::kv::snapshot::{FilterFn, Snapshot, FILTERS};
 use crate::storage::kv::util::now;
 
 /// An MVCC transaction mode.
@@ -60,7 +61,7 @@ pub struct Transaction {
     mode: Mode,
 
     /// The snapshot that the transaction is running in.
-    pub(crate) snapshot: Snapshot,
+    pub(crate) snapshot: RwLock<Snapshot>,
 
     // Reusable buffer for encoding transaction records.
     buf: BytesMut,
@@ -86,7 +87,7 @@ impl Transaction {
     pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
         // TODO!! This should be the max txID of the index, get this from oracle
         let read_ts = store.oracle.read_ts();
-        let snapshot = Snapshot::take(store.clone(), read_ts)?;
+        let snapshot = RwLock::new(Snapshot::take(store.clone(), read_ts)?);
 
         Ok(Self {
             read_ts,
@@ -135,7 +136,7 @@ impl Transaction {
 
         // Check if the key is in the snapshot.
         let key = Bytes::copy_from_slice(key);
-        match self.snapshot.get(&key[..].into()) {
+        match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
@@ -186,13 +187,44 @@ impl Transaction {
             let indexed_value: Vec<u8> =
                 vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
             let indexed_value_bytes = Bytes::from(indexed_value);
-            self.snapshot.set(&e.key[..].into(), indexed_value_bytes)?;
+            self.snapshot
+                .write()
+                .set(&e.key[..].into(), indexed_value_bytes)?;
         }
 
         // Add the entry to pending writes
         self.write_set.insert(e.key.clone(), e);
 
         Ok(())
+    }
+
+    pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Bytes, u64, u64)>>
+    where
+        R: RangeBounds<VectorKey> + 'b,
+    {
+        let iterator = self.snapshot.write().new_reader()?;
+        let ranger = iterator.range(range);
+        let mut results = Vec::new();
+
+        for (key, value, version, ts) in ranger {
+            let mut val_ref = ValueRef::new(self.store.clone());
+            let val_bytes_ref: &Bytes = &value;
+            val_ref.decode(*version, val_bytes_ref)?;
+
+            for filter in &FILTERS {
+                if filter.apply(&val_ref, self.read_ts).is_err() {
+                    continue;
+                }
+            }
+
+            self.read_set
+                .lock()
+                .push((Bytes::copy_from_slice(&key), val_ref.ts));
+
+            results.push((value.clone(), *version, *ts));
+        }
+
+        Ok(results)
     }
 
     // precommit the transaction to WAL
@@ -481,5 +513,40 @@ mod tests {
                 _ => false,
             });
         }
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_basic_scan() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new Core instance with VectorKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Define key-value pairs for the test
+        let keys_to_insert = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+
+        for key in &keys_to_insert {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &key).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // TODO: fix passing vector key to scan
+        let range = VectorKey::from_str("key1")..=VectorKey::from_str("key3");
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range).unwrap();
+        assert_eq!(results.len(), keys_to_insert.len());
     }
 }
