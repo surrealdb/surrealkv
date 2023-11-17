@@ -341,7 +341,7 @@ impl Drop for WAL {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::log::WAL_RECORD_HEADER_SIZE;
+    use crate::storage::log::{BLOCK_SIZE, WAL_RECORD_HEADER_SIZE};
 
     use super::*;
     use tempdir::TempDir;
@@ -386,7 +386,7 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing
-        assert_eq!(a.offset(), 4096);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64);
 
         // Test reading from segment
         let mut bs = vec![0; 11];
@@ -405,7 +405,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = a.read_at(&mut bs, 4097);
+        let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
@@ -414,12 +414,12 @@ mod tests {
         assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 7 + 4 = 4107
-        assert_eq!(a.offset(), 4107);
+        // BLOCK_SIZE + 7 + 4 = 4107
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 11];
-        let n = a.read_at(&mut bs, 4096).expect("should read");
+        let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
         assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
@@ -428,7 +428,7 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing again
-        assert_eq!(a.offset(), 4096 * 2);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 * 2);
 
         // Test closing wal
         assert!(a.close().is_ok());
@@ -462,7 +462,7 @@ mod tests {
 
         // Validate offset after appending
         // 4096 + 7 + 7 = 4110
-        assert_eq!(a.offset(), 4110);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 7);
 
         // Test reading from segment
         let mut bs = vec![0; 11];
@@ -472,7 +472,7 @@ mod tests {
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 14];
-        let n = a.read_at(&mut bs, 4096).expect("should read");
+        let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
         assert_eq!(14, n);
         assert_eq!(
             &[4, 5, 6, 7, 8, 9, 10].to_vec(),
@@ -481,7 +481,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = a.read_at(&mut bs, 4097);
+        let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
@@ -490,12 +490,14 @@ mod tests {
         assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4110 + 7 + 4 = 4121
-        assert_eq!(a.offset(), 4121);
+        // BLOCK_SZIE + 14 + 7 + 4 = 4121
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 14 + 7 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 11];
-        let n = a.read_at(&mut bs, 4110).expect("should read");
+        let n = a
+            .read_at(&mut bs, BLOCK_SIZE as u64 + 14)
+            .expect("should read");
         assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 

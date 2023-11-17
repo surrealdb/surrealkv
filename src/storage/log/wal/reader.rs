@@ -264,11 +264,11 @@ mod tests {
 
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![5, 6]);
-        assert_eq!(reader.total_read, 4105);
+        assert_eq!(reader.total_read, BLOCK_SIZE + 9);
 
         reader.next().expect("should read");
         assert_eq!(reader.rec, vec![7, 8, 9]);
-        assert_eq!(reader.total_read, 8202);
+        assert_eq!(reader.total_read, BLOCK_SIZE * 2 + 10);
     }
 
     fn create_test_segment_with_data(
@@ -400,7 +400,7 @@ mod tests {
         read_file_header(&mut file).expect("should read");
 
         // Corrupt the checksum of the second record
-        let offset_to_edit = 162;
+        let offset_to_edit = 195;
         let new_byte_value = 0x55;
         file.seek(SeekFrom::Start(offset_to_edit as u64))
             .expect("should seek");
@@ -477,7 +477,7 @@ mod tests {
 
             let rec = reader.read().expect("should read");
             assert_eq!(rec.0, vec![4, 5, 6, 7, 8, 9, 10]);
-            assert_eq!(reader.total_read, 4110);
+            assert_eq!(reader.total_read, BLOCK_SIZE + 14);
         }
     }
 
