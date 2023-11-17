@@ -236,27 +236,6 @@ impl TxRecordHeader {
             buf.put(md_bytes);
         }
     }
-
-    pub(crate) fn decode(&mut self, encoded_bytes: &Bytes) -> Result<()> {
-        let mut cursor = Cursor::new(encoded_bytes);
-        self.id = cursor.get_u64();
-        self.ts = cursor.get_u64();
-        self.version = cursor.get_u16();
-
-        let md_len = cursor.get_u16() as usize;
-        if md_len > 0 {
-            let metadata_bytes = cursor.get_ref()[cursor.position() as usize..][..md_len].as_ref();
-            cursor.advance(md_len);
-            let metadata = Metadata::from_bytes(metadata_bytes)?;
-            self.metadata = Some(metadata);
-        } else {
-            self.metadata = None;
-        }
-
-        self.num_entries = cursor.get_u16();
-
-        Ok(())
-    }
 }
 
 #[derive(Debug)]

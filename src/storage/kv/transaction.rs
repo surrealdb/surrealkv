@@ -344,10 +344,6 @@ impl Transaction {
 
     /// Rolls back the transaction, by removing all updated entries.
     pub fn rollback(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(Error::TxnClosed);
-        }
-
         self.closed = true;
         self.committed_values_offsets.clear();
         self.buf.clear();
@@ -355,6 +351,15 @@ impl Transaction {
         self.read_set.lock().clear();
 
         Ok(())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        let err = self.rollback();
+        if err.is_err() {
+            panic!("failed to drop transaction: {:?}", err);
+        }
     }
 }
 
