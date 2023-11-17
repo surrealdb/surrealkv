@@ -1,4 +1,5 @@
 use std::collections::{Bound, VecDeque};
+use std::ops::RangeBounds;
 use std::rc::Rc;
 
 use crate::storage::index::art::{Node, NodeType};
@@ -31,6 +32,14 @@ impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
     ///
     pub fn iter(&self) -> Iter<P, V> {
         Iter::new(Some(&self.root))
+    }
+
+    pub fn range<'a, R>(&'a self, range: R) -> Range<P, P, V>
+    where
+        R: RangeBounds<P> + 'a,
+    {
+        let iter = self.iter();
+        return Range::for_iter(iter, range.end_bound().cloned());
     }
 }
 
@@ -102,7 +111,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for Iter<'a, P, V> {
 
 /// An internal state for the Iter iterator.
 struct IterState<'a, P: KeyTrait + 'a, V: Clone> {
-    node_iter: Vec<NodeIter<'a, P, V>>,
+    iters: Vec<NodeIter<'a, P, V>>,
     leafs: VecDeque<(&'a P, &'a V, &'a u64, &'a u64)>,
 }
 
@@ -114,13 +123,12 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
     /// * `node` - A reference to the root node of the Trie.
     ///
     pub fn new(node: &'a Node<P, V>) -> Self {
-        let mut node_iter = Vec::new();
-        node_iter.push(NodeIter::new(node.iter()));
+        let mut iters = Vec::new();
+        let leafs = VecDeque::new();
 
-        Self {
-            node_iter,
-            leafs: VecDeque::new(),
-        }
+        iters.push(NodeIter::new(node.iter()));
+
+        Self { iters, leafs }
     }
 }
 
@@ -128,12 +136,12 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
     type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        'outer: while let Some(node) = self.node_iter.last_mut() {
+        'outer: while let Some(node) = self.iters.last_mut() {
             let e = node.next();
             loop {
                 match e {
                     None => {
-                        self.node_iter.pop().unwrap();
+                        self.iters.pop().unwrap();
                         break;
                     }
                     Some(other) => {
@@ -148,7 +156,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
                             }
                             break 'outer;
                         } else {
-                            self.node_iter.push(NodeIter::new(other.1.iter()));
+                            self.iters.push(NodeIter::new(other.1.iter()));
                             break;
                         }
                     }
@@ -164,7 +172,6 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
 
 /// An enum representing the result of a range operation.
 enum RangeResult<'a, V: Clone> {
-    Continue,
     Yield(Option<(Vec<u8>, &'a V, &'a u64, &'a u64)>),
 }
 
@@ -212,7 +219,9 @@ impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V
             Some((key, value, version, ts)) => {
                 let next_key_slice = key.as_slice();
                 match &self.end_bound {
-                    Bound::Included(k) if next_key_slice == k.as_slice() => RangeResult::Continue,
+                    Bound::Included(k) if next_key_slice == k.as_slice() => {
+                        RangeResult::Yield(Some((key, value, version, ts)))
+                    }
                     Bound::Excluded(k) if next_key_slice == k.as_slice() => {
                         RangeResult::Yield(None)
                     }
@@ -230,11 +239,6 @@ impl<'a, K: KeyTrait, P: KeyTrait + 'a, V: Clone + 'a> Iterator for Range<'a, K,
 
     fn next(&mut self) -> Option<(Vec<u8>, &'a V, &'a u64, &'a u64)> {
         match self.inner.next() {
-            RangeResult::Continue => {
-                let res = self.next();
-                self.inner = Box::new(EmptyRangeIterator);
-                res
-            }
             RangeResult::Yield(item) => item,
         }
     }
