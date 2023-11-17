@@ -217,9 +217,10 @@ impl Transaction {
                 }
             }
 
-            self.read_set
-                .lock()
-                .push((Bytes::copy_from_slice(&key), val_ref.ts));
+            self.read_set.lock().push((
+                Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the tart leaf are terminated with a null byte
+                val_ref.ts,
+            ));
 
             results.push((value.clone(), *version, *ts));
         }
@@ -265,6 +266,8 @@ impl Transaction {
         self.commit_to_index(tx_id, commit_ts)?;
 
         oracle.committed_upto(tx_id);
+
+        self.closed = true;
 
         Ok(())
     }
@@ -360,11 +363,9 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
 
-    use crate::storage::kv::error::Error;
+    use super::*;
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Core;
     use crate::storage::kv::store::Store;
-    use crate::storage::kv::transaction::{Mode, Transaction};
 
     use tempdir::TempDir;
 
@@ -448,6 +449,28 @@ mod tests {
             txn2.commit().unwrap();
         }
 
+        // read conflict when the read key was updated by another transaction
+        {
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key1, &value1).unwrap();
+            txn1.commit().unwrap();
+
+            assert!(txn2.get(&key1).is_ok());
+            txn2.set(&key1, &value2).unwrap();
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+
         // blind writes should succeed if key wasn't read first
         {
             let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
@@ -464,6 +487,7 @@ mod tests {
             assert_eq!(val, value2.as_ref());
         }
 
+        // read conflict when the read key was updated by another transaction
         {
             let key = Bytes::from("key3");
 
@@ -487,6 +511,7 @@ mod tests {
             });
         }
 
+        // read conflict when the read key was deleted by another transaction
         {
             let key = Bytes::from("key4");
 
@@ -515,10 +540,37 @@ mod tests {
         }
     }
 
-    use super::*;
+    #[test]
+    fn test_basic_scan_single_key() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new Core instance with VectorKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Define key-value pairs for the test
+        let keys_to_insert = vec![Bytes::from("key1")];
+
+        for key in &keys_to_insert {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &key).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // TODO: fix passing vector key to scan
+        let range = VectorKey::from_str("key1")..=VectorKey::from_str("key3");
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range).unwrap();
+        assert_eq!(results.len(), keys_to_insert.len());
+    }
 
     #[test]
-    fn test_basic_scan() {
+    fn test_basic_scan_multiple_keys() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -548,5 +600,87 @@ mod tests {
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
+    }
+
+    #[test]
+    fn test_mvcc_snapshot_isolation_with_scan() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Arc::new(Core::new(opts).expect("should create store"));
+
+        let key1 = Bytes::from("key1");
+        let key2 = Bytes::from("key2");
+        let key3 = Bytes::from("key3");
+        let key4 = Bytes::from("key4");
+        let value1 = Bytes::from("value1");
+        let value2 = Bytes::from("value2");
+        let value3 = Bytes::from("value3");
+        let value4 = Bytes::from("value4");
+        let value5 = Bytes::from("value5");
+        let value6 = Bytes::from("value6");
+
+        // read conflict when scan keys have been updated in another transaction
+        {
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key1, &value1).unwrap();
+            txn1.commit().unwrap();
+
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn2.set(&key1, &value4).unwrap();
+            txn2.set(&key2, &value2).unwrap();
+            txn2.set(&key3, &value3).unwrap();
+            txn2.commit().unwrap();
+
+            let range = VectorKey::from_str("key1")..=VectorKey::from_str("key4");
+            let results = txn3.scan(range).unwrap();
+            assert_eq!(results.len(), 1);
+            txn3.set(&key2, &value5).unwrap();
+            txn3.set(&key3, &value6).unwrap();
+
+            assert!(match txn3.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+
+        // read conflict when read keys are deleted by other transaction
+        {
+            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn1.set(&key4, &value1).unwrap();
+            txn1.commit().unwrap();
+
+            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+
+            txn2.delete(&key4).unwrap();
+            txn2.commit().unwrap();
+
+            let range = VectorKey::from_str("key1")..=VectorKey::from_str("key5");
+            txn3.scan(range).unwrap();
+            txn3.set(&key4, &value2).unwrap();
+
+            assert!(match txn3.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
     }
 }

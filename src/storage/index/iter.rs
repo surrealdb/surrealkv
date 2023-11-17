@@ -124,9 +124,18 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
     ///
     pub fn new(node: &'a Node<P, V>) -> Self {
         let mut iters = Vec::new();
-        let leafs = VecDeque::new();
+        let mut leafs = VecDeque::new();
 
-        iters.push(NodeIter::new(node.iter()));
+        if node.is_twig() {
+            let NodeType::Twig(twig) = &node.node_type else {
+                panic!("should not happen");
+            };
+            for v in twig.iter() {
+                leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
+            }
+        } else {
+            iters.push(NodeIter::new(node.iter()));
+        }
 
         Self { iters, leafs }
     }
@@ -179,7 +188,6 @@ enum RangeResult<'a, V: Clone> {
 struct RangeIterator<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> {
     iter: Iter<'a, P, V>,
     end_bound: Bound<K>,
-    _marker: std::marker::PhantomData<P>,
 }
 
 struct EmptyRangeIterator;
@@ -202,11 +210,7 @@ impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V
 
 impl<'a, K: KeyTrait, P: KeyTrait, V: Clone> RangeIterator<'a, K, P, V> {
     pub fn new(iter: Iter<'a, P, V>, end_bound: Bound<K>) -> Self {
-        Self {
-            iter,
-            end_bound,
-            _marker: Default::default(),
-        }
+        Self { iter, end_bound }
     }
 }
 

@@ -1344,8 +1344,6 @@ mod tests {
     use super::{Tree, KV};
     use crate::storage::index::{ArrayKey, VectorKey};
 
-    use rand::{thread_rng, Rng};
-    use std::collections::BTreeMap;
     use std::fs::File;
     use std::io::{self, BufRead, BufReader};
 
@@ -1478,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_foo() {
+    fn test_inserting_keys_with_common_prefix() {
         let key1 = VectorKey::from_str("foo");
         let key2 = VectorKey::from_str("foo2");
 
