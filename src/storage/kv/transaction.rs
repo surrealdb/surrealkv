@@ -405,6 +405,13 @@ mod tests {
         }
 
         {
+            // Start a read-only transaction (txn3)
+            let txn3 = store.begin().unwrap();
+            let val = txn3.get(&key1).unwrap();
+            assert_eq!(val, value1.as_ref());
+        }
+
+        {
             // Start another read-write transaction (txn2)
             let mut txn2 = store.begin().unwrap();
             txn2.set(&key1, &value2).unwrap();
@@ -420,11 +427,11 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
 
-        // Start a read-only transaction (txn3)
-        let txn3 = store.begin().unwrap();
-        let val = txn3.get(&key1).unwrap();
+        // Start a read-only transaction (txn4)
+        let txn4 = store.begin().unwrap();
+        let val = txn4.get(&key1).unwrap();
 
-        // Assert that the value retrieved in txn3 matches value2_clone
+        // Assert that the value retrieved in txn4 matches value2
         assert_eq!(val, value2.as_ref());
     }
 
