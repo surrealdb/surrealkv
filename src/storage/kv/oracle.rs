@@ -139,7 +139,7 @@ impl SnapshotIsolation {
         for (key, ts) in read_set.iter() {
             match current_snapshot.get(&key[..].into()) {
                 Ok(val_ref) => {
-                    if *ts != val_ref.ts {
+                    if *ts != val_ref.ts() {
                         return Err(Error::TxnReadConflict);
                     }
                 }

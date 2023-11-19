@@ -65,15 +65,14 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &P, ts: u64) -> Result<(V, u64, u64), TrieError> {
+    pub fn get(&self, key: &P) -> Result<(V, u64, u64), TrieError> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
         // Use a recursive function to get the value and timestamp from the root node
         match self.root.as_ref() {
-            Some(root) => {
-                Node::get_recurse(root, key, ts).map(|(_, value, version, ts)| (value, version, ts))
-            }
+            Some(root) => Node::get_recurse(root, key, root.version())
+                .map(|(_, value, version, ts)| (value, version, ts)),
             None => Err(TrieError::KeyNotFound),
         }
     }
@@ -177,34 +176,33 @@ mod tests {
         let key_3_snap2 = VectorKey::from_str("key_3_snap2");
 
         assert!(tree.insert(&key_1, 1, 0, 0).is_ok());
-        let initial_version = tree.version();
 
         // Keys inserted before snapshot creation should be visible
         let mut snap1 = tree.create_snapshot().unwrap();
         assert_eq!(snap1.id, 0);
-        assert_eq!(snap1.get(&key_1, initial_version).unwrap(), (1, 1, 0));
+        assert_eq!(snap1.get(&key_1).unwrap(), (1, 1, 0));
 
         let mut snap2 = tree.create_snapshot().unwrap();
         assert_eq!(snap2.id, 1);
-        assert_eq!(snap2.get(&key_1, initial_version).unwrap(), (1, 1, 0));
+        assert_eq!(snap2.get(&key_1).unwrap(), (1, 1, 0));
 
         assert_eq!(tree.snapshot_count(), 2);
 
         // Keys inserted after snapshot creation should not be visible to other snapshots
         assert!(tree.insert(&key_2, 1, 0, 0).is_ok());
-        assert!(snap1.get(&key_2, snap1.version()).is_err());
-        assert!(snap2.get(&key_2, snap2.version()).is_err());
+        assert!(snap1.get(&key_2).is_err());
+        assert!(snap2.get(&key_2).is_err());
 
         // Keys inserted after snapshot creation should be visible to the snapshot that inserted them
         assert!(snap1.insert(&key_3_snap1, 2, 0).is_ok());
-        assert_eq!(snap1.get(&key_3_snap1, snap1.version()).unwrap(), (2, 2, 0));
+        assert_eq!(snap1.get(&key_3_snap1).unwrap(), (2, 2, 0));
 
         assert!(snap2.insert(&key_3_snap2, 3, 0).is_ok());
-        assert_eq!(snap2.get(&key_3_snap2, snap2.version()).unwrap(), (3, 2, 0));
+        assert_eq!(snap2.get(&key_3_snap2).unwrap(), (3, 2, 0));
 
         // Keys inserted after snapshot creation should not be visible to other snapshots
-        assert!(snap1.get(&key_3_snap2, snap1.version()).is_err());
-        assert!(snap2.get(&key_3_snap1, snap2.version()).is_err());
+        assert!(snap1.get(&key_3_snap2).is_err());
+        assert!(snap2.get(&key_3_snap1).is_err());
 
         assert!(snap1.close().is_ok());
         assert!(snap2.close().is_ok());

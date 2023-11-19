@@ -261,6 +261,13 @@ impl TxRecordEntry {
     }
 }
 
+pub(crate) trait Value {
+    fn resolve(&self) -> Result<Vec<u8>>;
+    fn ts(&self) -> u64;
+    fn key_value_metadata(&self) -> Option<&Metadata>;
+    fn length(&self) -> usize;
+}
+
 /// Value reference implementation.
 pub struct ValueRef {
     pub(crate) flag: u8,
@@ -273,11 +280,11 @@ pub struct ValueRef {
     store: Arc<Core>,
 }
 
-impl ValueRef {
+impl Value for ValueRef {
     /// Resolves the value associated with this instance.
     /// If the value is present, it returns a cloned vector of the value.
     /// If the value offset is present, it reads the value from the offset in the commit log.
-    pub(crate) fn resolve(&self) -> Result<Vec<u8>> {
+    fn resolve(&self) -> Result<Vec<u8>> {
         // Check if the value is present directly
         if let Some(value) = &self.value {
             Ok(value.to_vec())
@@ -290,34 +297,11 @@ impl ValueRef {
         }
     }
 
-    /// Resolves the value from the given offset in the commit log.
-    /// If the offset exists in the value cache, it returns the cached value.
-    /// Otherwise, it reads the value from the commit log, caches it, and returns it.
-    fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
-        // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.write().get(&value_offset) {
-            return Ok(value.to_vec());
-        }
-
-        // Read the value from the commit log at the specified offset
-        let mut buf = vec![0; self.value_length];
-        let vlog = self.store.clog.read();
-        vlog.read_at(&mut buf, value_offset)?;
-
-        // Store the offset and value in value_cache
-        self.store
-            .value_cache
-            .write()
-            .push(value_offset, Bytes::from(buf.clone()));
-
-        Ok(buf)
-    }
-
-    fn transaction_id(&self) -> u64 {
+    fn ts(&self) -> u64 {
         self.ts
     }
 
-    pub(crate) fn key_value_metadata(&self) -> Option<&Metadata> {
+    fn key_value_metadata(&self) -> Option<&Metadata> {
         self.key_value_metadata.as_ref()
     }
 
@@ -359,6 +343,25 @@ impl ValueRef {
             let val_off = value_offsets.get(key).unwrap();
             buf.put_u64(*val_off as u64);
         }
+
+        if let Some(metadata) = &metadata {
+            let md_bytes = metadata.bytes();
+            let md_len = md_bytes.len() as u16;
+            buf.put_u16(md_len);
+            buf.put(md_bytes);
+        } else {
+            buf.put_u16(0);
+        }
+        buf.freeze()
+    }
+
+    /// Encode the valueRef into an in-memory byte representation.
+    pub(crate) fn encode_mem(key: &Bytes, value: &Bytes, metadata: Option<&Metadata>) -> Bytes {
+        let mut buf = BytesMut::new();
+
+        buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
+        buf.put_u32(value.len() as u32);
+        buf.put(value.as_ref());
 
         if let Some(metadata) = &metadata {
             let md_bytes = metadata.bytes();
@@ -423,6 +426,29 @@ impl ValueRef {
         }
 
         Ok(())
+    }
+
+    /// Resolves the value from the given offset in the commit log.
+    /// If the offset exists in the value cache, it returns the cached value.
+    /// Otherwise, it reads the value from the commit log, caches it, and returns it.
+    fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
+        // Check if the offset exists in value_cache and return if found
+        if let Some(value) = self.store.value_cache.write().get(&value_offset) {
+            return Ok(value.to_vec());
+        }
+
+        // Read the value from the commit log at the specified offset
+        let mut buf = vec![0; self.value_length];
+        let vlog = self.store.clog.read();
+        vlog.read_at(&mut buf, value_offset)?;
+
+        // Store the offset and value in value_cache
+        self.store
+            .value_cache
+            .write()
+            .push(value_offset, Bytes::from(buf.clone()));
+
+        Ok(buf)
     }
 }
 

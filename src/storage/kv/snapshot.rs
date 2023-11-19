@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::entry::ValueRef;
+use super::entry::{Value, ValueRef};
 use crate::storage::index::art::TrieError;
 use crate::storage::index::iter::IterationPointer;
 use crate::storage::index::snapshot::Snapshot as TartSnapshot;
@@ -45,7 +45,7 @@ impl Snapshot {
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &VectorKey) -> Result<ValueRef> {
+    pub fn get(&self, key: &VectorKey) -> Result<Box<dyn Value>> {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VectorKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
@@ -53,11 +53,11 @@ impl Snapshot {
         self.get_with_filters(key, &FILTERS)
     }
 
-    pub fn get_with_filters<F>(&self, key: &VectorKey, filters: &[F]) -> Result<ValueRef>
+    pub fn get_with_filters<F>(&self, key: &VectorKey, filters: &[F]) -> Result<Box<dyn Value>>
     where
         F: FilterFn,
     {
-        let (val, version, _) = self.snap.get(key, self.ts)?;
+        let (val, version, _) = self.snap.get(key)?;
         let mut val_ref = ValueRef::new(self.store.clone());
         let val_bytes_ref: &Bytes = &val;
         val_ref.decode(version, val_bytes_ref)?;
@@ -66,7 +66,7 @@ impl Snapshot {
             filter.apply(&val_ref, self.ts)?
         }
 
-        Ok(val_ref)
+        Ok(Box::new(val_ref))
     }
 
     pub fn new_reader<'a>(&'a mut self) -> Result<IterationPointer<VectorKey, Bytes>> {

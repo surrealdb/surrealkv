@@ -11,7 +11,7 @@ use crate::storage::index::art::TrieError;
 use crate::storage::index::art::KV;
 use crate::storage::index::VectorKey;
 use crate::storage::kv::entry::{
-    Entry, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
+    Entry, Value, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
 };
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::{FilterFn, Snapshot, FILTERS};
@@ -86,7 +86,7 @@ impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
         // TODO!! This should be the max txID of the index, get this from oracle
-        let read_ts = store.oracle.read_ts();
+        let read_ts = now();
         let snapshot = RwLock::new(Snapshot::take(store.clone(), read_ts)?);
 
         Ok(Self {
@@ -132,16 +132,20 @@ impl Transaction {
             return Err(Error::EmptyKey);
         }
 
-        // Read Your Own Writes (RYOW) semantics.
-
         // Check if the key is in the snapshot.
         let key = Bytes::copy_from_slice(key);
         match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
-                if !self.mode.is_read_only() && val_ref.ts > 0 {
-                    self.read_set.lock().push((key, val_ref.ts));
+
+                // RYOW semantics: Read your own write
+                if let Some(entry) = self.write_set.get(&key) {
+                    return Ok(entry.value.clone().to_vec());
+                }
+
+                if !self.mode.is_read_only() && val_ref.ts() > 0 {
+                    self.read_set.lock().push((key, val_ref.ts()));
                 }
                 val_ref.resolve()
             }
@@ -184,12 +188,8 @@ impl Transaction {
 
         if !self.mode.is_write_only() {
             // Convert to Bytes
-            let indexed_value: Vec<u8> =
-                vec![0; VERSION_SIZE + VALUE_LENGTH_SIZE + VALUE_OFFSET_SIZE + MD_SIZE + MD_SIZE];
-            let indexed_value_bytes = Bytes::from(indexed_value);
-            self.snapshot
-                .write()
-                .set(&e.key[..].into(), indexed_value_bytes)?;
+            let index_value = ValueRef::encode_mem(&e.key, &e.value, e.metadata.as_ref());
+            self.snapshot.write().set(&e.key[..].into(), index_value)?;
         }
 
         // Add the entry to pending writes
@@ -198,7 +198,7 @@ impl Transaction {
         Ok(())
     }
 
-    pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Bytes, u64, u64)>>
+    pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
     where
         R: RangeBounds<VectorKey> + 'b,
     {
@@ -217,12 +217,17 @@ impl Transaction {
                 }
             }
 
-            self.read_set.lock().push((
-                Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the tart leaf are terminated with a null byte
-                val_ref.ts,
-            ));
+            // Only add the key to the read set if the timestamp is less than or equal to the
+            // read timestamp. This is to prevent adding keys that are added during transaction.
+            if val_ref.ts() <= self.read_ts {
+                self.read_set.lock().push((
+                    Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the tart leaf are terminated with a null byte
+                    val_ref.ts,
+                ));
+            }
 
-            results.push((value.clone(), *version, *ts));
+            let v = val_ref.resolve()?;
+            results.push((v, *version, *ts));
         }
 
         Ok(results)
@@ -693,6 +698,245 @@ mod tests {
                 }
                 _ => false,
             });
+        }
+    }
+
+    #[test]
+    fn test_ryow() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let key3 = Bytes::from("k3");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value2).unwrap();
+            assert_eq!(txn.get(&key1).unwrap(), value2.as_ref());
+            assert!(txn.get(&key3).is_err());
+            txn.set(&key2, &value1).unwrap();
+            assert_eq!(txn.get(&key2).unwrap(), value1.as_ref());
+            txn.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_snapshot_isolation_g0() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+        let value5 = Bytes::from("v5");
+        let value6 = Bytes::from("v6");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value2).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+            assert!(txn1.get(&key2).is_ok());
+            assert!(txn2.get(&key1).is_ok());
+            assert!(txn2.get(&key2).is_ok());
+
+            txn1.set(&key1, &value3).unwrap();
+            txn2.set(&key1, &value4).unwrap();
+
+            txn1.set(&key2, &value5).unwrap();
+
+            txn1.commit().unwrap();
+
+            txn2.set(&key2, &value6).unwrap();
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+
+        {
+            let txn3 = store.begin().unwrap();
+            let val1 = txn3.get(&key1).unwrap();
+            assert_eq!(val1, value3.as_ref());
+            let val2 = txn3.get(&key2).unwrap();
+            assert_eq!(val2, value5.as_ref());
+        }
+    }
+
+    #[test]
+    fn test_snapshot_isolation_g1a() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value2).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+
+            txn1.set(&key1, &value3).unwrap();
+
+            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+
+            drop(txn1);
+
+            let res = txn2.scan(range).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+
+            txn2.commit().unwrap();
+        }
+
+        {
+            let txn3 = store.begin().unwrap();
+            let val1 = txn3.get(&key1).unwrap();
+            assert_eq!(val1, value1.as_ref());
+            let val2 = txn3.get(&key2).unwrap();
+            assert_eq!(val2, value2.as_ref());
+        }
+    }
+
+    #[test]
+    fn test_snapshot_isolation_g1b() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value2).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+            assert!(txn1.get(&key2).is_ok());
+
+            txn1.set(&key1, &value3).unwrap();
+
+            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+
+            txn1.set(&key1, &value4).unwrap();
+            txn1.commit().unwrap();
+
+            let res = txn2.scan(range).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+
+            txn2.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_snapshot_isolation_g1c() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value2).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+            // assert!(txn2.get(&key2).is_ok());
+
+            txn1.set(&key1, &value3).unwrap();
+            // txn2.set(&key2, &value4).unwrap();
+            assert!(txn1.get(&key1).is_ok());
+
+            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let res = txn1.scan(range.clone()).unwrap();
+
+            assert_eq!(res.len(), 3);
+            assert_eq!(res[2].0, value2.as_ref());
+
+            let res = txn2.scan(range).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1.as_ref());
+
+            txn1.commit().unwrap();
+            txn2.commit().unwrap();
         }
     }
 }
