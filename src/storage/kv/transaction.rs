@@ -5,14 +5,11 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
-use super::entry::{TxRecord, ValueRef};
 use super::store::Core;
 use crate::storage::index::art::TrieError;
 use crate::storage::index::art::KV;
 use crate::storage::index::VectorKey;
-use crate::storage::kv::entry::{
-    Entry, Value, MD_SIZE, VALUE_LENGTH_SIZE, VALUE_OFFSET_SIZE, VERSION_SIZE,
-};
+use crate::storage::kv::entry::{Entry, TxRecord, Value, ValueRef};
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::snapshot::{FilterFn, Snapshot, FILTERS};
 use crate::storage::kv::util::now;

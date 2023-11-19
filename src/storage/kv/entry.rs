@@ -10,9 +10,6 @@ use crate::storage::kv::store::Core;
 use crate::storage::kv::util::calculate_crc32;
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
-pub(crate) const VERSION_SIZE: usize = 1; // Size of version in bytes
-pub(crate) const VALUE_LENGTH_SIZE: usize = 4; // Size of vLen in bytes
-pub(crate) const VALUE_OFFSET_SIZE: usize = 8; // Size of vOff in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
 pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
 pub(crate) const TRANSACTION_HEADER_VERSION: u16 = 1; // Version of the transaction header
