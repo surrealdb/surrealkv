@@ -633,7 +633,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
         };
 
         // Get the value from the TwigNode instance by the specified version.
-        let Some(val) = twig.get_leaf_by_version(version) else{
+        let Some(val) = twig.get_leaf_by_version(version) else {
             return None;
         };
 
