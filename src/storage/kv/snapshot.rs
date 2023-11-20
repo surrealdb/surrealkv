@@ -44,6 +44,13 @@ impl Snapshot {
         Ok(())
     }
 
+    /// Deletes given key from the snapshot.
+    pub fn delete(&mut self, key: &VectorKey) -> Result<()> {
+        let key = &key.terminate();
+        self.snap.remove(key)?;
+        Ok(())
+    }
+
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
     pub fn get(&self, key: &VectorKey) -> Result<Box<dyn Value>> {
         // TODO: need to fix this to avoid cloning the key
