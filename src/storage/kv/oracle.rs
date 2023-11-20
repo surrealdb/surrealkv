@@ -308,7 +308,8 @@ impl SerializableSnapshotIsolation {
                 .retain(|&read_ts| read_ts.0 > txn.read_ts);
 
             // Clean up committed transactions up to the current read mark.
-            commit_tracker.cleanup_committed_transactions(self.read_mark.read().peek().unwrap().0);
+            let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
+            commit_tracker.cleanup_committed_transactions(max_read_ts);
 
             let txn_ts = commit_tracker.next_ts;
             commit_tracker.next_ts += 1;
