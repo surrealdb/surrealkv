@@ -136,6 +136,30 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.max_active_readers.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
+
+    pub fn remove(&mut self, key: &P) -> Result<bool, TrieError> {
+        // Check if the tree is already closed
+        self.is_closed()?;
+
+        let (new_root, is_deleted) = match &self.root {
+            None => (None, false),
+            Some(root) => {
+                if root.is_twig() {
+                    (None, true)
+                } else {
+                    let (new_root, removed) = Node::remove_recurse(root, key, 0);
+                    if removed {
+                        (new_root, true)
+                    } else {
+                        (self.root.clone(), true)
+                    }
+                }
+            }
+        };
+
+        self.root = new_root;
+        Ok(is_deleted)
+    }
 }
 
 #[cfg(test)]

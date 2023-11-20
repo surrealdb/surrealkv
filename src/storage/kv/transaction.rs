@@ -186,7 +186,16 @@ impl Transaction {
         if !self.mode.is_write_only() {
             // Convert to Bytes
             let index_value = ValueRef::encode_mem(&e.key, &e.value, e.metadata.as_ref());
-            self.snapshot.write().set(&e.key[..].into(), index_value)?;
+
+            if let Some(md) = e.metadata.as_ref() {
+                if md.deleted() {
+                    self.snapshot.write().delete(&e.key[..].into())?;
+                } else {
+                    self.snapshot.write().set(&e.key[..].into(), index_value)?;
+                }
+            } else {
+                self.snapshot.write().set(&e.key[..].into(), index_value)?;
+            }
         }
 
         // Add the entry to pending writes
@@ -203,14 +212,14 @@ impl Transaction {
         let ranger = iterator.range(range);
         let mut results = Vec::new();
 
-        for (key, value, version, ts) in ranger {
+        'outer: for (key, value, version, ts) in ranger {
             let mut val_ref = ValueRef::new(self.store.clone());
             let val_bytes_ref: &Bytes = &value;
             val_ref.decode(*version, val_bytes_ref)?;
 
             for filter in &FILTERS {
                 if filter.apply(&val_ref, self.read_ts).is_err() {
-                    continue;
+                    continue 'outer;
                 }
             }
 
@@ -729,29 +738,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_snapshot_isolation_g0() {
+    // Common setup logic for creating a store
+    fn create_store() -> Store {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
         let store = Store::new(opts.clone()).expect("should create store");
+
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
         let value2 = Bytes::from("v2");
+        // Start a new read-write transaction (txn)
+        let mut txn = store.begin().unwrap();
+        txn.set(&key1, &value1).unwrap();
+        txn.set(&key2, &value2).unwrap();
+        txn.commit().unwrap();
+
+        store
+    }
+
+    // The following tests are taken from hermitage (https://github.com/ept/hermitage)
+    // Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
+
+    // G0: Write Cycles (dirty writes)
+    #[test]
+    fn test_snapshot_isolation_g0() {
+        let store = create_store();
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
         let value3 = Bytes::from("v3");
         let value4 = Bytes::from("v4");
         let value5 = Bytes::from("v5");
         let value6 = Bytes::from("v6");
-
-        {
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value1).unwrap();
-            txn.set(&key2, &value2).unwrap();
-            txn.commit().unwrap();
-        }
 
         {
             let mut txn1 = store.begin().unwrap();
@@ -791,26 +811,15 @@ mod tests {
         }
     }
 
+    // G1a: Aborted Reads (dirty reads, cascaded aborts)
     #[test]
     fn test_snapshot_isolation_g1a() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        let store = Store::new(opts.clone()).expect("should create store");
+        let store = create_store();
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
         let value2 = Bytes::from("v2");
         let value3 = Bytes::from("v3");
-
-        {
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value1).unwrap();
-            txn.set(&key2, &value2).unwrap();
-            txn.commit().unwrap();
-        }
 
         {
             let mut txn1 = store.begin().unwrap();
@@ -843,27 +852,16 @@ mod tests {
         }
     }
 
+    // G1b: Intermediate Reads (dirty reads)
     #[test]
     fn test_snapshot_isolation_g1b() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
+        let store = create_store();
 
-        let store = Store::new(opts.clone()).expect("should create store");
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
-        let value2 = Bytes::from("v2");
         let value3 = Bytes::from("v3");
         let value4 = Bytes::from("v4");
-
-        {
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value1).unwrap();
-            txn.set(&key2, &value2).unwrap();
-            txn.commit().unwrap();
-        }
 
         {
             let mut txn1 = store.begin().unwrap();
@@ -890,13 +888,71 @@ mod tests {
         }
     }
 
+    // G1c: Circular Information Flow (dirty reads)
     #[test]
     fn test_snapshot_isolation_g1c() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
+        let store = create_store();
 
-        let store = Store::new(opts.clone()).expect("should create store");
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+            assert!(txn2.get(&key2).is_ok());
+
+            txn1.set(&key1, &value3).unwrap();
+            txn2.set(&key2, &value4).unwrap();
+
+            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+
+            txn1.commit().unwrap();
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+    }
+
+    // PMP: Predicate-Many-Preceders
+    #[test]
+    fn test_snapshot_isolation_pmp() {
+        let store = create_store();
+
+        let key2 = Bytes::from("k2");
+        let key3 = Bytes::from("k3");
+        let value3 = Bytes::from("v3");
+
+        {
+            let txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key3).is_err());
+            txn2.set(&key2, &value3).unwrap();
+            txn2.commit().unwrap();
+
+            assert!(txn1.get(&key3).is_err());
+        }
+    }
+
+    // PMP-Write: Circular Information Flow (dirty reads)
+    #[test]
+    fn test_snapshot_isolation_pmp_write() {
+        let store = create_store();
+
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
@@ -904,36 +960,204 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value1).unwrap();
-            txn.set(&key2, &value2).unwrap();
-            txn.commit().unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert!(txn1.get(&key1).is_ok());
+            txn1.set(&key1, &value3).unwrap();
+
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+
+            txn2.delete(&key2).unwrap();
+            txn1.commit().unwrap();
+
+            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0].0, value1);
+
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
         }
+    }
+
+    // P4: Lost Update
+    #[test]
+    fn test_snapshot_isolation_p4() {
+        let store = create_store();
+
+        let key1 = Bytes::from("k1");
+        let value3 = Bytes::from("v3");
 
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
-            // assert!(txn2.get(&key2).is_ok());
+            assert!(txn2.get(&key1).is_ok());
 
             txn1.set(&key1, &value3).unwrap();
-            // txn2.set(&key2, &value4).unwrap();
-            assert!(txn1.get(&key1).is_ok());
-
-            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
-            let res = txn1.scan(range.clone()).unwrap();
-
-            assert_eq!(res.len(), 3);
-            assert_eq!(res[2].0, value2.as_ref());
-
-            let res = txn2.scan(range).unwrap();
-            assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1.as_ref());
+            txn2.set(&key1, &value3).unwrap();
 
             txn1.commit().unwrap();
+
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+    }
+
+    // G-single: Single Anti-dependency Cycles (read skew)
+    #[test]
+    fn test_snapshot_isolation_g_single() {
+        let store = create_store();
+
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            txn2.set(&key1, &value3).unwrap();
+            txn2.set(&key2, &value4).unwrap();
+
             txn2.commit().unwrap();
+
+            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
+            txn1.commit().unwrap();
+        }
+    }
+
+    // G-single-write-1: Single Anti-dependency Cycles (read skew)
+    #[test]
+    fn test_snapshot_isolation_g_single_write_1() {
+        let store = create_store();
+
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            txn2.set(&key1, &value3).unwrap();
+            txn2.set(&key2, &value4).unwrap();
+
+            txn2.commit().unwrap();
+
+            txn1.delete(&key2).unwrap();
+            assert!(txn1.get(&key2).is_err());
+            assert!(match txn1.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+        }
+    }
+
+    // G-single-write-2: Single Anti-dependency Cycles (read skew)
+    #[test]
+    fn test_snapshot_isolation_g_single_write_2() {
+        let store = create_store();
+
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+
+            txn2.set(&key1, &value3).unwrap();
+
+            txn1.delete(&key2).unwrap();
+
+            txn2.set(&key2, &value4).unwrap();
+
+            drop(txn1);
+
+            txn2.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_snapshot_isolation_g2_item() {
+        let store = create_store();
+
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+
+            txn1.set(&key1, &value3).unwrap();
+            txn2.set(&key2, &value4).unwrap();
+
+            txn1.commit().unwrap();
+
+            assert!(match txn2.commit() {
+                Err(err) => {
+                    if let Error::TxnReadConflict = err {
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
         }
     }
 }

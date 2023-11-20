@@ -791,7 +791,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     ///
     /// Returns a tuple containing the updated node (or `None`) and a flag indicating if the key was removed.
     ///
-    fn remove_recurse(
+    pub(crate) fn remove_recurse(
         cur_node: &Rc<Node<P, V>>,
         key: &P,
         depth: usize,
