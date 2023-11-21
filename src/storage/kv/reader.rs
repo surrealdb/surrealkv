@@ -1,11 +1,13 @@
+use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 
-use crate::storage::kv::entry::{TxRecordEntry, MAX_TX_METADATA_SIZE};
+use crate::storage::kv::entry::{TxEntry, MAX_TX_METADATA_SIZE};
 use crate::storage::kv::error::{Error, Result};
 use crate::storage::kv::meta::Metadata;
 use crate::storage::log::aol::aol::AOL;
 
 use super::entry::TxRecord;
+use super::util::calculate_crc32;
 
 pub(crate) struct Reader {
     r_at: AOL,
@@ -77,6 +79,12 @@ impl Reader {
         Ok(b[0])
     }
 
+    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; len];
+        self.read(&mut buffer)?;
+        Ok(buffer)
+    }
+
     pub(crate) fn read_uint64(&mut self) -> Result<u64> {
         let mut b = [0; 8];
         self.read(&mut b)?;
@@ -139,35 +147,29 @@ impl TxReader {
         Ok(())
     }
 
-    pub(crate) fn read_entry(&mut self, tx: &mut TxRecordEntry) -> Result<()> {
+    fn read_entry(&mut self) -> Result<TxEntry> {
         let md_len = self.r.read_uint16()?;
-        let mut kvmd: Option<Metadata> = None;
-        if md_len > 0 {
-            let mut md_bs = vec![0; md_len as usize];
-            self.r.read(&mut md_bs)?;
-
+        let kvmd = if md_len > 0 {
+            let md_bs = self.r.read_bytes(md_len as usize)?;
             let metadata = Metadata::from_bytes(&md_bs)?;
-            kvmd = Some(metadata);
-        }
-
-        let crc = self.r.read_uint32()?;
+            Some(metadata)
+        } else {
+            None
+        };
 
         let k_len = self.r.read_uint32()? as usize;
-        let mut k = vec![0; k_len];
-        self.r.read(&mut k)?;
+        let k = self.r.read_bytes(k_len)?;
 
         let v_len = self.r.read_uint32()? as usize;
-        let mut v = vec![0; v_len];
-        self.r.read(&mut v)?;
+        let v = self.r.read_bytes(v_len)?;
 
-        tx.crc = crc;
-        tx.metadata = kvmd;
-        tx.key = k.into();
-        tx.value = v.into();
-        tx.value_len = v_len as u32;
-        tx.key_len = k_len as u32;
-
-        Ok(())
+        Ok(TxEntry {
+            metadata: kvmd,
+            key: k.into(),
+            value: v.into(),
+            value_len: v_len as u32,
+            key_len: k_len as u32,
+        })
     }
 
     pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
@@ -176,17 +178,32 @@ impl TxReader {
         let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
         for i in 0..tx.header.num_entries as usize {
             let offset = self.r.offset();
-            if let Some(entry) = tx.entries.get_mut(i) {
-                self.read_entry(entry)?;
-            } else {
-                tx.entries.insert(i, TxRecordEntry::new());
-
-                self.read_entry(tx.entries.get_mut(i).unwrap())?;
-            }
-            let key = tx.entries.get(i).unwrap().key.clone();
+            let entry = self.read_entry()?;
+            let key = entry.key.clone();
+            tx.entries.insert(i, entry);
             value_offsets.insert(key, offset as usize);
         }
+
+        self.verify_crc(tx)?;
+
         Ok(value_offsets)
+    }
+
+    fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
+        let entry_crc = self.r.read_uint32()?;
+        let buf = Self::serialize_tx_record(tx)?;
+        let actual_crc = calculate_crc32(&buf);
+        if entry_crc != actual_crc {
+            return Err(Error::CorruptedTxRecord);
+        }
+
+        Ok(())
+    }
+
+    fn serialize_tx_record(tx: &TxRecord) -> Result<Bytes> {
+        let mut buf = BytesMut::new();
+        tx.to_buf(&mut buf)?;
+        Ok(buf.freeze())
     }
 }
 
