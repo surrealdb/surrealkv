@@ -185,14 +185,10 @@ impl Transaction {
 
         if !self.mode.is_write_only() {
             // Convert to Bytes
-            let index_value = ValueRef::encode_mem(&e.key, &e.value, e.metadata.as_ref());
+            let index_value = ValueRef::encode_mem(&e.value, e.metadata.as_ref());
 
-            if let Some(md) = e.metadata.as_ref() {
-                if md.deleted() {
-                    self.snapshot.write().delete(&e.key[..].into())?;
-                } else {
-                    self.snapshot.write().set(&e.key[..].into(), index_value)?;
-                }
+            if e.is_deleted() {
+                self.snapshot.write().delete(&e.key[..].into())?;
             } else {
                 self.snapshot.write().set(&e.key[..].into(), index_value)?;
             }

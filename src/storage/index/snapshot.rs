@@ -1,6 +1,6 @@
 //! This module defines the Snapshot struct for managing snapshots within a Trie structure.
+use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hashbrown::HashSet;
 
@@ -15,7 +15,7 @@ pub struct Snapshot<P: KeyTrait, V: Clone> {
     pub(crate) ts: u64,
     pub(crate) root: Option<Rc<Node<P, V>>>,
     pub(crate) readers: HashSet<u64>,
-    pub(crate) max_active_readers: AtomicU64,
+    pub(crate) max_active_readers: Cell<u64>,
     pub(crate) closed: bool,
 }
 
@@ -27,7 +27,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
             ts,
             root,
             readers: HashSet::new(),
-            max_active_readers: AtomicU64::new(0),
+            max_active_readers: Cell::new(0),
             closed: false,
         }
     }
@@ -95,7 +95,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Check if there are any active readers for the snapshot
-        if self.max_active_readers.load(Ordering::SeqCst) > 0 {
+        if self.max_active_readers.get() > 0 {
             return Err(TrieError::SnapshotReadersNotClosed);
         }
 
@@ -113,7 +113,8 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
             return Err(TrieError::SnapshotEmpty);
         }
 
-        let reader_id = self.max_active_readers.fetch_add(1, Ordering::SeqCst);
+        let reader_id = self.max_active_readers.get() + 1;
+        self.max_active_readers.set(reader_id);
         self.readers.insert(reader_id);
         Ok(IterationPointer::new(
             self.root.as_ref().unwrap().clone(),
@@ -125,7 +126,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
-        Ok(self.max_active_readers.load(Ordering::SeqCst))
+        Ok(self.max_active_readers.get())
     }
 
     pub fn close_reader(&mut self, reader_id: u64) -> Result<(), TrieError> {
@@ -133,7 +134,8 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         self.readers.remove(&reader_id);
-        self.max_active_readers.fetch_sub(1, Ordering::SeqCst);
+        let readers = self.max_active_readers.get();
+        self.max_active_readers.set(readers - 1);
         Ok(())
     }
 
@@ -256,11 +258,13 @@ mod tests {
         let reader1 = snap.new_reader().unwrap();
         let reader1_id = reader1.id;
         assert_eq!(count_items(&reader1), 4);
+        assert_eq!(reader1_id, 1);
 
         // Reader 2
         let reader2 = snap.new_reader().unwrap();
         let reader2_id = reader2.id;
         assert_eq!(count_items(&reader2), 4);
+        assert_eq!(reader2_id, 2);
 
         // Active readers
         assert_eq!(snap.active_readers().unwrap(), 2);

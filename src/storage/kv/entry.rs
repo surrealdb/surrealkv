@@ -46,10 +46,6 @@ impl Entry {
             false
         }
     }
-
-    pub(crate) fn set_ts(&mut self, ts: u64) {
-        self.ts = ts;
-    }
 }
 
 // Tx struct encoded format:
@@ -65,6 +61,7 @@ impl Entry {
 // |                     TxRecordHeader                      |
 // |---------------------------------------------------------|
 // | id: u64                                                 |
+// | lsn: u64                                                |
 // | ts: u64                                                 |
 // | version: u16                                            |
 // | metadata: Option<Metadata>                              |
@@ -84,11 +81,11 @@ impl Entry {
 //
 // Tx encoded format:
 //
-//   |---------------------------------------------------------------------------------------------|
-//   |                              TxRecordHeader                              | TxRecordEntry[]  |                                            |
-//   |-------|-------|------------|----------------|-----------------|----------|------------------|
-//   | id(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata |  ...entries...   |
-//   |-------|-------|------------|----------------|-----------------|----------|------------------|
+//   |------------------------------------------------------------------------------------------------------|
+//   |                              TxRecordHeader                                       | TxRecordEntry[]  |                                            |
+//   |-------|--------|-------|------------|----------------|-----------------|----------|------------------|
+//   | id(8) | lsn(8) | ts(8) | version(2) | num_entries(2) | metadata_len(2) | metadata |  ...entries...   |
+//   |-------|--------|------------|------------------------|-----------------|----------|------------------|
 //
 // TxRecordHeader struct encoded format:
 //
@@ -188,6 +185,7 @@ impl TxRecord {
 #[derive(Debug)]
 pub(crate) struct TxRecordHeader {
     pub(crate) id: u64,
+    pub(crate) lsn: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
     pub(crate) metadata: Option<Metadata>,
@@ -198,6 +196,7 @@ impl TxRecordHeader {
     pub(crate) fn new() -> Self {
         TxRecordHeader {
             id: 0,
+            lsn: 0,
             ts: 0,
             version: TRANSACTION_HEADER_VERSION,
             metadata: None,
@@ -223,8 +222,9 @@ impl TxRecordHeader {
             None => (0, Bytes::new()),
         };
 
-        // tx_id(8) + ts(8) + version(2) + num_entries(2) + meta_data_len(2) + metadata
+        // tx_id(8) + lsn(8) + ts(8) + version(2) + num_entries(2) + meta_data_len(2) + metadata
         buf.put_u64(self.id);
+        buf.put_u64(self.lsn);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
         buf.put_u16(self.num_entries);
@@ -353,7 +353,7 @@ impl ValueRef {
     }
 
     /// Encode the valueRef into an in-memory byte representation.
-    pub(crate) fn encode_mem(key: &Bytes, value: &Bytes, metadata: Option<&Metadata>) -> Bytes {
+    pub(crate) fn encode_mem(value: &Bytes, metadata: Option<&Metadata>) -> Bytes {
         let mut buf = BytesMut::new();
 
         buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
