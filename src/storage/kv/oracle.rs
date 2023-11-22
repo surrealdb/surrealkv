@@ -325,30 +325,32 @@ impl SerializableSnapshotIsolation {
             return Err(Error::TransactionReadConflict);
         }
 
-        let ts = {
-            // Mark that read operations are done up to the transaction's read timestamp.
-            self.read_mark
-                .write()
-                .retain(|&read_ts| read_ts.0 > txn.read_ts);
+        // Mark that read operations are done up to the transaction's read timestamp.
+        self.mark_read_operations_done(txn.read_ts);
 
-            // Clean up committed transactions up to the current read mark.
-            let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
-            commit_tracker.cleanup_committed_transactions(max_read_ts);
+        // Clean up committed transactions up to the current read mark.
+        let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
+        commit_tracker.cleanup_committed_transactions(max_read_ts);
 
-            let txn_ts = commit_tracker.next_ts;
-            commit_tracker.next_ts += 1;
-            txn_ts
-        };
+        let ts = commit_tracker.next_ts;
+        commit_tracker.next_ts += 1;
 
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
         // Add the transaction to the list of committed transactions with conflict keys.
-        commit_tracker.committed_transactions.push(CommitMarker {
-            ts,
-            conflict_keys: txn.write_set.keys().map(|k| k.clone()).collect(),
-        });
+        let conflict_keys = txn.write_set.keys().cloned().collect();
+        commit_tracker
+            .committed_transactions
+            .push(CommitMarker { ts, conflict_keys });
 
         Ok(ts)
+    }
+
+    // Helper method to mark read operations as done up to a given timestamp.
+    fn mark_read_operations_done(&self, read_ts: u64) {
+        self.read_mark
+            .write()
+            .retain(|&read_timestamp| read_timestamp.0 > read_ts);
     }
 
     // Set the global timestamp for the system.
