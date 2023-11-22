@@ -1,10 +1,14 @@
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 
-use crate::storage::kv::entry::{TxEntry, MAX_TX_METADATA_SIZE};
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::meta::Metadata;
-use crate::storage::log::aol::aol::AOL;
+use crate::storage::{
+    kv::{
+        entry::{TxEntry, MAX_TX_METADATA_SIZE},
+        error::{Error, Result},
+        meta::Metadata,
+    },
+    log::aol::aol::AOL,
+};
 
 use super::entry::TxRecord;
 use super::util::calculate_crc32;
@@ -218,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reader() {
+    fn reader() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 

@@ -1432,27 +1432,27 @@ mod tests {
     use tempdir::TempDir;
 
     #[test]
-    fn test_new_empty() {
+    fn new_empty() {
         let metadata = Metadata::new(None);
         assert_eq!(metadata.data.len(), 0);
     }
 
     #[test]
-    fn test_put_and_get_uint() {
+    fn put_and_get_uint() {
         let mut metadata = Metadata::new(None);
         metadata.put_uint("age", 25);
         assert_eq!(metadata.get_uint("age").unwrap(), 25);
     }
 
     #[test]
-    fn test_put_and_get_bool() {
+    fn put_and_get_bool() {
         let mut metadata = Metadata::new(None);
         metadata.put_bool("is_active", true);
         assert_eq!(metadata.get_bool("is_active").unwrap(), true);
     }
 
     #[test]
-    fn test_bytes_roundtrip() {
+    fn bytes_roundtrip() {
         let mut metadata = Metadata::new(None);
         metadata.put_uint("age", 30);
         metadata.put_uint("num", 40);
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_field() {
+    fn read_reader_field() {
         let data = [0, 0, 0, 5, 65, 66, 67, 68, 69]; // "ABCDE"
         let mut cursor = Cursor::new(&data);
         let result = read_field(&mut cursor).unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_field() {
+    fn write_reader_field() {
         let mut output = Vec::new();
         let data = b"XYZ";
         write_field(data, &mut output).unwrap();
@@ -1481,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_extension() {
+    fn metadata_extension() {
         let id = 12345;
         let opts = Options::default();
 
@@ -1517,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_header() {
+    fn check_and_validate_file_header() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1553,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_file_header() {
+    fn bad_file_header() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1586,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_name_with_extension() {
+    fn segment_name_with_extension() {
         let index = 42;
         let ext = "log";
         let expected = format!("{:020}.{}", index, ext);
@@ -1594,35 +1594,35 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_name_without_extension() {
+    fn segment_name_without_extension() {
         let index = 42;
         let expected = format!("{:020}", index);
         assert_eq!(segment_name(index, ""), expected);
     }
 
     #[test]
-    fn test_parse_segment_name_with_extension() {
+    fn parse_segment_name_with_extension() {
         let name = "00000000000000000042.log";
         let result = parse_segment_name(name).unwrap();
         assert_eq!(result, (42, Some("log".to_string())));
     }
 
     #[test]
-    fn test_parse_segment_name_without_extension() {
+    fn parse_segment_name_without_extension() {
         let name = "00000000000000000042";
         let result = parse_segment_name(name).unwrap();
         assert_eq!(result, (42, None));
     }
 
     #[test]
-    fn test_parse_segment_name_invalid_format() {
+    fn parse_segment_name_invalid_format() {
         let name = "invalid_name";
         let result = parse_segment_name(name);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_segments_empty_directory() {
+    fn segments_empty_directory() {
         let temp_dir = create_temp_directory();
         let dir = temp_dir.path().to_path_buf();
 
@@ -1631,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segments_non_empty_directory() {
+    fn segments_non_empty_directory() {
         let temp_dir = create_temp_directory();
         let dir = temp_dir.path().to_path_buf();
 
@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remaining() {
+    fn remaining() {
         let block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
             written: 100,
             flushed: 0,
@@ -1672,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_full() {
+    fn is_full() {
         let block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
             written: 4096 - WAL_RECORD_HEADER_SIZE,
             flushed: 0,
@@ -1689,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reset() {
+    fn reset() {
         let mut block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
             written: 100,
             flushed: 0,
@@ -1702,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aol_append() {
+    fn aol_append() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aol_reopen_empty_file() {
+    fn aol_reopen_empty_file() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1809,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_reopen() {
+    fn segment_reopen() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1902,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_reopen_file() {
+    fn segment_reopen_file() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_corrupted_metadata() {
+    fn segment_corrupted_metadata() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1960,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_closed_operations() {
+    fn segment_closed_operations() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -1995,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_append() {
+    fn wal_append() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_append_read_append() {
+    fn segment_append_read_append() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2140,7 +2140,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_segment() {
+    fn single_segment() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2184,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_segment() {
+    fn multi_segment() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_block() {
+    fn partial_block() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2284,7 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_synced_block() {
+    fn full_synced_block() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2321,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_segment_with_sync() {
+    fn multi_segment_with_sync() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -2371,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_ref() {
+    fn segment_ref() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 

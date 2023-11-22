@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::meta::Metadata;
-use crate::storage::kv::store::Core;
-use crate::storage::kv::util::calculate_crc32;
+use crate::storage::{
+    kv::error::{Error, Result},
+    kv::meta::Metadata,
+    kv::store::Core,
+    kv::util::calculate_crc32,
+};
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
@@ -473,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode() {
+    fn encode_decode() {
         // Create a sample valueRef instance
         let opts = Options::new();
         let store = Arc::new(Core::new(opts).expect("failed to create store"));
@@ -506,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_with_value_read_from_clog() {
+    fn txn_with_value_read_from_clog() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -582,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_with_value_read_from_memory() {
+    fn txn_with_value_read_from_memory() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 

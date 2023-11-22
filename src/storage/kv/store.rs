@@ -1,25 +1,29 @@
-use hashbrown::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::vec;
 
 use bytes::Bytes;
+use hashbrown::HashMap;
 use lru::LruCache;
 use parking_lot::RwLock;
 
-use crate::storage::index::art::KV;
-use crate::storage::index::VectorKey;
-use crate::storage::kv::entry::{TxRecord, ValueRef};
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::indexer::Indexer;
-use crate::storage::kv::option::Options;
-use crate::storage::kv::oracle::Oracle;
-use crate::storage::kv::reader::{Reader, TxReader};
-use crate::storage::kv::transaction::{Mode, Transaction};
-use crate::storage::log::aol::aol::AOL;
-use crate::storage::log::wal::wal::WAL;
-use crate::storage::log::{write_field, Options as LogOptions, BLOCK_SIZE};
-use crate::storage::log::{Error as LogError, Metadata};
+use crate::storage::{
+    index::{art::KV, VectorKey},
+    kv::{
+        entry::{TxRecord, ValueRef},
+        error::{Error, Result},
+        indexer::Indexer,
+        option::Options,
+        oracle::Oracle,
+        reader::{Reader, TxReader},
+        transaction::{Mode, Transaction},
+    },
+    log::{
+        aol::aol::AOL,
+        wal::wal::WAL,
+        {write_field, Options as LogOptions, BLOCK_SIZE}, {Error as LogError, Metadata},
+    },
+};
 
 /// An MVCC-based transactional key-value store.
 pub struct Store {
@@ -123,7 +127,7 @@ impl Core {
         oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
-        let cache_size = NonZeroUsize::new(opts.max_cache_size as usize).unwrap();
+        let cache_size = NonZeroUsize::new(opts.max_value_cache_size as usize).unwrap();
         let value_cache = Arc::new(RwLock::new(LruCache::new(cache_size)));
 
         // Construct and return the Core instance.
@@ -285,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bulk_insert() {
+    fn bulk_insert() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -354,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_store_open_and_reload_options() {
+    fn store_open_and_reload_options() {
         // // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -370,7 +374,7 @@ mod tests {
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
         opts.max_active_snapshots = 10;
-        opts.max_cache_size = 5;
+        opts.max_value_cache_size = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.core.opts.clone();

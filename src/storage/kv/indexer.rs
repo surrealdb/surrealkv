@@ -1,11 +1,14 @@
 use bytes::Bytes;
 
-use crate::storage::index::art::Tree as tart;
-use crate::storage::index::art::KV;
-use crate::storage::index::snapshot::Snapshot as TartSnapshot;
-use crate::storage::index::VectorKey;
-use crate::storage::kv::error::Result;
-use crate::storage::kv::option::Options;
+use crate::storage::{
+    index::{
+        art::{Tree as tart, KV},
+        snapshot::Snapshot as TartSnapshot,
+        VectorKey,
+    },
+    kv::error::Result,
+    kv::option::Options,
+};
 
 pub(crate) struct Indexer {
     pub(crate) index: tart<VectorKey, Bytes>,

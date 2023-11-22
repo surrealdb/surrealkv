@@ -171,7 +171,7 @@ mod tests {
     use crate::storage::index::VectorKey;
 
     #[test]
-    fn test_snapshot_creation() {
+    fn snapshot_creation() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
         let keys = ["key_1", "key_2", "key_3"];
 
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_isolation() {
+    fn snapshot_isolation() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
         let key_1 = VectorKey::from_str("key_1");
         let key_2 = VectorKey::from_str("key_2");
@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_readers() {
+    fn snapshot_readers() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
         let key_1 = VectorKey::from_str("key_1");
         let key_2 = VectorKey::from_str("key_2");

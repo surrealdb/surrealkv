@@ -195,7 +195,7 @@ mod tests {
 
     // BufferReader does not return EOF when the underlying reader returns 0 bytes read.
     #[test]
-    fn test_bufreader_eof_and_error() {
+    fn bufreader_eof_and_error() {
         // Create a temporary directory to hold the file
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reader() {
+    fn reader() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reader_with_single_segment_and_multiple_records() {
+    fn reader_with_single_segment_and_multiple_records() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reader_with_multiple_segments_and_multiple_records() {
+    fn reader_with_multiple_segments_and_multiple_records() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reader_with_wal() {
+    fn reader_with_wal() {
         // Create aol options and open a aol file
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_repair() {
+    fn wal_repair() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 

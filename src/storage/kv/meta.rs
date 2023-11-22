@@ -105,13 +105,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_metadata() {
+    fn new_metadata() {
         let metadata = Metadata::new();
         assert!(metadata.attributes.is_empty());
     }
 
     #[test]
-    fn test_as_deleted() {
+    fn as_deleted() {
         let mut metadata = Metadata::new();
 
         // Test setting 'deleted' attribute
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bytes() {
+    fn bytes() {
         let mut metadata = Metadata::new();
 
         // Test serialization with 'deleted' attribute
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes() {
+    fn from_bytes() {
         let mut metadata = Metadata::new();
         metadata.as_deleted(true).unwrap();
 

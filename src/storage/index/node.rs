@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flatnode() {
+    fn flatnode() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         node_test(
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node48() {
+    fn node48() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         // Create and test Node48
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node256() {
+    fn node256() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         node_test(
@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flatnode_update_version() {
+    fn flatnode_update_version() {
         const WIDTH: usize = 4;
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
@@ -914,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flatnode_repeated_update_version() {
+    fn flatnode_repeated_update_version() {
         const WIDTH: usize = 1;
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node48_update_version() {
+    fn node48_update_version() {
         const WIDTH: usize = 4;
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node256_update_version() {
+    fn node256_update_version() {
         const WIDTH: usize = 256;
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
@@ -993,7 +993,7 @@ mod tests {
 
     // TODO: add more scenarios to this as twig nodes have the actual data with versions
     #[test]
-    fn test_twig_nodes() {
+    fn twig_nodes() {
         const WIDTH: usize = 4;
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
@@ -1031,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_insert() {
+    fn twig_insert() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         let node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_insert_mut() {
+    fn twig_insert_mut() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_get_latest_leaf() {
+    fn twig_get_latest_leaf() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_get_latest_value() {
+    fn twig_get_latest_value() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_get_leaf_by_version() {
+    fn twig_get_leaf_by_version() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
@@ -1088,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_twig_iter() {
+    fn twig_iter() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
         let mut node = TwigNode::<ArrayKey<8>, usize>::new(dummy_prefix.clone(), dummy_prefix);
         node.insert_mut(42, 123, 0);
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_leak() {
+    fn memory_leak() {
         let dummy_prefix: ArrayKey<8> = ArrayKey::create_key("foo".as_bytes());
 
         // Create and test flatnode

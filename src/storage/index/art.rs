@@ -1355,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_search_delete_words() {
+    fn insert_search_delete_words() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
         let file_path = "testdata/words.txt";
 
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_string_insert_delete() {
+    fn string_insert_delete() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion phase
@@ -1405,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_string_long() {
+    fn string_long() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion phase
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_root_set_get() {
+    fn root_set_get() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion phase
@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn test_string_duplicate_insert() {
+    fn string_duplicate_insert() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // First insertion
@@ -1460,7 +1460,7 @@ mod tests {
 
     // Inserting a single value into the tree and removing it should result in a nil tree root.
     #[test]
-    fn test_insert_and_remove() {
+    fn insert_and_remove() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inserting_keys_with_common_prefix() {
+    fn inserting_keys_with_common_prefix() {
         let key1 = VectorKey::from_str("foo");
         let key2 = VectorKey::from_str("foo2");
 
@@ -1500,7 +1500,7 @@ mod tests {
     // Inserting Two values into the tree and removing one of them
     // should result in a tree root of type twig
     #[test]
-    fn test_insert2_and_remove1_and_root_should_be_node1() {
+    fn insert2_and_remove1_and_root_should_be_node1() {
         let key1 = VectorKey::from_str("test1");
         let key2 = VectorKey::from_str("test2");
 
@@ -1526,7 +1526,7 @@ mod tests {
     // // This tests the expansion of the root into a NODE4 and
     // // successfully collapsing into a twig and then nil upon successive removals
     // #[test]
-    // fn test_insert2_and_remove2_and_root_should_be_nil() {
+    // fn insert2_and_remove2_and_root_should_be_nil() {
     //     let key1 = &VectorKey::from_str("test1");
     //     let key2 = &VectorKey::from_str("test2");
 
@@ -1545,7 +1545,7 @@ mod tests {
     // This tests the expansion of the root into a NODE16 and
     // successfully collapsing into a NODE4 upon successive removals
     #[test]
-    fn test_insert5_and_remove1_and_root_should_be_node4() {
+    fn insert5_and_remove1_and_root_should_be_node4() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1572,7 +1572,7 @@ mod tests {
     //     // This tests the expansion of the root into a NODE16 and
     //     // successfully collapsing into a NODE4, twig, then nil
     //     #[test]
-    //     fn test_insert5_and_remove5_and_root_should_be_nil() {
+    //     fn insert5_and_remove5_and_root_should_be_nil() {
     //         let mut tree = Tree::<VectorKey, i32>::new();
 
     //         for i in 0..5u32 {
@@ -1593,7 +1593,7 @@ mod tests {
     // This tests the expansion of the root into a NODE48, and
     // successfully collapsing into a NODE16
     #[test]
-    fn test_insert17_and_remove1_and_root_should_be_node16() {
+    fn insert17_and_remove1_and_root_should_be_node16() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert17_and_root_should_be_node48() {
+    fn insert17_and_root_should_be_node48() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1639,7 +1639,7 @@ mod tests {
     // // This tests the expansion of the root into a NODE48, and
     // // successfully collapsing into a NODE16, NODE4, twig, and then nil
     // #[test]
-    // fn test_insert17_and_remove17_and_root_should_be_nil() {
+    // fn insert17_and_remove17_and_root_should_be_nil() {
     //     let mut tree = Tree::<VectorKey, i32>::new();
 
     //     for i in 0..17u32 {
@@ -1660,7 +1660,7 @@ mod tests {
     // This tests the expansion of the root into a NODE256, and
     // successfully collapasing into a NODE48
     #[test]
-    fn test_insert49_and_remove1_and_root_should_be_node48() {
+    fn insert49_and_remove1_and_root_should_be_node48() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1683,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert49_and_root_should_be_node248() {
+    fn insert49_and_root_should_be_node248() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertion
@@ -1706,7 +1706,7 @@ mod tests {
     //     // // This tests the expansion of the root into a NODE256, and
     //     // // successfully collapsing into a Node48, Node16, Node4, twig, and finally nil
     //     // #[test]
-    //     // fn test_insert49_and_remove49_and_root_should_be_nil() {
+    //     // fn insert49_and_remove49_and_root_should_be_nil() {
     //     //     let mut tree = Tree::<VectorKey, i32>::new();
 
     //     //     for i in 0..49u32 {
@@ -1729,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_insertion() {
+    fn timed_insertion() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
 
         let kvts = vec![
@@ -1792,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_insertion_update_same_key() {
+    fn timed_insertion_update_same_key() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
 
         let key1 = &VectorKey::from_str("key_1");
@@ -1823,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_insertion_update_non_increasing_version() {
+    fn timed_insertion_update_non_increasing_version() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
 
         let key1 = VectorKey::from_str("key_1");
@@ -1856,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_insertion_update_equal_to_root_version() {
+    fn timed_insertion_update_equal_to_root_version() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
 
         let key1 = VectorKey::from_str("key_1");
@@ -1871,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn test_timed_deletion_check_root_ts() {
+    fn timed_deletion_check_root_ts() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
 
         // Initial insertions
@@ -1899,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_seq_u16() {
+    fn iter_seq_u16() {
         let mut tree = Tree::<ArrayKey<32>, u16>::new();
 
         // Insertion
@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_seq_u8() {
+    fn iter_seq_u8() {
         let mut tree: Tree<ArrayKey<32>, u8> = Tree::<ArrayKey<32>, u8>::new();
 
         // Insertion
@@ -1953,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_seq_u8() {
+    fn range_seq_u8() {
         let mut tree: Tree<ArrayKey<32>, u8> = Tree::<ArrayKey<32>, u8>::new();
 
         let max = u8::MAX;
@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_seq_u16() {
+    fn range_seq_u16() {
         let mut tree: Tree<ArrayKey<32>, u16> = Tree::<ArrayKey<32>, u16>::new();
 
         let max = u16::MAX;
@@ -1995,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn test_same_key_with_versions() {
+    fn same_key_with_versions() {
         let mut tree = Tree::<VectorKey, i32>::new();
 
         // Insertions
@@ -2023,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bulk_insert() {
+    fn bulk_insert() {
         let mut tree: Tree<VectorKey, i32> = Tree::<VectorKey, i32>::new();
         let curr_version = tree.version();
         // Create a vector of KV<P, V>

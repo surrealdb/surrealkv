@@ -3,13 +3,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::entry::{Value, ValueRef};
-use crate::storage::index::art::TrieError;
-use crate::storage::index::iter::IterationPointer;
-use crate::storage::index::snapshot::Snapshot as TartSnapshot;
-use crate::storage::index::VectorKey;
-
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::store::Core;
+use crate::storage::{
+    index::{
+        art::TrieError, iter::IterationPointer, snapshot::Snapshot as TartSnapshot, VectorKey,
+    },
+    kv::error::{Error, Result},
+    kv::store::Core,
+};
 
 pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
 

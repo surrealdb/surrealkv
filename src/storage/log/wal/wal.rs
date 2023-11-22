@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append() {
+    fn append() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_reopen() {
+    fn wal_reopen() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 

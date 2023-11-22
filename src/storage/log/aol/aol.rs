@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append() {
+    fn append() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 

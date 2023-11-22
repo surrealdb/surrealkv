@@ -1,15 +1,16 @@
 use std::path::PathBuf;
 
-use crate::storage::index::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS;
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::log::Metadata;
+use crate::storage::{
+    index::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS,
+    kv::error::{Error, Result},
+    log::Metadata,
+};
 
 // Defining constants for metadata keys
 const META_KEY_ISOLATION_LEVEL: &str = "isolation_level";
 const META_KEY_MAX_KEY_SIZE: &str = "max_key_size";
 const META_KEY_MAX_VALUE_SIZE: &str = "max_value_size";
 const META_KEY_MAX_VALUE_THRESHOLD: &str = "max_value_threshold";
-const META_KEY_DETECT_CONFLICTS: &str = "detect_conflicts";
 const META_KEY_CREATE_IF_NOT_EXISTS: &str = "create_if_not_exists";
 const META_KEY_MAX_TX_ENTRIES: &str = "max_tx_entries";
 const META_KEY_WAL_DISABLED: &str = "wal_disabled";
@@ -44,14 +45,13 @@ pub struct Options {
     // Fine tuning options.
     pub max_key_size: u64,          // Maximum size in bytes for key.
     pub max_value_size: u64,        // Maximum size in bytes for value.
-    pub max_value_threshold: usize, // Threshold to decide value storage in LSM tree or log value files.
-    pub detect_conflicts: bool,     // Whether to check transactions for conflicts.
+    pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
     pub create_if_not_exists: bool, // Create the directory if the provided open path doesn't exist.
     pub max_tx_entries: usize,      // Maximum entries in a transaction.
     pub wal_disabled: bool,         // Whether to disable the write-ahead log.
     pub max_active_snapshots: u64,  // Maximum number of active snapshots.
     pub max_segment_size: u64,      // Maximum size of a single segment.
-    pub max_cache_size: u64,        // Maximum size of the value cache.
+    pub max_value_cache_size: u64,  // Maximum size of the value cache.
 }
 
 impl Default for Options {
@@ -61,7 +61,6 @@ impl Default for Options {
             dir: PathBuf::from(""),
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            detect_conflicts: true,
             create_if_not_exists: true,
             max_tx_entries: 1 << 10,
             wal_disabled: false,
@@ -69,7 +68,7 @@ impl Default for Options {
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_active_snapshots: DEFAULT_MAX_ACTIVE_SNAPSHOTS,
             max_segment_size: 1 << 26, // 64 MB
-            max_cache_size: 100000,
+            max_value_cache_size: 100000,
         }
     }
 }
@@ -90,13 +89,12 @@ impl Options {
             META_KEY_MAX_VALUE_THRESHOLD,
             self.max_value_threshold as u64,
         );
-        metadata.put_bool(META_KEY_DETECT_CONFLICTS, self.detect_conflicts);
         metadata.put_bool(META_KEY_CREATE_IF_NOT_EXISTS, self.create_if_not_exists);
         metadata.put_uint(META_KEY_MAX_TX_ENTRIES, self.max_tx_entries as u64);
         metadata.put_bool(META_KEY_WAL_DISABLED, self.wal_disabled);
         metadata.put_uint(META_KEY_MAX_ACTIVE_SNAPSHOTS, self.max_active_snapshots);
         metadata.put_uint(META_KEY_MAX_FILE_SIZE, self.max_segment_size);
-        metadata.put_uint(META_KEY_MAX_VALUE_CACHE_SIZE, self.max_cache_size);
+        metadata.put_uint(META_KEY_MAX_VALUE_CACHE_SIZE, self.max_value_cache_size);
 
         metadata
     }
@@ -113,13 +111,12 @@ impl Options {
             max_key_size: metadata.get_uint(META_KEY_MAX_KEY_SIZE)?,
             max_value_size: metadata.get_uint(META_KEY_MAX_VALUE_SIZE)?,
             max_value_threshold: metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD)? as usize,
-            detect_conflicts: metadata.get_bool(META_KEY_DETECT_CONFLICTS)?,
             create_if_not_exists: metadata.get_bool(META_KEY_CREATE_IF_NOT_EXISTS)?,
             max_tx_entries: metadata.get_uint(META_KEY_MAX_TX_ENTRIES)? as usize,
             wal_disabled: metadata.get_bool(META_KEY_WAL_DISABLED)?,
             max_active_snapshots: metadata.get_uint(META_KEY_MAX_ACTIVE_SNAPSHOTS)?,
             max_segment_size: metadata.get_uint(META_KEY_MAX_FILE_SIZE)?,
-            max_cache_size: metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE)?,
+            max_value_cache_size: metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE)?,
         })
     }
 }
@@ -137,7 +134,6 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from(""));
         assert_eq!(options.max_key_size, 1024);
         assert_eq!(options.max_value_size, 1024 * 1024);
-        assert_eq!(options.detect_conflicts, true);
         assert_eq!(options.create_if_not_exists, true);
         assert_eq!(options.max_tx_entries, 1 << 10);
         assert_eq!(options.wal_disabled, false);
@@ -145,7 +141,7 @@ mod tests {
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_active_snapshots, DEFAULT_MAX_ACTIVE_SNAPSHOTS);
         assert_eq!(options.max_segment_size, 1 << 26);
-        assert_eq!(options.max_cache_size, 100000);
+        assert_eq!(options.max_value_cache_size, 100000);
     }
 
     #[test]
@@ -154,7 +150,6 @@ mod tests {
             dir: PathBuf::from("/test/dir"),
             max_key_size: 2048,
             max_value_size: 4096,
-            detect_conflicts: false,
             create_if_not_exists: false,
             max_tx_entries: 500,
             wal_disabled: true,
@@ -162,7 +157,7 @@ mod tests {
             isolation_level: IsolationLevel::SerializableSnapshotIsolation,
             max_active_snapshots: 10,
             max_segment_size: 1 << 25, // 32 MB
-            max_cache_size: 200000,
+            max_value_cache_size: 200000,
         };
 
         let metadata = options.to_metadata();
@@ -177,7 +172,6 @@ mod tests {
             metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD).unwrap(),
             128
         );
-        assert_eq!(metadata.get_bool(META_KEY_DETECT_CONFLICTS).unwrap(), false);
         assert_eq!(
             metadata.get_bool(META_KEY_CREATE_IF_NOT_EXISTS).unwrap(),
             false
@@ -205,7 +199,6 @@ mod tests {
         metadata.put_uint(META_KEY_MAX_KEY_SIZE, 2048);
         metadata.put_uint(META_KEY_MAX_VALUE_SIZE, 4096);
         metadata.put_uint(META_KEY_MAX_VALUE_THRESHOLD, 128);
-        metadata.put_bool(META_KEY_DETECT_CONFLICTS, false);
         metadata.put_bool(META_KEY_CREATE_IF_NOT_EXISTS, false);
         metadata.put_uint(META_KEY_MAX_TX_ENTRIES, 500);
         metadata.put_bool(META_KEY_WAL_DISABLED, true);
@@ -224,7 +217,6 @@ mod tests {
         assert_eq!(options.max_key_size, 2048);
         assert_eq!(options.max_value_size, 4096);
         assert_eq!(options.max_value_threshold, 128);
-        assert_eq!(options.detect_conflicts, false);
         assert_eq!(options.create_if_not_exists, false);
         assert_eq!(options.max_tx_entries, 500);
         assert_eq!(options.wal_disabled, true);
@@ -234,6 +226,6 @@ mod tests {
         );
         assert_eq!(options.max_active_snapshots, 10);
         assert_eq!(options.max_segment_size, 1 << 25);
-        assert_eq!(options.max_cache_size, 200000);
+        assert_eq!(options.max_value_cache_size, 200000);
     }
 }

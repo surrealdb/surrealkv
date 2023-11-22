@@ -3,8 +3,7 @@ use std::{
     sync::{Arc, PoisonError},
 };
 
-use crate::storage::index::art::TrieError;
-use crate::storage::log::Error as LogError;
+use crate::storage::{index::art::TrieError, log::Error as LogError};
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;

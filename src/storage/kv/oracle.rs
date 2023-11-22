@@ -12,11 +12,15 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 
-use crate::storage::index::art::TrieError;
-use crate::storage::kv::error::{Error, Result};
-use crate::storage::kv::option::Options;
-use crate::storage::kv::snapshot::Snapshot;
-use crate::storage::kv::transaction::Transaction;
+use crate::storage::{
+    index::art::TrieError,
+    kv::{
+        error::{Error, Result},
+        option::Options,
+        snapshot::Snapshot,
+        transaction::Transaction,
+    },
+};
 
 pub(crate) struct Oracle {
     pub(crate) write_lock: Mutex<()>,
@@ -446,7 +450,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_waiters_new() {
+    fn waiters_new() {
         let hub = WaterMark::new();
 
         hub.done_upto(10);
@@ -459,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_waiters_async() {
+    fn waiters_async() {
         let hub = Arc::new(WaterMark::new());
         let hub_clone = Arc::clone(&hub);
 
