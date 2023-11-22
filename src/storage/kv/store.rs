@@ -31,24 +31,35 @@ pub struct Store {
 }
 
 impl Store {
-    /// Creates a new MVCC key-value store with the given key-value store for storage.
+    /// Creates a new MVCC key-value store with the given options.
+    /// It creates a new core with the options and wraps it in an atomic reference counter.
+    /// It returns the store.
     pub fn new(opts: Options) -> Result<Self> {
         let core = Arc::new(Core::new(opts)?);
         Ok(Self { core })
     }
 
+    /// Begins a new read-write transaction.
+    /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
+    /// It returns the transaction.
     pub fn begin(&self) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
+    /// Begins a new transaction with the given mode.
+    /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
+    /// It returns the transaction.
     pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
         txn.read_ts = self.core.oracle.read_ts();
         Ok(txn)
     }
 
+    /// Executes a function in a read-only transaction.
+    /// It begins a new read-only transaction and executes the function with the transaction.
+    /// It returns the result of the function.
     pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
@@ -56,6 +67,9 @@ impl Store {
         Ok(())
     }
 
+    /// Executes a function in a read-write transaction and commits the transaction.
+    /// It begins a new read-write transaction, executes the function with the transaction, and commits the transaction.
+    /// It returns the result of the function.
     pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
@@ -66,6 +80,8 @@ impl Store {
 }
 
 impl Drop for Store {
+    /// Drops the store by closing the core.
+    /// If closing the core fails, it panics with an error message.
     fn drop(&mut self) {
         let err = self.core.close();
         if err.is_err() {
@@ -74,12 +90,13 @@ impl Drop for Store {
     }
 }
 
+/// Core of the key-value store.
 pub struct Core {
     /// Index for store.
     pub(crate) indexer: RwLock<Indexer>,
     /// Options for store.
     pub(crate) opts: Options,
-    /// WAL for store.
+    /// Write-ahead log for store.
     pub(crate) wal: Arc<Option<WAL>>,
     /// Commit log for store.
     pub(crate) clog: Arc<RwLock<AOL>>,
@@ -95,6 +112,12 @@ pub struct Core {
 }
 
 impl Core {
+    /// Creates a new Core with the given options.
+    /// It initializes a new Indexer, opens or creates the manifest file,
+    /// loads or creates metadata from the manifest file, updates the options with the loaded metadata,
+    /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
+    /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
+    /// the Core instance.
     pub fn new(opts: Options) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Indexer::new(&opts);
@@ -158,7 +181,7 @@ impl Core {
             // Read the next transaction record from the log.
             let res = tx_reader.read_into(&mut tx);
             if let Err(e) = res {
-                if let Error::Log(log_error) = &e {
+                if let Error::LogError(log_error) = &e {
                     match log_error {
                         LogError::EOF => break,
                         _ => return Err(e),
@@ -240,7 +263,7 @@ impl Core {
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::Log(log_error) = &e {
+                if let Error::LogError(log_error) = &e {
                     match log_error {
                         LogError::EOF => break,
                         _ => return Err(e),

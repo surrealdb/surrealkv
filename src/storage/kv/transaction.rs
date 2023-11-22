@@ -16,19 +16,23 @@ use crate::storage::{
     },
 };
 
-/// An MVCC transaction mode.
+/// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
-    /// A read-write transaction.
+    /// `ReadWrite` mode allows the transaction to both read and write data.
     ReadWrite,
-    /// A read-only transaction.
+    /// `ReadOnly` mode allows the transaction to only read data.
     ReadOnly,
-    /// A Write-only transaction.
+    /// `WriteOnly` mode allows the transaction to only write data.
     WriteOnly,
 }
 
 impl Mode {
     /// Checks whether the transaction mode can mutate data.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if the mode is either `ReadWrite` or `WriteOnly`, `false` otherwise.
     pub(crate) fn mutable(&self) -> bool {
         match self {
             Self::ReadWrite => true,
@@ -37,6 +41,11 @@ impl Mode {
         }
     }
 
+    /// Checks if the transaction mode is `WriteOnly`.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if the mode is `WriteOnly`, `false` otherwise.
     pub(crate) fn is_write_only(&self) -> bool {
         match self {
             Self::WriteOnly => true,
@@ -44,6 +53,11 @@ impl Mode {
         }
     }
 
+    /// Checks if the transaction mode is `ReadOnly`.
+    ///
+    /// # Returns
+    ///
+    /// * `bool` - `true` if the mode is `ReadOnly`, `false` otherwise.
     pub(crate) fn is_read_only(&self) -> bool {
         match self {
             Self::ReadOnly => true,
@@ -52,39 +66,39 @@ impl Mode {
     }
 }
 
+/// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
-    /// The read timestamp of the transaction.
+    /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
     pub(crate) read_ts: u64,
 
-    /// The transaction mode.
+    /// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
     mode: Mode,
 
-    /// The snapshot that the transaction is running in.
+    /// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
     pub(crate) snapshot: RwLock<Snapshot>,
 
-    // Reusable buffer for encoding transaction records.
+    /// `buf` is a reusable buffer for encoding transaction records. This is used to reduce memory allocations.
     buf: BytesMut,
 
-    /// The underlying store for the transaction. Shared between transactions using a mutex.
+    /// `store` is the underlying store for the transaction. This is shared between transactions using a mutex to ensure data consistency.
     pub(crate) store: Arc<Core>,
 
-    /// The pending writes for the transaction.
+    /// `write_set` is the pending writes for the transaction. These are the changes that the transaction wants to make to the data.
     pub(crate) write_set: HashMap<Bytes, Entry>,
 
-    // The keys that are read in the transaction from the snapshot.
+    /// `read_set` is the keys that are read in the transaction from the snapshot. This is used to ensure repeatable reads.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
-    // The offsets of values in the transaction post commit to the transaction log.
+    /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
 
-    // The transaction is closed.
+    /// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
     closed: bool,
 }
 
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
-        // TODO!! This should be the max txID of the index, get this from oracle
         let read_ts = now();
         let snapshot = RwLock::new(Snapshot::take(store.clone(), read_ts)?);
 
@@ -124,43 +138,48 @@ impl Transaction {
 
     /// Gets a value for a key if it exists.
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        // If the transaction is closed, return an error.
         if self.closed {
-            return Err(Error::TxnClosed);
+            return Err(Error::TransactionClosed);
         }
+        // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
         }
 
-        // Check if the key is in the snapshot.
+        // Create a copy of the key.
         let key = Bytes::copy_from_slice(key);
+
+        // Attempt to get the value for the key from the snapshot.
         match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
-                // If the transaction is not read-only and the value reference has a timestamp greater than 0,
-                // add the key and its timestamp to the read set for conflict detection.
-
-                // RYOW semantics: Read your own write
+                // RYOW semantics: Read your own write. If the key is in the write set, return the value.
                 if let Some(entry) = self.write_set.get(&key) {
                     return Ok(entry.value.clone().to_vec());
                 }
 
+                // If the transaction is not read-only and the value reference has a timestamp greater than 0,
+                // add the key and its timestamp to the read set for conflict detection.
                 if !self.mode.is_read_only() && val_ref.ts() > 0 {
                     self.read_set.lock().push((key, val_ref.ts()));
                 }
+
+                // Resolve the value reference to get the actual value.
                 val_ref.resolve()
             }
             Err(e) => {
                 match &e {
-                    Error::Index(trie_error) => {
+                    // If the key is not found in the index, and the transaction is not read-only,
+                    // add the key to the read set with a timestamp of 0.
+                    Error::IndexError(trie_error) => {
                         if let TrieError::KeyNotFound = trie_error {
-                            // If the transaction is not read-only, add the key to the read set.
-                            // In snapshot isolation mode, this key could be added by another transaction,
-                            // and keeping track of this key helps detect conflicts.
                             if !self.mode.is_read_only() {
                                 self.read_set.lock().push((key, 0));
                             }
                         }
                         Err(e)
                     }
+                    // For other errors, just propagate them.
                     _ => Err(e),
                 }
             }
@@ -169,26 +188,34 @@ impl Transaction {
 
     /// Writes a value for a key. None is used for deletion.
     fn write(&mut self, e: Entry) -> Result<()> {
+        // If the transaction mode is not mutable (i.e., it's read-only), return an error.
         if !self.mode.mutable() {
-            return Err(Error::TxnReadOnly);
+            return Err(Error::TransactionReadOnly);
         }
+        // If the transaction is closed, return an error.
         if self.closed {
-            return Err(Error::TxnClosed);
+            return Err(Error::TransactionClosed);
         }
+        // If the key is empty, return an error.
         if e.key.is_empty() {
             return Err(Error::EmptyKey);
         }
+        // If the key length exceeds the maximum allowed key size, return an error.
         if e.key.len() as u64 > self.store.opts.max_key_size {
             return Err(Error::MaxKeyLengthExceeded);
         }
+        // If the value length exceeds the maximum allowed value size, return an error.
         if e.value.len() as u64 > self.store.opts.max_value_size {
             return Err(Error::MaxValueLengthExceeded);
         }
 
+        // If the transaction mode is not write-only, update the snapshot.
         if !self.mode.is_write_only() {
-            // Convert to Bytes
+            // Convert the value to Bytes.
             let index_value = ValueRef::encode_mem(&e.value, e.metadata.as_ref());
 
+            // If the entry is marked as deleted, delete it from the snapshot.
+            // Otherwise, set the key-value pair in the snapshot.
             if e.is_deleted() {
                 self.snapshot.write().delete(&e.key[..].into())?;
             } else {
@@ -196,25 +223,34 @@ impl Transaction {
             }
         }
 
-        // Add the entry to pending writes
+        // Add the entry to the set of pending writes.
         self.write_set.insert(e.key.clone(), e);
 
         Ok(())
     }
 
+    /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
     pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
     where
         R: RangeBounds<VectorKey> + 'b,
     {
+        // Create a new reader for the snapshot.
         let iterator = self.snapshot.write().new_reader()?;
+
+        // Get a range iterator for the specified range.
         let ranger = iterator.range(range);
+
+        // Initialize an empty vector to store the results.
         let mut results = Vec::new();
 
+        // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
+            // Create a new value reference and decode the value.
             let mut val_ref = ValueRef::new(self.store.clone());
             let val_bytes_ref: &Bytes = &value;
             val_ref.decode(*version, val_bytes_ref)?;
 
+            // Apply all filters. If any filter fails, skip this key and continue with the next one.
             for filter in &FILTERS {
                 if filter.apply(&val_ref, self.read_ts).is_err() {
                     continue 'outer;
@@ -222,7 +258,7 @@ impl Transaction {
             }
 
             // Only add the key to the read set if the timestamp is less than or equal to the
-            // read timestamp. This is to prevent adding keys that are added during transaction.
+            // read timestamp. This is to prevent adding keys that are added during the transaction.
             if val_ref.ts() <= self.read_ts {
                 self.read_set.lock().push((
                     Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the tart leaf are terminated with a null byte
@@ -230,10 +266,14 @@ impl Transaction {
                 ));
             }
 
+            // Resolve the value reference to get the actual value.
             let v = val_ref.resolve()?;
+
+            // Add the value, version, and timestamp to the results vector.
             results.push((v, *version, *ts));
         }
 
+        // Return the results.
         Ok(results)
     }
 
@@ -248,14 +288,17 @@ impl Transaction {
 
     /// Commits the transaction, by writing all pending entries to the store.
     pub fn commit(&mut self) -> Result<()> {
+        // If the transaction is closed, return an error.
         if self.closed {
-            return Err(Error::TxnClosed);
+            return Err(Error::TransactionClosed);
         }
 
+        // If the transaction is read-only, return an error.
         if self.mode.is_read_only() {
-            return Err(Error::TxnReadOnly);
+            return Err(Error::TransactionReadOnly);
         }
 
+        // If there are no pending writes, there's nothing to commit, so return early.
         if self.write_set.is_empty() {
             return Ok(());
         }
@@ -265,23 +308,28 @@ impl Transaction {
         let oracle = self.store.oracle.clone();
         let _lock = oracle.write_lock.lock();
 
-        // Prepare for the commit
+        // Prepare for the commit by getting a transaction ID and a commit timestamp.
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
-        // Add transaction records to the log
+        // Add transaction records to the transaction log.
         self.add_to_transaction_log(tx_id, commit_ts)?;
 
-        // Commit to the store index
+        // Commit the changes to the store index.
         self.commit_to_index(tx_id, commit_ts)?;
 
+        // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
         oracle.committed_upto(tx_id);
 
+        // Mark the transaction as closed.
         self.closed = true;
 
         Ok(())
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
+    /// It clones the oracle from the store and gets a new commit timestamp from the oracle.
+    /// Then it assigns commit timestamps to the transaction entries.
+    /// It returns the transaction ID and commit timestamp.
     fn prepare_commit(&mut self) -> Result<(u64, u64)> {
         let oracle = self.store.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
@@ -290,6 +338,8 @@ impl Transaction {
     }
 
     /// Assigns commit timestamps to transaction entries.
+    /// It gets the current time as the commit timestamp and assigns the commit timestamp to each entry in the write set.
+    /// It returns the commit timestamp.
     fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
         self.write_set.iter_mut().for_each(|(_, entry)| {
@@ -299,6 +349,10 @@ impl Transaction {
     }
 
     /// Adds transaction records to the transaction log.
+    /// It gets the current offset of the commit log and clones the entries from the write set.
+    /// Then it creates a new transaction record with the entries, transaction ID, and commit timestamp.
+    /// It encodes the transaction record into the buffer and appends the buffer to the commit log.
+    /// It returns the transaction offset.
     fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
         let current_offset = self.store.clog.read().offset()?;
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
@@ -315,6 +369,8 @@ impl Transaction {
     }
 
     /// Commits transaction changes to the store index.
+    /// It gets a write lock on the indexer and builds key-value pairs from the write set.
+    /// Then it inserts the key-value pairs into the index.
     fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
         let mut index = self.store.indexer.write();
         let mut kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
@@ -323,6 +379,10 @@ impl Transaction {
         Ok(())
     }
 
+    /// Builds key-value pairs from the write set.
+    /// It creates a new vector to hold the key-value pairs.
+    /// Then it iterates over the write set and for each entry, it builds an index value and pushes a new key-value pair to the vector.
+    /// It returns the vector of key-value pairs.
     fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VectorKey, Bytes>> {
         let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
 
@@ -340,6 +400,9 @@ impl Transaction {
         kv_pairs
     }
 
+    /// Builds an index value from an entry.
+    /// It encodes the entry into a value reference using the key, value, metadata, committed values offsets, and max value threshold.
+    /// It returns the index value.
     fn build_index_value(&self, entry: &Entry) -> Bytes {
         let index_value = ValueRef::encode(
             &entry.key,
@@ -351,24 +414,20 @@ impl Transaction {
         index_value
     }
 
-    /// Rolls back the transaction, by removing all updated entries.
-    pub fn rollback(&mut self) -> Result<()> {
+    /// Rolls back the transaction by removing all updated entries.
+    /// It sets the transaction as closed and clears the committed values offsets, buffer, write set, and read set.
+    pub fn rollback(&mut self) {
         self.closed = true;
         self.committed_values_offsets.clear();
         self.buf.clear();
         self.write_set.clear();
         self.read_set.lock().clear();
-
-        Ok(())
     }
 }
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        let err = self.rollback();
-        if err.is_err() {
-            panic!("failed to drop transaction: {:?}", err);
-        }
+        self.rollback();
     }
 }
 
@@ -482,7 +541,7 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -522,7 +581,7 @@ mod tests {
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -550,7 +609,7 @@ mod tests {
             txn3.set(&key, &value2).unwrap();
             assert!(match txn3.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -665,7 +724,7 @@ mod tests {
 
             assert!(match txn3.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -694,7 +753,7 @@ mod tests {
 
             assert!(match txn3.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -790,7 +849,7 @@ mod tests {
             txn2.set(&key2, &value6).unwrap();
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -914,7 +973,7 @@ mod tests {
             txn1.commit().unwrap();
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -977,7 +1036,7 @@ mod tests {
 
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -1010,7 +1069,7 @@ mod tests {
 
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -1078,7 +1137,7 @@ mod tests {
             assert!(txn1.get(&key2).is_err());
             assert!(match txn1.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false
@@ -1148,7 +1207,7 @@ mod tests {
 
             assert!(match txn2.commit() {
                 Err(err) => {
-                    if let Error::TxnReadConflict = err {
+                    if let Error::TransactionReadConflict = err {
                         true
                     } else {
                         false

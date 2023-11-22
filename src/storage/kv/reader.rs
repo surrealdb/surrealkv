@@ -13,6 +13,16 @@ use crate::storage::{
 use super::entry::TxRecord;
 use super::util::calculate_crc32;
 
+/// `Reader` is a generic reader for reading data from an AOL. It is used
+/// by the `TxReader` to read data from the AOL source.
+///
+/// # Fields
+/// * `r_at: AOL` - Represents the current position in the AOL source.
+/// * `buffer: Vec<u8>` - A buffer that temporarily holds data read from the source.
+/// * `read: usize` - The number of bytes read from the source.
+/// * `start: usize` - The starting position for reading data.
+/// * `eof: bool` - A flag indicating if the end of the file/data source has been reached.
+/// * `offset: u64` - The offset from the beginning of the file/data source.
 pub(crate) struct Reader {
     r_at: AOL,
     buffer: Vec<u8>,
@@ -23,6 +33,13 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// Creates a new `Reader` with the given `r_at`, `off`, and `size`.
+    ///
+    /// # Arguments
+    ///
+    /// * `r_at: AOL` - The current position in the data source.
+    /// * `off: u64` - The offset from the beginning of the file/data source.
+    /// * `size: usize` - The size of the buffer.
     pub(crate) fn new_from(r_at: AOL, off: u64, size: usize) -> Result<Self> {
         Ok(Reader {
             r_at,
@@ -34,6 +51,7 @@ impl Reader {
         })
     }
 
+    /// Resets the `Reader` to its initial state.
     fn reset(&mut self) {
         self.read = 0;
         self.eof = false;
@@ -41,10 +59,16 @@ impl Reader {
         self.start = 0;
     }
 
+    /// Returns the current offset of the `Reader`.
     fn offset(&self) -> u64 {
         self.offset
     }
 
+    /// Reads data into the provided buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf: &mut [u8]` - The buffer to read data into.
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut n = 0;
         let buf_len = buf.len();
@@ -77,30 +101,39 @@ impl Reader {
         Ok(n)
     }
 
+    /// Reads a single byte from the data source.
     pub(crate) fn read_byte(&mut self) -> Result<u8> {
         let mut b = [0; 1];
         self.read(&mut b)?;
         Ok(b[0])
     }
 
+    /// Reads a specified number of bytes from the data source.
+    ///
+    /// # Arguments
+    ///
+    /// * `len: usize` - The number of bytes to read.
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0; len];
         self.read(&mut buffer)?;
         Ok(buffer)
     }
 
+    /// Reads a 64-bit unsigned integer from the data source.
     pub(crate) fn read_uint64(&mut self) -> Result<u64> {
         let mut b = [0; 8];
         self.read(&mut b)?;
         Ok(u64::from_be_bytes(b))
     }
 
+    /// Reads a 32-bit unsigned integer from the data source.
     pub(crate) fn read_uint32(&mut self) -> Result<u32> {
         let mut b = [0; 4];
         self.read(&mut b)?;
         Ok(u32::from_be_bytes(b))
     }
 
+    /// Reads a 16-bit unsigned integer from the data source.
     pub(crate) fn read_uint16(&mut self) -> Result<u16> {
         let mut b = [0; 2];
         self.read(&mut b)?;
@@ -108,22 +141,36 @@ impl Reader {
     }
 }
 
+/// `TxReader` is a public struct within the crate that is used for reading transaction records.
+///
+/// # Fields
+/// * `r: Reader` - The `Reader` instance used to read data.
 pub(crate) struct TxReader {
     r: Reader,
 }
 
 impl TxReader {
+    /// Creates a new `TxReader` with the given `Reader`.
+    ///
+    /// # Arguments
+    ///
+    /// * `r: Reader` - The `Reader` instance to use for reading data.
     pub(crate) fn new(r: Reader) -> Result<Self> {
         Ok(TxReader { r })
     }
 
+    /// Reads the header of a transaction record.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx: &mut TxRecord` - The transaction record to read the header into.    
     pub(crate) fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
         let id = self.r.read_uint64()?;
 
         // Either the header is corrupted or we have reached the end of the file
         // and encountered the padded zeros towards the end of the file.
         if id == 0 {
-            return Err(Error::InvalidTxRecordID);
+            return Err(Error::InvalidTransactionRecordId);
         }
 
         tx.header.id = id;
@@ -134,7 +181,7 @@ impl TxReader {
 
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_TX_METADATA_SIZE {
-            return Err(Error::CorruptedTxHeader);
+            return Err(Error::CorruptedTransactionHeader);
         }
 
         let mut txmd: Option<Metadata> = None;
@@ -151,6 +198,7 @@ impl TxReader {
         Ok(())
     }
 
+    /// Reads a transaction entry.
     fn read_entry(&mut self) -> Result<TxEntry> {
         let md_len = self.r.read_uint16()?;
         let kvmd = if md_len > 0 {
@@ -176,6 +224,11 @@ impl TxReader {
         })
     }
 
+    /// Reads a transaction record into the provided `TxRecord`.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx: &mut TxRecord` - The `TxRecord` to read data into.
     pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
         self.read_header(tx)?;
 
@@ -193,17 +246,27 @@ impl TxReader {
         Ok(value_offsets)
     }
 
+    /// Verifies the CRC of a transaction record.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx: &TxRecord` - The `TxRecord` to verify the CRC of.    
     fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
         let entry_crc = self.r.read_uint32()?;
         let buf = Self::serialize_tx_record(tx)?;
         let actual_crc = calculate_crc32(&buf);
         if entry_crc != actual_crc {
-            return Err(Error::CorruptedTxRecord);
+            return Err(Error::CorruptedTransactionRecord);
         }
 
         Ok(())
     }
 
+    /// Serializes a transaction record.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx: &TxRecord` - The `TxRecord` to serialize.
     fn serialize_tx_record(tx: &TxRecord) -> Result<Bytes> {
         let mut buf = BytesMut::new();
         tx.to_buf(&mut buf)?;

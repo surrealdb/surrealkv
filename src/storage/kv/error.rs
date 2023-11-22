@@ -1,39 +1,36 @@
-use std::{
-    fmt, io,
-    sync::{Arc, PoisonError},
-};
+use std::{fmt, io, sync::Arc};
 
 use crate::storage::{index::art::TrieError, log::Error as LogError};
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Custom error type for the storage module
+/// `Error` is a custom error type for the storage module.
+/// It includes various variants to represent different types of errors that can occur.
 #[derive(Debug)]
 pub enum Error {
-    Abort,
-    IO(Arc<io::Error>),
-    Log(LogError),
-    EmptyKey,
-    PoisonError(String),
-    TxnClosed,
-    NonExpirable,
-    CorruptedMetadata,
-    TxnReadOnly,
-    Index(TrieError), // New variant to hold TrieError
-    MaxKeyLengthExceeded,
-    MaxValueLengthExceeded,
-    KeyNotFound,
-    CorruptedIndex,
-    TxnReadConflict,
-    StoreClosed,
-    InvalidAttributeData,
-    UnknownAttributeType,
-    CorruptedTxRecord,
-    CorruptedTxHeader,
-    InvalidTxRecordID,
-    EmptyValue,
-    ManifestNotFound,
+    Abort,                      // The operation was aborted
+    IoError(Arc<io::Error>),    // An I/O error occurred
+    LogError(LogError),         // An error occurred in the log
+    EmptyKey,                   // The key is empty
+    TransactionClosed,          // The transaction was closed
+    NonExpirable,               // The entry cannot be expired
+    CorruptedMetadata,          // The metadata is corrupted
+    TransactionReadOnly,        // The transaction is read-only
+    IndexError(TrieError),      // An error occurred in the index
+    MaxKeyLengthExceeded,       // The maximum key length was exceeded
+    MaxValueLengthExceeded,     // The maximum value length was exceeded
+    KeyNotFound,                // The key was not found
+    CorruptedIndex,             // The index is corrupted
+    TransactionReadConflict,    // A read conflict occurred in the transaction
+    StoreClosed,                // The store was closed
+    InvalidAttributeData,       // The attribute data is invalid
+    UnknownAttributeType,       // The attribute type is unknown
+    CorruptedTransactionRecord, // The transaction record is corrupted
+    CorruptedTransactionHeader, // The transaction header is corrupted
+    InvalidTransactionRecordId, // The transaction record ID is invalid
+    EmptyValue,                 // The value in the record is empty
+    ManifestNotFound,           // The manifest was not found
 }
 
 /// Error structure for encoding errors
@@ -67,28 +64,27 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Abort => write!(f, "Operation aborted"),
-            Error::IO(err) => write!(f, "IO error: {}", err),
+            Error::IoError(err) => write!(f, "IO error: {}", err),
             Error::EmptyKey => write!(f, "Empty key"),
-            Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
-            Error::TxnClosed => {
+            Error::TransactionClosed => {
                 write!(f, "This transaction has been closed")
             }
             Error::NonExpirable => write!(f, "This entry cannot be expired"),
             Error::CorruptedMetadata => write!(f, "Corrupted metadata"),
-            Error::TxnReadOnly => write!(f, "This transaction is read-only"),
-            Error::Index(trie_error) => write!(f, "Index error: {}", trie_error),
+            Error::TransactionReadOnly => write!(f, "This transaction is read-only"),
+            Error::IndexError(trie_error) => write!(f, "Index error: {}", trie_error),
             Error::MaxKeyLengthExceeded => write!(f, "Max Key length exceeded"),
             Error::MaxValueLengthExceeded => write!(f, "Max Value length exceeded"),
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::CorruptedIndex => write!(f, "Corrupted index"),
-            Error::TxnReadConflict => write!(f, "Transaction read conflict"),
+            Error::TransactionReadConflict => write!(f, "Transaction read conflict"),
             Error::StoreClosed => write!(f, "Store closed"),
             Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
             Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
-            Error::Log(log_error) => write!(f, "Log error: {}", log_error),
-            Error::CorruptedTxRecord => write!(f, "Corrupted transaction record"),
-            Error::CorruptedTxHeader => write!(f, "Corrupted transaction header"),
-            Error::InvalidTxRecordID => write!(f, "Invalid transaction record ID"),
+            Error::LogError(log_error) => write!(f, "Log error: {}", log_error),
+            Error::CorruptedTransactionRecord => write!(f, "Corrupted transaction record"),
+            Error::CorruptedTransactionHeader => write!(f, "Corrupted transaction header"),
+            Error::InvalidTransactionRecordId => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
             Error::ManifestNotFound => write!(f, "Manifest not found"),
         }
@@ -101,25 +97,18 @@ impl std::error::Error for Error {}
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
-        Error::IO(Arc::new(e))
-    }
-}
-
-// Implementation to convert PoisonError into Error
-impl<T: Sized> From<PoisonError<T>> for Error {
-    fn from(e: PoisonError<T>) -> Error {
-        Error::PoisonError(e.to_string())
+        Error::IoError(Arc::new(e))
     }
 }
 
 impl From<TrieError> for Error {
     fn from(trie_error: TrieError) -> Self {
-        Error::Index(trie_error)
+        Error::IndexError(trie_error)
     }
 }
 
 impl From<LogError> for Error {
     fn from(log_error: LogError) -> Self {
-        Error::Log(log_error)
+        Error::LogError(log_error)
     }
 }

@@ -3,13 +3,17 @@ use hashbrown::HashSet;
 
 use crate::storage::kv::error::{Error, Result};
 
+/// An enumeration of possible attributes for a key-value pair.
+/// Currently, only the `Deleted` attribute is defined.
+/// More attribute types can be added as variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Attribute {
     Deleted,
-    // Add more variants for other attribute types
 }
 
 impl Attribute {
+    /// Converts a `u8` value into an `Attribute` variant.
+    /// Returns `None` if the value does not correspond to a known attribute.
     fn from_u8(value: u8) -> Option<Attribute> {
         match value {
             0 => Some(Attribute::Deleted),
@@ -17,18 +21,22 @@ impl Attribute {
         }
     }
 
+    /// Returns a `u8` that represents the kind of the attribute.
     fn kind(&self) -> u8 {
         match self {
             Attribute::Deleted => 0,
         }
     }
 
+    /// Serializes the attribute into a `Bytes` object.
     fn serialize(&self) -> Bytes {
         match self {
             Attribute::Deleted => Bytes::new(),
         }
     }
 
+    /// Deserializes an attribute from a byte slice.
+    /// Returns `Error::UnknownAttributeType` if the attribute type is unknown.
     fn deserialize(&self, bytes: &mut &[u8]) -> Result<Attribute> {
         if bytes.is_empty() {
             return Ok(Attribute::Deleted);
@@ -40,21 +48,22 @@ impl Attribute {
     }
 }
 
-// Structure representing metadata for a key-value pair
+/// A structure representing metadata for a key-value pair.
+/// The metadata consists of a set of attributes.
 #[derive(Clone, Debug)]
 pub(crate) struct Metadata {
     attributes: HashSet<Attribute>,
 }
 
 impl Metadata {
-    // Create a new metadata instance
+    /// Creates a new `Metadata` instance with no attributes.
     pub(crate) fn new() -> Self {
         Metadata {
             attributes: HashSet::new(),
         }
     }
 
-    // Set the 'deleted' attribute based on the provided flag
+    /// Sets or removes the 'deleted' attribute based on the provided flag.
     pub(crate) fn as_deleted(&mut self, deleted: bool) -> Result<()> {
         if deleted {
             self.attributes.insert(Attribute::Deleted);
@@ -65,12 +74,12 @@ impl Metadata {
         Ok(())
     }
 
-    // Check if the 'deleted' attribute is present
+    /// Checks if the 'deleted' attribute is present.
     pub(crate) fn deleted(&self) -> bool {
         self.attributes.contains(&Attribute::Deleted)
     }
 
-    // Serialize metadata into a byte vector
+    /// Serializes the metadata into a byte vector.
     pub(crate) fn bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
@@ -82,7 +91,7 @@ impl Metadata {
         buf.freeze()
     }
 
-    // Deserialize metadata from Bytes into a Metadata instance
+    /// Deserializes metadata from a byte slice into a `Metadata` instance.
     pub(crate) fn from_bytes(encoded_bytes: &[u8]) -> Result<Self> {
         let mut attributes = HashSet::new();
         let mut cursor = encoded_bytes;

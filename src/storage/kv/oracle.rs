@@ -22,12 +22,19 @@ use crate::storage::{
     },
 };
 
+/// Oracle is responsible for managing transaction timestamps and isolation levels.
+/// It uses a write lock to ensure that only one transaction can commit at a time.
+/// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
+    /// Write lock to ensure that only one transaction can commit at a time.
     pub(crate) write_lock: Mutex<()>,
+    /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
 
 impl Oracle {
+    /// Creates a new Oracle with the given options.
+    /// It sets the isolation level based on the options.
     pub(crate) fn new(opts: &Options) -> Self {
         let isolation = match opts.isolation_level {
             crate::storage::kv::option::IsolationLevel::SnapshotIsolation => {
@@ -44,19 +51,27 @@ impl Oracle {
         }
     }
 
+    /// Generates a new commit timestamp for the given transaction.
+    /// It delegates to the isolation level to generate the timestamp.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         self.isolation.new_commit_ts(txn)
     }
 
+    /// Returns the read timestamp.
+    /// It delegates to the isolation level to get the timestamp.
     pub(crate) fn read_ts(&self) -> u64 {
         self.isolation.read_ts()
     }
 
+    /// Sets the timestamp and increments it.
+    /// It delegates to the isolation level to set and increment the timestamp.
     pub(crate) fn set_ts(&self, ts: u64) {
         self.isolation.set_ts(ts);
         self.isolation.increment_ts();
     }
 
+    /// Marks the transactions as committed up to the given timestamp.
+    /// If the isolation level is SerializableSnapshotIsolation, it delegates to the isolation level to mark the transactions.
     pub(crate) fn committed_upto(&self, ts: u64) {
         match &self.isolation {
             IsolationLevel::SnapshotIsolation(_) => {}
@@ -66,6 +81,8 @@ impl Oracle {
         }
     }
 
+    /// Waits for the transactions to commit up to the given timestamp.
+    /// If the isolation level is SerializableSnapshotIsolation, it delegates to the isolation level to wait for the transactions.
     pub(crate) fn wait_for(&self, ts: u64) {
         match &self.isolation {
             IsolationLevel::SnapshotIsolation(_) => {}
@@ -76,67 +93,72 @@ impl Oracle {
     }
 }
 
+/// Enum representing the isolation level of a transaction.
+/// It can be either SnapshotIsolation or SerializableSnapshotIsolation.
 pub(crate) enum IsolationLevel {
     SnapshotIsolation(SnapshotIsolation),
     SerializableSnapshotIsolation(SerializableSnapshotIsolation),
 }
 
+macro_rules! isolation_level_method {
+    ($self:ident, $method:ident $(, $arg:ident)?) => {
+        match $self {
+            IsolationLevel::SnapshotIsolation(oracle) => oracle.$method($($arg)?),
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.$method($($arg)?),
+        }
+    };
+}
+
 impl IsolationLevel {
+    /// Generates a new commit timestamp for the given transaction.
+    /// It delegates to the specific isolation level to generate the timestamp.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        match self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.new_commit_ts(txn),
-        }
+        isolation_level_method!(self, new_commit_ts, txn)
     }
 
+    /// Returns the read timestamp.
+    /// It delegates to the specific isolation level to get the timestamp.
     pub(crate) fn read_ts(&self) -> u64 {
-        match self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.read_ts(),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.read_ts(),
-        }
+        isolation_level_method!(self, read_ts)
     }
 
+    /// Sets the timestamp.
+    /// It delegates to the specific isolation level to set the timestamp.
     pub(crate) fn set_ts(&self, ts: u64) {
-        match self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.set_ts(ts),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.set_ts(ts),
-        }
+        isolation_level_method!(self, set_ts, ts)
     }
 
+    /// Increments the timestamp.
+    /// It delegates to the specific isolation level to increment the timestamp.
     pub(crate) fn increment_ts(&self) {
-        match self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.increment_ts(),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.increment_ts(),
-        }
+        isolation_level_method!(self, increment_ts)
     }
 }
 
+/// Struct representing the Snapshot Isolation level in a transaction.
+/// It uses an atomic u64 to keep track of the next transaction ID.
 pub(crate) struct SnapshotIsolation {
     next_tx_id: AtomicU64,
 }
 
 impl SnapshotIsolation {
+    /// Creates a new SnapshotIsolation instance with the next transaction ID set to 0.
     pub(crate) fn new() -> Self {
         Self {
             next_tx_id: AtomicU64::new(0),
         }
     }
 
+    /// Sets the next transaction ID to the given timestamp.
     pub(crate) fn set_ts(&self, ts: u64) {
         self.next_tx_id.store(ts, Ordering::SeqCst);
     }
 
+    /// Generates a new commit timestamp for the given transaction.
+    /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
+    /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
+    /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        // This is the scenario of snapshot isolation where the transaction is in read-write mode.
-        // In this mode, optimistic concurrency control (OCC) is supported.
-        // The following steps are performed:
-        //      1. Take the latest snapshot from the store
-        //      2. Check if the read keys in the transaction are still valid in the latest snapshot, and
-        //      the timestamp of the read keys in the transaction matches the timestamp of the latest snapshot.
-        //      If the timestamp does not match, then there is a conflict.
-        //      3. If the read keys are still valid, then there is no conflict
-        //      4. If the read keys are not valid, then there is a conflict
-        //
         let current_snapshot = Snapshot::take(txn.store.clone(), self.read_ts())?;
         let read_set = txn.read_set.lock();
 
@@ -144,26 +166,21 @@ impl SnapshotIsolation {
             match current_snapshot.get(&key[..].into()) {
                 Ok(val_ref) => {
                     if *ts != val_ref.ts() {
-                        return Err(Error::TxnReadConflict);
+                        return Err(Error::TransactionReadConflict);
                     }
                 }
-                Err(e) => {
-                    match &e {
-                        Error::Index(trie_error) => {
-                            // Handle key not found
-                            match trie_error {
-                                TrieError::KeyNotFound => {
-                                    if *ts > 0 {
-                                        return Err(Error::TxnReadConflict);
-                                    }
-                                    continue;
-                                }
-                                _ => return Err(e),
+                Err(e) => match &e {
+                    Error::IndexError(trie_error) => match trie_error {
+                        TrieError::KeyNotFound => {
+                            if *ts > 0 {
+                                return Err(Error::TransactionReadConflict);
                             }
+                            continue;
                         }
                         _ => return Err(e),
-                    }
-                }
+                    },
+                    _ => return Err(e),
+                },
             }
         }
 
@@ -172,20 +189,26 @@ impl SnapshotIsolation {
         Ok(ts)
     }
 
+    /// Returns the read timestamp, which is the next transaction ID minus 1.
     pub(crate) fn read_ts(&self) -> u64 {
         self.next_tx_id.load(Ordering::SeqCst) - 1
     }
 
+    /// Increments the next transaction ID by 1.
     pub(crate) fn increment_ts(&self) {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
     }
 }
 
+/// Struct representing a commit marker in a transaction.
+/// It contains a timestamp and a set of conflict keys.
 struct CommitMarker {
     ts: u64,
     conflict_keys: HashSet<Bytes>,
 }
 
+/// Struct for tracking committed transactions.
+/// It maintains the next timestamp, a list of committed transactions, and the last cleanup timestamp.
 #[derive(Default)]
 struct CommitTracker {
     next_ts: u64,
@@ -194,6 +217,7 @@ struct CommitTracker {
 }
 
 impl CommitTracker {
+    /// Creates a new CommitTracker instance with the next timestamp, committed transactions, and last cleanup timestamp set to 0.
     fn new() -> Self {
         Self {
             next_ts: 0,
@@ -202,37 +226,33 @@ impl CommitTracker {
         }
     }
 
+    /// Cleans up committed transactions with timestamps greater than the given maximum read timestamp.
+    /// It updates the last cleanup timestamp and removes committed transactions with timestamps greater than the maximum read timestamp.
     fn cleanup_committed_transactions(&mut self, max_read_ts: u64) {
-        // Ensure max_read_ts is greater than or equal to the last cleanup timestamp.
         assert!(max_read_ts >= self.last_cleanup_ts);
 
-        // If max_read_ts is equal to the last cleanup timestamp, no need to perform cleanup.
         if max_read_ts == self.last_cleanup_ts {
             return;
         }
 
-        // Update the last cleanup timestamp.
         self.last_cleanup_ts = max_read_ts;
 
-        // Remove committed transactions with timestamps greater than max_read_ts.
         self.committed_transactions
             .retain(|txn| txn.ts > max_read_ts);
     }
 
+    /// Checks if a transaction has conflicts with committed transactions.
+    /// It acquires a lock on the read set and checks if there are any conflict keys in the read set.
     fn has_conflict(&self, txn: &Transaction) -> bool {
-        // Acquire a lock on the read set.
         let read_set = txn.read_set.lock();
 
-        // If the read set is empty, there are no conflicts.
         if read_set.is_empty() {
             false
         } else {
-            // Check for conflicts with committed transactions.
             self.committed_transactions
                 .iter()
                 .filter(|committed_txn| committed_txn.ts > txn.read_ts)
                 .any(|committed_txn| {
-                    // Check if there are any conflict keys in the read set.
                     read_set
                         .iter()
                         .any(|read| committed_txn.conflict_keys.contains(&read.0))
@@ -302,7 +322,7 @@ impl SerializableSnapshotIsolation {
 
         // Check for conflicts between the transaction and committed transactions.
         if commit_tracker.has_conflict(txn) {
-            return Err(Error::TxnReadConflict);
+            return Err(Error::TransactionReadConflict);
         }
 
         let ts = {
