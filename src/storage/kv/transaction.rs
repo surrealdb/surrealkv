@@ -845,8 +845,8 @@ mod tests {
 
     #[test]
     fn g0() {
-        g0_tests(false);
-        g0_tests(true);
+        g0_tests(false); // snapshot isolation
+        g0_tests(true); // serializable snapshot isolation
     }
 
     // G1a: Aborted Reads (dirty reads, cascaded aborts)
@@ -891,8 +891,8 @@ mod tests {
 
     #[test]
     fn g1a() {
-        g1a_tests(false);
-        g1a_tests(true);
+        g1a_tests(false); // snapshot isolation
+        g1a_tests(true); // serializable snapshot isolation
     }
 
     // G1b: Intermediate Reads (dirty reads)
@@ -932,8 +932,8 @@ mod tests {
 
     #[test]
     fn g1b() {
-        g1b_tests(false);
-        g1b_tests(true);
+        g1b_tests(false); // snapshot isolation
+        g1b_tests(true); // serializable snapshot isolation
     }
 
     // G1c: Circular Information Flow (dirty reads)
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn g1c() {
-        g1c_tests(false);
+        g1c_tests(false); // snapshot isolation
         g1c_tests(true);
     }
 
@@ -1023,8 +1023,11 @@ mod tests {
             assert!(txn1.get(&key1).is_ok());
             txn1.set(&key1, &value3).unwrap();
 
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
 
             txn2.delete(&key2).unwrap();
             txn1.commit().unwrap();
@@ -1141,8 +1144,13 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
+
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
@@ -1185,8 +1193,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
 
             txn2.set(&key1, &value3).unwrap();
 
@@ -1220,10 +1231,16 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let res = txn1.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
+
+            let res = txn2.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
 
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
