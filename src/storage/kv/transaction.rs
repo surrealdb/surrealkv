@@ -417,10 +417,9 @@ impl Drop for Transaction {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use std::sync::Arc;
 
     use super::*;
-    use crate::storage::kv::option::Options;
+    use crate::storage::kv::option::{IsolationLevel, Options};
     use crate::storage::kv::store::Store;
 
     use tempdir::TempDir;
@@ -429,17 +428,23 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn basic_transaction() {
-        // Create a temporary directory for testing
+    // Common setup logic for creating a store
+    fn create_store(is_ssi: bool) -> (Store, TempDir) {
         let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        if is_ssi {
+            opts.isolation_level = IsolationLevel::SerializableSnapshotIsolation;
+        }
+        (
+            Store::new(opts.clone()).expect("should create store"),
+            temp_dir,
+        )
+    }
 
-        // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
+    #[test]
+    fn basic_transaction() {
+        let (store, temp_dir) = create_store(false);
 
         // Define key-value pairs for the test
         let key1 = Bytes::from("foo1");
@@ -486,13 +491,8 @@ mod tests {
         assert_eq!(val, value2.as_ref());
     }
 
-    #[test]
-    fn mvcc_snapshot_isolation() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        let store = Arc::new(Core::new(opts).expect("should create store"));
+    fn mvcc_tests(is_ssi: bool) {
+        let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
         let key2 = Bytes::from("key2");
@@ -501,8 +501,8 @@ mod tests {
 
         // no read conflict
         {
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().unwrap();
@@ -514,8 +514,8 @@ mod tests {
 
         // read conflict when the read key was updated by another transaction
         {
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().unwrap();
@@ -536,8 +536,8 @@ mod tests {
 
         // blind writes should succeed if key wasn't read first
         {
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn2.set(&key1, &value2).unwrap();
@@ -545,7 +545,7 @@ mod tests {
             txn1.commit().unwrap();
             txn2.commit().unwrap();
 
-            let txn3 = Transaction::new(store.clone(), Mode::ReadOnly).unwrap();
+            let txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap();
             assert_eq!(val, value2.as_ref());
         }
@@ -554,8 +554,8 @@ mod tests {
         {
             let key = Bytes::from("key3");
 
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key, &value1).unwrap();
             txn1.commit().unwrap();
@@ -578,12 +578,12 @@ mod tests {
         {
             let key = Bytes::from("key4");
 
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
             txn1.set(&key, &value1).unwrap();
             txn1.commit().unwrap();
 
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn3 = Transaction::new(store, Mode::ReadWrite).unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key).unwrap();
             assert!(txn2.commit().is_ok());
@@ -604,17 +604,18 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_serialized_snapshot_isolation() {
+        mvcc_tests(true);
+    }
+
+    #[test]
+    fn mvcc_snapshot_isolation() {
+        mvcc_tests(false);
+    }
+
+    #[test]
     fn basic_scan_single_key() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-
+        let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![Bytes::from("key1")];
 
@@ -634,16 +635,7 @@ mod tests {
 
     #[test]
     fn basic_scan_multiple_keys() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-
+        let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![
             Bytes::from("key1"),
@@ -665,13 +657,8 @@ mod tests {
         assert_eq!(results.len(), keys_to_insert.len());
     }
 
-    #[test]
-    fn mvcc_snapshot_isolation_with_scan() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        let store = Arc::new(Core::new(opts).expect("should create store"));
+    fn mvcc_with_scan_tests(is_ssi: bool) {
+        let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
         let key2 = Bytes::from("key2");
@@ -686,13 +673,13 @@ mod tests {
 
         // read conflict when scan keys have been updated in another transaction
         {
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().unwrap();
 
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.set(&key1, &value4).unwrap();
             txn2.set(&key2, &value2).unwrap();
@@ -719,13 +706,13 @@ mod tests {
 
         // read conflict when read keys are deleted by other transaction
         {
-            let mut txn1 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key4, &value1).unwrap();
             txn1.commit().unwrap();
 
-            let mut txn2 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
-            let mut txn3 = Transaction::new(store.clone(), Mode::ReadWrite).unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key4).unwrap();
             txn2.commit().unwrap();
@@ -745,6 +732,16 @@ mod tests {
                 _ => false,
             });
         }
+    }
+
+    #[test]
+    fn mvcc_serialized_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(true);
+    }
+
+    #[test]
+    fn mvcc_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(false);
     }
 
     #[test]
@@ -779,12 +776,8 @@ mod tests {
     }
 
     // Common setup logic for creating a store
-    fn create_store() -> Store {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        let store = Store::new(opts.clone()).expect("should create store");
+    fn create_hermitage_store(is_ssi: bool) -> Store {
+        let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -803,9 +796,8 @@ mod tests {
     // Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
 
     // G0: Write Cycles (dirty writes)
-    #[test]
-    fn snapshot_isolation_g0() {
-        let store = create_store();
+    fn g0_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value3 = Bytes::from("v3");
@@ -851,10 +843,15 @@ mod tests {
         }
     }
 
-    // G1a: Aborted Reads (dirty reads, cascaded aborts)
     #[test]
-    fn snapshot_isolation_g1a() {
-        let store = create_store();
+    fn g0() {
+        g0_tests(false);
+        g0_tests(true);
+    }
+
+    // G1a: Aborted Reads (dirty reads, cascaded aborts)
+    fn g1a_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
@@ -892,10 +889,15 @@ mod tests {
         }
     }
 
-    // G1b: Intermediate Reads (dirty reads)
     #[test]
-    fn snapshot_isolation_g1b() {
-        let store = create_store();
+    fn g1a() {
+        g1a_tests(false);
+        g1a_tests(true);
+    }
+
+    // G1b: Intermediate Reads (dirty reads)
+    fn g1b_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -928,10 +930,15 @@ mod tests {
         }
     }
 
-    // G1c: Circular Information Flow (dirty reads)
     #[test]
-    fn snapshot_isolation_g1c() {
-        let store = create_store();
+    fn g1b() {
+        g1b_tests(false);
+        g1b_tests(true);
+    }
+
+    // G1c: Circular Information Flow (dirty reads)
+    fn g1c_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -967,10 +974,15 @@ mod tests {
         }
     }
 
-    // PMP: Predicate-Many-Preceders
     #[test]
-    fn snapshot_isolation_pmp() {
-        let store = create_store();
+    fn g1c() {
+        g1c_tests(false);
+        g1c_tests(true);
+    }
+
+    // PMP: Predicate-Many-Preceders
+    fn pmp_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key2 = Bytes::from("k2");
         let key3 = Bytes::from("k3");
@@ -988,10 +1000,15 @@ mod tests {
         }
     }
 
-    // PMP-Write: Circular Information Flow (dirty reads)
     #[test]
-    fn snapshot_isolation_pmp_write() {
-        let store = create_store();
+    fn pmp() {
+        pmp_tests(false);
+        pmp_tests(true);
+    }
+
+    // PMP-Write: Circular Information Flow (dirty reads)
+    fn pmp_write_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1030,10 +1047,15 @@ mod tests {
         }
     }
 
-    // P4: Lost Update
     #[test]
-    fn snapshot_isolation_p4() {
-        let store = create_store();
+    fn pmp_write() {
+        pmp_write_tests(false);
+        pmp_write_tests(true);
+    }
+
+    // P4: Lost Update
+    fn p4_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let value3 = Bytes::from("v3");
@@ -1063,10 +1085,15 @@ mod tests {
         }
     }
 
-    // G-single: Single Anti-dependency Cycles (read skew)
     #[test]
-    fn snapshot_isolation_g_single() {
-        let store = create_store();
+    fn p4() {
+        p4_tests(false);
+        p4_tests(true);
+    }
+
+    // G-single: Single Anti-dependency Cycles (read skew)
+    fn g_single_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1092,10 +1119,15 @@ mod tests {
         }
     }
 
-    // G-single-write-1: Single Anti-dependency Cycles (read skew)
     #[test]
-    fn snapshot_isolation_g_single_write_1() {
-        let store = create_store();
+    fn g_single() {
+        g_single_tests(false);
+        g_single_tests(true);
+    }
+
+    // G-single-write-1: Single Anti-dependency Cycles (read skew)
+    fn g_single_write_1_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1131,10 +1163,15 @@ mod tests {
         }
     }
 
-    // G-single-write-2: Single Anti-dependency Cycles (read skew)
     #[test]
-    fn snapshot_isolation_g_single_write_2() {
-        let store = create_store();
+    fn g_single_write_1() {
+        g_single_write_1_tests(false);
+        g_single_write_1_tests(true);
+    }
+
+    // G-single-write-2: Single Anti-dependency Cycles (read skew)
+    fn g_single_write_2_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1164,8 +1201,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_isolation_g2_item() {
-        let store = create_store();
+    fn g_single_write_2() {
+        g_single_write_2_tests(false);
+        g_single_write_2_tests(true);
+    }
+
+    fn g2_item_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1199,5 +1241,11 @@ mod tests {
                 _ => false,
             });
         }
+    }
+
+    #[test]
+    fn g2_item() {
+        g2_item_tests(false);
+        g2_item_tests(true);
     }
 }
