@@ -199,7 +199,7 @@ impl TxReader {
     }
 
     /// Reads a transaction entry.
-    fn read_entry(&mut self) -> Result<TxEntry> {
+    fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
         let md_len = self.r.read_uint16()?;
         let kvmd = if md_len > 0 {
             let md_bs = self.r.read_bytes(md_len as usize)?;
@@ -213,15 +213,19 @@ impl TxReader {
         let k = self.r.read_bytes(k_len)?;
 
         let v_len = self.r.read_uint32()? as usize;
+        let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
 
-        Ok(TxEntry {
-            metadata: kvmd,
-            key: k.into(),
-            value: v.into(),
-            value_len: v_len as u32,
-            key_len: k_len as u32,
-        })
+        Ok((
+            TxEntry {
+                metadata: kvmd,
+                key: k.into(),
+                value: v.into(),
+                value_len: v_len as u32,
+                key_len: k_len as u32,
+            },
+            offset,
+        ))
     }
 
     /// Reads a transaction record into the provided `TxRecord`.
@@ -234,8 +238,7 @@ impl TxReader {
 
         let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
         for i in 0..tx.header.num_entries as usize {
-            let offset = self.r.offset();
-            let entry = self.read_entry()?;
+            let (entry, offset) = self.read_entry()?;
             let key = entry.key.clone();
             tx.entries.insert(i, entry);
             value_offsets.insert(key, offset as usize);

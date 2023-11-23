@@ -368,6 +368,8 @@ mod tests {
         // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 3;
+
         let store = Store::new(opts).expect("should create store");
 
         // Read the keys to the store
