@@ -1,4 +1,4 @@
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -232,8 +232,22 @@ impl Transaction {
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
     pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
     where
-        R: RangeBounds<VariableKey> + 'b,
+        R: RangeBounds<&'b [u8]>,
     {
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = (
+            match range.start_bound() {
+                Bound::Included(start) => Bound::Included(VariableKey::from_slice(&start.to_vec())),
+                Bound::Excluded(start) => Bound::Excluded(VariableKey::from_slice(&start.to_vec())),
+                Bound::Unbounded => Bound::Unbounded,
+            },
+            match range.end_bound() {
+                Bound::Included(end) => Bound::Included(VariableKey::from_slice(&end.to_vec())),
+                Bound::Excluded(end) => Bound::Excluded(VariableKey::from_slice(&end.to_vec())),
+                Bound::Unbounded => Bound::Unbounded,
+            },
+        );
+
         // Create a new reader for the snapshot.
         let iterator = self.snapshot.write().new_reader()?;
 
@@ -626,7 +640,7 @@ mod tests {
         }
 
         // TODO: fix passing vector key to scan
-        let range = VariableKey::from_str("key1")..=VariableKey::from_str("key3");
+        let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
@@ -641,6 +655,7 @@ mod tests {
             Bytes::from("key1"),
             Bytes::from("key2"),
             Bytes::from("key3"),
+            Bytes::from("lemon"),
         ];
 
         for key in &keys_to_insert {
@@ -649,12 +664,14 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        // TODO: fix passing vector key to scan
-        let range = VariableKey::from_str("key1")..=VariableKey::from_str("key3");
+        let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
+        assert_eq!(results[0].0, keys_to_insert[0]);
+        assert_eq!(results[1].0, keys_to_insert[1]);
+        assert_eq!(results[2].0, keys_to_insert[2]);
     }
 
     fn mvcc_with_scan_tests(is_ssi: bool) {
@@ -686,7 +703,7 @@ mod tests {
             txn2.set(&key3, &value3).unwrap();
             txn2.commit().unwrap();
 
-            let range = VariableKey::from_str("key1")..=VariableKey::from_str("key4");
+            let range = "key1".as_bytes()..="key4".as_bytes();
             let results = txn3.scan(range).unwrap();
             assert_eq!(results.len(), 1);
             txn3.set(&key2, &value5).unwrap();
@@ -717,7 +734,7 @@ mod tests {
             txn2.delete(&key4).unwrap();
             txn2.commit().unwrap();
 
-            let range = VariableKey::from_str("key1")..=VariableKey::from_str("key5");
+            let range = "key1".as_bytes()..="key5".as_bytes();
             txn3.scan(range).unwrap();
             txn3.set(&key4, &value2).unwrap();
 
@@ -866,7 +883,7 @@ mod tests {
 
             txn1.set(&key1, &value3).unwrap();
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
+            let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -914,7 +931,7 @@ mod tests {
 
             txn1.set(&key1, &value3).unwrap();
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
+            let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -1023,7 +1040,7 @@ mod tests {
             assert!(txn1.get(&key1).is_ok());
             txn1.set(&key1, &value3).unwrap();
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -1032,7 +1049,7 @@ mod tests {
             txn2.delete(&key2).unwrap();
             txn1.commit().unwrap();
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
+            let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].0, value1);
@@ -1145,7 +1162,7 @@ mod tests {
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -1193,7 +1210,7 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -1231,7 +1248,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k2");
+            let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn1.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
