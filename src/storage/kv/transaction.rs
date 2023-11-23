@@ -237,13 +237,21 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = (
             match range.start_bound() {
-                Bound::Included(start) => Bound::Included(VariableKey::from_slice(&start.to_vec())),
-                Bound::Excluded(start) => Bound::Excluded(VariableKey::from_slice(&start.to_vec())),
+                Bound::Included(start) => {
+                    Bound::Included(VariableKey::from_slice_with_termination(&start.to_vec()))
+                }
+                Bound::Excluded(start) => {
+                    Bound::Excluded(VariableKey::from_slice_with_termination(&start.to_vec()))
+                }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match range.end_bound() {
-                Bound::Included(end) => Bound::Included(VariableKey::from_slice(&end.to_vec())),
-                Bound::Excluded(end) => Bound::Excluded(VariableKey::from_slice(&end.to_vec())),
+                Bound::Included(end) => {
+                    Bound::Included(VariableKey::from_slice_with_termination(&end.to_vec()))
+                }
+                Bound::Excluded(end) => {
+                    Bound::Excluded(VariableKey::from_slice_with_termination(&end.to_vec()))
+                }
                 Bound::Unbounded => Bound::Unbounded,
             },
         );
@@ -668,7 +676,7 @@ mod tests {
 
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
-        assert_eq!(results.len(), keys_to_insert.len());
+        assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, keys_to_insert[0]);
         assert_eq!(results[1].0, keys_to_insert[1]);
         assert_eq!(results[2].0, keys_to_insert[2]);

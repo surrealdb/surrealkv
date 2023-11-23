@@ -19,11 +19,16 @@ pub trait Key {
     fn prefix_after(&self, start: usize) -> Self;
     fn longest_common_prefix(&self, slice: &[u8]) -> usize;
     fn as_slice(&self) -> &[u8];
-    fn cmp(&self, other: &Self) -> Ordering;
 }
 
-pub trait KeyTrait: Key + Clone + PartialEq + Debug + for<'a> From<&'a [u8]> {}
-impl<T: Key + Clone + PartialEq + Debug + for<'a> From<&'a [u8]>> KeyTrait for T {}
+pub trait KeyTrait:
+    Key + Clone + PartialEq + PartialOrd + Ord + Debug + for<'a> From<&'a [u8]>
+{
+}
+impl<T: Key + Clone + PartialOrd + PartialEq + Ord + Debug + for<'a> From<&'a [u8]>> KeyTrait
+    for T
+{
+}
 
 /*
     Key trait implementations
@@ -57,6 +62,11 @@ impl<const SIZE: usize> PartialEq for FixedKey<SIZE> {
 impl<const SIZE: usize> PartialOrd for FixedKey<SIZE> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+impl<const SIZE: usize> Ord for FixedKey<SIZE> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.content[..self.len].cmp(&other.content[..other.len])
     }
 }
 
@@ -109,10 +119,6 @@ impl<const SIZE: usize> Key for FixedKey<SIZE> {
     // Returns slice of the internal data up to the actual length
     fn as_slice(&self) -> &[u8] {
         &self.content[..self.len]
-    }
-
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.content[..self.len].cmp(&other.content[..other.len])
     }
 
     // Creates a new instance of FixedKey consisting only of the initial part of the content
@@ -191,7 +197,7 @@ impl<const N: usize> From<&String> for FixedKey<N> {
 }
 
 // A VariableKey is a variable-length datatype with NULL byte appended to it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug)]
 pub struct VariableKey {
     data: Vec<u8>,
 }
@@ -238,6 +244,13 @@ impl VariableKey {
     pub fn from(data: Vec<u8>) -> Self {
         Self { data }
     }
+
+    pub fn from_slice_with_termination(src: &[u8]) -> Self {
+        let mut data = Vec::with_capacity(src.len() + 1);
+        data.extend_from_slice(src);
+        data.push(0);
+        Self { data }
+    }
 }
 
 impl From<&[u8]> for VariableKey {
@@ -276,10 +289,6 @@ impl Key for VariableKey {
             .zip(key)
             .take_while(|&(a, &b)| *a == b)
             .count()
-    }
-
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.data.cmp(&other.data)
     }
 
     fn as_slice(&self) -> &[u8] {

@@ -1298,17 +1298,20 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
     /// Returns a `Range` iterator instance that iterates over the key-value pairs within the given range.
     /// If the Trie is empty, an empty `Range` iterator is returned.
     ///
-    pub fn range<'a, K: KeyTrait, R>(&'a self, range: R) -> Range<K, P, V>
+    pub fn range<'a, R>(
+        &'a self,
+        range: R,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)>
     where
-        R: RangeBounds<K> + 'a,
+        R: RangeBounds<P> + 'a,
     {
         // If the Trie is empty, return an empty Range iterator
         if self.root.is_none() {
-            return Range::empty();
+            return Range::empty(range);
         }
 
-        let iter = self.iter();
-        return Range::for_iter(iter, range.end_bound().cloned());
+        let root = self.root.as_ref();
+        return Range::new(root, range);
     }
 
     fn is_closed(&self) -> Result<(), TrieError> {
@@ -1904,11 +1907,11 @@ mod tests {
 
     #[test]
     fn iter_seq_u16() {
-        let mut tree = Tree::<FixedKey<32>, u16>::new();
+        let mut tree = Tree::<FixedKey<16>, u16>::new();
 
         // Insertion
         for i in 0..u16::MAX {
-            let key: FixedKey<32> = i.into();
+            let key: FixedKey<16> = i.into();
             tree.insert(&key, i, 0, i as u64);
         }
 
@@ -1958,33 +1961,60 @@ mod tests {
 
     #[test]
     fn range_seq_u8() {
-        let mut tree: Tree<FixedKey<32>, u8> = Tree::<FixedKey<32>, u8>::new();
+        let mut tree: Tree<FixedKey<8>, u8> = Tree::<FixedKey<8>, u8>::new();
 
         let max = u8::MAX;
         // Insertion
         for i in 0..=max {
-            let key: FixedKey<32> = i.into();
+            let key: FixedKey<8> = i.into();
             tree.insert(&key, i, 0, 0);
         }
 
+        // Test inclusive range
+        let start_key: FixedKey<8> = 5u8.into();
+        let end_key: FixedKey<8> = max.into();
         let mut len = 0usize;
-        let start_key: FixedKey<16> = 0u8.into();
-        let end_key: FixedKey<16> = max.into();
-
         for _ in tree.range(start_key..=end_key) {
             len += 1;
         }
-        assert_eq!(len, max as usize + 1);
+        assert_eq!(len, max as usize - 4);
+
+        // Test exclusive range
+        let start_key: FixedKey<8> = 5u8.into();
+        let end_key: FixedKey<8> = max.into();
+        let mut len = 0usize;
+        for _ in tree.range(start_key..end_key) {
+            len += 1;
+        }
+        assert_eq!(len, max as usize - 5);
+
+        // Test range with different start and end keys
+        let start_key: FixedKey<8> = 3u8.into();
+        let end_key: FixedKey<8> = 7u8.into();
+        let mut len = 0usize;
+        for _ in tree.range(start_key..=end_key) {
+            len += 1;
+        }
+        assert_eq!(len, 5);
+
+        // Test range with all keys
+        let start_key: FixedKey<8> = 0u8.into();
+        let end_key: FixedKey<8> = max.into();
+        let mut len = 0usize;
+        for _ in tree.range(start_key..=end_key) {
+            len += 1;
+        }
+        assert_eq!(len, 256);
     }
 
     #[test]
     fn range_seq_u16() {
-        let mut tree: Tree<FixedKey<32>, u16> = Tree::<FixedKey<32>, u16>::new();
+        let mut tree: Tree<FixedKey<16>, u16> = Tree::<FixedKey<16>, u16>::new();
 
         let max = u16::MAX;
         // Insertion
         for i in 0..=max {
-            let key: FixedKey<32> = i.into();
+            let key: FixedKey<16> = i.into();
             tree.insert(&key, i, 0, 0);
         }
 

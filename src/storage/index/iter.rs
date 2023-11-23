@@ -34,12 +34,14 @@ impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
         Iter::new(Some(&self.root))
     }
 
-    pub fn range<'a, R>(&'a self, range: R) -> Range<P, P, V>
+    pub fn range<'a, R>(
+        &'a self,
+        range: R,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)>
     where
         R: RangeBounds<P> + 'a,
     {
-        let iter = self.iter();
-        return Range::for_iter(iter, range.end_bound().cloned());
+        return Range::new(Some(&self.root), range);
     }
 }
 
@@ -139,6 +141,35 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
 
         Self { iters, leafs }
     }
+
+    pub fn empty() -> Self {
+        Self {
+            iters: Vec::new(),
+            leafs: VecDeque::new(),
+        }
+    }
+
+    fn forward_scan<R>(node: &'a Node<P, V>, range: &R) -> Self
+    where
+        R: RangeBounds<P>,
+    {
+        let mut leafs = VecDeque::new();
+        let mut iters = Vec::new();
+        if node.is_twig() {
+            let NodeType::Twig(twig) = &node.node_type else {
+                panic!("should not happen");
+            };
+            if range.contains(&twig.key) {
+                for v in twig.iter() {
+                    leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
+                }
+            }
+        } else {
+            iters.push(NodeIter::new(node.iter()));
+        }
+
+        Self { iters, leafs }
+    }
 }
 
 impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
@@ -179,85 +210,91 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
     }
 }
 
-/// An enum representing the result of a range operation.
-enum RangeResult<'a, V: Clone> {
-    Yield(Option<(Vec<u8>, &'a V, &'a u64, &'a u64)>),
+pub struct Range<'a, K: KeyTrait, V: Clone, R> {
+    forward: IterState<'a, K, V>,
+    range: R,
 }
 
-/// An iterator for the Range operation.
-struct RangeIterator<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> {
-    iter: Iter<'a, P, V>,
-    end_bound: Bound<K>,
-}
-
-struct EmptyRangeIterator;
-
-trait RangeIteratorTrait<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> {
-    fn next(&mut self) -> RangeResult<'a, V>;
-}
-
-pub struct Range<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> {
-    inner: Box<dyn RangeIteratorTrait<'a, K, P, V> + 'a>,
-}
-
-impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V>
-    for EmptyRangeIterator
+impl<'a, K: KeyTrait, V: Clone, R> Range<'a, K, V, R>
+where
+    K: Ord,
+    R: RangeBounds<K>,
 {
-    fn next(&mut self) -> RangeResult<'a, V> {
-        RangeResult::Yield(None)
+    pub(crate) fn empty(range: R) -> Self {
+        Self {
+            forward: IterState::empty(),
+            range,
+        }
     }
-}
 
-impl<'a, K: KeyTrait, P: KeyTrait, V: Clone> RangeIterator<'a, K, P, V> {
-    pub fn new(iter: Iter<'a, P, V>, end_bound: Bound<K>) -> Self {
-        Self { iter, end_bound }
-    }
-}
-
-impl<'a, K: KeyTrait + 'a, P: KeyTrait, V: Clone> RangeIteratorTrait<'a, K, P, V>
-    for RangeIterator<'a, K, P, V>
-{
-    fn next(&mut self) -> RangeResult<'a, V> {
-        let next_item = self.iter.next();
-        match next_item {
-            Some((key, value, version, ts)) => {
-                let next_key_slice = key.as_slice();
-                match &self.end_bound {
-                    Bound::Included(k) if next_key_slice == k.as_slice() => {
-                        RangeResult::Yield(Some((key, value, version, ts)))
-                    }
-                    Bound::Excluded(k) if next_key_slice == k.as_slice() => {
-                        RangeResult::Yield(None)
-                    }
-                    Bound::Unbounded => RangeResult::Yield(Some((key, value, version, ts))),
-                    _ => RangeResult::Yield(Some((key, value, version, ts))),
-                }
+    pub(crate) fn new(node: Option<&'a Rc<Node<K, V>>>, range: R) -> Self
+    where
+        R: RangeBounds<K>,
+    {
+        if let Some(node) = node {
+            Self {
+                forward: IterState::forward_scan(node, &range),
+                range,
             }
-            None => RangeResult::Yield(None),
+        } else {
+            Self {
+                forward: IterState::empty(),
+                range,
+            }
         }
     }
 }
 
-impl<'a, K: KeyTrait, P: KeyTrait + 'a, V: Clone + 'a> Iterator for Range<'a, K, P, V> {
+impl<'a, K: 'a + KeyTrait, V: Clone, R: RangeBounds<K>> Iterator for Range<'a, K, V, R> {
     type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
-    fn next(&mut self) -> Option<(Vec<u8>, &'a V, &'a u64, &'a u64)> {
-        match self.inner.next() {
-            RangeResult::Yield(item) => item,
-        }
-    }
-}
+    fn next(&mut self) -> Option<Self::Item> {
+        'outer: while let Some(node) = self.forward.iters.last_mut() {
+            let e = node.next();
+            loop {
+                match e {
+                    Some(other) => {
+                        if other.1.is_twig() {
+                            let NodeType::Twig(twig) = &other.1.node_type else {
+                                panic!("should not happen");
+                            };
 
-impl<'a, K: KeyTrait + 'a, P: KeyTrait + 'a, V: Clone> Range<'a, K, P, V> {
-    pub fn empty() -> Self {
-        Self {
-            inner: Box::new(EmptyRangeIterator),
-        }
-    }
+                            if self.range.contains(&twig.key) {
+                                for v in twig.iter() {
+                                    self.forward
+                                        .leafs
+                                        .push_back((&twig.key, &v.value, &v.version, &v.ts));
+                                }
+                                break 'outer;
+                            } else {
+                                match self.range.end_bound() {
+                                    Bound::Included(k) if &twig.key > k => {
+                                        self.forward.iters.clear()
+                                    }
+                                    Bound::Excluded(k) if &twig.key >= k => {
+                                        self.forward.iters.clear()
+                                    }
+                                    _ => {}
+                                }
+                            }
 
-    pub fn for_iter(iter: Iter<'a, P, V>, end_bound: Bound<K>) -> Self {
-        Self {
-            inner: Box::new(RangeIterator::new(iter, end_bound)),
+                            break;
+                        } else {
+                            self.forward.iters.push(NodeIter::new(other.1.iter()));
+                            break;
+                        }
+                    }
+                    None => {
+                        self.forward.iters.pop().unwrap();
+                        break;
+                    }
+                }
+            }
         }
+
+        self.forward
+            .leafs
+            .pop_front()
+            .map(|leaf| (leaf.0.as_slice().to_vec(), leaf.1, leaf.2, leaf.3))
     }
 }
