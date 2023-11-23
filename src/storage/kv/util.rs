@@ -4,9 +4,16 @@ use crc32fast::Hasher as crc32Hasher;
 /// Calculates the CRC32 hash of a byte array.
 /// It creates a new CRC32 hasher, updates it with the byte array, and finalizes the hash.
 /// It returns the hash as a 32-bit unsigned integer.
-pub(crate) fn calculate_crc32(a1: &[u8]) -> u32 {
+pub(crate) fn calculate_crc32(buf: &[u8]) -> u32 {
     let mut hasher = crc32Hasher::new();
-    hasher.update(a1);
+    hasher.update(buf);
+    hasher.finalize()
+}
+
+pub(crate) fn calculate_crc32_combined(buf1: &[u8], buf2: &[u8]) -> u32 {
+    let mut hasher = crc32Hasher::new();
+    hasher.update(buf1);
+    hasher.update(buf2);
     hasher.finalize()
 }
 

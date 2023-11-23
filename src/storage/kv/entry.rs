@@ -8,7 +8,7 @@ use crate::storage::{
     kv::error::{Error, Result},
     kv::meta::Metadata,
     kv::store::Core,
-    kv::util::calculate_crc32,
+    kv::util::{calculate_crc32, calculate_crc32_combined},
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
@@ -79,6 +79,7 @@ impl Entry {
 //   | md: Option<Metadata>                                    |
 //   | value_len: u32                                          |
 //   | value: Bytes                                            |
+//   | crc32: u32                                              |
 //   +---------------------------------------------------------+
 //
 //
@@ -92,9 +93,9 @@ impl Entry {
 //
 // TxEntry encoded format:
 //
-//   |------------|-----|--------------|-------|-----------------|----------|
-//   | key_len(4) | key | value_len(4) | value | metadata_len(4) | metadata |
-//   |------------|-----|--------------|-------|-----------------|----------|
+//   |-----------------|----------|------------|-----|--------------|-------|-------|
+//   | metadata_len(4) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
+//   |-----------------|----------|------------|-----|--------------|-------|-------|
 //
 #[derive(Debug)]
 pub(crate) struct TxRecord {
@@ -127,12 +128,14 @@ impl TxRecord {
     }
 
     pub(crate) fn add_entry(&mut self, entry: Entry) {
+        let crc32 = calculate_crc32_combined(&entry.key, &entry.value);
         let tx_record_entry = TxEntry {
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
+            crc32: crc32,
         };
         self.entries.push(tx_record_entry);
         self.header.num_entries += 1;
@@ -235,6 +238,7 @@ pub(crate) struct TxEntry {
     pub(crate) metadata: Option<Metadata>,
     pub(crate) value_len: u32,
     pub(crate) value: Bytes,
+    pub(crate) crc32: u32,
 }
 
 impl TxEntry {
@@ -245,6 +249,7 @@ impl TxEntry {
             metadata: None,
             value_len: 0,
             value: Bytes::new(),
+            crc32: 0,
         }
     }
 
@@ -259,12 +264,13 @@ impl TxEntry {
             buf.put_u16(0);
         }
 
-        // Encode key length, key, value length, and value
+        // Encode key length, key, value length, value, and crc32
         buf.put_u32(self.key_len);
         buf.put(self.key.as_ref());
         buf.put_u32(self.value_len);
         let offset = buf.len();
         buf.put(self.value.as_ref());
+        buf.put_u32(self.crc32);
 
         Ok(offset)
     }
@@ -383,7 +389,6 @@ impl ValueRef {
         buf.freeze()
     }
 
-    // TODO: Draw ascii diagram for decode format
     /// Decode the byte representation into a valueRef.
     pub(crate) fn decode(&mut self, ts: u64, encoded_bytes: &Bytes) -> Result<()> {
         let mut cursor = Cursor::new(encoded_bytes);

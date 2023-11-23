@@ -215,6 +215,7 @@ impl TxReader {
         let v_len = self.r.read_uint32()? as usize;
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
+        let crc32 = self.r.read_uint32()?;
 
         Ok((
             TxEntry {
@@ -223,6 +224,7 @@ impl TxReader {
                 value: v.into(),
                 value_len: v_len as u32,
                 key_len: k_len as u32,
+                crc32: crc32,
             },
             offset,
         ))
