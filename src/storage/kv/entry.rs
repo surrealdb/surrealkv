@@ -90,11 +90,11 @@ impl Entry {
 //   | crc(4) | id(8) | lsn(8) | ts(8) | version(2) | num_entries(2)  | metadata_len(2) | metadata |  ...entries...   |
 //   |--------|-------|--------|-------|------------|-----------------|-----------------|----------|------------------|
 //
-// TxEntry struct encoded format:
+// TxEntry encoded format:
 //
-//   |------------------|--------------|-------|-----------------|----------|
+//   |------------|-----|--------------|-------|-----------------|----------|
 //   | key_len(4) | key | value_len(4) | value | metadata_len(4) | metadata |
-//   |------------------|--------------|-------|-----------------|----------|
+//   |------------|-----|--------------|-------|-----------------|----------|
 //
 #[derive(Debug)]
 pub(crate) struct TxRecord {
@@ -477,7 +477,13 @@ mod tests {
     #[test]
     fn encode_decode() {
         // Create a sample valueRef instance
-        let opts = Options::new();
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
         let store = Arc::new(Core::new(opts).expect("failed to create store"));
 
         let mut txmd = Metadata::new();

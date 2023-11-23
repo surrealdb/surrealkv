@@ -80,13 +80,13 @@ pub struct Transaction {
     /// `buf` is a reusable buffer for encoding transaction records. This is used to reduce memory allocations.
     buf: BytesMut,
 
-    /// `store` is the underlying store for the transaction. This is shared between transactions using a mutex to ensure data consistency.
+    /// `store` is the underlying store for the transaction. This is shared between transactions.
     pub(crate) store: Arc<Core>,
 
     /// `write_set` is the pending writes for the transaction. These are the changes that the transaction wants to make to the data.
     pub(crate) write_set: HashMap<Bytes, Entry>,
 
-    /// `read_set` is the keys that are read in the transaction from the snapshot. This is used to ensure repeatable reads.
+    /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
@@ -327,9 +327,6 @@ impl Transaction {
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    /// It clones the oracle from the store and gets a new commit timestamp from the oracle.
-    /// Then it assigns commit timestamps to the transaction entries.
-    /// It returns the transaction ID and commit timestamp.
     fn prepare_commit(&mut self) -> Result<(u64, u64)> {
         let oracle = self.store.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
@@ -338,8 +335,6 @@ impl Transaction {
     }
 
     /// Assigns commit timestamps to transaction entries.
-    /// It gets the current time as the commit timestamp and assigns the commit timestamp to each entry in the write set.
-    /// It returns the commit timestamp.
     fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
         self.write_set.iter_mut().for_each(|(_, entry)| {
@@ -349,10 +344,6 @@ impl Transaction {
     }
 
     /// Adds transaction records to the transaction log.
-    /// It gets the current offset of the commit log and clones the entries from the write set.
-    /// Then it creates a new transaction record with the entries, transaction ID, and commit timestamp.
-    /// It encodes the transaction record into the buffer and appends the buffer to the commit log.
-    /// It returns the transaction offset.
     fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
         let current_offset = self.store.clog.read().offset()?;
         let entries: Vec<Entry> = self.write_set.values().cloned().collect();
@@ -369,8 +360,6 @@ impl Transaction {
     }
 
     /// Commits transaction changes to the store index.
-    /// It gets a write lock on the indexer and builds key-value pairs from the write set.
-    /// Then it inserts the key-value pairs into the index.
     fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
         let mut index = self.store.indexer.write();
         let mut kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
@@ -380,9 +369,6 @@ impl Transaction {
     }
 
     /// Builds key-value pairs from the write set.
-    /// It creates a new vector to hold the key-value pairs.
-    /// Then it iterates over the write set and for each entry, it builds an index value and pushes a new key-value pair to the vector.
-    /// It returns the vector of key-value pairs.
     fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VectorKey, Bytes>> {
         let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
 
@@ -401,8 +387,6 @@ impl Transaction {
     }
 
     /// Builds an index value from an entry.
-    /// It encodes the entry into a value reference using the key, value, metadata, committed values offsets, and max value threshold.
-    /// It returns the index value.
     fn build_index_value(&self, entry: &Entry) -> Bytes {
         let index_value = ValueRef::encode(
             &entry.key,
@@ -415,7 +399,6 @@ impl Transaction {
     }
 
     /// Rolls back the transaction by removing all updated entries.
-    /// It sets the transaction as closed and clears the committed values offsets, buffer, write set, and read set.
     pub fn rollback(&mut self) {
         self.closed = true;
         self.committed_values_offsets.clear();
