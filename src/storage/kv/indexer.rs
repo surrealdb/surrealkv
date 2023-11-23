@@ -4,7 +4,7 @@ use crate::storage::{
     index::{
         art::{Tree as tart, KV},
         snapshot::Snapshot as TartSnapshot,
-        VectorKey,
+        VariableKey,
     },
     kv::error::Result,
     kv::option::Options,
@@ -13,7 +13,7 @@ use crate::storage::{
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
 /// It uses a `tart` index, which is a type of persistent, lock-free B+ tree.
 pub(crate) struct Indexer {
-    pub(crate) index: tart<VectorKey, Bytes>,
+    pub(crate) index: tart<VariableKey, Bytes>,
 }
 
 impl Indexer {
@@ -26,7 +26,7 @@ impl Indexer {
     }
 
     /// Creates a snapshot of the current state of the index.
-    pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<VectorKey, Bytes>> {
+    pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<VariableKey, Bytes>> {
         let snapshot = self.index.create_snapshot()?;
         Ok(snapshot)
     }
@@ -34,7 +34,7 @@ impl Indexer {
     /// Inserts multiple key-value pairs into the index.
     /// Note: Currently, the keys are cloned to ensure they are null-terminated.
     /// This is a known issue that needs to be fixed.
-    pub fn bulk_insert(&mut self, kv_pairs: &mut [KV<VectorKey, Bytes>]) -> Result<()> {
+    pub fn bulk_insert(&mut self, kv_pairs: &mut [KV<VariableKey, Bytes>]) -> Result<()> {
         kv_pairs.iter_mut().for_each(|kv| {
             kv.key = kv.key.terminate();
         });

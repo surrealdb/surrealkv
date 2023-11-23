@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::{
-    index::{art::TrieError, art::KV, VectorKey},
+    index::{art::TrieError, art::KV, VariableKey},
     kv::{
         entry::{Entry, TxRecord, Value, ValueRef},
         error::{Error, Result},
@@ -232,7 +232,7 @@ impl Transaction {
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
     pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
     where
-        R: RangeBounds<VectorKey> + 'b,
+        R: RangeBounds<VariableKey> + 'b,
     {
         // Create a new reader for the snapshot.
         let iterator = self.snapshot.write().new_reader()?;
@@ -369,8 +369,8 @@ impl Transaction {
     }
 
     /// Builds key-value pairs from the write set.
-    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VectorKey, Bytes>> {
-        let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
+    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VariableKey, Bytes>> {
+        let mut kv_pairs: Vec<KV<VariableKey, Bytes>> = Vec::new();
 
         for (_, entry) in self.write_set.iter() {
             let index_value = self.build_index_value(entry);
@@ -438,7 +438,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        // Create a new Core instance with VectorKey as the key type
+        // Create a new Core instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
 
         // Define key-value pairs for the test
@@ -473,7 +473,7 @@ mod tests {
         // Drop the store to simulate closing it
         drop(store);
 
-        // Create a new Core instance with VectorKey after dropping the previous one
+        // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
@@ -612,7 +612,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        // Create a new Core instance with VectorKey as the key type
+        // Create a new Core instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
 
         // Define key-value pairs for the test
@@ -625,7 +625,7 @@ mod tests {
         }
 
         // TODO: fix passing vector key to scan
-        let range = VectorKey::from_str("key1")..=VectorKey::from_str("key3");
+        let range = VariableKey::from_str("key1")..=VariableKey::from_str("key3");
 
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
@@ -641,7 +641,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        // Create a new Core instance with VectorKey as the key type
+        // Create a new Core instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
 
         // Define key-value pairs for the test
@@ -658,7 +658,7 @@ mod tests {
         }
 
         // TODO: fix passing vector key to scan
-        let range = VectorKey::from_str("key1")..=VectorKey::from_str("key3");
+        let range = VariableKey::from_str("key1")..=VariableKey::from_str("key3");
 
         let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
@@ -699,7 +699,7 @@ mod tests {
             txn2.set(&key3, &value3).unwrap();
             txn2.commit().unwrap();
 
-            let range = VectorKey::from_str("key1")..=VectorKey::from_str("key4");
+            let range = VariableKey::from_str("key1")..=VariableKey::from_str("key4");
             let results = txn3.scan(range).unwrap();
             assert_eq!(results.len(), 1);
             txn3.set(&key2, &value5).unwrap();
@@ -730,7 +730,7 @@ mod tests {
             txn2.delete(&key4).unwrap();
             txn2.commit().unwrap();
 
-            let range = VectorKey::from_str("key1")..=VectorKey::from_str("key5");
+            let range = VariableKey::from_str("key1")..=VariableKey::from_str("key5");
             txn3.scan(range).unwrap();
             txn3.set(&key4, &value2).unwrap();
 
@@ -869,7 +869,7 @@ mod tests {
 
             txn1.set(&key1, &value3).unwrap();
 
-            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -912,7 +912,7 @@ mod tests {
 
             txn1.set(&key1, &value3).unwrap();
 
-            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].0, value1);
@@ -1012,7 +1012,7 @@ mod tests {
             txn2.delete(&key2).unwrap();
             txn1.commit().unwrap();
 
-            let range = VectorKey::from_str("k1")..=VectorKey::from_str("k3");
+            let range = VariableKey::from_str("k1")..=VariableKey::from_str("k3");
             let res = txn2.scan(range.clone()).unwrap();
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].0, value1);

@@ -523,7 +523,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         opts.max_value_threshold = 2;
 
-        // Create a new Core instance with VectorKey as the key type
+        // Create a new Core instance with VariableKey as the key type
         let store = Store::new(opts).expect("should create store");
 
         // Define test keys and value
@@ -599,7 +599,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         opts.max_value_threshold = 40;
 
-        // Create a new Core instance with VectorKey as the key type
+        // Create a new Core instance with VariableKey as the key type
         let store = Store::new(opts).expect("should create store");
 
         // Define test keys and value

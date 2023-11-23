@@ -8,7 +8,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::storage::{
-    index::{art::KV, VectorKey},
+    index::{art::KV, VariableKey},
     kv::{
         entry::{TxRecord, ValueRef},
         error::{Error, Result},
@@ -204,7 +204,7 @@ impl Core {
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<VectorKey, Bytes>> = Vec::new();
+        let mut kv_pairs: Vec<KV<VariableKey, Bytes>> = Vec::new();
 
         for entry in &tx.entries {
             let index_value = ValueRef::encode(
@@ -320,7 +320,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        // Create a new store instance with VectorKey as the key type
+        // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts).expect("should create store");
 
         // Number of keys to generate
@@ -365,7 +365,7 @@ mod tests {
         // Drop the store to simulate closing it
         drop(store);
 
-        // Create a new Core instance with VectorKey after dropping the previous one
+        // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
@@ -389,7 +389,7 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        // Create a new store instance with VectorKey as the key type
+        // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
 
         drop(store);

@@ -43,24 +43,24 @@ impl<T: Key + Clone + PartialEq + Debug + for<'a> From<&'a [u8]>> KeyTrait for T
 // because no string can have any characters after the NULL byte!
 //
 #[derive(Clone, Debug, Eq)]
-pub struct ArrayKey<const SIZE: usize> {
+pub struct FixedKey<const SIZE: usize> {
     content: [u8; SIZE],
     len: usize,
 }
 
-impl<const SIZE: usize> PartialEq for ArrayKey<SIZE> {
+impl<const SIZE: usize> PartialEq for FixedKey<SIZE> {
     fn eq(&self, other: &Self) -> bool {
         self.content[..self.len] == other.content[..other.len]
     }
 }
 
-impl<const SIZE: usize> PartialOrd for ArrayKey<SIZE> {
+impl<const SIZE: usize> PartialOrd for FixedKey<SIZE> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<const SIZE: usize> ArrayKey<SIZE> {
+impl<const SIZE: usize> FixedKey<SIZE> {
     // Create new instance with data ending in zero byte
     pub fn create_key(src: &[u8]) -> Self {
         assert!(src.len() < SIZE);
@@ -105,7 +105,7 @@ impl<const SIZE: usize> ArrayKey<SIZE> {
     }
 }
 
-impl<const SIZE: usize> Key for ArrayKey<SIZE> {
+impl<const SIZE: usize> Key for FixedKey<SIZE> {
     // Returns slice of the internal data up to the actual length
     fn as_slice(&self) -> &[u8] {
         &self.content[..self.len]
@@ -115,13 +115,13 @@ impl<const SIZE: usize> Key for ArrayKey<SIZE> {
         self.content[..self.len].cmp(&other.content[..other.len])
     }
 
-    // Creates a new instance of ArrayKey consisting only of the initial part of the content
+    // Creates a new instance of FixedKey consisting only of the initial part of the content
     fn prefix_before(&self, length: usize) -> Self {
         assert!(length <= self.len);
         Self::from_slice(&self.content[..length])
     }
 
-    // Creates a new instance of ArrayKey excluding the initial part of the content
+    // Creates a new instance of FixedKey excluding the initial part of the content
     fn prefix_after(&self, start: usize) -> Self {
         assert!(start <= self.len);
         Self::from_slice(&self.content[start..self.len])
@@ -149,54 +149,54 @@ impl<const SIZE: usize> Key for ArrayKey<SIZE> {
     }
 }
 
-impl<const SIZE: usize> From<&[u8]> for ArrayKey<SIZE> {
+impl<const SIZE: usize> From<&[u8]> for FixedKey<SIZE> {
     fn from(src: &[u8]) -> Self {
         Self::from_slice(src)
     }
 }
 
-impl<const N: usize> From<u8> for ArrayKey<N> {
+impl<const N: usize> From<u8> for FixedKey<N> {
     fn from(data: u8) -> Self {
         Self::from_slice(data.to_be_bytes().as_ref())
     }
 }
 
-impl<const N: usize> From<u16> for ArrayKey<N> {
+impl<const N: usize> From<u16> for FixedKey<N> {
     fn from(data: u16) -> Self {
         Self::from_slice(data.to_be_bytes().as_ref())
     }
 }
 
-impl<const N: usize> From<u64> for ArrayKey<N> {
+impl<const N: usize> From<u64> for FixedKey<N> {
     fn from(data: u64) -> Self {
         Self::from_slice(data.to_be_bytes().as_ref())
     }
 }
 
-impl<const N: usize> From<&str> for ArrayKey<N> {
+impl<const N: usize> From<&str> for FixedKey<N> {
     fn from(data: &str) -> Self {
         Self::from_str(data)
     }
 }
 
-impl<const N: usize> From<String> for ArrayKey<N> {
+impl<const N: usize> From<String> for FixedKey<N> {
     fn from(data: String) -> Self {
         Self::from_string(&data)
     }
 }
-impl<const N: usize> From<&String> for ArrayKey<N> {
+impl<const N: usize> From<&String> for FixedKey<N> {
     fn from(data: &String) -> Self {
         Self::from_string(data)
     }
 }
 
-// A VectorKey is a variable-length datatype with NULL byte appended to it.
+// A VariableKey is a variable-length datatype with NULL byte appended to it.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct VectorKey {
+pub struct VariableKey {
     data: Vec<u8>,
 }
 
-impl VectorKey {
+impl VariableKey {
     pub fn key(src: &[u8]) -> Self {
         let mut data = Vec::with_capacity(src.len() + 1);
         data.extend_from_slice(src);
@@ -240,21 +240,21 @@ impl VectorKey {
     }
 }
 
-impl From<&[u8]> for VectorKey {
+impl From<&[u8]> for VariableKey {
     fn from(src: &[u8]) -> Self {
         Self::from_slice(src)
     }
 }
 
-impl Key for VectorKey {
+impl Key for VariableKey {
     fn prefix_before(&self, length: usize) -> Self {
         assert!(length <= self.data.len());
-        VectorKey::from_slice(&self.data[..length])
+        VariableKey::from_slice(&self.data[..length])
     }
 
     fn prefix_after(&self, start: usize) -> Self {
         assert!(start <= self.data.len());
-        VectorKey::from_slice(&self.data[start..self.data.len()])
+        VariableKey::from_slice(&self.data[start..self.data.len()])
     }
 
     #[inline(always)]

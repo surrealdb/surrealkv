@@ -5,7 +5,7 @@ use bytes::Bytes;
 use super::entry::{Value, ValueRef};
 use crate::storage::{
     index::{
-        art::TrieError, iter::IterationPointer, snapshot::Snapshot as TartSnapshot, VectorKey,
+        art::TrieError, iter::IterationPointer, snapshot::Snapshot as TartSnapshot, VariableKey,
     },
     kv::error::{Error, Result},
     kv::store::Core,
@@ -19,7 +19,7 @@ pub(crate) struct Snapshot {
     /// key-value pairs in the snapshot. It can be used to filter out expired key-value
     /// pairs or to filter out key-value pairs based on the snapshot timestamp.
     ts: u64,
-    snap: TartSnapshot<VectorKey, Bytes>,
+    snap: TartSnapshot<VariableKey, Bytes>,
     store: Arc<Core>,
 }
 
@@ -35,9 +35,9 @@ impl Snapshot {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &VectorKey, value: Bytes) -> Result<()> {
+    pub fn set(&mut self, key: &VariableKey, value: Bytes) -> Result<()> {
         // TODO: need to fix this to avoid cloning the key
-        // This happens because the VectorKey transfrom from
+        // This happens because the VariableKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
         self.snap.insert(key, value, self.ts)?;
@@ -45,22 +45,22 @@ impl Snapshot {
     }
 
     /// Deletes given key from the snapshot.
-    pub fn delete(&mut self, key: &VectorKey) -> Result<()> {
+    pub fn delete(&mut self, key: &VariableKey) -> Result<()> {
         let key = &key.terminate();
         self.snap.remove(key)?;
         Ok(())
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &VectorKey) -> Result<Box<dyn Value>> {
+    pub fn get(&self, key: &VariableKey) -> Result<Box<dyn Value>> {
         // TODO: need to fix this to avoid cloning the key
-        // This happens because the VectorKey transfrom from
+        // This happens because the VariableKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
         self.get_with_filters(key, &FILTERS)
     }
 
-    pub fn get_with_filters<F>(&self, key: &VectorKey, filters: &[F]) -> Result<Box<dyn Value>>
+    pub fn get_with_filters<F>(&self, key: &VariableKey, filters: &[F]) -> Result<Box<dyn Value>>
     where
         F: FilterFn,
     {
@@ -76,7 +76,7 @@ impl Snapshot {
         Ok(Box::new(val_ref))
     }
 
-    pub fn new_reader<'a>(&'a mut self) -> Result<IterationPointer<VectorKey, Bytes>> {
+    pub fn new_reader<'a>(&'a mut self) -> Result<IterationPointer<VariableKey, Bytes>> {
         Ok(self.snap.new_reader()?)
     }
 
