@@ -111,11 +111,8 @@ impl<K: KeyTrait + Clone, V> TwigNode<K, V> {
         self.version = self.version(); // Update LeafNode's version
     }
 
-    pub fn get_latest_leaf(&self) -> Option<Rc<LeafValue<V>>> {
-        self.values
-            .iter()
-            .max_by_key(|value| value.version)
-            .cloned()
+    pub fn get_latest_leaf(&self) -> Option<&Rc<LeafValue<V>>> {
+        self.values.iter().max_by_key(|value| value.version)
     }
 
     pub fn get_latest_value(&self) -> Option<&V> {

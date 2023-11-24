@@ -2053,7 +2053,7 @@ mod tests {
         for _ in tree_iter {
             len += 1;
         }
-        assert_eq!(len, 3);
+        assert_eq!(len, 2);
     }
 
     #[test]

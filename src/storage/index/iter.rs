@@ -132,7 +132,8 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
             let NodeType::Twig(twig) = &node.node_type else {
                 panic!("should not happen");
             };
-            for v in twig.iter() {
+            let val = twig.get_latest_leaf();
+            if let Some(v) = val {
                 leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
             }
         } else {
@@ -160,7 +161,8 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
                 panic!("should not happen");
             };
             if range.contains(&twig.key) {
-                for v in twig.iter() {
+                let val = twig.get_latest_leaf();
+                if let Some(v) = val {
                     leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
                 }
             }
@@ -189,8 +191,8 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
                             let NodeType::Twig(twig) = &other.1.node_type else {
                                 panic!("should not happen");
                             };
-
-                            for v in twig.iter() {
+                            let val = twig.get_latest_leaf();
+                            if let Some(v) = val {
                                 self.leafs
                                     .push_back((&twig.key, &v.value, &v.version, &v.ts));
                             }
@@ -260,7 +262,8 @@ impl<'a, K: 'a + KeyTrait, V: Clone, R: RangeBounds<K>> Iterator for Range<'a, K
                             };
 
                             if self.range.contains(&twig.key) {
-                                for v in twig.iter() {
+                                let val = twig.get_latest_leaf();
+                                if let Some(v) = val {
                                     self.forward
                                         .leafs
                                         .push_back((&twig.key, &v.value, &v.version, &v.ts));

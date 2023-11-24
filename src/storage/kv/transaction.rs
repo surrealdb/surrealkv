@@ -513,6 +513,43 @@ mod tests {
         assert_eq!(val, value2.as_ref());
     }
 
+    #[test]
+    fn transaction_delete_scan() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("k1");
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn1)
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn1.commit().unwrap();
+        }
+
+        {
+            // Start a read-only transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key1).unwrap();
+            txn.commit().unwrap();
+        }
+
+        {
+            // Start another read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert!(txn.get(&key1).is_err());
+        }
+
+        {
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let txn = store.begin().unwrap();
+            let results = txn.scan(range).unwrap();
+            assert_eq!(results.len(), 0);
+        }
+    }
+
     fn mvcc_tests(is_ssi: bool) {
         let (store, _) = create_store(is_ssi);
 
@@ -647,7 +684,6 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        // TODO: fix passing vector key to scan
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
