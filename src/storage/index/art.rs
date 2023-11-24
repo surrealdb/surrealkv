@@ -29,7 +29,7 @@ const NODE48MAX: usize = 48;
 const NODE256MIN: usize = NODE48MAX + 1;
 
 // Maximum number of active snapshots
-pub(crate) const DEFAULT_MAX_ACTIVE_SNAPSHOTS: u64 = 100;
+pub(crate) const DEFAULT_MAX_ACTIVE_SNAPSHOTS: u64 = 10000;
 
 // Define a custom error enum representing different error cases for the Trie
 #[derive(Clone, Debug)]
