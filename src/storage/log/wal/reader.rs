@@ -187,7 +187,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::vec::Vec;
 
-    use crate::storage::log::wal::wal::WAL;
+    use crate::storage::log::wal::log::WAL;
     use crate::storage::log::{
         read_file_header, Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE,
     };

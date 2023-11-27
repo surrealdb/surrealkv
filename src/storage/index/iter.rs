@@ -1,6 +1,6 @@
 use std::collections::{Bound, VecDeque};
 use std::ops::RangeBounds;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::storage::index::art::{Node, NodeType};
 use crate::storage::index::KeyTrait;
@@ -9,7 +9,7 @@ use crate::storage::index::KeyTrait;
 /// A structure representing a pointer for iterating over the Trie's key-value pairs.
 pub struct IterationPointer<P: KeyTrait, V: Clone> {
     pub(crate) id: u64,
-    root: Rc<Node<P, V>>,
+    root: Arc<Node<P, V>>,
 }
 
 impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
@@ -20,7 +20,7 @@ impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
     /// * `root` - The root node of the Trie.
     /// * `id` - The ID of the snapshot.
     ///
-    pub fn new(root: Rc<Node<P, V>>, id: u64) -> IterationPointer<P, V> {
+    pub fn new(root: Arc<Node<P, V>>, id: u64) -> IterationPointer<P, V> {
         IterationPointer { id, root }
     }
 
@@ -47,7 +47,7 @@ impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
 
 /// An iterator over the nodes in the Trie.
 struct NodeIter<'a, P: KeyTrait, V: Clone> {
-    node: Box<dyn Iterator<Item = (u8, &'a Rc<Node<P, V>>)> + 'a>,
+    node: Box<dyn Iterator<Item = (u8, &'a Arc<Node<P, V>>)> + 'a>,
 }
 
 impl<'a, P: KeyTrait, V: Clone> NodeIter<'a, P, V> {
@@ -59,7 +59,7 @@ impl<'a, P: KeyTrait, V: Clone> NodeIter<'a, P, V> {
     ///
     fn new<I>(iter: I) -> Self
     where
-        I: Iterator<Item = (u8, &'a Rc<Node<P, V>>)> + 'a,
+        I: Iterator<Item = (u8, &'a Arc<Node<P, V>>)> + 'a,
     {
         Self {
             node: Box::new(iter),
@@ -68,7 +68,7 @@ impl<'a, P: KeyTrait, V: Clone> NodeIter<'a, P, V> {
 }
 
 impl<'a, P: KeyTrait, V: Clone> Iterator for NodeIter<'a, P, V> {
-    type Item = (u8, &'a Rc<Node<P, V>>);
+    type Item = (u8, &'a Arc<Node<P, V>>);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.node.next()
@@ -88,7 +88,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iter<'a, P, V> {
     ///
     /// * `node` - An optional reference to the root node of the Trie.
     ///
-    pub(crate) fn new(node: Option<&'a Rc<Node<P, V>>>) -> Self {
+    pub(crate) fn new(node: Option<&'a Arc<Node<P, V>>>) -> Self {
         if let Some(node) = node {
             Self {
                 inner: Box::new(IterState::new(node)),
@@ -178,29 +178,25 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
     type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        'outer: while let Some(node) = self.iters.last_mut() {
+        while let Some(node) = self.iters.last_mut() {
             let e = node.next();
-            loop {
-                match e {
-                    None => {
-                        self.iters.pop().unwrap();
-                        break;
-                    }
-                    Some(other) => {
-                        if other.1.is_twig() {
-                            let NodeType::Twig(twig) = &other.1.node_type else {
-                                panic!("should not happen");
-                            };
-                            let val = twig.get_latest_leaf();
-                            if let Some(v) = val {
-                                self.leafs
-                                    .push_back((&twig.key, &v.value, &v.version, &v.ts));
-                            }
-                            break 'outer;
-                        } else {
-                            self.iters.push(NodeIter::new(other.1.iter()));
-                            break;
+            match e {
+                None => {
+                    self.iters.pop().unwrap();
+                }
+                Some(other) => {
+                    if other.1.is_twig() {
+                        let NodeType::Twig(twig) = &other.1.node_type else {
+                            panic!("should not happen");
+                        };
+                        let val = twig.get_latest_leaf();
+                        if let Some(v) = val {
+                            self.leafs
+                                .push_back((&twig.key, &v.value, &v.version, &v.ts));
                         }
+                        break;
+                    } else {
+                        self.iters.push(NodeIter::new(other.1.iter()));
                     }
                 }
             }
@@ -229,7 +225,7 @@ where
         }
     }
 
-    pub(crate) fn new(node: Option<&'a Rc<Node<K, V>>>, range: R) -> Self
+    pub(crate) fn new(node: Option<&'a Arc<Node<K, V>>>, range: R) -> Self
     where
         R: RangeBounds<K>,
     {
@@ -251,46 +247,36 @@ impl<'a, K: 'a + KeyTrait, V: Clone, R: RangeBounds<K>> Iterator for Range<'a, K
     type Item = (Vec<u8>, &'a V, &'a u64, &'a u64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        'outer: while let Some(node) = self.forward.iters.last_mut() {
+        while let Some(node) = self.forward.iters.last_mut() {
             let e = node.next();
-            loop {
-                match e {
-                    Some(other) => {
-                        if other.1.is_twig() {
-                            let NodeType::Twig(twig) = &other.1.node_type else {
-                                panic!("should not happen");
-                            };
+            match e {
+                Some(other) => {
+                    if other.1.is_twig() {
+                        let NodeType::Twig(twig) = &other.1.node_type else {
+                            panic!("should not happen");
+                        };
 
-                            if self.range.contains(&twig.key) {
-                                let val = twig.get_latest_leaf();
-                                if let Some(v) = val {
-                                    self.forward
-                                        .leafs
-                                        .push_back((&twig.key, &v.value, &v.version, &v.ts));
-                                }
-                                break 'outer;
-                            } else {
-                                match self.range.end_bound() {
-                                    Bound::Included(k) if &twig.key > k => {
-                                        self.forward.iters.clear()
-                                    }
-                                    Bound::Excluded(k) if &twig.key >= k => {
-                                        self.forward.iters.clear()
-                                    }
-                                    _ => {}
-                                }
+                        if self.range.contains(&twig.key) {
+                            let val = twig.get_latest_leaf();
+                            if let Some(v) = val {
+                                self.forward
+                                    .leafs
+                                    .push_back((&twig.key, &v.value, &v.version, &v.ts));
                             }
-
                             break;
                         } else {
-                            self.forward.iters.push(NodeIter::new(other.1.iter()));
-                            break;
+                            match self.range.end_bound() {
+                                Bound::Included(k) if &twig.key > k => self.forward.iters.clear(),
+                                Bound::Excluded(k) if &twig.key >= k => self.forward.iters.clear(),
+                                _ => {}
+                            }
                         }
+                    } else {
+                        self.forward.iters.push(NodeIter::new(other.1.iter()));
                     }
-                    None => {
-                        self.forward.iters.pop().unwrap();
-                        break;
-                    }
+                }
+                None => {
+                    self.forward.iters.pop().unwrap();
                 }
             }
         }

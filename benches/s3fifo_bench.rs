@@ -4,7 +4,7 @@ use rand::{thread_rng, Rng};
 use std::num::NonZeroUsize;
 use surrealkv::storage::cache::s3fifo::Cache;
 
-const cases: usize = 1_000_00;
+const cases: usize = 100_000;
 
 fn bench_s3fifo_cache(c: &mut Criterion) {
     c.bench_function("Test s3fifo Cache", move |b| {
@@ -28,7 +28,7 @@ fn bench_s3fifo_cache(c: &mut Criterion) {
             |(mut l, nums)| {
                 (0..cases).for_each(|v| {
                     let k = nums[v];
-                    let _ = l.push(k, k);
+                    l.push(k, k);
                 });
 
                 (0..cases).for_each(|v| {

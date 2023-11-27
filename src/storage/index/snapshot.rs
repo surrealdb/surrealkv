@@ -1,6 +1,6 @@
 //! This module defines the Snapshot struct for managing snapshots within a Trie structure.
 use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use hashbrown::HashSet;
 
@@ -13,7 +13,7 @@ use crate::storage::index::KeyTrait;
 pub struct Snapshot<P: KeyTrait, V: Clone> {
     pub(crate) id: u64,
     pub(crate) ts: u64,
-    pub(crate) root: Option<Rc<Node<P, V>>>,
+    pub(crate) root: Option<Arc<Node<P, V>>>,
     pub(crate) readers: HashSet<u64>,
     pub(crate) max_active_readers: Cell<u64>,
     pub(crate) closed: bool,
@@ -21,7 +21,7 @@ pub struct Snapshot<P: KeyTrait, V: Clone> {
 
 impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     /// Creates a new Snapshot instance with the provided snapshot_id and root node.
-    pub(crate) fn new(id: u64, root: Option<Rc<Node<P, V>>>, ts: u64) -> Self {
+    pub(crate) fn new(id: u64, root: Option<Arc<Node<P, V>>>, ts: u64) -> Self {
         Snapshot {
             id,
             ts,
@@ -51,7 +51,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
                 self.root = Some(new_node);
             }
             None => {
-                self.root = Some(Rc::new(Node::new_twig(
+                self.root = Some(Arc::new(Node::new_twig(
                     key.as_slice().into(),
                     key.as_slice().into(),
                     value,

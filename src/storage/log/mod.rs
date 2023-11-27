@@ -1,4 +1,4 @@
-pub mod aol;
+pub mod aof;
 pub mod wal;
 
 use std::fmt;
@@ -412,7 +412,7 @@ impl Metadata {
         let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
 
         // Loop to read key-value pairs from the reader
-        for i in 0..len {
+        for _i in 0..len {
             let k = read_field(reader)?; // Read key
             let v = read_field(reader)?; // Read value
             self.data.insert(String::from_utf8_lossy(&k).to_string(), v);
@@ -608,18 +608,13 @@ fn validate_metadata(header: &[u8], opts: &Options) -> Result<()> {
     let additional_md = meta.get(KEY_ADDITIONAL_METADATA);
 
     match (additional_md, &opts.metadata) {
-        (Some(md), Some(expected_md)) if *md != expected_md.bytes() => {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::InvalidData,
-                "Corrupted metadata",
-            )));
-        }
-        (None, Some(_)) | (Some(_), None) => {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::InvalidData,
-                "Invalid metadata",
-            )));
-        }
+        (Some(md), Some(expected_md)) if *md != expected_md.bytes() => Err(Error::IO(
+            IOError::new(io::ErrorKind::InvalidData, "Corrupted metadata"),
+        )),
+        (None, Some(_)) | (Some(_), None) => Err(Error::IO(IOError::new(
+            io::ErrorKind::InvalidData,
+            "Invalid metadata",
+        ))),
         _ => Ok(()),
     }
 }
@@ -1448,7 +1443,7 @@ mod tests {
     fn put_and_get_bool() {
         let mut metadata = Metadata::new(None);
         metadata.put_bool("is_active", true);
-        assert_eq!(metadata.get_bool("is_active").unwrap(), true);
+        assert!(metadata.get_bool("is_active").unwrap());
     }
 
     #[test]

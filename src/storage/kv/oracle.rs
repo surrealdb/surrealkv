@@ -169,18 +169,13 @@ impl SnapshotIsolation {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
-                Err(e) => match &e {
-                    Error::IndexError(trie_error) => match trie_error {
-                        TrieError::KeyNotFound => {
-                            if *ts > 0 {
-                                return Err(Error::TransactionReadConflict);
-                            }
-                            continue;
-                        }
-                        _ => return Err(e),
-                    },
-                    _ => return Err(e),
-                },
+                Err(Error::IndexError(TrieError::KeyNotFound)) => {
+                    if *ts > 0 {
+                        return Err(Error::TransactionReadConflict);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
         }
 

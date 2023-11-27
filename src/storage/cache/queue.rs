@@ -92,18 +92,18 @@ impl<'a, T> Iterator for Iter<'a, T> {
         loop {
             unsafe {
                 let node_ref = self.ptr.as_ref().unwrap();
-                let key = &(*node_ref).item;
+                let key = &node_ref.item;
 
                 match (key, node_ref.next.load(Relaxed).is_null()) {
                     (Some(key), true) => {
                         self.len -= 1;
-                        return Some(&key);
+                        return Some(key);
                     }
 
                     (Some(key), false) => {
                         self.len -= 1;
                         self.ptr = node_ref.next.load(Relaxed);
-                        return Some(&key);
+                        return Some(key);
                     }
 
                     (None, true) => {

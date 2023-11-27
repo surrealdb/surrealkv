@@ -27,7 +27,7 @@ fn bench_dequeue(c: &mut Criterion) {
             |(mut l, nums)| {
                 (0..cases).for_each(|v| {
                     let k = nums[v];
-                    let _ = l.insert(k as usize, k);
+                    l.insert(k as usize, k);
                 });
             },
             BatchSize::LargeInput,

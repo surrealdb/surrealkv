@@ -3,8 +3,8 @@ use std::cmp::min;
 use std::error::Error;
 use std::fmt;
 use std::ops::RangeBounds;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use hashbrown::HashSet;
 
@@ -352,7 +352,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     /// Returns an `Option` containing a reference to the found child node or `None` if not found.
     ///
     #[inline]
-    fn find_child(&self, key: u8) -> Option<&Rc<Node<P, V>>> {
+    fn find_child(&self, key: u8) -> Option<&Arc<Node<P, V>>> {
         // If there are no children, return None.
         if self.num_children() == 0 {
             return None;
@@ -382,7 +382,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     ///
     /// Returns a new `Node` instance with the child node replaced.
     ///
-    fn replace_child(&self, key: u8, node: Rc<Node<P, V>>) -> Self {
+    fn replace_child(&self, key: u8, node: Arc<Node<P, V>>) -> Self {
         match &self.node_type {
             NodeType::Node1(n) => {
                 // Replace the child node in the Node4 instance and update the NodeType.
@@ -685,13 +685,13 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     /// Returns the updated node and the old value (if any) for the given key.
     ///
     pub(crate) fn insert_recurse(
-        cur_node: &Rc<Node<P, V>>,
+        cur_node: &Arc<Node<P, V>>,
         key: &P,
         value: V,
         commit_version: u64,
         ts: u64,
         depth: usize,
-    ) -> Result<(Rc<Node<P, V>>, Option<V>), TrieError> {
+    ) -> Result<(Arc<Node<P, V>>, Option<V>), TrieError> {
         // Obtain the current node's prefix and its length.
         let cur_node_prefix = cur_node.prefix().clone();
         let cur_node_prefix_len = cur_node.prefix().len();
@@ -716,7 +716,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
                 let old_val = twig.get_leaf_by_version(commit_version).unwrap();
                 let new_twig = twig.insert(value, commit_version, ts);
                 return Ok((
-                    Rc::new(Node {
+                    Arc::new(Node {
                         node_type: NodeType::Twig(new_twig),
                     }),
                     Some(old_val.value.clone()),
@@ -740,7 +740,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
                 ts,
             );
             n4 = n4.add_child(k1, old_node).add_child(k2, new_twig);
-            return Ok((Rc::new(n4), None));
+            return Ok((Arc::new(n4), None));
         }
 
         // Continue the insertion process by finding or creating the appropriate child node for the next character.
@@ -757,7 +757,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
             ) {
                 Ok((new_child, old_value)) => {
                     let new_node = cur_node.replace_child(k, new_child);
-                    return Ok((Rc::new(new_node), old_value));
+                    return Ok((Arc::new(new_node), old_value));
                 }
                 Err(err) => {
                     return Err(err);
@@ -774,7 +774,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
             ts,
         );
         let new_node = cur_node.add_child(k, new_twig);
-        Ok((Rc::new(new_node), None))
+        Ok((Arc::new(new_node), None))
     }
 
     /// Removes a key recursively from the node and its children.
@@ -792,10 +792,10 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     /// Returns a tuple containing the updated node (or `None`) and a flag indicating if the key was removed.
     ///
     pub(crate) fn remove_recurse(
-        cur_node: &Rc<Node<P, V>>,
+        cur_node: &Arc<Node<P, V>>,
         key: &P,
         depth: usize,
-    ) -> (Option<Rc<Node<P, V>>>, bool) {
+    ) -> (Option<Arc<Node<P, V>>>, bool) {
         // Obtain the prefix of the current node.
         let prefix = cur_node.prefix().clone();
 
@@ -825,7 +825,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
             if removed {
                 // If the key was successfully removed from the child node, update the current node's child pointer.
                 let new_node = cur_node.delete_child(k);
-                return (Some(Rc::new(new_node)), true);
+                return (Some(Arc::new(new_node)), true);
             }
         }
 
@@ -901,7 +901,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
     /// Returns a boxed iterator that yields tuples containing keys and references to child nodes.
     ///
     #[allow(dead_code)]
-    pub fn iter(&self) -> Box<dyn Iterator<Item = (u8, &Rc<Self>)> + '_> {
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (u8, &Arc<Self>)> + '_> {
         match &self.node_type {
             NodeType::Node1(n) => Box::new(n.iter()),
             NodeType::Node4(n) => Box::new(n.iter()),
@@ -933,7 +933,7 @@ impl<P: KeyTrait + Clone, V: Clone> Node<P, V> {
 ///
 pub struct Tree<P: KeyTrait, V: Clone> {
     /// An optional shared reference to the root node of the tree.
-    pub(crate) root: Option<Rc<Node<P, V>>>,
+    pub(crate) root: Option<Arc<Node<P, V>>>,
     /// A mapping of snapshot IDs to their corresponding snapshots.
     pub(crate) snapshots: HashSet<u64>,
     /// An atomic value indicating the maximum snapshot ID assigned.
@@ -1036,7 +1036,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
                     commit_version += 1;
                 }
                 (
-                    Rc::new(Node::new_twig(
+                    Arc::new(Node::new_twig(
                         key.as_slice().into(),
                         key.as_slice().into(),
                         value,
@@ -1104,7 +1104,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
             // self.insert(&new_kv.key, new_kv.value, new_kv.version, new_kv.ts)?;
             match &self.root {
                 None => {
-                    self.root = Some(Rc::new(Node::new_twig(
+                    self.root = Some(Arc::new(Node::new_twig(
                         new_kv.key.as_slice().into(),
                         new_kv.key.as_slice().into(),
                         new_kv.value,
@@ -1439,11 +1439,8 @@ mod tests {
         tree.insert(&key, value, 0, 0);
 
         // Verification phase
-        if let (_, val, _ts, _) = tree.get(&key, 0).unwrap() {
-            assert_eq!(val, value);
-        } else {
-            panic!("Key not found");
-        }
+        let (_, val, _ts, _) = tree.get(&key, 0).unwrap();
+        assert_eq!(val, value);
     }
 
     #[test]

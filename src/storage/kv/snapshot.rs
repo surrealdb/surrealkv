@@ -76,7 +76,7 @@ impl Snapshot {
         Ok(Box::new(val_ref))
     }
 
-    pub fn new_reader<'a>(&'a mut self) -> Result<IterationPointer<VariableKey, Bytes>> {
+    pub fn new_reader(&mut self) -> Result<IterationPointer<VariableKey, Bytes>> {
         Ok(self.snap.new_reader()?)
     }
 

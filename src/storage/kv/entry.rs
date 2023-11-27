@@ -135,7 +135,7 @@ impl TxRecord {
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32: crc32,
+            crc32,
         };
         self.entries.push(tx_record_entry);
         self.header.num_entries += 1;
@@ -153,13 +153,13 @@ impl TxRecord {
         // Encode entries and store offsets
         for entry in &self.entries {
             let mut offset = entry.encode(buf)?;
-            offset = current_offset as usize + offset;
+            offset += current_offset as usize;
 
             // Store the offset for the current entry
             offset_tracker.insert(entry.key.clone(), offset);
         }
 
-        let crc = calculate_crc32(&buf);
+        let crc = calculate_crc32(buf);
         buf.put_u32(crc);
 
         Ok(())

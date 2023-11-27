@@ -47,10 +47,7 @@ impl Mode {
     ///
     /// * `bool` - `true` if the mode is `WriteOnly`, `false` otherwise.
     pub(crate) fn is_write_only(&self) -> bool {
-        match self {
-            Self::WriteOnly => true,
-            _ => false,
-        }
+        matches!(self, Self::WriteOnly)
     }
 
     /// Checks if the transaction mode is `ReadOnly`.
@@ -59,10 +56,7 @@ impl Mode {
     ///
     /// * `bool` - `true` if the mode is `ReadOnly`, `false` otherwise.
     pub(crate) fn is_read_only(&self) -> bool {
-        match self {
-            Self::ReadOnly => true,
-            _ => false,
-        }
+        matches!(self, Self::ReadOnly)
     }
 }
 
@@ -238,19 +232,19 @@ impl Transaction {
         let range = (
             match range.start_bound() {
                 Bound::Included(start) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(&start.to_vec()))
+                    Bound::Included(VariableKey::from_slice_with_termination(start))
                 }
                 Bound::Excluded(start) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(&start.to_vec()))
+                    Bound::Excluded(VariableKey::from_slice_with_termination(start))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match range.end_bound() {
                 Bound::Included(end) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(&end.to_vec()))
+                    Bound::Included(VariableKey::from_slice_with_termination(end))
                 }
                 Bound::Excluded(end) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(&end.to_vec()))
+                    Bound::Excluded(VariableKey::from_slice_with_termination(end))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
@@ -269,7 +263,7 @@ impl Transaction {
         'outer: for (key, value, version, ts) in ranger {
             // Create a new value reference and decode the value.
             let mut val_ref = ValueRef::new(self.store.clone());
-            let val_bytes_ref: &Bytes = &value;
+            let val_bytes_ref: &Bytes = value;
             val_ref.decode(*version, val_bytes_ref)?;
 
             // Apply all filters. If any filter fails, skip this key and continue with the next one.
@@ -680,7 +674,7 @@ mod tests {
 
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
-            txn.set(&key, &key).unwrap();
+            txn.set(key, key).unwrap();
             txn.commit().unwrap();
         }
 
@@ -704,7 +698,7 @@ mod tests {
 
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
-            txn.set(&key, &key).unwrap();
+            txn.set(key, key).unwrap();
             txn.commit().unwrap();
         }
 

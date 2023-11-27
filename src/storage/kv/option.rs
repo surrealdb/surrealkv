@@ -134,9 +134,9 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from(""));
         assert_eq!(options.max_key_size, 1024);
         assert_eq!(options.max_value_size, 1024 * 1024);
-        assert_eq!(options.create_if_not_exists, true);
+        assert!(options.create_if_not_exists);
         assert_eq!(options.max_tx_entries, 1 << 10);
-        assert_eq!(options.wal_disabled, false);
+        assert!(!options.wal_disabled);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_active_snapshots, DEFAULT_MAX_ACTIVE_SNAPSHOTS);
@@ -172,12 +172,9 @@ mod tests {
             metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD).unwrap(),
             128
         );
-        assert_eq!(
-            metadata.get_bool(META_KEY_CREATE_IF_NOT_EXISTS).unwrap(),
-            false
-        );
+        assert!(!metadata.get_bool(META_KEY_CREATE_IF_NOT_EXISTS).unwrap());
         assert_eq!(metadata.get_uint(META_KEY_MAX_TX_ENTRIES).unwrap(), 500);
-        assert_eq!(metadata.get_bool(META_KEY_WAL_DISABLED).unwrap(), true);
+        assert!(metadata.get_bool(META_KEY_WAL_DISABLED).unwrap());
         assert_eq!(
             metadata.get_uint(META_KEY_MAX_ACTIVE_SNAPSHOTS).unwrap(),
             10
@@ -217,9 +214,9 @@ mod tests {
         assert_eq!(options.max_key_size, 2048);
         assert_eq!(options.max_value_size, 4096);
         assert_eq!(options.max_value_threshold, 128);
-        assert_eq!(options.create_if_not_exists, false);
+        assert!(!options.create_if_not_exists);
         assert_eq!(options.max_tx_entries, 500);
-        assert_eq!(options.wal_disabled, true);
+        assert!(options.wal_disabled);
         assert_eq!(
             options.isolation_level,
             IsolationLevel::SerializableSnapshotIsolation

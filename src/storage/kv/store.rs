@@ -19,8 +19,8 @@ use crate::storage::{
         transaction::{Mode, Transaction},
     },
     log::{
-        aol::aol::AOL,
-        wal::wal::WAL,
+        aof::log::AOL,
+        wal::log::WAL,
         {write_field, Options as LogOptions, BLOCK_SIZE}, {Error as LogError, Metadata},
     },
 };
@@ -161,7 +161,7 @@ impl Core {
             wal: Arc::new(None),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
-            value_cache: value_cache,
+            value_cache,
         })
     }
 
@@ -181,11 +181,8 @@ impl Core {
             // Read the next transaction record from the log.
             let res = tx_reader.read_into(&mut tx);
             if let Err(e) = res {
-                if let Error::LogError(log_error) = &e {
-                    match log_error {
-                        LogError::EOF => break,
-                        _ => return Err(e),
-                    }
+                if let Error::LogError(LogError::EOF) = e {
+                    break;
                 } else {
                     return Err(e);
                 }
@@ -233,7 +230,7 @@ impl Core {
     ) -> Result<Metadata> {
         let current_metadata = opts.to_metadata();
         let existing_metadata = if !manifest.size()? > 0 {
-            Core::load_manifest(&opts, &mopts)?
+            Core::load_manifest(opts, mopts)?
         } else {
             None
         };
@@ -263,11 +260,8 @@ impl Core {
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::LogError(log_error) = &e {
-                    match log_error {
-                        LogError::EOF => break,
-                        _ => return Err(e),
-                    }
+                if let Error::LogError(LogError::EOF) = e {
+                    break;
                 } else {
                     return Err(e);
                 }
@@ -349,7 +343,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
             let mut txn = store.begin().unwrap();
-            txn.set(&key, &default_value).unwrap();
+            txn.set(key, &default_value).unwrap();
             txn.commit().unwrap();
         }
 
@@ -357,7 +351,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap();
+            let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -376,7 +370,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap();
+            let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }

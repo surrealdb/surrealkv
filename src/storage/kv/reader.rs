@@ -7,7 +7,7 @@ use crate::storage::{
         error::{Error, Result},
         meta::Metadata,
     },
-    log::aol::aol::AOL,
+    log::aof::log::AOL,
 };
 
 use super::entry::TxRecord;
@@ -49,14 +49,6 @@ impl Reader {
             eof: false,
             offset: off,
         })
-    }
-
-    /// Resets the `Reader` to its initial state.
-    fn reset(&mut self) {
-        self.read = 0;
-        self.eof = false;
-        self.offset = 0;
-        self.start = 0;
     }
 
     /// Returns the current offset of the `Reader`.
@@ -102,6 +94,7 @@ impl Reader {
     }
 
     /// Reads a single byte from the data source.
+    #[allow(dead_code)]
     pub(crate) fn read_byte(&mut self) -> Result<u8> {
         let mut b = [0; 1];
         self.read(&mut b)?;
@@ -224,7 +217,7 @@ impl TxReader {
                 value: v.into(),
                 value_len: v_len as u32,
                 key_len: k_len as u32,
-                crc32: crc32,
+                crc32,
             },
             offset,
         ))
