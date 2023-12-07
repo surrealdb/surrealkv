@@ -1039,19 +1039,32 @@ mod tests {
     fn pmp_tests(is_ssi: bool) {
         let store = create_hermitage_store(is_ssi);
 
-        let key2 = Bytes::from("k2");
         let key3 = Bytes::from("k3");
+        let value1 = Bytes::from("v1");
+        let value2 = Bytes::from("v2");
         let value3 = Bytes::from("v3");
 
         {
             let txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert!(txn1.get(&key3).is_err());
-            txn2.set(&key2, &value3).unwrap();
+            // k3 should not be visible to txn1
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let res = txn1.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
+
+            // k3 is committed by txn2
+            txn2.set(&key3, &value3).unwrap();
             txn2.commit().unwrap();
 
-            assert!(txn1.get(&key3).is_err());
+            // k3 should still not be visible to txn1
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let res = txn1.scan(range.clone()).unwrap();
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0].0, value1);
+            assert_eq!(res[1].0, value2);
         }
     }
 
