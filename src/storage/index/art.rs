@@ -1247,14 +1247,11 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         // Check if the tree is already closed
         self.is_closed()?;
 
-        let _ = self
-            .snapshots
-            .get(&snapshot_id)
-            .ok_or(TrieError::SnapshotNotFound)?;
-
-        self.snapshots.remove(&snapshot_id);
-
-        Ok(())
+        if self.snapshots.remove(&snapshot_id) {
+            Ok(())
+        } else {
+            Err(TrieError::SnapshotNotFound)
+        }
     }
 
     /// Returns the count of active snapshots.

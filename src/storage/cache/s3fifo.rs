@@ -113,8 +113,7 @@ where
     }
 
     fn evict_m(&mut self) {
-        let mut evicted = false;
-        while !evicted && self.main.len() > 0 {
+        while self.main.len() > 0 {
             if let Some(tail) = self.main.pop() {
                 let freq = tail.freq.load(Relaxed);
                 if freq > 0 {
@@ -122,21 +121,20 @@ where
                     self.main.push(tail);
                 } else {
                     self.table.remove(&tail.key);
-                    evicted = true;
+                    break;
                 }
             }
         }
     }
 
     fn evict_s(&mut self) {
-        let mut evicted = false;
-        while !evicted && self.small.len() > 0 {
+        while self.small.len() > 0 {
             if let Some(tail) = self.small.pop() {
                 if tail.freq.load(Relaxed) > 1 {
                     self.insert_m(tail);
                 } else {
                     self.insert_g(tail);
-                    evicted = true;
+                    break;
                 }
             }
         }

@@ -128,10 +128,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
         let mut iters = Vec::new();
         let mut leafs = VecDeque::new();
 
-        if node.is_twig() {
-            let NodeType::Twig(twig) = &node.node_type else {
-                panic!("should not happen");
-            };
+        if let NodeType::Twig(twig) = &node.node_type {
             let val = twig.get_latest_leaf();
             if let Some(v) = val {
                 leafs.push_back((&twig.key, &v.value, &v.version, &v.ts));
@@ -156,10 +153,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> IterState<'a, P, V> {
     {
         let mut leafs = VecDeque::new();
         let mut iters = Vec::new();
-        if node.is_twig() {
-            let NodeType::Twig(twig) = &node.node_type else {
-                panic!("should not happen");
-            };
+        if let NodeType::Twig(twig) = &node.node_type {
             if range.contains(&twig.key) {
                 let val = twig.get_latest_leaf();
                 if let Some(v) = val {
@@ -185,10 +179,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
                     self.iters.pop().unwrap();
                 }
                 Some(other) => {
-                    if other.1.is_twig() {
-                        let NodeType::Twig(twig) = &other.1.node_type else {
-                            panic!("should not happen");
-                        };
+                    if let NodeType::Twig(twig) = &other.1.node_type {
                         let val = twig.get_latest_leaf();
                         if let Some(v) = val {
                             self.leafs
@@ -251,11 +242,7 @@ impl<'a, K: 'a + KeyTrait, V: Clone, R: RangeBounds<K>> Iterator for Range<'a, K
             let e = node.next();
             match e {
                 Some(other) => {
-                    if other.1.is_twig() {
-                        let NodeType::Twig(twig) = &other.1.node_type else {
-                            panic!("should not happen");
-                        };
-
+                    if let NodeType::Twig(twig) = &other.1.node_type {
                         if self.range.contains(&twig.key) {
                             let val = twig.get_latest_leaf();
                             if let Some(v) = val {
