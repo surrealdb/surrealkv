@@ -1,6 +1,7 @@
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-use crate::storage::index::{KeyTrait, SparseVector};
+use crate::storage::index::{BitArray, KeyTrait};
 
 /*
     Immutable nodes
@@ -153,17 +154,23 @@ pub struct FlatNode<P: KeyTrait + Clone, N: Version, const WIDTH: usize> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
     keys: [u8; WIDTH],
-    children: Vec<Option<Arc<N>>>,
+    children: Box<[MaybeUninit<Option<Arc<N>>>; WIDTH]>,
     num_children: u8,
 }
 
 impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> {
     pub fn new(prefix: P) -> Self {
+        let mut children: [MaybeUninit<Option<Arc<N>>>; WIDTH] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+        for child in &mut children[..] {
+            *child = MaybeUninit::new(None);
+        }
+
         Self {
             prefix,
             version: 0,
             keys: [0; WIDTH],
-            children: vec![None; WIDTH],
+            children: Box::new(children),
             num_children: 0,
         }
     }
@@ -185,7 +192,9 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
         let mut new_node = FlatNode::<P, N, NEW_WIDTH>::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
             new_node.keys[i] = self.keys[i];
-            new_node.children[i] = self.children[i].clone();
+            unsafe {
+                *new_node.children[i].as_mut_ptr() = self.children[i].assume_init_ref().clone();
+            }
         }
         new_node.version = self.version;
         new_node.num_children = self.num_children;
@@ -196,7 +205,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
     pub fn grow(&self) -> Node48<P, N> {
         let mut n48 = Node48::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
-            if let Some(child) = self.children[i].as_ref() {
+            if let Some(child) = unsafe { self.children[i].assume_init_ref().as_ref() } {
                 n48.insert_child(self.keys[i], child.clone());
             }
         }
@@ -209,17 +218,17 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
     fn insert_child(&mut self, idx: usize, key: u8, node: Arc<N>) {
         for i in (idx..self.num_children as usize).rev() {
             self.keys[i + 1] = self.keys[i];
-            self.children[i + 1] = self.children[i].clone();
+            self.children[i + 1] = std::mem::replace(&mut self.children[i], MaybeUninit::new(None));
         }
         self.keys[idx] = key;
-        self.children[idx] = Some(node);
+        self.children[idx].write(Some(node));
         self.num_children += 1;
     }
 
     #[inline]
     fn max_child_version(&self) -> u64 {
         self.children.iter().fold(0, |acc, x| {
-            if let Some(child) = x.as_ref() {
+            if let Some(child) = unsafe { x.assume_init_ref().as_ref() } {
                 std::cmp::max(acc, child.version())
             } else {
                 acc
@@ -256,7 +265,13 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
             .iter()
             .zip(self.children.iter())
             .take(self.num_children as usize)
-            .map(|(&k, c)| (k, c.as_ref().unwrap()))
+            .filter_map(|(&k, c)| {
+                if let Some(child) = unsafe { c.assume_init_ref() } {
+                    Some((k, child))
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -265,7 +280,8 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
         let mut new_node = Self::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
             new_node.keys[i] = self.keys[i];
-            new_node.children[i] = self.children[i].clone();
+            new_node.children[i] =
+                MaybeUninit::new(unsafe { self.children[i].assume_init_ref() }.clone());
         }
         new_node.num_children = self.num_children;
         new_node.version = self.version;
@@ -276,7 +292,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
         let mut new_node = self.clone();
         let idx = new_node.index(key).unwrap();
         new_node.keys[idx] = key;
-        new_node.children[idx] = Some(node);
+        new_node.children[idx] = MaybeUninit::new(Some(node));
         new_node.update_version_to_max_child_version();
 
         new_node
@@ -296,7 +312,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
 
     fn find_child(&self, key: u8) -> Option<&Arc<N>> {
         let idx = self.index(key)?;
-        let child = self.children[idx].as_ref();
+        let child = unsafe { self.children[idx].assume_init_ref().as_ref() };
         child
     }
 
@@ -308,16 +324,16 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
             .take(self.num_children as usize)
             .position(|&k| k == key)
             .unwrap();
-
-        new_node.children[idx] = None;
-
+        new_node.children[idx] = MaybeUninit::new(None);
         for i in idx..(WIDTH - 1) {
             new_node.keys[i] = self.keys[i + 1];
-            new_node.children[i] = self.children[i + 1].clone();
+            unsafe {
+                *new_node.children[i].as_mut_ptr() = self.children[i + 1].assume_init_ref().clone();
+            }
         }
 
         new_node.keys[WIDTH - 1] = 0;
-        new_node.children[WIDTH - 1] = None;
+        new_node.children[WIDTH - 1] = MaybeUninit::new(None);
         new_node.num_children -= 1;
         new_node.update_version_to_max_child_version();
 
@@ -341,6 +357,15 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Version for FlatNode<P
     }
 }
 
+impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Drop for FlatNode<P, N, WIDTH> {
+    fn drop(&mut self) {
+        for value in &mut self.children[..self.num_children as usize] {
+            unsafe { value.assume_init_drop() }
+        }
+        self.num_children = 0;
+    }
+}
+
 // Source: https://www.the-paper-trail.org/post/art-paper-notes/
 //
 // Node48: It can hold up to three times as many keys as a Node16. As the paper says,
@@ -354,8 +379,8 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Version for FlatNode<P
 pub struct Node48<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
-    child_ptr_indexes: Box<SparseVector<u8, 256>>,
-    children: Box<SparseVector<Arc<N>, 48>>,
+    keys: BitArray<u8, 256>,
+    children: BitArray<Arc<N>, 48>,
     num_children: u8,
 }
 
@@ -364,23 +389,24 @@ impl<P: KeyTrait + Clone, N: Version> Node48<P, N> {
         Self {
             prefix,
             version: 0,
-            child_ptr_indexes: Box::new(SparseVector::new()),
-            children: Box::new(SparseVector::new()),
+            keys: BitArray::new(),
+            children: BitArray::new(),
             num_children: 0,
         }
     }
 
     pub fn insert_child(&mut self, key: u8, node: Arc<N>) {
-        let pos = self.children.first_free_pos();
+        let pos = self.children.first_free_pos().unwrap();
+        assert!(pos < 48);
 
-        self.child_ptr_indexes.set(key as usize, pos as u8);
+        self.keys.set(key as usize, pos as u8);
         self.children.set(pos, node);
         self.num_children += 1;
     }
 
     pub fn shrink<const NEW_WIDTH: usize>(&self) -> FlatNode<P, N, NEW_WIDTH> {
         let mut fnode = FlatNode::new(self.prefix.clone());
-        for (key, pos) in self.child_ptr_indexes.iter() {
+        for (key, pos) in self.keys.iter() {
             let child = self.children.get(*pos as usize).unwrap().clone();
             let idx = fnode.find_pos(key as u8).expect("node is full");
             fnode.insert_child(idx, key as u8, child);
@@ -391,7 +417,7 @@ impl<P: KeyTrait + Clone, N: Version> Node48<P, N> {
 
     pub fn grow(&self) -> Node256<P, N> {
         let mut n256 = Node256::new(self.prefix.clone());
-        for (key, pos) in self.child_ptr_indexes.iter() {
+        for (key, pos) in self.keys.iter() {
             let child = self.children.get(*pos as usize).unwrap().clone();
             n256.insert_child(key as u8, child);
         }
@@ -430,7 +456,7 @@ impl<P: KeyTrait + Clone, N: Version> Node48<P, N> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u8, &Arc<N>)> {
-        self.child_ptr_indexes
+        self.keys
             .iter()
             .map(move |(key, pos)| (key as u8, self.children.get(*pos as usize).unwrap()))
     }
@@ -441,15 +467,15 @@ impl<P: KeyTrait + Clone, N: Version> NodeTrait<N> for Node48<P, N> {
         Node48 {
             prefix: self.prefix.clone(),
             version: self.version,
-            child_ptr_indexes: Box::new(*self.child_ptr_indexes.clone()),
-            children: Box::new(*self.children.clone()),
+            keys: self.keys.clone(),
+            children: self.children.clone(),
             num_children: self.num_children,
         }
     }
 
     fn replace_child(&self, key: u8, node: Arc<N>) -> Self {
         let mut new_node = self.clone();
-        let idx = new_node.child_ptr_indexes.get(key as usize).unwrap();
+        let idx = new_node.keys.get(key as usize).unwrap();
         new_node.children.set(*idx as usize, node);
         new_node.update_version_to_max_child_version();
 
@@ -467,9 +493,9 @@ impl<P: KeyTrait + Clone, N: Version> NodeTrait<N> for Node48<P, N> {
     }
 
     fn delete_child(&self, key: u8) -> Self {
-        let pos = self.child_ptr_indexes.get(key as usize).unwrap();
+        let pos = self.keys.get(key as usize).unwrap();
         let mut new_node = self.clone();
-        new_node.child_ptr_indexes.erase(key as usize);
+        new_node.keys.erase(key as usize);
         new_node.children.erase(*pos as usize);
         new_node.num_children -= 1;
 
@@ -478,7 +504,7 @@ impl<P: KeyTrait + Clone, N: Version> NodeTrait<N> for Node48<P, N> {
     }
 
     fn find_child(&self, key: u8) -> Option<&Arc<N>> {
-        let idx = self.child_ptr_indexes.get(key as usize)?;
+        let idx = self.keys.get(key as usize)?;
         let child = self.children.get(*idx as usize)?;
         Some(child)
     }
@@ -499,6 +525,14 @@ impl<P: KeyTrait + Clone, N: Version> Version for Node48<P, N> {
     }
 }
 
+impl<P: KeyTrait + Clone, N: Version> Drop for Node48<P, N> {
+    fn drop(&mut self) {
+        self.num_children = 0;
+        self.keys.clear();
+        self.children.clear();
+    }
+}
+
 // Source: https://www.the-paper-trail.org/post/art-paper-notes/
 //
 // Node256: It is the traditional trie node, used when a node has
@@ -512,7 +546,7 @@ pub struct Node256<P: KeyTrait + Clone, N: Version> {
     pub(crate) prefix: P,    // Prefix associated with the node
     pub(crate) version: u64, // Version for node256
 
-    children: Box<SparseVector<Arc<N>, 256>>,
+    children: BitArray<Arc<N>, 256>,
     num_children: usize,
 }
 
@@ -521,7 +555,7 @@ impl<P: KeyTrait + Clone, N: Version> Node256<P, N> {
         Self {
             prefix,
             version: 0,
-            children: Box::new(SparseVector::new()),
+            children: BitArray::new(),
             num_children: 0,
         }
     }
@@ -641,11 +675,19 @@ impl<P: KeyTrait + Clone, N: Version> Version for Node256<P, N> {
     }
 }
 
+impl<P: KeyTrait + Clone, N: Version> Drop for Node256<P, N> {
+    fn drop(&mut self) {
+        self.num_children = 0;
+        self.children.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::storage::index::FixedKey;
 
     use super::{FlatNode, Node256, Node48, NodeTrait, TwigNode, Version};
+    use std::mem::MaybeUninit;
     use std::sync::Arc;
 
     macro_rules! impl_timestamp {
@@ -870,15 +912,14 @@ mod tests {
             prefix: dummy_prefix.clone(),
             version: 6,
             keys: [0; WIDTH],
-            children: vec![
-                Some(Arc::new(child1)),
-                Some(Arc::new(child2)),
-                Some(Arc::new(child3)),
-                None,
-            ],
+            children: Box::new([
+                MaybeUninit::new(Some(Arc::new(child1))),
+                MaybeUninit::new(Some(Arc::new(child2))),
+                MaybeUninit::new(Some(Arc::new(child3))),
+                MaybeUninit::new(None),
+            ]),
             num_children: 3,
         };
-
         // The maximum version among children is 10 (child2.version), so after calling update_version,
         // the parent's version should be updated to 10.
         parent.update_version();
@@ -897,7 +938,7 @@ mod tests {
         // Update a child's version to be the largest (20), parent's version should update to 20
         let mut child6 = FlatNode::<FixedKey<8>, usize, WIDTH>::new(dummy_prefix);
         child6.version = 20;
-        parent.children[2] = Some(Arc::new(child6));
+        parent.children[2] = MaybeUninit::new(Some(Arc::new(child6)));
         parent.update_version();
         assert_eq!(parent.version(), 20);
     }
@@ -912,7 +953,7 @@ mod tests {
             prefix: dummy_prefix,
             version: 6,
             keys: [0; WIDTH],
-            children: vec![Some(Arc::new(child))],
+            children: Box::new([MaybeUninit::new(Some(Arc::new(child)))]),
             num_children: 1,
         };
 
@@ -1004,15 +1045,14 @@ mod tests {
             prefix: dummy_prefix,
             version: 0,
             keys: [0; WIDTH],
-            children: vec![
-                Some(Arc::new(twig1)),
-                Some(Arc::new(twig2)),
-                Some(Arc::new(twig3)),
-                Some(Arc::new(twig4)),
-            ],
+            children: Box::new([
+                MaybeUninit::new(Some(Arc::new(twig1))),
+                MaybeUninit::new(Some(Arc::new(twig2))),
+                MaybeUninit::new(Some(Arc::new(twig3))),
+                MaybeUninit::new(Some(Arc::new(twig4))),
+            ]),
             num_children: 3,
         };
-
         // The maximum version among children is 10 (child2.version), so after calling update_version,
         // the parent's version should be updated to 10.
         parent.update_version();
@@ -1107,6 +1147,7 @@ mod tests {
         for i in 0..48 {
             n48 = n48.add_child(i, i);
         }
+
         for child in n48.iter() {
             assert_eq!(Arc::strong_count(child.1), 1);
         }
@@ -1116,8 +1157,15 @@ mod tests {
         for i in 0..255 {
             n256 = n256.add_child(i, i);
         }
+
         for child in n256.iter() {
             assert_eq!(Arc::strong_count(child.1), 1);
         }
+    }
+
+    #[test]
+    fn cache_line_size() {
+        assert!(std::mem::size_of::<FlatNode::<FixedKey<8>, usize, 4>>() <= 64);
+        assert!(std::mem::size_of::<FlatNode::<FixedKey<8>, usize, 16>>() <= 64);
     }
 }
