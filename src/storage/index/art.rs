@@ -1308,7 +1308,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         }
 
         let root = self.root.as_ref();
-        return Range::new(root, range);
+        Range::new(root, range)
     }
 
     fn is_closed(&self) -> Result<(), TrieError> {

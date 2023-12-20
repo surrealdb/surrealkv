@@ -28,7 +28,7 @@ fn bench_s3fifo_cache(c: &mut Criterion) {
             |(mut l, nums)| {
                 (0..cases).for_each(|v| {
                     let k = nums[v];
-                    l.push(k, k);
+                    l.insert(k, k);
                 });
 
                 (0..cases).for_each(|v| {

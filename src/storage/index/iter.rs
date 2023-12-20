@@ -89,16 +89,15 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iter<'a, P, V> {
     /// * `node` - An optional reference to the root node of the Trie.
     ///
     pub(crate) fn new(node: Option<&'a Arc<Node<P, V>>>) -> Self {
-        if let Some(node) = node {
-            Self {
+        match node {
+            Some(node) => Self {
                 inner: Box::new(IterState::new(node)),
                 _marker: Default::default(),
-            }
-        } else {
-            Self {
+            },
+            None => Self {
                 inner: Box::new(std::iter::empty()),
                 _marker: Default::default(),
-            }
+            },
         }
     }
 }

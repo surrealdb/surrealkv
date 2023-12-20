@@ -27,7 +27,8 @@ rand = "0.8.5"
 criterion = "0.5.1"
 jemallocator = "0.5.4"
 nanoid = "0.4.0"
+caches = "0.2" 
 
 [[bench]]
-name = "store_bench"
+name = "s3fifo_bench"
 harness = false

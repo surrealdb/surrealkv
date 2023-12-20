@@ -1,11 +1,13 @@
+/// This is an experimental implementation of a cache that uses the S3-FIFO algorithm. This is not yet
+/// used in the main codebase. But the implementation is kept here for future reference for replacing it
+/// with the current LRU cache for caching recently accessed values.
 use hashbrown::HashMap;
 use std::cmp::min;
+use std::collections::LinkedList;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering::Relaxed;
-
-use crate::storage::cache::queue::Queue;
+use std::sync::atomic::Ordering::SeqCst;
 
 const MAX_FREQUENCY_LIMIT: u8 = 3;
 
@@ -27,20 +29,19 @@ impl<K, V> Entry<K, V> {
 
 /// Cache is an implementation of "S3-FIFO" from "FIFO Queues are ALL You Need for Cache Eviction" by
 /// Juncheng Yang, et al: https://jasony.me/publication/sosp23-s3fifo.pdf
+
 pub struct Cache<K, V>
 where
     K: PartialEq + Eq + Hash + Clone + Debug,
     V: Clone,
 {
-    min_eviction_size: usize,
-    max_ghost_size: usize,
-    max_cache_size: usize,
-    small: Queue<Entry<K, V>>,
-    main: Queue<Entry<K, V>>,
-    ghost: Queue<K>,
+    max_small_size: usize,
+    max_main_size: usize,
+    small: LinkedList<Entry<K, V>>,
+    main: LinkedList<Entry<K, V>>,
+    ghost: LinkedList<K>,
     table: HashMap<K, Entry<K, V>>,
 }
-
 impl<K, V> Cache<K, V>
 where
     K: PartialEq + Eq + Hash + Clone + Debug,
@@ -48,94 +49,84 @@ where
 {
     pub fn new(max_cache_size: usize) -> Self {
         assert!(max_cache_size > 0);
-        let min_eviction_size = max_cache_size / 10;
-        let max_ghost_size = max_cache_size - min_eviction_size;
+        let max_small_size = max_cache_size / 10;
+        let max_main_size = max_cache_size - max_small_size;
 
         Self {
-            min_eviction_size,
-            max_ghost_size,
-            max_cache_size,
-            small: Queue::new(),
-            main: Queue::new(),
-            ghost: Queue::new(),
+            max_small_size,
+            max_main_size,
+            small: LinkedList::new(),
+            main: LinkedList::new(),
+            ghost: LinkedList::new(),
             table: HashMap::new(),
         }
     }
 
     pub fn get(&mut self, key: &K) -> Option<&V> {
         if let Some(entry) = self.table.get(key) {
-            let freq = min(entry.freq.load(Relaxed) + 1, MAX_FREQUENCY_LIMIT);
-            entry.freq.store(freq, Relaxed);
+            let freq = min(entry.freq.load(SeqCst) + 1, MAX_FREQUENCY_LIMIT);
+            entry.freq.store(freq, SeqCst);
             Some(&entry.value)
         } else {
             None
         }
     }
 
-    pub fn push(&mut self, key: K, value: V) {
-        self.ensure_free();
+    pub fn insert(&mut self, key: K, value: V) {
+        self.evict();
 
         if self.table.contains_key(&key) {
             let entry = Entry::new(key, value);
-            self.main.push(entry);
+            self.main.push_front(entry);
         } else {
             let entry = Entry::new(key.clone(), value.clone());
             self.table.insert(entry.key.clone(), entry);
             let entry = Entry::new(key, value);
-            self.small.push(entry);
+            self.small.push_front(entry);
         }
     }
 
     fn insert_m(&mut self, tail: Entry<K, V>) {
-        self.main.push(tail);
-        if self.main.len() >= self.max_cache_size {
+        self.main.push_front(tail);
+        if self.main.len() >= self.max_main_size {
             self.evict_m();
         }
     }
 
     fn insert_g(&mut self, tail: Entry<K, V>) {
-        if self.ghost.len() >= self.max_ghost_size {
-            let key = self.ghost.pop().unwrap();
+        self.ghost.push_front(tail.key);
+        if self.ghost.len() >= self.max_main_size {
+            let key = self.ghost.pop_back().unwrap();
             self.table.remove(&key);
         }
-
-        self.ghost.push(tail.key);
     }
 
-    fn ensure_free(&mut self) {
-        while self.small.len() + self.main.len() >= self.max_cache_size {
-            if self.small.len() >= self.min_eviction_size {
-                self.evict_s();
-            } else {
-                self.evict_m();
-            }
+    fn evict(&mut self) {
+        if self.small.len() >= self.max_small_size {
+            self.evict_s();
+        } else {
+            self.evict_m();
         }
     }
 
     fn evict_m(&mut self) {
-        while self.main.len() > 0 {
-            if let Some(tail) = self.main.pop() {
-                let freq = tail.freq.load(Relaxed);
-                if freq > 0 {
-                    tail.freq.store(freq - 1, Relaxed);
-                    self.main.push(tail);
-                } else {
-                    self.table.remove(&tail.key);
-                    break;
-                }
+        while let Some(tail) = self.main.pop_back() {
+            let freq = tail.freq.load(SeqCst);
+            if freq > 0 {
+                tail.freq.store(freq - 1, SeqCst);
+                self.main.push_front(tail);
+            } else {
+                break;
             }
         }
     }
 
     fn evict_s(&mut self) {
-        while self.small.len() > 0 {
-            if let Some(tail) = self.small.pop() {
-                if tail.freq.load(Relaxed) > 1 {
-                    self.insert_m(tail);
-                } else {
-                    self.insert_g(tail);
-                    break;
-                }
+        while let Some(tail) = self.small.pop_back() {
+            if tail.freq.load(SeqCst) > 1 {
+                self.insert_m(tail);
+            } else {
+                self.insert_g(tail);
             }
         }
     }
@@ -145,7 +136,7 @@ where
 mod tests {
     use std::fmt::Debug;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::SeqCst;
 
     use super::*;
 
@@ -158,8 +149,8 @@ mod tests {
     fn test_push_and_read() {
         let mut cache = Cache::new(2);
 
-        cache.push("apple", "red");
-        cache.push("banana", "yellow");
+        cache.insert("apple", "red");
+        cache.insert("banana", "yellow");
 
         assert_opt_eq(cache.get(&"apple"), "red");
         assert_opt_eq(cache.get(&"banana"), "yellow");
@@ -169,23 +160,25 @@ mod tests {
     fn test_push_removes_oldest() {
         let mut cache = Cache::new(2);
 
-        cache.push("apple", "red");
-        cache.push("banana", "yellow");
-        cache.push("orange", "orange");
-        cache.push("pear", "green");
-        cache.push("tomato", "red");
+        cache.insert("apple", "red");
+        cache.insert("banana", "yellow");
+        cache.insert("orange", "orange");
+        cache.insert("pear", "green");
+        cache.insert("tomato", "red");
 
         assert!(cache.get(&"apple").is_none());
-        assert_opt_eq(cache.get(&"banana"), "yellow");
-        assert_opt_eq(cache.get(&"orange"), "orange");
+        assert!(cache.get(&"banana").is_none());
+        assert!(cache.get(&"orange").is_none());
+        assert_opt_eq(cache.get(&"pear"), "green");
+        assert_opt_eq(cache.get(&"tomato"), "red");
 
         // "apple" should been removed from the cache.
-        cache.push("apple", "orange");
-        cache.push("tomato", "red");
+        cache.insert("apple", "red");
+        cache.insert("banana", "yellow");
 
-        assert!(cache.get(&"orange").is_none());
-        assert_opt_eq(cache.get(&"apple"), "orange");
-        assert_opt_eq(cache.get(&"tomato"), "red");
+        assert!(cache.get(&"pear").is_none());
+        assert_opt_eq(cache.get(&"apple"), "red");
+        assert_opt_eq(cache.get(&"banana"), "yellow");
     }
 
     #[test]
@@ -197,17 +190,17 @@ mod tests {
 
         impl Drop for DropCounter {
             fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Relaxed);
+                DROP_COUNT.fetch_add(1, SeqCst);
             }
         }
 
         let n = 100;
         for _ in 0..n {
-            let mut cache = Cache::new(2);
+            let mut cache = Cache::new(20);
             for i in 0..n {
-                cache.push(i, DropCounter {});
+                cache.insert(i, DropCounter {});
             }
         }
-        assert_eq!(DROP_COUNT.load(Relaxed), 2 * n * n);
+        assert_eq!(DROP_COUNT.load(SeqCst), 2 * n * n);
     }
 }
