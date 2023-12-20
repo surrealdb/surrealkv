@@ -1,6 +1,6 @@
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::vec;
+use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use bytes::Bytes;
 use hashbrown::HashMap;
@@ -26,6 +26,7 @@ use crate::storage::{
 };
 
 /// An MVCC-based transactional key-value store.
+#[derive(Clone)]
 pub struct Store {
     pub(crate) core: Arc<Core>,
 }
@@ -44,7 +45,7 @@ impl Store {
     /// It returns the transaction.
     pub fn begin(&self) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
-        txn.read_ts = self.core.oracle.read_ts();
+        txn.read_ts = self.core.read_ts()?;
         Ok(txn)
     }
 
@@ -53,7 +54,7 @@ impl Store {
     /// It returns the transaction.
     pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let mut txn = Transaction::new(self.core.clone(), mode)?;
-        txn.read_ts = self.core.oracle.read_ts();
+        txn.read_ts = self.core.read_ts()?;
         Ok(txn)
     }
 
@@ -109,6 +110,7 @@ pub struct Core {
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
     pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
+    is_closed: AtomicBool,
 }
 
 impl Core {
@@ -162,7 +164,16 @@ impl Core {
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
             value_cache,
+            is_closed: AtomicBool::new(false),
         })
+    }
+
+    fn read_ts(&self) -> Result<u64> {
+        if self.is_closed() {
+            return Err(Error::StoreClosed);
+        }
+
+        Ok(self.oracle.read_ts())
     }
 
     fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
@@ -276,7 +287,15 @@ impl Core {
         Ok(md)
     }
 
+    fn is_closed(&self) -> bool {
+        self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn close(&self) -> Result<()> {
+        if self.is_closed() {
+            return Ok(());
+        }
+
         // Wait for the oracle to catch up to the latest commit transaction.
         let oracle = self.oracle.clone();
         let last_commit_ts = oracle.read_ts();
@@ -289,6 +308,10 @@ impl Core {
 
         // Close the commit log
         self.clog.write().close()?;
+
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 }
@@ -398,5 +421,49 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.core.opts.clone();
         assert_eq!(store_opts, opts);
+    }
+
+    #[test]
+    fn clone_store() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Number of keys to generate
+        let num_keys = 100;
+
+        // Initialize a counter
+        let mut counter = 0u32;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for _ in 1..=num_keys {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Increment the counter
+            counter += 1;
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+        let store1 = store.clone();
+
+        // Write the keys to the store
+        for (_, key) in keys.iter().enumerate() {
+            // Start a new write transaction
+            let mut txn = store1.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().unwrap();
+        }
     }
 }

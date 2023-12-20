@@ -26,11 +26,8 @@ tempdir = "0.3"
 rand = "0.8.5"
 criterion = "0.5.1"
 jemallocator = "0.5.4"
+nanoid = "0.4.0"
 
 [[bench]]
 name = "store_bench"
-harness = false
-
-[[bench]]
-name = "s3fifo_bench"
 harness = false
