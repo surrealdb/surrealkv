@@ -7,24 +7,24 @@ use crate::storage::{
         error::{Error, Result},
         meta::Metadata,
     },
-    log::aof::log::AOL,
+    log::aof::log::Aol,
 };
 
 use super::entry::TxRecord;
 use super::util::calculate_crc32;
 
-/// `Reader` is a generic reader for reading data from an AOL. It is used
-/// by the `TxReader` to read data from the AOL source.
+/// `Reader` is a generic reader for reading data from an Aol. It is used
+/// by the `TxReader` to read data from the Aol source.
 ///
 /// # Fields
-/// * `r_at: AOL` - Represents the current position in the AOL source.
+/// * `r_at: Aol` - Represents the current position in the Aol source.
 /// * `buffer: Vec<u8>` - A buffer that temporarily holds data read from the source.
 /// * `read: usize` - The number of bytes read from the source.
 /// * `start: usize` - The starting position for reading data.
 /// * `eof: bool` - A flag indicating if the end of the file/data source has been reached.
 /// * `offset: u64` - The offset from the beginning of the file/data source.
 pub(crate) struct Reader {
-    r_at: AOL,
+    r_at: Aol,
     buffer: Vec<u8>,
     read: usize,
     start: usize,
@@ -37,10 +37,10 @@ impl Reader {
     ///
     /// # Arguments
     ///
-    /// * `r_at: AOL` - The current position in the data source.
+    /// * `r_at: Aol` - The current position in the data source.
     /// * `off: u64` - The offset from the beginning of the file/data source.
     /// * `size: usize` - The size of the buffer.
-    pub(crate) fn new_from(r_at: AOL, off: u64, size: usize) -> Result<Self> {
+    pub(crate) fn new_from(r_at: Aol, off: u64, size: usize) -> Result<Self> {
         Ok(Reader {
             r_at,
             buffer: vec![0; size],
@@ -289,7 +289,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset().unwrap();
@@ -307,7 +307,7 @@ mod tests {
 
         a.close().expect("should close aol");
 
-        let a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
         let mut r = Reader::new_from(a, 0, 200000).unwrap();
 
         let mut bs = vec![0; 4];

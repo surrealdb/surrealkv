@@ -45,7 +45,6 @@ where
     }
 }
 
-
 /// Cache is an implementation of "S3-FIFO" from "FIFO Queues are ALL You Need for Cache Eviction" by
 /// Juncheng Yang, et al: https://jasony.me/publication/sosp23-s3fifo.pdf
 pub struct Cache<K, V>
@@ -72,7 +71,6 @@ where
 {
     /// Creates a new cache with the given maximum size.
     pub fn new(max_cache_size: usize) -> Self {
-        assert!(max_cache_size > 0);
         let max_small_size = max_cache_size / 10;
         let max_main_size = max_cache_size - max_small_size;
 
@@ -185,17 +183,21 @@ mod tests {
     fn test_push_removes_oldest() {
         let mut cache = Cache::new(2);
 
-        cache.insert("apple", "red");
-        cache.insert("banana", "yellow");
-        cache.insert("orange", "orange");
-        cache.insert("pear", "green");
-        cache.insert("tomato", "red");
+        let fruits = vec![
+            ("apple", "red"),
+            ("banana", "yellow"),
+            ("orange", "orange"),
+            ("pear", "green"),
+            ("peach", "pink"),
+        ];
+
+        for (fruit, color) in fruits {
+            cache.insert(fruit, color);
+        }
 
         assert!(cache.get(&"apple").is_none());
-        // assert!(cache.get(&"banana").is_none());
-        // assert!(cache.get(&"orange").is_none());
         assert_opt_eq(cache.get(&"pear"), "green");
-        assert_opt_eq(cache.get(&"tomato"), "red");
+        assert_opt_eq(cache.get(&"peach"), "pink");
 
         // "apple" should been removed from the cache.
         cache.insert("apple", "red");

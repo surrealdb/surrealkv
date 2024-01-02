@@ -80,7 +80,7 @@ impl Metadata {
     }
 
     /// Serializes the metadata into a byte vector.
-    pub(crate) fn bytes(&self) -> Bytes {
+    pub(crate) fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
 
         for attr in &self.attributes {
@@ -140,13 +140,13 @@ mod tests {
 
         // Test serialization with 'deleted' attribute
         metadata.as_deleted(true).unwrap();
-        let bytes = metadata.bytes();
+        let bytes = metadata.to_bytes();
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes[0], Attribute::Deleted as u8);
 
         // Test serialization without 'deleted' attribute
         metadata.as_deleted(false).unwrap();
-        let bytes = metadata.bytes();
+        let bytes = metadata.to_bytes();
         assert!(bytes.is_empty());
     }
 
@@ -155,7 +155,7 @@ mod tests {
         let mut metadata = Metadata::new();
         metadata.as_deleted(true).unwrap();
 
-        let bytes = metadata.bytes();
+        let bytes = metadata.to_bytes();
         let deserialized_metadata = Metadata::from_bytes(bytes.as_ref()).unwrap();
 
         assert_eq!(

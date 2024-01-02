@@ -187,7 +187,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::vec::Vec;
 
-    use crate::storage::log::wal::log::WAL;
+    use crate::storage::log::wal::log::Wal;
     use crate::storage::log::{
         read_file_header, Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE,
     };
@@ -347,7 +347,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         let opts = Options::default().with_max_file_size(4096 * 10).with_wal();
-        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
 
         let record_size = 4;
 
@@ -437,7 +437,7 @@ mod tests {
 
         // Repair the corrupted segment
         let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), opts).expect("should create wal");
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create wal");
         a.repair(corrupted_segment_id, corrupted_offset_marker)
             .expect("should repair");
 

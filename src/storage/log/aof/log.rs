@@ -13,11 +13,11 @@ use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Se
 
 const RECORD_HEADER_SIZE: usize = 0;
 
-/// Append-Only Log (AOL) is a data structure used to sequentially store records
+/// Append-Only Log (Aol) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
 /// writing data in a sequential manner.
-pub struct AOL {
+pub struct Aol {
     /// The currently active segment where data is being written.
     active_segment: Segment<RECORD_HEADER_SIZE>,
 
@@ -40,7 +40,7 @@ pub struct AOL {
     segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
 }
 
-impl AOL {
+impl Aol {
     /// Opens or creates a new AOL instance associated with the specified directory and segment ID.
     ///
     /// This function prepares the AOL instance by creating the necessary directory,
@@ -239,15 +239,14 @@ impl AOL {
             self.active_segment.read_at(buf, read_offset)
         } else {
             let mut cache = self.segment_cache.write();
-            let reader = cache.get(&segment_id);
-            if reader.is_none() {
-                let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
-                let read_bytes = segment.read_at(buf, read_offset)?;
-                cache.push(segment_id, segment);
-                Ok(read_bytes)
-            } else {
-                let segment = reader.unwrap();
-                segment.read_at(buf, read_offset)
+            match cache.get(&segment_id) {
+                Some(segment) => segment.read_at(buf, read_offset),
+                None => {
+                    let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
+                    let read_bytes = segment.read_at(buf, read_offset)?;
+                    cache.push(segment_id, segment);
+                    Ok(read_bytes)
+                }
             }
         }
     }
@@ -272,7 +271,7 @@ impl AOL {
     }
 }
 
-impl Drop for AOL {
+impl Drop for Aol {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -295,7 +294,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = AOL::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset().unwrap();

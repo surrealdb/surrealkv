@@ -211,7 +211,7 @@ impl TxHeader {
     pub(crate) fn encode(&self, buf: &mut BytesMut) {
         let (md_len, md_bytes) = match &self.metadata {
             Some(metadata) => {
-                let md_bytes = metadata.bytes();
+                let md_bytes = metadata.to_bytes();
                 let md_len = md_bytes.len() as u16;
                 (md_len, md_bytes)
             }
@@ -256,7 +256,7 @@ impl TxEntry {
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // Encode metadata, if present
         if let Some(metadata) = &self.metadata {
-            let md_bytes = metadata.bytes();
+            let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
             buf.put_u16(md_len);
             buf.put(md_bytes);
@@ -360,7 +360,7 @@ impl ValueRef {
         }
 
         if let Some(metadata) = &metadata {
-            let md_bytes = metadata.bytes();
+            let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
             buf.put_u16(md_len);
             buf.put(md_bytes);
@@ -379,7 +379,7 @@ impl ValueRef {
         buf.put(value.as_ref());
 
         if let Some(metadata) = &metadata {
-            let md_bytes = metadata.bytes();
+            let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
             buf.put_u16(md_len);
             buf.put(md_bytes);

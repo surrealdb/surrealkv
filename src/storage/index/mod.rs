@@ -7,6 +7,7 @@ pub mod snapshot;
 use std::cmp::{Ord, Ordering, PartialOrd};
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
+use std::str::FromStr;
 
 // "Partial" in the Adaptive Radix Tree paper refers to "partial keys", a technique employed
 // for prefix compression in this data structure. Instead of storing entire keys in the nodes,
@@ -74,7 +75,7 @@ impl<const SIZE: usize> Ord for FixedKey<SIZE> {
 impl<const SIZE: usize> FixedKey<SIZE> {
     // Create new instance with data ending in zero byte
     pub fn create_key(src: &[u8]) -> Self {
-        assert!(src.len() < SIZE);
+        debug_assert!(src.len() < SIZE);
         let mut content = [0; SIZE];
         content[..src.len()].copy_from_slice(src);
         content[src.len()] = 0;
@@ -86,32 +87,12 @@ impl<const SIZE: usize> FixedKey<SIZE> {
 
     // Create new instance from slice
     pub fn from_slice(src: &[u8]) -> Self {
-        assert!(src.len() <= SIZE);
+        debug_assert!(src.len() <= SIZE);
         let mut content = [0; SIZE];
         content[..src.len()].copy_from_slice(src);
         Self {
             content,
             len: src.len(),
-        }
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        assert!(s.len() < SIZE, "data length is greater than array length");
-        let mut arr = [0; SIZE];
-        arr[..s.len()].copy_from_slice(s.as_bytes());
-        Self {
-            content: arr,
-            len: s.len() + 1,
-        }
-    }
-
-    pub fn from_string(s: &String) -> Self {
-        assert!(s.len() < SIZE, "data length is greater than array length");
-        let mut arr = [0; SIZE];
-        arr[..s.len()].copy_from_slice(s.as_bytes());
-        Self {
-            content: arr,
-            len: s.len() + 1,
         }
     }
 }
@@ -180,23 +161,6 @@ impl<const N: usize> From<u64> for FixedKey<N> {
     }
 }
 
-impl<const N: usize> From<&str> for FixedKey<N> {
-    fn from(data: &str) -> Self {
-        Self::from_str(data)
-    }
-}
-
-impl<const N: usize> From<String> for FixedKey<N> {
-    fn from(data: String) -> Self {
-        Self::from_string(&data)
-    }
-}
-impl<const N: usize> From<&String> for FixedKey<N> {
-    fn from(data: &String) -> Self {
-        Self::from_string(data)
-    }
-}
-
 // A VariableKey is a variable-length datatype with NULL byte appended to it.
 #[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug)]
 pub struct VariableKey {
@@ -235,13 +199,6 @@ impl VariableKey {
         Self { data }
     }
 
-    pub fn from_str(s: &str) -> Self {
-        let mut data = Vec::with_capacity(s.len() + 1);
-        data.extend_from_slice(s.as_bytes());
-        data.push(0);
-        Self { data }
-    }
-
     pub fn from(data: Vec<u8>) -> Self {
         Self { data }
     }
@@ -251,6 +208,21 @@ impl VariableKey {
         data.extend_from_slice(src);
         data.push(0);
         Self { data }
+    }
+}
+
+impl FromStr for VariableKey {
+    type Err = ();
+
+    // fn from_str(s: &str) -> Result<Self, Self::Err> {
+    //     Ok(Self::from_string(&String::from(s)))
+    // }
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut data = Vec::with_capacity(s.len() + 1);
+        data.extend_from_slice(s.as_bytes());
+        data.push(0);
+        Ok(Self { data })
     }
 }
 

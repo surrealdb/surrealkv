@@ -293,15 +293,6 @@ impl Transaction {
         Ok(results)
     }
 
-    // precommit the transaction to WAL
-    pub fn precommit(&mut self) -> Result<()> {
-        if self.store.opts.wal_disabled {
-            return Ok(());
-        }
-
-        todo!();
-    }
-
     /// Commits the transaction, by writing all pending entries to the store.
     pub fn commit(&mut self) -> Result<()> {
         // If the transaction is closed, return an error.
@@ -386,7 +377,7 @@ impl Transaction {
 
     /// Builds key-value pairs from the write set.
     fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VariableKey, Bytes>> {
-        let mut kv_pairs: Vec<KV<VariableKey, Bytes>> = Vec::new();
+        let mut kv_pairs = Vec::new();
 
         for (_, entry) in self.write_set.iter() {
             let index_value = self.build_index_value(entry);

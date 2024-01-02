@@ -169,6 +169,7 @@ mod tests {
     use crate::storage::index::art::Tree;
     use crate::storage::index::iter::IterationPointer;
     use crate::storage::index::VariableKey;
+    use std::str::FromStr;
 
     #[test]
     fn snapshot_creation() {
@@ -176,13 +177,15 @@ mod tests {
         let keys = ["key_1", "key_2", "key_3"];
 
         for key in keys.iter() {
-            assert!(tree.insert(&VariableKey::from_str(key), 1, 0, 0).is_ok());
+            assert!(tree
+                .insert(&VariableKey::from_str(key).unwrap(), 1, 0, 0)
+                .is_ok());
         }
 
         let mut snap1 = tree.create_snapshot().unwrap();
         let key_to_insert = "key_1";
         assert!(snap1
-            .insert(&VariableKey::from_str(key_to_insert), 1, 0)
+            .insert(&VariableKey::from_str(key_to_insert).unwrap(), 1, 0)
             .is_ok());
 
         let expected_snap_ts = keys.len() as u64 + 1;
@@ -196,10 +199,10 @@ mod tests {
     #[test]
     fn snapshot_isolation() {
         let mut tree: Tree<VariableKey, i32> = Tree::<VariableKey, i32>::new();
-        let key_1 = VariableKey::from_str("key_1");
-        let key_2 = VariableKey::from_str("key_2");
-        let key_3_snap1 = VariableKey::from_str("key_3_snap1");
-        let key_3_snap2 = VariableKey::from_str("key_3_snap2");
+        let key_1 = VariableKey::from_str("key_1").unwrap();
+        let key_2 = VariableKey::from_str("key_2").unwrap();
+        let key_3_snap1 = VariableKey::from_str("key_3_snap1").unwrap();
+        let key_3_snap2 = VariableKey::from_str("key_3_snap2").unwrap();
 
         assert!(tree.insert(&key_1, 1, 0, 0).is_ok());
 
@@ -242,10 +245,10 @@ mod tests {
     #[test]
     fn snapshot_readers() {
         let mut tree: Tree<VariableKey, i32> = Tree::<VariableKey, i32>::new();
-        let key_1 = VariableKey::from_str("key_1");
-        let key_2 = VariableKey::from_str("key_2");
-        let key_3 = VariableKey::from_str("key_3");
-        let key_4 = VariableKey::from_str("key_4");
+        let key_1 = VariableKey::from_str("key_1").unwrap();
+        let key_2 = VariableKey::from_str("key_2").unwrap();
+        let key_3 = VariableKey::from_str("key_3").unwrap();
+        let key_4 = VariableKey::from_str("key_4").unwrap();
 
         assert!(tree.insert(&key_1, 1, 0, 0).is_ok());
         assert!(tree.insert(&key_2, 1, 0, 0).is_ok());

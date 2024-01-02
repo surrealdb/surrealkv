@@ -41,7 +41,7 @@ impl<P: KeyTrait, V: Clone> IterationPointer<P, V> {
     where
         R: RangeBounds<P> + 'a,
     {
-        return Range::new(Some(&self.root), range);
+        Range::new(Some(&self.root), range)
     }
 }
 

@@ -12,10 +12,10 @@ use crate::storage::log::{
     WAL_RECORD_HEADER_SIZE,
 };
 
-/// Write-Ahead Log (WAL) is a data structure used to sequentially store records
+/// Write-Ahead Log (Wal) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like write-ahead logging.
-pub struct WAL {
+pub struct Wal {
     /// The currently active segment where data is being written.
     active_segment: Segment<WAL_RECORD_HEADER_SIZE>,
 
@@ -35,7 +35,7 @@ pub struct WAL {
     mutex: RwLock<()>, // TODO: Lock only the active segment
 }
 
-impl WAL {
+impl Wal {
     /// Opens or creates a new WAL instance associated with the specified directory and segment ID.
     ///
     /// This function prepares the WAL instance by creating the necessary directory,
@@ -332,7 +332,7 @@ impl WAL {
     }
 }
 
-impl Drop for WAL {
+impl Drop for Wal {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -357,7 +357,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -441,7 +441,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = WAL::open(temp_dir.path(), opts).expect("should create aol");
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
@@ -453,7 +453,7 @@ mod tests {
 
         // Reopen the wal
         let opts = Options::default();
-        let mut a = WAL::open(temp_dir.path(), opts).expect("should open aol");
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should open aol");
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);

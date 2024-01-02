@@ -8,7 +8,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 
 use crate::storage::{
-    index::{art::KV, VariableKey},
+    index::art::KV,
     kv::{
         entry::{TxRecord, ValueRef},
         error::{Error, Result},
@@ -19,8 +19,7 @@ use crate::storage::{
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::AOL,
-        wal::log::WAL,
+        aof::log::Aol,
         {write_field, Options as LogOptions, BLOCK_SIZE}, {Error as LogError, Metadata},
     },
 };
@@ -97,12 +96,10 @@ pub struct Core {
     pub(crate) indexer: RwLock<Indexer>,
     /// Options for store.
     pub(crate) opts: Options,
-    /// Write-ahead log for store.
-    pub(crate) wal: Arc<Option<WAL>>,
     /// Commit log for store.
-    pub(crate) clog: Arc<RwLock<AOL>>,
+    pub(crate) clog: Arc<RwLock<Aol>>,
     /// Manifest for store to track Store state.
-    pub(crate) manifest: AOL,
+    pub(crate) manifest: Aol,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Value cache for store.
@@ -127,7 +124,7 @@ impl Core {
         // Determine options for the manifest file and open or create it.
         let manifest_subdir = opts.dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        let mut manifest = AOL::open(&manifest_subdir, &mopts)?;
+        let mut manifest = Aol::open(&manifest_subdir, &mopts)?;
 
         // Load or create metadata from the manifest file.
         let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest)?;
@@ -140,7 +137,7 @@ impl Core {
         let copts = LogOptions::default()
             .with_max_file_size(opts.max_segment_size)
             .with_file_extension("clog".to_string());
-        let clog = AOL::open(&clog_subdir, &copts)?;
+        let clog = Aol::open(&clog_subdir, &copts)?;
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
@@ -160,7 +157,6 @@ impl Core {
             indexer: RwLock::new(indexer),
             opts,
             manifest,
-            wal: Arc::new(None),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
             value_cache,
@@ -178,7 +174,7 @@ impl Core {
 
     fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
         let clog_subdir = opts.dir.join("clog");
-        let clog = AOL::open(&clog_subdir, copts)?;
+        let clog = Aol::open(&clog_subdir, copts)?;
         let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
         let mut tx = TxRecord::new(opts.max_tx_entries);
@@ -190,16 +186,17 @@ impl Core {
             tx.reset();
 
             // Read the next transaction record from the log.
-            let res = tx_reader.read_into(&mut tx);
-            if let Err(e) = res {
-                if let Error::LogError(LogError::EOF) = e {
-                    break;
-                } else {
-                    return Err(e);
+            let value_offsets = match tx_reader.read_into(&mut tx) {
+                Ok(value_offsets) => value_offsets,
+                Err(e) => {
+                    if let Error::LogError(LogError::EOF) = e {
+                        break;
+                    } else {
+                        return Err(e);
+                    }
                 }
-            }
+            };
 
-            let value_offsets = res.unwrap();
             Core::process_entries(&tx, opts, &value_offsets, indexer)?;
         }
 
@@ -212,7 +209,7 @@ impl Core {
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<VariableKey, Bytes>> = Vec::new();
+        let mut kv_pairs = Vec::new();
 
         for entry in &tx.entries {
             let index_value = ValueRef::encode(
@@ -237,7 +234,7 @@ impl Core {
     fn load_or_create_metadata(
         opts: &Options,
         mopts: &LogOptions,
-        manifest: &mut AOL,
+        manifest: &mut Aol,
     ) -> Result<Metadata> {
         let current_metadata = opts.to_metadata();
         let existing_metadata = if !manifest.size()? > 0 {
@@ -249,7 +246,7 @@ impl Core {
         match existing_metadata {
             Some(existing) if existing == current_metadata => Ok(current_metadata),
             _ => {
-                let md_bytes = current_metadata.bytes();
+                let md_bytes = current_metadata.to_bytes();
                 let mut buf = Vec::new();
                 write_field(&md_bytes, &mut buf)?;
                 manifest.append(&buf)?;
@@ -261,7 +258,7 @@ impl Core {
 
     fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
         let manifest_subdir = opts.dir.join("manifest");
-        let mlog = AOL::open(&manifest_subdir, mopts)?;
+        let mlog = Aol::open(&manifest_subdir, mopts)?;
         let mut reader = Reader::new_from(mlog, 0, BLOCK_SIZE)?;
 
         let mut md: Option<Metadata> = None; // Initialize with None
@@ -300,8 +297,6 @@ impl Core {
         let oracle = self.oracle.clone();
         let last_commit_ts = oracle.read_ts();
         oracle.wait_for(last_commit_ts);
-
-        // TODO: close the wal
 
         // Close the indexer
         self.indexer.write().close()?;
