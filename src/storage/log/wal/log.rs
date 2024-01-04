@@ -3,18 +3,21 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
 
-use crate::storage::wal::reader::{MultiSegmentReader, Reader};
-use crate::storage::WAL_RECORD_HEADER_SIZE;
-use crate::storage::{get_segment_range, Options, Segment, SegmentRef};
+use parking_lot::RwLock;
 
-/// Write-Ahead Log (WAL) is a data structure used to sequentially store records
+use crate::storage::log::wal::reader::Reader;
+use crate::storage::log::{
+    get_segment_range, Error, IOError, MultiSegmentReader, Options, Result, Segment, SegmentRef,
+    WAL_RECORD_HEADER_SIZE,
+};
+
+/// Write-Ahead Log (Wal) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like write-ahead logging.
-pub struct WAL {
+pub struct Wal {
     /// The currently active segment where data is being written.
-    active_segment: Segment,
+    active_segment: Segment<WAL_RECORD_HEADER_SIZE>,
 
     /// The ID of the currently active segment.
     active_segment_id: u64,
@@ -32,7 +35,7 @@ pub struct WAL {
     mutex: RwLock<()>, // TODO: Lock only the active segment
 }
 
-impl WAL {
+impl Wal {
     /// Opens or creates a new WAL instance associated with the specified directory and segment ID.
     ///
     /// This function prepares the WAL instance by creating the necessary directory,
@@ -42,31 +45,34 @@ impl WAL {
     ///
     /// - `dir`: The directory where segment files are located.
     /// - `opts`: Configuration options for the WAL instance.
-    pub fn open(dir: &Path, opts: &Options) -> io::Result<Self> {
+    pub fn open(dir: &Path, opts: Options) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
+        // Ensure the WAL option is enabled
+        let opts = opts.with_wal();
+
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(dir, opts)?;
+        Self::prepare_directory(dir, &opts)?;
 
         // Determine the active segment ID
         let active_segment_id = Self::calculate_active_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts)?;
+        let active_segment = Segment::open(dir, active_segment_id, &opts)?;
 
         Ok(Self {
             active_segment,
             active_segment_id,
             dir: dir.to_path_buf(),
-            opts: opts.clone(),
+            opts,
             closed: false,
             mutex: RwLock::new(()),
         })
     }
 
     // Helper function to prepare the directory with proper permissions
-    fn prepare_directory(dir: &Path, opts: &Options) -> io::Result<()> {
+    fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
         fs::create_dir_all(dir)?;
 
         if let Ok(metadata) = fs::metadata(dir) {
@@ -79,7 +85,7 @@ impl WAL {
     }
 
     // Helper function to calculate the active segment ID
-    fn calculate_active_segment_id(dir: &Path) -> io::Result<u64> {
+    fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
         Ok(if last > 0 { last + 1 } else { 0 })
     }
@@ -104,20 +110,25 @@ impl WAL {
     ///
     /// This function may return an error if the active segment is closed, the provided record
     /// is empty, or any I/O error occurs during the appending process.
-    pub fn append(&mut self, rec: &[u8]) -> io::Result<(u64, usize)> {
+    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
         if self.closed {
-            return Err(io::Error::new(io::ErrorKind::Other, "Segment is closed"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Segment is closed",
+            )));
         }
 
         if rec.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "buf is empty"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "buf is empty",
+            )));
         }
 
-        let _lock = self.mutex.write().unwrap();
+        let _lock = self.mutex.write();
 
         // Get options and initialize variables
         let opts = &self.opts;
-        let mut offset = 0;
 
         // Calculate available space in the active segment
         let available = opts.max_file_size - self.active_segment.offset();
@@ -140,7 +151,7 @@ impl WAL {
         }
 
         let (off, _) = self.active_segment.append(rec)?;
-        offset = off + self.calculate_offset();
+        let offset = off + self.calculate_offset();
 
         Ok((offset, rec.len() + WAL_RECORD_HEADER_SIZE))
     }
@@ -168,9 +179,12 @@ impl WAL {
     ///
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
-    pub fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
         if buf.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Buffer is empty"));
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Buffer is empty",
+            )));
         }
 
         let mut r = 0;
@@ -192,30 +206,31 @@ impl WAL {
         buf: &mut [u8],
         segment_id: u64,
         read_offset: u64,
-    ) -> io::Result<usize> {
+    ) -> Result<usize> {
         if segment_id == self.active_segment_id {
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
+            let segment: Segment<WAL_RECORD_HEADER_SIZE> =
+                Segment::open(&self.dir, segment_id, &self.opts)?;
             segment.read_at(buf, read_offset)
         }
     }
 
-    pub fn close(&mut self) -> io::Result<()> {
-        let _lock = self.mutex.write().unwrap();
+    pub fn close(&mut self) -> Result<()> {
+        let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
     }
 
-    pub fn sync(&mut self) -> io::Result<()> {
-        let _lock = self.mutex.write().unwrap();
+    pub fn sync(&mut self) -> Result<()> {
+        let _lock = self.mutex.write();
         self.active_segment.sync()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> u64 {
-        let _lock = self.mutex.read().unwrap();
+        let _lock = self.mutex.read();
         self.active_segment.offset()
     }
 
@@ -229,12 +244,12 @@ impl WAL {
     ///
     /// # Returns
     ///
-    /// Returns an `io::Result` indicating the success of the repair operation.
+    /// Returns an `Result` indicating the success of the repair operation.
     pub fn repair(
         &mut self,
         corrupted_segment_id: u64,
         corrupted_offset_marker: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         // Read the list of segments from the directory
         let segs = SegmentRef::read_segments_from_directory(&self.dir)?;
 
@@ -261,10 +276,10 @@ impl WAL {
 
         // If information about the corrupted segment is not available, return an error
         if corrupted_segment_info.is_none() {
-            return Err(io::Error::new(
+            return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Corrupted segment not found",
-            ));
+            )));
         }
 
         // Retrieve the information about the corrupted segment
@@ -317,7 +332,7 @@ impl WAL {
     }
 }
 
-impl Drop for WAL {
+impl Drop for Wal {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -326,7 +341,7 @@ impl Drop for WAL {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::WAL_RECORD_HEADER_SIZE;
+    use crate::storage::log::{BLOCK_SIZE, WAL_RECORD_HEADER_SIZE};
 
     use super::*;
     use tempdir::TempDir;
@@ -336,13 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn test_append() {
+    fn append() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Options::default();
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test initial offset
         let sz = a.offset();
@@ -371,7 +386,7 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing
-        assert_eq!(a.offset(), 4096);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64);
 
         // Test reading from segment
         let mut bs = vec![0; 11];
@@ -390,7 +405,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = a.read_at(&mut bs, 4097);
+        let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
@@ -399,12 +414,12 @@ mod tests {
         assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4096 + 7 + 4 = 4107
-        assert_eq!(a.offset(), 4107);
+        // BLOCK_SIZE + 7 + 4 = 4107
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 11];
-        let n = a.read_at(&mut bs, 4096).expect("should read");
+        let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
         assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
@@ -413,20 +428,20 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing again
-        assert_eq!(a.offset(), 4096 * 2);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 * 2);
 
         // Test closing wal
         assert!(a.close().is_ok());
     }
 
     #[test]
-    fn test_wal_reopen() {
+    fn wal_reopen() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default().with_wal();
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Options::default();
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
@@ -437,7 +452,8 @@ mod tests {
         assert!(a.close().is_ok());
 
         // Reopen the wal
-        let mut a = WAL::open(temp_dir.path(), &opts).expect("should open aol");
+        let opts = Options::default();
+        let mut a = Wal::open(temp_dir.path(), opts).expect("should open aol");
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
@@ -446,7 +462,7 @@ mod tests {
 
         // Validate offset after appending
         // 4096 + 7 + 7 = 4110
-        assert_eq!(a.offset(), 4110);
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 7);
 
         // Test reading from segment
         let mut bs = vec![0; 11];
@@ -456,7 +472,7 @@ mod tests {
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 14];
-        let n = a.read_at(&mut bs, 4096).expect("should read");
+        let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
         assert_eq!(14, n);
         assert_eq!(
             &[4, 5, 6, 7, 8, 9, 10].to_vec(),
@@ -465,7 +481,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = a.read_at(&mut bs, 4097);
+        let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
@@ -474,12 +490,14 @@ mod tests {
         assert_eq!(11, r.unwrap().1);
 
         // Validate offset after appending
-        // 4110 + 7 + 4 = 4121
-        assert_eq!(a.offset(), 4121);
+        // BLOCK_SZIE + 14 + 7 + 4 = 4121
+        assert_eq!(a.offset(), BLOCK_SIZE as u64 + 14 + 7 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 11];
-        let n = a.read_at(&mut bs, 4110).expect("should read");
+        let n = a
+            .read_at(&mut bs, BLOCK_SIZE as u64 + 14)
+            .expect("should read");
         assert_eq!(11, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
