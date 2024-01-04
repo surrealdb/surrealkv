@@ -1324,4 +1324,18 @@ mod tests {
         g2_item_tests(false);
         g2_item_tests(true);
     }
+
+    fn require_send<T: Send>(_: T) {}
+    fn require_sync<T: Sync + Send>(_: T) {}
+
+    #[test]
+    fn is_send_sync() {
+        let (db, _) = create_store(false);
+
+        let txn = db.begin().unwrap();
+        require_send(txn);
+
+        let txn = db.begin().unwrap();
+        require_sync(txn);
+    }
 }

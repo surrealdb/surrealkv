@@ -1,5 +1,6 @@
 //! This module defines the Snapshot struct for managing snapshots within a Trie structure.
-use std::cell::Cell;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use hashbrown::HashSet;
@@ -15,7 +16,7 @@ pub struct Snapshot<P: KeyTrait, V: Clone> {
     pub(crate) ts: u64,
     pub(crate) root: Option<Arc<Node<P, V>>>,
     pub(crate) readers: HashSet<u64>,
-    pub(crate) max_active_readers: Cell<u64>,
+    pub(crate) max_active_readers: AtomicU64,
     pub(crate) closed: bool,
 }
 
@@ -27,7 +28,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
             ts,
             root,
             readers: HashSet::new(),
-            max_active_readers: Cell::new(0),
+            max_active_readers: AtomicU64::new(0),
             closed: false,
         }
     }
@@ -95,10 +96,9 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         // Check if there are any active readers for the snapshot
-        if self.max_active_readers.get() > 0 {
+        if self.max_active_readers.load(Ordering::SeqCst) > 0 {
             return Err(TrieError::SnapshotReadersNotClosed);
         }
-
         // Mark the snapshot as closed
         self.closed = true;
 
@@ -113,8 +113,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
             return Err(TrieError::SnapshotEmpty);
         }
 
-        let reader_id = self.max_active_readers.get() + 1;
-        self.max_active_readers.set(reader_id);
+        let reader_id = self.max_active_readers.fetch_add(1, Ordering::SeqCst) + 1;
         self.readers.insert(reader_id);
         Ok(IterationPointer::new(
             self.root.as_ref().unwrap().clone(),
@@ -126,7 +125,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         // Check if the snapshot is already closed
         self.is_closed()?;
 
-        Ok(self.max_active_readers.get())
+        Ok(self.max_active_readers.load(Ordering::SeqCst))
     }
 
     pub fn close_reader(&mut self, reader_id: u64) -> Result<(), TrieError> {
@@ -134,8 +133,7 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
         self.is_closed()?;
 
         self.readers.remove(&reader_id);
-        let readers = self.max_active_readers.get();
-        self.max_active_readers.set(readers - 1);
+        let _readers = self.max_active_readers.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
 
