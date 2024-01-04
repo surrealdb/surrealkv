@@ -177,7 +177,7 @@ impl Core {
         let clog = Aol::open(&clog_subdir, copts)?;
         let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
         let mut tx_reader = TxReader::new(reader)?;
-        let mut tx = TxRecord::new(opts.max_tx_entries);
+        let mut tx = TxRecord::new(opts.max_tx_entries as usize);
 
         loop {
             // Reset the transaction record before reading into it.
@@ -189,7 +189,7 @@ impl Core {
             let value_offsets = match tx_reader.read_into(&mut tx) {
                 Ok(value_offsets) => value_offsets,
                 Err(e) => {
-                    if let Error::LogError(LogError::EOF) = e {
+                    if let Error::LogError(LogError::EOF(_)) = e {
                         break;
                     } else {
                         return Err(e);
@@ -268,7 +268,7 @@ impl Core {
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::LogError(LogError::EOF) = e {
+                if let Error::LogError(LogError::EOF(_)) = e {
                     break;
                 } else {
                     return Err(e);

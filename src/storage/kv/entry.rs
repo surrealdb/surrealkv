@@ -184,7 +184,7 @@ pub(crate) struct TxHeader {
     pub(crate) lsn: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
-    pub(crate) num_entries: u16,
+    pub(crate) num_entries: u32,
     pub(crate) metadata: Option<Metadata>,
 }
 
@@ -218,12 +218,12 @@ impl TxHeader {
             None => (0, Bytes::new()),
         };
 
-        // tx_id(8) + lsn(8) + ts(8) + version(2) + num_entries(2) + meta_data_len(2) + metadata
+        // tx_id(8) + lsn(8) + ts(8) + version(2) + num_entries(4) + meta_data_len(2) + metadata
         buf.put_u64(self.id);
         buf.put_u64(self.lsn);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
-        buf.put_u16(self.num_entries);
+        buf.put_u32(self.num_entries);
         buf.put_u16(md_len);
         if md_len > 0 {
             buf.put(md_bytes);

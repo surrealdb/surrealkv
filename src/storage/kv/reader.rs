@@ -170,7 +170,7 @@ impl TxReader {
         tx.header.lsn = self.r.read_uint64()?;
         tx.header.ts = self.r.read_uint64()?;
         tx.header.version = self.r.read_uint16()?;
-        tx.header.num_entries = self.r.read_uint16()?;
+        tx.header.num_entries = self.r.read_uint32()?;
 
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_TX_METADATA_SIZE {

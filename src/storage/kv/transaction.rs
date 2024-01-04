@@ -203,6 +203,10 @@ impl Transaction {
             return Err(Error::MaxValueLengthExceeded);
         }
 
+        if self.write_set.len() as u32 >= self.store.opts.max_tx_entries {
+            return Err(Error::MaxTransactionEntriesLimitExceeded);
+        }
+
         // If the transaction mode is not write-only, update the snapshot.
         if !self.mode.is_write_only() {
             // Convert the value to Bytes.
@@ -424,6 +428,7 @@ impl Drop for Transaction {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::mem::size_of;
 
     use super::*;
     use crate::storage::kv::option::{IsolationLevel, Options};
@@ -1337,5 +1342,115 @@ mod tests {
 
         let txn = db.begin().unwrap();
         require_sync(txn);
+    }
+
+    #[test]
+    fn max_transaction_entries_limit_exceeded() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_tx_entries = 5;
+
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        let num_keys = 6;
+        let mut counter = 0u32;
+        let mut keys = Vec::new();
+
+        for _ in 1..=num_keys {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Increment the counter
+            counter += 1;
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Writing the 6th key should fail
+        let mut txn = store.begin().unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            // Start a new write transaction
+            if i < 5 {
+                assert!(txn.set(key, &default_value).is_ok());
+            } else {
+                assert!(txn.set(key, &default_value).is_err());
+            }
+        }
+    }
+
+    const ENTRIES: usize = 4_000_00;
+    const KEY_SIZE: usize = 24;
+    const VALUE_SIZE: usize = 150;
+    const RNG_SEED: u64 = 3;
+
+    fn fill_slice(slice: &mut [u8], rng: &mut fastrand::Rng) {
+        let mut i = 0;
+        while i + size_of::<u128>() < slice.len() {
+            let tmp = rng.u128(..);
+            slice[i..(i + size_of::<u128>())].copy_from_slice(&tmp.to_le_bytes());
+            i += size_of::<u128>()
+        }
+        if i + size_of::<u64>() < slice.len() {
+            let tmp = rng.u64(..);
+            slice[i..(i + size_of::<u64>())].copy_from_slice(&tmp.to_le_bytes());
+            i += size_of::<u64>()
+        }
+        if i + size_of::<u32>() < slice.len() {
+            let tmp = rng.u32(..);
+            slice[i..(i + size_of::<u32>())].copy_from_slice(&tmp.to_le_bytes());
+            i += size_of::<u32>()
+        }
+        if i + size_of::<u16>() < slice.len() {
+            let tmp = rng.u16(..);
+            slice[i..(i + size_of::<u16>())].copy_from_slice(&tmp.to_le_bytes());
+            i += size_of::<u16>()
+        }
+        if i + size_of::<u8>() < slice.len() {
+            slice[i] = rng.u8(..);
+        }
+    }
+
+    fn gen_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
+        let mut key = [0u8; KEY_SIZE];
+        fill_slice(&mut key, rng);
+        let mut value = vec![0u8; VALUE_SIZE];
+        fill_slice(&mut value, rng);
+
+        (key, value)
+    }
+
+    fn make_rng() -> fastrand::Rng {
+        fastrand::Rng::with_seed(RNG_SEED)
+    }
+
+    #[test]
+    fn insert_large_txn_and_get() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let mut rng = make_rng();
+
+        let mut txn = store.begin().unwrap();
+        for _ in 0..ENTRIES {
+            let (key, value) = gen_pair(&mut rng);
+            txn.set(&key, &value).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(txn);
+
+        // Read the keys from the store
+        let mut rng = make_rng();
+        let txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
+        for i in 0..ENTRIES {
+            let (key, _) = gen_pair(&mut rng);
+            txn.get(&key).unwrap();
+        }
     }
 }

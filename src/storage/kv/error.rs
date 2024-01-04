@@ -9,28 +9,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// It includes various variants to represent different types of errors that can occur.
 #[derive(Debug)]
 pub enum Error {
-    Abort,                      // The operation was aborted
-    IoError(Arc<io::Error>),    // An I/O error occurred
-    LogError(LogError),         // An error occurred in the log
-    EmptyKey,                   // The key is empty
-    TransactionClosed,          // The transaction was closed
-    NonExpirable,               // The entry cannot be expired
-    CorruptedMetadata,          // The metadata is corrupted
-    TransactionReadOnly,        // The transaction is read-only
-    IndexError(TrieError),      // An error occurred in the index
-    MaxKeyLengthExceeded,       // The maximum key length was exceeded
-    MaxValueLengthExceeded,     // The maximum value length was exceeded
-    KeyNotFound,                // The key was not found
-    CorruptedIndex,             // The index is corrupted
-    TransactionReadConflict,    // A read conflict occurred in the transaction
-    StoreClosed,                // The store was closed
-    InvalidAttributeData,       // The attribute data is invalid
-    UnknownAttributeType,       // The attribute type is unknown
-    CorruptedTransactionRecord, // The transaction record is corrupted
-    CorruptedTransactionHeader, // The transaction header is corrupted
-    InvalidTransactionRecordId, // The transaction record ID is invalid
-    EmptyValue,                 // The value in the record is empty
-    ManifestNotFound,           // The manifest was not found
+    Abort,                              // The operation was aborted
+    IoError(Arc<io::Error>),            // An I/O error occurred
+    LogError(LogError),                 // An error occurred in the log
+    EmptyKey,                           // The key is empty
+    TransactionClosed,                  // The transaction was closed
+    NonExpirable,                       // The entry cannot be expired
+    CorruptedMetadata,                  // The metadata is corrupted
+    TransactionReadOnly,                // The transaction is read-only
+    IndexError(TrieError),              // An error occurred in the index
+    MaxKeyLengthExceeded,               // The maximum key length was exceeded
+    MaxValueLengthExceeded,             // The maximum value length was exceeded
+    KeyNotFound,                        // The key was not found
+    CorruptedIndex,                     // The index is corrupted
+    TransactionReadConflict,            // A read conflict occurred in the transaction
+    StoreClosed,                        // The store was closed
+    InvalidAttributeData,               // The attribute data is invalid
+    UnknownAttributeType,               // The attribute type is unknown
+    CorruptedTransactionRecord,         // The transaction record is corrupted
+    CorruptedTransactionHeader,         // The transaction header is corrupted
+    InvalidTransactionRecordId,         // The transaction record ID is invalid
+    EmptyValue,                         // The value in the record is empty
+    ManifestNotFound,                   // The manifest was not found
+    MaxTransactionEntriesLimitExceeded, // The maximum number of entries in a transaction was exceeded
 }
 
 /// Error structure for encoding errors
@@ -87,6 +88,9 @@ impl fmt::Display for Error {
             Error::InvalidTransactionRecordId => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
             Error::ManifestNotFound => write!(f, "Manifest not found"),
+            Error::MaxTransactionEntriesLimitExceeded => {
+                write!(f, "Max transaction entries limit exceeded")
+            }
         }
     }
 }

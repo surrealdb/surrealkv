@@ -904,6 +904,9 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The current offset within the file.
     file_offset: u64,
 
+    /// The maximum size of the segment file.
+    pub(crate) file_size: u64,
+
     /// A flag indicating whether the segment is closed or not.
     closed: bool,
 
@@ -962,6 +965,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             closed: false,
             block: Block::new(),
             is_wal: opts.is_wal,
+            file_size: opts.max_file_size,
         })
     }
 
@@ -994,7 +998,16 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         }
 
         if self.block.written > 0 {
-            self.flush_block(true)?;
+            // Flush the full block to disk if it is a WAL with zero padded
+            // to the end of the last block. This is done to avoid writing
+            // partial records to the WAL, and for detecting corruption.
+            //
+            // Else flush the block as it is without zero padding.
+            if self.is_wal {
+                self.flush_block(true)?;
+            } else {
+                self.flush_block(false)?;
+            }
         }
 
         self.file.sync_all()?;
@@ -1188,7 +1201,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             if remaining == pending {
                 return Ok(n);
             } else {
-                return Err(Error::EOF);
+                return Err(Error::EOF(n));
             }
         }
 
@@ -1212,7 +1225,7 @@ pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
     EmptyBuffer,
-    EOF,
+    EOF(usize),
     IO(IOError),
     PoisonError(String),
 }
@@ -1225,7 +1238,7 @@ impl fmt::Display for Error {
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
             Error::IO(err) => write!(f, "IO error: {}", err),
-            Error::EOF => write!(f, "EOF error"),
+            Error::EOF(n) => write!(f, "EOF error after reading {} bytes", n),
             Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
         }
     }
@@ -1733,7 +1746,7 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64);
+        assert_eq!(segment.offset(), 11);
 
         // Test reading from segment
         let mut bs = vec![0; 4];
@@ -1749,7 +1762,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = segment.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
+        let r = segment.read_at(&mut bs, 11 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing
@@ -1758,14 +1771,12 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // BLOCK_SIZE + 4 = 4100
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 + 4);
+        // 11 + 4 = 4100
+        assert_eq!(segment.offset(), 11 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = segment
-            .read_at(&mut bs, BLOCK_SIZE as u64)
-            .expect("should read");
+        let n = segment.read_at(&mut bs, 11).expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
@@ -1774,7 +1785,7 @@ mod tests {
         assert!(r.is_ok());
 
         // Validate offset after syncing again
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 * 2);
+        assert_eq!(segment.offset(), 15);
 
         // Test closing segment
         assert!(segment.close().is_ok());
@@ -1834,7 +1845,7 @@ mod tests {
         assert!(segment.sync().is_ok());
 
         // Validate offset after syncing
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64);
+        assert_eq!(segment.offset(), 11);
 
         // Test closing segment
         assert!(segment.close().is_ok());
@@ -1846,7 +1857,7 @@ mod tests {
             Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64);
+        assert_eq!(segment.offset(), 11);
 
         // Test reading from segment
         let mut bs = vec![0; 4];
@@ -1871,14 +1882,12 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         // Validate offset after appending
-        // BLOCK_SIZE + 4 = 4100
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 + 4);
+        // 11 + 4 = 4100
+        assert_eq!(segment.offset(), 11 + 4);
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = segment
-            .read_at(&mut bs, BLOCK_SIZE as u64)
-            .expect("should read");
+        let n = segment.read_at(&mut bs, 11 as u64).expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
@@ -1889,7 +1898,7 @@ mod tests {
         let segment: Segment<0> =
             Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
         // Test initial offset
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 + 4);
+        assert_eq!(segment.offset(), 11 + 4);
 
         // Cleanup: Drop the temp directory, which deletes its contents
         drop(segment);

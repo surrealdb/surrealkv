@@ -1313,7 +1313,6 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
 
     fn is_closed(&self) -> Result<(), TrieError> {
         if self.closed {
-            println!("we here 1");
             return Err(TrieError::SnapshotAlreadyClosed);
         }
         Ok(())

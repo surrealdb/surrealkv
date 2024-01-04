@@ -83,7 +83,7 @@ fn sequential_insert_read(c: &mut Criterion) {
     });
 }
 
-fn parallel_insert(c: &mut Criterion) {
+fn concurrent_insert(c: &mut Criterion) {
     let item_count = 100_000;
 
     let mut group = c.benchmark_group("inserts");
@@ -124,6 +124,6 @@ fn parallel_insert(c: &mut Criterion) {
     }
 }
 
-// criterion_group!(benches, bulk_insert, sequential_insert_read);
-criterion_group!(benches, parallel_insert);
-criterion_main!(benches);
+criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
+criterion_group!(benches_concurrent, concurrent_insert);
+criterion_main!(benches_sequential, benches_concurrent);

@@ -156,12 +156,7 @@ impl Aol {
                 let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
 
                 // Retrieve the previous active segment and replace it with the new one
-                let previous_segment_id = self.active_segment_id - 1;
-                let previous_segment = mem::replace(&mut self.active_segment, new_segment);
-
-                // Cache the previous segment
-                let mut cache = self.segment_cache.write();
-                cache.push(previous_segment_id, previous_segment);
+                let _ = mem::replace(&mut self.active_segment, new_segment);
 
                 available = opts.max_file_size as i64;
             }
@@ -219,7 +214,23 @@ impl Aol {
             let read_offset = offset % self.opts.max_file_size;
 
             // Read data from the appropriate segment
-            r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
+            // r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
+            match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
+                Ok(bytes_read) => {
+                    r += bytes_read;
+                }
+                Err(e) => match e {
+                    Error::EOF(n) => {
+                        r = n;
+                        if n > 0 {
+                            continue;
+                        } else {
+                            return Err(Error::EOF(n));
+                        }
+                    }
+                    _ => return Err(e),
+                },
+            }
         }
 
         Ok(r)
@@ -260,7 +271,7 @@ impl Aol {
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
         let _lock = self.mutex.read();
-        Ok(self.active_segment.offset())
+        Ok((self.active_segment_id * self.opts.max_file_size) + self.active_segment.offset())
     }
 
     pub fn size(&self) -> Result<u64> {

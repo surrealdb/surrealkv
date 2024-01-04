@@ -46,7 +46,7 @@ pub struct Options {
     pub max_value_size: u64,        // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
     pub create_if_not_exists: bool, // Create the directory if the provided open path doesn't exist.
-    pub max_tx_entries: usize,      // Maximum entries in a transaction.
+    pub max_tx_entries: u32,        // Maximum entries in a transaction.
     pub max_active_snapshots: u64,  // Maximum number of active snapshots.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
@@ -108,7 +108,7 @@ impl Options {
             max_value_size: metadata.get_uint(META_KEY_MAX_VALUE_SIZE)?,
             max_value_threshold: metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD)? as usize,
             create_if_not_exists: metadata.get_bool(META_KEY_CREATE_IF_NOT_EXISTS)?,
-            max_tx_entries: metadata.get_uint(META_KEY_MAX_TX_ENTRIES)? as usize,
+            max_tx_entries: metadata.get_uint(META_KEY_MAX_TX_ENTRIES)? as u32,
             max_active_snapshots: metadata.get_uint(META_KEY_MAX_ACTIVE_SNAPSHOTS)?,
             max_segment_size: metadata.get_uint(META_KEY_MAX_FILE_SIZE)?,
             max_value_cache_size: metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE)?,
