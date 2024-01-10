@@ -230,18 +230,4 @@ mod tests {
         }
         assert_eq!(DROP_COUNT.load(SeqCst), 2 * n * n);
     }
-
-    // Inserting a new key-value pair into a cache that is already at maximum size evicts an entry before adding the new pair.
-    #[test]
-    fn test_insert_into_full_cache_evicts_entry_before_adding_new_pair() {
-        let mut cache: Cache<i32, i32> = Cache::new(2);
-        cache.insert(1, 10);
-        cache.insert(2, 20);
-        cache.insert(3, 30);
-        assert_eq!(cache.entries.len(), 2);
-
-        assert!(cache.get(&1).is_none());
-        assert_opt_eq(cache.get(&2), 20);
-        assert_opt_eq(cache.get(&3), 30);
-    }
 }

@@ -43,8 +43,7 @@ impl Store {
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin(&self) -> Result<Transaction> {
-        let mut txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
-        txn.read_ts = self.core.read_ts()?;
+        let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
 
@@ -52,8 +51,7 @@ impl Store {
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-        let mut txn = Transaction::new(self.core.clone(), mode)?;
-        txn.read_ts = self.core.read_ts()?;
+        let txn = Transaction::new(self.core.clone(), mode)?;
         Ok(txn)
     }
 
@@ -164,7 +162,7 @@ impl Core {
         })
     }
 
-    fn read_ts(&self) -> Result<u64> {
+    pub(crate) fn read_ts(&self) -> Result<u64> {
         if self.is_closed() {
             return Err(Error::StoreClosed);
         }

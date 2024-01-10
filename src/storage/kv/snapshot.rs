@@ -17,7 +17,7 @@ pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_delete
 pub(crate) struct Snapshot {
     /// The timestamp of the snapshot. This is used to determine the visibility of the
     /// key-value pairs in the snapshot. It can be used to filter out expired key-value
-    /// pairs or to filter out key-value pairs based on the snapshot timestamp.
+    /// pairs or deleted key-value pairs based on the read timestamp.
     ts: u64,
     snap: TartSnapshot<VariableKey, Bytes>,
     store: Arc<Core>,
@@ -40,7 +40,7 @@ impl Snapshot {
         // This happens because the VariableKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.ts)?;
+        self.snap.insert(key, value, self.snap.ts)?;
         Ok(())
     }
 

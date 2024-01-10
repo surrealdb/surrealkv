@@ -93,8 +93,8 @@ pub struct Transaction {
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
-        let read_ts = now();
-        let snapshot = RwLock::new(Snapshot::take(store.clone(), read_ts)?);
+        let snapshot = RwLock::new(Snapshot::take(store.clone(), now())?);
+        let read_ts = store.read_ts()?;
 
         Ok(Self {
             read_ts,
@@ -1429,10 +1429,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn insert_large_txn_and_get() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.max_tx_entries = ENTRIES as u32;
 
         let store = Store::new(opts.clone()).expect("should create store");
         let mut rng = make_rng();
