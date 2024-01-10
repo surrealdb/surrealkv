@@ -281,7 +281,7 @@ impl Transaction {
             // read timestamp. This is to prevent adding keys that are added during the transaction.
             if val_ref.ts() <= self.read_ts {
                 self.read_set.lock().push((
-                    Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the tart leaf are terminated with a null byte
+                    Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the vart leaf are terminated with a null byte
                     val_ref.ts,
                 ));
             }

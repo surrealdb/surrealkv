@@ -270,10 +270,7 @@ impl Key for VariableKey {
 }
 
 /*
-    BitArray implementation
-
-    This implementation is inspired from the BitArray implementation by rdaum
-    Reference: https://github.com/rdaum/rart-rs
+    BitSet implementation
 */
 
 #[derive(Clone)]

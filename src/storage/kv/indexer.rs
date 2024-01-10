@@ -2,8 +2,8 @@ use bytes::Bytes;
 
 use crate::storage::{
     index::{
-        art::{Tree as tart, KV},
-        snapshot::Snapshot as TartSnapshot,
+        art::{Tree as vart, KV},
+        snapshot::Snapshot as VartSnapshot,
         VariableKey,
     },
     kv::error::Result,
@@ -11,22 +11,22 @@ use crate::storage::{
 };
 
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
-/// It uses a `tart` index, which is a type of persistent, lock-free B+ tree.
+/// It uses a `vart` index, which is a type of persistent, lock-free B+ tree.
 pub(crate) struct Indexer {
-    pub(crate) index: tart<VariableKey, Bytes>,
+    pub(crate) index: vart<VariableKey, Bytes>,
 }
 
 impl Indexer {
     /// Creates a new `Indexer` instance.
     /// The maximum number of active snapshots is set based on the provided options.
     pub(crate) fn new(opts: &Options) -> Self {
-        let mut index = tart::new();
+        let mut index = vart::new();
         index.set_max_active_snapshots(opts.max_active_snapshots);
         Self { index }
     }
 
     /// Creates a snapshot of the current state of the index.
-    pub(crate) fn snapshot(&mut self) -> Result<TartSnapshot<VariableKey, Bytes>> {
+    pub(crate) fn snapshot(&mut self) -> Result<VartSnapshot<VariableKey, Bytes>> {
         let snapshot = self.index.create_snapshot()?;
         Ok(snapshot)
     }
