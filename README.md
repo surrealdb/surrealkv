@@ -1,21 +1,20 @@
-# surrealkv - Readme
+# surrealkv
 
-**Note: This project is actively in development. Expect ongoing changes to the file format, APIs, or features until the project reaches stability in future releases.**
-
-surrealkv is a versioned, low-level, embedded, key-value database implemented in Rust. It operates as an in-memory database, is embeddable, and boasts ACID compliance with support for multiple readers and writers.
+surrealkv is a versioned, low-level, embedded key-value database implemented in Rust. Functioning as an in-memory database, it ensures durability and ACID compliance, supporting concurrent operations from multiple readers and writers.
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
 ## Features
 
-- **In-memory Database:**
-- **Embeddable:**
-- **ACID Semantics:** 
-- **Rich Transaction Support:** 
-- **Built-in Item Versioning:** [TODO]
-- **Multi-Version Concurrency Control (MVCC):**
-- **Multiple Concurrent Readers and Writers:**
-- **Durable Append-only File Format:**
+- **In-memory Database**
+- **Embeddable**
+- **ACID Semantics** 
+- **Transaction Support:** 
+- **Built-in Item Versioning** [TODO]
+- **Multi-Version Concurrency Control (MVCC) support**
+- **Multiple Concurrent Readers and Writers**
+- **Persistence through an append-only File**
+
 
 ## Important Notice
 
