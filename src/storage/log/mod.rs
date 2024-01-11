@@ -372,7 +372,7 @@ impl Metadata {
     /// # Returns
     ///
     /// Returns a `Metadata` instance containing the file header information.
-    fn new_file_header(id: u64, opts: &Options) -> Self {
+    fn new_file_header(id: u64, opts: &Options) -> Result<Self> {
         let mut buf = Metadata::new(None);
 
         // Set file header key-value pairs using constants
@@ -392,17 +392,17 @@ impl Metadata {
         buf.put_uint(KEY_COMPRESSION_LEVEL, cl.as_u64());
         buf.put_uint(KEY_MAX_FILE_SIZE, opts.max_file_size);
         if let Some(md) = opts.metadata.as_ref() {
-            buf.put(KEY_ADDITIONAL_METADATA, &md.to_bytes());
+            buf.put(KEY_ADDITIONAL_METADATA, &md.to_bytes()?);
         }
 
-        buf
+        Ok(buf)
     }
 
     // Returns the serialized bytes representation of Metadata
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut b = Vec::new();
-        self.write_to(&mut b).unwrap();
-        b
+        self.write_to(&mut b)?;
+        Ok(b)
     }
 
     // Reads Metadata from a given reader
@@ -581,8 +581,8 @@ fn write_file_header(file: &mut File, id: u64, opts: &Options) -> Result<usize> 
     let mut buf = Vec::new();
 
     // Write the header using write_field
-    let meta = Metadata::new_file_header(id, opts);
-    write_field(&meta.to_bytes(), &mut buf)?;
+    let meta = Metadata::new_file_header(id, opts)?;
+    write_field(&meta.to_bytes()?, &mut buf)?;
 
     // Write header to the file
     file.write_all(&buf)?;
@@ -608,7 +608,7 @@ fn validate_metadata(header: &[u8], opts: &Options) -> Result<()> {
     let additional_md = meta.get(KEY_ADDITIONAL_METADATA);
 
     match (additional_md, &opts.metadata) {
-        (Some(md), Some(expected_md)) if *md != expected_md.to_bytes() => Err(Error::IO(
+        (Some(md), Some(expected_md)) if *md != expected_md.to_bytes()? => Err(Error::IO(
             IOError::new(io::ErrorKind::InvalidData, "Corrupted metadata"),
         )),
         (None, Some(_)) | (Some(_), None) => Err(Error::IO(IOError::new(
@@ -1465,7 +1465,7 @@ mod tests {
         metadata.put_uint("age", 30);
         metadata.put_uint("num", 40);
 
-        let bytes = metadata.to_bytes();
+        let bytes = metadata.to_bytes().unwrap();
         let restored_metadata = Metadata::new(Some(bytes));
 
         assert_eq!(restored_metadata.get_uint("age").unwrap(), 30);
@@ -1494,7 +1494,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new metadata using new_file_header
-        let mut meta = Metadata::new_file_header(id, &opts);
+        let mut meta = Metadata::new_file_header(id, &opts).unwrap();
 
         // Create an extended metadata
         let mut extended_meta = Metadata::new(None);
@@ -1502,7 +1502,7 @@ mod tests {
         extended_meta.put_uint("key2", 456);
 
         // Serialize and extend the extended metadata using bytes
-        let extended_bytes = extended_meta.to_bytes();
+        let extended_bytes = extended_meta.to_bytes().unwrap();
         meta.read_from(&mut &extended_bytes[..])
             .expect("Failed to read from bytes");
 

@@ -244,7 +244,7 @@ impl Core {
         match existing_metadata {
             Some(existing) if existing == current_metadata => Ok(current_metadata),
             _ => {
-                let md_bytes = current_metadata.to_bytes();
+                let md_bytes = current_metadata.to_bytes()?;
                 let mut buf = Vec::new();
                 write_field(&md_bytes, &mut buf)?;
                 manifest.append(&buf)?;

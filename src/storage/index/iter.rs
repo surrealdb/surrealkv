@@ -175,7 +175,7 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for IterState<'a, P, V> {
             let e = node.next();
             match e {
                 None => {
-                    self.iters.pop().unwrap();
+                    self.iters.pop();
                 }
                 Some(other) => {
                     if let NodeType::Twig(twig) = &other.1.node_type {
@@ -262,7 +262,7 @@ impl<'a, K: 'a + KeyTrait, V: Clone, R: RangeBounds<K>> Iterator for Range<'a, K
                     }
                 }
                 None => {
-                    self.forward.iters.pop().unwrap();
+                    self.forward.iters.pop();
                 }
             }
         }
