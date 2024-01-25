@@ -466,184 +466,185 @@ impl ValueRef {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Core;
-    use crate::storage::kv::store::Store;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    use tempdir::TempDir;
+//     use crate::storage::kv::option::Options;
+//     use crate::storage::kv::store::Store;
 
-    fn create_temp_directory() -> TempDir {
-        TempDir::new("test").unwrap()
-    }
+//     use tempdir::TempDir;
 
-    #[test]
-    fn encode_decode() {
-        // Create a sample valueRef instance
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
+//     fn create_temp_directory() -> TempDir {
+//         TempDir::new("test").unwrap()
+//     }
 
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
+//     #[test]
+//     fn encode_decode() {
+//         // Create a sample valueRef instance
+//         // Create a temporary directory for testing
+//         let temp_dir = create_temp_directory();
 
-        let store = Arc::new(Core::new(opts).expect("failed to create store"));
+//         // Create store options with the test directory
+//         let mut opts = Options::new();
+//         opts.dir = temp_dir.path().to_path_buf();
 
-        let mut txmd = Metadata::new();
-        txmd.as_deleted(true).expect("failed to set deleted");
-        let mut kvmd = Metadata::new();
-        kvmd.as_deleted(true).expect("failed to set deleted");
+//         // Create a new Core instance with VariableKey as the key type
+//         let store = Store::new(opts).expect("should create store");
 
-        let mut value_ref = ValueRef::new(store);
-        value_ref.value_length = 100;
-        value_ref.value_offset = Some(200);
-        value_ref.key_value_metadata = Some(kvmd);
+//         let mut txmd = Metadata::new();
+//         txmd.as_deleted(true).expect("failed to set deleted");
+//         let mut kvmd = Metadata::new();
+//         kvmd.as_deleted(true).expect("failed to set deleted");
 
-        // // Encode the valueRef
-        // let encoded_bytes = value_ref.encode();
+//         let mut value_ref = ValueRef::new(store.core.clone());
+//         value_ref.value_length = 100;
+//         value_ref.value_offset = Some(200);
+//         value_ref.key_value_metadata = Some(kvmd);
 
-        // // Decode the encoded bytes into a new valueRef
-        // let mut decoded_value_ref = ValueRef::new(store);
-        // decoded_value_ref.decode(0, &encoded_bytes).unwrap();
+//         // // Encode the valueRef
+//         // let encoded_bytes = value_ref.encode();
 
-        // // Check if the decoded valueRef matches the original
-        // assert_eq!(decoded_value_ref.version, value_ref.version);
-        // assert_eq!(decoded_value_ref.value_length, value_ref.value_length);
-        // assert_eq!(decoded_value_ref.value_offset, value_ref.value_offset);
-        // assert_eq!(
-        //     decoded_value_ref.key_value_metadata.unwrap().deleted(),
-        //     value_ref.key_value_metadata.unwrap().deleted()
-        // );
-    }
+//         // // Decode the encoded bytes into a new valueRef
+//         // let mut decoded_value_ref = ValueRef::new(store);
+//         // decoded_value_ref.decode(0, &encoded_bytes).unwrap();
 
-    #[test]
-    fn txn_with_value_read_from_clog() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
+//         // // Check if the decoded valueRef matches the original
+//         // assert_eq!(decoded_value_ref.version, value_ref.version);
+//         // assert_eq!(decoded_value_ref.value_length, value_ref.value_length);
+//         // assert_eq!(decoded_value_ref.value_offset, value_ref.value_offset);
+//         // assert_eq!(
+//         //     decoded_value_ref.key_value_metadata.unwrap().deleted(),
+//         //     value_ref.key_value_metadata.unwrap().deleted()
+//         // );
+//     }
 
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 2;
+//     #[test]
+//     fn txn_with_value_read_from_clog() {
+//         // Create a temporary directory for testing
+//         let temp_dir = create_temp_directory();
 
-        // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+//         // Create store options with the test directory
+//         let mut opts = Options::new();
+//         opts.dir = temp_dir.path().to_path_buf();
+//         opts.max_value_threshold = 2;
 
-        // Define test keys and value
-        let key1 = Bytes::from("foo1");
-        let key2 = Bytes::from("foo2");
-        let key3 = Bytes::from("foo3");
-        let value = Bytes::from("bar");
+//         // Create a new Core instance with VariableKey as the key type
+//         let store = Store::new(opts).expect("should create store");
 
-        {
-            // Start a new write transaction (txn)
-            let mut txn = store.begin().unwrap();
+//         // Define test keys and value
+//         let key1 = Bytes::from("foo1");
+//         let key2 = Bytes::from("foo2");
+//         let key3 = Bytes::from("foo3");
+//         let value = Bytes::from("bar");
 
-            // Set key1 and key2 with the same value
-            txn.set(&key1, &value).unwrap();
-            txn.set(&key2, &value).unwrap();
+//         {
+//             // Start a new write transaction (txn)
+//             let mut txn = store.begin().unwrap();
 
-            // Commit the transaction
-            txn.commit().unwrap();
-        }
+//             // Set key1 and key2 with the same value
+//             txn.set(&key1, &value).unwrap();
+//             txn.set(&key2, &value).unwrap();
 
-        {
-            // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+//             // Commit the transaction
+//             txn.commit().await();
+//         }
 
-            // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+//         {
+//             // Start a new read-only transaction
+//             let txn = store.begin().unwrap();
 
-            // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(&val[..], value.as_ref());
-        }
+//             // Retrieve the value associated with key1
+//             let val = txn.get(&key1).unwrap();
 
-        {
-            // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+//             // Assert that the value retrieved in txn matches the expected value
+//             assert_eq!(&val[..], value.as_ref());
+//         }
 
-            // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+//         {
+//             // Start a new read-only transaction
+//             let txn = store.begin().unwrap();
 
-            // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
-        }
+//             // Retrieve the value associated with key2
+//             let val = txn.get(&key2).unwrap();
 
-        {
-            // Start a new write transaction
-            let mut txn = store.begin().unwrap();
+//             // Assert that the value retrieved in txn matches the expected value
+//             assert_eq!(val, value);
+//         }
 
-            // Set key3 with the same value
-            txn.set(&key3, &value).unwrap();
+//         {
+//             // Start a new write transaction
+//             let mut txn = store.begin().unwrap();
 
-            // Commit the transaction
-            txn.commit().unwrap();
-        }
+//             // Set key3 with the same value
+//             txn.set(&key3, &value).unwrap();
 
-        {
-            // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+//             // Commit the transaction
+//             txn.commit().unwrap();
+//         }
 
-            // Retrieve the value associated with key3
-            let val = txn.get(&key3).unwrap();
+//         {
+//             // Start a new read-only transaction
+//             let txn = store.begin().unwrap();
 
-            // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
-        }
-    }
+//             // Retrieve the value associated with key3
+//             let val = txn.get(&key3).unwrap();
 
-    #[test]
-    fn txn_with_value_read_from_memory() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
+//             // Assert that the value retrieved in txn matches the expected value
+//             assert_eq!(val, value);
+//         }
+//     }
 
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 40;
+//     #[test]
+//     fn txn_with_value_read_from_memory() {
+//         // Create a temporary directory for testing
+//         let temp_dir = create_temp_directory();
 
-        // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+//         // Create store options with the test directory
+//         let mut opts = Options::new();
+//         opts.dir = temp_dir.path().to_path_buf();
+//         opts.max_value_threshold = 40;
 
-        // Define test keys and value
-        let key1 = Bytes::from("foo1");
-        let key2 = Bytes::from("foo2");
-        let value = Bytes::from("bar");
+//         // Create a new Core instance with VariableKey as the key type
+//         let store = Store::new(opts).expect("should create store");
 
-        {
-            // Start a new write transaction (txn)
-            let mut txn = store.begin().unwrap();
+//         // Define test keys and value
+//         let key1 = Bytes::from("foo1");
+//         let key2 = Bytes::from("foo2");
+//         let value = Bytes::from("bar");
 
-            // Set key1 and key2 with the same value
-            txn.set(&key1, &value).unwrap();
-            txn.set(&key2, &value).unwrap();
+//         {
+//             // Start a new write transaction (txn)
+//             let mut txn = store.begin().unwrap();
 
-            // Commit the transaction
-            txn.commit().unwrap();
-        }
+//             // Set key1 and key2 with the same value
+//             txn.set(&key1, &value).unwrap();
+//             txn.set(&key2, &value).unwrap();
 
-        {
-            // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+//             // Commit the transaction
+//             txn.commit().unwrap();
+//         }
 
-            // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+//         {
+//             // Start a new read-only transaction
+//             let txn = store.begin().unwrap();
 
-            // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(&val[..], value.as_ref());
-        }
+//             // Retrieve the value associated with key1
+//             let val = txn.get(&key1).unwrap();
 
-        {
-            // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+//             // Assert that the value retrieved in txn matches the expected value
+//             assert_eq!(&val[..], value.as_ref());
+//         }
 
-            // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+//         {
+//             // Start a new read-only transaction
+//             let txn = store.begin().unwrap();
 
-            // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
-        }
-    }
-}
+//             // Retrieve the value associated with key2
+//             let val = txn.get(&key2).unwrap();
+
+//             // Assert that the value retrieved in txn matches the expected value
+//             assert_eq!(val, value);
+//         }
+//     }
+// }

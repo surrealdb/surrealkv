@@ -159,7 +159,7 @@ impl SnapshotIsolation {
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(txn.store.clone(), self.read_ts())?;
+        let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts())?;
         let read_set = txn.read_set.lock();
 
         for (key, ts) in read_set.iter() {

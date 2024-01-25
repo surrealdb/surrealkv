@@ -278,6 +278,12 @@ pub struct BitSet<const SIZE: usize> {
     bits: [bool; SIZE],
 }
 
+impl<const SIZE: usize> Default for BitSet<SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const SIZE: usize> BitSet<SIZE> {
     pub fn new() -> Self {
         Self {

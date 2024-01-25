@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use jemallocator::Jemalloc;
 
@@ -92,9 +94,11 @@ fn concurrent_insert(c: &mut Criterion) {
 
     let mut opts = Options::new();
     opts.dir = create_temp_directory().path().to_path_buf();
-    let db = Store::new(opts).expect("should create store");
+    opts.max_tx_entries = item_count;
+    let db = Arc::new(Store::new(opts).expect("should create store"));
 
-    for thread_count in [1_u32, 2, 4] {
+    {
+        let thread_count = 8_u32;
         group.bench_function(
             format!("{} inserts ({} threads)", item_count, thread_count),
             |b| {
@@ -105,13 +109,13 @@ fn concurrent_insert(c: &mut Criterion) {
                         let db = db.clone();
 
                         threads.push(std::thread::spawn(move || {
+                            let mut txn = db.begin().unwrap();
                             for _ in 0..(item_count / thread_count) {
                                 let key = nanoid::nanoid!();
                                 let value = nanoid::nanoid!();
-                                let mut txn = db.begin().unwrap();
                                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-                                txn.commit().unwrap();
                             }
+                            txn.commit().unwrap();
                         }));
                     }
 
@@ -126,4 +130,4 @@ fn concurrent_insert(c: &mut Criterion) {
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-criterion_main!(benches_sequential, benches_concurrent);
+criterion_main!(benches_concurrent);

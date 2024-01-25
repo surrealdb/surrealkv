@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::vec;
 use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
-use bytes::Bytes;
+use async_channel::{bounded, Receiver, Sender};
+use async_std::task::spawn;
+use bytes::{Bytes, BytesMut};
+use futures::{select, FutureExt};
 use hashbrown::HashMap;
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -10,7 +13,7 @@ use parking_lot::RwLock;
 use crate::storage::{
     index::art::KV,
     kv::{
-        entry::{TxRecord, ValueRef},
+        entry::{Entry, TxRecord, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
         option::Options,
@@ -25,9 +28,9 @@ use crate::storage::{
 };
 
 /// An MVCC-based transactional key-value store.
-#[derive(Clone)]
 pub struct Store {
     pub(crate) core: Arc<Core>,
+    pub(crate) stop_tx: Sender<()>,
 }
 
 impl Store {
@@ -35,14 +38,19 @@ impl Store {
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
     pub fn new(opts: Options) -> Result<Self> {
-        let core = Arc::new(Core::new(opts)?);
-        Ok(Self { core })
+        // TODO: make this channel size configurable
+        let (writes_tx, writes_rx) = bounded(10000);
+        let (stop_tx, stop_rx) = bounded(1);
+        let core = Arc::new(Core::new(opts, writes_tx)?);
+        TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
+
+        Ok(Self { core, stop_tx })
     }
 
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin(&self) -> Result<Transaction> {
+    pub async fn begin(&self) -> Result<Transaction> {
         let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
@@ -50,7 +58,7 @@ impl Store {
     /// Begins a new transaction with the given mode.
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+    pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let txn = Transaction::new(self.core.clone(), mode)?;
         Ok(txn)
     }
@@ -58,8 +66,8 @@ impl Store {
     /// Executes a function in a read-only transaction.
     /// It begins a new read-only transaction and executes the function with the transaction.
     /// It returns the result of the function.
-    pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
+    pub async fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+        let mut txn = self.begin_with_mode(Mode::ReadOnly).await?;
         f(&mut txn)?;
 
         Ok(())
@@ -68,10 +76,13 @@ impl Store {
     /// Executes a function in a read-write transaction and commits the transaction.
     /// It begins a new read-write transaction, executes the function with the transaction, and commits the transaction.
     /// It returns the result of the function.
-    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
+    pub async fn write(
+        self: Arc<Self>,
+        f: impl FnOnce(&mut Transaction) -> Result<()>,
+    ) -> Result<()> {
+        let mut txn = self.begin_with_mode(Mode::ReadWrite).await?;
         f(&mut txn)?;
-        txn.commit()?;
+        txn.commit().await?;
 
         Ok(())
     }
@@ -81,9 +92,55 @@ impl Drop for Store {
     /// Drops the store by closing the core.
     /// If closing the core fails, it panics with an error message.
     fn drop(&mut self) {
+        if self.stop_tx.try_send(()).is_err() {
+            eprintln!("Failed to send stop signal");
+        }
         let err = self.core.close();
         if err.is_err() {
             panic!("failed to close core: {:?}", err);
+        }
+    }
+}
+
+pub(crate) struct TaskRunner {
+    core: Arc<Core>,
+    writes_rx: Receiver<Task>,
+    stop_rx: Receiver<()>,
+}
+
+impl TaskRunner {
+    #[inline]
+    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+        Self {
+            core,
+            writes_rx,
+            stop_rx,
+        }
+    }
+
+    #[inline]
+    fn spawn(self) {
+        spawn(Box::pin(async move {
+            loop {
+                select! {
+                    req = self.writes_rx.recv().fuse() => {
+                        let task = req.unwrap();
+                        self.handle_task(task).await
+                    },
+                    _ = self.stop_rx.recv().fuse() => {
+                        drop(self);
+                        return;
+                    },
+                }
+            }
+        }));
+    }
+
+    #[inline]
+    async fn handle_task(&self, task: Task) {
+        let core = self.core.clone();
+        if let Err(err) = core.write_request(task).await {
+            println!("failed to write: {:?}", err);
         }
     }
 }
@@ -105,7 +162,23 @@ pub struct Core {
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
     pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
+    /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
+    /// Channel to send write requests to the writer
+    writes_tx: Sender<Task>,
+}
+
+/// A Task contains multiple entries to be written to the disk.
+#[derive(Clone)]
+pub struct Task {
+    /// Entries contained in this task
+    entries: Vec<Entry>,
+    /// Use channel to notify that the value has been persisted to disk
+    done: Option<Sender<Result<()>>>,
+    /// Transaction ID
+    tx_id: u64,
+    /// Commit timestamp
+    commit_ts: u64,
 }
 
 impl Core {
@@ -115,7 +188,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Indexer::new(&opts);
 
@@ -159,6 +232,7 @@ impl Core {
             oracle: Arc::new(oracle),
             value_cache,
             is_closed: AtomicBool::new(false),
+            writes_tx,
         })
     }
 
@@ -286,7 +360,7 @@ impl Core {
         self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -307,10 +381,96 @@ impl Core {
 
         Ok(())
     }
+
+    pub(crate) async fn write_request(&self, req: Task) -> Result<()> {
+        let done = req.done.clone();
+
+        let result = self.write_entries(req);
+
+        if let Some(done) = done {
+            done.send(result.clone()).await?;
+        }
+
+        result
+    }
+
+    fn write_entries(&self, req: Task) -> Result<()> {
+        if req.entries.is_empty() {
+            return Ok(());
+        }
+
+        let current_offset = self.clog.read().offset()?;
+        let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
+        let mut buf = BytesMut::new();
+        let mut committed_values_offsets = HashMap::new();
+
+        tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
+
+        self.append_to_log(&buf)?;
+        self.write_to_index(&req, &committed_values_offsets)?;
+
+        Ok(())
+    }
+
+    fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
+        let mut clog = self.clog.write();
+        clog.append(tx_record)?;
+
+        Ok(())
+    }
+
+    fn write_to_index(
+        &self,
+        req: &Task,
+        committed_values_offsets: &HashMap<Bytes, usize>,
+    ) -> Result<()> {
+        let mut index = self.indexer.write();
+        let mut kv_pairs = Vec::new();
+
+        for entry in &req.entries {
+            let index_value = ValueRef::encode(
+                &entry.key,
+                &entry.value,
+                entry.metadata.as_ref(),
+                committed_values_offsets,
+                self.opts.max_value_threshold,
+            );
+
+            kv_pairs.push(KV {
+                key: entry.key[..].into(),
+                value: index_value,
+                version: req.tx_id,
+                ts: req.commit_ts,
+            });
+        }
+
+        index.bulk_insert(&mut kv_pairs)?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn send_to_write_channel(
+        &self,
+        entries: Vec<Entry>,
+        tx_id: u64,
+        commit_ts: u64,
+    ) -> Result<Receiver<Result<()>>> {
+        let (tx, rx) = bounded(1);
+        let req = Task {
+            entries,
+            done: Some(tx),
+            tx_id,
+            commit_ts,
+        };
+        self.writes_tx.send(req).await?;
+        Ok(rx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
 
@@ -321,8 +481,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn bulk_insert() {
+    #[tokio::test]
+    async fn bulk_insert() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -358,15 +518,15 @@ mod tests {
         // Write the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let txn = store.begin().await.unwrap();
             let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -385,15 +545,15 @@ mod tests {
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let txn = store.begin().await.unwrap();
             let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
     }
 
-    #[test]
-    fn store_open_and_reload_options() {
+    #[tokio::test]
+    async fn store_open_and_reload_options() {
         // // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -416,8 +576,8 @@ mod tests {
         assert_eq!(store_opts, opts);
     }
 
-    #[test]
-    fn clone_store() {
+    #[tokio::test]
+    async fn clone_store() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -426,7 +586,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Arc::new(Store::new(opts).expect("should create store"));
 
         // Number of keys to generate
         let num_keys = 100;
@@ -454,9 +614,9 @@ mod tests {
         // Write the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
-            let mut txn = store1.begin().unwrap();
+            let mut txn = store1.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
     }
 }

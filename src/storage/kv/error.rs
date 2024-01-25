@@ -1,5 +1,6 @@
 use std::{fmt, io, sync::Arc};
 
+use crate::storage::kv::store::Task;
 use crate::storage::{index::art::TrieError, log::Error as LogError};
 
 /// Result returning Error
@@ -7,7 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// `Error` is a custom error type for the storage module.
 /// It includes various variants to represent different types of errors that can occur.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Error {
     Abort,                              // The operation was aborted
     IoError(Arc<io::Error>),            // An I/O error occurred
@@ -32,6 +33,8 @@ pub enum Error {
     EmptyValue,                         // The value in the record is empty
     ManifestNotFound,                   // The manifest was not found
     MaxTransactionEntriesLimitExceeded, // The maximum number of entries in a transaction was exceeded
+    SendError(String),
+    ReceiveError(String),
 }
 
 /// Error structure for encoding errors
@@ -91,6 +94,8 @@ impl fmt::Display for Error {
             Error::MaxTransactionEntriesLimitExceeded => {
                 write!(f, "Max transaction entries limit exceeded")
             }
+            Error::SendError(err) => write!(f, "Send error: {}", err),
+            Error::ReceiveError(err) => write!(f, "Receive error: {}", err),
         }
     }
 }
@@ -114,5 +119,23 @@ impl From<TrieError> for Error {
 impl From<LogError> for Error {
     fn from(log_error: LogError) -> Self {
         Error::LogError(log_error)
+    }
+}
+
+impl From<async_channel::SendError<Task>> for Error {
+    fn from(error: async_channel::SendError<Task>) -> Self {
+        Error::SendError(format!("Async channel send error: {}", error))
+    }
+}
+
+impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
+    fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
+        Error::SendError(format!("Async channel send error: {}", error))
+    }
+}
+
+impl From<async_channel::RecvError> for Error {
+    fn from(error: async_channel::RecvError) -> Self {
+        Error::ReceiveError(format!("Async channel receive error: {}", error))
     }
 }
