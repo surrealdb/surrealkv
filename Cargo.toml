@@ -43,7 +43,7 @@ comfy-table = "7.0.1"
 
 tempdir = "0.3"
 rand = "0.8.5"
-criterion = "0.5.1"
+criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 jemallocator = "0.5.4"
 nanoid = "0.4.0"
 caches = "0.2" 
@@ -54,7 +54,3 @@ fastrand = "2.0.1"
 [[bench]]
 name = "store_bench"
 harness = false
-
-[[bin]]
-name = "rocks_bench"
-path = "example/rocks_bench.rs"

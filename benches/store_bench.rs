@@ -1,5 +1,8 @@
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use jemallocator::Jemalloc;
 
@@ -14,75 +17,95 @@ fn create_temp_directory() -> TempDir {
     TempDir::new("test").unwrap()
 }
 
-fn bulk_insert(c: &mut Criterion) {
-    let mut count = 0_u32;
-    let mut bytes = |len| -> Vec<u8> {
-        count += 1;
+async fn bulk_insert(c: &mut Criterion) {
+    let count = AtomicU32::new(0_u32);
+    let bytes = |len| -> Vec<u8> {
         count
+            .fetch_add(1, Relaxed)
             .to_be_bytes()
             .into_iter()
             .cycle()
             .take(len)
-            .clone()
             .collect()
     };
 
     let mut bench = |key_len, val_len| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .unwrap();
+
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
         let db = Store::new(opts).expect("should create store");
 
         c.bench_function(
-            &format!("bulk insert key/value lengths {}/{}", key_len, val_len),
+            &format!("bulk load key/value lengths {}/{}", key_len, val_len),
             |b| {
-                b.iter(|| {
-                    let mut txn = db.begin().unwrap();
+                b.to_async(&rt).iter(|| async {
+                    let mut txn = db.begin().await.unwrap();
                     txn.set(bytes(key_len)[..].into(), bytes(val_len)[..].into())
                         .unwrap();
-                    txn.commit().unwrap();
+                    txn.commit().await.unwrap();
                 })
             },
         );
+        rt.shutdown_background();
     };
 
     for key_len in &[10_usize, 128, 256, 512] {
         for val_len in &[0_usize, 10, 128, 256, 512, 1024, 2048, 4096, 8192] {
-            bench(*key_len, *val_len)
+            bench(*key_len, *val_len);
         }
     }
 }
 
 fn sequential_insert_read(c: &mut Criterion) {
-    let mut max_count = 0_u32;
-    let mut opts = Options::new();
-    opts.dir = create_temp_directory().path().to_path_buf();
-    let db = Store::new(opts).expect("should create store");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
 
-    c.bench_function("sequential inserts", |b| {
-        let mut count = 0_u32;
-        b.iter(|| {
-            count += 1;
-            let mut txn = db.begin().unwrap();
-            txn.set(count.to_be_bytes()[..].into(), vec![][..].into())
+    rt.block_on(async {
+        let max_count = AtomicU32::new(0_u32);
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        let db = Store::new(opts).expect("should create store");
+
+        c.bench_function(&format!("sequential inserts"), |b| {
+            let count = AtomicU32::new(0_u32);
+            b.iter(|| async {
+                let mut txn = db.begin().await.unwrap();
+                txn.set(
+                    count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
+                    vec![][..].into(),
+                )
                 .unwrap();
-            txn.commit().unwrap();
-            if count > max_count {
-                max_count = count;
-            }
+                txn.commit().await.unwrap();
+
+                let current_count = count.load(Relaxed);
+                if current_count > max_count.load(Relaxed) {
+                    max_count.store(current_count, Relaxed);
+                }
+            })
+        });
+
+        c.bench_function(&format!("sequential gets"), |b| {
+            let count = AtomicU32::new(0_u32);
+            b.iter(|| async {
+                count.fetch_add(1, Relaxed);
+
+                let current_count = count.load(Relaxed);
+                if current_count <= max_count.load(Relaxed) {
+                    let txn = db.begin().await.unwrap();
+                    txn.get(&current_count.to_be_bytes()[..]).unwrap();
+                }
+            })
         });
     });
-
-    c.bench_function("sequential gets", |b| {
-        let mut count = 0_u32;
-        b.iter(|| {
-            count += 1;
-            // not sure why this exceeds the max_count
-            if count <= max_count {
-                let txn = db.begin().unwrap();
-                txn.get(count.to_be_bytes()[..].into()).unwrap();
-            }
-        })
-    });
+    rt.shutdown_background();
 }
 
 fn concurrent_insert(c: &mut Criterion) {
@@ -109,13 +132,16 @@ fn concurrent_insert(c: &mut Criterion) {
                         let db = db.clone();
 
                         threads.push(std::thread::spawn(move || {
-                            let mut txn = db.begin().unwrap();
-                            for _ in 0..(item_count / thread_count) {
-                                let key = nanoid::nanoid!();
-                                let value = nanoid::nanoid!();
-                                txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-                            }
-                            txn.commit().unwrap();
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                let mut txn = db.begin().await.unwrap();
+                                for _ in 0..(item_count / thread_count) {
+                                    let key = nanoid::nanoid!();
+                                    let value = nanoid::nanoid!();
+                                    txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+                                }
+                                txn.commit().await.unwrap();
+                            })
                         }));
                     }
 
@@ -130,4 +156,4 @@ fn concurrent_insert(c: &mut Criterion) {
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-criterion_main!(benches_concurrent);
+criterion_main!(benches_sequential, benches_concurrent);

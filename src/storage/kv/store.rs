@@ -127,6 +127,7 @@ impl TaskRunner {
                         let task = req.unwrap();
                         self.handle_task(task).await
                     },
+                    // TODO: need to consume all transactions from channel
                     _ = self.stop_rx.recv().fuse() => {
                         drop(self);
                         return;
