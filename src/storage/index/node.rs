@@ -1,4 +1,3 @@
-use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::storage::index::{BitArray, KeyTrait};
@@ -154,17 +153,13 @@ pub struct FlatNode<P: KeyTrait + Clone, N: Version, const WIDTH: usize> {
     pub(crate) prefix: P,
     pub(crate) version: u64,
     keys: [u8; WIDTH],
-    children: Box<[MaybeUninit<Option<Arc<N>>>; WIDTH]>,
+    children: Box<[Option<Arc<N>>; WIDTH]>,
     num_children: u8,
 }
 
 impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> {
     pub fn new(prefix: P) -> Self {
-        let mut children: [MaybeUninit<Option<Arc<N>>>; WIDTH] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-        for child in &mut children[..] {
-            *child = MaybeUninit::new(None);
-        }
+        let children: [Option<Arc<N>>; WIDTH] = std::array::from_fn(|_| None);
 
         Self {
             prefix,
@@ -192,9 +187,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
         let mut new_node = FlatNode::<P, N, NEW_WIDTH>::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
             new_node.keys[i] = self.keys[i];
-            unsafe {
-                *new_node.children[i].as_mut_ptr() = self.children[i].assume_init_ref().clone();
-            }
+            new_node.children[i] = self.children[i].clone();
         }
         new_node.version = self.version;
         new_node.num_children = self.num_children;
@@ -205,7 +198,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
     pub fn grow(&self) -> Node48<P, N> {
         let mut n48 = Node48::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
-            if let Some(child) = unsafe { self.children[i].assume_init_ref().as_ref() } {
+            if let Some(child) = self.children[i].as_ref() {
                 n48.insert_child(self.keys[i], child.clone());
             }
         }
@@ -218,17 +211,17 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
     fn insert_child(&mut self, idx: usize, key: u8, node: Arc<N>) {
         for i in (idx..self.num_children as usize).rev() {
             self.keys[i + 1] = self.keys[i];
-            self.children[i + 1] = std::mem::replace(&mut self.children[i], MaybeUninit::new(None));
+            self.children[i + 1] = std::mem::replace(&mut self.children[i], None);
         }
         self.keys[idx] = key;
-        self.children[idx].write(Some(node));
+        self.children[idx] = Some(node);
         self.num_children += 1;
     }
 
     #[inline]
     fn max_child_version(&self) -> u64 {
         self.children.iter().fold(0, |acc, x| {
-            if let Some(child) = unsafe { x.assume_init_ref().as_ref() } {
+            if let Some(child) = x.as_ref() {
                 std::cmp::max(acc, child.version())
             } else {
                 acc
@@ -266,7 +259,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> FlatNode<P, N, WIDTH> 
             .zip(self.children.iter())
             .take(self.num_children as usize)
             .filter_map(|(&k, c)| {
-                if let Some(child) = unsafe { c.assume_init_ref() } {
+                if let Some(child) = c {
                     Some((k, child))
                 } else {
                     None
@@ -280,8 +273,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
         let mut new_node = Self::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
             new_node.keys[i] = self.keys[i];
-            new_node.children[i] =
-                MaybeUninit::new(unsafe { self.children[i].assume_init_ref() }.clone());
+            new_node.children[i] =self.children[i].clone();
         }
         new_node.num_children = self.num_children;
         new_node.version = self.version;
@@ -292,7 +284,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
         let mut new_node = self.clone();
         let idx = new_node.index(key).unwrap();
         new_node.keys[idx] = key;
-        new_node.children[idx] = MaybeUninit::new(Some(node));
+        new_node.children[idx] = Some(node);
         new_node.update_version_to_max_child_version();
 
         new_node
@@ -312,7 +304,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
 
     fn find_child(&self, key: u8) -> Option<&Arc<N>> {
         let idx = self.index(key)?;
-        let child = unsafe { self.children[idx].assume_init_ref().as_ref() };
+        let child = self.children[idx].as_ref();
         child
     }
 
@@ -324,16 +316,14 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
             .take(self.num_children as usize)
             .position(|&k| k == key)
             .unwrap();
-        new_node.children[idx] = MaybeUninit::new(None);
+        new_node.children[idx] = None;
         for i in idx..(WIDTH - 1) {
             new_node.keys[i] = self.keys[i + 1];
-            unsafe {
-                *new_node.children[i].as_mut_ptr() = self.children[i + 1].assume_init_ref().clone();
-            }
+            new_node.children[i] = self.children[i + 1].clone();
         }
 
         new_node.keys[WIDTH - 1] = 0;
-        new_node.children[WIDTH - 1] = MaybeUninit::new(None);
+        new_node.children[WIDTH - 1] = None;
         new_node.num_children -= 1;
         new_node.update_version_to_max_child_version();
 
@@ -360,7 +350,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Version for FlatNode<P
 impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> Drop for FlatNode<P, N, WIDTH> {
     fn drop(&mut self) {
         for value in &mut self.children[..self.num_children as usize] {
-            unsafe { value.assume_init_drop() }
+            value.take();
         }
         self.num_children = 0;
     }
@@ -687,7 +677,6 @@ mod tests {
     use crate::storage::index::FixedKey;
 
     use super::{FlatNode, Node256, Node48, NodeTrait, TwigNode, Version};
-    use std::mem::MaybeUninit;
     use std::sync::Arc;
 
     macro_rules! impl_timestamp {
@@ -913,10 +902,10 @@ mod tests {
             version: 6,
             keys: [0; WIDTH],
             children: Box::new([
-                MaybeUninit::new(Some(Arc::new(child1))),
-                MaybeUninit::new(Some(Arc::new(child2))),
-                MaybeUninit::new(Some(Arc::new(child3))),
-                MaybeUninit::new(None),
+                Some(Arc::new(child1)),
+                Some(Arc::new(child2)),
+                Some(Arc::new(child3)),
+                None,
             ]),
             num_children: 3,
         };
@@ -938,7 +927,7 @@ mod tests {
         // Update a child's version to be the largest (20), parent's version should update to 20
         let mut child6 = FlatNode::<FixedKey<8>, usize, WIDTH>::new(dummy_prefix);
         child6.version = 20;
-        parent.children[2] = MaybeUninit::new(Some(Arc::new(child6)));
+        parent.children[2] = Some(Arc::new(child6));
         parent.update_version();
         assert_eq!(parent.version(), 20);
     }
@@ -953,7 +942,7 @@ mod tests {
             prefix: dummy_prefix,
             version: 6,
             keys: [0; WIDTH],
-            children: Box::new([MaybeUninit::new(Some(Arc::new(child)))]),
+            children: Box::new([Some(Arc::new(child))]),
             num_children: 1,
         };
 
@@ -1046,10 +1035,10 @@ mod tests {
             version: 0,
             keys: [0; WIDTH],
             children: Box::new([
-                MaybeUninit::new(Some(Arc::new(twig1))),
-                MaybeUninit::new(Some(Arc::new(twig2))),
-                MaybeUninit::new(Some(Arc::new(twig3))),
-                MaybeUninit::new(Some(Arc::new(twig4))),
+                Some(Arc::new(twig1)),
+                Some(Arc::new(twig2)),
+                Some(Arc::new(twig3)),
+                Some(Arc::new(twig4)),
             ]),
             num_children: 3,
         };
