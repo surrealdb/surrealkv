@@ -157,7 +157,7 @@ pub struct Core {
     /// Commit log for store.
     pub(crate) clog: Arc<RwLock<Aol>>,
     /// Manifest for store to track Store state.
-    pub(crate) manifest: Aol,
+    pub(crate) manifest: RwLock<Aol>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Value cache for store.
@@ -230,7 +230,7 @@ impl Core {
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
-            manifest,
+            manifest: RwLock::new(manifest),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
             value_cache,
@@ -379,6 +379,9 @@ impl Core {
         // Close the commit log
         self.clog.write().close()?;
 
+        // Close the manifest
+        self.manifest.write().close()?;
+
         self.is_closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -477,8 +480,7 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
 
-    use async_channel::{bounded, Receiver, Sender};
-    use async_std::task::spawn;
+    use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
