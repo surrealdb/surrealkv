@@ -3,7 +3,7 @@ use std::vec;
 use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use async_channel::{bounded, Receiver, Sender};
-use async_std::task::spawn;
+use async_std::task::{spawn, JoinHandle};
 use bytes::{Bytes, BytesMut};
 use futures::{select, FutureExt};
 use hashbrown::HashMap;
@@ -32,7 +32,7 @@ pub struct Store {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     stop_tx: Sender<()>,
-    done_rx: Receiver<()>,
+    task_runner_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl Store {
@@ -43,16 +43,15 @@ impl Store {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
-        let (done_tx, done_rx) = bounded(1);
 
         let core = Arc::new(Core::new(opts, writes_tx)?);
-        TaskRunner::new(core.clone(), writes_rx, stop_rx, done_tx).spawn();
+        let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
 
         Ok(Self {
             core,
             stop_tx,
             is_closed: AtomicBool::new(false),
-            done_rx,
+            task_runner_handle: Arc::new(RwLock::new(Some(task_runner_handle))),
         })
     }
 
@@ -101,12 +100,18 @@ impl Store {
         if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
+
+        // Send stop signal
         self.stop_tx
             .send(())
             .await
             .map_err(|e| Error::SendError(format!("{}", e)))?;
-        // Wait for done signal
-        self.done_rx.recv().await?;
+
+        // Wait for task to finish
+        if let Some(handle) = self.task_runner_handle.write().take() {
+            handle.await;
+        }
+
         self.core.close()?;
         Ok(())
     }
@@ -116,27 +121,20 @@ pub(crate) struct TaskRunner {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
     stop_rx: Receiver<()>,
-    done_tx: Sender<()>,
 }
 
 impl TaskRunner {
     #[inline]
-    fn new(
-        core: Arc<Core>,
-        writes_rx: Receiver<Task>,
-        stop_rx: Receiver<()>,
-        done_tx: Sender<()>,
-    ) -> Self {
+    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
         Self {
             core,
             writes_rx,
             stop_rx,
-            done_tx,
         }
     }
 
     #[inline]
-    fn spawn(self) {
+    fn spawn(self) -> JoinHandle<()> {
         spawn(Box::pin(async move {
             loop {
                 select! {
@@ -149,14 +147,12 @@ impl TaskRunner {
                         while let Ok(task) = self.writes_rx.try_recv() {
                             self.handle_task(task).await;
                         }
-                        // Send done signal
-                        self.done_tx.try_send(()).ok();
                         drop(self);
                         return;
                     },
                 }
             }
-        }));
+        }))
     }
 
     #[inline]
@@ -181,7 +177,7 @@ pub struct Core {
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Value cache for store.
-    /// The assumption for this cache is that it could be useful for
+    /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
     pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
@@ -663,11 +659,10 @@ mod tests {
 
         let (writes_tx, writes_rx) = bounded(100);
         let (stop_tx, stop_rx) = bounded(1);
-        let (done_tx, done_rx) = bounded(1);
         let core = &store.core;
 
-        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx, done_tx);
-        runner.spawn();
+        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx);
+        let fut = runner.spawn();
 
         // Send some tasks
         let task_counter = Arc::new(AtomicU64::new(0));
@@ -694,7 +689,7 @@ mod tests {
         stop_tx.send(()).await.unwrap();
 
         // Wait for a while to let TaskRunner handle all tasks
-        done_rx.recv().await.unwrap();
+        fut.await;
 
         // Check if all tasks were handled
         assert_eq!(task_counter.load(Ordering::SeqCst), 10);

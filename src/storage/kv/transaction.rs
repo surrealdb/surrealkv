@@ -6,9 +6,9 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::{
-    index::{art::TrieError, art::KV, VariableKey},
+    index::{art::TrieError, VariableKey},
     kv::{
-        entry::{Entry, TxRecord, Value, ValueRef},
+        entry::{Entry, Value, ValueRef},
         error::{Error, Result},
         snapshot::{FilterFn, Snapshot, FILTERS},
         store::Core,
@@ -314,7 +314,6 @@ impl Transaction {
             return Ok(());
         }
 
-        // TODO: Use a commit pipeline to avoid blocking calls.
         // Lock the oracle to serialize commits to the transaction log.
         let oracle = self.core.oracle.clone();
         let write_ch_lock = oracle.write_lock.lock();
@@ -323,6 +322,7 @@ impl Transaction {
         let (tx_id, commit_ts) = self.prepare_commit()?;
         let entries = self.write_set.values().cloned().collect();
 
+        // Commit the changes to the store index.
         let done = self
             .core
             .send_to_write_channel(entries, tx_id, commit_ts)
@@ -335,17 +335,11 @@ impl Transaction {
 
         drop(write_ch_lock);
 
-        // // Add transaction records to the transaction log.
-        // self.add_to_transaction_log(tx_id, commit_ts)?;
-
-        // // Commit the changes to the store index.
-        // self.commit_to_index(tx_id, commit_ts)?;
-
-        // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
-        // oracle.committed_upto(tx_id);
-
+        // Check if the transaction is written to the transaction log.
         let done = done.unwrap();
         let ret = done.recv().await?;
+
+        // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
         oracle.committed_upto(tx_id);
 
         // Mark the transaction as closed.
@@ -370,61 +364,6 @@ impl Transaction {
             entry.ts = commit_ts;
         });
         commit_ts
-    }
-
-    /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
-        let current_offset = self.core.clog.read().offset()?;
-        let entries: Vec<Entry> = self.write_set.values().cloned().collect();
-        let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
-        tx_record.encode(
-            &mut self.buf,
-            current_offset,
-            &mut self.committed_values_offsets,
-        )?;
-
-        let mut clog = self.core.clog.write();
-        let (tx_offset, _) = clog.append(self.buf.as_ref())?;
-        Ok(tx_offset)
-    }
-
-    /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
-        let mut index = self.core.indexer.write();
-        let mut kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
-
-        index.bulk_insert(&mut kv_pairs)?;
-        Ok(())
-    }
-
-    /// Builds key-value pairs from the write set.
-    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VariableKey, Bytes>> {
-        let mut kv_pairs = Vec::new();
-
-        for (_, entry) in self.write_set.iter() {
-            let index_value = self.build_index_value(entry);
-
-            kv_pairs.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: tx_id,
-                ts: commit_ts,
-            });
-        }
-
-        kv_pairs
-    }
-
-    /// Builds an index value from an entry.
-    fn build_index_value(&self, entry: &Entry) -> Bytes {
-        let index_value = ValueRef::encode(
-            &entry.key,
-            &entry.value,
-            entry.metadata.as_ref(),
-            &self.committed_values_offsets,
-            self.core.opts.max_value_threshold,
-        );
-        index_value
     }
 
     /// Rolls back the transaction by removing all updated entries.

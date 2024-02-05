@@ -2,7 +2,6 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use jemallocator::Jemalloc;
 
@@ -156,4 +155,5 @@ fn concurrent_insert(c: &mut Criterion) {
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-criterion_main!(benches_sequential, benches_concurrent);
+// criterion_main!(benches_sequential, benches_concurrent);
+criterion_main!(benches_concurrent);
