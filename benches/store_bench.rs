@@ -17,7 +17,7 @@ fn create_temp_directory() -> TempDir {
     TempDir::new("test").unwrap()
 }
 
-async fn bulk_insert(c: &mut Criterion) {
+fn bulk_insert(c: &mut Criterion) {
     let count = AtomicU32::new(0_u32);
     let bytes = |len| -> Vec<u8> {
         count

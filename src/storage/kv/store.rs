@@ -30,7 +30,9 @@ use crate::storage::{
 /// An MVCC-based transactional key-value store.
 pub struct Store {
     pub(crate) core: Arc<Core>,
-    pub(crate) stop_tx: Sender<()>,
+    pub(crate) is_closed: AtomicBool,
+    stop_tx: Sender<()>,
+    done_rx: Receiver<()>,
 }
 
 impl Store {
@@ -41,10 +43,17 @@ impl Store {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
-        let core = Arc::new(Core::new(opts, writes_tx)?);
-        TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
+        let (done_tx, done_rx) = bounded(1);
 
-        Ok(Self { core, stop_tx })
+        let core = Arc::new(Core::new(opts, writes_tx)?);
+        TaskRunner::new(core.clone(), writes_rx, stop_rx, done_tx).spawn();
+
+        Ok(Self {
+            core,
+            stop_tx,
+            is_closed: AtomicBool::new(false),
+            done_rx,
+        })
     }
 
     /// Begins a new read-write transaction.
@@ -86,19 +95,20 @@ impl Store {
 
         Ok(())
     }
-}
 
-impl Drop for Store {
-    /// Drops the store by closing the core.
-    /// If closing the core fails, it panics with an error message.
-    fn drop(&mut self) {
-        if self.stop_tx.try_send(()).is_err() {
-            eprintln!("Failed to send stop signal");
+    /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
+    pub async fn close(&self) -> Result<()> {
+        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
         }
-        let err = self.core.close();
-        if err.is_err() {
-            panic!("failed to close core: {:?}", err);
-        }
+        self.stop_tx
+            .send(())
+            .await
+            .map_err(|e| Error::SendError(format!("{}", e)))?;
+        // Wait for done signal
+        self.done_rx.recv().await?;
+        self.core.close()?;
+        Ok(())
     }
 }
 
@@ -106,15 +116,22 @@ pub(crate) struct TaskRunner {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
     stop_rx: Receiver<()>,
+    done_tx: Sender<()>,
 }
 
 impl TaskRunner {
     #[inline]
-    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+    fn new(
+        core: Arc<Core>,
+        writes_rx: Receiver<Task>,
+        stop_rx: Receiver<()>,
+        done_tx: Sender<()>,
+    ) -> Self {
         Self {
             core,
             writes_rx,
             stop_rx,
+            done_tx,
         }
     }
 
@@ -128,9 +145,12 @@ impl TaskRunner {
                         self.handle_task(task).await
                     },
                     _ = self.stop_rx.recv().fuse() => {
+                        // Consume all remaining items in writes_rx
                         while let Ok(task) = self.writes_rx.try_recv() {
                             self.handle_task(task).await;
                         }
+                        // Send done signal
+                        self.done_tx.try_send(()).ok();
                         drop(self);
                         return;
                     },
@@ -643,9 +663,10 @@ mod tests {
 
         let (writes_tx, writes_rx) = bounded(100);
         let (stop_tx, stop_rx) = bounded(1);
+        let (done_tx, done_rx) = bounded(1);
         let core = &store.core;
 
-        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx);
+        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx, done_tx);
         runner.spawn();
 
         // Send some tasks
@@ -673,7 +694,7 @@ mod tests {
         stop_tx.send(()).await.unwrap();
 
         // Wait for a while to let TaskRunner handle all tasks
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        done_rx.recv().await.unwrap();
 
         // Check if all tasks were handled
         assert_eq!(task_counter.load(Ordering::SeqCst), 10);
