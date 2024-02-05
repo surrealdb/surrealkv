@@ -127,8 +127,10 @@ impl TaskRunner {
                         let task = req.unwrap();
                         self.handle_task(task).await
                     },
-                    // TODO: need to consume all transactions from channel
                     _ = self.stop_rx.recv().fuse() => {
+                        while let Ok(task) = self.writes_rx.try_recv() {
+                            self.handle_task(task).await;
+                        }
                         drop(self);
                         return;
                     },
@@ -473,7 +475,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
+    use crate::storage::kv::store::{Store, Task, TaskRunner};
+
+    use async_channel::{bounded, Receiver, Sender};
+    use async_std::task::spawn;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use tempdir::TempDir;
@@ -619,5 +625,55 @@ mod tests {
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn stop_task_runner() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        let (writes_tx, writes_rx) = bounded(100);
+        let (stop_tx, stop_rx) = bounded(1);
+        let core = &store.core;
+
+        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx);
+        runner.spawn();
+
+        // Send some tasks
+        let task_counter = Arc::new(AtomicU64::new(0));
+        for i in 0..10 {
+            let (done_tx, done_rx) = bounded(1);
+            writes_tx
+                .send(Task {
+                    entries: vec![],
+                    done: Some(done_tx),
+                    tx_id: i,
+                    commit_ts: i,
+                })
+                .await
+                .unwrap();
+
+            let task_counter = Arc::clone(&task_counter);
+            tokio::spawn(async move {
+                done_rx.recv().await.unwrap().unwrap();
+                task_counter.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        // Send stop signal
+        stop_tx.send(()).await.unwrap();
+
+        // Wait for a while to let TaskRunner handle all tasks
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Check if all tasks were handled
+        assert_eq!(task_counter.load(Ordering::SeqCst), 10);
     }
 }
