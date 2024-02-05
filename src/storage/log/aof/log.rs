@@ -7,7 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lru::LruCache;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -199,7 +199,7 @@ impl Aol {
     ///
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
-    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
+    pub async fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
         if buf.is_empty() {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::UnexpectedEof,
@@ -215,7 +215,10 @@ impl Aol {
 
             // Read data from the appropriate segment
             // r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
-            match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
+            match self
+                .read_segment_data(&mut buf[r..], segment_id, read_offset)
+                .await
+            {
                 Ok(bytes_read) => {
                     r += bytes_read;
                 }
@@ -237,7 +240,7 @@ impl Aol {
     }
 
     // Helper function to read data from the appropriate segment
-    fn read_segment_data(
+    async fn read_segment_data(
         &self,
         buf: &mut [u8],
         segment_id: u64,
@@ -249,7 +252,7 @@ impl Aol {
             let _lock = self.mutex.write();
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let mut cache = self.segment_cache.write();
+            let mut cache = self.segment_cache.write().await;
             match cache.get(&segment_id) {
                 Some(segment) => segment.read_at(buf, read_offset),
                 None => {
@@ -298,8 +301,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn append() {
+    #[tokio::test]
+    async fn append() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -334,19 +337,19 @@ mod tests {
 
         // Test reading from segment
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, 0).expect("should read");
+        let n = a.read_at(&mut bs, 0).await.expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 7];
-        let n = a.read_at(&mut bs, 4).expect("should read");
+        let n = a.read_at(&mut bs, 4).await.expect("should read");
         assert_eq!(7, n);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
-        let r = a.read_at(&mut bs, 4097);
+        let r = a.read_at(&mut bs, 4097).await;
         assert!(r.is_err());
 
         // Test appending another buffer
@@ -360,7 +363,7 @@ mod tests {
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, 11).expect("should read");
+        let n = a.read_at(&mut bs, 11).await.expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 

@@ -10,7 +10,7 @@ use std::{
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
-use parking_lot::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::storage::{
     index::art::TrieError,
@@ -53,21 +53,21 @@ impl Oracle {
 
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        self.isolation.new_commit_ts(txn)
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        self.isolation.new_commit_ts(txn).await
     }
 
     /// Returns the read timestamp.
     /// It delegates to the isolation level to get the timestamp.
-    pub(crate) fn read_ts(&self) -> u64 {
-        self.isolation.read_ts()
+    pub(crate) async fn read_ts(&self) -> u64 {
+        self.isolation.read_ts().await
     }
 
     /// Sets the timestamp and increments it.
     /// It delegates to the isolation level to set and increment the timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.isolation.set_ts(ts);
-        self.isolation.increment_ts();
+    pub(crate) async fn set_ts(&self, ts: u64) {
+        self.isolation.set_ts(ts).await;
+        self.isolation.increment_ts().await;
     }
 
     /// Marks the transactions as committed up to the given timestamp.
@@ -103,8 +103,12 @@ pub(crate) enum IsolationLevel {
 macro_rules! isolation_level_method {
     ($self:ident, $method:ident $(, $arg:ident)?) => {
         match $self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.$method($($arg)?),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.$method($($arg)?),
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => {
+                oracle.$method($($arg)?).await
+            },
+            IsolationLevel::SnapshotIsolation(oracle) => {
+                oracle.$method($($arg)?).await
+            },
         }
     };
 }
@@ -112,25 +116,25 @@ macro_rules! isolation_level_method {
 impl IsolationLevel {
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the specific isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         isolation_level_method!(self, new_commit_ts, txn)
     }
 
     /// Returns the read timestamp.
     /// It delegates to the specific isolation level to get the timestamp.
-    pub(crate) fn read_ts(&self) -> u64 {
+    pub(crate) async fn read_ts(&self) -> u64 {
         isolation_level_method!(self, read_ts)
     }
 
     /// Sets the timestamp.
     /// It delegates to the specific isolation level to set the timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
+    pub(crate) async fn set_ts(&self, ts: u64) {
         isolation_level_method!(self, set_ts, ts)
     }
 
-    /// Increments the timestamp.
-    /// It delegates to the specific isolation level to increment the timestamp.
-    pub(crate) fn increment_ts(&self) {
+    // /// Increments the timestamp.
+    // /// It delegates to the specific isolation level to increment the timestamp.
+    pub(crate) async fn increment_ts(&self) {
         isolation_level_method!(self, increment_ts)
     }
 }
@@ -150,7 +154,7 @@ impl SnapshotIsolation {
     }
 
     /// Sets the next transaction ID to the given timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
+    pub(crate) async fn set_ts(&self, ts: u64) {
         self.next_tx_id.store(ts, Ordering::SeqCst);
     }
 
@@ -158,9 +162,9 @@ impl SnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts())?;
-        let read_set = txn.read_set.lock();
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts().await).await?;
+        let read_set = txn.read_set.lock().await;
 
         for (key, ts) in read_set.iter() {
             match current_snapshot.get(&key[..].into()) {
@@ -185,12 +189,12 @@ impl SnapshotIsolation {
     }
 
     /// Returns the read timestamp, which is the next transaction ID minus 1.
-    pub(crate) fn read_ts(&self) -> u64 {
+    pub(crate) async fn read_ts(&self) -> u64 {
         self.next_tx_id.load(Ordering::SeqCst) - 1
     }
 
     /// Increments the next transaction ID by 1.
-    pub(crate) fn increment_ts(&self) {
+    pub(crate) async fn increment_ts(&self) {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -238,8 +242,8 @@ impl CommitTracker {
 
     /// Checks if a transaction has conflicts with committed transactions.
     /// It acquires a lock on the read set and checks if there are any conflict keys in the read set.
-    fn has_conflict(&self, txn: &Transaction) -> bool {
-        let read_set = txn.read_set.lock();
+    async fn has_conflict(&self, txn: &Transaction) -> bool {
+        let read_set = txn.read_set.lock().await;
 
         if read_set.is_empty() {
             false
@@ -299,12 +303,12 @@ impl SerializableSnapshotIsolation {
     }
 
     // Retrieve the read timestamp for a new read operation.
-    pub(crate) fn read_ts(&self) -> u64 {
-        let commit_tracker = self.commit_tracker.lock();
+    pub(crate) async fn read_ts(&self) -> u64 {
+        let commit_tracker = self.commit_tracker.lock().await;
         let read_ts = commit_tracker.next_ts - 1;
 
         // Keep track of the read timestamp for active transactions.
-        self.read_mark.write().push(Reverse(read_ts));
+        self.read_mark.write().await.push(Reverse(read_ts));
 
         // Wait for the current read timestamp to be visible to new transactions.
         self.txn_mark.wait_for(read_ts);
@@ -312,19 +316,19 @@ impl SerializableSnapshotIsolation {
     }
 
     // Generate a new commit timestamp for a transaction.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let mut commit_tracker = self.commit_tracker.lock();
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        let mut commit_tracker = self.commit_tracker.lock().await;
 
         // Check for conflicts between the transaction and committed transactions.
-        if commit_tracker.has_conflict(txn) {
+        if commit_tracker.has_conflict(txn).await {
             return Err(Error::TransactionReadConflict);
         }
 
         // Mark that read operations are done up to the transaction's read timestamp.
-        self.mark_read_operations_done(txn.read_ts);
+        self.mark_read_operations_done(txn.read_ts).await;
 
         // Clean up committed transactions up to the current read mark.
-        let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
+        let max_read_ts = self.read_mark.read().await.peek().map_or(0, |peek| peek.0);
         commit_tracker.cleanup_committed_transactions(max_read_ts);
 
         let ts = commit_tracker.next_ts;
@@ -342,26 +346,30 @@ impl SerializableSnapshotIsolation {
     }
 
     // Helper method to mark read operations as done up to a given timestamp.
-    fn mark_read_operations_done(&self, read_ts: u64) {
+    async fn mark_read_operations_done(&self, read_ts: u64) {
         self.read_mark
             .write()
+            .await
             .retain(|&read_timestamp| read_timestamp.0 > read_ts);
     }
 
     // Set the global timestamp for the system.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.commit_tracker.lock().next_ts = ts;
+    pub(crate) async fn set_ts(&self, ts: u64) {
+        self.commit_tracker.lock().await.next_ts = ts;
 
         // Mark that read operations are done up to the given timestamp.
         self.txn_mark.done_upto(ts);
 
         // Mark that reads are done up to the given timestamp.
-        self.read_mark.write().retain(|&read_ts| read_ts.0 > ts);
+        self.read_mark
+            .write()
+            .await
+            .retain(|&read_ts| read_ts.0 > ts);
     }
 
     // Increment the global timestamp for the system.
-    pub(crate) fn increment_ts(&self) {
-        let mut commit_info = self.commit_tracker.lock();
+    pub(crate) async fn increment_ts(&self) {
+        let mut commit_info = self.commit_tracker.lock().await;
         commit_info.next_ts += 1;
     }
 }
@@ -400,8 +408,8 @@ impl Mark {
         })
     }
 
-    fn take(&self) -> Sender<()> {
-        self.ch.lock().take().unwrap()
+    async fn take(&self) -> Sender<()> {
+        self.ch.lock().await.take().unwrap()
     }
 }
 
@@ -414,8 +422,8 @@ impl WaterMark {
     }
 
     /// Marks transactions as done up to the specified timestamp.
-    fn done_upto(&self, t: u64) {
-        let mut mark = self.mark.write();
+    async fn done_upto(&self, t: u64) {
+        let mut mark = self.mark.write().await;
 
         let done_upto = mark.done_upto;
         if done_upto >= t {
@@ -433,8 +441,8 @@ impl WaterMark {
     }
 
     /// Waits for transactions to be done up to the specified timestamp.
-    fn wait_for(&self, t: u64) {
-        let mark = self.mark.read();
+    async fn wait_for(&self, t: u64) {
+        let mark = self.mark.read().await;
         if mark.done_upto >= t {
             return;
         }
@@ -442,20 +450,20 @@ impl WaterMark {
         drop(mark);
 
         if should_insert {
-            let mut mark = self.mark.write();
+            let mut mark = self.mark.write().await;
             mark.waiters.entry(t).or_insert_with(Mark::new);
             drop(mark);
         }
 
-        let mark = self.mark.read(); // Re-acquire the read lock.
+        let mark = self.mark.read().await; // Re-acquire the read lock.
         let wp = mark.waiters.get(&t).unwrap().clone();
         drop(mark);
         matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
     }
 
     /// Gets the highest completed timestamp.
-    fn done_until(&self) -> u64 {
-        let mark = self.mark.read();
+    async fn done_until(&self) -> u64 {
+        let mark = self.mark.read().await;
         mark.done_upto
     }
 }
@@ -466,12 +474,12 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    #[test]
-    fn waiters_new() {
+    #[tokio::test]
+    async fn waiters_new() {
         let hub = WaterMark::new();
 
         hub.done_upto(10);
-        let t2 = hub.done_until();
+        let t2 = hub.done_until().await;
         assert_eq!(t2, 10);
 
         for i in 1..=10 {

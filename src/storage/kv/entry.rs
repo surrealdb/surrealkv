@@ -2,6 +2,7 @@ use hashbrown::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::storage::{
@@ -276,8 +277,9 @@ impl TxEntry {
     }
 }
 
+#[async_trait]
 pub(crate) trait Value {
-    fn resolve(&self) -> Result<Vec<u8>>;
+    async fn resolve(&self) -> Result<Vec<u8>>;
     fn ts(&self) -> u64;
     fn key_value_metadata(&self) -> Option<&Metadata>;
     fn length(&self) -> usize;
@@ -295,17 +297,18 @@ pub struct ValueRef {
     store: Arc<Core>,
 }
 
+#[async_trait]
 impl Value for ValueRef {
     /// Resolves the value associated with this instance.
     /// If the value is present, it returns a cloned vector of the value.
     /// If the value offset is present, it reads the value from the offset in the commit log.
-    fn resolve(&self) -> Result<Vec<u8>> {
+    async fn resolve(&self) -> Result<Vec<u8>> {
         // Check if the value is present directly
         if let Some(value) = &self.value {
             Ok(value.to_vec())
         } else if let Some(value_offset) = self.value_offset {
             // Resolve from the specified offset
-            self.resolve_from_offset(value_offset)
+            self.resolve_from_offset(value_offset).await
         } else {
             // If neither value nor offset is present, return an error
             Err(Error::EmptyValue)
@@ -445,21 +448,22 @@ impl ValueRef {
     /// Resolves the value from the given offset in the commit log.
     /// If the offset exists in the value cache, it returns the cached value.
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
-    fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
+    async fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
         // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.write().get(&value_offset) {
+        if let Some(value) = self.store.value_cache.write().await.get(&value_offset) {
             return Ok(value.to_vec());
         }
 
         // Read the value from the commit log at the specified offset
         let mut buf = vec![0; self.value_length];
-        let vlog = self.store.clog.read();
-        vlog.read_at(&mut buf, value_offset)?;
+        let vlog = self.store.clog.read().await;
+        vlog.read_at(&mut buf, value_offset).await?;
 
         // Store the offset and value in value_cache
         self.store
             .value_cache
             .write()
+            .await
             .push(value_offset, Bytes::from(buf.clone()));
 
         Ok(buf)
@@ -479,8 +483,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn encode_decode() {
+    #[tokio::test]
+    async fn encode_decode() {
         // Create a sample valueRef instance
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
@@ -490,7 +494,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         let mut txmd = Metadata::new();
         txmd.as_deleted(true).expect("failed to set deleted");
@@ -530,7 +534,7 @@ mod tests {
         opts.max_value_threshold = 2;
 
         // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         // Define test keys and value
         let key1 = Bytes::from("foo1");
@@ -543,8 +547,8 @@ mod tests {
             let mut txn = store.begin().await.unwrap();
 
             // Set key1 and key2 with the same value
-            txn.set(&key1, &value).unwrap();
-            txn.set(&key2, &value).unwrap();
+            txn.set(&key1, &value).await.unwrap();
+            txn.set(&key2, &value).await.unwrap();
 
             // Commit the transaction
             txn.commit().await.unwrap();
@@ -555,7 +559,7 @@ mod tests {
             let txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).await.unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -566,7 +570,7 @@ mod tests {
             let txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).await.unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -577,7 +581,7 @@ mod tests {
             let mut txn = store.begin().await.unwrap();
 
             // Set key3 with the same value
-            txn.set(&key3, &value).unwrap();
+            txn.set(&key3, &value).await.unwrap();
 
             // Commit the transaction
             txn.commit().await.unwrap();
@@ -588,7 +592,7 @@ mod tests {
             let txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key3
-            let val = txn.get(&key3).unwrap();
+            let val = txn.get(&key3).await.unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -606,7 +610,7 @@ mod tests {
         opts.max_value_threshold = 40;
 
         // Create a new Core instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         // Define test keys and value
         let key1 = Bytes::from("foo1");
@@ -618,8 +622,8 @@ mod tests {
             let mut txn = store.begin().await.unwrap();
 
             // Set key1 and key2 with the same value
-            txn.set(&key1, &value).unwrap();
-            txn.set(&key2, &value).unwrap();
+            txn.set(&key1, &value).await.unwrap();
+            txn.set(&key2, &value).await.unwrap();
 
             // Commit the transaction
             txn.commit().await.unwrap();
@@ -630,7 +634,7 @@ mod tests {
             let txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).await.unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -641,7 +645,7 @@ mod tests {
             let txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).await.unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);

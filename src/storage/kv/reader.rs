@@ -61,7 +61,7 @@ impl Reader {
     /// # Arguments
     ///
     /// * `buf: &mut [u8]` - The buffer to read data into.
-    pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let mut n = 0;
         let buf_len = buf.len();
 
@@ -80,7 +80,8 @@ impl Reader {
 
             let rn = self
                 .r_at
-                .read_at(&mut self.buffer[..buf_len], self.offset)?;
+                .read_at(&mut self.buffer[..buf_len], self.offset)
+                .await?;
             self.read = rn;
             self.start = 0;
             self.offset += rn as u64;
@@ -95,9 +96,9 @@ impl Reader {
 
     /// Reads a single byte from the data source.
     #[allow(dead_code)]
-    pub(crate) fn read_byte(&mut self) -> Result<u8> {
+    pub(crate) async fn read_byte(&mut self) -> Result<u8> {
         let mut b = [0; 1];
-        self.read(&mut b)?;
+        self.read(&mut b).await?;
         Ok(b[0])
     }
 
@@ -106,30 +107,30 @@ impl Reader {
     /// # Arguments
     ///
     /// * `len: usize` - The number of bytes to read.
-    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+    async fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0; len];
-        self.read(&mut buffer)?;
+        self.read(&mut buffer).await?;
         Ok(buffer)
     }
 
     /// Reads a 64-bit unsigned integer from the data source.
-    pub(crate) fn read_uint64(&mut self) -> Result<u64> {
+    pub(crate) async fn read_uint64(&mut self) -> Result<u64> {
         let mut b = [0; 8];
-        self.read(&mut b)?;
+        self.read(&mut b).await?;
         Ok(u64::from_be_bytes(b))
     }
 
     /// Reads a 32-bit unsigned integer from the data source.
-    pub(crate) fn read_uint32(&mut self) -> Result<u32> {
+    pub(crate) async fn read_uint32(&mut self) -> Result<u32> {
         let mut b = [0; 4];
-        self.read(&mut b)?;
+        self.read(&mut b).await?;
         Ok(u32::from_be_bytes(b))
     }
 
     /// Reads a 16-bit unsigned integer from the data source.
-    pub(crate) fn read_uint16(&mut self) -> Result<u16> {
+    pub(crate) async fn read_uint16(&mut self) -> Result<u16> {
         let mut b = [0; 2];
-        self.read(&mut b)?;
+        self.read(&mut b).await?;
         Ok(u16::from_be_bytes(b))
     }
 }
@@ -157,8 +158,8 @@ impl TxReader {
     /// # Arguments
     ///
     /// * `tx: &mut TxRecord` - The transaction record to read the header into.    
-    pub(crate) fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
-        let id = self.r.read_uint64()?;
+    pub(crate) async fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
+        let id = self.r.read_uint64().await?;
 
         // Either the header is corrupted or we have reached the end of the file
         // and encountered the padded zeros towards the end of the file.
@@ -167,12 +168,12 @@ impl TxReader {
         }
 
         tx.header.id = id;
-        tx.header.lsn = self.r.read_uint64()?;
-        tx.header.ts = self.r.read_uint64()?;
-        tx.header.version = self.r.read_uint16()?;
-        tx.header.num_entries = self.r.read_uint32()?;
+        tx.header.lsn = self.r.read_uint64().await?;
+        tx.header.ts = self.r.read_uint64().await?;
+        tx.header.version = self.r.read_uint16().await?;
+        tx.header.num_entries = self.r.read_uint32().await?;
 
-        let md_len = self.r.read_uint16()? as usize;
+        let md_len = self.r.read_uint16().await? as usize;
         if md_len > MAX_TX_METADATA_SIZE {
             return Err(Error::CorruptedTransactionHeader);
         }
@@ -180,7 +181,7 @@ impl TxReader {
         let mut txmd: Option<Metadata> = None;
         if md_len > 0 {
             let mut md_bs = [0; MAX_TX_METADATA_SIZE];
-            self.r.read(&mut md_bs[..md_len])?;
+            self.r.read(&mut md_bs[..md_len]).await?;
 
             let metadata = Metadata::from_bytes(&md_bs)?;
             txmd = Some(metadata);
@@ -192,23 +193,23 @@ impl TxReader {
     }
 
     /// Reads a transaction entry.
-    fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
-        let md_len = self.r.read_uint16()?;
+    async fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
+        let md_len = self.r.read_uint16().await?;
         let kvmd = if md_len > 0 {
-            let md_bs = self.r.read_bytes(md_len as usize)?;
+            let md_bs = self.r.read_bytes(md_len as usize).await?;
             let metadata = Metadata::from_bytes(&md_bs)?;
             Some(metadata)
         } else {
             None
         };
 
-        let k_len = self.r.read_uint32()? as usize;
-        let k = self.r.read_bytes(k_len)?;
+        let k_len = self.r.read_uint32().await? as usize;
+        let k = self.r.read_bytes(k_len).await?;
 
-        let v_len = self.r.read_uint32()? as usize;
+        let v_len = self.r.read_uint32().await? as usize;
         let offset = self.r.offset();
-        let v = self.r.read_bytes(v_len)?;
-        let crc32 = self.r.read_uint32()?;
+        let v = self.r.read_bytes(v_len).await?;
+        let crc32 = self.r.read_uint32().await?;
 
         Ok((
             TxEntry {
@@ -228,18 +229,21 @@ impl TxReader {
     /// # Arguments
     ///
     /// * `tx: &mut TxRecord` - The `TxRecord` to read data into.
-    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
-        self.read_header(tx)?;
+    pub(crate) async fn read_into(
+        &mut self,
+        tx: &mut TxRecord,
+    ) -> Result<HashMap<bytes::Bytes, usize>> {
+        self.read_header(tx).await?;
 
         let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
         for i in 0..tx.header.num_entries as usize {
-            let (entry, offset) = self.read_entry()?;
+            let (entry, offset) = self.read_entry().await?;
             let key = entry.key.clone();
             tx.entries.insert(i, entry);
             value_offsets.insert(key, offset as usize);
         }
 
-        self.verify_crc(tx)?;
+        self.verify_crc(tx).await?;
 
         Ok(value_offsets)
     }
@@ -249,8 +253,8 @@ impl TxReader {
     /// # Arguments
     ///
     /// * `tx: &TxRecord` - The `TxRecord` to verify the CRC of.    
-    fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
-        let entry_crc = self.r.read_uint32()?;
+    async fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
+        let entry_crc = self.r.read_uint32().await?;
         let buf = Self::serialize_tx_record(tx)?;
         let actual_crc = calculate_crc32(&buf);
         if entry_crc != actual_crc {
@@ -282,8 +286,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn reader() {
+    #[tokio::test]
+    async fn reader() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -311,7 +315,7 @@ mod tests {
         let mut r = Reader::new_from(a, 0, 200000).unwrap();
 
         let mut bs = vec![0; 4];
-        let n = r.read(&mut bs).expect("should read");
+        let n = r.read(&mut bs).await.expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
     }

@@ -37,7 +37,7 @@ fn bulk_insert(c: &mut Criterion) {
 
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
-        let db = Store::new(opts).expect("should create store");
+        let db = rt.block_on(async { Store::new(opts).await.expect("should create store") });
 
         c.bench_function(
             &format!("bulk load key/value lengths {}/{}", key_len, val_len),
@@ -45,6 +45,7 @@ fn bulk_insert(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let mut txn = db.begin().await.unwrap();
                     txn.set(bytes(key_len)[..].into(), bytes(val_len)[..].into())
+                        .await
                         .unwrap();
                     txn.commit().await.unwrap();
                 })
@@ -71,7 +72,7 @@ fn sequential_insert_read(c: &mut Criterion) {
         let max_count = AtomicU32::new(0_u32);
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
-        let db = Store::new(opts).expect("should create store");
+        let db = rt.block_on(async { Store::new(opts).await.expect("should create store") });
 
         c.bench_function(&format!("sequential inserts"), |b| {
             let count = AtomicU32::new(0_u32);
@@ -81,6 +82,7 @@ fn sequential_insert_read(c: &mut Criterion) {
                     count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
                     vec![][..].into(),
                 )
+                .await
                 .unwrap();
                 txn.commit().await.unwrap();
 
@@ -99,7 +101,7 @@ fn sequential_insert_read(c: &mut Criterion) {
                 let current_count = count.load(Relaxed);
                 if current_count <= max_count.load(Relaxed) {
                     let txn = db.begin().await.unwrap();
-                    txn.get(&current_count.to_be_bytes()[..]).unwrap();
+                    txn.get(&current_count.to_be_bytes()[..]).await.unwrap();
                 }
             })
         });
@@ -114,10 +116,16 @@ fn concurrent_insert(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(criterion::Throughput::Elements(item_count as u64));
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+
     let mut opts = Options::new();
     opts.dir = create_temp_directory().path().to_path_buf();
     opts.max_tx_entries = item_count;
-    let db = Arc::new(Store::new(opts).expect("should create store"));
+    let db = rt.block_on(async { Arc::new(Store::new(opts).await.expect("should create store")) });
 
     {
         let thread_count = 8_u32;
@@ -137,7 +145,7 @@ fn concurrent_insert(c: &mut Criterion) {
                                 for _ in 0..(item_count / thread_count) {
                                     let key = nanoid::nanoid!();
                                     let value = nanoid::nanoid!();
-                                    txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+                                    txn.set(key.as_bytes(), value.as_bytes()).await.unwrap();
                                 }
                                 txn.commit().await.unwrap();
                             })
@@ -151,9 +159,9 @@ fn concurrent_insert(c: &mut Criterion) {
             },
         );
     }
+    rt.shutdown_background();
 }
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-// criterion_main!(benches_sequential, benches_concurrent);
-criterion_main!(benches_concurrent);
+criterion_main!(benches_sequential, benches_concurrent);

@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{select, FutureExt};
 use hashbrown::HashMap;
 use lru::LruCache;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 
 use crate::storage::{
     index::art::KV,
@@ -39,12 +39,12 @@ impl Store {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub async fn new(opts: Options) -> Result<Self> {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
 
-        let core = Arc::new(Core::new(opts, writes_tx)?);
+        let core = Arc::new(Core::new(opts, writes_tx).await?);
         let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
 
         Ok(Self {
@@ -59,7 +59,7 @@ impl Store {
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub async fn begin(&self) -> Result<Transaction> {
-        let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
+        let txn = Transaction::new(self.core.clone(), Mode::ReadWrite).await?;
         Ok(txn)
     }
 
@@ -67,7 +67,7 @@ impl Store {
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-        let txn = Transaction::new(self.core.clone(), mode)?;
+        let txn = Transaction::new(self.core.clone(), mode).await?;
         Ok(txn)
     }
 
@@ -108,11 +108,11 @@ impl Store {
             .map_err(|e| Error::SendError(format!("{}", e)))?;
 
         // Wait for task to finish
-        if let Some(handle) = self.task_runner_handle.write().take() {
+        if let Some(handle) = self.task_runner_handle.write().await.take() {
             handle.await;
         }
 
-        self.core.close()?;
+        self.core.close().await?;
         Ok(())
     }
 }
@@ -207,7 +207,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
+    pub async fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Indexer::new(&opts);
 
@@ -217,7 +217,7 @@ impl Core {
         let mut manifest = Aol::open(&manifest_subdir, &mopts)?;
 
         // Load or create metadata from the manifest file.
-        let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest)?;
+        let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest).await?;
 
         // Update options with the loaded metadata.
         let opts = Options::from_metadata(metadata, opts.dir.clone())?;
@@ -231,7 +231,7 @@ impl Core {
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &copts, &mut indexer)?;
+            Core::load_index(&opts, &copts, &mut indexer).await?;
         }
 
         // Create and initialize an Oracle.
@@ -255,15 +255,15 @@ impl Core {
         })
     }
 
-    pub(crate) fn read_ts(&self) -> Result<u64> {
+    pub(crate) async fn read_ts(&self) -> Result<u64> {
         if self.is_closed() {
             return Err(Error::StoreClosed);
         }
 
-        Ok(self.oracle.read_ts())
+        Ok(self.oracle.read_ts().await)
     }
 
-    fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
+    async fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
         let clog_subdir = opts.dir.join("clog");
         let clog = Aol::open(&clog_subdir, copts)?;
         let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
@@ -277,7 +277,7 @@ impl Core {
             tx.reset();
 
             // Read the next transaction record from the log.
-            let value_offsets = match tx_reader.read_into(&mut tx) {
+            let value_offsets = match tx_reader.read_into(&mut tx).await {
                 Ok(value_offsets) => value_offsets,
                 Err(e) => {
                     if let Error::LogError(LogError::EOF(_)) = e {
@@ -322,14 +322,14 @@ impl Core {
         indexer.bulk_insert(&mut kv_pairs)
     }
 
-    fn load_or_create_metadata(
+    async fn load_or_create_metadata(
         opts: &Options,
         mopts: &LogOptions,
         manifest: &mut Aol,
     ) -> Result<Metadata> {
         let current_metadata = opts.to_metadata();
         let existing_metadata = if !manifest.size()? > 0 {
-            Core::load_manifest(opts, mopts)?
+            Core::load_manifest(opts, mopts).await?
         } else {
             None
         };
@@ -347,7 +347,7 @@ impl Core {
         }
     }
 
-    fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
+    async fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
         let manifest_subdir = opts.dir.join("manifest");
         let mlog = Aol::open(&manifest_subdir, mopts)?;
         let mut reader = Reader::new_from(mlog, 0, BLOCK_SIZE)?;
@@ -357,7 +357,7 @@ impl Core {
         loop {
             // Read the next transaction record from the log.
             let mut len_buf = [0; 4];
-            let res = reader.read(&mut len_buf); // Read 4 bytes for the length
+            let res = reader.read(&mut len_buf).await; // Read 4 bytes for the length
             if let Err(e) = res {
                 if let Error::LogError(LogError::EOF(_)) = e {
                     break;
@@ -368,7 +368,7 @@ impl Core {
 
             let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
             let mut md_bytes = vec![0u8; len];
-            reader.read(&mut md_bytes)?; // Read the actual metadata
+            reader.read(&mut md_bytes).await?; // Read the actual metadata
             md = Some(Metadata::new(Some(md_bytes))); // Update md with the new metadata
         }
 
@@ -379,24 +379,24 @@ impl Core {
         self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn close(&self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
 
         // Wait for the oracle to catch up to the latest commit transaction.
         let oracle = self.oracle.clone();
-        let last_commit_ts = oracle.read_ts();
+        let last_commit_ts = oracle.read_ts().await;
         oracle.wait_for(last_commit_ts);
 
         // Close the indexer
-        self.indexer.write().close()?;
+        self.indexer.write().await.close()?;
 
         // Close the commit log
-        self.clog.write().close()?;
+        self.clog.write().await.close()?;
 
         // Close the manifest
-        self.manifest.write().close()?;
+        self.manifest.write().await.close()?;
 
         self.is_closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -407,7 +407,7 @@ impl Core {
     pub(crate) async fn write_request(&self, req: Task) -> Result<()> {
         let done = req.done.clone();
 
-        let result = self.write_entries(req);
+        let result = self.write_entries(req).await;
 
         if let Some(done) = done {
             done.send(result.clone()).await?;
@@ -416,37 +416,37 @@ impl Core {
         result
     }
 
-    fn write_entries(&self, req: Task) -> Result<()> {
+    async fn write_entries(&self, req: Task) -> Result<()> {
         if req.entries.is_empty() {
             return Ok(());
         }
 
-        let current_offset = self.clog.read().offset()?;
+        let current_offset = self.clog.read().await.offset()?;
         let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
         let mut committed_values_offsets = HashMap::new();
 
         tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
 
-        self.append_to_log(&buf)?;
-        self.write_to_index(&req, &committed_values_offsets)?;
+        self.append_to_log(&buf).await?;
+        self.write_to_index(&req, &committed_values_offsets).await?;
 
         Ok(())
     }
 
-    fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
-        let mut clog = self.clog.write();
+    async fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
+        let mut clog = self.clog.write().await;
         clog.append(tx_record)?;
 
         Ok(())
     }
 
-    fn write_to_index(
+    async fn write_to_index(
         &self,
         req: &Task,
         committed_values_offsets: &HashMap<Bytes, usize>,
     ) -> Result<()> {
-        let mut index = self.indexer.write();
+        let mut index = self.indexer.write().await;
         let mut kv_pairs = Vec::new();
 
         for entry in &req.entries {
@@ -516,7 +516,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         // Number of keys to generate
         let num_keys = 10000;
@@ -544,7 +544,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
             let mut txn = store.begin().await.unwrap();
-            txn.set(key, &default_value).unwrap();
+            txn.set(key, &default_value).await.unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -552,7 +552,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().await.unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).await.unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -565,13 +565,13 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         opts.max_value_threshold = 3;
 
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().await.unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).await.unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -587,7 +587,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
+        let store = Store::new(opts.clone()).await.expect("should create store");
 
         drop(store);
 
@@ -596,7 +596,7 @@ mod tests {
         opts.max_active_snapshots = 10;
         opts.max_value_cache_size = 5;
 
-        let store = Store::new(opts.clone()).expect("should create store");
+        let store = Store::new(opts.clone()).await.expect("should create store");
         let store_opts = store.core.opts.clone();
         assert_eq!(store_opts, opts);
     }
@@ -611,7 +611,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Arc::new(Store::new(opts).expect("should create store"));
+        let store = Arc::new(Store::new(opts).await.expect("should create store"));
 
         // Number of keys to generate
         let num_keys = 100;
@@ -640,7 +640,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
             let mut txn = store1.begin().await.unwrap();
-            txn.set(key, &default_value).unwrap();
+            txn.set(key, &default_value).await.unwrap();
             txn.commit().await.unwrap();
         }
     }
@@ -655,7 +655,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Store::new(opts).await.expect("should create store");
 
         let (writes_tx, writes_rx) = bounded(100);
         let (stop_tx, stop_rx) = bounded(1);

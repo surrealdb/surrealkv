@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 
 use crate::storage::log::wal::reader::Reader;
 use crate::storage::log::{

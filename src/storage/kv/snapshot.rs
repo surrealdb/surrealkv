@@ -24,8 +24,8 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: Arc<Core>, ts: u64) -> Result<Self> {
-        let snapshot = store.indexer.write().snapshot()?;
+    pub(crate) async fn take(store: Arc<Core>, ts: u64) -> Result<Self> {
+        let snapshot = store.indexer.write().await.snapshot()?;
 
         Ok(Self {
             ts,
@@ -80,21 +80,21 @@ impl Snapshot {
         Ok(self.snap.new_reader()?)
     }
 
-    pub fn close(&mut self) -> Result<()> {
-        let mut indexer = self.store.indexer.write();
+    pub async fn close(&mut self) -> Result<()> {
+        let mut indexer = self.store.indexer.write().await;
         indexer.close_snapshot(self.snap.id)?;
         Ok(())
     }
 }
 
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        let err = self.close();
-        if err.is_err() {
-            panic!("failed to close snapshot: {:?}", err);
-        }
-    }
-}
+// impl Drop for Snapshot {
+//     fn drop(&mut self) {
+//         let err = self.close();
+//         if err.is_err() {
+//             panic!("failed to close snapshot: {:?}", err);
+//         }
+//     }
+// }
 
 pub(crate) trait FilterFn {
     fn apply(&self, val_ref: &ValueRef, ts: u64) -> Result<()>;
