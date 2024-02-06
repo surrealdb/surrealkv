@@ -58,7 +58,7 @@ impl Store {
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub async fn begin(&self) -> Result<Transaction> {
+    pub fn begin(&self) -> Result<Transaction> {
         let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
@@ -66,7 +66,7 @@ impl Store {
     /// Begins a new transaction with the given mode.
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
         let txn = Transaction::new(self.core.clone(), mode)?;
         Ok(txn)
     }
@@ -74,8 +74,8 @@ impl Store {
     /// Executes a function in a read-only transaction.
     /// It begins a new read-only transaction and executes the function with the transaction.
     /// It returns the result of the function.
-    pub async fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadOnly).await?;
+    pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+        let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
 
         Ok(())
@@ -88,7 +88,7 @@ impl Store {
         self: Arc<Self>,
         f: impl FnOnce(&mut Transaction) -> Result<()>,
     ) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadWrite).await?;
+        let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
         txn.commit().await?;
 
@@ -159,7 +159,7 @@ impl TaskRunner {
     async fn handle_task(&self, task: Task) {
         let core = self.core.clone();
         if let Err(err) = core.write_request(task).await {
-            println!("failed to write: {:?}", err);
+            eprintln!("failed to write: {:?}", err);
         }
     }
 }
@@ -543,7 +543,7 @@ mod tests {
         // Write the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
@@ -551,7 +551,7 @@ mod tests {
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -570,7 +570,7 @@ mod tests {
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -639,7 +639,7 @@ mod tests {
         // Write the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new write transaction
-            let mut txn = store1.begin().await.unwrap();
+            let mut txn = store1.begin().unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }

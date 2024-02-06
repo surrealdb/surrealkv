@@ -423,7 +423,7 @@ mod tests {
 
         {
             // Start a new read-write transaction (txn1)
-            let mut txn1 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key2, &value1).unwrap();
             txn1.commit().await.unwrap();
@@ -431,14 +431,14 @@ mod tests {
 
         {
             // Start a read-only transaction (txn3)
-            let txn3 = store.begin().await.unwrap();
+            let txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap();
             assert_eq!(val, value1.as_ref());
         }
 
         {
             // Start another read-write transaction (txn2)
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn2 = store.begin().unwrap();
             txn2.set(&key1, &value2).unwrap();
             txn2.set(&key2, &value2).unwrap();
             txn2.commit().await.unwrap();
@@ -453,7 +453,7 @@ mod tests {
         let store = Store::new(opts).expect("should create store");
 
         // Start a read-only transaction (txn4)
-        let txn4 = store.begin().await.unwrap();
+        let txn4 = store.begin().unwrap();
         let val = txn4.get(&key1).unwrap();
 
         // Assert that the value retrieved in txn4 matches value2
@@ -470,7 +470,7 @@ mod tests {
 
         {
             // Start a new read-write transaction (txn1)
-            let mut txn1 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().await.unwrap();
@@ -478,20 +478,20 @@ mod tests {
 
         {
             // Start a read-only transaction (txn)
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.delete(&key1).unwrap();
             txn.commit().await.unwrap();
         }
 
         {
             // Start another read-write transaction (txn)
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
             assert!(txn.get(&key1).is_err());
         }
 
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
             let results = txn.scan(range).unwrap();
             assert_eq!(results.len(), 0);
         }
@@ -507,8 +507,8 @@ mod tests {
 
         // no read conflict
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().await.unwrap();
@@ -520,8 +520,8 @@ mod tests {
 
         // read conflict when the read key was updated by another transaction
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().await.unwrap();
@@ -542,8 +542,8 @@ mod tests {
 
         // blind writes should succeed if key wasn't read first
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn2.set(&key1, &value2).unwrap();
@@ -551,7 +551,7 @@ mod tests {
             txn1.commit().await.unwrap();
             txn2.commit().await.unwrap();
 
-            let txn3 = store.begin().await.unwrap();
+            let txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap();
             assert_eq!(val, value2.as_ref());
         }
@@ -560,8 +560,8 @@ mod tests {
         {
             let key = Bytes::from("key3");
 
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key, &value1).unwrap();
             txn1.commit().await.unwrap();
@@ -584,12 +584,12 @@ mod tests {
         {
             let key = Bytes::from("key4");
 
-            let mut txn1 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
             txn1.set(&key, &value1).unwrap();
             txn1.commit().await.unwrap();
 
-            let mut txn2 = store.begin().await.unwrap();
-            let mut txn3 = store.begin().await.unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key).unwrap();
             assert!(txn2.commit().await.is_ok());
@@ -626,14 +626,14 @@ mod tests {
         let keys_to_insert = vec![Bytes::from("key1")];
 
         for key in &keys_to_insert {
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
             txn.commit().await.unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
-        let txn = store.begin().await.unwrap();
+        let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
     }
@@ -650,14 +650,14 @@ mod tests {
         ];
 
         for key in &keys_to_insert {
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
             txn.commit().await.unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
-        let txn = store.begin().await.unwrap();
+        let txn = store.begin().unwrap();
         let results = txn.scan(range).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, keys_to_insert[0]);
@@ -681,13 +681,13 @@ mod tests {
 
         // read conflict when scan keys have been updated in another transaction
         {
-            let mut txn1 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().await.unwrap();
 
-            let mut txn2 = store.begin().await.unwrap();
-            let mut txn3 = store.begin().await.unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.set(&key1, &value4).unwrap();
             txn2.set(&key2, &value2).unwrap();
@@ -714,13 +714,13 @@ mod tests {
 
         // read conflict when read keys are deleted by other transaction
         {
-            let mut txn1 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key4, &value1).unwrap();
             txn1.commit().await.unwrap();
 
-            let mut txn2 = store.begin().await.unwrap();
-            let mut txn3 = store.begin().await.unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key4).unwrap();
             txn2.commit().await.unwrap();
@@ -766,14 +766,14 @@ mod tests {
         let value2 = Bytes::from("v2");
 
         {
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
             txn.commit().await.unwrap();
         }
 
         {
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
             txn.set(&key1, &value2).unwrap();
             assert_eq!(txn.get(&key1).unwrap(), value2.as_ref());
             assert!(txn.get(&key3).is_err());
@@ -792,7 +792,7 @@ mod tests {
         let value1 = Bytes::from("v1");
         let value2 = Bytes::from("v2");
         // Start a new read-write transaction (txn)
-        let mut txn = store.begin().await.unwrap();
+        let mut txn = store.begin().unwrap();
         txn.set(&key1, &value1).unwrap();
         txn.set(&key2, &value2).unwrap();
         txn.commit().await.unwrap();
@@ -814,8 +814,8 @@ mod tests {
         let value6 = Bytes::from("v6");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
             assert!(txn1.get(&key2).is_ok());
@@ -843,7 +843,7 @@ mod tests {
         }
 
         {
-            let txn3 = store.begin().await.unwrap();
+            let txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap();
             assert_eq!(val1, value3.as_ref());
             let val2 = txn3.get(&key2).unwrap();
@@ -867,8 +867,8 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
 
@@ -889,7 +889,7 @@ mod tests {
         }
 
         {
-            let txn3 = store.begin().await.unwrap();
+            let txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap();
             assert_eq!(val1, value1.as_ref());
             let val2 = txn3.get(&key2).unwrap();
@@ -914,8 +914,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
             assert!(txn1.get(&key2).is_ok());
@@ -956,8 +956,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
             assert!(txn2.get(&key2).is_ok());
@@ -998,8 +998,8 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            let txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             // k3 should not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
@@ -1038,8 +1038,8 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
             txn1.set(&key1, &value3).unwrap();
@@ -1085,8 +1085,8 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert!(txn1.get(&key1).is_ok());
             assert!(txn2.get(&key1).is_ok());
@@ -1127,8 +1127,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
             assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
@@ -1161,8 +1161,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
 
@@ -1210,8 +1210,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
             let range = "k1".as_bytes()..="k2".as_bytes();
@@ -1249,8 +1249,8 @@ mod tests {
         let value4 = Bytes::from("v4");
 
         {
-            let mut txn1 = store.begin().await.unwrap();
-            let mut txn2 = store.begin().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn1.scan(range.clone()).unwrap();
@@ -1294,10 +1294,10 @@ mod tests {
     async fn is_send_sync() {
         let (db, _) = create_store(false);
 
-        let txn = db.begin().await.unwrap();
+        let txn = db.begin().unwrap();
         require_send(txn);
 
-        let txn = db.begin().await.unwrap();
+        let txn = db.begin().unwrap();
         require_sync(txn);
     }
 
@@ -1328,7 +1328,7 @@ mod tests {
         let default_value = Bytes::from("default_value".to_string());
 
         // Writing the 6th key should fail
-        let mut txn = store.begin().await.unwrap();
+        let mut txn = store.begin().unwrap();
 
         for (i, key) in keys.iter().enumerate() {
             // Start a new write transaction
@@ -1396,7 +1396,7 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let mut rng = make_rng();
 
-        let mut txn = store.begin().await.unwrap();
+        let mut txn = store.begin().unwrap();
         for _ in 0..ENTRIES {
             let (key, value) = gen_pair(&mut rng);
             txn.set(&key, &value).unwrap();
@@ -1406,7 +1406,7 @@ mod tests {
 
         // Read the keys from the store
         let mut rng = make_rng();
-        let txn = store.begin_with_mode(Mode::ReadOnly).await.unwrap();
+        let txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
         for _i in 0..ENTRIES {
             let (key, _) = gen_pair(&mut rng);
             txn.get(&key).unwrap();

@@ -540,7 +540,7 @@ mod tests {
 
         {
             // Start a new write transaction (txn)
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Set key1 and key2 with the same value
             txn.set(&key1, &value).unwrap();
@@ -552,7 +552,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap();
@@ -563,7 +563,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap();
@@ -574,7 +574,7 @@ mod tests {
 
         {
             // Start a new write transaction
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Set key3 with the same value
             txn.set(&key3, &value).unwrap();
@@ -585,7 +585,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key3
             let val = txn.get(&key3).unwrap();
@@ -615,7 +615,7 @@ mod tests {
 
         {
             // Start a new write transaction (txn)
-            let mut txn = store.begin().await.unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Set key1 and key2 with the same value
             txn.set(&key1, &value).unwrap();
@@ -627,7 +627,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap();
@@ -638,7 +638,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().await.unwrap();
+            let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap();

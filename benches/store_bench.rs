@@ -43,7 +43,7 @@ fn bulk_insert(c: &mut Criterion) {
             &format!("bulk load key/value lengths {}/{}", key_len, val_len),
             |b| {
                 b.to_async(&rt).iter(|| async {
-                    let mut txn = db.begin().await.unwrap();
+                    let mut txn = db.begin().unwrap();
                     txn.set(bytes(key_len)[..].into(), bytes(val_len)[..].into())
                         .unwrap();
                     txn.commit().await.unwrap();
@@ -76,7 +76,7 @@ fn sequential_insert_read(c: &mut Criterion) {
         c.bench_function(&format!("sequential inserts"), |b| {
             let count = AtomicU32::new(0_u32);
             b.iter(|| async {
-                let mut txn = db.begin().await.unwrap();
+                let mut txn = db.begin().unwrap();
                 txn.set(
                     count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
                     vec![][..].into(),
@@ -98,7 +98,7 @@ fn sequential_insert_read(c: &mut Criterion) {
 
                 let current_count = count.load(Relaxed);
                 if current_count <= max_count.load(Relaxed) {
-                    let txn = db.begin().await.unwrap();
+                    let txn = db.begin().unwrap();
                     txn.get(&current_count.to_be_bytes()[..]).unwrap();
                 }
             })
@@ -133,7 +133,7 @@ fn concurrent_insert(c: &mut Criterion) {
                         threads.push(std::thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new().unwrap();
                             rt.block_on(async {
-                                let mut txn = db.begin().await.unwrap();
+                                let mut txn = db.begin().unwrap();
                                 for _ in 0..(item_count / thread_count) {
                                     let key = nanoid::nanoid!();
                                     let value = nanoid::nanoid!();
@@ -155,5 +155,4 @@ fn concurrent_insert(c: &mut Criterion) {
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-// criterion_main!(benches_sequential, benches_concurrent);
-criterion_main!(benches_concurrent);
+criterion_main!(benches_sequential, benches_concurrent);
