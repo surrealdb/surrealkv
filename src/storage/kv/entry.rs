@@ -479,8 +479,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn encode_decode() {
+    #[tokio::test]
+    async fn encode_decode() {
         // Create a sample valueRef instance
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();

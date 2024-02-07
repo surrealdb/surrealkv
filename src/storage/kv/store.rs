@@ -555,7 +555,7 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        drop(store);
+        store.close().await.unwrap();
 
         // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
@@ -585,6 +585,7 @@ mod tests {
 
         // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
 
         drop(store);
 
@@ -663,7 +664,7 @@ mod tests {
 
         // Send some tasks
         let task_counter = Arc::new(AtomicU64::new(0));
-        for i in 0..10 {
+        for i in 0..100 {
             let (done_tx, done_rx) = bounded(1);
             writes_tx
                 .send(Task {
@@ -685,11 +686,14 @@ mod tests {
         // Send stop signal
         stop_tx.send(()).await.unwrap();
 
-        // Wait for a while to let TaskRunner handle all tasks
+        // Wait for a while to let TaskRunner handle all tasks by waiting on done_rx
         fut.await;
 
+        // Wait for the spawned tokio thread to finish
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
         // Check if all tasks were handled
-        assert_eq!(task_counter.load(Ordering::SeqCst), 10);
+        assert_eq!(task_counter.load(Ordering::SeqCst), 100);
     }
 
     async fn concurrent_task(store: Arc<Store>) {

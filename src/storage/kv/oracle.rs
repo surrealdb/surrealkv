@@ -7,11 +7,11 @@ use std::{
     },
 };
 
-use async_std::sync::Mutex as AsyncMutex;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::storage::{
     index::art::TrieError,

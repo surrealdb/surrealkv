@@ -119,38 +119,49 @@ fn concurrent_insert(c: &mut Criterion) {
     opts.max_tx_entries = item_count;
     let db = Arc::new(Store::new(opts).expect("should create store"));
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+
     {
         let thread_count = 8_u32;
         group.bench_function(
             format!("{} inserts ({} threads)", item_count, thread_count),
             |b| {
                 b.iter(|| {
-                    let mut threads = vec![];
+                    let mut handles = vec![];
 
                     for _ in 0..thread_count {
                         let db = db.clone();
 
-                        threads.push(std::thread::spawn(move || {
-                            let rt = tokio::runtime::Runtime::new().unwrap();
-                            rt.block_on(async {
-                                let mut txn = db.begin().unwrap();
-                                for _ in 0..(item_count / thread_count) {
-                                    let key = nanoid::nanoid!();
-                                    let value = nanoid::nanoid!();
-                                    txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-                                }
-                                txn.commit().await.unwrap();
-                            })
-                        }));
+                        let handle = rt.spawn(async move {
+                            let mut txn = db.begin().unwrap();
+                            for _ in 0..(item_count / thread_count) {
+                                let key = nanoid::nanoid!();
+                                let value = nanoid::nanoid!();
+                                txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+                            }
+                            txn.commit().await.unwrap();
+                        });
+
+                        handles.push(handle);
                     }
 
-                    for thread in threads {
-                        thread.join().unwrap();
+                    for handle in handles {
+                        rt.block_on(handle).unwrap();
                     }
                 })
             },
         );
     }
+
+    rt.block_on(async {
+        db.close().await.unwrap();
+    });
+
+    rt.shutdown_background();
 }
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);

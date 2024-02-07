@@ -456,7 +456,7 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        drop(store);
+        store.close().await.unwrap();
 
         // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
@@ -1301,8 +1301,8 @@ mod tests {
     fn require_send<T: Send>(_: T) {}
     fn require_sync<T: Sync + Send>(_: T) {}
 
-    #[test]
-    fn is_send_sync() {
+    #[tokio::test]
+    async fn is_send_sync() {
         let (db, _) = create_store(false);
 
         let txn = db.begin().unwrap();
