@@ -301,6 +301,8 @@ impl Transaction {
             let v = val_ref.resolve()?;
 
             // Add the value, version, and timestamp to the results vector.
+            let mut key = key;
+            key.truncate(key.len() - 1);
             results.push((key, v, *version, *ts));
         }
 
@@ -331,7 +333,11 @@ impl Transaction {
 
         // Prepare for the commit by getting a transaction ID and a commit timestamp.
         let (tx_id, commit_ts) = self.prepare_commit()?;
-        let entries = self.write_set.values().cloned().collect();
+
+        // Sort the keys in the write set and create a vector of entries.
+        let mut keys: Vec<Bytes> = self.write_set.keys().cloned().collect();
+        keys.sort();
+        let entries = keys.iter().map(|k| self.write_set[k].clone()).collect();
 
         // Commit the changes to the store index.
         let done = self
@@ -497,7 +503,7 @@ mod tests {
         {
             // Start another read-write transaction (txn)
             let txn = store.begin().unwrap();
-            assert!(txn.get(&key1).is_err());
+            assert!(txn.get(&key1).unwrap().is_none());
         }
 
         {
@@ -524,7 +530,7 @@ mod tests {
             txn1.set(&key1, &value1).unwrap();
             txn1.commit().await.unwrap();
 
-            assert!(txn2.get(&key2).is_err());
+            assert!(txn2.get(&key2).unwrap().is_none());
             txn2.set(&key2, &value2).unwrap();
             txn2.commit().await.unwrap();
         }
@@ -577,7 +583,7 @@ mod tests {
             txn1.set(&key, &value1).unwrap();
             txn1.commit().await.unwrap();
 
-            assert!(txn2.get(&key).is_err());
+            assert!(txn2.get(&key).unwrap().is_none());
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
@@ -671,6 +677,35 @@ mod tests {
         let txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
+        assert_eq!(results[0].1, keys_to_insert[0]);
+        assert_eq!(results[1].1, keys_to_insert[1]);
+        assert_eq!(results[2].1, keys_to_insert[2]);
+    }
+
+    #[tokio::test]
+    async fn scan_multiple_keys_within_single_transaction() {
+        let (store, _) = create_store(false);
+        // Define key-value pairs for the test
+        let keys_to_insert = vec![
+            Bytes::from("test1"),
+            Bytes::from("test2"),
+            Bytes::from("test3"),
+        ];
+
+        let mut txn = store.begin().unwrap();
+        for key in &keys_to_insert {
+            txn.set(key, key).unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        let range = "test1".as_bytes()..="test7".as_bytes();
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range, None).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, keys_to_insert[0]);
+        assert_eq!(results[1].0, keys_to_insert[1]);
+        assert_eq!(results[2].0, keys_to_insert[2]);
         assert_eq!(results[0].1, keys_to_insert[0]);
         assert_eq!(results[1].1, keys_to_insert[1]);
         assert_eq!(results[2].1, keys_to_insert[2]);
@@ -787,7 +822,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value2).unwrap();
             assert_eq!(txn.get(&key1).unwrap().unwrap(), value2.as_ref());
-            assert!(txn.get(&key3).is_err());
+            assert!(txn.get(&key3).unwrap().is_none());
             txn.set(&key2, &value1).unwrap();
             assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref());
             txn.commit().await.unwrap();
@@ -1189,7 +1224,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             txn1.delete(&key2).unwrap();
-            assert!(txn1.get(&key2).is_err());
+            assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
