@@ -4,8 +4,9 @@ use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use async_channel::{bounded, Receiver, Sender};
 use async_std::task::{spawn, JoinHandle};
-use bytes::{Bytes, BytesMut};
 use futures::{select, FutureExt};
+
+use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use lru::LruCache;
 use parking_lot::RwLock;

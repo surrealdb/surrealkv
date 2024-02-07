@@ -1,4 +1,4 @@
 pub mod cache;
-pub mod index;
-pub mod kv;
-pub mod log;
+pub(crate) mod index;
+pub(crate) mod kv;
+pub(crate) mod log;

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use criterion::{criterion_group, criterion_main, Criterion};
 use jemallocator::Jemalloc;
 
-use surrealkv::storage::kv::option::Options;
-use surrealkv::storage::kv::store::Store;
+use surrealkv::Options;
+use surrealkv::Store;
 use tempdir::TempDir;
 
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), global_allocator)]
