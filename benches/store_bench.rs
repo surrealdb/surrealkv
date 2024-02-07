@@ -114,16 +114,18 @@ fn concurrent_insert(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(criterion::Throughput::Elements(item_count as u64));
 
-    let mut opts = Options::new();
-    opts.dir = create_temp_directory().path().to_path_buf();
-    opts.max_tx_entries = item_count;
-    let db = Arc::new(Store::new(opts).expect("should create store"));
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .enable_all()
         .build()
         .unwrap();
+
+    let db = rt.block_on(async {
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        opts.max_tx_entries = item_count;
+        Arc::new(Store::new(opts).expect("should create store"))
+    });
 
     {
         let thread_count = 8_u32;

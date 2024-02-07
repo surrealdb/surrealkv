@@ -3,7 +3,7 @@ use std::vec;
 use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use async_channel::{bounded, Receiver, Sender};
-use async_std::task::{spawn, JoinHandle};
+use tokio::task::{spawn, JoinHandle};
 use futures::{select, FutureExt};
 
 use bytes::{Bytes, BytesMut};
