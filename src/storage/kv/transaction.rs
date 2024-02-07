@@ -228,7 +228,11 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
+    pub fn scan<'b, R>(
+        &'b self,
+        range: R,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64, u64)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -265,6 +269,13 @@ impl Transaction {
 
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
+            // If a limit is set and we've already got enough results, break the loop.
+            if let Some(limit) = limit {
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
             // Create a new value reference and decode the value.
             let mut val_ref = ValueRef::new(self.core.clone());
             let val_bytes_ref: &Bytes = value;
@@ -290,7 +301,7 @@ impl Transaction {
             let v = val_ref.resolve()?;
 
             // Add the value, version, and timestamp to the results vector.
-            results.push((v, *version, *ts));
+            results.push((key, v, *version, *ts));
         }
 
         // Return the results.
@@ -316,7 +327,7 @@ impl Transaction {
 
         // Lock the oracle to serialize commits to the transaction log.
         let oracle = self.core.oracle.clone();
-        let write_ch_lock = oracle.write_lock.lock();
+        let write_ch_lock = oracle.write_lock.lock().await;
 
         // Prepare for the commit by getting a transaction ID and a commit timestamp.
         let (tx_id, commit_ts) = self.prepare_commit()?;
@@ -492,7 +503,7 @@ mod tests {
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let txn = store.begin().unwrap();
-            let results = txn.scan(range).unwrap();
+            let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
         }
     }
@@ -634,7 +645,7 @@ mod tests {
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
-        let results = txn.scan(range).unwrap();
+        let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
     }
 
@@ -658,11 +669,11 @@ mod tests {
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
-        let results = txn.scan(range).unwrap();
+        let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, keys_to_insert[0]);
-        assert_eq!(results[1].0, keys_to_insert[1]);
-        assert_eq!(results[2].0, keys_to_insert[2]);
+        assert_eq!(results[0].1, keys_to_insert[0]);
+        assert_eq!(results[1].1, keys_to_insert[1]);
+        assert_eq!(results[2].1, keys_to_insert[2]);
     }
 
     async fn mvcc_with_scan_tests(is_ssi: bool) {
@@ -695,7 +706,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key4".as_bytes();
-            let results = txn3.scan(range).unwrap();
+            let results = txn3.scan(range, None).unwrap();
             assert_eq!(results.len(), 1);
             txn3.set(&key2, &value5).unwrap();
             txn3.set(&key3, &value6).unwrap();
@@ -726,7 +737,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key5".as_bytes();
-            txn3.scan(range).unwrap();
+            txn3.scan(range, None).unwrap();
             txn3.set(&key4, &value2).unwrap();
 
             assert!(match txn3.commit().await {
@@ -875,15 +886,15 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             drop(txn1);
 
-            let res = txn2.scan(range).unwrap();
+            let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             txn2.commit().await.unwrap();
         }
@@ -923,16 +934,16 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             txn1.set(&key1, &value4).unwrap();
             txn1.commit().await.unwrap();
 
-            let res = txn2.scan(range).unwrap();
+            let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             txn2.commit().await.unwrap();
         }
@@ -1003,10 +1014,10 @@ mod tests {
 
             // k3 should not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             // k3 is committed by txn2
             txn2.set(&key3, &value3).unwrap();
@@ -1014,10 +1025,10 @@ mod tests {
 
             // k3 should still not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
         }
     }
 
@@ -1045,18 +1056,18 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.delete(&key2).unwrap();
             txn1.commit().await.unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 1);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             assert!(match txn2.commit().await {
                 Err(err) => {
@@ -1167,10 +1178,10 @@ mod tests {
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
@@ -1215,10 +1226,10 @@ mod tests {
 
             assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.set(&key1, &value3).unwrap();
 
@@ -1253,15 +1264,15 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
@@ -1290,8 +1301,8 @@ mod tests {
     fn require_send<T: Send>(_: T) {}
     fn require_sync<T: Sync + Send>(_: T) {}
 
-    #[tokio::test]
-    async fn is_send_sync() {
+    #[test]
+    fn is_send_sync() {
         let (db, _) = create_store(false);
 
         let txn = db.begin().unwrap();

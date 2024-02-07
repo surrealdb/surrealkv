@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use async_std::sync::Mutex as AsyncMutex;
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
@@ -27,7 +28,7 @@ use crate::storage::{
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
     /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: Mutex<()>,
+    pub(crate) write_lock: AsyncMutex<()>,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -46,7 +47,7 @@ impl Oracle {
         };
 
         Self {
-            write_lock: Mutex::new(()),
+            write_lock: AsyncMutex::new(()),
             isolation,
         }
     }

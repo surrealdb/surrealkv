@@ -41,8 +41,6 @@ Temporary Items
 /bin/
 /docker/
 /.direnv/
-/testdata/
-/example/
 
 # -----------------------------------
 # Specific

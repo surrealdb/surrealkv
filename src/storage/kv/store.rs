@@ -124,7 +124,6 @@ pub(crate) struct TaskRunner {
 }
 
 impl TaskRunner {
-    #[inline]
     fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
         Self {
             core,
@@ -133,7 +132,6 @@ impl TaskRunner {
         }
     }
 
-    #[inline]
     fn spawn(self) -> JoinHandle<()> {
         spawn(Box::pin(async move {
             loop {
@@ -155,7 +153,6 @@ impl TaskRunner {
         }))
     }
 
-    #[inline]
     async fn handle_task(&self, task: Task) {
         let core = self.core.clone();
         if let Err(err) = core.write_request(task).await {
@@ -693,5 +690,21 @@ mod tests {
 
         // Check if all tasks were handled
         assert_eq!(task_counter.load(Ordering::SeqCst), 10);
+    }
+
+    async fn concurrent_task(store: Arc<Store>) {
+        let mut txn = store.begin().unwrap();
+        txn.set(b"dummy key", b"dummy value").unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_test() {
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        let db = Arc::new(Store::new(opts).expect("should create store"));
+        let task1 = tokio::spawn(concurrent_task(db.clone()));
+        let task2 = tokio::spawn(concurrent_task(db.clone()));
+        let _ = tokio::try_join!(task1, task2).expect("Tasks failed");
     }
 }
