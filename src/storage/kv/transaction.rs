@@ -131,7 +131,7 @@ impl Transaction {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -149,7 +149,7 @@ impl Transaction {
             Ok(val_ref) => {
                 // RYOW semantics: Read your own write. If the key is in the write set, return the value.
                 if let Some(entry) = self.write_set.get(&key) {
-                    return Ok(entry.value.clone().to_vec());
+                    return Ok(Some(entry.value.clone().to_vec()));
                 }
 
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
@@ -159,7 +159,7 @@ impl Transaction {
                 }
 
                 // Resolve the value reference to get the actual value.
-                val_ref.resolve()
+                val_ref.resolve().map(Some)
             }
             Err(e) => {
                 match &e {
@@ -171,7 +171,7 @@ impl Transaction {
                                 self.read_set.lock().push((key, 0));
                             }
                         }
-                        Err(e)
+                        Ok(None)
                     }
                     // For other errors, just propagate them.
                     _ => Err(e),
@@ -443,7 +443,7 @@ mod tests {
         {
             // Start a read-only transaction (txn3)
             let txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap();
+            let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value1.as_ref());
         }
 
@@ -465,7 +465,7 @@ mod tests {
 
         // Start a read-only transaction (txn4)
         let txn4 = store.begin().unwrap();
-        let val = txn4.get(&key1).unwrap();
+        let val = txn4.get(&key1).unwrap().unwrap();
 
         // Assert that the value retrieved in txn4 matches value2
         assert_eq!(val, value2.as_ref());
@@ -563,7 +563,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             let txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap();
+            let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value2.as_ref());
         }
 
@@ -786,10 +786,10 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value2).unwrap();
-            assert_eq!(txn.get(&key1).unwrap(), value2.as_ref());
+            assert_eq!(txn.get(&key1).unwrap().unwrap(), value2.as_ref());
             assert!(txn.get(&key3).is_err());
             txn.set(&key2, &value1).unwrap();
-            assert_eq!(txn.get(&key2).unwrap(), value1.as_ref());
+            assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref());
             txn.commit().await.unwrap();
         }
     }
@@ -855,9 +855,9 @@ mod tests {
 
         {
             let txn3 = store.begin().unwrap();
-            let val1 = txn3.get(&key1).unwrap();
+            let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value3.as_ref());
-            let val2 = txn3.get(&key2).unwrap();
+            let val2 = txn3.get(&key2).unwrap().unwrap();
             assert_eq!(val2, value5.as_ref());
         }
     }
@@ -901,9 +901,9 @@ mod tests {
 
         {
             let txn3 = store.begin().unwrap();
-            let val1 = txn3.get(&key1).unwrap();
+            let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value1.as_ref());
-            let val2 = txn3.get(&key2).unwrap();
+            let val2 = txn3.get(&key2).unwrap().unwrap();
             assert_eq!(val2, value2.as_ref());
         }
     }
@@ -976,8 +976,8 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
 
             txn1.commit().await.unwrap();
             assert!(match txn2.commit().await {
@@ -1141,15 +1141,15 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2.as_ref());
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
             txn2.commit().await.unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
             txn1.commit().await.unwrap();
         }
     }
@@ -1175,7 +1175,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
 
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
@@ -1224,7 +1224,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);

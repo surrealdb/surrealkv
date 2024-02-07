@@ -550,7 +550,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -569,7 +569,7 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }

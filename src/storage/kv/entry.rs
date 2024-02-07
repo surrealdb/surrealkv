@@ -555,7 +555,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -566,7 +566,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -588,7 +588,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key3
-            let val = txn.get(&key3).unwrap();
+            let val = txn.get(&key3).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -630,7 +630,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -641,7 +641,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
