@@ -5,7 +5,6 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
-use crate::storage::index;
 use crate::storage::{
     index::{art::TrieError, VariableKey},
     kv::{
@@ -13,7 +12,7 @@ use crate::storage::{
         error::{Error, Result},
         snapshot::{FilterFn, Snapshot, FILTERS},
         store::Core,
-        util::now,
+        util::{now, sha256},
     },
 };
 
@@ -78,8 +77,12 @@ pub struct Transaction {
     /// `core` is the underlying core for the transaction. This is shared between transactions.
     pub(crate) core: Arc<Core>,
 
-    /// `write_set` is the pending writes for the transaction. These are the changes that the transaction wants to make to the data.
-    pub(crate) write_set: HashMap<Bytes, Entry>,
+    /// `write_order_map` is a mapping from sha256 of keys to their order in the write_set.
+    pub(crate) write_order_map: HashMap<Bytes, u32>,
+
+    /// `write_set` is a vector of tuples, where each tuple contains a key and its corresponding entry.
+    /// These are the changes that the transaction intends to make to the data.
+    pub(crate) write_set: Vec<(Bytes, Entry)>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
@@ -103,7 +106,8 @@ impl Transaction {
             snapshot,
             buf: BytesMut::new(),
             core,
-            write_set: HashMap::new(),
+            write_order_map: HashMap::new(),
+            write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
             closed: false,
@@ -144,13 +148,17 @@ impl Transaction {
 
         // Create a copy of the key.
         let key = Bytes::copy_from_slice(key);
+        let hashed_key = sha256(key.clone());
 
         // Attempt to get the value for the key from the snapshot.
         match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
                 // RYOW semantics: Read your own write. If the key is in the write set, return the value.
-                if let Some(entry) = self.write_set.get(&key) {
-                    return Ok(Some(entry.value.clone().to_vec()));
+                // Check if the key is in the write set by checking in the write_order_map map.
+                if let Some(order) = self.write_order_map.get(&hashed_key) {
+                    if let Some(entry) = self.write_set.get(*order as usize) {
+                        return Ok(Some(entry.1.value.clone().to_vec()));
+                    }
                 }
 
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
@@ -223,7 +231,16 @@ impl Transaction {
         }
 
         // Add the entry to the set of pending writes.
-        self.write_set.insert(e.key.clone(), e);
+        let hashed_key = sha256(e.key.clone());
+
+        // Check if the key already exists in write_order_map, if so, update the entry in write_set.
+        if let Some(order) = self.write_order_map.get(&hashed_key) {
+            self.write_set[*order as usize] = (e.key.clone(), e);
+        } else {
+            self.write_set.push((e.key.clone(), e));
+            self.write_order_map
+                .insert(hashed_key, self.write_order_map.len() as u32);
+        }
 
         Ok(())
     }
@@ -340,9 +357,11 @@ impl Transaction {
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
         // Sort the keys in the write set and create a vector of entries.
-        let mut keys: Vec<Bytes> = self.write_set.keys().cloned().collect();
-        keys.sort();
-        let entries = keys.iter().map(|k| self.write_set[k].clone()).collect();
+        let entries: Vec<Entry> = self
+            .write_set
+            .iter()
+            .map(|(_, entry)| entry.clone())
+            .collect();
 
         // Commit the changes to the store index.
         let done = self

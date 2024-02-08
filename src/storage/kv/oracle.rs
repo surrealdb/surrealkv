@@ -334,7 +334,9 @@ impl SerializableSnapshotIsolation {
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
         // Add the transaction to the list of committed transactions with conflict keys.
-        let conflict_keys = txn.write_set.keys().cloned().collect();
+        let conflict_keys: HashSet<Bytes> =
+            txn.write_set.iter().map(|(key, _)| key.clone()).collect();
+
         commit_tracker
             .committed_transactions
             .push(CommitMarker { ts, conflict_keys });

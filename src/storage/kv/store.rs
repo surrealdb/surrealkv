@@ -110,7 +110,12 @@ impl Store {
 
         // Wait for task to finish
         if let Some(handle) = self.task_runner_handle.write().take() {
-            handle.await;
+            handle.await.map_err(|e| {
+                Error::ReceiveError(format!(
+                    "Error occurred while closing the kv store. JoinError: {}",
+                    e.to_string()
+                ))
+            })?;
         }
 
         self.core.close()?;
