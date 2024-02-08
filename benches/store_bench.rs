@@ -35,9 +35,11 @@ fn bulk_insert(c: &mut Criterion) {
             .build()
             .unwrap();
 
-        let mut opts = Options::new();
-        opts.dir = create_temp_directory().path().to_path_buf();
-        let db = Store::new(opts).expect("should create store");
+        let db = rt.block_on(async {
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            Store::new(opts).expect("should create store")
+        });
 
         c.bench_function(
             &format!("bulk load key/value lengths {}/{}", key_len, val_len),

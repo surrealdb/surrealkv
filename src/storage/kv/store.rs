@@ -1,6 +1,6 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::vec;
-use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
@@ -8,8 +8,8 @@ use tokio::task::{spawn, JoinHandle};
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
-use lru::LruCache;
 use parking_lot::RwLock;
+use quick_cache::sync::Cache;
 
 use crate::storage::{
     index::art::KV,
@@ -183,7 +183,7 @@ pub struct Core {
     /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
+    pub(crate) value_cache: Cache<u64, Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Channel to send write requests to the writer
@@ -242,8 +242,7 @@ impl Core {
         oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
-        let cache_size = NonZeroUsize::new(opts.max_value_cache_size as usize).unwrap();
-        let value_cache = Arc::new(RwLock::new(LruCache::new(cache_size)));
+        let value_cache = Cache::new(opts.max_value_cache_size as usize);
 
         // Construct and return the Core instance.
         Ok(Self {
@@ -693,7 +692,7 @@ mod tests {
         stop_tx.send(()).await.unwrap();
 
         // Wait for a while to let TaskRunner handle all tasks by waiting on done_rx
-        fut.await;
+        fut.await.expect("TaskRunner should finish");
 
         // Wait for the spawned tokio thread to finish
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
