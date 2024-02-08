@@ -273,7 +273,7 @@ impl<P: KeyTrait + Clone, N: Version, const WIDTH: usize> NodeTrait<N> for FlatN
         let mut new_node = Self::new(self.prefix.clone());
         for i in 0..self.num_children as usize {
             new_node.keys[i] = self.keys[i];
-            new_node.children[i] =self.children[i].clone();
+            new_node.children[i] = self.children[i].clone();
         }
         new_node.num_children = self.num_children;
         new_node.version = self.version;

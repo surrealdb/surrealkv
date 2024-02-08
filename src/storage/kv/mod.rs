@@ -3,7 +3,7 @@ pub mod error;
 pub(crate) mod indexer;
 pub(crate) mod meta;
 pub mod option;
-pub mod oracle;
+pub(crate) mod oracle;
 pub(crate) mod reader;
 pub mod snapshot;
 pub mod store;

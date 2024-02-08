@@ -11,6 +11,7 @@ use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::storage::{
     index::art::TrieError,
@@ -27,7 +28,7 @@ use crate::storage::{
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
     /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: Mutex<()>,
+    pub(crate) write_lock: AsyncMutex<()>,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -46,7 +47,7 @@ impl Oracle {
         };
 
         Self {
-            write_lock: Mutex::new(()),
+            write_lock: AsyncMutex::new(()),
             isolation,
         }
     }
@@ -159,7 +160,7 @@ impl SnapshotIsolation {
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(txn.store.clone(), self.read_ts())?;
+        let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts())?;
         let read_set = txn.read_set.lock();
 
         for (key, ts) in read_set.iter() {
@@ -333,7 +334,9 @@ impl SerializableSnapshotIsolation {
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
         // Add the transaction to the list of committed transactions with conflict keys.
-        let conflict_keys = txn.write_set.keys().cloned().collect();
+        let conflict_keys: HashSet<Bytes> =
+            txn.write_set.iter().map(|(key, _)| key.clone()).collect();
+
         commit_tracker
             .committed_transactions
             .push(CommitMarker { ts, conflict_keys });

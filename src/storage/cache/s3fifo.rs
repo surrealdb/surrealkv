@@ -122,7 +122,7 @@ where
 
     fn evict(&mut self) {
         if self.small.len() + self.main.len() >= self.max_cache_size {
-            if self.main.len() >= self.max_main_size || self.small.len() == 0 {
+            if self.main.len() >= self.max_main_size || self.small.is_empty() {
                 self.evict_m();
             } else {
                 self.evict_s();

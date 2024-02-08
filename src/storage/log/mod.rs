@@ -1887,7 +1887,7 @@ mod tests {
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = segment.read_at(&mut bs, 11 as u64).expect("should read");
+        let n = segment.read_at(&mut bs, 11_u64).expect("should read");
         assert_eq!(4, n);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
@@ -2226,10 +2226,10 @@ mod tests {
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read remaining empty block
-        const remaining: usize = BLOCK_SIZE - 11;
-        let mut bs = [0u8; remaining];
+        const REMAINING: usize = BLOCK_SIZE - 11;
+        let mut bs = [0u8; REMAINING];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, remaining);
+        assert_eq!(bytes_read, REMAINING);
 
         // Read second record from the MultiSegmentReader
         let mut bs = [0u8; 11];
@@ -2238,9 +2238,9 @@ mod tests {
         assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read remaining empty block
-        let mut bs = [0u8; remaining];
+        let mut bs = [0u8; REMAINING];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, remaining);
+        assert_eq!(bytes_read, REMAINING);
 
         let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");

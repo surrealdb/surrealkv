@@ -6,13 +6,13 @@ use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::{
-    index::{art::TrieError, art::KV, VariableKey},
+    index::{art::TrieError, VariableKey},
     kv::{
-        entry::{Entry, TxRecord, Value, ValueRef},
+        entry::{Entry, Value, ValueRef},
         error::{Error, Result},
         snapshot::{FilterFn, Snapshot, FILTERS},
         store::Core,
-        util::now,
+        util::{now, sha256},
     },
 };
 
@@ -74,11 +74,15 @@ pub struct Transaction {
     /// `buf` is a reusable buffer for encoding transaction records. This is used to reduce memory allocations.
     buf: BytesMut,
 
-    /// `store` is the underlying store for the transaction. This is shared between transactions.
-    pub(crate) store: Arc<Core>,
+    /// `core` is the underlying core for the transaction. This is shared between transactions.
+    pub(crate) core: Arc<Core>,
 
-    /// `write_set` is the pending writes for the transaction. These are the changes that the transaction wants to make to the data.
-    pub(crate) write_set: HashMap<Bytes, Entry>,
+    /// `write_order_map` is a mapping from sha256 of keys to their order in the write_set.
+    pub(crate) write_order_map: HashMap<Bytes, u32>,
+
+    /// `write_set` is a vector of tuples, where each tuple contains a key and its corresponding entry.
+    /// These are the changes that the transaction intends to make to the data.
+    pub(crate) write_set: Vec<(Bytes, Entry)>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
@@ -92,17 +96,18 @@ pub struct Transaction {
 
 impl Transaction {
     /// Prepare a new transaction in the given mode.
-    pub fn new(store: Arc<Core>, mode: Mode) -> Result<Self> {
-        let snapshot = RwLock::new(Snapshot::take(store.clone(), now())?);
-        let read_ts = store.read_ts()?;
+    pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+        let snapshot = RwLock::new(Snapshot::take(core.clone(), now())?);
+        let read_ts = core.read_ts()?;
 
         Ok(Self {
             read_ts,
             mode,
             snapshot,
             buf: BytesMut::new(),
-            store,
-            write_set: HashMap::new(),
+            core,
+            write_order_map: HashMap::new(),
+            write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
             closed: false,
@@ -131,7 +136,7 @@ impl Transaction {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -143,13 +148,17 @@ impl Transaction {
 
         // Create a copy of the key.
         let key = Bytes::copy_from_slice(key);
+        let hashed_key = sha256(key.clone());
 
         // Attempt to get the value for the key from the snapshot.
         match self.snapshot.read().get(&key[..].into()) {
             Ok(val_ref) => {
                 // RYOW semantics: Read your own write. If the key is in the write set, return the value.
-                if let Some(entry) = self.write_set.get(&key) {
-                    return Ok(entry.value.clone().to_vec());
+                // Check if the key is in the write set by checking in the write_order_map map.
+                if let Some(order) = self.write_order_map.get(&hashed_key) {
+                    if let Some(entry) = self.write_set.get(*order as usize) {
+                        return Ok(Some(entry.1.value.clone().to_vec()));
+                    }
                 }
 
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
@@ -159,7 +168,7 @@ impl Transaction {
                 }
 
                 // Resolve the value reference to get the actual value.
-                val_ref.resolve()
+                val_ref.resolve().map(Some)
             }
             Err(e) => {
                 match &e {
@@ -171,7 +180,7 @@ impl Transaction {
                                 self.read_set.lock().push((key, 0));
                             }
                         }
-                        Err(e)
+                        Ok(None)
                     }
                     // For other errors, just propagate them.
                     _ => Err(e),
@@ -195,15 +204,15 @@ impl Transaction {
             return Err(Error::EmptyKey);
         }
         // If the key length exceeds the maximum allowed key size, return an error.
-        if e.key.len() as u64 > self.store.opts.max_key_size {
+        if e.key.len() as u64 > self.core.opts.max_key_size {
             return Err(Error::MaxKeyLengthExceeded);
         }
         // If the value length exceeds the maximum allowed value size, return an error.
-        if e.value.len() as u64 > self.store.opts.max_value_size {
+        if e.value.len() as u64 > self.core.opts.max_value_size {
             return Err(Error::MaxValueLengthExceeded);
         }
 
-        if self.write_set.len() as u32 >= self.store.opts.max_tx_entries {
+        if self.write_set.len() as u32 >= self.core.opts.max_tx_entries {
             return Err(Error::MaxTransactionEntriesLimitExceeded);
         }
 
@@ -222,13 +231,26 @@ impl Transaction {
         }
 
         // Add the entry to the set of pending writes.
-        self.write_set.insert(e.key.clone(), e);
+        let hashed_key = sha256(e.key.clone());
+
+        // Check if the key already exists in write_order_map, if so, update the entry in write_set.
+        if let Some(order) = self.write_order_map.get(&hashed_key) {
+            self.write_set[*order as usize] = (e.key.clone(), e);
+        } else {
+            self.write_set.push((e.key.clone(), e));
+            self.write_order_map
+                .insert(hashed_key, self.write_order_map.len() as u32);
+        }
 
         Ok(())
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, u64, u64)>>
+    pub fn scan<'b, R>(
+        &'b self,
+        range: R,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64, u64)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -254,19 +276,30 @@ impl Transaction {
             },
         );
 
+        // Initialize an empty vector to store the results.
+        let mut results = Vec::new();
+
         // Create a new reader for the snapshot.
-        let iterator = self.snapshot.write().new_reader()?;
+        let iterator = match self.snapshot.write().new_reader() {
+            Ok(reader) => reader,
+            Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
 
         // Get a range iterator for the specified range.
         let ranger = iterator.range(range);
 
-        // Initialize an empty vector to store the results.
-        let mut results = Vec::new();
-
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
+            // If a limit is set and we've already got enough results, break the loop.
+            if let Some(limit) = limit {
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
             // Create a new value reference and decode the value.
-            let mut val_ref = ValueRef::new(self.store.clone());
+            let mut val_ref = ValueRef::new(self.core.clone());
             let val_bytes_ref: &Bytes = value;
             val_ref.decode(*version, val_bytes_ref)?;
 
@@ -290,7 +323,9 @@ impl Transaction {
             let v = val_ref.resolve()?;
 
             // Add the value, version, and timestamp to the results vector.
-            results.push((v, *version, *ts));
+            let mut key = key;
+            key.truncate(key.len() - 1);
+            results.push((key, v, *version, *ts));
         }
 
         // Return the results.
@@ -298,7 +333,7 @@ impl Transaction {
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
-    pub fn commit(&mut self) -> Result<()> {
+    pub async fn commit(&mut self) -> Result<()> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -314,19 +349,36 @@ impl Transaction {
             return Ok(());
         }
 
-        // TODO: Use a commit pipeline to avoid blocking calls.
         // Lock the oracle to serialize commits to the transaction log.
-        let oracle = self.store.oracle.clone();
-        let _lock = oracle.write_lock.lock();
+        let oracle = self.core.oracle.clone();
+        let write_ch_lock = oracle.write_lock.lock().await;
 
         // Prepare for the commit by getting a transaction ID and a commit timestamp.
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
-        // Add transaction records to the transaction log.
-        self.add_to_transaction_log(tx_id, commit_ts)?;
+        // Sort the keys in the write set and create a vector of entries.
+        let entries: Vec<Entry> = self
+            .write_set
+            .iter()
+            .map(|(_, entry)| entry.clone())
+            .collect();
 
         // Commit the changes to the store index.
-        self.commit_to_index(tx_id, commit_ts)?;
+        let done = self
+            .core
+            .send_to_write_channel(entries, tx_id, commit_ts)
+            .await;
+
+        if let Err(err) = done {
+            oracle.committed_upto(commit_ts);
+            return Err(err);
+        }
+
+        drop(write_ch_lock);
+
+        // Check if the transaction is written to the transaction log.
+        let done = done.unwrap();
+        let ret = done.recv().await?;
 
         // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
         oracle.committed_upto(tx_id);
@@ -334,12 +386,13 @@ impl Transaction {
         // Mark the transaction as closed.
         self.closed = true;
 
-        Ok(())
+        // Ok(())
+        ret
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
     fn prepare_commit(&mut self) -> Result<(u64, u64)> {
-        let oracle = self.store.oracle.clone();
+        let oracle = self.core.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
         let commit_ts = self.assign_commit_ts();
         Ok((tx_id, commit_ts))
@@ -352,61 +405,6 @@ impl Transaction {
             entry.ts = commit_ts;
         });
         commit_ts
-    }
-
-    /// Adds transaction records to the transaction log.
-    fn add_to_transaction_log(&mut self, tx_id: u64, commit_ts: u64) -> Result<u64> {
-        let current_offset = self.store.clog.read().offset()?;
-        let entries: Vec<Entry> = self.write_set.values().cloned().collect();
-        let tx_record = TxRecord::new_with_entries(entries, tx_id, commit_ts);
-        tx_record.encode(
-            &mut self.buf,
-            current_offset,
-            &mut self.committed_values_offsets,
-        )?;
-
-        let mut clog = self.store.clog.write();
-        let (tx_offset, _) = clog.append(self.buf.as_ref())?;
-        Ok(tx_offset)
-    }
-
-    /// Commits transaction changes to the store index.
-    fn commit_to_index(&mut self, tx_id: u64, commit_ts: u64) -> Result<()> {
-        let mut index = self.store.indexer.write();
-        let mut kv_pairs = self.build_kv_pairs(tx_id, commit_ts);
-
-        index.bulk_insert(&mut kv_pairs)?;
-        Ok(())
-    }
-
-    /// Builds key-value pairs from the write set.
-    fn build_kv_pairs(&self, tx_id: u64, commit_ts: u64) -> Vec<KV<VariableKey, Bytes>> {
-        let mut kv_pairs = Vec::new();
-
-        for (_, entry) in self.write_set.iter() {
-            let index_value = self.build_index_value(entry);
-
-            kv_pairs.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: tx_id,
-                ts: commit_ts,
-            });
-        }
-
-        kv_pairs
-    }
-
-    /// Builds an index value from an entry.
-    fn build_index_value(&self, entry: &Entry) -> Bytes {
-        let index_value = ValueRef::encode(
-            &entry.key,
-            &entry.value,
-            entry.metadata.as_ref(),
-            &self.committed_values_offsets,
-            self.store.opts.max_value_threshold,
-        );
-        index_value
     }
 
     /// Rolls back the transaction by removing all updated entries.
@@ -454,8 +452,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn basic_transaction() {
+    #[tokio::test]
+    async fn basic_transaction() {
         let (store, temp_dir) = create_store(false);
 
         // Define key-value pairs for the test
@@ -469,13 +467,13 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key2, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
         }
 
         {
             // Start a read-only transaction (txn3)
             let txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap();
+            let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value1.as_ref());
         }
 
@@ -484,11 +482,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
             txn2.set(&key1, &value2).unwrap();
             txn2.set(&key2, &value2).unwrap();
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
         }
 
         // Drop the store to simulate closing it
-        drop(store);
+        store.close().await.unwrap();
 
         // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
@@ -497,14 +495,14 @@ mod tests {
 
         // Start a read-only transaction (txn4)
         let txn4 = store.begin().unwrap();
-        let val = txn4.get(&key1).unwrap();
+        let val = txn4.get(&key1).unwrap().unwrap();
 
         // Assert that the value retrieved in txn4 matches value2
         assert_eq!(val, value2.as_ref());
     }
 
-    #[test]
-    fn transaction_delete_scan() {
+    #[tokio::test]
+    async fn transaction_delete_scan() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -516,31 +514,31 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
         }
 
         {
             // Start a read-only transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.delete(&key1).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         {
             // Start another read-write transaction (txn)
             let txn = store.begin().unwrap();
-            assert!(txn.get(&key1).is_err());
+            assert!(txn.get(&key1).unwrap().is_none());
         }
 
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let txn = store.begin().unwrap();
-            let results = txn.scan(range).unwrap();
+            let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
         }
     }
 
-    fn mvcc_tests(is_ssi: bool) {
+    async fn mvcc_tests(is_ssi: bool) {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
@@ -554,11 +552,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
-            assert!(txn2.get(&key2).is_err());
+            assert!(txn2.get(&key2).unwrap().is_none());
             txn2.set(&key2, &value2).unwrap();
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
         }
 
         // read conflict when the read key was updated by another transaction
@@ -567,11 +565,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             assert!(txn2.get(&key1).is_ok());
             txn2.set(&key1, &value2).unwrap();
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -591,11 +589,11 @@ mod tests {
             txn1.set(&key1, &value1).unwrap();
             txn2.set(&key1, &value2).unwrap();
 
-            txn1.commit().unwrap();
-            txn2.commit().unwrap();
+            txn1.commit().await.unwrap();
+            txn2.commit().await.unwrap();
 
             let txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap();
+            let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value2.as_ref());
         }
 
@@ -607,11 +605,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
-            assert!(txn2.get(&key).is_err());
+            assert!(txn2.get(&key).unwrap().is_none());
             txn2.set(&key, &value1).unwrap();
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -629,17 +627,17 @@ mod tests {
 
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key).unwrap();
-            assert!(txn2.commit().is_ok());
+            assert!(txn2.commit().await.is_ok());
 
             assert!(txn3.get(&key).is_ok());
             txn3.set(&key, &value2).unwrap();
-            assert!(match txn3.commit() {
+            assert!(match txn3.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -652,18 +650,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mvcc_serialized_snapshot_isolation() {
-        mvcc_tests(true);
+    #[tokio::test]
+    async fn mvcc_serialized_snapshot_isolation() {
+        mvcc_tests(true).await;
     }
 
-    #[test]
-    fn mvcc_snapshot_isolation() {
-        mvcc_tests(false);
+    #[tokio::test]
+    async fn mvcc_snapshot_isolation() {
+        mvcc_tests(false).await;
     }
 
-    #[test]
-    fn basic_scan_single_key() {
+    #[tokio::test]
+    async fn basic_scan_single_key() {
         let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![Bytes::from("key1")];
@@ -671,18 +669,18 @@ mod tests {
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
-        let results = txn.scan(range).unwrap();
+        let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
     }
 
-    #[test]
-    fn basic_scan_multiple_keys() {
+    #[tokio::test]
+    async fn basic_scan_multiple_keys() {
         let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![
@@ -695,20 +693,49 @@ mod tests {
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let txn = store.begin().unwrap();
-        let results = txn.scan(range).unwrap();
+        let results = txn.scan(range, None).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].1, keys_to_insert[0]);
+        assert_eq!(results[1].1, keys_to_insert[1]);
+        assert_eq!(results[2].1, keys_to_insert[2]);
+    }
+
+    #[tokio::test]
+    async fn scan_multiple_keys_within_single_transaction() {
+        let (store, _) = create_store(false);
+        // Define key-value pairs for the test
+        let keys_to_insert = vec![
+            Bytes::from("test1"),
+            Bytes::from("test2"),
+            Bytes::from("test3"),
+        ];
+
+        let mut txn = store.begin().unwrap();
+        for key in &keys_to_insert {
+            txn.set(key, key).unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        let range = "test1".as_bytes()..="test7".as_bytes();
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, keys_to_insert[0]);
         assert_eq!(results[1].0, keys_to_insert[1]);
         assert_eq!(results[2].0, keys_to_insert[2]);
+        assert_eq!(results[0].1, keys_to_insert[0]);
+        assert_eq!(results[1].1, keys_to_insert[1]);
+        assert_eq!(results[2].1, keys_to_insert[2]);
     }
 
-    fn mvcc_with_scan_tests(is_ssi: bool) {
+    async fn mvcc_with_scan_tests(is_ssi: bool) {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
@@ -727,7 +754,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
@@ -735,15 +762,15 @@ mod tests {
             txn2.set(&key1, &value4).unwrap();
             txn2.set(&key2, &value2).unwrap();
             txn2.set(&key3, &value3).unwrap();
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key4".as_bytes();
-            let results = txn3.scan(range).unwrap();
+            let results = txn3.scan(range, None).unwrap();
             assert_eq!(results.len(), 1);
             txn3.set(&key2, &value5).unwrap();
             txn3.set(&key3, &value6).unwrap();
 
-            assert!(match txn3.commit() {
+            assert!(match txn3.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -760,19 +787,19 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key4, &value1).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key4).unwrap();
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key5".as_bytes();
-            txn3.scan(range).unwrap();
+            txn3.scan(range, None).unwrap();
             txn3.set(&key4, &value2).unwrap();
 
-            assert!(match txn3.commit() {
+            assert!(match txn3.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -785,18 +812,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mvcc_serialized_snapshot_isolation_scan() {
-        mvcc_with_scan_tests(true);
+    #[tokio::test]
+    async fn mvcc_serialized_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(true).await;
     }
 
-    #[test]
-    fn mvcc_snapshot_isolation_scan() {
-        mvcc_with_scan_tests(false);
+    #[tokio::test]
+    async fn mvcc_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(false).await;
     }
 
-    #[test]
-    fn ryow() {
+    #[tokio::test]
+    async fn ryow() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -811,23 +838,23 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value2).unwrap();
-            assert_eq!(txn.get(&key1).unwrap(), value2.as_ref());
-            assert!(txn.get(&key3).is_err());
+            assert_eq!(txn.get(&key1).unwrap().unwrap(), value2.as_ref());
+            assert!(txn.get(&key3).unwrap().is_none());
             txn.set(&key2, &value1).unwrap();
-            assert_eq!(txn.get(&key2).unwrap(), value1.as_ref());
-            txn.commit().unwrap();
+            assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref());
+            txn.commit().await.unwrap();
         }
     }
 
     // Common setup logic for creating a store
-    fn create_hermitage_store(is_ssi: bool) -> Store {
+    async fn create_hermitage_store(is_ssi: bool) -> Store {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("k1");
@@ -838,7 +865,7 @@ mod tests {
         let mut txn = store.begin().unwrap();
         txn.set(&key1, &value1).unwrap();
         txn.set(&key2, &value2).unwrap();
-        txn.commit().unwrap();
+        txn.commit().await.unwrap();
 
         store
     }
@@ -847,8 +874,8 @@ mod tests {
     // Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
 
     // G0: Write Cycles (dirty writes)
-    fn g0_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g0_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value3 = Bytes::from("v3");
@@ -870,10 +897,10 @@ mod tests {
 
             txn1.set(&key2, &value5).unwrap();
 
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             txn2.set(&key2, &value6).unwrap();
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -887,22 +914,22 @@ mod tests {
 
         {
             let txn3 = store.begin().unwrap();
-            let val1 = txn3.get(&key1).unwrap();
+            let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value3.as_ref());
-            let val2 = txn3.get(&key2).unwrap();
+            let val2 = txn3.get(&key2).unwrap().unwrap();
             assert_eq!(val2, value5.as_ref());
         }
     }
 
-    #[test]
-    fn g0() {
-        g0_tests(false); // snapshot isolation
-        g0_tests(true); // serializable snapshot isolation
+    #[tokio::test]
+    async fn g0() {
+        g0_tests(false).await; // snapshot isolation
+        g0_tests(true).await; // serializable snapshot isolation
     }
 
     // G1a: Aborted Reads (dirty reads, cascaded aborts)
-    fn g1a_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g1a_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
@@ -918,37 +945,37 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             drop(txn1);
 
-            let res = txn2.scan(range).unwrap();
+            let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
         }
 
         {
             let txn3 = store.begin().unwrap();
-            let val1 = txn3.get(&key1).unwrap();
+            let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value1.as_ref());
-            let val2 = txn3.get(&key2).unwrap();
+            let val2 = txn3.get(&key2).unwrap().unwrap();
             assert_eq!(val2, value2.as_ref());
         }
     }
 
-    #[test]
-    fn g1a() {
-        g1a_tests(false); // snapshot isolation
-        g1a_tests(true); // serializable snapshot isolation
+    #[tokio::test]
+    async fn g1a() {
+        g1a_tests(false).await; // snapshot isolation
+        g1a_tests(true).await; // serializable snapshot isolation
     }
 
     // G1b: Intermediate Reads (dirty reads)
-    fn g1b_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g1b_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -966,30 +993,30 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
             txn1.set(&key1, &value4).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
-            let res = txn2.scan(range).unwrap();
+            let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
         }
     }
 
-    #[test]
-    fn g1b() {
-        g1b_tests(false); // snapshot isolation
-        g1b_tests(true); // serializable snapshot isolation
+    #[tokio::test]
+    async fn g1b() {
+        g1b_tests(false).await; // snapshot isolation
+        g1b_tests(true).await; // serializable snapshot isolation
     }
 
     // G1c: Circular Information Flow (dirty reads)
-    fn g1c_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g1c_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1008,11 +1035,11 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
 
-            txn1.commit().unwrap();
-            assert!(match txn2.commit() {
+            txn1.commit().await.unwrap();
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -1025,15 +1052,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn g1c() {
-        g1c_tests(false); // snapshot isolation
-        g1c_tests(true);
+    #[tokio::test]
+    async fn g1c() {
+        g1c_tests(false).await; // snapshot isolation
+        g1c_tests(true).await;
     }
 
     // PMP: Predicate-Many-Preceders
-    fn pmp_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn pmp_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key3 = Bytes::from("k3");
         let value1 = Bytes::from("v1");
@@ -1046,33 +1073,33 @@ mod tests {
 
             // k3 should not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             // k3 is committed by txn2
             txn2.set(&key3, &value3).unwrap();
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
 
             // k3 should still not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
         }
     }
 
-    #[test]
-    fn pmp() {
-        pmp_tests(false);
-        pmp_tests(true);
+    #[tokio::test]
+    async fn pmp() {
+        pmp_tests(false).await;
+        pmp_tests(true).await;
     }
 
     // PMP-Write: Circular Information Flow (dirty reads)
-    fn pmp_write_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn pmp_write_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1088,20 +1115,20 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.delete(&key2).unwrap();
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 1);
-            assert_eq!(res[0].0, value1);
+            assert_eq!(res[0].1, value1);
 
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -1114,15 +1141,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pmp_write() {
-        pmp_write_tests(false);
-        pmp_write_tests(true);
+    #[tokio::test]
+    async fn pmp_write() {
+        pmp_write_tests(false).await;
+        pmp_write_tests(true).await;
     }
 
     // P4: Lost Update
-    fn p4_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn p4_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let value3 = Bytes::from("v3");
@@ -1137,9 +1164,9 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key1, &value3).unwrap();
 
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -1152,15 +1179,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn p4() {
-        p4_tests(false);
-        p4_tests(true);
+    #[tokio::test]
+    async fn p4() {
+        p4_tests(false).await;
+        p4_tests(true).await;
     }
 
     // G-single: Single Anti-dependency Cycles (read skew)
-    fn g_single_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g_single_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1173,28 +1200,28 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap(), value2.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2.as_ref());
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap(), value2.as_ref());
-            txn1.commit().unwrap();
+            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
+            txn1.commit().await.unwrap();
         }
     }
 
-    #[test]
-    fn g_single() {
-        g_single_tests(false);
-        g_single_tests(true);
+    #[tokio::test]
+    async fn g_single() {
+        g_single_tests(false).await;
+        g_single_tests(true).await;
     }
 
     // G-single-write-1: Single Anti-dependency Cycles (read skew)
-    fn g_single_write_1_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g_single_write_1_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1207,22 +1234,22 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
 
             txn1.delete(&key2).unwrap();
-            assert!(txn1.get(&key2).is_err());
-            assert!(match txn1.commit() {
+            assert!(txn1.get(&key2).unwrap().is_none());
+            assert!(match txn1.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -1235,15 +1262,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn g_single_write_1() {
-        g_single_write_1_tests(false);
-        g_single_write_1_tests(true);
+    #[tokio::test]
+    async fn g_single_write_1() {
+        g_single_write_1_tests(false).await;
+        g_single_write_1_tests(true).await;
     }
 
     // G-single-write-2: Single Anti-dependency Cycles (read skew)
-    fn g_single_write_2_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g_single_write_2_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1256,12 +1283,12 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn2.set(&key1, &value3).unwrap();
 
@@ -1271,18 +1298,18 @@ mod tests {
 
             drop(txn1);
 
-            txn2.commit().unwrap();
+            txn2.commit().await.unwrap();
         }
     }
 
-    #[test]
-    fn g_single_write_2() {
-        g_single_write_2_tests(false);
-        g_single_write_2_tests(true);
+    #[tokio::test]
+    async fn g_single_write_2() {
+        g_single_write_2_tests(false).await;
+        g_single_write_2_tests(true).await;
     }
 
-    fn g2_item_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi);
+    async fn g2_item_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1296,22 +1323,22 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn1.scan(range.clone()).unwrap();
+            let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
-            let res = txn2.scan(range.clone()).unwrap();
+            let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].0, value1);
-            assert_eq!(res[1].0, value2);
+            assert_eq!(res[0].1, value1);
+            assert_eq!(res[1].1, value2);
 
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn1.commit().unwrap();
+            txn1.commit().await.unwrap();
 
-            assert!(match txn2.commit() {
+            assert!(match txn2.commit().await {
                 Err(err) => {
                     if let Error::TransactionReadConflict = err {
                         true
@@ -1324,17 +1351,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn g2_item() {
-        g2_item_tests(false);
-        g2_item_tests(true);
+    #[tokio::test]
+    async fn g2_item() {
+        g2_item_tests(false).await;
+        g2_item_tests(true).await;
     }
 
     fn require_send<T: Send>(_: T) {}
     fn require_sync<T: Sync + Send>(_: T) {}
 
-    #[test]
-    fn is_send_sync() {
+    #[tokio::test]
+    async fn is_send_sync() {
         let (db, _) = create_store(false);
 
         let txn = db.begin().unwrap();
@@ -1344,8 +1371,8 @@ mod tests {
         require_sync(txn);
     }
 
-    #[test]
-    fn max_transaction_entries_limit_exceeded() {
+    #[tokio::test]
+    async fn max_transaction_entries_limit_exceeded() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1383,7 +1410,7 @@ mod tests {
         }
     }
 
-    const ENTRIES: usize = 4_000_00;
+    const ENTRIES: usize = 400_000;
     const KEY_SIZE: usize = 24;
     const VALUE_SIZE: usize = 150;
     const RNG_SEED: u64 = 3;
@@ -1428,9 +1455,9 @@ mod tests {
         fastrand::Rng::with_seed(RNG_SEED)
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn insert_large_txn_and_get() {
+    async fn insert_large_txn_and_get() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1444,15 +1471,26 @@ mod tests {
             let (key, value) = gen_pair(&mut rng);
             txn.set(&key, &value).unwrap();
         }
-        txn.commit().unwrap();
+        txn.commit().await.unwrap();
         drop(txn);
 
         // Read the keys from the store
         let mut rng = make_rng();
         let txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
-        for i in 0..ENTRIES {
+        for _i in 0..ENTRIES {
             let (key, _) = gen_pair(&mut rng);
             txn.get(&key).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn empty_scan_should_not_return_an_error() {
+        let (store, _) = create_store(false);
+
+        let range = "key1".as_bytes()..="key3".as_bytes();
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range, None).unwrap();
+        assert_eq!(results.len(), 0);
     }
 }

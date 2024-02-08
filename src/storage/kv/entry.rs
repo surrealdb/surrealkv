@@ -447,7 +447,7 @@ impl ValueRef {
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
     fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
         // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.write().get(&value_offset) {
+        if let Some(value) = self.store.value_cache.get(&value_offset) {
             return Ok(value.to_vec());
         }
 
@@ -459,8 +459,7 @@ impl ValueRef {
         // Store the offset and value in value_cache
         self.store
             .value_cache
-            .write()
-            .push(value_offset, Bytes::from(buf.clone()));
+            .insert(value_offset, Bytes::from(buf.clone()));
 
         Ok(buf)
     }
@@ -469,8 +468,8 @@ impl ValueRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Core;
     use crate::storage::kv::store::Store;
 
     use tempdir::TempDir;
@@ -479,8 +478,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn encode_decode() {
+    #[tokio::test]
+    async fn encode_decode() {
         // Create a sample valueRef instance
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
@@ -489,14 +488,15 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let store = Arc::new(Core::new(opts).expect("failed to create store"));
+        // Create a new Core instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
 
         let mut txmd = Metadata::new();
         txmd.as_deleted(true).expect("failed to set deleted");
         let mut kvmd = Metadata::new();
         kvmd.as_deleted(true).expect("failed to set deleted");
 
-        let mut value_ref = ValueRef::new(store);
+        let mut value_ref = ValueRef::new(store.core.clone());
         value_ref.value_length = 100;
         value_ref.value_offset = Some(200);
         value_ref.key_value_metadata = Some(kvmd);
@@ -518,8 +518,8 @@ mod tests {
         // );
     }
 
-    #[test]
-    fn txn_with_value_read_from_clog() {
+    #[tokio::test]
+    async fn txn_with_value_read_from_clog() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -546,7 +546,7 @@ mod tests {
             txn.set(&key2, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         {
@@ -554,7 +554,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -565,7 +565,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -579,7 +579,7 @@ mod tests {
             txn.set(&key3, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         {
@@ -587,15 +587,15 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key3
-            let val = txn.get(&key3).unwrap();
+            let val = txn.get(&key3).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
         }
     }
 
-    #[test]
-    fn txn_with_value_read_from_memory() {
+    #[tokio::test]
+    async fn txn_with_value_read_from_memory() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -621,7 +621,7 @@ mod tests {
             txn.set(&key2, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         {
@@ -629,7 +629,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap();
+            let val = txn.get(&key1).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -640,7 +640,7 @@ mod tests {
             let txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap();
+            let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);

@@ -1,7 +1,17 @@
 [package]
 name = "surrealkv"
+publish = true
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+description = "A low-level, versioned, embedded, ACID-compliant, key-value database for Rust"
+repository = "https://github.com/surrealdb/surrealkv"
+homepage = "https://github.com/surrealdb/surrealkv"
+documentation = "https://docs.rs/surrealkv/"
+keywords = ["lmdb", "rocksdb", "sled", "redb", "tikv"]
+categories = ["database-implementations", "concurrency", "data-structures"]
+rust-version = "1.75"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,23 +23,23 @@ crossbeam-channel = "0.5.8"
 parking_lot = "0.12.1"
 hashbrown = "0.14.2"
 lru = "0.12.0"
-
-# below is for the async runtime
-async-task = "4.4.0"
-futures-lite = "1.12.0"
-once_cell = "1.17.1"
-flume = "0.11.0"
+async-channel = "2.1.1"
+futures = "0.3.30"
 bytes = "1.5.0"
+tokio = { version = "1.36", features = ["rt"] }
+sha2 = "0.10.8"
+quick_cache = "0.4.0"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full"] }
 tempdir = "0.3"
 rand = "0.8.5"
-criterion = "0.5.1"
+criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 jemallocator = "0.5.4"
 nanoid = "0.4.0"
-caches = "0.2" 
 fastrand = "2.0.1"
 
+
 [[bench]]
-name = "s3fifo_bench"
+name = "store_bench"
 harness = false

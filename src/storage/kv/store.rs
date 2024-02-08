@@ -1,16 +1,20 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::vec;
-use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
-use bytes::Bytes;
+use async_channel::{bounded, Receiver, Sender};
+use futures::{select, FutureExt};
+use tokio::task::{spawn, JoinHandle};
+
+use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
-use lru::LruCache;
 use parking_lot::RwLock;
+use quick_cache::sync::Cache;
 
 use crate::storage::{
     index::art::KV,
     kv::{
-        entry::{TxRecord, ValueRef},
+        entry::{Entry, TxRecord, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
         option::Options,
@@ -25,9 +29,11 @@ use crate::storage::{
 };
 
 /// An MVCC-based transactional key-value store.
-#[derive(Clone)]
 pub struct Store {
     pub(crate) core: Arc<Core>,
+    pub(crate) is_closed: AtomicBool,
+    stop_tx: Sender<()>,
+    task_runner_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl Store {
@@ -35,8 +41,19 @@ impl Store {
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
     pub fn new(opts: Options) -> Result<Self> {
-        let core = Arc::new(Core::new(opts)?);
-        Ok(Self { core })
+        // TODO: make this channel size configurable
+        let (writes_tx, writes_rx) = bounded(10000);
+        let (stop_tx, stop_rx) = bounded(1);
+
+        let core = Arc::new(Core::new(opts, writes_tx)?);
+        let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
+
+        Ok(Self {
+            core,
+            stop_tx,
+            is_closed: AtomicBool::new(false),
+            task_runner_handle: Arc::new(RwLock::new(Some(task_runner_handle))),
+        })
     }
 
     /// Begins a new read-write transaction.
@@ -68,22 +85,84 @@ impl Store {
     /// Executes a function in a read-write transaction and commits the transaction.
     /// It begins a new read-write transaction, executes the function with the transaction, and commits the transaction.
     /// It returns the result of the function.
-    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+    pub async fn write(
+        self: Arc<Self>,
+        f: impl FnOnce(&mut Transaction) -> Result<()>,
+    ) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
-        txn.commit()?;
+        txn.commit().await?;
 
+        Ok(())
+    }
+
+    /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
+    pub async fn close(&self) -> Result<()> {
+        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Send stop signal
+        self.stop_tx
+            .send(())
+            .await
+            .map_err(|e| Error::SendError(format!("{}", e)))?;
+
+        // Wait for task to finish
+        if let Some(handle) = self.task_runner_handle.write().take() {
+            handle.await.map_err(|e| {
+                Error::ReceiveError(format!(
+                    "Error occurred while closing the kv store. JoinError: {}",
+                    e.to_string()
+                ))
+            })?;
+        }
+
+        self.core.close()?;
         Ok(())
     }
 }
 
-impl Drop for Store {
-    /// Drops the store by closing the core.
-    /// If closing the core fails, it panics with an error message.
-    fn drop(&mut self) {
-        let err = self.core.close();
-        if err.is_err() {
-            panic!("failed to close core: {:?}", err);
+pub(crate) struct TaskRunner {
+    core: Arc<Core>,
+    writes_rx: Receiver<Task>,
+    stop_rx: Receiver<()>,
+}
+
+impl TaskRunner {
+    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+        Self {
+            core,
+            writes_rx,
+            stop_rx,
+        }
+    }
+
+    fn spawn(self) -> JoinHandle<()> {
+        spawn(Box::pin(async move {
+            loop {
+                select! {
+                    req = self.writes_rx.recv().fuse() => {
+                        let task = req.unwrap();
+                        self.handle_task(task).await
+                    },
+                    _ = self.stop_rx.recv().fuse() => {
+                        // Consume all remaining items in writes_rx
+                        while let Ok(task) = self.writes_rx.try_recv() {
+                            self.handle_task(task).await;
+                        }
+                        drop(self);
+                        return;
+                    },
+                }
+            }
+        }))
+    }
+
+    async fn handle_task(&self, task: Task) {
+        let core = self.core.clone();
+        if let Err(err) = core.write_request(task).await {
+            eprintln!("failed to write: {:?}", err);
         }
     }
 }
@@ -97,15 +176,31 @@ pub struct Core {
     /// Commit log for store.
     pub(crate) clog: Arc<RwLock<Aol>>,
     /// Manifest for store to track Store state.
-    pub(crate) manifest: Aol,
+    pub(crate) manifest: RwLock<Aol>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Value cache for store.
-    /// The assumption for this cache is that it could be useful for
+    /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Arc<RwLock<LruCache<u64, Bytes>>>,
+    pub(crate) value_cache: Cache<u64, Bytes>,
+    /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
+    /// Channel to send write requests to the writer
+    writes_tx: Sender<Task>,
+}
+
+/// A Task contains multiple entries to be written to the disk.
+#[derive(Clone)]
+pub struct Task {
+    /// Entries contained in this task
+    entries: Vec<Entry>,
+    /// Use channel to notify that the value has been persisted to disk
+    done: Option<Sender<Result<()>>>,
+    /// Transaction ID
+    tx_id: u64,
+    /// Commit timestamp
+    commit_ts: u64,
 }
 
 impl Core {
@@ -115,7 +210,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Indexer::new(&opts);
 
@@ -147,18 +242,18 @@ impl Core {
         oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
-        let cache_size = NonZeroUsize::new(opts.max_value_cache_size as usize).unwrap();
-        let value_cache = Arc::new(RwLock::new(LruCache::new(cache_size)));
+        let value_cache = Cache::new(opts.max_value_cache_size as usize);
 
         // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
-            manifest,
+            manifest: RwLock::new(manifest),
             clog: Arc::new(RwLock::new(clog)),
             oracle: Arc::new(oracle),
             value_cache,
             is_closed: AtomicBool::new(false),
+            writes_tx,
         })
     }
 
@@ -286,7 +381,7 @@ impl Core {
         self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn close(&self) -> Result<()> {
+    pub(crate) fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -302,17 +397,109 @@ impl Core {
         // Close the commit log
         self.clog.write().close()?;
 
+        // Close the manifest
+        self.manifest.write().close()?;
+
         self.is_closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
+
+    pub(crate) async fn write_request(&self, req: Task) -> Result<()> {
+        let done = req.done.clone();
+
+        let result = self.write_entries(req);
+
+        if let Some(done) = done {
+            done.send(result.clone()).await?;
+        }
+
+        result
+    }
+
+    fn write_entries(&self, req: Task) -> Result<()> {
+        if req.entries.is_empty() {
+            return Ok(());
+        }
+
+        let current_offset = self.clog.read().offset()?;
+        let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
+        let mut buf = BytesMut::new();
+        let mut committed_values_offsets = HashMap::new();
+
+        tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
+
+        self.append_to_log(&buf)?;
+        self.write_to_index(&req, &committed_values_offsets)?;
+
+        Ok(())
+    }
+
+    fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
+        let mut clog = self.clog.write();
+        clog.append(tx_record)?;
+
+        Ok(())
+    }
+
+    fn write_to_index(
+        &self,
+        req: &Task,
+        committed_values_offsets: &HashMap<Bytes, usize>,
+    ) -> Result<()> {
+        let mut index = self.indexer.write();
+        let mut kv_pairs = Vec::new();
+
+        for entry in &req.entries {
+            let index_value = ValueRef::encode(
+                &entry.key,
+                &entry.value,
+                entry.metadata.as_ref(),
+                committed_values_offsets,
+                self.opts.max_value_threshold,
+            );
+
+            kv_pairs.push(KV {
+                key: entry.key[..].into(),
+                value: index_value,
+                version: req.tx_id,
+                ts: req.commit_ts,
+            });
+        }
+
+        index.bulk_insert(&mut kv_pairs)?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn send_to_write_channel(
+        &self,
+        entries: Vec<Entry>,
+        tx_id: u64,
+        commit_ts: u64,
+    ) -> Result<Receiver<Result<()>>> {
+        let (tx, rx) = bounded(1);
+        let req = Task {
+            entries,
+            done: Some(tx),
+            tx_id,
+            commit_ts,
+        };
+        self.writes_tx.send(req).await?;
+        Ok(rx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
+    use crate::storage::kv::store::{Store, Task, TaskRunner};
+
+    use async_channel::bounded;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use tempdir::TempDir;
@@ -321,8 +508,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn bulk_insert() {
+    #[tokio::test]
+    async fn bulk_insert() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -360,20 +547,20 @@ mod tests {
             // Start a new write transaction
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         // Read the keys to the store
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn3 matches default_value
             assert_eq!(val, default_value.as_ref());
         }
 
         // Drop the store to simulate closing it
-        drop(store);
+        store.close().await.unwrap();
 
         // Create a new Core instance with VariableKey after dropping the previous one
         let mut opts = Options::new();
@@ -386,14 +573,14 @@ mod tests {
         for (_, key) in keys.iter().enumerate() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
     }
 
-    #[test]
-    fn store_open_and_reload_options() {
+    #[tokio::test]
+    async fn store_open_and_reload_options() {
         // // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -403,6 +590,7 @@ mod tests {
 
         // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
 
         drop(store);
 
@@ -416,8 +604,8 @@ mod tests {
         assert_eq!(store_opts, opts);
     }
 
-    #[test]
-    fn clone_store() {
+    #[tokio::test]
+    async fn clone_store() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -426,7 +614,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
 
         // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts).expect("should create store");
+        let store = Arc::new(Store::new(opts).expect("should create store"));
 
         // Number of keys to generate
         let num_keys = 100;
@@ -456,7 +644,76 @@ mod tests {
             // Start a new write transaction
             let mut txn = store1.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn stop_task_runner() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        let (writes_tx, writes_rx) = bounded(100);
+        let (stop_tx, stop_rx) = bounded(1);
+        let core = &store.core;
+
+        let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx);
+        let fut = runner.spawn();
+
+        // Send some tasks
+        let task_counter = Arc::new(AtomicU64::new(0));
+        for i in 0..100 {
+            let (done_tx, done_rx) = bounded(1);
+            writes_tx
+                .send(Task {
+                    entries: vec![],
+                    done: Some(done_tx),
+                    tx_id: i,
+                    commit_ts: i,
+                })
+                .await
+                .unwrap();
+
+            let task_counter = Arc::clone(&task_counter);
+            tokio::spawn(async move {
+                done_rx.recv().await.unwrap().unwrap();
+                task_counter.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        // Send stop signal
+        stop_tx.send(()).await.unwrap();
+
+        // Wait for a while to let TaskRunner handle all tasks by waiting on done_rx
+        fut.await.expect("TaskRunner should finish");
+
+        // Wait for the spawned tokio thread to finish
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
+        // Check if all tasks were handled
+        assert_eq!(task_counter.load(Ordering::SeqCst), 100);
+    }
+
+    async fn concurrent_task(store: Arc<Store>) {
+        let mut txn = store.begin().unwrap();
+        txn.set(b"dummy key", b"dummy value").unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_test() {
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        let db = Arc::new(Store::new(opts).expect("should create store"));
+        let task1 = tokio::spawn(concurrent_task(db.clone()));
+        let task2 = tokio::spawn(concurrent_task(db.clone()));
+        let _ = tokio::try_join!(task1, task2).expect("Tasks failed");
     }
 }
