@@ -3,8 +3,8 @@ use std::vec;
 use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
 
 use async_channel::{bounded, Receiver, Sender};
-use tokio::task::{spawn, JoinHandle};
 use futures::{select, FutureExt};
+use tokio::task::{spawn, JoinHandle};
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;

@@ -5,6 +5,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
+use crate::storage::index;
 use crate::storage::{
     index::{art::TrieError, VariableKey},
     kv::{
@@ -258,14 +259,18 @@ impl Transaction {
             },
         );
 
+        // Initialize an empty vector to store the results.
+        let mut results = Vec::new();
+
         // Create a new reader for the snapshot.
-        let iterator = self.snapshot.write().new_reader()?;
+        let iterator = match self.snapshot.write().new_reader() {
+            Ok(reader) => reader,
+            Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
 
         // Get a range iterator for the specified range.
         let ranger = iterator.range(range);
-
-        // Initialize an empty vector to store the results.
-        let mut results = Vec::new();
 
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
@@ -1457,5 +1462,16 @@ mod tests {
             let (key, _) = gen_pair(&mut rng);
             txn.get(&key).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn empty_scan_should_not_return_an_error() {
+        let (store, _) = create_store(false);
+
+        let range = "key1".as_bytes()..="key3".as_bytes();
+
+        let txn = store.begin().unwrap();
+        let results = txn.scan(range, None).unwrap();
+        assert_eq!(results.len(), 0);
     }
 }
