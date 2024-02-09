@@ -221,13 +221,8 @@ impl Transaction {
             // Convert the value to Bytes.
             let index_value = ValueRef::encode_mem(&e.value, e.metadata.as_ref());
 
-            // If the entry is marked as deleted, delete it from the snapshot.
-            // Otherwise, set the key-value pair in the snapshot.
-            if e.is_deleted() {
-                self.snapshot.write().delete(&e.key[..].into())?;
-            } else {
-                self.snapshot.write().set(&e.key[..].into(), index_value)?;
-            }
+            // Set the key-value pair in the snapshot.
+            self.snapshot.write().set(&e.key[..].into(), index_value)?;
         }
 
         // Add the entry to the set of pending writes.
@@ -1493,4 +1488,107 @@ mod tests {
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 0);
     }
+
+    #[tokio::test]
+    async fn transaction_delete_and_scan_test() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("k1");
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn1)
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn1.commit().await.unwrap();
+        }
+
+        {
+            // Start a read-only transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.get(&key1).unwrap();
+            txn.delete(&key1).unwrap();
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let results = txn.scan(range, None).unwrap();
+            assert_eq!(results.len(), 0);
+            txn.commit().await.unwrap();
+        }
+        {
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let txn = store.begin().unwrap();
+            let results = txn.scan(range, None).unwrap();
+            assert_eq!(results.len(), 0);
+        }
+    }
+
+
+    #[tokio::test]
+    async fn sdb_delete_record_id_bug() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::copy_from_slice(&[47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52]);
+        let key2 = Bytes::copy_from_slice(&[47, 33, 104, 98, 0, 0, 1, 141, 141, 42, 113, 8, 47, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52]);
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let key3 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key3, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+
+        let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+        let txn1 = store.begin().unwrap();
+        txn1.get(&key4).unwrap();
+
+
+        {
+            let mut txn2 = store.begin().unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+            txn2.set(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]), &value1).unwrap();
+    
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
+            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0]), &value1).unwrap();
+    
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
+            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0]), &value1).unwrap();
+    
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
+            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0]), &value1).unwrap();
+    
+            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
+    
+            txn2.commit().await.unwrap();
+        }
+
+        {
+            let mut txn3 = store.begin().unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
+            txn3.delete(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
+            txn3.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0]), &value1).unwrap();
+            txn3.commit().await.unwrap();    
+        }
+    }
+
+
 }
