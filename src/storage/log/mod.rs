@@ -986,17 +986,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(file)
     }
 
-    // Flushes the current block to disk.
-    // This method also synchronize file metadata to the filesystem
-    // hence it is a bit slower than fdatasync (sync_data).
-    pub(crate) fn sync(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Segment is closed",
-            )));
-        }
-
+    fn flush_and_sync(&mut self) -> Result<()> {
         if self.block.written > 0 {
             // Flush the full block to disk if it is a WAL with zero padded
             // to the end of the last block. This is done to avoid writing
@@ -1015,6 +1005,20 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(())
     }
 
+    // Flushes the current block to disk.
+    // This method also synchronize file metadata to the filesystem
+    // hence it is a bit slower than fdatasync (sync_data).
+    pub(crate) fn sync(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Segment is closed",
+            )));
+        }
+
+        self.flush_and_sync()
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
         if self.closed {
             return Err(Error::IO(IOError::new(
@@ -1023,20 +1027,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             )));
         }
 
-        if self.block.written > 0 {
-            // Flush the full block to disk if it is a WAL with zero padded
-            // to the end of the last block. This is done to avoid writing
-            // partial records to the WAL, and for detecting corruption.
-            //
-            // Else flush the block as it is without zero padding.
-            if self.is_wal {
-                self.flush_block(true)?;
-            } else {
-                self.flush_block(false)?;
-            }
-        }
-
-        self.file.sync_all()?;
+        self.flush_and_sync()?;
 
         self.closed = true;
         Ok(())

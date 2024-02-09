@@ -46,7 +46,7 @@ where
 }
 
 /// Cache is an implementation of "S3-FIFO" from "FIFO Queues are ALL You Need for Cache Eviction" by
-/// Juncheng Yang, et al: https://jasony.me/publication/sosp23-s3fifo.pdf
+/// Juncheng Yang, et al: <https://jasony.me/publication/sosp23-s3fifo.pdf>
 pub struct Cache<K, V>
 where
     K: PartialEq + Eq + Hash + Clone + Debug,
