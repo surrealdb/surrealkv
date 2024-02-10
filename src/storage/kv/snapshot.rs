@@ -9,9 +9,8 @@ use crate::storage::{
 };
 
 use vart::{
-    TrieError, iter::IterationPointer, snapshot::Snapshot as TartSnapshot, VariableSizeKey,
+    iter::IterationPointer, snapshot::Snapshot as TartSnapshot, TrieError, VariableSizeKey,
 };
-
 
 pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
 
@@ -55,7 +54,11 @@ impl Snapshot {
         self.get_with_filters(key, &FILTERS)
     }
 
-    pub fn get_with_filters<F>(&self, key: &VariableSizeKey, filters: &[F]) -> Result<Box<dyn Value>>
+    pub fn get_with_filters<F>(
+        &self,
+        key: &VariableSizeKey,
+        filters: &[F],
+    ) -> Result<Box<dyn Value>>
     where
         F: FilterFn,
     {

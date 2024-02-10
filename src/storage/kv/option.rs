@@ -7,7 +7,6 @@ use crate::storage::{
 
 use vart::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS;
 
-
 // Defining constants for metadata keys
 const META_KEY_ISOLATION_LEVEL: &str = "isolation_level";
 const META_KEY_MAX_KEY_SIZE: &str = "max_key_size";

@@ -81,41 +81,18 @@ impl CompressionFormat {
             CompressionFormat::NoCompression => 0,
         }
     }
-
-    fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(CompressionFormat::NoCompression),
-            _ => None,
-        }
-    }
 }
 
 // Enum to represent different compression levels
 #[derive(Clone)]
 pub enum CompressionLevel {
     BestSpeed = 0,
-    BestCompression = 1,
-    DefaultCompression = 2,
-    HuffmanOnly = 3,
 }
 
 impl CompressionLevel {
     fn as_u64(&self) -> u64 {
         match *self {
             CompressionLevel::BestSpeed => 0,
-            CompressionLevel::BestCompression => 1,
-            CompressionLevel::DefaultCompression => 2,
-            CompressionLevel::HuffmanOnly => 3,
-        }
-    }
-
-    fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(CompressionLevel::BestSpeed),
-            1 => Some(CompressionLevel::BestCompression),
-            2 => Some(CompressionLevel::DefaultCompression),
-            3 => Some(CompressionLevel::HuffmanOnly),
-            _ => None,
         }
     }
 }
@@ -262,20 +239,6 @@ impl Default for Options {
 }
 
 impl Options {
-    fn new() -> Self {
-        Options {
-            dir_mode: None,
-            file_mode: None,
-            compression_format: None,
-            compression_level: None,
-            metadata: None,
-            file_extension: None,
-            max_file_size: 0,
-            is_wal: false,
-            max_open_files: 0,
-        }
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.max_file_size == 0 {
             return Err(Error::IO(IOError::new(
@@ -287,41 +250,49 @@ impl Options {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn with_file_mode(mut self, file_mode: u32) -> Self {
         self.file_mode = Some(file_mode);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
         self.compression_format = Some(compression_format);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
         self.compression_level = Some(compression_level);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_file_extension(mut self, extension: String) -> Self {
         self.file_extension = Some(extension);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_dir_mode(mut self, dir_mode: u32) -> Self {
         self.dir_mode = Some(dir_mode);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_wal(mut self) -> Self {
         self.is_wal = true;
         self
@@ -889,6 +860,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
+    #[allow(dead_code)]
     /// The path where the segment file is located.
     file_path: PathBuf,
 
@@ -904,6 +876,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The current offset within the file.
     file_offset: u64,
 
+    #[allow(dead_code)]
     /// The maximum size of the segment file.
     pub(crate) file_size: u64,
 
@@ -1192,7 +1165,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             if remaining == pending {
                 return Ok(n);
             } else {
-                return Err(Error::EOF(n));
+                return Err(Error::Eof(n));
             }
         }
 
@@ -1216,9 +1189,9 @@ pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
     EmptyBuffer,
-    EOF(usize),
+    Eof(usize),
     IO(IOError),
-    PoisonError(String),
+    Poison(String),
 }
 
 // Implementation of Display trait for Error
@@ -1229,8 +1202,8 @@ impl fmt::Display for Error {
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
             Error::IO(err) => write!(f, "IO error: {}", err),
-            Error::EOF(n) => write!(f, "EOF error after reading {} bytes", n),
-            Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
+            Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
         }
     }
 }
@@ -1251,7 +1224,7 @@ impl From<io::Error> for Error {
 // Implementation to convert PoisonError into Error
 impl<T: Sized> From<PoisonError<T>> for Error {
     fn from(e: PoisonError<T>) -> Error {
-        Error::PoisonError(e.to_string())
+        Error::Poison(e.to_string())
     }
 }
 
@@ -1576,8 +1549,8 @@ mod tests {
         // Read the header from the file
         let header = read_file_header(&mut file).expect("should read header");
 
-        // Modify the compression level to an unexpected value
-        opts.compression_level = Some(CompressionLevel::BestCompression); // This doesn't match the default compression level
+        // Modify the metadata to an unexpected value
+        opts.metadata = Some(Metadata::new(None)); // This doesn't match the default metadata
 
         // Validate the file header, expecting an error due to mismatched compression level
         let result = validate_file_header(&header, id, &opts);

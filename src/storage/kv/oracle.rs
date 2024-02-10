@@ -15,11 +15,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use vart::TrieError;
 
 use crate::storage::kv::{
-        error::{Error, Result},
-        option::Options,
-        snapshot::Snapshot,
-        transaction::Transaction,
-    };
+    error::{Error, Result},
+    option::Options,
+    snapshot::Snapshot,
+    transaction::Transaction,
+};
 
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
 /// It uses a write lock to ensure that only one transaction can commit at a time.
@@ -454,7 +454,6 @@ impl WaterMark {
         matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
     }
 
-    
     /// Gets the highest completed timestamp.
     fn _done_until(&self) -> u64 {
         let mark = self.mark.read();

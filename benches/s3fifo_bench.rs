@@ -4,7 +4,7 @@ use rand::{thread_rng, Rng};
 use std::num::NonZeroUsize;
 use surrealkv::storage::cache::s3fifo::Cache;
 
-const cases: usize = 100_000;
+const CASES: usize = 100_000;
 
 fn bench_s3fifo_cache(c: &mut Criterion) {
     c.bench_function("Test s3fifo Cache", move |b| {
@@ -12,7 +12,7 @@ fn bench_s3fifo_cache(c: &mut Criterion) {
             || {
                 let mut rng = thread_rng();
                 let nums: Vec<u64> = black_box(
-                    (0..(cases * 2))
+                    (0..(CASES * 2))
                         .map(|i| {
                             if i % 2 == 0 {
                                 rng.gen::<u64>() % 16384
@@ -26,12 +26,12 @@ fn bench_s3fifo_cache(c: &mut Criterion) {
                 (l, nums)
             },
             |(mut l, nums)| {
-                (0..cases).for_each(|v| {
+                (0..CASES).for_each(|v| {
                     let k = nums[v];
                     l.insert(k, k);
                 });
 
-                (0..cases).for_each(|v| {
+                (0..CASES).for_each(|v| {
                     let k = nums[v];
                     let _ = l.get(&k);
                 });
@@ -47,7 +47,7 @@ fn bench_lru_cache(c: &mut Criterion) {
             || {
                 let mut rng = thread_rng();
                 let nums: Vec<u64> = black_box(
-                    (0..(cases * 2))
+                    (0..(CASES * 2))
                         .map(|i| {
                             if i % 2 == 0 {
                                 rng.gen::<u64>() % 16384
@@ -61,12 +61,12 @@ fn bench_lru_cache(c: &mut Criterion) {
                 (l, nums)
             },
             |(mut l, nums)| {
-                (0..cases).for_each(|v| {
+                (0..CASES).for_each(|v| {
                     let k = nums[v];
                     let _ = l.put(k, k);
                 });
 
-                (0..cases).for_each(|v| {
+                (0..CASES).for_each(|v| {
                     let k = nums[v];
                     let _ = l.get(&k);
                 });

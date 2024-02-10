@@ -1,9 +1,6 @@
 use bytes::Bytes;
 
-use crate::storage::{
-    kv::error::Result,
-    kv::option::Options,
-};
+use crate::storage::{kv::error::Result, kv::option::Options};
 
 use vart::{
     art::{Tree as VartIndex, KV},

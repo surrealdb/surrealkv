@@ -7,12 +7,12 @@ use parking_lot::{Mutex, RwLock};
 use vart::{TrieError, VariableSizeKey};
 
 use crate::storage::kv::{
-        entry::{Entry, Value, ValueRef},
-        error::{Error, Result},
-        snapshot::{FilterFn, Snapshot, FILTERS},
-        store::Core,
-        util::{now, sha256},
-    };
+    entry::{Entry, Value, ValueRef},
+    error::{Error, Result},
+    snapshot::{FilterFn, Snapshot, FILTERS},
+    store::Core,
+    util::{now, sha256},
+};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,6 +57,9 @@ impl Mode {
         matches!(self, Self::ReadOnly)
     }
 }
+
+/// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
+pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
@@ -243,11 +246,7 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(
-        &'b self,
-        range: R,
-        limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64, u64)>>
+    pub fn scan<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<ScanResult>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -568,11 +567,7 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -608,11 +603,7 @@ mod tests {
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -636,11 +627,7 @@ mod tests {
             txn3.set(&key, &value2).unwrap();
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -769,11 +756,7 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -798,11 +781,7 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -910,11 +889,7 @@ mod tests {
             txn2.set(&key2, &value6).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1049,11 +1024,7 @@ mod tests {
             txn1.commit().await.unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1138,11 +1109,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1176,11 +1143,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1259,11 +1222,7 @@ mod tests {
             assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1348,11 +1307,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1389,15 +1344,11 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
 
         let num_keys = 6;
-        let mut counter = 0u32;
         let mut keys = Vec::new();
 
-        for _ in 1..=num_keys {
+        for (counter, _) in (1..=num_keys).enumerate() {
             // Convert the counter to Bytes
             let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-
-            // Increment the counter
-            counter += 1;
 
             // Add the key to the vector
             keys.push(key_bytes);
