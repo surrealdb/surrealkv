@@ -75,7 +75,7 @@ fn sequential_insert_read(c: &mut Criterion) {
         opts.dir = create_temp_directory().path().to_path_buf();
         let db = Store::new(opts).expect("should create store");
 
-        c.bench_function(&format!("sequential inserts"), |b| {
+        c.bench_function("sequential inserts", |b| {
             let count = AtomicU32::new(0_u32);
             b.iter(|| async {
                 let mut txn = db.begin().unwrap();
@@ -93,7 +93,7 @@ fn sequential_insert_read(c: &mut Criterion) {
             })
         });
 
-        c.bench_function(&format!("sequential gets"), |b| {
+        c.bench_function("sequential gets", |b| {
             let count = AtomicU32::new(0_u32);
             b.iter(|| async {
                 count.fetch_add(1, Relaxed);

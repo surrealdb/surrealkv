@@ -4,11 +4,12 @@ use bytes::Bytes;
 
 use super::entry::{Value, ValueRef};
 use crate::storage::{
-    index::{
-        art::TrieError, iter::IterationPointer, snapshot::Snapshot as TartSnapshot, VariableKey,
-    },
     kv::error::{Error, Result},
     kv::store::Core,
+};
+
+use vart::{
+    iter::IterationPointer, snapshot::Snapshot as TartSnapshot, TrieError, VariableSizeKey,
 };
 
 pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
@@ -19,7 +20,7 @@ pub(crate) struct Snapshot {
     /// key-value pairs in the snapshot. It can be used to filter out expired key-value
     /// pairs or deleted key-value pairs based on the read timestamp.
     ts: u64,
-    snap: TartSnapshot<VariableKey, Bytes>,
+    snap: TartSnapshot<VariableSizeKey, Bytes>,
     store: Arc<Core>,
 }
 
@@ -35,32 +36,29 @@ impl Snapshot {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &VariableKey, value: Bytes) -> Result<()> {
+    pub fn set(&mut self, key: &VariableSizeKey, value: Bytes) -> Result<()> {
         // TODO: need to fix this to avoid cloning the key
-        // This happens because the VariableKey transfrom from
+        // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.snap.ts)?;
-        Ok(())
-    }
-
-    /// Deletes given key from the snapshot.
-    pub fn delete(&mut self, key: &VariableKey) -> Result<()> {
-        let key = &key.terminate();
-        self.snap.remove(key)?;
+        self.snap.insert(key, value, self.snap.ts())?;
         Ok(())
     }
 
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
-    pub fn get(&self, key: &VariableKey) -> Result<Box<dyn Value>> {
+    pub fn get(&self, key: &VariableSizeKey) -> Result<Box<dyn Value>> {
         // TODO: need to fix this to avoid cloning the key
-        // This happens because the VariableKey transfrom from
+        // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
         self.get_with_filters(key, &FILTERS)
     }
 
-    pub fn get_with_filters<F>(&self, key: &VariableKey, filters: &[F]) -> Result<Box<dyn Value>>
+    pub fn get_with_filters<F>(
+        &self,
+        key: &VariableSizeKey,
+        filters: &[F],
+    ) -> Result<Box<dyn Value>>
     where
         F: FilterFn,
     {
@@ -76,13 +74,13 @@ impl Snapshot {
         Ok(Box::new(val_ref))
     }
 
-    pub fn new_reader(&mut self) -> Result<IterationPointer<VariableKey, Bytes>> {
+    pub fn new_reader(&mut self) -> Result<IterationPointer<VariableSizeKey, Bytes>> {
         Ok(self.snap.new_reader()?)
     }
 
     pub fn close(&mut self) -> Result<()> {
         let mut indexer = self.store.indexer.write();
-        indexer.close_snapshot(self.snap.id)?;
+        indexer.close_snapshot(self.snap.id())?;
         Ok(())
     }
 }

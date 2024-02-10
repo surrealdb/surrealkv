@@ -1,7 +1,7 @@
 [package]
 name = "surrealkv"
 publish = true
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
@@ -11,7 +11,7 @@ homepage = "https://github.com/surrealdb/surrealkv"
 documentation = "https://docs.rs/surrealkv/"
 keywords = ["lmdb", "rocksdb", "sled", "redb", "tikv"]
 categories = ["database-implementations", "concurrency", "data-structures"]
-rust-version = "1.75"
+rust-version = "1.74"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -29,6 +29,7 @@ bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.4.0"
+vart = "0.1.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

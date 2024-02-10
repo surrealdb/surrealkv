@@ -4,16 +4,14 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use vart::{TrieError, VariableSizeKey};
 
-use crate::storage::{
-    index::{art::TrieError, VariableKey},
-    kv::{
-        entry::{Entry, Value, ValueRef},
-        error::{Error, Result},
-        snapshot::{FilterFn, Snapshot, FILTERS},
-        store::Core,
-        util::{now, sha256},
-    },
+use crate::storage::kv::{
+    entry::{Entry, Value, ValueRef},
+    error::{Error, Result},
+    snapshot::{FilterFn, Snapshot, FILTERS},
+    store::Core,
+    util::{now, sha256},
 };
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -59,6 +57,9 @@ impl Mode {
         matches!(self, Self::ReadOnly)
     }
 }
+
+/// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
+pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
@@ -157,7 +158,11 @@ impl Transaction {
                 // Check if the key is in the write set by checking in the write_order_map map.
                 if let Some(order) = self.write_order_map.get(&hashed_key) {
                     if let Some(entry) = self.write_set.get(*order as usize) {
-                        return Ok(Some(entry.1.value.clone().to_vec()));
+                        return Ok(if entry.1.is_deleted() {
+                            None
+                        } else {
+                            Some(entry.1.value.clone().to_vec())
+                        });
                     }
                 }
 
@@ -241,11 +246,7 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(
-        &'b self,
-        range: R,
-        limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64, u64)>>
+    pub fn scan<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<ScanResult>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -253,19 +254,19 @@ impl Transaction {
         let range = (
             match range.start_bound() {
                 Bound::Included(start) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(start))
+                    Bound::Included(VariableSizeKey::from_slice_with_termination(start))
                 }
                 Bound::Excluded(start) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(start))
+                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match range.end_bound() {
                 Bound::Included(end) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(end))
+                    Bound::Included(VariableSizeKey::from_slice_with_termination(end))
                 }
                 Bound::Excluded(end) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(end))
+                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(end))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
@@ -483,7 +484,7 @@ mod tests {
         // Drop the store to simulate closing it
         store.close().await.unwrap();
 
-        // Create a new Core instance with VariableKey after dropping the previous one
+        // Create a new Core instance with VariableSizeKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
@@ -566,11 +567,7 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -606,11 +603,7 @@ mod tests {
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -634,11 +627,7 @@ mod tests {
             txn3.set(&key, &value2).unwrap();
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -767,11 +756,7 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -796,11 +781,7 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -829,6 +810,17 @@ mod tests {
         let key3 = Bytes::from("k3");
         let value1 = Bytes::from("v1");
         let value2 = Bytes::from("v2");
+
+        // Set a key, delete it and read it in the same transaction. Should return None.
+        {
+            // Start a new read-write transaction (txn1)
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value1).unwrap();
+            txn1.delete(&key1).unwrap();
+            let res = txn1.get(&key1).unwrap();
+            assert!(res.is_none());
+            txn1.commit().await.unwrap();
+        }
 
         {
             let mut txn = store.begin().unwrap();
@@ -897,11 +889,7 @@ mod tests {
             txn2.set(&key2, &value6).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1036,11 +1024,7 @@ mod tests {
             txn1.commit().await.unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1125,11 +1109,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1163,11 +1143,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1246,11 +1222,7 @@ mod tests {
             assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1335,11 +1307,7 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    if let Error::TransactionReadConflict = err {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(err, Error::TransactionReadConflict)
                 }
                 _ => false,
             });
@@ -1376,15 +1344,11 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
 
         let num_keys = 6;
-        let mut counter = 0u32;
         let mut keys = Vec::new();
 
-        for _ in 1..=num_keys {
+        for (counter, _) in (1..=num_keys).enumerate() {
             // Convert the counter to Bytes
             let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-
-            // Increment the counter
-            counter += 1;
 
             // Add the key to the vector
             keys.push(key_bytes);
@@ -1522,14 +1486,19 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn sdb_delete_record_id_bug() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
-        let key1 = Bytes::copy_from_slice(&[47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52]);
-        let key2 = Bytes::copy_from_slice(&[47, 33, 104, 98, 0, 0, 1, 141, 141, 42, 113, 8, 47, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52]);
+        let key1 = Bytes::copy_from_slice(&[
+            47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72,
+            52,
+        ]);
+        let key2 = Bytes::copy_from_slice(&[
+            47, 33, 104, 98, 0, 0, 1, 141, 141, 42, 113, 8, 47, 166, 192, 229, 30, 101, 24, 73,
+            242, 185, 36, 233, 242, 54, 96, 72, 52,
+        ]);
         let value1 = Bytes::from("baz");
 
         {
@@ -1548,47 +1517,145 @@ mod tests {
             txn.commit().await.unwrap();
         }
 
-
         let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
         let txn1 = store.begin().unwrap();
         txn1.get(&key4).unwrap();
 
-
         {
             let mut txn2 = store.begin().unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
-            txn2.set(&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]), &value1).unwrap();
-    
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
-            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0]), &value1).unwrap();
-    
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
-            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0]), &value1).unwrap();
-    
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
-            txn2.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0]), &value1).unwrap();
-    
-            txn2.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
-    
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
+                98, 117, 115, 101, 114, 0,
+            ]))
+            .unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
+            ]))
+            .unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
+            ]))
+            .unwrap();
+            txn2.set(
+                &Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]),
+                &value1,
+            )
+            .unwrap();
+
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+                71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+            ]))
+            .unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+                71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+            ]))
+            .unwrap();
+            txn2.set(
+                &Bytes::copy_from_slice(&[
+                    47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
+                    72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
+                    69, 0,
+                ]),
+                &value1,
+            )
+            .unwrap();
+
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
+                98, 117, 115, 101, 114, 0,
+            ]))
+            .unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
+                98, 117, 115, 101, 114, 0,
+            ]))
+            .unwrap();
+            txn2.set(
+                &Bytes::copy_from_slice(&[
+                    47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71,
+                    72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+                    33, 116, 98, 117, 115, 101, 114, 0,
+                ]),
+                &value1,
+            )
+            .unwrap();
+
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
+                98, 117, 115, 101, 114, 0,
+            ]))
+            .unwrap();
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
+                115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+            ]))
+            .unwrap();
+            txn2.set(
+                &Bytes::copy_from_slice(&[
+                    47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71,
+                    72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+                    42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+                ]),
+                &value1,
+            )
+            .unwrap();
+
+            txn2.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+                71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+            ]))
+            .unwrap();
+
             txn2.commit().await.unwrap();
         }
 
         {
             let mut txn3 = store.begin().unwrap();
-            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
-            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116, 98, 117, 115, 101, 114, 0])).unwrap();
-            txn3.delete(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0])).unwrap();
-            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
-            txn3.get(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0])).unwrap();
-            txn3.set(&Bytes::copy_from_slice(&[47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0]), &value1).unwrap();
-            txn3.commit().await.unwrap();    
+            txn3.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
+                115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+            ]))
+            .unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
+                98, 117, 115, 101, 114, 0,
+            ]))
+            .unwrap();
+            txn3.delete(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
+                50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
+                115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
+            ]))
+            .unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+                71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+            ]))
+            .unwrap();
+            txn3.get(&Bytes::copy_from_slice(&[
+                47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
+                71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
+            ]))
+            .unwrap();
+            txn3.set(
+                &Bytes::copy_from_slice(&[
+                    47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
+                    72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
+                    69, 0,
+                ]),
+                &value1,
+            )
+            .unwrap();
+            txn3.commit().await.unwrap();
         }
     }
-
-
 }

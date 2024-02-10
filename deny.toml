@@ -1,0 +1,23 @@
+# Configuration documentation:
+#   https://embarkstudios.github.io/cargo-deny/index.html
+
+[advisories]
+vulnerability = "deny"
+yanked = "deny"
+unmaintained = "warn"
+notice = "warn"
+ignore = [
+]
+git-fetch-with-cli = true
+
+[licenses]
+allow-osi-fsf-free = "either"
+copyleft = "warn"
+unlicensed = "deny"
+default = "deny"
+confidence-threshold = 0.8
+
+
+[bans]
+multiple-versions = "warn"
+highlight = "all"

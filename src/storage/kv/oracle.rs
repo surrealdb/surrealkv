@@ -12,15 +12,13 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
+use vart::TrieError;
 
-use crate::storage::{
-    index::art::TrieError,
-    kv::{
-        error::{Error, Result},
-        option::Options,
-        snapshot::Snapshot,
-        transaction::Transaction,
-    },
+use crate::storage::kv::{
+    error::{Error, Result},
+    option::Options,
+    snapshot::Snapshot,
+    transaction::Transaction,
 };
 
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
@@ -457,7 +455,7 @@ impl WaterMark {
     }
 
     /// Gets the highest completed timestamp.
-    fn done_until(&self) -> u64 {
+    fn _done_until(&self) -> u64 {
         let mark = self.mark.read();
         mark.done_upto
     }
@@ -474,7 +472,7 @@ mod tests {
         let hub = WaterMark::new();
 
         hub.done_upto(10);
-        let t2 = hub.done_until();
+        let t2 = hub._done_until();
         assert_eq!(t2, 10);
 
         for i in 1..=10 {

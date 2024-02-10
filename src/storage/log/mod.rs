@@ -81,41 +81,18 @@ impl CompressionFormat {
             CompressionFormat::NoCompression => 0,
         }
     }
-
-    fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(CompressionFormat::NoCompression),
-            _ => None,
-        }
-    }
 }
 
 // Enum to represent different compression levels
 #[derive(Clone)]
 pub enum CompressionLevel {
     BestSpeed = 0,
-    BestCompression = 1,
-    DefaultCompression = 2,
-    HuffmanOnly = 3,
 }
 
 impl CompressionLevel {
     fn as_u64(&self) -> u64 {
         match *self {
             CompressionLevel::BestSpeed => 0,
-            CompressionLevel::BestCompression => 1,
-            CompressionLevel::DefaultCompression => 2,
-            CompressionLevel::HuffmanOnly => 3,
-        }
-    }
-
-    fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(CompressionLevel::BestSpeed),
-            1 => Some(CompressionLevel::BestCompression),
-            2 => Some(CompressionLevel::DefaultCompression),
-            3 => Some(CompressionLevel::HuffmanOnly),
-            _ => None,
         }
     }
 }
@@ -262,20 +239,6 @@ impl Default for Options {
 }
 
 impl Options {
-    fn new() -> Self {
-        Options {
-            dir_mode: None,
-            file_mode: None,
-            compression_format: None,
-            compression_level: None,
-            metadata: None,
-            file_extension: None,
-            max_file_size: 0,
-            is_wal: false,
-            max_open_files: 0,
-        }
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.max_file_size == 0 {
             return Err(Error::IO(IOError::new(
@@ -287,41 +250,49 @@ impl Options {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn with_file_mode(mut self, file_mode: u32) -> Self {
         self.file_mode = Some(file_mode);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_compression_format(mut self, compression_format: CompressionFormat) -> Self {
         self.compression_format = Some(compression_format);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_compression_level(mut self, compression_level: CompressionLevel) -> Self {
         self.compression_level = Some(compression_level);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_file_extension(mut self, extension: String) -> Self {
         self.file_extension = Some(extension);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_dir_mode(mut self, dir_mode: u32) -> Self {
         self.dir_mode = Some(dir_mode);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_wal(mut self) -> Self {
         self.is_wal = true;
         self
@@ -889,6 +860,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
+    #[allow(dead_code)]
     /// The path where the segment file is located.
     file_path: PathBuf,
 
@@ -904,6 +876,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     /// The current offset within the file.
     file_offset: u64,
 
+    #[allow(dead_code)]
     /// The maximum size of the segment file.
     pub(crate) file_size: u64,
 
@@ -986,17 +959,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(file)
     }
 
-    // Flushes the current block to disk.
-    // This method also synchronize file metadata to the filesystem
-    // hence it is a bit slower than fdatasync (sync_data).
-    pub(crate) fn sync(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Segment is closed",
-            )));
-        }
-
+    fn flush_and_sync(&mut self) -> Result<()> {
         if self.block.written > 0 {
             // Flush the full block to disk if it is a WAL with zero padded
             // to the end of the last block. This is done to avoid writing
@@ -1015,6 +978,20 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(())
     }
 
+    // Flushes the current block to disk.
+    // This method also synchronize file metadata to the filesystem
+    // hence it is a bit slower than fdatasync (sync_data).
+    pub(crate) fn sync(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Segment is closed",
+            )));
+        }
+
+        self.flush_and_sync()
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
         if self.closed {
             return Err(Error::IO(IOError::new(
@@ -1023,20 +1000,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             )));
         }
 
-        if self.block.written > 0 {
-            // Flush the full block to disk if it is a WAL with zero padded
-            // to the end of the last block. This is done to avoid writing
-            // partial records to the WAL, and for detecting corruption.
-            //
-            // Else flush the block as it is without zero padding.
-            if self.is_wal {
-                self.flush_block(true)?;
-            } else {
-                self.flush_block(false)?;
-            }
-        }
-
-        self.file.sync_all()?;
+        self.flush_and_sync()?;
 
         self.closed = true;
         Ok(())
@@ -1201,7 +1165,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             if remaining == pending {
                 return Ok(n);
             } else {
-                return Err(Error::EOF(n));
+                return Err(Error::Eof(n));
             }
         }
 
@@ -1225,9 +1189,9 @@ pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
     EmptyBuffer,
-    EOF(usize),
+    Eof(usize),
     IO(IOError),
-    PoisonError(String),
+    Poison(String),
 }
 
 // Implementation of Display trait for Error
@@ -1238,8 +1202,8 @@ impl fmt::Display for Error {
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
             Error::IO(err) => write!(f, "IO error: {}", err),
-            Error::EOF(n) => write!(f, "EOF error after reading {} bytes", n),
-            Error::PoisonError(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
+            Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
         }
     }
 }
@@ -1260,7 +1224,7 @@ impl From<io::Error> for Error {
 // Implementation to convert PoisonError into Error
 impl<T: Sized> From<PoisonError<T>> for Error {
     fn from(e: PoisonError<T>) -> Error {
-        Error::PoisonError(e.to_string())
+        Error::Poison(e.to_string())
     }
 }
 
@@ -1585,8 +1549,8 @@ mod tests {
         // Read the header from the file
         let header = read_file_header(&mut file).expect("should read header");
 
-        // Modify the compression level to an unexpected value
-        opts.compression_level = Some(CompressionLevel::BestCompression); // This doesn't match the default compression level
+        // Modify the metadata to an unexpected value
+        opts.metadata = Some(Metadata::new(None)); // This doesn't match the default metadata
 
         // Validate the file header, expecting an error due to mismatched compression level
         let result = validate_file_header(&header, id, &opts);
@@ -1656,7 +1620,7 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    fn create_segment_file(dir: &PathBuf, name: &str) {
+    fn create_segment_file(dir: &Path, name: &str) {
         let file_path = dir.join(name);
         let mut file = File::create(file_path).unwrap();
         file.write_all(b"dummy content").unwrap();
@@ -1944,7 +1908,7 @@ mod tests {
 
         // Corrupt the segment's metadata by overwriting the first few bytes
         let segment_path = temp_dir.path().join("00000000000000000000");
-        let mut corrupted_data = vec![0; 4];
+        let corrupted_data = vec![0; 4];
 
         // Open the file for writing before writing to it
         let mut corrupted_file = OpenOptions::new()
@@ -1954,7 +1918,7 @@ mod tests {
             .expect("should open corrupted file");
 
         corrupted_file
-            .write_all(&mut corrupted_data)
+            .write_all(&corrupted_data)
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
@@ -2178,10 +2142,10 @@ mod tests {
         assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read remaining empty block
-        const remaining: usize = BLOCK_SIZE - 11 - 11;
-        let mut bs = [0u8; remaining];
+        const REMAINING: usize = BLOCK_SIZE - 11 - 11;
+        let mut bs = [0u8; REMAINING];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, remaining);
+        assert_eq!(bytes_read, REMAINING);
 
         let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");
