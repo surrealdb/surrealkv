@@ -1647,7 +1647,7 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    fn create_segment_file(dir: &PathBuf, name: &str) {
+    fn create_segment_file(dir: &Path, name: &str) {
         let file_path = dir.join(name);
         let mut file = File::create(file_path).unwrap();
         file.write_all(b"dummy content").unwrap();
@@ -1935,7 +1935,7 @@ mod tests {
 
         // Corrupt the segment's metadata by overwriting the first few bytes
         let segment_path = temp_dir.path().join("00000000000000000000");
-        let mut corrupted_data = vec![0; 4];
+        let corrupted_data = vec![0; 4];
 
         // Open the file for writing before writing to it
         let mut corrupted_file = OpenOptions::new()
@@ -1945,7 +1945,7 @@ mod tests {
             .expect("should open corrupted file");
 
         corrupted_file
-            .write_all(&mut corrupted_data)
+            .write_all(&corrupted_data)
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
@@ -2169,10 +2169,10 @@ mod tests {
         assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
 
         // Read remaining empty block
-        const remaining: usize = BLOCK_SIZE - 11 - 11;
-        let mut bs = [0u8; remaining];
+        const REMAINING: usize = BLOCK_SIZE - 11 - 11;
+        let mut bs = [0u8; REMAINING];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, remaining);
+        assert_eq!(bytes_read, REMAINING);
 
         let mut bs = [0u8; 11];
         buf_reader.read(&mut bs).expect_err("should not read");

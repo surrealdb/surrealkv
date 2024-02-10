@@ -10,9 +10,9 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
+use vart::art::KV;
 
 use crate::storage::{
-    index::art::KV,
     kv::{
         entry::{Entry, TxRecord, ValueRef},
         error::{Error, Result},
@@ -113,7 +113,7 @@ impl Store {
             handle.await.map_err(|e| {
                 Error::ReceiveError(format!(
                     "Error occurred while closing the kv store. JoinError: {}",
-                    e.to_string()
+                    e
                 ))
             })?;
         }

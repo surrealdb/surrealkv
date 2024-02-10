@@ -4,17 +4,15 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use vart::{TrieError, VariableSizeKey};
 
-use crate::storage::{
-    index::{art::TrieError, VariableKey},
-    kv::{
+use crate::storage::kv::{
         entry::{Entry, Value, ValueRef},
         error::{Error, Result},
         snapshot::{FilterFn, Snapshot, FILTERS},
         store::Core,
         util::{now, sha256},
-    },
-};
+    };
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -257,19 +255,19 @@ impl Transaction {
         let range = (
             match range.start_bound() {
                 Bound::Included(start) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(start))
+                    Bound::Included(VariableSizeKey::from_slice_with_termination(start))
                 }
                 Bound::Excluded(start) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(start))
+                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match range.end_bound() {
                 Bound::Included(end) => {
-                    Bound::Included(VariableKey::from_slice_with_termination(end))
+                    Bound::Included(VariableSizeKey::from_slice_with_termination(end))
                 }
                 Bound::Excluded(end) => {
-                    Bound::Excluded(VariableKey::from_slice_with_termination(end))
+                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(end))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
@@ -487,7 +485,7 @@ mod tests {
         // Drop the store to simulate closing it
         store.close().await.unwrap();
 
-        // Create a new Core instance with VariableKey after dropping the previous one
+        // Create a new Core instance with VariableSizeKey after dropping the previous one
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
         let store = Store::new(opts).expect("should create store");
