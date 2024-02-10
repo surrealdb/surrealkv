@@ -6,15 +6,14 @@ surrealkv is a versioned, low-level, embedded key-value database implemented in 
 
 ## Features
 
-- **In-memory Database**
-- **Embeddable**
-- **ACID Semantics** 
-- **Transaction Support:** 
-- **Built-in Item Versioning** [TODO]
-- **Multi-Version Concurrency Control (MVCC) support**
-- **Multiple Concurrent Readers and Writers**
-- **Persistence through an append-only File**
-
+- [x] **In-memory Database**
+- [x] **Embeddable**
+- [x] **ACID Semantics** 
+- [x] **Transaction Support:** 
+- [ ] **Built-in Item Versioning**
+- [x] **Multi-Version Concurrency Control (MVCC) support**
+- [x] **Multiple Concurrent Readers and Writers**
+- [x] **Persistence through an append-only File**
 
 ## Important Notice
 

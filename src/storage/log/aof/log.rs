@@ -220,12 +220,12 @@ impl Aol {
                     r += bytes_read;
                 }
                 Err(e) => match e {
-                    Error::EOF(n) => {
+                    Error::Eof(n) => {
                         r = n;
                         if n > 0 {
                             continue;
                         } else {
-                            return Err(Error::EOF(n));
+                            return Err(Error::Eof(n));
                         }
                     }
                     _ => return Err(e),

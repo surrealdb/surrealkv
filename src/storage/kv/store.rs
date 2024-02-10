@@ -10,9 +10,10 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
+use tokio::sync::Mutex as AsyncMutex;
+use vart::art::KV;
 
 use crate::storage::{
-    index::art::KV,
     kv::{
         entry::{Entry, TxRecord, ValueRef},
         error::{Error, Result},
@@ -33,7 +34,7 @@ pub struct Store {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     stop_tx: Sender<()>,
-    task_runner_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
 
 impl Store {
@@ -52,7 +53,7 @@ impl Store {
             core,
             stop_tx,
             is_closed: AtomicBool::new(false),
-            task_runner_handle: Arc::new(RwLock::new(Some(task_runner_handle))),
+            task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
         })
     }
 
@@ -109,11 +110,11 @@ impl Store {
             .map_err(|e| Error::SendError(format!("{}", e)))?;
 
         // Wait for task to finish
-        if let Some(handle) = self.task_runner_handle.write().take() {
+        if let Some(handle) = self.task_runner_handle.lock().await.take() {
             handle.await.map_err(|e| {
                 Error::ReceiveError(format!(
                     "Error occurred while closing the kv store. JoinError: {}",
-                    e.to_string()
+                    e
                 ))
             })?;
         }
@@ -282,7 +283,7 @@ impl Core {
             let value_offsets = match tx_reader.read_into(&mut tx) {
                 Ok(value_offsets) => value_offsets,
                 Err(e) => {
-                    if let Error::LogError(LogError::EOF(_)) = e {
+                    if let Error::LogError(LogError::Eof(_)) = e {
                         break;
                     } else {
                         return Err(e);
@@ -361,7 +362,7 @@ impl Core {
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::LogError(LogError::EOF(_)) = e {
+                if let Error::LogError(LogError::Eof(_)) = e {
                     break;
                 } else {
                     return Err(e);
@@ -523,18 +524,12 @@ mod tests {
         // Number of keys to generate
         let num_keys = 10000;
 
-        // Initialize a counter
-        let mut counter = 0u32;
-
         // Create a vector to store the generated keys
         let mut keys: Vec<Bytes> = Vec::new();
 
-        for _ in 1..=num_keys {
+        for (counter, _) in (1..=num_keys).enumerate() {
             // Convert the counter to Bytes
             let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-
-            // Increment the counter
-            counter += 1;
 
             // Add the key to the vector
             keys.push(key_bytes);
@@ -543,7 +538,7 @@ mod tests {
         let default_value = Bytes::from("default_value".to_string());
 
         // Write the keys to the store
-        for (_, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             // Start a new write transaction
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
@@ -551,7 +546,7 @@ mod tests {
         }
 
         // Read the keys to the store
-        for (_, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
@@ -570,7 +565,7 @@ mod tests {
         let store = Store::new(opts).expect("should create store");
 
         // Read the keys to the store
-        for (_, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
@@ -619,18 +614,12 @@ mod tests {
         // Number of keys to generate
         let num_keys = 100;
 
-        // Initialize a counter
-        let mut counter = 0u32;
-
         // Create a vector to store the generated keys
         let mut keys: Vec<Bytes> = Vec::new();
 
-        for _ in 1..=num_keys {
+        for (counter, _) in (1..=num_keys).enumerate() {
             // Convert the counter to Bytes
             let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-
-            // Increment the counter
-            counter += 1;
 
             // Add the key to the vector
             keys.push(key_bytes);
@@ -640,7 +629,7 @@ mod tests {
         let store1 = store.clone();
 
         // Write the keys to the store
-        for (_, key) in keys.iter().enumerate() {
+        for key in keys.iter() {
             // Start a new write transaction
             let mut txn = store1.begin().unwrap();
             txn.set(key, &default_value).unwrap();

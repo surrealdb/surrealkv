@@ -242,17 +242,6 @@ pub(crate) struct TxEntry {
 }
 
 impl TxEntry {
-    pub(crate) fn new() -> Self {
-        TxEntry {
-            key: Bytes::new(),
-            key_len: 0,
-            metadata: None,
-            value_len: 0,
-            value: Bytes::new(),
-            crc32: 0,
-        }
-    }
-
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // Encode metadata, if present
         if let Some(metadata) = &self.metadata {

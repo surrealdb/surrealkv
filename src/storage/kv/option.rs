@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use crate::storage::{
-    index::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS,
     kv::error::{Error, Result},
     log::Metadata,
 };
+
+use vart::art::DEFAULT_MAX_ACTIVE_SNAPSHOTS;
 
 // Defining constants for metadata keys
 const META_KEY_ISOLATION_LEVEL: &str = "isolation_level";
