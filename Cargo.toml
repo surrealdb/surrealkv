@@ -11,7 +11,7 @@ homepage = "https://github.com/surrealdb/surrealkv"
 documentation = "https://docs.rs/surrealkv/"
 keywords = ["lmdb", "rocksdb", "sled", "redb", "tikv"]
 categories = ["database-implementations", "concurrency", "data-structures"]
-rust-version = "1.75"
+rust-version = "1.74"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
