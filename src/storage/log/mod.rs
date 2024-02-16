@@ -6,7 +6,6 @@ use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
 use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
@@ -946,8 +945,12 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         let mut open_options = OpenOptions::new();
         open_options.read(true).write(true);
 
-        if let Some(file_mode) = opts.file_mode {
-            open_options.mode(file_mode);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Some(file_mode) = opts.file_mode {
+                open_options.mode(file_mode);
+            }
         }
 
         if !file_path.exists() {
@@ -1145,7 +1148,9 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         let mut n = 0;
         if off < self.file_offset {
             // Read from the file
-            n = self.file.read_at(bs, self.file_header_offset + off)?;
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(self.file_header_offset + off))?;
+            n = file.read(bs)?;
         } else {
             boff = (off - self.file_offset) as usize;
         }

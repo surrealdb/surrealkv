@@ -8,13 +8,41 @@ on:
     branches:
       - main
   pull_request:
-  merge_group:
 
 defaults:
   run:
     shell: bash
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [ 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'x86_64-pc-windows-msvc', 'x86_64-apple-darwin', 'aarch64-apple-darwin' ]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Cache
+        id: rust-cache
+        uses: actions/cache@v3
+        with:
+            path: |
+                ~/.cargo/bin/
+                ~/.cargo/registry/index/
+                ~/.cargo/registry/cache/
+                ~/.cargo/git/db/
+                target/
+            key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.75.0
+          target: ${{ matrix.target }}
+          components: rustfmt, clippy
+          default: true
+
+      - name: Compile
+        run: cargo build --target=${{ matrix.target }}
+
   ci:
     strategy:
       matrix:
@@ -48,9 +76,6 @@ jobs:
       - name: Install cargo-deny
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: rustup run --install 1.70 cargo install --force --version 0.14.3 cargo-deny --locked
-
-      - name: Compile
-        run: cargo build --all-targets --all-features
 
       - name: Run tests
         run: make test
