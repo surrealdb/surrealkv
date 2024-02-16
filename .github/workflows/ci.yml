@@ -41,7 +41,7 @@ jobs:
           default: true
 
       - name: Compile
-        run: cargo build TARGET=${{ matrix.target }}
+        run: cargo build --target=${{ matrix.target }}
 
   ci:
     strategy:
