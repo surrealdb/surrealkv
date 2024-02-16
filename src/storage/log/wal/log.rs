@@ -1,6 +1,5 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -77,7 +76,18 @@ impl Wal {
 
         if let Ok(metadata) = fs::metadata(dir) {
             let mut permissions = metadata.permissions();
-            permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
+            }
+
+            #[cfg(windows)]
+            {
+                permissions.set_readonly(false);
+            }
+
             fs::set_permissions(dir, permissions)?;
         }
 

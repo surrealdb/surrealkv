@@ -50,7 +50,7 @@ jobs:
         run: rustup run --install 1.70 cargo install --force --version 0.14.3 cargo-deny --locked
 
       - name: Compile
-        run: cargo build --all-targets --all-features
+        run: make build
 
       - name: Run tests
         run: make test
