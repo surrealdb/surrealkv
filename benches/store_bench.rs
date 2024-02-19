@@ -111,26 +111,26 @@ fn sequential_insert_read(c: &mut Criterion) {
 
 fn concurrent_insert(c: &mut Criterion) {
     let item_count = 100_000;
+    let thread_counts = [1, 2, 4, 8];
 
-    let mut group = c.benchmark_group("inserts");
-    group.sample_size(10);
-    group.throughput(criterion::Throughput::Elements(item_count as u64));
+    for &thread_count in &thread_counts {
+        let mut group = c.benchmark_group(format!("inserts_{}_threads", thread_count));
+        group.sample_size(10);
+        group.throughput(criterion::Throughput::Elements(item_count as u64));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .enable_all()
-        .build()
-        .unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(thread_count as usize)
+            .enable_all()
+            .build()
+            .unwrap();
 
-    let db = rt.block_on(async {
-        let mut opts = Options::new();
-        opts.dir = create_temp_directory().path().to_path_buf();
-        opts.max_tx_entries = item_count;
-        Arc::new(Store::new(opts).expect("should create store"))
-    });
+        let db = rt.block_on(async {
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            opts.max_tx_entries = item_count;
+            Arc::new(Store::new(opts).expect("should create store"))
+        });
 
-    {
-        let thread_count = 8_u32;
         group.bench_function(
             format!("{} inserts ({} threads)", item_count, thread_count),
             |b| {
@@ -159,15 +159,15 @@ fn concurrent_insert(c: &mut Criterion) {
                 })
             },
         );
+
+        rt.block_on(async {
+            db.close().await.unwrap();
+        });
+
+        rt.shutdown_background();
     }
-
-    rt.block_on(async {
-        db.close().await.unwrap();
-    });
-
-    rt.shutdown_background();
 }
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-criterion_main!(benches_sequential, benches_concurrent);
+criterion_main!(benches_concurrent);
