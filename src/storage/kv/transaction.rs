@@ -1723,7 +1723,6 @@ mod tests {
     const ENTRIES: usize = 400_000;
     const KEY_SIZE: usize = 24;
     const VALUE_SIZE: usize = 150;
-    const RNG_SEED: u64 = 3;
 
     fn fill_slice(slice: &mut [u8], rng: &mut fastrand::Rng) {
         let mut i = 0;
@@ -1762,7 +1761,7 @@ mod tests {
     }
 
     fn make_rng() -> fastrand::Rng {
-        fastrand::Rng::with_seed(RNG_SEED)
+        fastrand::Rng::with_seed(5)
     }
 
     #[tokio::test]

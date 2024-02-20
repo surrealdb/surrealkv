@@ -20,10 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::env::current_dir;
+use fastrand::Rng;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::{fs, process, thread};
+use std::thread;
 use tempdir::TempDir;
 
 mod common;
@@ -32,7 +32,6 @@ use common::*;
 use std::fs::File;
 use std::time::{Duration, Instant};
 
-const ITERATIONS: usize = 2;
 const ELEMENTS: usize = 1_000_000;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
@@ -97,227 +96,194 @@ fn make_rng_shards(shards: usize, elements: usize) -> Vec<fastrand::Rng> {
     rngs
 }
 
-async fn benchmark<T: BenchDatabase + Send + Sync>(db: T) -> Vec<(String, Duration)> {
-    let mut rng = make_rng();
-    let mut results = Vec::new();
-    let db = Arc::new(db);
-
+async fn bulk_load<T: BenchStore + Send + Sync>(db: &Arc<T>, rng: &mut Rng) -> Duration {
     let start = Instant::now();
-    let mut txn = db.write_transaction();
-    {
-        for _ in 0..ELEMENTS {
-            let (key, value) = gen_pair(&mut rng);
-            txn.insert(&key, &value).unwrap();
-        }
+    let mut txn = db.transaction(true);
+    for _ in 0..ELEMENTS {
+        let (key, value) = gen_pair(rng);
+        txn.insert(&key, &value).unwrap();
     }
     txn.commit().await.unwrap();
+    Instant::now() - start
+}
 
-    let end = Instant::now();
-    let duration = end - start;
-    println!(
-        "{}: Bulk loaded {} items in {}ms",
-        T::store_name(),
-        ELEMENTS,
-        duration.as_millis()
-    );
-    results.push(("bulk load".to_string(), duration));
-
+async fn individual_writes<T: BenchStore + Send + Sync>(
+    db: &Arc<T>,
+    rng: &mut Rng,
+    writes: usize,
+) -> Duration {
     let start = Instant::now();
-    let writes = 100;
-    {
-        for _ in 0..writes {
-            let mut txn = db.write_transaction();
-            let (key, value) = gen_pair(&mut rng);
+    for _ in 0..writes {
+        let mut txn = db.transaction(true);
+        let (key, value) = gen_pair(rng);
+        txn.insert(&key, &value).unwrap();
+        txn.commit().await.unwrap();
+    }
+    Instant::now() - start
+}
+
+async fn batch_writes<T: BenchStore + Send + Sync>(
+    db: &Arc<T>,
+    rng: &mut Rng,
+    writes: usize,
+    batch_size: usize,
+) -> Duration {
+    let start = Instant::now();
+    for _ in 0..writes {
+        let mut txn = db.transaction(true);
+        for _ in 0..batch_size {
+            let (key, value) = gen_pair(rng);
             txn.insert(&key, &value).unwrap();
-            txn.commit().await.unwrap();
-        }
-    }
-
-    let end = Instant::now();
-    let duration = end - start;
-    println!(
-        "{}: Wrote {} individual items in {}ms",
-        T::store_name(),
-        writes,
-        duration.as_millis()
-    );
-    results.push(("individual writes".to_string(), duration));
-
-    let start = Instant::now();
-    let batch_size = 1000;
-    {
-        for _ in 0..writes {
-            let mut txn = db.write_transaction();
-            for _ in 0..batch_size {
-                let (key, value) = gen_pair(&mut rng);
-                txn.insert(&key, &value).unwrap();
-            }
-            txn.commit().await.unwrap();
-        }
-    }
-
-    let end = Instant::now();
-    let duration = end - start;
-    println!(
-        "{}: Wrote {} x {} items in {}ms",
-        T::store_name(),
-        writes,
-        batch_size,
-        duration.as_millis()
-    );
-    results.push(("batch writes".to_string(), duration));
-
-    let txn = db.read_transaction();
-    {
-        for _ in 0..ITERATIONS {
-            let mut rng = make_rng();
-            let start = Instant::now();
-            let mut checksum = 0u64;
-            let mut expected_checksum = 0u64;
-            for _ in 0..ELEMENTS {
-                let (key, value) = gen_pair(&mut rng);
-                let result = txn.get(&key).unwrap();
-                checksum += result.as_ref()[0] as u64;
-                expected_checksum += value[0] as u64;
-            }
-            assert_eq!(checksum, expected_checksum);
-            let end = Instant::now();
-            let duration = end - start;
-            println!(
-                "{}: Random read {} items in {}ms",
-                T::store_name(),
-                ELEMENTS,
-                duration.as_millis()
-            );
-            results.push(("random reads".to_string(), duration));
-        }
-    }
-    drop(txn);
-
-    for num_threads in [4, 8, 16, 32] {
-        let mut rngs = make_rng_shards(num_threads, ELEMENTS);
-        let start = Instant::now();
-
-        thread::scope(|s| {
-            for _ in 0..num_threads {
-                let db2 = db.clone();
-                let mut rng = rngs.pop().unwrap();
-                s.spawn(move || {
-                    let txn = db2.read_transaction();
-                    let mut checksum = 0u64;
-                    let mut expected_checksum = 0u64;
-                    for _ in 0..(ELEMENTS / num_threads) {
-                        let (key, value) = gen_pair(&mut rng);
-                        let result = txn.get(&key).unwrap();
-                        checksum += result.as_ref()[0] as u64;
-                        expected_checksum += value[0] as u64;
-                    }
-                    assert_eq!(checksum, expected_checksum);
-                });
-            }
-        });
-
-        let end = Instant::now();
-        let duration = end - start;
-        println!(
-            "{}: Random read ({} threads) {} items in {}ms",
-            T::store_name(),
-            num_threads,
-            ELEMENTS,
-            duration.as_millis()
-        );
-        results.push((format!("random reads ({num_threads} threads)"), duration));
-    }
-
-    let start = Instant::now();
-    let deletes = ELEMENTS / 2;
-    {
-        let mut rng = make_rng();
-        let mut txn = db.write_transaction();
-        for _ in 0..deletes {
-            let (key, _value) = gen_pair(&mut rng);
-            txn.remove(&key).unwrap();
         }
         txn.commit().await.unwrap();
     }
+    Instant::now() - start
+}
 
-    let end = Instant::now();
-    let duration = end - start;
-    println!(
-        "{}: Removed {} items in {}ms",
-        T::store_name(),
-        deletes,
-        duration.as_millis()
-    );
-    results.push(("removals".to_string(), duration));
+fn random_reads<T: BenchStore + Send + Sync>(db: &Arc<T>) -> Duration {
+    let mut rng = make_rng();
+    let start = Instant::now();
+    let txn = db.transaction(false);
+    let mut checksum = 0u64;
+    let mut expected_checksum = 0u64;
+    for _ in 0..ELEMENTS {
+        let (key, value) = gen_pair(&mut rng);
+        let result = txn.get(&key).unwrap();
+        checksum += result.as_ref()[0] as u64;
+        expected_checksum += value[0] as u64;
+    }
+    assert_eq!(checksum, expected_checksum);
+    Instant::now() - start
+}
+
+async fn deletes<T: BenchStore + Send + Sync>(
+    db: &Arc<T>,
+    rng: &mut Rng,
+    deletes: usize,
+) -> Duration {
+    let start = Instant::now();
+    let mut txn = db.transaction(true);
+    for _ in 0..deletes {
+        let (key, _value) = gen_pair(rng);
+        txn.delete(&key).unwrap();
+    }
+    txn.commit().await.unwrap();
+    Instant::now() - start
+}
+
+fn random_reads_multithreaded<T: BenchStore + Send + Sync>(
+    db: &Arc<T>,
+    num_threads: usize,
+) -> Duration {
+    let mut rngs = make_rng_shards(num_threads, ELEMENTS);
+    let start = Instant::now();
+
+    thread::scope(|s| {
+        for _ in 0..num_threads {
+            let db2 = db.clone();
+            let mut rng = rngs.pop().unwrap();
+            s.spawn(move || {
+                let txn = db2.transaction(false);
+                let mut checksum = 0u64;
+                let mut expected_checksum = 0u64;
+                for _ in 0..(ELEMENTS / num_threads) {
+                    let (key, value) = gen_pair(&mut rng);
+                    let result = txn.get(&key).unwrap();
+                    checksum += result.as_ref()[0] as u64;
+                    expected_checksum += value[0] as u64;
+                }
+                assert_eq!(checksum, expected_checksum);
+            });
+        }
+    });
+
+    Instant::now() - start
+}
+
+async fn benchmark<T: BenchStore + Send + Sync>(db: T) -> Vec<(String, Duration)> {
+    let mut rng = make_rng();
+    let db = Arc::new(db);
+
+    let mut results = Vec::new();
+
+    let duration = bulk_load(&db, &mut rng).await;
+    results.push(("bulk load".to_string(), duration));
+
+    let duration = individual_writes(&db, &mut rng, 100).await;
+    results.push(("individual writes".to_string(), duration));
+
+    let duration = batch_writes(&db, &mut rng, 100, 1000).await;
+    results.push(("batch writes".to_string(), duration));
+
+    let duration = random_reads(&db);
+    results.push(("random reads".to_string(), duration));
+
+    let duration = deletes(&db, &mut rng, ELEMENTS / 2).await;
+    results.push(("deletes".to_string(), duration));
+
+    for num_threads in [4, 8, 16, 32] {
+        let duration = random_reads_multithreaded(&db, num_threads);
+        results.push((format!("random reads ({} threads)", num_threads), duration));
+    }
 
     results
 }
 
+async fn benchmark_redb() -> Vec<(String, Duration)> {
+    let tmpdir = create_temp_directory();
+    let file_path = tmpdir.path().join("my_file.txt");
+    let _ = File::create(file_path.clone()).unwrap();
+    let db = redb::Database::builder()
+        .set_cache_size(4 * 1024 * 1024 * 1024)
+        .create(file_path)
+        .unwrap();
+    let table = RedbBenchStore::new(&db);
+    benchmark(table).await
+}
+
+async fn benchmark_rocksdb() -> Vec<(String, Duration)> {
+    let tmpdir: TempDir = create_temp_directory();
+    let db = rocksdb::TransactionDB::open_default(tmpdir.path()).unwrap();
+    let table = RocksdbBenchStore::new(&db);
+    benchmark(table).await
+}
+
+async fn benchmark_sled() -> Vec<(String, Duration)> {
+    let tmpdir: TempDir = create_temp_directory();
+    let db = sled::Config::new().path(tmpdir.path()).open().unwrap();
+    let table = SledBenchStore::new(&db, tmpdir.path());
+    benchmark(table).await
+}
+
+async fn benchmark_surrealkv() -> Vec<(String, Duration)> {
+    let tmpdir: TempDir = create_temp_directory();
+    let mut opts = surrealkv::Options::new();
+    opts.dir = tmpdir.path().to_path_buf();
+    opts.max_value_threshold = VALUE_SIZE;
+    let db = surrealkv::Store::new(opts).unwrap();
+    let table = SurrealKVBenchStore::new(&db);
+    benchmark(table).await
+}
+
 #[tokio::main]
 async fn main() {
-    let tmpdir = current_dir().unwrap().join(".benchmark");
-    fs::create_dir(&tmpdir).unwrap();
+    let redb_results = benchmark_redb().await;
+    let rocksdb_results = benchmark_rocksdb().await;
+    let sled_results = benchmark_sled().await;
+    let surrealkv_results = benchmark_surrealkv().await;
 
-    let tmpdir2 = tmpdir.clone();
-    ctrlc::set_handler(move || {
-        fs::remove_dir_all(&tmpdir2).unwrap();
-        process::exit(1);
-    })
-    .unwrap();
-
-    let redb_latency_results = {
-        let tmpdir = create_temp_directory();
-        let file_path = tmpdir.path().join("my_file.txt");
-        let _ = File::create(file_path.clone()).unwrap();
-        let db = redb::Database::builder()
-            .set_cache_size(4 * 1024 * 1024 * 1024)
-            .create(file_path)
-            .unwrap();
-        let table = RedbBenchDatabase::new(&db);
-        benchmark(table).await
-    };
-
-    let rocksdb_results = {
-        let tmpdir: TempDir = create_temp_directory();
-        let db = rocksdb::TransactionDB::open_default(tmpdir.path()).unwrap();
-        let table = RocksdbBenchDatabase::new(&db);
-        benchmark(table).await
-    };
-
-    let sled_results = {
-        let tmpdir: TempDir = create_temp_directory();
-        let db = sled::Config::new().path(tmpdir.path()).open().unwrap();
-        let table = SledBenchDatabase::new(&db, tmpdir.path());
-        benchmark(table).await
-    };
-
-    let surrealkv_results = {
-        let tmpdir: TempDir = create_temp_directory();
-        let mut opts = surrealkv::Options::new();
-        opts.dir = tmpdir.path().to_path_buf();
-        opts.max_value_threshold = 200;
-        opts.max_tx_entries = 10000000;
-        let db = surrealkv::Store::new(opts).unwrap();
-        let table = SurrealKVBenchDatabase::new(&db);
-        benchmark(table).await
-    };
-
-    fs::remove_dir_all(&tmpdir).unwrap();
-
-    let mut rows = Vec::new();
-
-    for (benchmark, _duration) in &redb_latency_results {
-        rows.push(vec![benchmark.to_string()]);
-    }
+    let mut rows = vec![Vec::new(); redb_results.len()];
 
     for results in [
-        redb_latency_results,
-        rocksdb_results,
-        sled_results,
-        surrealkv_results,
+        &redb_results,
+        &rocksdb_results,
+        &sled_results,
+        &surrealkv_results,
     ] {
-        for (i, (_benchmark, duration)) in results.iter().enumerate() {
+        for (i, (benchmark, duration)) in results.iter().enumerate() {
+            if rows[i].is_empty() {
+                rows[i].push(benchmark.to_string());
+            }
             rows[i].push(format!("{}ms", duration.as_millis()));
         }
     }

@@ -48,15 +48,16 @@ rocksdb = "0.22.0"
 comfy-table = "7.0.1"
 
 
-[[bench]]
-name = "store_bench"
-harness = false
+# [[bench]]
+# name = "store_bench"
+# harness = false
+
+# [[bench]]
+# name = "sdb_bench"
+# harness = false
 
 [[bench]]
 name = "compare_stores_bench"
 harness = false
 
-[[bench]]
-name = "sdb_bench"
-harness = false
 

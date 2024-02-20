@@ -163,17 +163,11 @@ fn concurrent_insert(c: &mut Criterion) {
         );
 
         rt.block_on(async {
-            db.close().await.unwrap();
+            drop(db);
         });
 
         rt.shutdown_background();
     }
-
-    rt.block_on(async {
-        drop(db);
-    });
-
-    rt.shutdown_background();
 }
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);

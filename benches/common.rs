@@ -1,25 +1,3 @@
-// This code is borrowed from: https://github.com/cberner/redb/blob/master/benches/common.rs
-//
-// Copyright (c) 2021 Christopher Berner
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 use redb::ReadableTable;
 use redb::TableDefinition;
 use rocksdb::{Direction, IteratorMode, TransactionDB, TransactionOptions, WriteOptions};
@@ -29,171 +7,149 @@ use std::path::Path;
 
 const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
 
-pub(crate) trait BenchDatabase {
-    type W<'db>: BenchWriteTransaction
-    where
-        Self: 'db;
-    type R<'db>: BenchReadTransaction
+pub(crate) trait BenchStore {
+    type T<'db>: Transaction
     where
         Self: 'db;
 
-    fn store_name() -> &'static str;
-    fn write_transaction(&self) -> Self::W<'_>;
-    fn read_transaction(&self) -> Self::R<'_>;
+    fn transaction(&self, write: bool) -> Self::T<'_>;
 }
 
-pub(crate) trait BenchWriteTransaction {
-    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()>;
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()>;
-    async fn commit(self) -> Result<(), ()>;
-}
-
-pub trait BenchReadTransaction {
+pub(crate) trait Transaction {
     type Output<'out>: AsRef<[u8]> + 'out
     where
         Self: 'out;
 
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()>;
     fn get<'a>(&'a self, key: &[u8]) -> Option<Self::Output<'a>>;
     fn range(&self, key: &[u8]) -> Vec<Vec<u8>>;
+    fn delete(&mut self, key: &[u8]) -> Result<(), ()>;
+    async fn commit(self) -> Result<(), ()>;
 }
 
-pub struct RedbBenchDatabase<'a> {
+pub struct RedbBenchStore<'a> {
     db: &'a redb::Database,
 }
 
-impl<'a> RedbBenchDatabase<'a> {
-    #[allow(dead_code)]
+impl<'a> RedbBenchStore<'a> {
     pub fn new(db: &'a redb::Database) -> Self {
-        RedbBenchDatabase { db }
+        RedbBenchStore { db }
     }
 }
 
-impl<'a> BenchDatabase for RedbBenchDatabase<'a> {
-    type W<'db> = RedbBenchWriteTransaction<'db> where Self: 'db;
-    type R<'db> = RedbBenchReadTransaction<'db> where Self: 'db;
+impl<'a> BenchStore for RedbBenchStore<'a> {
+    type T<'db> = RedbTransaction<'db> where Self: 'db;
 
-    fn store_name() -> &'static str {
-        "redb"
-    }
-
-    fn write_transaction(&self) -> Self::W<'_> {
-        let txn = self.db.begin_write().unwrap();
-        RedbBenchWriteTransaction { txn }
-    }
-
-    fn read_transaction(&self) -> Self::R<'_> {
-        let txn = self.db.begin_read().unwrap();
-        RedbBenchReadTransaction { txn }
+    fn transaction(&self, write: bool) -> Self::T<'_> {
+        if write {
+            let txn = self.db.begin_write().unwrap();
+            RedbTransaction::Write(txn)
+        } else {
+            let txn = self.db.begin_read().unwrap();
+            RedbTransaction::Read(txn)
+        }
     }
 }
 
-pub struct RedbBenchReadTransaction<'a> {
-    txn: redb::ReadTransaction<'a>,
+pub enum RedbTransaction<'a> {
+    Read(redb::ReadTransaction<'a>),
+    Write(redb::WriteTransaction<'a>),
 }
 
-impl<'a> BenchReadTransaction for RedbBenchReadTransaction<'a> {
+impl<'a> Transaction for RedbTransaction<'a> {
     type Output<'out> = Vec<u8> where Self: 'out;
 
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
+        match self {
+            RedbTransaction::Read(_) => Err(()),
+            RedbTransaction::Write(txn) => {
+                let mut table = txn.open_table(X).unwrap();
+                table.insert(key, value).map(|_| ()).map_err(|_| ())
+            }
+        }
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
+        match self {
+            RedbTransaction::Read(_) => Err(()),
+            RedbTransaction::Write(txn) => {
+                let mut table = txn.open_table(X).unwrap();
+                table.remove(key).map(|_| ()).map_err(|_| ())
+            }
+        }
+    }
+
     fn get<'b>(&'b self, key: &[u8]) -> Option<Self::Output<'b>> {
-        let table = self.txn.open_table(X).unwrap();
-        let res = table.get(key).unwrap();
-        res.map(|value| value.value().to_vec())
+        match self {
+            RedbTransaction::Write(_) => None,
+            RedbTransaction::Read(txn) => {
+                let table = txn.open_table(X).unwrap();
+                let res = table.get(key).unwrap();
+                res.map(|value| value.value().to_vec())
+            }
+        }
     }
 
     fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let table = self.txn.open_table(X).unwrap();
-        let iter: redb::Range<'_, &[u8], &[u8]> = table.range(key..).unwrap();
-        let values: Result<Vec<Vec<u8>>, _> = iter
-            .map(|result| match result {
-                Ok((_, v)) => Ok(v.value().to_vec()),
-                Err(e) => Err(e),
-            })
-            .collect();
-        values.unwrap()
-    }
-}
-
-pub struct RedbBenchWriteTransaction<'a> {
-    txn: redb::WriteTransaction<'a>,
-}
-
-impl<'a> BenchWriteTransaction for RedbBenchWriteTransaction<'a> {
-    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
-        let mut table = self.txn.open_table(X).unwrap();
-        table.insert(key, value).map(|_| ()).map_err(|_| ())
-    }
-
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
-        let mut table = self.txn.open_table(X).unwrap();
-        table.remove(key).map(|_| ()).map_err(|_| ())
+        match self {
+            RedbTransaction::Write(_) => Vec::new(),
+            RedbTransaction::Read(txn) => {
+                let table = txn.open_table(X).unwrap();
+                let iter: redb::Range<'_, &[u8], &[u8]> = table.range(key..).unwrap();
+                let values: Result<Vec<Vec<u8>>, _> = iter
+                    .map(|result| match result {
+                        Ok((_, v)) => Ok(v.value().to_vec()),
+                        Err(e) => Err(e),
+                    })
+                    .collect();
+                values.unwrap()
+            }
+        }
     }
 
     async fn commit(self) -> Result<(), ()> {
-        self.txn.commit().map_err(|_| ())
+        match self {
+            RedbTransaction::Read(_) => Err(()),
+            RedbTransaction::Write(txn) => txn.commit().map_err(|_| ()),
+        }
     }
 }
 
-pub struct SledBenchDatabase<'a> {
+pub struct SledBenchStore<'a> {
     db: &'a sled::Db,
     db_dir: &'a Path,
 }
 
-impl<'a> SledBenchDatabase<'a> {
+impl<'a> SledBenchStore<'a> {
     pub fn new(db: &'a sled::Db, path: &'a Path) -> Self {
-        SledBenchDatabase { db, db_dir: path }
+        SledBenchStore { db, db_dir: path }
     }
 }
 
-impl<'a> BenchDatabase for SledBenchDatabase<'a> {
-    type W<'db> = SledBenchWriteTransaction<'db> where Self: 'db;
-    type R<'db> = SledBenchReadTransaction<'db> where Self: 'db;
+impl<'a> BenchStore for SledBenchStore<'a> {
+    type T<'db> = SledTransaction<'db> where Self: 'db;
 
-    fn store_name() -> &'static str {
-        "sled"
-    }
-
-    fn write_transaction(&self) -> Self::W<'_> {
-        SledBenchWriteTransaction {
+    fn transaction(&self, _write: bool) -> Self::T<'_> {
+        SledTransaction {
             db: self.db,
             db_dir: self.db_dir,
         }
     }
-
-    fn read_transaction(&self) -> Self::R<'_> {
-        SledBenchReadTransaction { db: self.db }
-    }
 }
 
-pub struct SledBenchReadTransaction<'db> {
-    db: &'db sled::Db,
-}
-
-impl<'db> BenchReadTransaction for SledBenchReadTransaction<'db> {
-    type Output<'out> = sled::IVec where Self: 'out;
-
-    fn get(&self, key: &[u8]) -> Option<sled::IVec> {
-        self.db.get(key).unwrap()
-    }
-
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let iter = self.db.range(key..);
-        iter.filter_map(|x| x.ok())
-            .map(|(_, v)| v.to_vec())
-            .collect()
-    }
-}
-
-pub struct SledBenchWriteTransaction<'a> {
+pub struct SledTransaction<'a> {
     db: &'a sled::Db,
     db_dir: &'a Path,
 }
 
-impl<'a> BenchWriteTransaction for SledBenchWriteTransaction<'a> {
+impl<'a> Transaction for SledTransaction<'a> {
+    type Output<'out> = sled::IVec where Self: 'out;
+
     fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
         self.db.insert(key, value).map(|_| ()).map_err(|_| ())
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
+    fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
         self.db.remove(key).map(|_| ()).map_err(|_| ())
     }
 
@@ -211,145 +167,174 @@ impl<'a> BenchWriteTransaction for SledBenchWriteTransaction<'a> {
         }
         Ok(())
     }
+
+    fn get(&self, key: &[u8]) -> Option<sled::IVec> {
+        self.db.get(key).unwrap()
+    }
+
+    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
+        let iter = self.db.range(key..);
+        iter.filter_map(|x| x.ok())
+            .map(|(_, v)| v.to_vec())
+            .collect()
+    }
 }
 
-pub struct RocksdbBenchDatabase<'a> {
+pub struct RocksdbBenchStore<'a> {
     db: &'a TransactionDB,
 }
 
-impl<'a> RocksdbBenchDatabase<'a> {
+impl<'a> RocksdbBenchStore<'a> {
     pub fn new(db: &'a TransactionDB) -> Self {
         Self { db }
     }
 }
 
-impl<'a> BenchDatabase for RocksdbBenchDatabase<'a> {
-    type W<'db> = RocksdbBenchWriteTransaction<'db> where Self: 'db;
-    type R<'db> = RocksdbBenchReadTransaction<'db> where Self: 'db;
+impl<'a> BenchStore for RocksdbBenchStore<'a> {
+    type T<'db> = RocksdbTransaction<'db> where Self: 'db;
 
-    fn store_name() -> &'static str {
-        "rocksdb"
-    }
-
-    fn write_transaction(&self) -> Self::W<'_> {
-        let mut write_opt = WriteOptions::new();
-        write_opt.set_sync(true);
-        let mut txn_opt = TransactionOptions::new();
-        txn_opt.set_snapshot(true);
-        let txn = self.db.transaction_opt(&write_opt, &txn_opt);
-        RocksdbBenchWriteTransaction { txn }
-    }
-
-    fn read_transaction(&self) -> Self::R<'_> {
-        let snapshot = self.db.snapshot();
-        RocksdbBenchReadTransaction { snapshot }
+    fn transaction(&self, write: bool) -> Self::T<'_> {
+        if write {
+            let mut write_opt = WriteOptions::new();
+            write_opt.set_sync(true);
+            let mut txn_opt = TransactionOptions::new();
+            txn_opt.set_snapshot(true);
+            let txn = self.db.transaction_opt(&write_opt, &txn_opt);
+            RocksdbTransaction::Write(txn)
+        } else {
+            let snapshot = self.db.snapshot();
+            RocksdbTransaction::Read(snapshot)
+        }
     }
 }
 
-pub struct RocksdbBenchWriteTransaction<'a> {
-    txn: rocksdb::Transaction<'a, TransactionDB>,
+pub enum RocksdbTransaction<'a> {
+    Write(rocksdb::Transaction<'a, TransactionDB>),
+    Read(rocksdb::SnapshotWithThreadMode<'a, TransactionDB>),
 }
 
-impl<'a> BenchWriteTransaction for RocksdbBenchWriteTransaction<'a> {
+impl<'a> Transaction for RocksdbTransaction<'a> {
+    type Output<'out> = Vec<u8> where Self: 'out;
+
     fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
-        self.txn.put(key, value).map_err(|_| ())
+        match self {
+            RocksdbTransaction::Read(_) => Err(()),
+            RocksdbTransaction::Write(txn) => txn.put(key, value).map_err(|_| ()),
+        }
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
-        self.txn.delete(key).map_err(|_| ())
+    fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
+        match self {
+            RocksdbTransaction::Read(_) => Err(()),
+            RocksdbTransaction::Write(txn) => txn.delete(key).map_err(|_| ()),
+        }
     }
 
     async fn commit(self) -> Result<(), ()> {
-        self.txn.commit().map_err(|_| ())
+        match self {
+            RocksdbTransaction::Read(_) => Err(()),
+            RocksdbTransaction::Write(txn) => txn.commit().map_err(|_| ()),
+        }
     }
-}
-
-pub struct RocksdbBenchReadTransaction<'db> {
-    snapshot: rocksdb::SnapshotWithThreadMode<'db, TransactionDB>,
-}
-
-impl<'db> BenchReadTransaction for RocksdbBenchReadTransaction<'db> {
-    type Output<'out> = Vec<u8> where Self: 'out;
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.snapshot.get(key).unwrap()
+        match self {
+            RocksdbTransaction::Write(_) => None,
+            RocksdbTransaction::Read(snapshot) => snapshot.get(key).unwrap(),
+        }
     }
 
     fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let iter = self
-            .snapshot
-            .iterator(IteratorMode::From(key, Direction::Forward));
-        iter.map(|x| {
-            let x = x.unwrap();
-            x.1.to_vec()
-        })
-        .collect()
+        match self {
+            RocksdbTransaction::Write(_) => Vec::new(),
+            RocksdbTransaction::Read(snapshot) => {
+                let iter = snapshot.iterator(IteratorMode::From(key, Direction::Forward));
+                iter.map(|x| {
+                    let x = x.unwrap();
+                    x.1.to_vec()
+                })
+                .collect()
+            }
+        }
     }
 }
 
-pub struct SurrealKVBenchDatabase<'a> {
+pub struct SurrealKVBenchStore<'a> {
     db: &'a surrealkv::Store,
 }
 
-impl<'a> SurrealKVBenchDatabase<'a> {
+impl<'a> SurrealKVBenchStore<'a> {
     pub fn new(db: &'a surrealkv::Store) -> Self {
-        SurrealKVBenchDatabase { db }
+        SurrealKVBenchStore { db }
     }
 }
 
-impl<'a> BenchDatabase for SurrealKVBenchDatabase<'a> {
-    type W<'db> = SurrealKVBenchWriteTransaction where Self: 'db;
-    type R<'db> = SurrealKVBenchReadTransaction where Self: 'db;
-
-    fn store_name() -> &'static str {
-        "surrealkv"
-    }
-
-    fn write_transaction(&self) -> Self::W<'_> {
-        let txn = self.db.begin().unwrap();
-        SurrealKVBenchWriteTransaction { txn }
-    }
-
-    fn read_transaction(&self) -> Self::R<'_> {
-        let txn = self.db.begin().unwrap();
-        SurrealKVBenchReadTransaction { txn }
+impl<'a> BenchStore for SurrealKVBenchStore<'a> {
+    type T<'db> = SurrealKVTransaction<'db> where Self: 'db;
+    fn transaction(&self, write: bool) -> Self::T<'_> {
+        if write {
+            let txn = self.db.begin().unwrap();
+            SurrealKVTransaction::Write(txn)
+        } else {
+            let txn = self.db.begin_with_mode(surrealkv::Mode::ReadOnly).unwrap();
+            SurrealKVTransaction::Read(txn)
+        }
     }
 }
 
-pub struct SurrealKVBenchReadTransaction {
-    txn: surrealkv::Transaction,
+pub enum SurrealKVTransaction<'a> {
+    Read(surrealkv::Transaction),
+    Write(surrealkv::Transaction),
+    _PhantomData(std::marker::PhantomData<&'a ()>),
 }
 
-impl BenchReadTransaction for SurrealKVBenchReadTransaction {
+impl<'a> Transaction for SurrealKVTransaction<'a> {
     type Output<'out> = Vec<u8> where Self: 'out;
 
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
+        match self {
+            SurrealKVTransaction::Read(_) => Err(()),
+            SurrealKVTransaction::Write(txn) => txn.set(key, value).map(|_| ()).map_err(|_| ()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
+        match self {
+            SurrealKVTransaction::Read(_) => Err(()),
+            SurrealKVTransaction::Write(txn) => txn.delete(key).map(|_| ()).map_err(|_| ()),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn commit(self) -> Result<(), ()> {
+        match self {
+            SurrealKVTransaction::Read(_) => Err(()),
+            SurrealKVTransaction::Write(mut txn) => {
+                txn.commit().await.unwrap();
+                Ok(())
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.txn.get(key).unwrap()
+        match self {
+            SurrealKVTransaction::Write(_) => None,
+            SurrealKVTransaction::Read(txn) => txn.get(key).unwrap(),
+            _ => unreachable!(),
+        }
     }
 
     fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let range = key..;
-        let iter = self.txn.scan(range, None).unwrap();
-        iter.into_iter().map(|x| x.1).collect()
-    }
-}
-
-pub struct SurrealKVBenchWriteTransaction {
-    txn: surrealkv::Transaction,
-}
-
-impl BenchWriteTransaction for SurrealKVBenchWriteTransaction {
-    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
-        self.txn.set(key, value).map(|_| ()).map_err(|_| ())
-    }
-
-    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
-        self.txn.delete(key).map(|_| ()).map_err(|_| ())
-    }
-
-    async fn commit(mut self) -> Result<(), ()> {
-        self.txn.commit().await.unwrap();
-
-        Ok(())
+        match self {
+            SurrealKVTransaction::Write(_) => Vec::new(),
+            SurrealKVTransaction::Read(txn) => {
+                let range = key..;
+                let iter = txn.scan(range, None).unwrap();
+                iter.into_iter().map(|x| x.1).collect()
+            }
+            _ => unreachable!(),
+        }
     }
 }
