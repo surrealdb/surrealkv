@@ -378,4 +378,100 @@ mod tests {
         // Test closing segment
         assert!(a.close().is_ok());
     }
+
+    #[test]
+    fn append_and_read_two_blocks() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let opts = Options::default();
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Create two slices of bytes of different sizes
+        let data1 = vec![1; 31 * 1024];
+        let data2 = vec![2; 2 * 1024];
+
+        // Append the first data slice to the aol
+        let r1 = a.append(&data1);
+        assert!(r1.is_ok());
+        assert_eq!(31 * 1024, r1.unwrap().1);
+
+        // Append the second data slice to the aol
+        let r2 = a.append(&data2);
+        assert!(r2.is_ok());
+        assert_eq!(2 * 1024, r2.unwrap().1);
+
+        // Read the first data slice back from the aol
+        let mut read_data1 = vec![0; 31 * 1024];
+        let n1 = a.read_at(&mut read_data1, 0).expect("should read");
+        assert_eq!(31 * 1024, n1);
+        assert_eq!(data1, read_data1);
+
+        // Read the second data slice back from the aol
+        let mut read_data2 = vec![0; 2 * 1024];
+        let n2 = a.read_at(&mut read_data2, 31 * 1024).expect("should read");
+        assert_eq!(2 * 1024, n2);
+        assert_eq!(data2, read_data2);
+
+        // Test closing segment
+        assert!(a.close().is_ok());
+    }
+
+    #[test]
+    fn append_read_append_read() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let opts = Options::default();
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Create two slices of bytes of different sizes
+        let data1 = vec![1; 31 * 1024];
+        let data2 = vec![2; 2 * 1024];
+        let data3 = vec![3; 1024];
+        let data4 = vec![4; 1024];
+
+        // Append the first data slice to the aol
+        let r1 = a.append(&data1);
+        assert!(r1.is_ok());
+        assert_eq!(31 * 1024, r1.unwrap().1);
+
+        // Append the second data slice to the aol
+        let r2 = a.append(&data2);
+        assert!(r2.is_ok());
+        assert_eq!(2 * 1024, r2.unwrap().1);
+
+        // Read the first data slice back from the aol
+        let mut read_data1 = vec![0; 31 * 1024];
+        let n1 = a.read_at(&mut read_data1, 0).expect("should read");
+        assert_eq!(31 * 1024, n1);
+        assert_eq!(data1, read_data1);
+
+        // Append the third data slice to the aol
+        let r3 = a.append(&data4);
+        assert!(r3.is_ok());
+        assert_eq!(1024, r3.unwrap().1);
+
+        // Append the third data slice to the aol
+        let r4 = a.append(&data3);
+        assert!(r4.is_ok());
+        assert_eq!(1024, r4.unwrap().1);
+
+        // Read the first data slice back from the aol
+        let mut read_data1 = vec![0; 31 * 1024];
+        let n1 = a.read_at(&mut read_data1, 0).expect("should read");
+        assert_eq!(31 * 1024, n1);
+        assert_eq!(data1, read_data1);
+
+        // Read the second data slice back from the aol
+        let mut read_data2 = vec![0; 2 * 1024];
+        let n2 = a.read_at(&mut read_data2, 31 * 1024).expect("should read");
+        assert_eq!(2 * 1024, n2);
+        assert_eq!(data2, read_data2);
+
+        // Test closing segment
+        assert!(a.close().is_ok());
+    }
 }

@@ -705,4 +705,70 @@ mod tests {
         let task2 = tokio::spawn(concurrent_task(db.clone()));
         let _ = tokio::try_join!(task1, task2).expect("Tasks failed");
     }
+
+    #[tokio::test]
+    async fn insert_then_read_then_delete_then_read() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 0;
+        opts.max_value_cache_size = 0;
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Number of keys to generate
+        let num_keys = 5000;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for (counter, _) in (1..=num_keys).enumerate() {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Write the keys to the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Read the keys from the store
+        for key in keys.iter() {
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap().unwrap();
+            assert_eq!(val, default_value.as_ref());
+        }
+
+        // Delete the keys from the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.delete(key).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // ReWrite the keys to the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Read the keys from the store
+        for key in keys.iter() {
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap().unwrap();
+            assert_eq!(val, default_value.as_ref());
+        }
+    }
 }

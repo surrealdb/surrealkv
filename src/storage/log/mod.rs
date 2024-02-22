@@ -702,7 +702,9 @@ fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
+/// Copies elements from `src` into `dest` until either `dest` is full or all elements in `src` have been copied.
+/// Returns the number of elements copied.
+fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
     let min_len = dest.len().min(src.len());
 
     for (d, s) in dest.iter_mut().zip(src.iter()) {
@@ -710,6 +712,14 @@ fn merge_slices(dest: &mut [u8], src: &[u8]) -> usize {
     }
 
     min_len
+}
+
+/// Tries to copy `dest.len()` bytes from `src`, starting at `dest_len`, but not more than `src_len`.
+/// Returns the length of `dest`.
+fn copy_into_dest_from_src(dest: &mut [u8], dest_len: usize, src: &[u8], src_len: usize) -> usize {
+    let min_len = std::cmp::min(dest.len() - dest_len, src_len);
+    dest[dest_len..(min_len + dest_len)].copy_from_slice(&src[..min_len]);
+    dest.len()
 }
 
 fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
@@ -1023,6 +1033,9 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
         // write_all will write the entire buffer to the file
         // hence ensuring atomic writes to the file
+
+        // Seek to the end of the file before writing because the cursor might have been moved during read
+        self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&p.buf[p.flushed..p.written])?;
         p.flushed += n;
         self.file_offset += n as u64;
@@ -1093,10 +1106,10 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         if self.is_wal {
             encode_record_header(buf, rec.len(), partial_record, i);
             // Copy the 'partial_record' into the buffer starting from the WAL_RECORD_HEADER_SIZE offset
-            merge_slices(&mut buf[WAL_RECORD_HEADER_SIZE..], partial_record);
+            copy_slice(&mut buf[WAL_RECORD_HEADER_SIZE..], partial_record);
             active_block.written += partial_record.len() + WAL_RECORD_HEADER_SIZE;
         } else {
-            merge_slices(buf, partial_record);
+            copy_slice(buf, partial_record);
             active_block.written += partial_record.len();
         }
 
@@ -1163,7 +1176,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             if remaining > 0 {
                 let buf = &self.block.buf
                     [self.block.flushed + boff..self.block.flushed + boff + remaining];
-                merge_slices(bs, buf);
+                copy_into_dest_from_src(bs, n, buf, buf.len());
                 n += remaining;
             }
 
@@ -2362,5 +2375,36 @@ mod tests {
         assert!(sr[0].id == 4);
         assert!(sr[1].id == 6);
         assert!(sr[2].id == 8);
+    }
+
+    #[test]
+    fn test_copy_into_dest_from_src() {
+        // Scenario 1: dest has one byte and rest in src
+        let mut dest = vec![1, 0, 0, 0, 0];
+        let src = vec![2, 3, 4, 5];
+        let dest_len = copy_into_dest_from_src(&mut dest, 1, &src, src.len());
+        assert_eq!(dest_len, 5);
+        assert_eq!(dest, vec![1, 2, 3, 4, 5]);
+
+        // Scenario 2: src is smaller than dest
+        let mut dest = vec![0; 10];
+        let src = vec![1, 2, 3, 4, 5];
+        let dest_len = copy_into_dest_from_src(&mut dest, 0, &src, src.len());
+        assert_eq!(dest_len, 10);
+        assert_eq!(dest, vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0]);
+
+        // Scenario 3: src is larger than dest
+        let mut dest = vec![0; 5];
+        let src = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let dest_len = copy_into_dest_from_src(&mut dest, 0, &src, src.len());
+        assert_eq!(dest_len, 5);
+        assert_eq!(dest, vec![1, 2, 3, 4, 5]);
+
+        // Scenario 4: dest is already partially filled
+        let mut dest = vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0];
+        let src = vec![6, 7, 8, 9, 10];
+        let dest_len = copy_into_dest_from_src(&mut dest, 5, &src, src.len());
+        assert_eq!(dest_len, 10);
+        assert_eq!(dest, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 }
