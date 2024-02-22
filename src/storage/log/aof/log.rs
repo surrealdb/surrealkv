@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn append_read_append() {
+    fn append_read_append_read() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 

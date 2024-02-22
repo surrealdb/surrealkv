@@ -702,6 +702,8 @@ fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// Copies elements from `src` into `dest` until either `dest` is full or all elements in `src` have been copied.
+/// Returns the number of elements copied.
 fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
     let min_len = dest.len().min(src.len());
 
@@ -712,6 +714,8 @@ fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
     min_len
 }
 
+/// Tries to copy `dest.len()` bytes from `src`, starting at `dest_len`, but not more than `src_len`.
+/// Returns the length of `dest`.
 fn copy_into_dest_from_src(dest: &mut [u8], dest_len: usize, src: &[u8], src_len: usize) -> usize {
     let min_len = std::cmp::min(dest.len() - dest_len, src_len);
     dest[dest_len..(min_len + dest_len)].copy_from_slice(&src[..min_len]);
