@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_open_and_reload_options() {
+    async fn store_open_and_update_options() {
         // // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -597,6 +597,50 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.core.opts.clone();
         assert_eq!(store_opts, opts);
+    }
+
+    #[tokio::test]
+    async fn insert_close_reopen() {
+        for _ in 0..10 {
+            // Create a temporary directory for testing
+            let temp_dir = create_temp_directory();
+
+            // Create store options with the test directory
+            let mut opts = Options::new();
+            opts.dir = temp_dir.path().to_path_buf();
+
+            // Create a new store instance with VariableKey as the key type
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Insert 1000 items into the store
+            for i in 0..1000 {
+                let key = format!("key{}", i);
+                let value = format!("value{}", i);
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+                txn.commit().await.unwrap();
+            }
+
+            // Close the store
+            store.close().await.unwrap();
+
+            // Reopen the store
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Test that the items are still in the store
+            for i in 0..1000 {
+                let key = format!("key{}", i);
+                let value = format!("value{}", i);
+                let value = value.into_bytes();
+                let txn = store.begin().unwrap();
+                let val = txn.get(key.as_bytes()).unwrap().unwrap();
+
+                assert_eq!(val, value);
+            }
+
+            // Close the store again
+            store.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
