@@ -32,7 +32,7 @@ use common::*;
 use std::fs::File;
 use std::time::{Duration, Instant};
 
-const ELEMENTS: usize = 1_000_000;
+const ELEMENTS: usize = 1_000_00;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
