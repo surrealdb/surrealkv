@@ -34,6 +34,7 @@ pub enum Error {
     EmptyValue,                         // The value in the record is empty
     ManifestNotFound,                   // The manifest was not found
     MaxTransactionEntriesLimitExceeded, // The maximum number of entries in a transaction was exceeded
+    TransactionWriteOnly,               // The transaction is write-only
     SendError(String),
     ReceiveError(String),
 }
@@ -95,6 +96,7 @@ impl fmt::Display for Error {
             Error::MaxTransactionEntriesLimitExceeded => {
                 write!(f, "Max transaction entries limit exceeded")
             }
+            Error::TransactionWriteOnly => write!(f, "Transaction is write-only"),
             Error::SendError(err) => write!(f, "Send error: {}", err),
             Error::ReceiveError(err) => write!(f, "Receive error: {}", err),
         }

@@ -147,6 +147,11 @@ impl Transaction {
             return Err(Error::EmptyKey);
         }
 
+        // Do not allow reads if it is a write-only transaction
+        if self.mode.is_write_only() {
+            return Err(Error::TransactionWriteOnly);
+        }
+
         // Create a copy of the key.
         let key = Bytes::copy_from_slice(key);
         let hashed_key = sha256(key.clone());
