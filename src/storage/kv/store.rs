@@ -616,9 +616,9 @@ mod tests {
 
             // Append num_ops items to the store
             for j in 0..num_ops {
-                let key = format!("key{}", (i - 1) * num_ops + j);
-                let value = (i - 1) * num_ops + j;
-                let value = format!("value{}", value);
+                let id = (i - 1) * num_ops + j;
+                let key = format!("key{}", id);
+                let value = format!("value{}", id);
                 let mut txn = store.begin().unwrap();
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
                 txn.commit().await.unwrap();
