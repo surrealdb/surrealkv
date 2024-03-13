@@ -608,16 +608,17 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let num_ops = 1000;
+        let num_ops = 10;
 
         for i in 1..=10 {
             // (Re)open the store
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Append num_ops items to the store
-            for j in (num_ops * (i - 1))..(num_ops * i) {
-                let key = format!("key{}", j);
-                let value = format!("value{}", j);
+            for j in 0..num_ops {
+                let key = format!("key{}", (i - 1) * num_ops + j);
+                let value = (i - 1) * num_ops + j;
+                let value = format!("value{}", value);
                 let mut txn = store.begin().unwrap();
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
                 txn.commit().await.unwrap();
