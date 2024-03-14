@@ -485,7 +485,7 @@ mod tests {
         let mut kvmd = Metadata::new();
         kvmd.as_deleted(true).expect("failed to set deleted");
 
-        let mut value_ref = ValueRef::new(store.core.clone());
+        let mut value_ref = ValueRef::new(store.inner.as_ref().unwrap().core.clone());
         value_ref.value_length = 100;
         value_ref.value_offset = Some(200);
         value_ref.key_value_metadata = Some(kvmd);

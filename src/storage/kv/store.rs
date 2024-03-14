@@ -29,15 +29,15 @@ use crate::storage::{
     },
 };
 
-/// An MVCC-based transactional key-value store.
-pub struct Store {
+pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
 
-impl Store {
+// Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
+impl StoreInner {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
@@ -57,11 +57,57 @@ impl Store {
         })
     }
 
+    /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
+    pub async fn close(&self) -> Result<()> {
+        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Send stop signal
+        self.stop_tx
+            .send(())
+            .await
+            .map_err(|e| Error::SendError(format!("{}", e)))?;
+
+        // Wait for task to finish
+        if let Some(handle) = self.task_runner_handle.lock().await.take() {
+            handle.await.map_err(|e| {
+                Error::ReceiveError(format!(
+                    "Error occurred while closing the kv store. JoinError: {}",
+                    e
+                ))
+            })?;
+        }
+
+        self.core.close()?;
+        Ok(())
+    }
+}
+
+/// An MVCC-based transactional key-value store.
+///
+/// The store is closed asynchronously when it is dropped.
+/// If you need to guarantee that the store is closed before the program continues, use the `close` method.
+
+// This is a wrapper around the inner store to allow for asynchronous closing of the store.
+#[derive(Default)]
+pub struct Store {
+    pub(crate) inner: Option<StoreInner>,
+}
+
+impl Store {
+    /// Creates a new MVCC key-value store with the given options.
+    pub fn new(opts: Options) -> Result<Self> {
+        Ok(Self {
+            inner: Some(StoreInner::new(opts)?),
+        })
+    }
+
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin(&self) -> Result<Transaction> {
-        let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
+        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
 
@@ -69,7 +115,7 @@ impl Store {
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-        let txn = Transaction::new(self.core.clone(), mode)?;
+        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), mode)?;
         Ok(txn)
     }
 
@@ -97,30 +143,27 @@ impl Store {
         Ok(())
     }
 
-    /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
+    /// Closes the inner store
     pub async fn close(&self) -> Result<()> {
-        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(());
+        if let Some(inner) = self.inner.as_ref() {
+            inner.close().await?;
         }
 
-        // Send stop signal
-        self.stop_tx
-            .send(())
-            .await
-            .map_err(|e| Error::SendError(format!("{}", e)))?;
-
-        // Wait for task to finish
-        if let Some(handle) = self.task_runner_handle.lock().await.take() {
-            handle.await.map_err(|e| {
-                Error::ReceiveError(format!(
-                    "Error occurred while closing the kv store. JoinError: {}",
-                    e
-                ))
-            })?;
-        }
-
-        self.core.close()?;
         Ok(())
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // Close the store asynchronously
+            tokio::spawn(async move {
+                if let Err(err) = inner.close().await {
+                    // TODO: use log/tracing instead of eprintln
+                    eprintln!("Error occurred while closing the kv store: {}", err);
+                }
+            });
+        }
     }
 }
 
@@ -595,7 +638,7 @@ mod tests {
         opts.max_value_cache_size = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
-        let store_opts = store.core.opts.clone();
+        let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
         assert_eq!(store_opts, opts);
     }
 
@@ -692,7 +735,7 @@ mod tests {
 
         let (writes_tx, writes_rx) = bounded(100);
         let (stop_tx, stop_rx) = bounded(1);
-        let core = &store.core;
+        let core = &store.inner.as_ref().unwrap().core;
 
         let runner = TaskRunner::new(core.clone(), writes_rx, stop_rx);
         let fut = runner.spawn();
@@ -810,6 +853,84 @@ mod tests {
             let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn records_not_lost_when_store_is_closed() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let key = "key".as_bytes();
+        let value = "value".as_bytes();
+
+        {
+            // Create a new store instance
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Insert an item into the store
+            let mut txn = store.begin().unwrap();
+            txn.set(key, value).unwrap();
+            txn.commit().await.unwrap();
+
+            drop(txn);
+            store.close().await.unwrap();
+        }
+        {
+            // Reopen the store
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Test that the item is still in the store
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap();
+
+            assert_eq!(val.unwrap(), value);
+        }
+    }
+
+    // This test is relevant today because unless the store is dropped, the data will not be persisted to disk.
+    // Once the store automatically syncs the data to disk, this test will not verify the intended behaviour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn records_not_lost_when_store_is_dropped() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let key = "key".as_bytes();
+        let value = "value".as_bytes();
+
+        {
+            // Create a new store instance
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Insert an item into the store
+            let mut txn = store.begin().unwrap();
+            txn.set(key, value).unwrap();
+            txn.commit().await.unwrap();
+
+            drop(txn);
+            drop(store);
+        }
+
+        // Give some room for the store to close asynchronously
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        {
+            // Reopen the store
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            // Test that the item is still in the store
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap();
+
+            assert_eq!(val.unwrap(), value);
         }
     }
 }
