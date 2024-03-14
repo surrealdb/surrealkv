@@ -80,6 +80,10 @@ impl StoreInner {
         }
 
         self.core.close()?;
+
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
         Ok(())
     }
 }
@@ -932,5 +936,30 @@ mod tests {
 
             assert_eq!(val.unwrap(), value);
         }
+    }
+
+    #[tokio::test]
+    async fn store_closed_twice_without_error() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Close the store once
+        assert!(
+            store.close().await.is_ok(),
+            "should close store without error"
+        );
+
+        // Close the store a second time
+        assert!(
+            store.close().await.is_ok(),
+            "should close store without error"
+        );
     }
 }
