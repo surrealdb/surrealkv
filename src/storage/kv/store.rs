@@ -93,8 +93,6 @@ impl StoreInner {
 #[derive(Default)]
 pub struct Store {
     pub(crate) inner: Option<StoreInner>,
-    // Flag to indicate if the store has been dropped so we don't enter a loop
-    pub(self) _dropped: bool,
 }
 
 impl Store {
@@ -102,7 +100,6 @@ impl Store {
     pub fn new(opts: Options) -> Result<Self> {
         Ok(Self {
             inner: Some(StoreInner::new(opts)?),
-            _dropped: false,
         })
     }
 
@@ -158,15 +155,10 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if !self._dropped {
-            // Replace the current self with a default, so we can send the original self to the async task
-            let mut this = Store::default();
-            std::mem::swap(&mut this, self);
-            this._dropped = true;
-
+        if let Some(inner) = self.inner.take() {
             // Close the store asynchronously
             tokio::spawn(async move {
-                if let Err(err) = this.close().await {
+                if let Err(err) = inner.close().await {
                     // TODO: use log/tracing instead of eprintln
                     eprintln!("Error occurred while closing the kv store: {}", err);
                 }
@@ -545,7 +537,6 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Borrow;
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;
