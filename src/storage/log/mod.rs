@@ -432,16 +432,6 @@ impl Metadata {
         Ok(int_value)
     }
 
-    pub(crate) fn put_bool(&mut self, key: &str, b: bool) {
-        let value = if b { 1 } else { 0 };
-        self.put_uint(key, value);
-    }
-
-    pub(crate) fn get_bool(&self, key: &str) -> Result<bool> {
-        let value = self.get_uint(key)?;
-        Ok(value == 1)
-    }
-
     // Generic method to put a key-value pair into the data HashMap
     pub(crate) fn put(&mut self, key: &str, value: &[u8]) {
         self.data.insert(key.to_string(), value.to_vec());
@@ -1428,13 +1418,6 @@ mod tests {
         let mut metadata = Metadata::new(None);
         metadata.put_uint("age", 25);
         assert_eq!(metadata.get_uint("age").unwrap(), 25);
-    }
-
-    #[test]
-    fn put_and_get_bool() {
-        let mut metadata = Metadata::new(None);
-        metadata.put_bool("is_active", true);
-        assert!(metadata.get_bool("is_active").unwrap());
     }
 
     #[test]

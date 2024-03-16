@@ -61,7 +61,7 @@ impl Mode {
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
 pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
     /// Commits with this durability level will be queued for persitance to disk, and will be
     /// written to disk in batches of BLOCK_SIZE. This helps reduce the number of disk writes,
@@ -448,6 +448,7 @@ impl Transaction {
         self.buf.clear();
         self.write_set.clear();
         self.read_set.lock().clear();
+        self.snapshot.take();
     }
 }
 
