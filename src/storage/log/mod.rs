@@ -1103,7 +1103,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         }
 
         if active_block.is_full() {
-            self.flush_block(true)?;
+            self.flush_and_sync()?;
         }
 
         *rec = &rec[remaining..];
