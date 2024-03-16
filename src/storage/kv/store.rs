@@ -29,6 +29,8 @@ use crate::storage::{
     },
 };
 
+use super::transaction::Durability;
+
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
@@ -249,6 +251,8 @@ pub struct Task {
     tx_id: u64,
     /// Commit timestamp
     commit_ts: u64,
+    /// Durability
+    durability: Durability,
 }
 
 impl Core {
@@ -478,15 +482,26 @@ impl Core {
 
         tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
 
-        self.append_to_log(&buf)?;
+        self.append_to_log(&buf, req.durability)?;
         self.write_to_index(&req, &committed_values_offsets)?;
 
         Ok(())
     }
 
-    fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
+    fn append_to_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
         let mut clog = self.clog.write();
-        clog.append(tx_record)?;
+
+        match durability {
+            Durability::Immediate => {
+                // Immediate durability means that the transaction is made to
+                // fsync the data to disk before returning.
+                clog.append(tx_record)?;
+                clog.sync()?;
+            }
+            Durability::Eventual => {
+                clog.append(tx_record)?;
+            }
+        }
 
         Ok(())
     }
@@ -526,6 +541,7 @@ impl Core {
         entries: Vec<Entry>,
         tx_id: u64,
         commit_ts: u64,
+        durability: Durability,
     ) -> Result<Receiver<Result<()>>> {
         let (tx, rx) = bounded(1);
         let req = Task {
@@ -533,6 +549,7 @@ impl Core {
             done: Some(tx),
             tx_id,
             commit_ts,
+            durability,
         };
         self.writes_tx.send(req).await?;
         Ok(rx)
@@ -545,6 +562,7 @@ mod tests {
 
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
+    use crate::storage::kv::transaction::Durability;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -754,6 +772,7 @@ mod tests {
                     done: Some(done_tx),
                     tx_id: i,
                     commit_ts: i,
+                    durability: Durability::default(),
                 })
                 .await
                 .unwrap();

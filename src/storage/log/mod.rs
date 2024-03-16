@@ -17,7 +17,7 @@ use hashbrown::HashMap;
 /// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
 /// flushing to disk. Larger block sizes can improve write performance but might use more memory.
-pub(crate) const BLOCK_SIZE: usize = 32768;
+pub(crate) const BLOCK_SIZE: usize = 4 * 1024;
 
 /// Length of the record header in bytes.
 ///
@@ -1072,17 +1072,11 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
     pub(crate) fn append(&mut self, mut rec: &[u8]) -> Result<(u64, usize)> {
         // If the segment is closed, return an error
         if self.closed {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Segment is closed",
-            )));
+            return Err(Error::SegmentClosed);
         }
 
         if rec.is_empty() {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "buf is empty",
-            )));
+            return Err(Error::EmptyBuffer);
         }
 
         let offset = self.offset();
@@ -1114,7 +1108,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         }
 
         if active_block.is_full() {
-            self.flush_block(true)?;
+            self.flush_and_sync()?;
         }
 
         *rec = &rec[remaining..];
@@ -1202,7 +1196,7 @@ impl<const RECORD_HEADER_SIZE: usize> Drop for Segment<RECORD_HEADER_SIZE> {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error type for the storage module
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
@@ -1210,6 +1204,7 @@ pub enum Error {
     Eof(usize),
     IO(IOError),
     Poison(String),
+    RecordTooLarge,
 }
 
 // Implementation of Display trait for Error
@@ -1222,6 +1217,7 @@ impl fmt::Display for Error {
             Error::IO(err) => write!(f, "IO error: {}", err),
             Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
             Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::RecordTooLarge => write!(f, "Record too large"),
         }
     }
 }
@@ -1246,7 +1242,7 @@ impl<T: Sized> From<PoisonError<T>> for Error {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IOError {
     kind: io::ErrorKind,
     message: String,
@@ -1267,7 +1263,7 @@ impl fmt::Display for IOError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,

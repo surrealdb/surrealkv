@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -38,6 +39,9 @@ pub struct Aol {
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
     segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
+
+    /// A flag indicating whether the AOL instance has encountered an IO error or not.
+    fsync_failed: AtomicBool,
 }
 
 impl Aol {
@@ -75,6 +79,7 @@ impl Aol {
             closed: false,
             mutex: RwLock::new(()),
             segment_cache: RwLock::new(cache),
+            fsync_failed: Default::default(),
         })
     }
 
@@ -128,63 +133,149 @@ impl Aol {
     ///
     /// This function may return an error if the active segment is closed, the provided record
     /// is empty, or any I/O error occurs during the appending process.
+    // pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
+    //     if self.closed {
+    //         return Err(Error::SegmentClosed);
+    //     }
+
+    //     self.has_fsync_failed()?;
+
+    //     if rec.is_empty() {
+    //         return Err(Error::EmptyBuffer);
+    //     }
+
+    //     let _lock = self.mutex.write();
+
+    //     // Get options and initialize variables
+    //     let opts = &self.opts;
+    //     let mut n = 0usize;
+    //     let mut offset = 0;
+
+    //     // TODO: check if there is a potential infinite loop here if the
+    //     // record is larger than the max file size. Write a test to check this.
+    //     while n < rec.len() {
+    //         // Calculate available space in the active segment
+    //         let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+
+    //         // If space is not available, create a new segment
+    //         if available <= 0 {
+    //             // Rotate to a new segment
+
+    //             // Sync and close the active segment
+    //             // Note that closing the segment will
+    //             // not close the underlying file until
+    //             // it is dropped.
+    //             self.active_segment.close()?;
+
+    //             // Increment the active segment id
+    //             self.active_segment_id += 1;
+
+    //             // Open a new segment for writing
+    //             let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+
+    //             // Retrieve the previous active segment and replace it with the new one
+    //             let _ = mem::replace(&mut self.active_segment, new_segment);
+
+    //             available = opts.max_file_size as i64;
+    //         }
+
+    //         // Calculate the amount of data to append
+    //         let d = std::cmp::min(available as usize, rec.len() - n);
+    //         let result = self.active_segment.append(&rec[n..n + d]);
+    //         match result {
+    //             Ok((off, _)) => off,
+    //             Err(e) => {
+    //                 match e{
+    //                     Error::IO(_) => {
+    //                         self.set_fsync_failed(true);
+    //                     }
+    //                     _ => {}
+    //                 }
+    //                 return Err(e);
+    //             }
+    //         };
+    //         let (off, _) = result.unwrap();
+    //         // Calculate offset only for the first chunk of data
+    //         if n == 0 {
+    //             offset = off + self.calculate_offset();
+    //         }
+
+    //         n += d;
+    //     }
+
+    //     Ok((offset, n))
+    // }
+
     pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
         if self.closed {
             return Err(Error::SegmentClosed);
         }
 
+        self.has_fsync_failed()?;
+
         if rec.is_empty() {
             return Err(Error::EmptyBuffer);
+        }
+
+        // Check if the record is larger than the maximum file size
+        if rec.len() > self.opts.max_file_size as usize {
+            return Err(Error::RecordTooLarge);
         }
 
         let _lock = self.mutex.write();
 
         // Get options and initialize variables
         let opts = &self.opts;
-        let mut n = 0usize;
-        let mut offset = 0;
 
-        // TODO: check if there is a potential infinite loop here if the
-        // record is larger than the max file size. Write a test to check this.
-        while n < rec.len() {
-            // Calculate available space in the active segment
-            let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+        // Calculate available space in the active segment
+        let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
 
-            // If space is not available, create a new segment
-            if available <= 0 {
-                // Rotate to a new segment
+        // If the entire record can't fit into the remaining space of the current segment,
+        // close the current segment and create a new one
+        if available < rec.len() as i64 {
+            // Rotate to a new segment
 
-                // Sync and close the active segment
-                // Note that closing the segment will
-                // not close the underlying file until
-                // it is dropped.
-                self.active_segment.close()?;
+            // Sync and close the active segment
+            // Note that closing the segment will
+            // not close the underlying file until
+            // it is dropped.
+            self.active_segment.close()?;
 
-                // Increment the active segment id
-                self.active_segment_id += 1;
+            // Increment the active segment id
+            self.active_segment_id += 1;
 
-                // Open a new segment for writing
-                let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+            // Open a new segment for writing
+            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
 
-                // Retrieve the previous active segment and replace it with the new one
-                let _ = mem::replace(&mut self.active_segment, new_segment);
-
-                available = opts.max_file_size as i64;
-            }
-
-            // Calculate the amount of data to append
-            let d = std::cmp::min(available as usize, rec.len() - n);
-            let (off, _) = self.active_segment.append(&rec[n..n + d])?;
-
-            // Calculate offset only for the first chunk of data
-            if n == 0 {
-                offset = off + self.calculate_offset();
-            }
-
-            n += d;
+            // Retrieve the previous active segment and replace it with the new one
+            let _ = mem::replace(&mut self.active_segment, new_segment);
         }
 
-        Ok((offset, n))
+        // Write the record to the segment
+        let result = self.active_segment.append(rec);
+        match result {
+            Ok((off, _)) => off,
+            Err(e) => {
+                match e {
+                    Error::IO(_) => {
+                        self.set_fsync_failed(true);
+                    }
+                    _ => {}
+                }
+                return Err(e);
+            }
+        };
+        let (off, _) = result.unwrap();
+        // Calculate offset only for the first chunk of data
+        let offset = off + self.calculate_offset();
+
+        Ok((offset, rec.len()))
+    }
+
+    /// Flushes and syncs the active segment.
+    pub fn sync(&mut self) -> Result<()> {
+        self.has_fsync_failed()?;
+        self.active_segment.sync()
     }
 
     // Helper function to calculate offset
@@ -211,6 +302,8 @@ impl Aol {
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
+        self.has_fsync_failed()?;
+
         if buf.is_empty() {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::UnexpectedEof,
@@ -225,7 +318,6 @@ impl Aol {
             let read_offset = offset % self.opts.max_file_size;
 
             // Read data from the appropriate segment
-            // r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
             match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
                 Ok(bytes_read) => {
                     r += bytes_read;
@@ -274,6 +366,7 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
+        self.has_fsync_failed()?;
         let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
@@ -290,6 +383,23 @@ impl Aol {
         let cur_segment_size = self.active_segment.file_offset;
         let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
+    }
+
+    #[inline]
+    fn set_fsync_failed(&self, failed: bool) {
+        self.fsync_failed.store(failed, Ordering::Release);
+    }
+
+    #[inline]
+    fn has_fsync_failed(&self) -> Result<()> {
+        if self.fsync_failed.load(Ordering::Acquire) {
+            Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "fsync failed",
+            )))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -473,5 +583,26 @@ mod tests {
 
         // Test closing segment
         assert!(a.close().is_ok());
+    }
+
+    #[test]
+    fn test_append_large_record() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let mut opts = Options::default();
+        opts.max_file_size = 1024;
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        let large_record = vec![1; 1025];
+        let small_record = vec![1; 1024];
+        let r = a.append(&small_record);
+        assert!(r.is_ok());
+        assert_eq!(1024, a.offset().unwrap());
+
+        let r = a.append(&large_record);
+        assert!(r.is_err());
+        assert_eq!(1024, a.offset().unwrap());
     }
 }

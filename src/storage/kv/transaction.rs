@@ -61,6 +61,27 @@ impl Mode {
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
 pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
+#[derive(Debug, Copy, Clone)]
+pub enum Durability {
+    /// Commits with this durability level will be queued for persitance to disk, and will be
+    /// written to disk in batches of BLOCK_SIZE. This helps reduce the number of disk writes,
+    /// and increases throughput as the data is written to disk in batches. But it does not
+    /// guarantee that the data will be persisted to disk as soon as [Transaction::commit] returns.
+    Eventual,
+    /// Commits with this durability level are guaranteed to be persistent as soon as
+    /// [Transaction::commit] returns.
+    ///
+    /// Data is fsynced to disk before returning from [Transaction::commit]. This is the slowest
+    /// durability level, but it is the safest.
+    Immediate,
+}
+
+impl Default for Durability {
+    fn default() -> Self {
+        Durability::Eventual
+    }
+}
+
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
     /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
@@ -91,6 +112,9 @@ pub struct Transaction {
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
 
+    /// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
+    durability: Durability,
+
     /// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
     closed: bool,
 }
@@ -111,6 +135,7 @@ impl Transaction {
             write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
+            durability: Durability::Eventual,
             closed: false,
         })
     }
@@ -118,6 +143,11 @@ impl Transaction {
     /// Returns the transaction mode.
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Sets the durability level of the transaction.
+    pub fn set_durability(&mut self, durability: Durability) {
+        self.durability = durability;
     }
 
     /// Adds a key-value pair to the store.
@@ -367,7 +397,7 @@ impl Transaction {
         // Commit the changes to the store index.
         let done = self
             .core
-            .send_to_write_channel(entries, tx_id, commit_ts)
+            .send_to_write_channel(entries, tx_id, commit_ts, self.durability)
             .await;
 
         if let Err(err) = done {
