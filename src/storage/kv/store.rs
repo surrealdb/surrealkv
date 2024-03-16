@@ -558,6 +558,8 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::SliceRandom;
+    use rand::Rng;
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;
@@ -980,5 +982,72 @@ mod tests {
             store.close().await.is_ok(),
             "should close store without error"
         );
+    }
+
+    /// Returns pairs of key, value
+    fn gen_data(count: usize, key_size: usize, value_size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut pairs = vec![];
+
+        for _ in 0..count {
+            let key: Vec<u8> = (0..key_size).map(|_| rand::thread_rng().gen()).collect();
+            let value: Vec<u8> = (0..value_size).map(|_| rand::thread_rng().gen()).collect();
+            pairs.push((key, value));
+        }
+
+        pairs
+    }
+
+    async fn test_durability(durability: Durability) {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let num_elements = 100;
+        let pairs = gen_data(num_elements, 16, 20);
+
+        {
+            // Create a new store instance
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            let mut txn = store.begin().unwrap();
+            txn.set_durability(durability);
+
+            {
+                for i in 0..num_elements {
+                    let (key, value) = &pairs[i % pairs.len()];
+                    txn.set(key.as_slice(), value.as_slice()).unwrap();
+                }
+            }
+            txn.commit().await.unwrap();
+
+            drop(store);
+        }
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let txn = store.begin().unwrap();
+
+        let mut key_order: Vec<usize> = (0..num_elements).collect();
+        key_order.shuffle(&mut rand::thread_rng());
+
+        {
+            for i in &key_order {
+                let (key, value) = &pairs[*i % pairs.len()];
+                let val = txn.get(key.as_slice()).unwrap().unwrap();
+                assert_eq!(&val, value);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eventual_durability() {
+        test_durability(Durability::Eventual).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_durability() {
+        test_durability(Durability::Immediate).await;
     }
 }
