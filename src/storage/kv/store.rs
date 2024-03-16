@@ -264,7 +264,7 @@ impl Core {
     /// the Core instance.
     pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
-        let mut indexer = Indexer::new(&opts);
+        let mut indexer = Indexer::new();
 
         // Determine options for the manifest file and open or create it.
         let manifest_subdir = opts.dir.join("manifest");
@@ -658,7 +658,6 @@ mod tests {
 
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
-        opts.max_active_snapshots = 10;
         opts.max_value_cache_size = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");

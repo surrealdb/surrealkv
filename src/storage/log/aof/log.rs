@@ -146,6 +146,7 @@ impl Aol {
 
         // Check if the record is larger than the maximum file size
         if rec.len() > self.opts.max_file_size as usize {
+            println!("rec len {} {}", rec.len(), self.opts.max_file_size);
             return Err(Error::RecordTooLarge);
         }
 
