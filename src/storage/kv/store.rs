@@ -1041,7 +1041,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn eventual_durability() {
         test_durability(Durability::Eventual).await;
     }

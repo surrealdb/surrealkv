@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_large_record() {
+    fn append_large_record() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -534,5 +534,33 @@ mod tests {
         let r = a.append(&large_record);
         assert!(r.is_err());
         assert_eq!(1024, a.offset().unwrap());
+    }
+
+    #[test]
+    fn fsync_failure() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let mut opts = Options::default();
+        opts.max_file_size = 1024;
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        let small_record = vec![1; 1024];
+        let r = a.append(&small_record);
+        assert!(r.is_ok());
+        assert_eq!(1024, a.offset().unwrap());
+
+        // Simulate fsync failure
+        a.set_fsync_failed(true);
+
+        // Writes should fail aftet fsync failure
+        let r = a.append(&small_record);
+        assert!(r.is_err());
+
+        // Reads should fai after fsync failure
+        let mut read_data = vec![0; 1024];
+        let r = a.read_at(&mut read_data, 0);
+        assert!(r.is_err());
     }
 }
