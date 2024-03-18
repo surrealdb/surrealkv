@@ -138,7 +138,7 @@ impl Aol {
             return Err(Error::SegmentClosed);
         }
 
-        self.has_fsync_failed()?;
+        self.check_if_fsync_failed()?;
 
         if rec.is_empty() {
             return Err(Error::EmptyBuffer);
@@ -201,7 +201,7 @@ impl Aol {
 
     /// Flushes and syncs the active segment.
     pub fn sync(&mut self) -> Result<()> {
-        self.has_fsync_failed()?;
+        self.check_if_fsync_failed()?;
         self.active_segment.sync()
     }
 
@@ -229,7 +229,7 @@ impl Aol {
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
-        self.has_fsync_failed()?;
+        self.check_if_fsync_failed()?;
 
         if buf.is_empty() {
             return Err(Error::IO(IOError::new(
@@ -293,7 +293,7 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.has_fsync_failed()?;
+        self.check_if_fsync_failed()?;
         let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
@@ -317,8 +317,11 @@ impl Aol {
         self.fsync_failed.store(failed, Ordering::Release);
     }
 
+    /// Checks if fsync failed and returns error if true. Otherwise, returns Ok.
+    /// This means writes or reads on the log file will not happpen if fsync failed previously.
+    /// The only way to recorver is to close and restart the store to repair the corruped log file.
     #[inline]
-    fn has_fsync_failed(&self) -> Result<()> {
+    fn check_if_fsync_failed(&self) -> Result<()> {
         if self.fsync_failed.load(Ordering::Acquire) {
             Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
