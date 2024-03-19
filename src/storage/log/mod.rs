@@ -1295,6 +1295,7 @@ pub struct MultiSegmentReader {
     segments: Vec<SegmentRef>, // List of segments to read from.
     cur: usize,                // Index of current segment in segments.
     off: usize,                // Offset in current segment.
+    is_wal: bool,
 }
 
 impl MultiSegmentReader {
@@ -1320,7 +1321,12 @@ impl MultiSegmentReader {
             segments,
             cur,
             off,
+            is_wal: false,
         })
+    }
+
+    fn set_wal_mode(&mut self, is_wal: bool) {
+        self.is_wal = is_wal;
     }
 
     fn is_eof(&mut self) -> io::Result<bool> {
@@ -1332,14 +1338,16 @@ impl MultiSegmentReader {
         let bytes_read = self.buf.read(buf)?;
         self.off += bytes_read;
 
-        // If we read less than the buffer size, we've reached the end of the current segment.
-        // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
-        // This is to avoid detecting the wrong segment as corrupt.
-        if self.off % BLOCK_SIZE != 0 {
-            // Fill the rest of the buffer with zeros.
-            let i = self.fill_with_zeros(buf, bytes_read);
-            self.off += i;
-            return Ok(bytes_read + i);
+        if self.is_wal{
+            // If we read less than the buffer size, we've reached the end of the current segment.
+            // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
+            // This is to avoid detecting the wrong segment as corrupt.
+            if self.off % BLOCK_SIZE != 0 {
+                // Fill the rest of the buffer with zeros.
+                let i = self.fill_with_zeros(buf, bytes_read);
+                self.off += i;
+                return Ok(bytes_read + i);
+            }    
         }
 
         Ok(bytes_read)
@@ -1388,14 +1396,21 @@ impl Read for MultiSegmentReader {
         }
 
         // Note: This could create a problem when reading a partial block
-        // spread over multiple segments. Currently aol and wal do not
+        // spread over multiple segments. Currently wal do not
         // write partial blocks spanning multiple segments.
-        if !self.is_eof()? {
-            self.read_to_buffer(buf)
-        } else {
-            self.load_next_segment()?;
-            self.read_to_buffer(buf)
+        let mut n = 0;
+        while n < buf.len() {
+            let mut rn = 0;
+            if !self.is_eof()? {
+                rn += self.read_to_buffer(&mut buf[n..])?;
+            } else {
+                self.load_next_segment()?;
+                rn += self.read_to_buffer(&mut buf[n..])?;
+            }
+            n+=rn;
         }
+
+        Ok(n)
     }
 }
 
@@ -2432,4 +2447,64 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(segment.offset(), 11);
     }
+
+    fn multi_segment_rec() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a sample segment file and populate it with data
+        let opts = Options::default();
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
+
+        // Test appending a non-empty buffer
+        let r = segment1.append(&[0, 1, 2, 3]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        // Test appending another buffer
+        let r = segment2.append(&[4, 5, 6, 7]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        segment1.close().expect("should close segment");
+        segment2.close().expect("should close segment");
+
+        // Create a Vec of segments containing our sample segment
+        let segments: Vec<SegmentRef> = vec![
+            create_test_segment_ref(&segment1),
+            create_test_segment_ref(&segment2),
+        ];
+
+        // Create a MultiSegmentReader for testing
+        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
+
+        // Read first record from the MultiSegmentReader
+        let mut bs = [0u8; 8];
+        let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        assert_eq!(bytes_read, 8);
+        assert_eq!(&[0, 1, 2, 3, 4, 5, 6, 7].to_vec(), &bs[..]);
+
+        // // Read remaining empty block
+        // const REMAINING: usize = BLOCK_SIZE - 11;
+        // let mut bs = [0u8; REMAINING];
+        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        // assert_eq!(bytes_read, REMAINING);
+
+        // // Read second record from the MultiSegmentReader
+        // let mut bs = [0u8; 11];
+        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        // assert_eq!(bytes_read, 11);
+        // assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[..]);
+
+        // // Read remaining empty block
+        // let mut bs = [0u8; REMAINING];
+        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        // assert_eq!(bytes_read, REMAINING);
+
+        // let mut bs = [0u8; 11];
+        // buf_reader.read(&mut bs).expect_err("should not read");
+    }
+
+
 }
