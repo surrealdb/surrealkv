@@ -20,12 +20,13 @@ use crate::storage::{
         indexer::Indexer,
         option::Options,
         oracle::Oracle,
-        reader::{Reader, TxReader},
+        // reader::{Reader, TxReader},
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::Aol,
-        {write_field, Options as LogOptions, BLOCK_SIZE}, {Error as LogError, Metadata},
+        aof::log::Aol, write_field, Error as LogError, Metadata, 
+        MultiSegmentReader, Options as LogOptions, SegmentRef, BLOCK_SIZE,
+        aof::reader::{Reader, TxReader},
     },
 };
 
@@ -282,11 +283,11 @@ impl Core {
         let copts = LogOptions::default()
             .with_max_file_size(opts.max_segment_size)
             .with_file_extension("clog".to_string());
-        let clog = Aol::open(&clog_subdir, &copts)?;
+        let mut clog = Aol::open(&clog_subdir, &copts)?;
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &copts, &mut indexer)?;
+            Core::load_index(&opts, &copts,&mut clog, &mut indexer)?;
         }
 
         // Create and initialize an Oracle.
@@ -317,12 +318,18 @@ impl Core {
         Ok(self.oracle.read_ts())
     }
 
-    fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
+    fn load_index(opts: &Options, copts: &LogOptions, clog:&mut Aol, indexer: &mut Indexer) -> Result<()> {
         let clog_subdir = opts.dir.join("clog");
-        let clog = Aol::open(&clog_subdir, copts)?;
-        let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
-        let mut tx_reader = TxReader::new(reader)?;
+        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
+            .expect("should read segments");
+        let reader = MultiSegmentReader::new(sr)?;
+        let reader = Reader::new_from(reader, copts.max_file_size, BLOCK_SIZE);
+        let mut tx_reader = TxReader::new(reader);
         let mut tx = TxRecord::new(opts.max_tx_entries as usize);
+
+        let mut needs_repair = false;
+        let mut corrupted_segment_id = 0;
+        let mut corrupted_offset_marker = 0;
 
         loop {
             // Reset the transaction record before reading into it.
@@ -330,19 +337,32 @@ impl Core {
             // unnecessary allocations.
             tx.reset();
 
+
             // Read the next transaction record from the log.
             let value_offsets = match tx_reader.read_into(&mut tx) {
                 Ok(value_offsets) => value_offsets,
                 Err(e) => {
-                    if let Error::LogError(LogError::Eof(_)) = e {
-                        break;
-                    } else {
-                        return Err(e);
+                    match e {
+                        Error::LogError(LogError::Eof(_)) => break,
+                        Error::LogError(LogError::Corruption(err)) => {
+                            needs_repair = true;
+                            corrupted_segment_id = err.segment_id;
+                            corrupted_offset_marker = err.offset;
+                            break
+                        }
+                        _ => {
+                            return Err(e)
+                        }
+                        
                     }
                 }
             };
 
             Core::process_entries(&tx, opts, &value_offsets, indexer)?;
+        }
+
+        if needs_repair{
+            clog.repair(corrupted_segment_id, corrupted_offset_marker as u64)?
         }
 
         Ok(())
@@ -402,9 +422,13 @@ impl Core {
     }
 
     fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
+        let mut md: Option<Metadata> = None; // Initialize with None
+
         let manifest_subdir = opts.dir.join("manifest");
-        let mlog = Aol::open(&manifest_subdir, mopts)?;
-        let mut reader = Reader::new_from(mlog, 0, BLOCK_SIZE)?;
+        let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
+            .expect("should read segments");
+        let reader = MultiSegmentReader::new(sr)?;
+        let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
 
         let mut md: Option<Metadata> = None; // Initialize with None
 
