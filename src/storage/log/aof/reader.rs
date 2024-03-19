@@ -9,7 +9,7 @@ use crate::storage::{
         error::{Error, Result},
         meta::Metadata,
     },
-    log::{aof::LogReader, CorruptionError, Error::{self as LogError, Corruption}, MultiSegmentReader},
+    log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
 
 use crate::storage::kv::entry::TxRecord;
@@ -296,10 +296,8 @@ impl TxReader {
         tx.to_buf(&mut buf)?;
         Ok(buf.freeze())
     }
-}
-
-impl LogReader for TxReader{
-    fn read(&mut self) -> Result<(&[u8], u64)> {
+    
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
@@ -318,6 +316,8 @@ impl LogReader for TxReader{
 
         Ok((&self.rec, self.r.offset() as u64))
     }
+
+
 }
 
 #[cfg(test)]

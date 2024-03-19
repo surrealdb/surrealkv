@@ -159,40 +159,40 @@ pub struct Options {
     /// If specified, this option sets the permission mode for creating directories. It determines
     /// the access rights for creating new directories. If not specified, the default directory
     /// creation mode will be used.
-    dir_mode: Option<u32>,
+    pub(crate) dir_mode: Option<u32>,
 
     /// The file mode to set for the segment file.
     ///
     /// If specified, this option sets the permission mode for the segment file. It determines who
     /// can read, write, and execute the file. If not specified, the default file mode will be used.
-    file_mode: Option<u32>,
+    pub(crate) file_mode: Option<u32>,
 
     /// The compression format to apply to the segment's data.
     ///
     /// If specified, this option sets the compression format that will be used to compress the
     /// data written to the segment. Compression can help save storage space but might introduce
     /// some overhead in terms of CPU usage during read and write operations.
-    compression_format: Option<CompressionFormat>,
+    pub(crate) compression_format: Option<CompressionFormat>,
 
     /// The compression level to use with the selected compression format.
     ///
     /// This option specifies the compression level that will be applied when compressing the data.
     /// Higher levels usually provide better compression ratios but require more computational
     /// resources. If not specified, a default compression level will be used.
-    compression_level: Option<CompressionLevel>,
+    pub(crate) compression_level: Option<CompressionLevel>,
 
     /// The metadata associated with the segment.
     ///
     /// This option allows you to attach metadata to the segment. Metadata can be useful for storing
     /// additional information about the segment's contents or usage. If not specified, no metadata
     /// will be associated with the segment.
-    metadata: Option<Metadata>,
+    pub(crate) metadata: Option<Metadata>,
 
     /// The extension to use for the segment file.
     ///
     /// If specified, this option sets the extension for the segment file. The extension is used
     /// when creating the segment file on disk. If not specified, a default extension might be used.
-    file_extension: Option<String>,
+    pub(crate) file_extension: Option<String>,
 
     /// The maximum size of the segment file.
     ///
@@ -201,7 +201,7 @@ pub struct Options {
     /// there is no maximum size limit for the file.
     ///
     /// This is used by aol to cycle segments when the max file size is reached.
-    max_file_size: u64,
+    pub(crate) max_file_size: u64,
 
     /// A flag indicating whether the segment is a Write-Ahead Logging (WAL).
     ///
@@ -218,7 +218,7 @@ pub struct Options {
     /// If specified, this option sets the maximum number of open files allowed.
     ///
     /// This is used by aol to initialize the segment cache.
-    max_open_files: usize,
+    pub(crate) max_open_files: usize,
 }
 
 impl Default for Options {
@@ -1257,12 +1257,12 @@ impl fmt::Display for IOError {
 pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,
-    segment_id: u64,
-    offset: usize,
+    pub(crate) segment_id: u64,
+    pub(crate) offset: usize,
 }
 
 impl CorruptionError {
-    fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: usize) -> Self {
+    pub(crate) fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: usize) -> Self {
         CorruptionError {
             kind,
             message: message.to_string(),
@@ -1380,11 +1380,11 @@ impl MultiSegmentReader {
         Ok(())
     }
 
-    fn current_segment_id(&self) -> u64 {
+    pub(crate) fn current_segment_id(&self) -> u64 {
         self.segments[self.cur].id
     }
 
-    fn current_offset(&self) -> usize {
+    pub(crate) fn current_offset(&self) -> usize {
         self.off
     }
 }
@@ -2467,6 +2467,8 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().1);
 
+        let r = segment2.append(&[8, 9]);
+
         segment1.close().expect("should close segment");
         segment2.close().expect("should close segment");
 
@@ -2480,11 +2482,15 @@ mod tests {
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
 
         // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 8];
+        let mut bs = [0u8; 6];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 8);
-        assert_eq!(&[0, 1, 2, 3, 4, 5, 6, 7].to_vec(), &bs[..]);
+        assert_eq!(bytes_read, 6);
+        assert_eq!(&[0, 1, 2, 3, 4, 5].to_vec(), &bs[..]);
 
+        let mut bs = [0u8; 4];
+        let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        assert_eq!(bytes_read, 4);
+        assert_eq!(&[6, 7,8,9].to_vec(), &bs[..]);
         // // Read remaining empty block
         // const REMAINING: usize = BLOCK_SIZE - 11;
         // let mut bs = [0u8; REMAINING];
