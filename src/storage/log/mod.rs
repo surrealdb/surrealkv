@@ -531,7 +531,7 @@ pub(crate) fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
+pub(crate) fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
     // Read the header using read_field
     read_field(file)
 }
@@ -861,7 +861,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 
     #[allow(dead_code)]
     /// The path where the segment file is located.
-    file_path: PathBuf,
+    pub(crate) file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
@@ -1338,7 +1338,7 @@ impl MultiSegmentReader {
         let bytes_read = self.buf.read(buf)?;
         self.off += bytes_read;
 
-        if self.is_wal{
+        if self.is_wal {
             // If we read less than the buffer size, we've reached the end of the current segment.
             // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
             // This is to avoid detecting the wrong segment as corrupt.
@@ -1347,7 +1347,7 @@ impl MultiSegmentReader {
                 let i = self.fill_with_zeros(buf, bytes_read);
                 self.off += i;
                 return Ok(bytes_read + i);
-            }    
+            }
         }
 
         Ok(bytes_read)
@@ -1407,7 +1407,7 @@ impl Read for MultiSegmentReader {
                 self.load_next_segment()?;
                 rn += self.read_to_buffer(&mut buf[n..])?;
             }
-            n+=rn;
+            n += rn;
         }
 
         Ok(n)
@@ -2490,7 +2490,7 @@ mod tests {
         let mut bs = [0u8; 4];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 4);
-        assert_eq!(&[6, 7,8,9].to_vec(), &bs[..]);
+        assert_eq!(&[6, 7, 8, 9].to_vec(), &bs[..]);
         // // Read remaining empty block
         // const REMAINING: usize = BLOCK_SIZE - 11;
         // let mut bs = [0u8; REMAINING];
@@ -2511,6 +2511,4 @@ mod tests {
         // let mut bs = [0u8; 11];
         // buf_reader.read(&mut bs).expect_err("should not read");
     }
-
-
 }

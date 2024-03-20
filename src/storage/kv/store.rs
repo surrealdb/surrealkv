@@ -20,13 +20,20 @@ use crate::storage::{
         indexer::Indexer,
         option::Options,
         oracle::Oracle,
-        // reader::{Reader, TxReader},
+        reader::{Reader, TxReader},
+        repair::repair,
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::Aol, write_field, Error as LogError, Metadata, 
-        MultiSegmentReader, Options as LogOptions, SegmentRef, BLOCK_SIZE,
-        aof::reader::{Reader, TxReader},
+        aof::log::Aol,
+        // aof::reader::{Reader, TxReader},
+        write_field,
+        Error as LogError,
+        Metadata,
+        MultiSegmentReader,
+        Options as LogOptions,
+        SegmentRef,
+        BLOCK_SIZE,
     },
 };
 
@@ -287,7 +294,7 @@ impl Core {
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &copts,&mut clog, &mut indexer)?;
+            Core::load_index(&opts, &copts, &mut clog, &mut indexer)?;
         }
 
         // Create and initialize an Oracle.
@@ -318,7 +325,12 @@ impl Core {
         Ok(self.oracle.read_ts())
     }
 
-    fn load_index(opts: &Options, copts: &LogOptions, clog:&mut Aol, indexer: &mut Indexer) -> Result<()> {
+    fn load_index(
+        opts: &Options,
+        copts: &LogOptions,
+        clog: &mut Aol,
+        indexer: &mut Indexer,
+    ) -> Result<()> {
         let clog_subdir = opts.dir.join("clog");
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
             .expect("should read segments");
@@ -337,32 +349,26 @@ impl Core {
             // unnecessary allocations.
             tx.reset();
 
-
             // Read the next transaction record from the log.
             let value_offsets = match tx_reader.read_into(&mut tx) {
                 Ok(value_offsets) => value_offsets,
-                Err(e) => {
-                    match e {
-                        Error::LogError(LogError::Eof(_)) => break,
-                        Error::LogError(LogError::Corruption(err)) => {
-                            needs_repair = true;
-                            corrupted_segment_id = err.segment_id;
-                            corrupted_offset_marker = err.offset;
-                            break
-                        }
-                        _ => {
-                            return Err(e)
-                        }
-                        
+                Err(e) => match e {
+                    Error::LogError(LogError::Eof(_)) => break,
+                    Error::LogError(LogError::Corruption(err)) => {
+                        needs_repair = true;
+                        corrupted_segment_id = err.segment_id;
+                        corrupted_offset_marker = err.offset;
+                        break;
                     }
-                }
+                    _ => return Err(e),
+                },
             };
 
             Core::process_entries(&tx, opts, &value_offsets, indexer)?;
         }
 
-        if needs_repair{
-            clog.repair(corrupted_segment_id, corrupted_offset_marker as u64)?
+        if needs_repair {
+            repair(clog, corrupted_segment_id, corrupted_offset_marker as u64)?
         }
 
         Ok(())
