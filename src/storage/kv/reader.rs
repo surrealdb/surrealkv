@@ -9,7 +9,7 @@ use crate::storage::{
         error::{Error, Result},
         meta::Metadata,
     },
-    log::{aof::LogReader, CorruptionError, Error::{self as LogError, Corruption}, MultiSegmentReader},
+    log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
 
 use crate::storage::kv::entry::TxRecord;
@@ -59,6 +59,14 @@ impl Reader {
     fn offset(&self) -> u64 {
         // println!("rdr offset {} {}", self.rdr.current_segment_id(),self.rdr.current_offset());
         self.rdr.current_segment_id() * self.file_size + self.rdr.current_offset() as u64
+    }
+
+    fn current_segment_id(&self) -> u64 {
+        self.rdr.current_segment_id()
+    }
+
+    fn current_offset(&self) -> u64 {
+        self.rdr.current_offset() as u64
     }
 
     /// Reads data into the provided buffer.
@@ -154,7 +162,6 @@ impl Reader {
         self.read(&mut b)?;
         Ok(u16::from_be_bytes(b))
     }
-
 }
 
 /// `TxReader` is a public struct within the crate that is used for reading transaction records.
@@ -174,7 +181,11 @@ impl TxReader {
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
     pub(crate) fn new(r: Reader) -> Self {
-        TxReader { r, err: None, rec: Vec::new() }
+        TxReader {
+            r,
+            err: None,
+            rec: Vec::new(),
+        }
     }
 
     /// Reads the header of a transaction record.
@@ -199,7 +210,14 @@ impl TxReader {
 
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_TX_METADATA_SIZE {
-            return Err(Error::CorruptedTransactionHeader);
+            let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
+
+            return Err(Error::LogError(Corruption(CorruptionError::new(
+                std::io::ErrorKind::Other,
+                Error::CorruptedTransactionHeader.to_string().as_str(),
+                segment_id,
+                offset as usize,
+            ))));
         }
 
         let mut txmd: Option<Metadata> = None;
@@ -280,7 +298,14 @@ impl TxReader {
         let buf = Self::serialize_tx_record(tx)?;
         let actual_crc = calculate_crc32(&buf);
         if entry_crc != actual_crc {
-            return Err(Error::CorruptedTransactionRecord);
+            let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
+
+            return Err(Error::LogError(Corruption(CorruptionError::new(
+                std::io::ErrorKind::Other,
+                Error::CorruptedTransactionRecord.to_string().as_str(),
+                segment_id,
+                offset as usize,
+            ))));
         }
 
         Ok(())
@@ -296,10 +321,8 @@ impl TxReader {
         tx.to_buf(&mut buf)?;
         Ok(buf.freeze())
     }
-}
 
-impl LogReader for TxReader{
-    fn read(&mut self) -> Result<(&[u8], u64)> {
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
@@ -308,11 +331,8 @@ impl LogReader for TxReader{
         let mut tx = TxRecord::new(100);
         let value_offsets = match self.read_into(&mut tx) {
             Ok(value_offsets) => value_offsets,
-            Err(e) => {
-                return Err(e)
-            }
+            Err(e) => return Err(e),
         };
-
 
         self.rec = Self::serialize_tx_record(&tx)?.to_vec();
 

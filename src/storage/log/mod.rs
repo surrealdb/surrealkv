@@ -531,7 +531,7 @@ pub(crate) fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
+pub(crate) fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
     // Read the header using read_field
     read_field(file)
 }
@@ -861,7 +861,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 
     #[allow(dead_code)]
     /// The path where the segment file is located.
-    file_path: PathBuf,
+    pub(crate) file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
@@ -2495,7 +2495,7 @@ mod tests {
         let mut bs = [0u8; 4];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 4);
-        assert_eq!(&[6, 7,8,9].to_vec(), &bs[..]);
+        assert_eq!(&[6, 7, 8, 9].to_vec(), &bs[..]);
         // // Read remaining empty block
         // const REMAINING: usize = BLOCK_SIZE - 11;
         // let mut bs = [0u8; REMAINING];
