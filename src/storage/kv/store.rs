@@ -368,7 +368,7 @@ impl Core {
         }
 
         if needs_repair {
-            repair(clog, corrupted_segment_id, corrupted_offset_marker)?
+            repair(clog, opts.max_tx_entries as usize, corrupted_segment_id, corrupted_offset_marker)?
         }
 
         Ok(())
