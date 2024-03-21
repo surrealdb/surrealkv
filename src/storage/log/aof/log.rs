@@ -133,79 +133,6 @@ impl Aol {
     ///
     /// This function may return an error if the active segment is closed, the provided record
     /// is empty, or any I/O error occurs during the appending process.
-    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
-        if self.closed {
-            return Err(Error::SegmentClosed);
-        }
-
-        self.check_if_fsync_failed()?;
-
-        if rec.is_empty() {
-            return Err(Error::EmptyBuffer);
-        }
-
-        let _lock = self.mutex.write();
-
-        // Get options and initialize variables
-        let opts = &self.opts;
-        let mut n = 0usize;
-        let mut offset = 0;
-
-        // TODO: check if there is a potential infinite loop here if the
-        // record is larger than the max file size. Write a test to check this.
-        while n < rec.len() {
-            // Calculate available space in the active segment
-            let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
-
-            // If space is not available, create a new segment
-            if available <= 0 {
-                // Rotate to a new segment
-
-                // Sync and close the active segment
-                // Note that closing the segment will
-                // not close the underlying file until
-                // it is dropped.
-                self.active_segment.close()?;
-
-                // Increment the active segment id
-                self.active_segment_id += 1;
-
-                // Open a new segment for writing
-                let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
-
-                // Retrieve the previous active segment and replace it with the new one
-                let _ = mem::replace(&mut self.active_segment, new_segment);
-
-                available = opts.max_file_size as i64;
-            }
-
-            // Calculate the amount of data to append
-            let d = std::cmp::min(available as usize, rec.len() - n);
-            let result = self.active_segment.append(&rec[n..n + d]);
-            match result {
-                Ok((off, _)) => off,
-                Err(e) => {
-                    if let Error::IO(_) = e {
-                        self.set_fsync_failed(true);
-                    }
-                    return Err(e);
-                }
-            };
-
-            let (off, _) = result.unwrap();
-
-            // let (off, _) = self.active_segment.append(&rec[n..n + d])?;
-
-            // Calculate offset only for the first chunk of data
-            if n == 0 {
-                offset = off + self.calculate_offset();
-            }
-
-            n += d;
-        }
-
-        Ok((offset, n))
-    }
     // pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
     //     if self.closed {
     //         return Err(Error::SegmentClosed);
@@ -217,59 +144,132 @@ impl Aol {
     //         return Err(Error::EmptyBuffer);
     //     }
 
-    //     // Check if the record is larger than the maximum file size
-    //     if rec.len() > self.opts.max_file_size as usize {
-    //         println!("rec len {} {}", rec.len(), self.opts.max_file_size);
-    //         return Err(Error::RecordTooLarge);
-    //     }
-
     //     let _lock = self.mutex.write();
 
     //     // Get options and initialize variables
     //     let opts = &self.opts;
+    //     let mut n = 0usize;
+    //     let mut offset = 0;
 
-    //     // Calculate available space in the active segment
-    //     let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+    //     // TODO: check if there is a potential infinite loop here if the
+    //     // record is larger than the max file size. Write a test to check this.
+    //     while n < rec.len() {
+    //         // Calculate available space in the active segment
+    //         let mut available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
 
-    //     // If the entire record can't fit into the remaining space of the current segment,
-    //     // close the current segment and create a new one
-    //     if available < rec.len() as i64 {
-    //         // Rotate to a new segment
+    //         // If space is not available, create a new segment
+    //         if available <= 0 {
+    //             // Rotate to a new segment
 
-    //         // Sync and close the active segment
-    //         // Note that closing the segment will
-    //         // not close the underlying file until
-    //         // it is dropped.
-    //         self.active_segment.close()?;
+    //             // Sync and close the active segment
+    //             // Note that closing the segment will
+    //             // not close the underlying file until
+    //             // it is dropped.
+    //             self.active_segment.close()?;
 
-    //         // Increment the active segment id
-    //         self.active_segment_id += 1;
+    //             // Increment the active segment id
+    //             self.active_segment_id += 1;
 
-    //         // Open a new segment for writing
-    //         let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+    //             // Open a new segment for writing
+    //             let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
 
-    //         // Retrieve the previous active segment and replace it with the new one
-    //         let _ = mem::replace(&mut self.active_segment, new_segment);
+    //             // Retrieve the previous active segment and replace it with the new one
+    //             let _ = mem::replace(&mut self.active_segment, new_segment);
+
+    //             available = opts.max_file_size as i64;
+    //         }
+
+    //         // Calculate the amount of data to append
+    //         let d = std::cmp::min(available as usize, rec.len() - n);
+    //         let result = self.active_segment.append(&rec[n..n + d]);
+    //         match result {
+    //             Ok((off, _)) => off,
+    //             Err(e) => {
+    //                 if let Error::IO(_) = e {
+    //                     self.set_fsync_failed(true);
+    //                 }
+    //                 return Err(e);
+    //             }
+    //         };
+
+    //         let (off, _) = result.unwrap();
+
+    //         // let (off, _) = self.active_segment.append(&rec[n..n + d])?;
+
+    //         // Calculate offset only for the first chunk of data
+    //         if n == 0 {
+    //             offset = off + self.calculate_offset();
+    //         }
+
+    //         n += d;
     //     }
 
-    //     // Write the record to the segment
-    //     let result = self.active_segment.append(rec);
-    //     match result {
-    //         Ok((off, _)) => off,
-    //         Err(e) => {
-    //             if let Error::IO(_) = e {
-    //                 self.set_fsync_failed(true);
-    //             }
-    //             return Err(e);
-    //         }
-    //     };
-
-    //     let (off, _) = result.unwrap();
-    //     // Calculate offset only for the first chunk of data
-    //     let offset = off + self.calculate_offset();
-
-    //     Ok((offset, rec.len()))
+    //     Ok((offset, n))
     // }
+
+    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
+        if self.closed {
+            return Err(Error::SegmentClosed);
+        }
+
+        self.check_if_fsync_failed()?;
+
+        if rec.is_empty() {
+            return Err(Error::EmptyBuffer);
+        }
+
+        // Check if the record is larger than the maximum file size
+        if rec.len() > self.opts.max_file_size as usize {
+            return Err(Error::RecordTooLarge);
+        }
+
+        let _lock = self.mutex.write();
+
+        // Get options and initialize variables
+        let opts = &self.opts;
+
+        // Calculate available space in the active segment
+        let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+
+        // If the entire record can't fit into the remaining space of the current segment,
+        // close the current segment and create a new one
+        if available < rec.len() as i64 {
+            // Rotate to a new segment
+
+            // Sync and close the active segment
+            // Note that closing the segment will
+            // not close the underlying file until
+            // it is dropped.
+            self.active_segment.close()?;
+
+            // Increment the active segment id
+            self.active_segment_id += 1;
+
+            // Open a new segment for writing
+            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+
+            // Retrieve the previous active segment and replace it with the new one
+            let _ = mem::replace(&mut self.active_segment, new_segment);
+        }
+
+        // Write the record to the segment
+        let result = self.active_segment.append(rec);
+        match result {
+            Ok((off, _)) => off,
+            Err(e) => {
+                if let Error::IO(_) = e {
+                    self.set_fsync_failed(true);
+                }
+                return Err(e);
+            }
+        };
+
+        let (off, _) = result.unwrap();
+        // Calculate offset only for the first chunk of data
+        let offset = off + self.calculate_offset();
+
+        Ok((offset, rec.len()))
+    }
 
     /// Flushes and syncs the active segment.
     pub fn sync(&mut self) -> Result<()> {

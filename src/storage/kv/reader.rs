@@ -57,7 +57,6 @@ impl Reader {
 
     /// Returns the current offset of the `Reader`.
     fn offset(&self) -> u64 {
-        // println!("rdr offset {} {}", self.rdr.current_segment_id(),self.rdr.current_offset());
         self.rdr.current_segment_id() * self.file_size + self.rdr.current_offset() as u64
     }
 
@@ -105,7 +104,7 @@ impl Reader {
                                 std::io::ErrorKind::Other,
                                 e.to_string().as_str(),
                                 segment_id,
-                                offset,
+                                offset as u64,
                             )))
                         }
                     };
@@ -216,7 +215,7 @@ impl TxReader {
                 std::io::ErrorKind::Other,
                 Error::CorruptedTransactionHeader.to_string().as_str(),
                 segment_id,
-                offset as usize,
+                offset,
             ))));
         }
 
@@ -250,7 +249,6 @@ impl TxReader {
 
         let v_len = self.r.read_uint32()? as usize;
         let offset = self.r.offset();
-        // println!("read offset {} {}", offset, self.r.offset());
         let v = self.r.read_bytes(v_len)?;
         let crc32 = self.r.read_uint32()?;
 
@@ -304,7 +302,7 @@ impl TxReader {
                 std::io::ErrorKind::Other,
                 Error::CorruptedTransactionRecord.to_string().as_str(),
                 segment_id,
-                offset as usize,
+                offset,
             ))));
         }
 
@@ -329,14 +327,14 @@ impl TxReader {
 
         self.rec.clear();
         let mut tx = TxRecord::new(100);
-        let value_offsets = match self.read_into(&mut tx) {
+        match self.read_into(&mut tx) {
             Ok(value_offsets) => value_offsets,
             Err(e) => return Err(e),
         };
 
         self.rec = Self::serialize_tx_record(&tx)?.to_vec();
 
-        Ok((&self.rec, self.r.offset() as u64))
+        Ok((&self.rec, self.r.offset()))
     }
 }
 

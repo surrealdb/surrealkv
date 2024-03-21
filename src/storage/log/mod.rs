@@ -1258,11 +1258,11 @@ pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,
     pub(crate) segment_id: u64,
-    pub(crate) offset: usize,
+    pub(crate) offset: u64,
 }
 
 impl CorruptionError {
-    pub(crate) fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: usize) -> Self {
+    pub(crate) fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: u64) -> Self {
         CorruptionError {
             kind,
             message: message.to_string(),
@@ -1295,7 +1295,6 @@ pub struct MultiSegmentReader {
     segments: Vec<SegmentRef>, // List of segments to read from.
     cur: usize,                // Index of current segment in segments.
     off: usize,                // Offset in current segment.
-    is_wal: bool,
 }
 
 impl MultiSegmentReader {
@@ -1321,12 +1320,7 @@ impl MultiSegmentReader {
             segments,
             cur,
             off,
-            is_wal: false,
         })
-    }
-
-    fn set_wal_mode(&mut self, is_wal: bool) {
-        self.is_wal = is_wal;
     }
 
     fn is_eof(&mut self) -> io::Result<bool> {
@@ -1338,16 +1332,14 @@ impl MultiSegmentReader {
         let bytes_read = self.buf.read(buf)?;
         self.off += bytes_read;
 
-        if self.is_wal {
-            // If we read less than the buffer size, we've reached the end of the current segment.
-            // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
-            // This is to avoid detecting the wrong segment as corrupt.
-            if self.off % BLOCK_SIZE != 0 {
-                // Fill the rest of the buffer with zeros.
-                let i = self.fill_with_zeros(buf, bytes_read);
-                self.off += i;
-                return Ok(bytes_read + i);
-            }
+        // If we read less than the buffer size, we've reached the end of the current segment.
+        // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
+        // This is to avoid detecting the wrong segment as corrupt.
+        if self.off % BLOCK_SIZE != 0 {
+            // Fill the rest of the buffer with zeros.
+            let i = self.fill_with_zeros(buf, bytes_read);
+            self.off += i;
+            return Ok(bytes_read + i);
         }
 
         Ok(bytes_read)
@@ -1398,19 +1390,12 @@ impl Read for MultiSegmentReader {
         // Note: This could create a problem when reading a partial block
         // spread over multiple segments. Currently wal do not
         // write partial blocks spanning multiple segments.
-        let mut n = 0;
-        while n < buf.len() {
-            let mut rn = 0;
-            if !self.is_eof()? {
-                rn += self.read_to_buffer(&mut buf[n..])?;
-            } else {
-                self.load_next_segment()?;
-                rn += self.read_to_buffer(&mut buf[n..])?;
-            }
-            n += rn;
+        if !self.is_eof()? {
+            self.read_to_buffer(buf)
+        } else {
+            self.load_next_segment()?;
+            self.read_to_buffer(buf)
         }
-
-        Ok(n)
     }
 }
 
@@ -2468,6 +2453,8 @@ mod tests {
         assert_eq!(4, r.unwrap().1);
 
         let r = segment2.append(&[8, 9]);
+        assert!(r.is_ok());
+        assert_eq!(2, r.unwrap().1);
 
         segment1.close().expect("should close segment");
         segment2.close().expect("should close segment");
@@ -2482,33 +2469,14 @@ mod tests {
         let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
 
         // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 6];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&[0, 1, 2, 3, 4, 5].to_vec(), &bs[..]);
-
         let mut bs = [0u8; 4];
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 4);
-        assert_eq!(&[6, 7, 8, 9].to_vec(), &bs[..]);
-        // // Read remaining empty block
-        // const REMAINING: usize = BLOCK_SIZE - 11;
-        // let mut bs = [0u8; REMAINING];
-        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        // assert_eq!(bytes_read, REMAINING);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
 
-        // // Read second record from the MultiSegmentReader
-        // let mut bs = [0u8; 11];
-        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        // assert_eq!(bytes_read, 11);
-        // assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[..]);
-
-        // // Read remaining empty block
-        // let mut bs = [0u8; REMAINING];
-        // let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        // assert_eq!(bytes_read, REMAINING);
-
-        // let mut bs = [0u8; 11];
-        // buf_reader.read(&mut bs).expect_err("should not read");
+        let mut bs = [0u8; 6];
+        let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        assert_eq!(bytes_read, 6);
+        assert_eq!(&[4, 5, 6, 7, 8, 9].to_vec(), &bs[..]);
     }
 }

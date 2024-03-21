@@ -368,7 +368,7 @@ impl Core {
         }
 
         if needs_repair {
-            repair(clog, corrupted_segment_id, corrupted_offset_marker as u64)?
+            repair(clog, corrupted_segment_id, corrupted_offset_marker)?
         }
 
         Ok(())
@@ -427,8 +427,8 @@ impl Core {
         }
     }
 
-    fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
-        let mut md: Option<Metadata> = None; // Initialize with None
+    fn load_manifest(opts: &Options, _mopts: &LogOptions) -> Result<Option<Metadata>> {
+        let _md: Option<Metadata> = None; // Initialize with None
 
         let manifest_subdir = opts.dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
