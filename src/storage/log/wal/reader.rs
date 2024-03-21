@@ -104,7 +104,7 @@ impl Reader {
                     io::ErrorKind::Other,
                     e.to_string().as_str(),
                     segment_id,
-                    offset,
+                    offset as u64,
                 ));
                 self.err = Some(err.clone());
                 return Err(err);
