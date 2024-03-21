@@ -61,12 +61,13 @@ impl Mode {
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
 pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub enum Durability {
     /// Commits with this durability level will be queued for persitance to disk, and will be
     /// written to disk in batches of BLOCK_SIZE. This helps reduce the number of disk writes,
     /// and increases throughput as the data is written to disk in batches. But it does not
     /// guarantee that the data will be persisted to disk as soon as [Transaction::commit] returns.
+    #[default]
     Eventual,
     /// Commits with this durability level are guaranteed to be persistent as soon as
     /// [Transaction::commit] returns.
@@ -74,12 +75,6 @@ pub enum Durability {
     /// Data is fsynced to disk before returning from [Transaction::commit]. This is the slowest
     /// durability level, but it is the safest.
     Immediate,
-}
-
-impl Default for Durability {
-    fn default() -> Self {
-        Durability::Eventual
-    }
 }
 
 /// `Transaction` is a struct representing a transaction in a database.

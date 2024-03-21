@@ -183,11 +183,8 @@ impl Aol {
         match result {
             Ok((off, _)) => off,
             Err(e) => {
-                match e {
-                    Error::IO(_) => {
-                        self.set_fsync_failed(true);
-                    }
-                    _ => {}
+                if let Error::IO(_) = e {
+                    self.set_fsync_failed(true);
                 }
                 return Err(e);
             }
@@ -521,8 +518,10 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let mut opts = Options::default();
-        opts.max_file_size = 1024;
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         let large_record = vec![1; 1025];
@@ -542,8 +541,10 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let mut opts = Options::default();
-        opts.max_file_size = 1024;
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         let small_record = vec![1; 1024];
