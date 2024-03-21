@@ -1,6 +1,7 @@
 use std::io::Read;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, BufMut};
+
 use hashbrown::HashMap;
 
 use crate::storage::{
@@ -320,19 +321,30 @@ impl TxReader {
         Ok(buf.freeze())
     }
 
-    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
+
+    pub(crate) fn serialize_tx_with_crc(tx: &TxRecord) -> Result<Bytes> {
+        let mut buf = BytesMut::new();
+        tx.to_buf(&mut buf)?;
+        let crc = calculate_crc32(&buf);
+        buf.put_u32(crc);
+        Ok(buf.freeze())
+    }
+
+    pub(crate) fn read(&mut self, max_entries: usize) -> Result<(&[u8], u64)> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
 
         self.rec.clear();
-        let mut tx = TxRecord::new(100);
+
+        let mut tx = TxRecord::new(max_entries);
         match self.read_into(&mut tx) {
             Ok(value_offsets) => value_offsets,
             Err(e) => return Err(e),
         };
 
-        self.rec = Self::serialize_tx_record(&tx)?.to_vec();
+        let rec = Self::serialize_tx_with_crc(&tx)?;
+        self.rec.extend(&rec);
 
         Ok((&self.rec, self.r.offset()))
     }
