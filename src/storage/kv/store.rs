@@ -264,6 +264,24 @@ pub struct Task {
 }
 
 impl Core {
+    fn initialize_indexer() -> Indexer {
+        Indexer::new()
+    }
+
+    fn initialize_manifest(opts: &Options) -> Result<Aol> {
+        let manifest_subdir = opts.dir.join("manifest");
+        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
+        Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
+    }
+
+    fn initialize_clog(opts: &Options) -> Result<Aol> {
+        let clog_subdir = opts.dir.join("clog");
+        let copts = LogOptions::default()
+            .with_max_file_size(opts.max_segment_size)
+            .with_file_extension("clog".to_string());
+        Aol::open(&clog_subdir, &copts).map_err(Error::from)
+    }
+
     /// Creates a new Core with the given options.
     /// It initializes a new Indexer, opens or creates the manifest file,
     /// loads or creates metadata from the manifest file, updates the options with the loaded metadata,
@@ -272,29 +290,23 @@ impl Core {
     /// the Core instance.
     pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
-        let mut indexer = Indexer::new();
+        let mut indexer = Self::initialize_indexer();
 
         // Determine options for the manifest file and open or create it.
-        let manifest_subdir = opts.dir.join("manifest");
-        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        let mut manifest = Aol::open(&manifest_subdir, &mopts)?;
+        let mut manifest = Self::initialize_manifest(&opts)?;
 
         // Load or create metadata from the manifest file.
-        let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest)?;
+        let metadata = Core::load_or_create_metadata(&opts, &mut manifest)?;
 
         // Update options with the loaded metadata.
         let opts = Options::from_metadata(metadata, opts.dir.clone())?;
 
         // Determine options for the commit log file and open or create it.
-        let clog_subdir = opts.dir.join("clog");
-        let copts = LogOptions::default()
-            .with_max_file_size(opts.max_segment_size)
-            .with_file_extension("clog".to_string());
-        let mut clog = Aol::open(&clog_subdir, &copts)?;
+        let mut clog = Self::initialize_clog(&opts)?;
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &copts, &mut clog, &mut indexer)?;
+            Core::load_index(&opts, &mut clog, &mut indexer)?;
         }
 
         // Create and initialize an Oracle.
@@ -325,50 +337,38 @@ impl Core {
         Ok(self.oracle.read_ts())
     }
 
-    fn load_index(
-        opts: &Options,
-        copts: &LogOptions,
-        clog: &mut Aol,
-        indexer: &mut Indexer,
-    ) -> Result<()> {
+    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<()> {
         let clog_subdir = opts.dir.join("clog");
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
-        let reader = Reader::new_from(reader, copts.max_file_size, BLOCK_SIZE);
+        let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
         let mut tx_reader = TxReader::new(reader);
         let mut tx = TxRecord::new(opts.max_tx_entries as usize);
 
-        let mut needs_repair = false;
-        let mut corrupted_segment_id = 0;
-        let mut corrupted_offset_marker = 0;
+        let mut repair_info = None;
 
         loop {
-            // Reset the transaction record before reading into it.
-            // Keeping the same transaction record instance avoids
-            // unnecessary allocations.
             tx.reset();
 
-            // Read the next transaction record from the log.
-            let value_offsets = match tx_reader.read_into(&mut tx) {
-                Ok(value_offsets) => value_offsets,
-                Err(e) => match e {
-                    Error::LogError(LogError::Eof(_)) => break,
-                    Error::LogError(LogError::Corruption(err)) => {
-                        needs_repair = true;
-                        corrupted_segment_id = err.segment_id;
-                        corrupted_offset_marker = err.offset;
-                        break;
-                    }
-                    _ => return Err(e),
-                },
+            match tx_reader.read_into(&mut tx) {
+                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+                Err(Error::LogError(LogError::Eof(_))) => break,
+                Err(Error::LogError(LogError::Corruption(err))) => {
+                    repair_info = Some((err.segment_id, err.offset));
+                    break;
+                }
+                Err(err) => return Err(err),
             };
-
-            Core::process_entries(&tx, opts, &value_offsets, indexer)?;
         }
 
-        if needs_repair {
-            repair(clog, opts.max_tx_entries as usize, corrupted_segment_id, corrupted_offset_marker)?
+        if let Some((corrupted_segment_id, corrupted_offset_marker)) = repair_info {
+            repair(
+                clog,
+                opts.max_tx_entries as usize,
+                corrupted_segment_id,
+                corrupted_offset_marker,
+            )?;
         }
 
         Ok(())
@@ -380,56 +380,53 @@ impl Core {
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs = Vec::new();
+        let mut kv_pairs: Vec<KV<vart::VariableSizeKey, Bytes>> = tx
+            .entries
+            .iter()
+            .map(|entry| {
+                let index_value = ValueRef::encode(
+                    &entry.key,
+                    &entry.value,
+                    entry.metadata.as_ref(),
+                    value_offsets,
+                    opts.max_value_threshold,
+                );
 
-        for entry in &tx.entries {
-            let index_value = ValueRef::encode(
-                &entry.key,
-                &entry.value,
-                entry.metadata.as_ref(),
-                value_offsets,
-                opts.max_value_threshold,
-            );
-
-            kv_pairs.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: tx.header.id,
-                ts: tx.header.ts,
-            });
-        }
+                KV {
+                    key: entry.key[..].into(),
+                    value: index_value,
+                    version: tx.header.id,
+                    ts: tx.header.ts,
+                }
+            })
+            .collect();
 
         indexer.bulk_insert(&mut kv_pairs)
     }
 
-    fn load_or_create_metadata(
-        opts: &Options,
-        mopts: &LogOptions,
-        manifest: &mut Aol,
-    ) -> Result<Metadata> {
+    fn load_or_create_metadata(opts: &Options, manifest: &mut Aol) -> Result<Metadata> {
         let current_metadata = opts.to_metadata();
-        let existing_metadata = if !manifest.size()? > 0 {
-            Core::load_manifest(opts, mopts)?
-        } else {
-            None
+
+        let existing_metadata = match manifest.size()? {
+            0 => Core::load_manifest(opts)?,
+            _ => None,
         };
 
-        match existing_metadata {
-            Some(existing) if existing == current_metadata => Ok(current_metadata),
-            _ => {
-                let md_bytes = current_metadata.to_bytes()?;
-                let mut buf = Vec::new();
-                write_field(&md_bytes, &mut buf)?;
-                manifest.append(&buf)?;
-
-                Ok(current_metadata)
+        if let Some(existing) = &existing_metadata {
+            if *existing == current_metadata {
+                return Ok(current_metadata);
             }
         }
+
+        let md_bytes = current_metadata.to_bytes()?;
+        let mut buf = Vec::new();
+        write_field(&md_bytes, &mut buf)?;
+        manifest.append(&buf)?;
+
+        Ok(current_metadata)
     }
 
-    fn load_manifest(opts: &Options, _mopts: &LogOptions) -> Result<Option<Metadata>> {
-        let _md: Option<Metadata> = None; // Initialize with None
-
+    fn load_manifest(opts: &Options) -> Result<Option<Metadata>> {
         let manifest_subdir = opts.dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");

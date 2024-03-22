@@ -51,16 +51,13 @@ pub fn repair(
     }
 
     // If information about the corrupted segment is not available, return an error
-    if corrupted_segment_info.is_none() {
-        return Err(Error::LogError(LogError::IO(IOError::new(
-            std::io::ErrorKind::Other,
-            "Corrupted segment not found",
-        ))));
-    }
-
-    // Retrieve the information about the corrupted segment
-    let (corrupted_segment_path, corrupted_segment_file_header_offset) =
-        corrupted_segment_info.unwrap();
+    let (corrupted_segment_path, corrupted_segment_file_header_offset) = corrupted_segment_info
+        .ok_or_else(|| {
+            Error::LogError(LogError::IO(IOError::new(
+                std::io::ErrorKind::Other,
+                "Corrupted segment not found",
+            )))
+        })?;
 
     // Prepare the repaired segment path
     let repaired_segment_path = corrupted_segment_path.with_extension("repair");
@@ -154,7 +151,12 @@ mod tests {
         }
     }
 
-    async fn corrupt_and_repair(store: &Store, opts: Options, segment_num: usize, corruption_offset: u64) {
+    async fn corrupt_and_repair(
+        store: &Store,
+        opts: Options,
+        segment_num: usize,
+        corruption_offset: u64,
+    ) {
         let mut clog = store.inner.as_ref().unwrap().core.clog.write();
 
         let clog_subdir = opts.dir.join("clog");
@@ -162,7 +164,7 @@ mod tests {
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
 
         // Open the nth segment file for corrupting
-        let file_path = &sr[segment_num-1].file_path;
+        let file_path = &sr[segment_num - 1].file_path;
         corrupt_segment(file_path, corruption_offset);
 
         let (corrupted_segment_id, corrupted_offset_marker) =
@@ -180,47 +182,30 @@ mod tests {
         drop(clog);
     }
 
-    #[allow(unused_assignments)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let mut corrupted_segment_id = 0;
-        let mut corrupted_offset_marker = 0;
-        // Read and repair the corrupted segment
-        {
-            let reader = Reader::new_from(
-                MultiSegmentReader::new(sr).expect("should create"),
-                opts.max_segment_size,
-                1000,
-            );
-            let mut tx_reader = TxReader::new(reader);
-            let mut tx = TxRecord::new(opts.max_tx_entries as usize);
+        let reader = Reader::new_from(
+            MultiSegmentReader::new(sr).expect("should create"),
+            opts.max_segment_size,
+            1000,
+        );
+        let mut tx_reader = TxReader::new(reader);
+        let mut tx = TxRecord::new(opts.max_tx_entries as usize);
 
-            loop {
-                // Reset the transaction record before reading into it.
-                // Keeping the same transaction record instance avoids
-                // unnecessary allocations.
-                tx.reset();
+        loop {
+            tx.reset();
 
-                // Read the next transaction record from the log.
-                match tx_reader.read_into(&mut tx) {
-                    Ok(value_offsets) => value_offsets,
-                    Err(e) => match e {
-                        Error::LogError(LogError::Corruption(err)) => {
-                            corrupted_segment_id = err.segment_id;
-                            corrupted_offset_marker = err.offset;
-                            break;
-                        }
-                        err => panic!(
-                            "Expected a CorruptionError, but got a different error {}",
-                            err
-                        ),
-                    },
-                };
+            match tx_reader.read_into(&mut tx) {
+                Ok(_) => continue,
+                Err(Error::LogError(LogError::Corruption(err))) => {
+                    return (err.segment_id, err.offset);
+                }
+                Err(err) => panic!(
+                    "Expected a CorruptionError, but got a different error {}",
+                    err
+                ),
             }
         }
-
-        (corrupted_segment_id, corrupted_offset_marker)
     }
-
     // File header is 170 bytes
     // Each transaction header is 32 in len
     fn corrupt_segment(segment_file_path: &Path, offset_to_edit: u64) {
@@ -321,7 +306,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn repair_with_corruption_in_first_segment() {
         let temp_dir = create_temp_directory();
@@ -340,7 +324,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1,corruption_offset).await;
+        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k6")];
@@ -382,7 +366,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 4,corruption_offset).await;
+        corrupt_and_repair(&store, opts.clone(), 4, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k6")];
@@ -413,7 +397,14 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         opts.max_segment_size = 550;
 
-        let keys = vec![Bytes::from("k1"), Bytes::from("k2"), Bytes::from("k3"), Bytes::from("k4"), Bytes::from("k5"), Bytes::from("k6")];
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
@@ -441,5 +432,4 @@ mod tests {
             assert_eq!(val, default_value);
         }
     }
-
 }
