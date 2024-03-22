@@ -29,8 +29,6 @@ pub fn repair(
     // Read the list of segments from the directory
     let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
 
-    let sid = aol.active_segment_id;
-    println!("sid: {} {} {}", sid, segs.len(), corrupted_segment_id);
     // Prepare to store information about the corrupted segment
     let mut corrupted_segment_info = None;
 
@@ -420,6 +418,49 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
 
         let expected_keys = vec!["k1", "k2", "k3", "k4", "k7"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_multiple_segment_with_multiple_records() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 110;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 55 + 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset).await;
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        let expected_keys = vec!["k1", "k2", "k3", "k4", "k5", "k7"];
         for key in expected_keys {
             let key = Bytes::from(key);
 
