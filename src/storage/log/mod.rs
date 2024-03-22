@@ -1209,7 +1209,10 @@ impl fmt::Display for Error {
             Error::IO(err) => write!(f, "IO error: {}", err),
             Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
             Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
-            Error::RecordTooLarge => write!(f, "Record too large"),
+            Error::RecordTooLarge => write!(
+                f,
+                "Record is too large to fit in a segment. Increase max segment size"
+            ),
         }
     }
 }
