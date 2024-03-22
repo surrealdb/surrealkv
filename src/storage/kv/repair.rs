@@ -122,8 +122,6 @@ mod tests {
     use bytes::Bytes;
     use tempdir::TempDir;
 
-    const MAX_TX_ENTRIES: usize = 10;
-
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
     }
@@ -145,14 +143,7 @@ mod tests {
         }
     }
 
-    async fn corrupt_and_repair(
-        store: &Store,
-        opts: Options,
-        segment_num: usize,
-        corruption_offset: u64,
-    ) {
-        let mut clog = store.inner.as_ref().unwrap().core.clog.write();
-
+    async fn corrupt_at_offset(opts: Options, segment_num: usize, corruption_offset: u64) {
         let clog_subdir = opts.dir.join("clog");
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
@@ -161,22 +152,11 @@ mod tests {
         let file_path = &sr[segment_num - 1].file_path;
         corrupt_segment(file_path, corruption_offset);
 
-        // TODO: Let store repoen do the repair
-        let (corrupted_segment_id, corrupted_offset_marker) =
-            find_corrupted_segment(sr, opts.clone());
-
-        repair(
-            &mut clog,
-            MAX_TX_ENTRIES,
-            corrupted_segment_id,
-            corrupted_offset_marker,
-        )
-        .unwrap();
-
-        // drop lock over commit log
-        drop(clog);
+        // let (corrupted_segment_id, corrupted_offset_marker) =
+        //     find_corrupted_segment(sr, opts.clone());
     }
 
+    #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
         let reader = Reader::new_from(
             MultiSegmentReader::new(sr).expect("should create"),
@@ -201,6 +181,7 @@ mod tests {
             }
         }
     }
+
     // File header is 170 bytes
     // Each transaction header is 32 in len
     fn corrupt_segment(segment_file_path: &Path, offset_to_edit: u64) {
@@ -235,7 +216,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 2, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k3")];
@@ -277,7 +258,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 3, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k6")];
@@ -319,7 +300,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 1, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k6")];
@@ -361,7 +342,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 4, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 4, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k6")];
@@ -404,7 +385,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 220 + 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 1, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k7")];
@@ -447,7 +428,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 55 + 25; // 32bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset).await;
+        corrupt_at_offset(opts.clone(), 3, corruption_offset).await;
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k7")];

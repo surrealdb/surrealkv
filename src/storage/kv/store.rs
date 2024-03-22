@@ -25,15 +25,8 @@ use crate::storage::{
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::Aol,
-        // aof::reader::{Reader, TxReader},
-        write_field,
-        Error as LogError,
-        Metadata,
-        MultiSegmentReader,
-        Options as LogOptions,
-        SegmentRef,
-        BLOCK_SIZE,
+        aof::log::Aol, write_field, Error as LogError, Metadata, MultiSegmentReader,
+        Options as LogOptions, SegmentRef, BLOCK_SIZE,
     },
 };
 
@@ -346,8 +339,6 @@ impl Core {
         let mut tx_reader = TxReader::new(reader);
         let mut tx = TxRecord::new(opts.max_tx_entries as usize);
 
-        let mut repair_info = None;
-
         loop {
             tx.reset();
 
@@ -355,20 +346,15 @@ impl Core {
                 Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
                 Err(Error::LogError(LogError::Eof(_))) => break,
                 Err(Error::LogError(LogError::Corruption(err))) => {
-                    repair_info = Some((err.segment_id, err.offset));
-                    break;
+                    repair(
+                        clog,
+                        opts.max_tx_entries as usize,
+                        err.segment_id,
+                        err.offset,
+                    )?;
                 }
                 Err(err) => return Err(err),
             };
-        }
-
-        if let Some((corrupted_segment_id, corrupted_offset_marker)) = repair_info {
-            repair(
-                clog,
-                opts.max_tx_entries as usize,
-                corrupted_segment_id,
-                corrupted_offset_marker,
-            )?;
         }
 
         Ok(())
