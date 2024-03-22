@@ -345,7 +345,7 @@ impl TxReader {
         let rec = Self::serialize_tx_with_crc(&tx)?;
         self.rec.extend(&rec);
 
-        Ok((&self.rec, self.r.offset()))
+        Ok((&self.rec, self.r.current_offset()))
     }
 }
 
