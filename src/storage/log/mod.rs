@@ -781,6 +781,8 @@ fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 
     Ok(refs)
 }
+
+#[derive(Debug)]
 pub(crate) struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
