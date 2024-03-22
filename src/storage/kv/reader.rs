@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use hashbrown::HashMap;
 
@@ -320,7 +320,6 @@ impl TxReader {
         tx.to_buf(&mut buf)?;
         Ok(buf.freeze())
     }
-
 
     pub(crate) fn serialize_tx_with_crc(tx: &TxRecord) -> Result<Bytes> {
         let mut buf = BytesMut::new();
