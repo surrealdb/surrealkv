@@ -149,7 +149,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set_durability(Durability::Immediate);
-            txn.set(&key, &val).unwrap();
+            txn.set(&key, val).unwrap();
             txn.commit().await.unwrap();
         }
     }
@@ -172,7 +172,7 @@ mod tests {
             &mut clog,
             MAX_TX_ENTRIES,
             corrupted_segment_id,
-            corrupted_offset_marker as u64,
+            corrupted_offset_marker,
         )
         .unwrap();
 
@@ -180,6 +180,7 @@ mod tests {
         drop(clog);
     }
 
+    #[allow(unused_assignments)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
         let mut corrupted_segment_id = 0;
         let mut corrupted_offset_marker = 0;
