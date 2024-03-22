@@ -29,6 +29,8 @@ pub fn repair(
     // Read the list of segments from the directory
     let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
 
+    let sid = aol.active_segment_id;
+    println!("sid: {} {} {}", sid, segs.len(), corrupted_segment_id);
     // Prepare to store information about the corrupted segment
     let mut corrupted_segment_info = None;
 
@@ -42,11 +44,6 @@ pub fn repair(
         // Store information about the corrupted segment
         if s.id == corrupted_segment_id {
             corrupted_segment_info = Some((s.file_path.clone(), s.file_header_offset));
-        }
-
-        // Remove segments newer than the corrupted segment
-        if s.id > corrupted_segment_id {
-            std::fs::remove_file(&s.file_path)?;
         }
     }
 
@@ -66,9 +63,7 @@ pub fn repair(
     std::fs::rename(&corrupted_segment_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
-    let new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
-    aol.active_segment = new_segment;
-    aol.active_segment_id = corrupted_segment_id;
+    let mut new_segment: Segment<0> = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
 
     // Create a segment reader for the repaired segment
     let segments: Vec<SegmentRef> = vec![SegmentRef {
@@ -89,19 +84,20 @@ pub fn repair(
             break;
         }
 
-        aol.append(data)?;
+        new_segment.append(data)?;
         count += 1;
     }
 
     // Flush and close the active segment
-    aol.active_segment.close()?;
+    new_segment.close()?;
 
     // Remove the repaired segment file
     std::fs::remove_file(&repaired_segment_path)?;
 
     // Open the next segment and make it active
-    if count > 0 {
-        aol.active_segment_id += 1;
+    if count == 0 {
+        println!("deleting empty file {:?}", corrupted_segment_path);
+        std::fs::remove_file(&corrupted_segment_path)?;
     }
     let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts)?;
     aol.active_segment = new_segment;
@@ -167,6 +163,7 @@ mod tests {
         let file_path = &sr[segment_num - 1].file_path;
         corrupt_segment(file_path, corruption_offset);
 
+        // TODO: Let store repoen do the repair
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
