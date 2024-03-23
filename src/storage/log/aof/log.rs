@@ -290,7 +290,6 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.check_if_fsync_failed()?;
         let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
@@ -559,7 +558,7 @@ mod tests {
         let r = a.append(&small_record);
         assert!(r.is_err());
 
-        // Reads should fai after fsync failure
+        // Reads should fail after fsync failure
         let mut read_data = vec![0; 1024];
         let r = a.read_at(&mut read_data, 0);
         assert!(r.is_err());
