@@ -190,6 +190,7 @@ impl Aol {
                 return Err(e);
             }
         };
+
         let (off, _) = result.unwrap();
         // Calculate offset only for the first chunk of data
         let offset = off + self.calculate_offset();
