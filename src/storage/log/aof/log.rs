@@ -297,7 +297,6 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        self.check_if_fsync_failed()?;
         let _lock = self.mutex.write();
         self.active_segment.close()?;
         Ok(())
