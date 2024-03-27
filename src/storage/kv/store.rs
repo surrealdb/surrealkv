@@ -1066,7 +1066,7 @@ mod tests {
         pairs
     }
 
-    async fn test_durability(durability: Durability) {
+    async fn test_durability(durability: Durability, wait_enabled: bool) {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1095,6 +1095,11 @@ mod tests {
             drop(store);
         }
 
+        // Wait for a while to let close be called on drop as it is executed asynchronously
+        if wait_enabled {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
         let store = Store::new(opts.clone()).expect("should create store");
         let txn = store.begin().unwrap();
 
@@ -1112,11 +1117,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn eventual_durability() {
-        test_durability(Durability::Eventual).await;
+        test_durability(Durability::Eventual, true).await;
     }
 
     #[tokio::test]
     async fn immediate_durability() {
-        test_durability(Durability::Immediate).await;
+        test_durability(Durability::Immediate, false).await;
     }
 }

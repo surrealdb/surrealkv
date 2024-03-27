@@ -11,35 +11,9 @@ use crate::storage::{
     log::{aof::log::Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
 };
 
-#[allow(unused)]
-pub(crate) fn repair_corrupted_segment(
-    aol: &mut Aol,
-    max_entries_per_txn: usize,
-    corrupted_segment_id: u64,
-    corrupted_offset_marker: u64,
-) -> Result<()> {
-    // Read the list of segments from the directory
-    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
-
-    // Loop through the segments
-    for s in &segs {
-        // If the segment ID matches the corrupted segment ID, repair the segment
-        if s.id == corrupted_segment_id {
-            repair_segment(
-                aol,
-                max_entries_per_txn,
-                corrupted_segment_id,
-                corrupted_offset_marker,
-                s.file_path.clone(),
-                s.file_header_offset,
-            )?;
-            break;
-        }
-    }
-
-    Ok(())
-}
-
+/// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
+/// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
+/// and also due to the asynchronous nature of calling close on the store.
 pub(crate) fn repair_last_corrupted_segment(
     aol: &mut Aol,
     max_entries_per_txn: usize,
@@ -62,14 +36,63 @@ pub(crate) fn repair_last_corrupted_segment(
         ));
     }
 
+    let last_segment_id = last_segment.id;
+    let last_segment_path = last_segment.file_path.clone();
+    let last_segment_header_offset = last_segment.file_header_offset;
+
+    drop(segs);
+
     // Repair the last segment
     repair_segment(
         aol,
         max_entries_per_txn,
-        last_segment.id,
+        last_segment_id,
         corrupted_offset_marker,
-        last_segment.file_path.clone(),
-        last_segment.file_header_offset,
+        last_segment_path,
+        last_segment_header_offset,
+    )
+}
+
+/// This function is used to repair a corrupted any given segment in the append-only log (AOL).
+/// Currently it is only being used for testing purposes.
+#[allow(unused)]
+pub(crate) fn repair_corrupted_segment(
+    aol: &mut Aol,
+    max_entries_per_txn: usize,
+    corrupted_segment_id: u64,
+    corrupted_offset_marker: u64,
+) -> Result<()> {
+    // Read the list of segments from the directory
+    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+
+    let mut file_path = None;
+    let mut file_header_offset = 0;
+    // Loop through the segments
+    for s in &segs {
+        // If the segment ID matches the corrupted segment ID, repair the segment
+        if s.id == corrupted_segment_id {
+            file_path = Some(s.file_path.clone());
+            file_header_offset = s.file_header_offset;
+            break;
+        }
+    }
+
+    // Explicitly drop the segments here to ensure no file descriptors are kept
+    drop(segs);
+
+    // Check if file_path is found, if not return an error
+    let file_path = match file_path {
+        Some(path) => path,
+        None => return Ok(()),
+    };
+
+    repair_segment(
+        aol,
+        max_entries_per_txn,
+        corrupted_segment_id,
+        corrupted_offset_marker,
+        file_path,
+        file_header_offset,
     )?;
 
     Ok(())
@@ -230,6 +253,26 @@ mod tests {
 
     use bytes::Bytes;
     use tempdir::TempDir;
+
+    use std::process::Command;
+    use std::str;
+
+    #[allow(unused)]
+    pub fn count_file_descriptors(file_path: &str) -> std::io::Result<usize> {
+        let output = Command::new("lsof").arg(file_path).output()?;
+
+        if output.status.success() {
+            let output_str = str::from_utf8(&output.stdout).unwrap();
+            let count = output_str.lines().count();
+            // Subtract 1 for the header line
+            Ok(if count > 0 { count - 1 } else { 0 })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to execute lsof",
+            ))
+        }
+    }
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
