@@ -29,7 +29,8 @@ bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.4.0"
-vart = "0.1.1"
+vart = "0.1.2"
+
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

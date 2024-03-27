@@ -29,6 +29,8 @@ use crate::storage::{
     },
 };
 
+use super::transaction::Durability;
+
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
@@ -249,6 +251,8 @@ pub struct Task {
     tx_id: u64,
     /// Commit timestamp
     commit_ts: u64,
+    /// Durability
+    durability: Durability,
 }
 
 impl Core {
@@ -260,7 +264,7 @@ impl Core {
     /// the Core instance.
     pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
-        let mut indexer = Indexer::new(&opts);
+        let mut indexer = Indexer::new();
 
         // Determine options for the manifest file and open or create it.
         let manifest_subdir = opts.dir.join("manifest");
@@ -478,15 +482,26 @@ impl Core {
 
         tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
 
-        self.append_to_log(&buf)?;
+        self.append_to_log(&buf, req.durability)?;
         self.write_to_index(&req, &committed_values_offsets)?;
 
         Ok(())
     }
 
-    fn append_to_log(&self, tx_record: &BytesMut) -> Result<()> {
+    fn append_to_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
         let mut clog = self.clog.write();
-        clog.append(tx_record)?;
+
+        match durability {
+            Durability::Immediate => {
+                // Immediate durability means that the transaction is made to
+                // fsync the data to disk before returning.
+                clog.append(tx_record)?;
+                clog.sync()?;
+            }
+            Durability::Eventual => {
+                clog.append(tx_record)?;
+            }
+        }
 
         Ok(())
     }
@@ -526,6 +541,7 @@ impl Core {
         entries: Vec<Entry>,
         tx_id: u64,
         commit_ts: u64,
+        durability: Durability,
     ) -> Result<Receiver<Result<()>>> {
         let (tx, rx) = bounded(1);
         let req = Task {
@@ -533,6 +549,7 @@ impl Core {
             done: Some(tx),
             tx_id,
             commit_ts,
+            durability,
         };
         self.writes_tx.send(req).await?;
         Ok(rx)
@@ -541,10 +558,13 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    use rand::prelude::SliceRandom;
+    use rand::Rng;
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
+    use crate::storage::kv::transaction::Durability;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -638,7 +658,6 @@ mod tests {
 
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
-        opts.max_active_snapshots = 10;
         opts.max_value_cache_size = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
@@ -754,6 +773,7 @@ mod tests {
                     done: Some(done_tx),
                     tx_id: i,
                     commit_ts: i,
+                    durability: Durability::default(),
                 })
                 .await
                 .unwrap();
@@ -961,5 +981,72 @@ mod tests {
             store.close().await.is_ok(),
             "should close store without error"
         );
+    }
+
+    /// Returns pairs of key, value
+    fn gen_data(count: usize, key_size: usize, value_size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut pairs = vec![];
+
+        for _ in 0..count {
+            let key: Vec<u8> = (0..key_size).map(|_| rand::thread_rng().gen()).collect();
+            let value: Vec<u8> = (0..value_size).map(|_| rand::thread_rng().gen()).collect();
+            pairs.push((key, value));
+        }
+
+        pairs
+    }
+
+    async fn test_durability(durability: Durability) {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let num_elements = 100;
+        let pairs = gen_data(num_elements, 16, 20);
+
+        {
+            // Create a new store instance
+            let store = Store::new(opts.clone()).expect("should create store");
+
+            let mut txn = store.begin().unwrap();
+            txn.set_durability(durability);
+
+            {
+                for i in 0..num_elements {
+                    let (key, value) = &pairs[i % pairs.len()];
+                    txn.set(key.as_slice(), value.as_slice()).unwrap();
+                }
+            }
+            txn.commit().await.unwrap();
+
+            drop(store);
+        }
+
+        let store = Store::new(opts.clone()).expect("should create store");
+        let txn = store.begin().unwrap();
+
+        let mut key_order: Vec<usize> = (0..num_elements).collect();
+        key_order.shuffle(&mut rand::thread_rng());
+
+        {
+            for i in &key_order {
+                let (key, value) = &pairs[*i % pairs.len()];
+                let val = txn.get(key.as_slice()).unwrap().unwrap();
+                assert_eq!(&val, value);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eventual_durability() {
+        test_durability(Durability::Eventual).await;
+    }
+
+    #[tokio::test]
+    async fn immediate_durability() {
+        test_durability(Durability::Immediate).await;
     }
 }
