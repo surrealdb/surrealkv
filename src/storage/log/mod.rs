@@ -2440,6 +2440,7 @@ mod tests {
         assert_eq!(segment.offset(), 11);
     }
 
+    #[test]
     fn multi_segment_rec() {
         // Create a temporary directory to hold the segment files
         let temp_dir = TempDir::new("test").expect("should create temp dir");
