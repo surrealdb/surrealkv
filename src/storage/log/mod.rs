@@ -1197,6 +1197,7 @@ pub enum Error {
     IO(IOError),
     Poison(String),
     RecordTooLarge,
+    SegmentNotFound,
 }
 
 // Implementation of Display trait for Error
@@ -1213,6 +1214,7 @@ impl fmt::Display for Error {
                 f,
                 "Record is too large to fit in a segment. Increase max segment size"
             ),
+            Error::SegmentNotFound => write!(f, "Segment not found"),
         }
     }
 }

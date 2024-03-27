@@ -110,7 +110,7 @@ impl Aol {
     // Helper function to calculate the active segment ID
     fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
-        Ok(if last > 0 { last + 1 } else { 0 })
+        Ok(last)
     }
 
     /// Appends a record to the active segment.
@@ -563,5 +563,36 @@ mod tests {
         let mut read_data = vec![0; 1024];
         let r = a.read_at(&mut read_data, 0);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn append_and_reload_to_check_active_segment_id() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        let large_record = vec![1; 1024];
+        let small_record = vec![1; 512];
+        let r = a.append(&large_record);
+        assert!(r.is_ok());
+        assert_eq!(1024, a.offset().unwrap());
+
+        assert_eq!(0, a.active_segment_id);
+
+        a.close().expect("should close");
+
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        assert_eq!(0, a.active_segment_id);
+
+        let r = a.append(&small_record);
+        assert!(r.is_ok());
+        assert_eq!(1536, a.offset().unwrap());
+        assert_eq!(1, a.active_segment_id);
     }
 }

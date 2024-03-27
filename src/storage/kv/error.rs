@@ -37,6 +37,7 @@ pub enum Error {
     TransactionWriteOnly,               // The transaction is write-only
     SendError(String),
     ReceiveError(String),
+    MismatchedSegmentID(u64, u64),
 }
 
 /// Error structure for encoding errors
@@ -99,6 +100,11 @@ impl fmt::Display for Error {
             Error::TransactionWriteOnly => write!(f, "Transaction is write-only"),
             Error::SendError(err) => write!(f, "Send error: {}", err),
             Error::ReceiveError(err) => write!(f, "Receive error: {}", err),
+            Error::MismatchedSegmentID(expected, found) => write!(
+                f,
+                "Mismatched segment ID: expected={}, found={}",
+                expected, found
+            ),
         }
     }
 }
