@@ -251,7 +251,7 @@ impl Transaction {
             return Err(Error::MaxValueLengthExceeded);
         }
 
-        if self.write_set.len() as u32 >= self.core.opts.max_tx_entries {
+        if self.write_set.len() as u32 >= self.core.opts.max_entries_per_txn {
             return Err(Error::MaxTransactionEntriesLimitExceeded);
         }
 
@@ -1378,7 +1378,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_tx_entries = 5;
+        opts.max_entries_per_txn = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
 
@@ -1459,7 +1459,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_tx_entries = ENTRIES as u32;
+        opts.max_entries_per_txn = ENTRIES as u32;
 
         let store = Store::new(opts.clone()).expect("should create store");
         let mut rng = make_rng();

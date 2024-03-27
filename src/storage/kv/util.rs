@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use bytes::Bytes;
 use chrono::Utc;
 use crc32fast::Hasher as crc32Hasher;
@@ -34,4 +36,24 @@ pub(crate) fn sha256(arg: Bytes) -> Bytes {
     hasher.update(arg);
     let result = hasher.finalize();
     Bytes::copy_from_slice(result.as_slice())
+}
+
+pub(crate) fn sanitize_directory(directory: &str) -> std::io::Result<PathBuf> {
+    // Convert the directory string to a PathBuf
+    let mut path = PathBuf::from(directory);
+
+    // Normalize the path (resolve '..' and '.' components)
+    path = path.canonicalize()?;
+
+    // Check if the path is absolute
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Directory path must be absolute"));
+    }
+
+    // Check if the path contains any '..' components after normalization
+    if path.components().any(|component| component.as_os_str() == "..") {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Directory path must not contain '..' components"));
+    }
+
+    Ok(path)
 }

@@ -1,7 +1,11 @@
+use std::fs;
+use std::path::Path;
+
 use crate::storage::{
     kv::{
         error::{Error, Result},
         reader::{Reader, TxReader},
+        util::sanitize_directory,
     },
     log::{
         aof::log::Aol, Error as LogError, IOError, MultiSegmentReader, Segment, SegmentRef,
@@ -9,8 +13,7 @@ use crate::storage::{
     },
 };
 
-/// Repairs the corrupted segment identified by `corrupted_segment_id` and ensures that
-/// the records up to `corrupted_offset_marker` are appended correctly.
+/// This function repairs a corrupted segment in the append-only log (AOL).
 ///
 /// # Arguments
 ///
@@ -20,9 +23,25 @@ use crate::storage::{
 /// # Returns
 ///
 /// Returns an `Result` indicating the success of the repair operation.
-pub fn repair(
+///
+/// The function first reads the list of segments from the directory and prepares to store information about the corrupted segment.
+/// It then loops through the segments, closing the active segment if its ID matches the corrupted segment's ID and storing information about the corrupted segment.
+///
+/// If information about the corrupted segment is not available, the function returns an error.
+/// Otherwise, it prepares the path for the repaired segment and renames the corrupted segment to the repaired segment.
+///
+/// The function then opens a new segment as the active segment and creates a segment reader for the repaired segment.
+/// It initializes a reader for the segment and reads records until the offset marker is reached, appending the records to the new segment.
+///
+/// After reading the records, the function flushes and closes the active segment and removes the repaired segment file.
+/// If no records were read, it also removes the corrupted segment file.
+///
+/// Finally, the function opens the next segment and makes it active.
+///
+/// If any of these operations fail, the function returns an error.
+pub(crate) fn repair(
     aol: &mut Aol,
-    max_tx_entries: usize,
+    max_entries_per_txn: usize,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -77,7 +96,7 @@ pub fn repair(
 
     let mut count = 0;
     // Read records until the offset marker is reached
-    while let Ok((data, cur_offset)) = reader.read(max_tx_entries) {
+    while let Ok((data, cur_offset)) = reader.read(max_entries_per_txn) {
         if cur_offset >= corrupted_offset_marker {
             break;
         }
@@ -103,9 +122,58 @@ pub fn repair(
     Ok(())
 }
 
+// This function is used to restore files in a directory after a repair process.
+// The repair process creates a backup of the original file with a '.repair' extension
+// and creates a new file with the '.clog' extension. If the repair process is interrupted,
+// there might be pairs of '.clog' and '.repair' files in the directory.
+// This function deletes the '.clog' file and renames the '.repair' file back to '.clog'.
+//
+// Parameters:
+// directory: A string slice that holds the path to the directory.
+pub(crate) fn restore_repair_files(directory: &str) -> std::io::Result<()> {
+    // Check if the directory exists
+    if !Path::new(directory).exists() {
+        return Ok(());
+    }
+
+    // Validate and sanitize the directory parameter
+    let directory = sanitize_directory(directory)?;
+
+    // Read the directory
+    let entries = fs::read_dir(directory.clone())?;
+
+    // Iterate over each entry in the directory
+    for entry in entries.flatten() {
+        // If the entry is a file
+        let path = entry.path();
+        if path.is_file() {
+            // Get the filename of the file
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            // If the filename ends with '.repair'
+            if let Some(stem) = filename.strip_suffix(".repair") {
+                // Construct the filename of the corresponding '.clog' file
+                let clog_filename = format!("{}.clog", stem);
+                let clog_path = Path::new(&directory).join(clog_filename);
+                // If the '.clog' file exists
+                if clog_path.exists() {
+                    // Remove the '.clog' file
+                    fs::remove_file(&clog_path)?;
+                }
+                // Rename the '.repair' file back to '.clog'
+                fs::rename(path, clog_path)?;
+            }
+        }
+    }
+
+    // Return Ok if the operation was successful
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::fs::OpenOptions;
+    use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
@@ -124,6 +192,83 @@ mod tests {
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
+    }
+
+    #[test]
+    fn test_restore_files_multiple_clog_files() {
+        let dir = create_temp_directory();
+        let mut file1 = File::create(dir.path().join("0001.clog")).unwrap();
+        let mut file2 = File::create(dir.path().join("0002.clog")).unwrap();
+        file1.write_all(b"Data for 0001.clog").unwrap();
+        file2.write_all(b"Data for 0002.clog").unwrap();
+        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(dir.path().join("0001.clog").exists());
+        assert!(dir.path().join("0002.clog").exists());
+    }
+
+    #[test]
+    fn test_restore_files_multiple_repair_files() {
+        let dir = create_temp_directory();
+        File::create(dir.path().join("001.repair")).unwrap();
+        File::create(dir.path().join("002.repair")).unwrap();
+        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(dir.path().join("001.clog").exists());
+        assert!(dir.path().join("002.clog").exists());
+        assert!(!dir.path().join("001.repair").exists());
+        assert!(!dir.path().join("002.repair").exists());
+    }
+
+    #[test]
+    fn test_restore_files_multiple_clog_and_repair_files() {
+        let dir = create_temp_directory();
+        File::create(dir.path().join("0001.clog")).unwrap();
+        File::create(dir.path().join("0002.clog")).unwrap();
+        File::create(dir.path().join("0001.repair")).unwrap();
+        File::create(dir.path().join("0002.repair")).unwrap();
+        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(dir.path().join("0001.clog").exists());
+        assert!(dir.path().join("0002.clog").exists());
+        assert!(!dir.path().join("0001.repair").exists());
+        assert!(!dir.path().join("0002.repair").exists());
+    }
+
+    #[test]
+    fn test_restore_files_single_clog_and_repair_files() {
+        let dir = create_temp_directory();
+        File::create(dir.path().join("0001.clog")).unwrap();
+        File::create(dir.path().join("0002.clog")).unwrap();
+        File::create(dir.path().join("0001.repair")).unwrap();
+        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(dir.path().join("0001.clog").exists());
+        assert!(dir.path().join("0002.clog").exists());
+        assert!(!dir.path().join("0001.repair").exists());
+    }
+
+    #[test]
+    fn test_restore_files_multiple_repair_files_with_data() {
+        let dir = create_temp_directory();
+        let mut file1 = File::create(dir.path().join("0001.clog")).unwrap();
+        let mut file2 = File::create(dir.path().join("0002.clog")).unwrap();
+        let mut repair_file1 = File::create(dir.path().join("0001.repair")).unwrap();
+        let mut repair_file2 = File::create(dir.path().join("0002.repair")).unwrap();
+        file1.write_all(b"Data for 0001.clog").unwrap();
+        file2.write_all(b"Data for 0002.clog").unwrap();
+        repair_file1.write_all(b"Data for 0001.repair").unwrap();
+        repair_file2.write_all(b"Data for 0002.repair").unwrap();
+        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(dir.path().join("0001.clog").exists());
+        assert!(dir.path().join("0002.clog").exists());
+        assert!(!dir.path().join("0001.repair").exists());
+        assert!(!dir.path().join("0002.repair").exists());
+
+        let mut restored_file1 = File::open(dir.path().join("0001.clog")).unwrap();
+        let mut restored_file2 = File::open(dir.path().join("0002.clog")).unwrap();
+        let mut contents1 = String::new();
+        let mut contents2 = String::new();
+        restored_file1.read_to_string(&mut contents1).unwrap();
+        restored_file2.read_to_string(&mut contents2).unwrap();
+        assert_eq!(contents1, "Data for 0001.repair");
+        assert_eq!(contents2, "Data for 0002.repair");
     }
 
     async fn setup_store_with_data(opts: Options, keys: Vec<Bytes>, value: Bytes) -> Store {
@@ -164,7 +309,7 @@ mod tests {
             1000,
         );
         let mut tx_reader = TxReader::new(reader);
-        let mut tx = TxRecord::new(opts.max_tx_entries as usize);
+        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
 
         loop {
             tx.reset();
