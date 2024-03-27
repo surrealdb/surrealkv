@@ -21,7 +21,7 @@ use crate::storage::{
         option::Options,
         oracle::Oracle,
         reader::{Reader, TxReader},
-        repair::{repair, restore_repair_files},
+        repair::{repair_last_corrupted_segment, restore_repair_files},
         transaction::{Mode, Transaction},
     },
     log::{
@@ -349,31 +349,69 @@ impl Core {
         Ok(self.oracle.read_ts())
     }
 
+    // The load_index function is responsible for loading the index from the log.
     fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<()> {
+        // The directory where the log segments are stored is determined.
         let clog_subdir = opts.dir.join("clog");
+
+        // The segments are read from the directory.
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
             .expect("should read segments");
+
+        // A MultiSegmentReader is created to read from multiple segments.
         let reader = MultiSegmentReader::new(sr)?;
+
+        // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
         let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
+
+        // A TxReader is created from the Reader to read transactions.
         let mut tx_reader = TxReader::new(reader);
+
+        // A TxRecord is created to hold the transactions. The maximum number of entries per transaction is specified.
         let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
 
+        // An Option is created to hold the segment ID and offset in case of corruption.
+        let mut corruption_info: Option<(u64, u64)> = None;
+
+        // A loop is started to read transactions.
         loop {
+            // The TxRecord is reset for each iteration.
             tx.reset();
 
+            // The TxReader attempts to read into the TxRecord.
             match tx_reader.read_into(&mut tx) {
+                // If the read is successful, the entries are processed.
                 Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+
+                // If the end of the file is reached, the loop is broken.
                 Err(Error::LogError(LogError::Eof(_))) => break,
+
+                // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
                 Err(Error::LogError(LogError::Corruption(err))) => {
-                    repair(
-                        clog,
-                        opts.max_entries_per_txn as usize,
-                        err.segment_id,
-                        err.offset,
-                    )?;
+                    corruption_info = Some((err.segment_id, err.offset));
+                    break;
                 }
+
+                // If any other error is encountered, it is returned immediately.
                 Err(err) => return Err(err),
             };
+        }
+
+        // If a corruption was encountered, the last segment is repaired using the stored segment ID and offset.
+        // The reason why the last segment is repaired is because the last segment is the one that was being actively
+        // written to and acts like the active WAL file. Any corruption in the previous immutable segments is pure
+        // corruption of the data and should be handled by the user.
+        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
+            eprintln!(
+                "Repairing corrupted segment with id: {} and offset: {}",
+                corrupted_segment_id, corrupted_offset
+            );
+            repair_last_corrupted_segment(
+                clog,
+                opts.max_entries_per_txn as usize,
+                corrupted_segment_id,
+                corrupted_offset,
+            )?;
         }
 
         Ok(())

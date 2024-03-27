@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::storage::{
     kv::{
@@ -7,11 +8,72 @@ use crate::storage::{
         reader::{Reader, TxReader},
         util::sanitize_directory,
     },
-    log::{
-        aof::log::Aol, Error as LogError, IOError, MultiSegmentReader, Segment, SegmentRef,
-        BLOCK_SIZE,
-    },
+    log::{aof::log::Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
 };
+
+#[allow(unused)]
+pub(crate) fn repair_corrupted_segment(
+    aol: &mut Aol,
+    max_entries_per_txn: usize,
+    corrupted_segment_id: u64,
+    corrupted_offset_marker: u64,
+) -> Result<()> {
+    // Read the list of segments from the directory
+    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+
+    // Loop through the segments
+    for s in &segs {
+        // If the segment ID matches the corrupted segment ID, repair the segment
+        if s.id == corrupted_segment_id {
+            repair_segment(
+                aol,
+                max_entries_per_txn,
+                corrupted_segment_id,
+                corrupted_offset_marker,
+                s.file_path.clone(),
+                s.file_header_offset,
+            )?;
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn repair_last_corrupted_segment(
+    aol: &mut Aol,
+    max_entries_per_txn: usize,
+    corrupted_segment_id: u64,
+    corrupted_offset_marker: u64,
+) -> Result<()> {
+    // Read the list of segments from the directory
+    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+
+    // Get the last segment
+    let last_segment = segs
+        .last()
+        .ok_or_else(|| Error::LogError(LogError::SegmentNotFound))?;
+
+    // Check if the last segment's ID is equal to the corrupted_segment_id
+    if last_segment.id != corrupted_segment_id {
+        return Err(Error::MismatchedSegmentID(
+            last_segment.id,
+            corrupted_segment_id,
+        ));
+    }
+
+    // Repair the last segment
+    repair_segment(
+        aol,
+        max_entries_per_txn,
+        last_segment.id,
+        corrupted_offset_marker,
+        last_segment.file_path.clone(),
+        last_segment.file_header_offset,
+    )?;
+
+    Ok(())
+}
 
 /// This function repairs a corrupted segment in the append-only log (AOL).
 ///
@@ -39,45 +101,24 @@ use crate::storage::{
 /// Finally, the function opens the next segment and makes it active.
 ///
 /// If any of these operations fail, the function returns an error.
-pub(crate) fn repair(
+fn repair_segment(
     aol: &mut Aol,
     max_entries_per_txn: usize,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
+    corrupted_segment_file_path: PathBuf,
+    corrupted_segment_file_header_offset: u64,
 ) -> Result<()> {
-    // Read the list of segments from the directory
-    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
-
-    // Prepare to store information about the corrupted segment
-    let mut corrupted_segment_info = None;
-
-    // Loop through the segments
-    for s in &segs {
-        // Close the active segment if its ID matches
-        if s.id == aol.active_segment_id {
-            aol.active_segment.close()?;
-        }
-
-        // Store information about the corrupted segment
-        if s.id == corrupted_segment_id {
-            corrupted_segment_info = Some((s.file_path.clone(), s.file_header_offset));
-        }
+    // Close the active segment if its ID matches
+    if aol.active_segment_id == corrupted_segment_id {
+        aol.active_segment.close()?;
     }
 
-    // If information about the corrupted segment is not available, return an error
-    let (corrupted_segment_path, corrupted_segment_file_header_offset) = corrupted_segment_info
-        .ok_or_else(|| {
-            Error::LogError(LogError::IO(IOError::new(
-                std::io::ErrorKind::Other,
-                "Corrupted segment not found",
-            )))
-        })?;
-
     // Prepare the repaired segment path
-    let repaired_segment_path = corrupted_segment_path.with_extension("repair");
+    let repaired_segment_path = corrupted_segment_file_path.with_extension("repair");
 
     // Rename the corrupted segment to the repaired segment
-    std::fs::rename(&corrupted_segment_path, &repaired_segment_path)?;
+    std::fs::rename(&corrupted_segment_file_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
     let mut new_segment: Segment<0> = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
@@ -113,8 +154,8 @@ pub(crate) fn repair(
 
     // Open the next segment and make it active
     if count == 0 {
-        println!("deleting empty file {:?}", corrupted_segment_path);
-        std::fs::remove_file(&corrupted_segment_path)?;
+        println!("deleting empty file {:?}", corrupted_segment_file_path);
+        std::fs::remove_file(&corrupted_segment_file_path)?;
     }
     let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts)?;
     aol.active_segment = new_segment;
@@ -194,6 +235,488 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
+    const MAX_TX_ENTRIES: usize = 10;
+
+    async fn setup_store_with_data(opts: Options, keys: Vec<Bytes>, value: Bytes) -> Store {
+        let store = Store::new(opts.clone()).expect("should create store");
+        append_data(&store, keys, &value).await;
+
+        store
+    }
+
+    async fn append_data(store: &Store, keys: Vec<Bytes>, val: &Bytes) {
+        for key in keys {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set_durability(Durability::Immediate);
+            txn.set(&key, val).unwrap();
+            txn.commit().await.unwrap();
+        }
+    }
+
+    fn corrupt_at_offset(opts: Options, segment_num: usize, corruption_offset: u64) {
+        let clog_subdir = opts.dir.join("clog");
+        let sr =
+            SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
+
+        // Open the nth segment file for corrupting
+        let file_path = &sr[segment_num - 1].file_path;
+        corrupt_segment(file_path, corruption_offset);
+    }
+
+    // Helper function to corrupt any segment file at a given offset
+    // This is useful for testing the repair process because when opening
+    // the store, the repair process will only repair the corrupted segment
+    // if it is the last segment in the directory.
+    fn corrupt_and_repair(
+        store: &Store,
+        opts: Options,
+        segment_num: usize,
+        corruption_offset: u64,
+    ) {
+        let mut clog = store.inner.as_ref().unwrap().core.clog.write();
+
+        let clog_subdir = opts.dir.join("clog");
+        let sr =
+            SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
+
+        // Open the nth segment file for corrupting
+        corrupt_at_offset(opts.clone(), segment_num, corruption_offset);
+
+        // TODO: Let store repoen do the repair
+        let (corrupted_segment_id, corrupted_offset_marker) =
+            find_corrupted_segment(sr, opts.clone());
+
+        repair_corrupted_segment(
+            &mut clog,
+            MAX_TX_ENTRIES,
+            corrupted_segment_id,
+            corrupted_offset_marker,
+        )
+        .unwrap();
+
+        // drop lock over commit log
+        drop(clog);
+    }
+
+    #[allow(unused)]
+    fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
+        let reader = Reader::new_from(
+            MultiSegmentReader::new(sr).expect("should create"),
+            opts.max_segment_size,
+            1000,
+        );
+        let mut tx_reader = TxReader::new(reader);
+        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+
+        loop {
+            tx.reset();
+
+            match tx_reader.read_into(&mut tx) {
+                Ok(_) => continue,
+                Err(Error::LogError(LogError::Corruption(err))) => {
+                    return (err.segment_id, err.offset);
+                }
+                Err(err) => panic!(
+                    "Expected a CorruptionError, but got a different error {}",
+                    err
+                ),
+            }
+        }
+    }
+
+    // File header is 170 bytes
+    // Each transaction header is 32 in len
+    fn corrupt_segment(segment_file_path: &Path, offset_to_edit: u64) {
+        // Open the segment file for reading and writing
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(segment_file_path)
+            .expect("should open");
+
+        // Read the file header and move the cursor to the first record
+        let header_len = read_file_header(&mut file).expect("should read");
+
+        // Corrupt the checksum of the second record
+        let offset_to_edit = header_len.len() as u64 + offset_to_edit;
+        let new_byte_value = 0x55;
+        file.seek(SeekFrom::Start(offset_to_edit as u64))
+            .expect("should seek");
+        file.write_all(&[new_byte_value]).expect("should write");
+        file.sync_data().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_with_one_record_per_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 55;
+
+        let keys = vec![Bytes::from("k1"), Bytes::from("k2")];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k3")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k3"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_with_two_records_per_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 110;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Entries after corruption offset should not be present
+        let expected_deleted_keys = vec!["k5"];
+        for key in expected_deleted_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key).unwrap(), None);
+        }
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k2", "k3", "k4", "k7"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_with_corruption_in_first_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 55;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Entries after corruption offset should not be present
+        let expected_deleted_keys = vec!["k1"];
+        for key in expected_deleted_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key).unwrap(), None);
+        }
+
+        let expected_keys = vec!["k2", "k3", "k4", "k5"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_with_corruption_in_middle_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 55;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Entries after corruption offset should not be present
+        let expected_deleted_keys = vec!["k3"];
+        for key in expected_deleted_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key).unwrap(), None);
+        }
+
+        let expected_keys = vec!["k1", "k2", "k4", "k5"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_single_segment_with_multiple_records() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 550;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 220 + 25; // 32bytes is length of txn header
+        corrupt_at_offset(opts.clone(), 1, corruption_offset);
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Entries after corruption offset should not be present
+        let expected_deleted_keys = vec!["k5", "k6", "k7"];
+        for key in expected_deleted_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key).unwrap(), None);
+        }
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k8")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k2", "k3", "k4", "k8"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_first_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 110;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 55 + 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k3", "k4", "k5", "k6", "k7"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_middle_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 110;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 55 + 25; // 32bytes is length of txn header
+        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k2", "k3", "k5", "k6", "k7"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_last_segment() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 110;
+
+        let keys = vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+            Bytes::from("k4"),
+            Bytes::from("k5"),
+            Bytes::from("k6"),
+        ];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let corruption_offset = 55 + 25; // 32bytes is length of txn header
+        corrupt_at_offset(opts.clone(), 3, corruption_offset);
+
+        // Close the store
+        store.close().await.expect("should close store");
+        drop(store);
+
+        // Restart store to see if all entries are read
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Check if a new transaction can be appended post repair
+        let new_keys = vec![Bytes::from("k7")];
+        append_data(&store, new_keys, &default_value).await;
+
+        let expected_keys = vec!["k1", "k2", "k3", "k4", "k5", "k7"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
     #[test]
     fn test_restore_files_multiple_clog_files() {
         let dir = create_temp_directory();
@@ -269,417 +792,5 @@ mod tests {
         restored_file2.read_to_string(&mut contents2).unwrap();
         assert_eq!(contents1, "Data for 0001.repair");
         assert_eq!(contents2, "Data for 0002.repair");
-    }
-
-    async fn setup_store_with_data(opts: Options, keys: Vec<Bytes>, value: Bytes) -> Store {
-        let store = Store::new(opts.clone()).expect("should create store");
-        append_data(&store, keys, &value).await;
-
-        store
-    }
-
-    async fn append_data(store: &Store, keys: Vec<Bytes>, val: &Bytes) {
-        for key in keys {
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set_durability(Durability::Immediate);
-            txn.set(&key, val).unwrap();
-            txn.commit().await.unwrap();
-        }
-    }
-
-    async fn corrupt_at_offset(opts: Options, segment_num: usize, corruption_offset: u64) {
-        let clog_subdir = opts.dir.join("clog");
-        let sr =
-            SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
-
-        // Open the nth segment file for corrupting
-        let file_path = &sr[segment_num - 1].file_path;
-        corrupt_segment(file_path, corruption_offset);
-
-        // let (corrupted_segment_id, corrupted_offset_marker) =
-        //     find_corrupted_segment(sr, opts.clone());
-    }
-
-    #[allow(unused)]
-    fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let reader = Reader::new_from(
-            MultiSegmentReader::new(sr).expect("should create"),
-            opts.max_segment_size,
-            1000,
-        );
-        let mut tx_reader = TxReader::new(reader);
-        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
-
-        loop {
-            tx.reset();
-
-            match tx_reader.read_into(&mut tx) {
-                Ok(_) => continue,
-                Err(Error::LogError(LogError::Corruption(err))) => {
-                    return (err.segment_id, err.offset);
-                }
-                Err(err) => panic!(
-                    "Expected a CorruptionError, but got a different error {}",
-                    err
-                ),
-            }
-        }
-    }
-
-    // File header is 170 bytes
-    // Each transaction header is 32 in len
-    fn corrupt_segment(segment_file_path: &Path, offset_to_edit: u64) {
-        // Open the segment file for reading and writing
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(segment_file_path)
-            .expect("should open");
-
-        // Read the file header and move the cursor to the first record
-        let header_len = read_file_header(&mut file).expect("should read");
-
-        // Corrupt the checksum of the second record
-        let offset_to_edit = header_len.len() as u64 + offset_to_edit;
-        let new_byte_value = 0x55;
-        file.seek(SeekFrom::Start(offset_to_edit as u64))
-            .expect("should seek");
-        file.write_all(&[new_byte_value]).expect("should write");
-        file.sync_data().unwrap();
-    }
-
-    #[tokio::test]
-    async fn repair_with_one_record_per_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 55;
-
-        let keys = vec![Bytes::from("k1"), Bytes::from("k2")];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 2, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k3")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k3"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_with_two_records_per_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 3, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k6")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k2", "k3", "k4", "k6"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_with_corruption_in_first_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 55;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 1, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k6")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k2", "k3", "k4", "k6"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_with_corruption_in_middle_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 55;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 4, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k6")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k2", "k3", "k5", "k6"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_single_segment_with_multiple_records() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 550;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-            Bytes::from("k6"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 220 + 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 1, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k7")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k2", "k3", "k4", "k7"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_first_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-            Bytes::from("k6"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 55 + 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 1, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k7")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k3", "k4", "k5", "k6", "k7"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_middle_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-            Bytes::from("k6"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 55 + 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 2, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k7")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k2", "k3", "k5", "k6", "k7"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_multiple_segment_with_multiple_records_with_corruption_in_last_segment() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
-
-        let keys = vec![
-            Bytes::from("k1"),
-            Bytes::from("k2"),
-            Bytes::from("k3"),
-            Bytes::from("k4"),
-            Bytes::from("k5"),
-            Bytes::from("k6"),
-        ];
-        let default_value = Bytes::from("val");
-
-        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 55 + 25; // 32bytes is length of txn header
-        corrupt_at_offset(opts.clone(), 3, corruption_offset).await;
-
-        // Check if a new transaction can be appended post repair
-        let new_keys = vec![Bytes::from("k7")];
-        append_data(&store, new_keys, &default_value).await;
-
-        // Close the store
-        store.close().await.expect("should close store");
-        drop(store);
-
-        // Restart store to see if all entries are read
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let expected_keys = vec!["k1", "k2", "k3", "k4", "k5", "k7"];
-        for key in expected_keys {
-            let key = Bytes::from(key);
-
-            // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
-        }
     }
 }

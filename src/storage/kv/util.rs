@@ -47,12 +47,21 @@ pub(crate) fn sanitize_directory(directory: &str) -> std::io::Result<PathBuf> {
 
     // Check if the path is absolute
     if !path.is_absolute() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Directory path must be absolute"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Directory path must be absolute",
+        ));
     }
 
     // Check if the path contains any '..' components after normalization
-    if path.components().any(|component| component.as_os_str() == "..") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Directory path must not contain '..' components"));
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "..")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Directory path must not contain '..' components",
+        ));
     }
 
     Ok(path)
