@@ -21,7 +21,7 @@ use crate::storage::{
         option::Options,
         oracle::Oracle,
         reader::{Reader, TxReader},
-        repair::repair,
+        repair::{repair, restore_repair_files},
         transaction::{Mode, Transaction},
     },
     log::{
@@ -261,17 +261,36 @@ impl Core {
         Indexer::new()
     }
 
+    // This function initializes the manifest log for the database to store all settings.
     fn initialize_manifest(opts: &Options) -> Result<Aol> {
         let manifest_subdir = opts.dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
     }
 
+    // This function initializes the commit log (clog) for the database.
     fn initialize_clog(opts: &Options) -> Result<Aol> {
+        // It first constructs the path to the clog subdirectory within the database directory.
         let clog_subdir = opts.dir.join("clog");
+
+        // Then it creates a LogOptions object to configure the clog.
+        // The maximum file size for the clog is set to the max_segment_size option from the database options.
+        // The file extension for the clog files is set to "clog".
         let copts = LogOptions::default()
             .with_max_file_size(opts.max_segment_size)
             .with_file_extension("clog".to_string());
+
+        // It then attempts to restore any repair files in the clog subdirectory.
+        // If this fails, the error is propagated up to the caller of the function.
+        // This is required because the repair operation may have failed, and the
+        // store should not be opened with existing repair files.
+        //
+        // Even though we are restoring the corrupted files, it will get repaired
+        // during in the load_index function.
+        restore_repair_files(clog_subdir.as_path().to_str().unwrap())?;
+
+        // Finally, it attempts to open the clog with the specified options.
+        // If this fails, the error is converted to a database error and then propagated up to the caller of the function.
         Aol::open(&clog_subdir, &copts).map_err(Error::from)
     }
 
@@ -337,7 +356,7 @@ impl Core {
         let reader = MultiSegmentReader::new(sr)?;
         let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
         let mut tx_reader = TxReader::new(reader);
-        let mut tx = TxRecord::new(opts.max_tx_entries as usize);
+        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
 
         loop {
             tx.reset();
@@ -348,7 +367,7 @@ impl Core {
                 Err(Error::LogError(LogError::Corruption(err))) => {
                     repair(
                         clog,
-                        opts.max_tx_entries as usize,
+                        opts.max_entries_per_txn as usize,
                         err.segment_id,
                         err.offset,
                     )?;
