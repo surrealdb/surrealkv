@@ -17,7 +17,7 @@ use hashbrown::HashMap;
 /// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
 /// flushing to disk. Larger block sizes can improve write performance but might use more memory.
-pub(crate) const BLOCK_SIZE: usize = 4 * 1024;
+pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
 
 /// Length of the record header in bytes.
 ///
@@ -1098,7 +1098,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         }
 
         if active_block.is_full() {
-            self.flush_and_sync()?;
+            self.flush_block(true)?;
         }
 
         *rec = &rec[remaining..];
@@ -2385,5 +2385,51 @@ mod tests {
         let dest_len = copy_into_dest_from_src(&mut dest, 5, &src, src.len());
         assert_eq!(dest_len, 10);
         assert_eq!(dest, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn sync_on_synced_segment() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options and open a segment
+        let opts = Options::default();
+        let mut segment: Segment<0> =
+            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        let sz = segment.offset();
+        assert_eq!(0, sz);
+
+        // Test appending a non-empty buffer
+        let r = segment.append(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(11, r.unwrap().1);
+
+        // Validate offset after appending
+        assert_eq!(segment.offset(), 11);
+
+        // Test syncing segment
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
+
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
+
+        segment.close().expect("should close segment");
+
+        // Reopen segment and validate offset
+        let mut segment: Segment<0> =
+            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        let sz = segment.offset();
+        assert_eq!(11, sz);
+
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
     }
 }
