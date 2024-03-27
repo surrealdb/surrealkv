@@ -6,15 +6,13 @@ use hashbrown::HashMap;
 
 use crate::storage::{
     kv::{
-        entry::{TxEntry, MAX_TX_METADATA_SIZE},
+        entry::{TxEntry, TxRecord, MAX_TX_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
+        util::calculate_crc32,
     },
     log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
-
-use crate::storage::kv::entry::TxRecord;
-use crate::storage::kv::util::calculate_crc32;
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `TxReader` to read data from the Aol source.

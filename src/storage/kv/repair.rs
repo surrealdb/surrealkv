@@ -280,10 +280,9 @@ mod tests {
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
 
-        // Open the nth segment file for corrupting
+        // Open the nth segment file for corruption
         corrupt_at_offset(opts.clone(), segment_num, corruption_offset);
 
-        // TODO: Let store repoen do the repair
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
@@ -363,7 +362,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -405,7 +403,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -457,7 +454,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -505,7 +501,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -558,7 +553,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -611,7 +605,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -654,7 +647,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
@@ -697,7 +689,6 @@ mod tests {
 
         // Close the store
         store.close().await.expect("should close store");
-        drop(store);
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
