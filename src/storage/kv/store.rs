@@ -647,7 +647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_insert() {
+    async fn bulk_insert_and_reload() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -694,10 +694,11 @@ mod tests {
         // Drop the store to simulate closing it
         store.close().await.unwrap();
 
-        // Create a new Core instance with VariableKey after dropping the previous one
+        // Create a new store instance but with values read from disk
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 3;
+        // This is to ensure values are read from disk
+        opts.max_value_threshold = 0;
 
         let store = Store::new(opts).expect("should create store");
 
