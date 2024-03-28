@@ -10,7 +10,7 @@ const META_KEY_ISOLATION_LEVEL: &str = "isolation_level";
 const META_KEY_MAX_KEY_SIZE: &str = "max_key_size";
 const META_KEY_MAX_VALUE_SIZE: &str = "max_value_size";
 const META_KEY_MAX_VALUE_THRESHOLD: &str = "max_value_threshold";
-const META_KEY_MAX_TX_ENTRIES: &str = "max_tx_entries";
+const META_KEY_MAX_ENTRIES_PER_TX: &str = "max_entries_per_txn";
 const META_KEY_MAX_FILE_SIZE: &str = "max_file_size";
 const META_KEY_MAX_VALUE_CACHE_SIZE: &str = "max_value_cache_size";
 
@@ -42,7 +42,7 @@ pub struct Options {
     pub max_key_size: u64,          // Maximum size in bytes for key.
     pub max_value_size: u64,        // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
-    pub max_tx_entries: u32,        // Maximum entries in a transaction.
+    pub max_entries_per_txn: u32,   // Maximum entries in a transaction.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
 }
@@ -54,7 +54,7 @@ impl Default for Options {
             dir: PathBuf::from(""),
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            max_tx_entries: 1 << 10,
+            max_entries_per_txn: 1 << 10,
             max_value_threshold: 64, // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_segment_size: 1 << 29, // 512 MB
@@ -79,7 +79,7 @@ impl Options {
             META_KEY_MAX_VALUE_THRESHOLD,
             self.max_value_threshold as u64,
         );
-        metadata.put_uint(META_KEY_MAX_TX_ENTRIES, self.max_tx_entries as u64);
+        metadata.put_uint(META_KEY_MAX_ENTRIES_PER_TX, self.max_entries_per_txn as u64);
         metadata.put_uint(META_KEY_MAX_FILE_SIZE, self.max_segment_size);
         metadata.put_uint(META_KEY_MAX_VALUE_CACHE_SIZE, self.max_value_cache_size);
 
@@ -98,7 +98,7 @@ impl Options {
             max_key_size: metadata.get_uint(META_KEY_MAX_KEY_SIZE)?,
             max_value_size: metadata.get_uint(META_KEY_MAX_VALUE_SIZE)?,
             max_value_threshold: metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD)? as usize,
-            max_tx_entries: metadata.get_uint(META_KEY_MAX_TX_ENTRIES)? as u32,
+            max_entries_per_txn: metadata.get_uint(META_KEY_MAX_ENTRIES_PER_TX)? as u32,
             max_segment_size: metadata.get_uint(META_KEY_MAX_FILE_SIZE)?,
             max_value_cache_size: metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE)?,
         })
@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from(""));
         assert_eq!(options.max_key_size, 1024);
         assert_eq!(options.max_value_size, 1024 * 1024);
-        assert_eq!(options.max_tx_entries, 1 << 10);
+        assert_eq!(options.max_entries_per_txn, 1 << 10);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
@@ -131,7 +131,7 @@ mod tests {
             dir: PathBuf::from("/test/dir"),
             max_key_size: 2048,
             max_value_size: 4096,
-            max_tx_entries: 500,
+            max_entries_per_txn: 500,
             max_value_threshold: 128,
             isolation_level: IsolationLevel::SerializableSnapshotIsolation,
             max_segment_size: 1 << 25, // 32 MB
@@ -150,7 +150,7 @@ mod tests {
             metadata.get_uint(META_KEY_MAX_VALUE_THRESHOLD).unwrap(),
             128
         );
-        assert_eq!(metadata.get_uint(META_KEY_MAX_TX_ENTRIES).unwrap(), 500);
+        assert_eq!(metadata.get_uint(META_KEY_MAX_ENTRIES_PER_TX).unwrap(), 500);
         assert_eq!(metadata.get_uint(META_KEY_MAX_FILE_SIZE).unwrap(), 1 << 25);
         assert_eq!(
             metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE).unwrap(),
@@ -168,7 +168,7 @@ mod tests {
         metadata.put_uint(META_KEY_MAX_KEY_SIZE, 2048);
         metadata.put_uint(META_KEY_MAX_VALUE_SIZE, 4096);
         metadata.put_uint(META_KEY_MAX_VALUE_THRESHOLD, 128);
-        metadata.put_uint(META_KEY_MAX_TX_ENTRIES, 500);
+        metadata.put_uint(META_KEY_MAX_ENTRIES_PER_TX, 500);
         metadata.put_uint(META_KEY_MAX_FILE_SIZE, 1 << 25);
         metadata.put_uint(META_KEY_MAX_VALUE_CACHE_SIZE, 200000);
 
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(options.max_key_size, 2048);
         assert_eq!(options.max_value_size, 4096);
         assert_eq!(options.max_value_threshold, 128);
-        assert_eq!(options.max_tx_entries, 500);
+        assert_eq!(options.max_entries_per_txn, 500);
         assert_eq!(
             options.isolation_level,
             IsolationLevel::SerializableSnapshotIsolation

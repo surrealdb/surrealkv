@@ -17,7 +17,7 @@ For more information on the underlying immutable versioned adaptive radix tries 
 
 ## Features
 
-- [x] **In-memory Database**
+- [x] **In-memory Index**
 - [x] **Embeddable**
 - [x] **ACID Semantics** 
 - [x] **Transaction Support:** 

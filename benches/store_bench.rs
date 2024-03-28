@@ -125,7 +125,7 @@ fn concurrent_insert(c: &mut Criterion) {
     let db = rt.block_on(async {
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
-        opts.max_tx_entries = item_count;
+        opts.max_entries_per_txn = item_count;
         Arc::new(Store::new(opts).expect("should create store"))
     });
 

@@ -57,18 +57,17 @@ impl Entry {
 //   |---------------------------------------------------------|
 //   | header: TxHeader                                        |
 //   | entries: Vec<TxEntry>                                   |
+//   | crc: u32                                                |
 //   +---------------------------------------------------------+
 
 //   +---------------------------------------------------------+
 //   |                     TxHeader                            |
 //   |---------------------------------------------------------|
-//   | crc: u32                                                |
 //   | id: u64                                                 |
-//   | lsn: u64                                                |
 //   | ts: u64                                                 |
 //   | version: u16                                            |
-//   | metadata: Option<Metadata>                              |
 //   | num_entries: u16                                        |
+//   | metadata: Option<Metadata>                              |
 //   +---------------------------------------------------------+
 
 //   +---------------------------------------------------------+
@@ -85,11 +84,11 @@ impl Entry {
 //
 // TxHeader encoded format:
 //
-//   |---------------------------------------------------------------------------------------------|------------------|
-//   |                              TxHeader                                                       |     TxEntry[]    |
-//   |--------|-------|--------|-------|------------|-----------------|-----------------|----------|------------------|
-//   | crc(4) | id(8) | lsn(8) | ts(8) | version(2) | num_entries(2)  | metadata_len(2) | metadata |  ...entries...   |
-//   |--------|-------|--------|-------|------------|-----------------|-----------------|----------|------------------|
+//   |------------------------------------------------------------------------------------|------------------|
+//   |                              TxHeader                                              |     TxEntry[]    |
+//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
+//   | crc(4) | id(8) | ts(8) | version(2) | num_entries(2)  | metadata_len(2) | metadata |  ...entries...   |
+//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
 //
 // TxEntry encoded format:
 //
@@ -181,7 +180,6 @@ impl TxRecord {
 #[derive(Debug)]
 pub(crate) struct TxHeader {
     pub(crate) id: u64,
-    pub(crate) lsn: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
     pub(crate) num_entries: u32,
@@ -192,7 +190,6 @@ impl TxHeader {
     pub(crate) fn new() -> Self {
         TxHeader {
             id: 0,
-            lsn: 0,
             ts: 0,
             version: TRANSACTION_HEADER_VERSION,
             num_entries: 0,
@@ -218,9 +215,8 @@ impl TxHeader {
             None => (0, Bytes::new()),
         };
 
-        // tx_id(8) + lsn(8) + ts(8) + version(2) + num_entries(4) + meta_data_len(2) + metadata
+        // tx_id(8) + ts(8) + version(2) + num_entries(4) + meta_data_len(2) + metadata
         buf.put_u64(self.id);
-        buf.put_u64(self.lsn);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
         buf.put_u32(self.num_entries);
