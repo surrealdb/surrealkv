@@ -201,7 +201,6 @@ impl TxReader {
         }
 
         tx.header.id = id;
-        tx.header.lsn = self.r.read_uint64()?;
         tx.header.ts = self.r.read_uint64()?;
         tx.header.version = self.r.read_uint16()?;
         tx.header.num_entries = self.r.read_uint32()?;
