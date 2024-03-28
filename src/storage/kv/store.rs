@@ -307,11 +307,8 @@ impl Core {
         // Determine options for the manifest file and open or create it.
         let mut manifest = Self::initialize_manifest(&opts)?;
 
-        // Load or create metadata from the manifest file.
-        let metadata = Core::load_or_create_metadata(&opts, &mut manifest)?;
-
-        // Update options with the loaded metadata.
-        let opts = Options::from_metadata(metadata, opts.dir.clone())?;
+        // Load options from the manifest file.
+        let opts = Core::load_options(&opts, &mut manifest)?;
 
         // Determine options for the commit log file and open or create it.
         let mut clog = Self::initialize_clog(&opts)?;
@@ -447,36 +444,67 @@ impl Core {
         indexer.bulk_insert(&mut kv_pairs)
     }
 
-    fn load_or_create_metadata(opts: &Options, manifest: &mut Aol) -> Result<Metadata> {
+    fn load_options(opts: &Options, manifest: &mut Aol) -> Result<Options> {
         let current_metadata = opts.to_metadata();
-
-        let existing_metadata = match manifest.size()? {
-            0 => Core::load_manifest(opts)?,
-            _ => None,
+        let existing_metadata_list = if !manifest.size()? > 0 {
+            Core::load_manifests(opts)?
+        } else {
+            Vec::new()
         };
 
-        if let Some(existing) = &existing_metadata {
+        Core::validate_options(opts, &existing_metadata_list)?;
+
+        if let Some(existing) = existing_metadata_list.last() {
             if *existing == current_metadata {
-                return Ok(current_metadata);
+                return Options::from_metadata(current_metadata, opts.dir.clone());
             }
         }
 
         let md_bytes = current_metadata.to_bytes()?;
         let mut buf = Vec::new();
+
+        // Write the metadata to the manifest [md_len: u32][md_bytes: Vec<u8>]
         write_field(&md_bytes, &mut buf)?;
         manifest.append(&buf)?;
 
-        Ok(current_metadata)
+        // Update options with the loaded metadata.
+        Options::from_metadata(current_metadata, opts.dir.clone())
     }
 
-    fn load_manifest(opts: &Options) -> Result<Option<Metadata>> {
+    fn validate_options(opts: &Options, existing_metadata_list: &[Metadata]) -> Result<()> {
+        let mut last_max_value_size = 0;
+        let mut last_max_key_size = 0;
+        for metadata in existing_metadata_list {
+            let options = Options::from_metadata(metadata.clone(), opts.dir.clone())?;
+            if options.max_value_size < last_max_value_size {
+                return Err(Error::MaxValueSizeCannotBeDecreased);
+            }
+            if options.max_key_size < last_max_key_size {
+                return Err(Error::MaxKeySizeCannotBeDecreased);
+            }
+            last_max_value_size = options.max_value_size;
+            last_max_key_size = options.max_key_size;
+        }
+
+        // Include current opts in the comparison
+        if opts.max_value_size < last_max_value_size {
+            return Err(Error::MaxValueSizeCannotBeDecreased);
+        }
+        if opts.max_key_size < last_max_key_size {
+            return Err(Error::MaxKeySizeCannotBeDecreased);
+        }
+
+        Ok(())
+    }
+    /// Loads the latest options from the manifest log.
+    fn load_manifests(opts: &Options) -> Result<Vec<Metadata>> {
         let manifest_subdir = opts.dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
         let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
 
-        let mut md: Option<Metadata> = None; // Initialize with None
+        let mut manifests: Vec<Metadata> = Vec::new(); // Initialize with an empty Vec
 
         loop {
             // Read the next transaction record from the log.
@@ -493,10 +521,10 @@ impl Core {
             let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
             let mut md_bytes = vec![0u8; len];
             reader.read(&mut md_bytes)?; // Read the actual metadata
-            md = Some(Metadata::new(Some(md_bytes))); // Update md with the new metadata
+            manifests.push(Metadata::new(Some(md_bytes))); // Add the new metadata to the Vec
         }
 
-        Ok(md)
+        Ok(manifests)
     }
 
     fn is_closed(&self) -> bool {
@@ -725,8 +753,6 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         store.close().await.unwrap();
 
-        drop(store);
-
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
         opts.max_value_cache_size = 5;
@@ -734,6 +760,77 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
         assert_eq!(store_opts, opts);
+    }
+
+    #[tokio::test]
+    async fn increasing_max_key_value_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        let mut opts = opts.clone();
+        opts.max_key_size += 1;
+        opts.max_value_size += 1;
+
+        // Try to create a new store instance with the updated options
+        let result = Store::new(opts.clone());
+        assert!(
+            result.is_ok(),
+            "should not throw an error when max_key_size or max_value_size is increased"
+        );
+    }
+
+    #[tokio::test]
+    async fn decreasing_max_key_value_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        {
+            let mut opts = opts.clone();
+            opts.max_key_size -= 1;
+
+            let result = Store::new(opts.clone());
+            assert!(
+                result.is_err(),
+                "should throw an error when max_key_size is decreased"
+            );
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "Max key size cannot be decreased".to_string()
+            );
+        }
+
+        {
+            let mut opts = opts.clone();
+            opts.max_value_size -= 1;
+            let result = Store::new(opts.clone());
+            assert!(
+                result.is_err(),
+                "should throw an error when max_value_size is decreased"
+            );
+
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "Max value size cannot be decreased".to_string()
+            );
+        }
     }
 
     #[tokio::test]
