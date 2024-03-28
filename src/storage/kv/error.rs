@@ -28,8 +28,8 @@ pub enum Error {
     StoreClosed,                        // The store was closed
     InvalidAttributeData,               // The attribute data is invalid
     UnknownAttributeType,               // The attribute type is unknown
-    CorruptedTransactionRecord,         // The transaction record is corrupted
-    CorruptedTransactionHeader,         // The transaction header is corrupted
+    CorruptedTransactionRecord(String), // The transaction record is corrupted
+    CorruptedTransactionHeader(String), // The transaction header is corrupted
     InvalidTransactionRecordId,         // The transaction record ID is invalid
     EmptyValue,                         // The value in the record is empty
     ManifestNotFound,                   // The manifest was not found
@@ -91,8 +91,12 @@ impl fmt::Display for Error {
             Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
             Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
             Error::LogError(log_error) => write!(f, "Log error: {}", log_error),
-            Error::CorruptedTransactionRecord => write!(f, "Corrupted transaction record"),
-            Error::CorruptedTransactionHeader => write!(f, "Corrupted transaction header"),
+            Error::CorruptedTransactionRecord(msg) => {
+                write!(f, "Corrupted transaction record: {}", msg)
+            }
+            Error::CorruptedTransactionHeader(msg) => {
+                write!(f, "Corrupted transaction header: {}", msg)
+            }
             Error::InvalidTransactionRecordId => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
             Error::ManifestNotFound => write!(f, "Manifest not found"),

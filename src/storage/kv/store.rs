@@ -362,7 +362,7 @@ impl Core {
         let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
 
         // A TxReader is created from the Reader to read transactions.
-        let mut tx_reader = TxReader::new(reader);
+        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
 
         // A TxRecord is created to hold the transactions. The maximum number of entries per transaction is specified.
         let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
@@ -403,12 +403,7 @@ impl Core {
                 "Repairing corrupted segment with id: {} and offset: {}",
                 corrupted_segment_id, corrupted_offset
             );
-            repair_last_corrupted_segment(
-                clog,
-                opts.max_entries_per_txn as usize,
-                corrupted_segment_id,
-                corrupted_offset,
-            )?;
+            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
         }
 
         Ok(())
