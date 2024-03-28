@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::storage::{
     kv::{
         error::{Error, Result},
+        option::Options,
         reader::{Reader, TxReader},
         util::sanitize_directory,
     },
@@ -16,7 +17,7 @@ use crate::storage::{
 /// and also due to the asynchronous nature of calling close on the store.
 pub(crate) fn repair_last_corrupted_segment(
     aol: &mut Aol,
-    max_entries_per_txn: usize,
+    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -45,7 +46,7 @@ pub(crate) fn repair_last_corrupted_segment(
     // Repair the last segment
     repair_segment(
         aol,
-        max_entries_per_txn,
+        db_opts,
         last_segment_id,
         corrupted_offset_marker,
         last_segment_path,
@@ -58,7 +59,7 @@ pub(crate) fn repair_last_corrupted_segment(
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment(
     aol: &mut Aol,
-    max_entries_per_txn: usize,
+    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -88,7 +89,7 @@ pub(crate) fn repair_corrupted_segment(
 
     repair_segment(
         aol,
-        max_entries_per_txn,
+        db_opts,
         corrupted_segment_id,
         corrupted_offset_marker,
         file_path,
@@ -126,7 +127,7 @@ pub(crate) fn repair_corrupted_segment(
 /// If any of these operations fail, the function returns an error.
 fn repair_segment(
     aol: &mut Aol,
-    max_entries_per_txn: usize,
+    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
@@ -156,11 +157,11 @@ fn repair_segment(
 
     // Initialize a reader for the segment
     let reader = Reader::new_from(segment_reader, aol.opts.max_file_size, BLOCK_SIZE);
-    let mut reader = TxReader::new(reader);
+    let mut reader = TxReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
 
     let mut count = 0;
     // Read records until the offset marker is reached
-    while let Ok((data, cur_offset)) = reader.read(max_entries_per_txn) {
+    while let Ok((data, cur_offset)) = reader.read(db_opts.max_entries_per_txn as usize) {
         if cur_offset >= corrupted_offset_marker {
             break;
         }
@@ -278,8 +279,6 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    const MAX_TX_ENTRIES: usize = 10;
-
     async fn setup_store_with_data(opts: Options, keys: Vec<Bytes>, value: Bytes) -> Store {
         let store = Store::new(opts.clone()).expect("should create store");
         append_data(&store, keys, &value).await;
@@ -331,7 +330,7 @@ mod tests {
 
         repair_corrupted_segment(
             &mut clog,
-            MAX_TX_ENTRIES,
+            &opts,
             corrupted_segment_id,
             corrupted_offset_marker,
         )
@@ -348,7 +347,7 @@ mod tests {
             opts.max_segment_size,
             1000,
         );
-        let mut tx_reader = TxReader::new(reader);
+        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
         let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
 
         loop {
@@ -735,6 +734,16 @@ mod tests {
 
         // Restart store to see if all entries are read
         let store = Store::new(opts.clone()).expect("should create store");
+
+        // Entries after corruption offset should not be present
+        let expected_deleted_keys = vec!["k6"];
+        for key in expected_deleted_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key).unwrap(), None);
+        }
 
         // Check if a new transaction can be appended post repair
         let new_keys = vec![Bytes::from("k7")];

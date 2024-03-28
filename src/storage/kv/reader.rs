@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 
 use crate::storage::{
     kv::{
-        entry::{TxEntry, TxRecord, MAX_TX_METADATA_SIZE},
+        entry::{TxEntry, TxRecord, MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
         util::calculate_crc32,
@@ -16,39 +16,23 @@ use crate::storage::{
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `TxReader` to read data from the Aol source.
-///
-/// # Fields
-/// * `rdr: Aol` - Represents the current position in the Aol source.
-/// * `buffer: Vec<u8>` - A buffer that temporarily holds data read from the source.
-/// * `read: usize` - The number of bytes read from the source.
-/// * `start: usize` - The starting position for reading data.
-/// * `eof: bool` - A flag indicating if the end of the file/data source has been reached.
-/// * `offset: u64` - The offset from the beginning of the file/data source.
 pub(crate) struct Reader {
     rdr: MultiSegmentReader,
     buffer: Vec<u8>,
     read: usize,
     start: usize,
-    // offset: u64,
     file_size: u64,
     err: Option<Error>,
 }
 
 impl Reader {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    ///
-    /// # Arguments
-    ///
-    /// * `rdr: Aol` - The current position in the data source.
-    /// * `off: u64` - The offset from the beginning of the file/data source.
-    /// * `size: usize` - The size of the buffer.
     pub(crate) fn new_from(rdr: MultiSegmentReader, file_size: u64, size: usize) -> Self {
         Reader {
             rdr,
             buffer: vec![0; size],
             read: 0,
             start: 0,
-            // offset: off,
             file_size,
             err: None,
         }
@@ -68,10 +52,6 @@ impl Reader {
     }
 
     /// Reads data into the provided buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf: &mut [u8]` - The buffer to read data into.
     pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if let Some(err) = &self.err {
             return Err(err.clone());
@@ -116,7 +96,6 @@ impl Reader {
 
             self.read = buf_len;
             self.start = 0;
-            // self.offset += buf_len as u64;
         }
         Ok(n)
     }
@@ -170,6 +149,8 @@ pub(crate) struct TxReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
+    max_key_size: u64,
+    max_value_size: u64,
 }
 
 impl TxReader {
@@ -178,11 +159,13 @@ impl TxReader {
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
-    pub(crate) fn new(r: Reader) -> Self {
+    pub(crate) fn new(r: Reader, max_key_size: u64, max_value_size: u64) -> Self {
         TxReader {
             r,
             err: None,
             rec: Vec::new(),
+            max_key_size,
+            max_value_size,
         }
     }
 
@@ -211,7 +194,9 @@ impl TxReader {
 
             return Err(Error::LogError(Corruption(CorruptionError::new(
                 std::io::ErrorKind::Other,
-                Error::CorruptedTransactionHeader.to_string().as_str(),
+                Error::CorruptedTransactionHeader("metadata length exceeds maximum".to_string())
+                    .to_string()
+                    .as_str(),
                 segment_id,
                 offset,
             ))));
@@ -233,9 +218,13 @@ impl TxReader {
 
     /// Reads a transaction entry.
     fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
-        let md_len = self.r.read_uint16()?;
+        let md_len = self.r.read_uint16()? as usize;
+        if md_len > MAX_KV_METADATA_SIZE {
+            return self.corrupt_record_error("metadata length exceeds maximum");
+        }
+
         let kvmd = if md_len > 0 {
-            let md_bs = self.r.read_bytes(md_len as usize)?;
+            let md_bs = self.r.read_bytes(md_len)?;
             let metadata = Metadata::from_bytes(&md_bs)?;
             Some(metadata)
         } else {
@@ -243,9 +232,17 @@ impl TxReader {
         };
 
         let k_len = self.r.read_uint32()? as usize;
+        if k_len > self.max_key_size as usize {
+            return self.corrupt_record_error("key length exceeds maximum");
+        }
+
         let k = self.r.read_bytes(k_len)?;
 
         let v_len = self.r.read_uint32()? as usize;
+        if v_len > self.max_value_size as usize {
+            return self.corrupt_record_error("value length exceeds maximum");
+        }
+
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
         let crc32 = self.r.read_uint32()?;
@@ -263,11 +260,20 @@ impl TxReader {
         ))
     }
 
+    fn corrupt_record_error(&self, message: &str) -> Result<(TxEntry, u64)> {
+        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
+
+        Err(Error::LogError(Corruption(CorruptionError::new(
+            std::io::ErrorKind::Other,
+            Error::CorruptedTransactionRecord(message.to_string())
+                .to_string()
+                .as_str(),
+            segment_id,
+            offset,
+        ))))
+    }
+
     /// Reads a transaction record into the provided `TxRecord`.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx: &mut TxRecord` - The `TxRecord` to read data into.
     pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
         self.read_header(tx)?;
 
@@ -285,10 +291,6 @@ impl TxReader {
     }
 
     /// Verifies the CRC of a transaction record.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx: &TxRecord` - The `TxRecord` to verify the CRC of.    
     fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
         let entry_crc = self.r.read_uint32()?;
         let buf = Self::serialize_tx_record(tx)?;
@@ -298,7 +300,9 @@ impl TxReader {
 
             return Err(Error::LogError(Corruption(CorruptionError::new(
                 std::io::ErrorKind::Other,
-                Error::CorruptedTransactionRecord.to_string().as_str(),
+                Error::CorruptedTransactionRecord("CRC mismatch".to_string())
+                    .to_string()
+                    .as_str(),
                 segment_id,
                 offset,
             ))));
@@ -308,10 +312,6 @@ impl TxReader {
     }
 
     /// Serializes a transaction record.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx: &TxRecord` - The `TxRecord` to serialize.
     pub(crate) fn serialize_tx_record(tx: &TxRecord) -> Result<Bytes> {
         let mut buf = BytesMut::new();
         tx.to_buf(&mut buf)?;
