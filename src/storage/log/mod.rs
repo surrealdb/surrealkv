@@ -945,7 +945,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
     fn open_file(file_path: &Path, opts: &Options) -> Result<File> {
         let mut open_options = OpenOptions::new();
-        open_options.read(true).write(true);
+        open_options.read(true).append(true);
 
         #[cfg(unix)]
         {
@@ -1023,11 +1023,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
         let n = p.unwritten();
 
-        // write_all will write the entire buffer to the file
-        // hence ensuring atomic writes to the file
-
-        // Seek to the end of the file before writing because the cursor might have been moved during read
-        self.file.seek(SeekFrom::End(0))?;
+        // write_all does atomic writes to the file (in this case the os buffer)
         self.file.write_all(&p.buf[p.flushed..p.written])?;
         p.flushed += n;
         self.file_offset += n as u64;
@@ -1409,9 +1405,11 @@ impl Read for MultiSegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::io::Seek;
+    use std::io::{Read, SeekFrom, Write};
     use tempdir::TempDir;
 
     #[test]
@@ -2486,5 +2484,79 @@ mod tests {
         let bytes_read = buf_reader.read(&mut bs).expect("should read");
         assert_eq!(bytes_read, 6);
         assert_eq!(&[4, 5, 6, 7, 8, 9].to_vec(), &bs[..]);
+    }
+
+    #[test]
+    fn file_option_with_write_mode() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a path to the file in the temporary directory
+        let file_path = temp_dir.path().join("testfile.txt");
+
+        // Create a new file in the temporary directory
+        let mut file = File::create(&file_path).unwrap();
+
+        // Write some content to the file
+        file.write_all(b"Hello, world!").unwrap();
+
+        // Open the file with append and read permissions
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        // Read the first 5 bytes from the file
+        let mut buffer = [0; 5];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"Hello");
+
+        // Append more content to the file
+        file.write_all(b" More content.").unwrap();
+
+        // Read from the start of the file again
+        let mut new_content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut new_content).unwrap();
+        // Should have overwritten the data in the file
+        assert_ne!(new_content, "Hello, world! More content.");
+    }
+
+    #[test]
+    fn file_option_with_append_mode() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a path to the file in the temporary directory
+        let file_path = temp_dir.path().join("testfile.txt");
+
+        // Create a new file in the temporary directory
+        let mut file = File::create(&file_path).unwrap();
+
+        // Write some content to the file
+        file.write_all(b"Hello, world!").unwrap();
+
+        // Open the file with append and read permissions
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+
+        // Read the first 5 bytes from the file
+        let mut buffer = [0; 5];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"Hello");
+
+        // Append more content to the file
+        file.write_all(b" More content.").unwrap();
+
+        // Read from the start of the file again
+        let mut new_content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut new_content).unwrap();
+        // Should not have overwritten the data in the file
+        assert_eq!(new_content, "Hello, world! More content.");
     }
 }
