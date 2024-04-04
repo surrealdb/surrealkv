@@ -1257,12 +1257,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn weak_durability() {
-        test_durability(Durability::Weak).await;
+        test_durability(Durability::Weak, true).await;
     }
 
     #[tokio::test]
     async fn eventual_durability() {
-        test_durability(Durability::Eventual, true).await;
+        test_durability(Durability::Eventual, false).await;
     }
 
     #[tokio::test]
