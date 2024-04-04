@@ -146,7 +146,7 @@ impl Aol {
 
         // Check if the record is larger than the maximum file size
         if rec.len() > self.opts.max_file_size as usize {
-            println!("rec len {} {}", rec.len(), self.opts.max_file_size);
+            eprintln!("rec len {} {}", rec.len(), self.opts.max_file_size);
             return Err(Error::RecordTooLarge);
         }
 
@@ -202,6 +202,12 @@ impl Aol {
     pub fn sync(&mut self) -> Result<()> {
         self.check_if_fsync_failed()?;
         self.active_segment.sync()
+    }
+
+    /// Flushes the active segment.
+    pub fn flush(&mut self) -> Result<()> {
+        self.check_if_fsync_failed()?;
+        self.active_segment.flush()
     }
 
     // Helper function to calculate offset
