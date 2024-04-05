@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::storage::{kv::error::Result, kv::option::Options};
+use crate::storage::kv::error::Result;
 
 use vart::{
     art::{Tree as VartIndex, KV},
@@ -17,14 +17,13 @@ pub(crate) struct Indexer {
 impl Indexer {
     /// Creates a new `Indexer` instance.
     /// The maximum number of active snapshots is set based on the provided options.
-    pub(crate) fn new(opts: &Options) -> Self {
-        let mut index = VartIndex::new();
-        index.set_max_active_snapshots(opts.max_active_snapshots);
+    pub(crate) fn new() -> Self {
+        let index = VartIndex::new();
         Self { index }
     }
 
     /// Creates a snapshot of the current state of the index.
-    pub(crate) fn snapshot(&mut self) -> Result<VartSnapshot<VariableSizeKey, Bytes>> {
+    pub(crate) fn snapshot(&self) -> Result<VartSnapshot<VariableSizeKey, Bytes>> {
         let snapshot = self.index.create_snapshot()?;
         Ok(snapshot)
     }
@@ -43,12 +42,6 @@ impl Indexer {
     /// Returns the current version of the index.
     pub fn version(&self) -> u64 {
         self.index.version()
-    }
-
-    /// Closes a snapshot of the index.
-    pub(crate) fn close_snapshot(&mut self, snapshot_id: u64) -> Result<()> {
-        self.index.close_snapshot(snapshot_id)?;
-        Ok(())
     }
 
     /// Closes the index.

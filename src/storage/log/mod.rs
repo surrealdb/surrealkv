@@ -17,7 +17,7 @@ use hashbrown::HashMap;
 /// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
 /// flushing to disk. Larger block sizes can improve write performance but might use more memory.
-pub(crate) const BLOCK_SIZE: usize = 32768;
+pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
 
 /// Length of the record header in bytes.
 ///
@@ -430,16 +430,6 @@ impl Metadata {
 
         let int_value = u64::from_be_bytes(value_bytes);
         Ok(int_value)
-    }
-
-    pub(crate) fn put_bool(&mut self, key: &str, b: bool) {
-        let value = if b { 1 } else { 0 };
-        self.put_uint(key, value);
-    }
-
-    pub(crate) fn get_bool(&self, key: &str) -> Result<bool> {
-        let value = self.get_uint(key)?;
-        Ok(value == 1)
     }
 
     // Generic method to put a key-value pair into the data HashMap
@@ -972,7 +962,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(file)
     }
 
-    fn flush_and_sync(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         if self.block.written > 0 {
             // Flush the full block to disk if it is a WAL with zero padded
             // to the end of the last block. This is done to avoid writing
@@ -986,6 +976,11 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             }
         }
 
+        Ok(())
+    }
+
+    fn flush_and_sync(&mut self) -> Result<()> {
+        self.flush()?;
         self.file.sync_all()?;
 
         Ok(())
@@ -1072,17 +1067,11 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
     pub(crate) fn append(&mut self, mut rec: &[u8]) -> Result<(u64, usize)> {
         // If the segment is closed, return an error
         if self.closed {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Segment is closed",
-            )));
+            return Err(Error::SegmentClosed);
         }
 
         if rec.is_empty() {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "buf is empty",
-            )));
+            return Err(Error::EmptyBuffer);
         }
 
         let offset = self.offset();
@@ -1202,7 +1191,7 @@ impl<const RECORD_HEADER_SIZE: usize> Drop for Segment<RECORD_HEADER_SIZE> {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Custom error type for the storage module
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
@@ -1210,6 +1199,7 @@ pub enum Error {
     Eof(usize),
     IO(IOError),
     Poison(String),
+    RecordTooLarge,
 }
 
 // Implementation of Display trait for Error
@@ -1222,6 +1212,7 @@ impl fmt::Display for Error {
             Error::IO(err) => write!(f, "IO error: {}", err),
             Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
             Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::RecordTooLarge => write!(f, "Record too large"),
         }
     }
 }
@@ -1246,7 +1237,7 @@ impl<T: Sized> From<PoisonError<T>> for Error {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IOError {
     kind: io::ErrorKind,
     message: String,
@@ -1267,7 +1258,7 @@ impl fmt::Display for IOError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,
@@ -1432,13 +1423,6 @@ mod tests {
         let mut metadata = Metadata::new(None);
         metadata.put_uint("age", 25);
         assert_eq!(metadata.get_uint("age").unwrap(), 25);
-    }
-
-    #[test]
-    fn put_and_get_bool() {
-        let mut metadata = Metadata::new(None);
-        metadata.put_bool("is_active", true);
-        assert!(metadata.get_bool("is_active").unwrap());
     }
 
     #[test]
@@ -2406,5 +2390,51 @@ mod tests {
         let dest_len = copy_into_dest_from_src(&mut dest, 5, &src, src.len());
         assert_eq!(dest_len, 10);
         assert_eq!(dest, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn sync_on_synced_segment() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create segment options and open a segment
+        let opts = Options::default();
+        let mut segment: Segment<0> =
+            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        let sz = segment.offset();
+        assert_eq!(0, sz);
+
+        // Test appending a non-empty buffer
+        let r = segment.append(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert!(r.is_ok());
+        assert_eq!(11, r.unwrap().1);
+
+        // Validate offset after appending
+        assert_eq!(segment.offset(), 11);
+
+        // Test syncing segment
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
+
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
+
+        segment.close().expect("should close segment");
+
+        // Reopen segment and validate offset
+        let mut segment: Segment<0> =
+            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+
+        // Test initial offset
+        let sz = segment.offset();
+        assert_eq!(11, sz);
+
+        let r = segment.sync();
+        assert!(r.is_ok());
+        assert_eq!(segment.offset(), 11);
     }
 }

@@ -77,21 +77,6 @@ impl Snapshot {
     pub fn new_reader(&mut self) -> Result<IterationPointer<VariableSizeKey, Bytes>> {
         Ok(self.snap.new_reader()?)
     }
-
-    pub fn close(&mut self) -> Result<()> {
-        let mut indexer = self.store.indexer.write();
-        indexer.close_snapshot(self.snap.id())?;
-        Ok(())
-    }
-}
-
-impl Drop for Snapshot {
-    fn drop(&mut self) {
-        let err = self.close();
-        if err.is_err() {
-            panic!("failed to close snapshot: {:?}", err);
-        }
-    }
 }
 
 pub(crate) trait FilterFn {
