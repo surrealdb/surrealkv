@@ -203,6 +203,12 @@ impl Aol {
         self.active_segment.sync()
     }
 
+    /// Flushes the active segment.
+    pub fn flush(&mut self) -> Result<()> {
+        self.check_if_fsync_failed()?;
+        self.active_segment.flush()
+    }
+
     // Helper function to calculate offset
     fn calculate_offset(&self) -> u64 {
         self.active_segment_id * self.opts.max_file_size

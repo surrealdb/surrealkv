@@ -964,7 +964,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(file)
     }
 
-    fn flush_and_sync(&mut self) -> Result<()> {
+    fn flush(&mut self) -> Result<()> {
         if self.block.written > 0 {
             // Flush the full block to disk if it is a WAL with zero padded
             // to the end of the last block. This is done to avoid writing
@@ -978,6 +978,11 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             }
         }
 
+        Ok(())
+    }
+
+    fn flush_and_sync(&mut self) -> Result<()> {
+        self.flush()?;
         self.file.sync_all()?;
 
         Ok(())

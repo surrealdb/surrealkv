@@ -592,6 +592,16 @@ impl Core {
                 clog.sync()?;
             }
             Durability::Eventual => {
+                // Eventual durability means that the transaction is made to
+                // write to disk using the write_all method. But it does not
+                // fsync the data to disk before returning.
+                clog.append(tx_record)?;
+                clog.flush()?;
+            }
+            Durability::Weak => {
+                // Weak durability means that the transaction is made to
+                // write to disk in size of BLOCK_SIZE. And it does not
+                // fsync the data to disk before returning.
                 clog.append(tx_record)?;
             }
         }
@@ -1079,10 +1089,11 @@ mod tests {
         }
     }
 
-    // This test is relevant today because unless the store is dropped, the data will not be persisted to disk.
-    // Once the store automatically syncs the data to disk, this test will not verify the intended behaviour.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn records_not_lost_when_store_is_dropped() {
+    async fn test_records_when_store_is_dropped(
+        durability: Durability,
+        wait: bool,
+        should_exist: bool,
+    ) {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1099,6 +1110,7 @@ mod tests {
 
             // Insert an item into the store
             let mut txn = store.begin().unwrap();
+            txn.set_durability(durability);
             txn.set(key, value).unwrap();
             txn.commit().await.unwrap();
 
@@ -1106,8 +1118,10 @@ mod tests {
             drop(store);
         }
 
-        // Give some room for the store to close asynchronously
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if wait {
+            // Give some room for the store to close asynchronously
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
 
         {
             // Reopen the store
@@ -1117,8 +1131,41 @@ mod tests {
             let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
 
-            assert_eq!(val.unwrap(), value);
+            if should_exist {
+                assert_eq!(val.unwrap(), value);
+            } else {
+                assert!(val.is_none());
+            }
         }
+    }
+
+    // This test is relevant today because unless the store is dropped, the data will not be persisted to disk.
+    // Once the store automatically syncs the data to disk, this test will not verify the intended behaviour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn weak_durability_records_persist_after_drop() {
+        test_records_when_store_is_dropped(Durability::Weak, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn eventual_durability_records_persist_after_drop() {
+        test_records_when_store_is_dropped(Durability::Eventual, true, true).await;
+    }
+
+    // This simulates the case where the store is dropped and not closed, which will cause the data to be lost.
+    #[tokio::test]
+    async fn weak_durability_records_lost_without_wait() {
+        test_records_when_store_is_dropped(Durability::Weak, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn eventual_durability_records_persist_without_wait() {
+        test_records_when_store_is_dropped(Durability::Eventual, false, true).await;
+    }
+
+    #[tokio::test]
+    async fn strong_durability_records_persist() {
+        test_records_when_store_is_dropped(Durability::Immediate, true, true).await;
+        test_records_when_store_is_dropped(Durability::Immediate, false, true).await;
     }
 
     #[tokio::test]
@@ -1209,8 +1256,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn weak_durability() {
+        test_durability(Durability::Weak, true).await;
+    }
+
+    #[tokio::test]
     async fn eventual_durability() {
-        test_durability(Durability::Eventual, true).await;
+        test_durability(Durability::Eventual, false).await;
     }
 
     #[tokio::test]
