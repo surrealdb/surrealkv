@@ -304,8 +304,17 @@ impl Aol {
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
+        // Lock the mutex to ensure thread safety
         let _lock = self.mutex.lock();
-        Ok((self.active_segment_id * self.opts.max_file_size) + self.active_segment.offset())
+
+        // Calculate the base offset
+        let base_offset = self.calculate_offset();
+
+        // Get the offset of the active segment
+        let active_segment_offset = self.active_segment.offset();
+
+        // Add the calculated offset to the offset of the active segment
+        Ok(base_offset + active_segment_offset)
     }
 
     pub fn size(&self) -> Result<u64> {

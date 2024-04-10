@@ -63,23 +63,23 @@ pub(crate) fn repair_corrupted_segment(
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
-    // Read the list of segments from the directory
-    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
-
     let mut file_path = None;
     let mut file_header_offset = 0;
-    // Loop through the segments
-    for s in &segs {
-        // If the segment ID matches the corrupted segment ID, repair the segment
-        if s.id == corrupted_segment_id {
-            file_path = Some(s.file_path.clone());
-            file_header_offset = s.file_header_offset;
-            break;
+
+    {
+        // Read the list of segments from the directory
+        let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+
+        // Loop through the segments
+        for s in &segs {
+            // If the segment ID matches the corrupted segment ID, repair the segment
+            if s.id == corrupted_segment_id {
+                file_path = Some(s.file_path.clone());
+                file_header_offset = s.file_header_offset;
+                break;
+            }
         }
     }
-
-    // Explicitly drop the segments here to ensure no file descriptors are kept
-    drop(segs);
 
     // Check if file_path is found, if not return an error
     let file_path = match file_path {
