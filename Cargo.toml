@@ -1,7 +1,7 @@
 [package]
 name = "surrealkv"
 publish = true
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 readme = "README.md"
@@ -29,7 +29,7 @@ bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.4.0"
-vart = "0.1.2"
+vart = "0.2.0"
 
 
 [dev-dependencies]
