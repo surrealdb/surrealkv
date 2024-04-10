@@ -21,11 +21,12 @@ use crate::storage::{
         option::Options,
         oracle::Oracle,
         reader::{Reader, TxReader},
+        repair::{repair_last_corrupted_segment, restore_repair_files},
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::Aol,
-        {write_field, Options as LogOptions, BLOCK_SIZE}, {Error as LogError, Metadata},
+        aof::log::Aol, write_field, Error as LogError, Metadata, MultiSegmentReader,
+        Options as LogOptions, SegmentRef, BLOCK_SIZE,
     },
 };
 
@@ -256,6 +257,43 @@ pub struct Task {
 }
 
 impl Core {
+    fn initialize_indexer() -> Indexer {
+        Indexer::new()
+    }
+
+    // This function initializes the manifest log for the database to store all settings.
+    fn initialize_manifest(opts: &Options) -> Result<Aol> {
+        let manifest_subdir = opts.dir.join("manifest");
+        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
+        Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
+    }
+
+    // This function initializes the commit log (clog) for the database.
+    fn initialize_clog(opts: &Options) -> Result<Aol> {
+        // It first constructs the path to the clog subdirectory within the database directory.
+        let clog_subdir = opts.dir.join("clog");
+
+        // Then it creates a LogOptions object to configure the clog.
+        // The maximum file size for the clog is set to the max_segment_size option from the database options.
+        // The file extension for the clog files is set to "clog".
+        let copts = LogOptions::default()
+            .with_max_file_size(opts.max_segment_size)
+            .with_file_extension("clog".to_string());
+
+        // It then attempts to restore any repair files in the clog subdirectory.
+        // If this fails, the error is propagated up to the caller of the function.
+        // This is required because the repair operation may have failed, and the
+        // store should not be opened with existing repair files.
+        //
+        // Even though we are restoring the corrupted files, it will get repaired
+        // during in the load_index function.
+        restore_repair_files(clog_subdir.as_path().to_str().unwrap())?;
+
+        // Finally, it attempts to open the clog with the specified options.
+        // If this fails, the error is converted to a database error and then propagated up to the caller of the function.
+        Aol::open(&clog_subdir, &copts).map_err(Error::from)
+    }
+
     /// Creates a new Core with the given options.
     /// It initializes a new Indexer, opens or creates the manifest file,
     /// loads or creates metadata from the manifest file, updates the options with the loaded metadata,
@@ -264,29 +302,20 @@ impl Core {
     /// the Core instance.
     pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
-        let mut indexer = Indexer::new();
+        let mut indexer = Self::initialize_indexer();
 
         // Determine options for the manifest file and open or create it.
-        let manifest_subdir = opts.dir.join("manifest");
-        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        let mut manifest = Aol::open(&manifest_subdir, &mopts)?;
+        let mut manifest = Self::initialize_manifest(&opts)?;
 
-        // Load or create metadata from the manifest file.
-        let metadata = Core::load_or_create_metadata(&opts, &mopts, &mut manifest)?;
-
-        // Update options with the loaded metadata.
-        let opts = Options::from_metadata(metadata, opts.dir.clone())?;
+        // Load options from the manifest file.
+        let opts = Core::load_options(&opts, &mut manifest)?;
 
         // Determine options for the commit log file and open or create it.
-        let clog_subdir = opts.dir.join("clog");
-        let copts = LogOptions::default()
-            .with_max_file_size(opts.max_segment_size)
-            .with_file_extension("clog".to_string());
-        let clog = Aol::open(&clog_subdir, &copts)?;
+        let mut clog = Self::initialize_clog(&opts)?;
 
         // Load the index from the commit log if it exists.
         if clog.size()? > 0 {
-            Core::load_index(&opts, &copts, &mut indexer)?;
+            Core::load_index(&opts, &mut clog, &mut indexer)?;
         }
 
         // Create and initialize an Oracle.
@@ -317,32 +346,64 @@ impl Core {
         Ok(self.oracle.read_ts())
     }
 
-    fn load_index(opts: &Options, copts: &LogOptions, indexer: &mut Indexer) -> Result<()> {
+    // The load_index function is responsible for loading the index from the log.
+    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<()> {
+        // The directory where the log segments are stored is determined.
         let clog_subdir = opts.dir.join("clog");
-        let clog = Aol::open(&clog_subdir, copts)?;
-        let reader = Reader::new_from(clog, 0, BLOCK_SIZE)?;
-        let mut tx_reader = TxReader::new(reader)?;
-        let mut tx = TxRecord::new(opts.max_tx_entries as usize);
 
+        // The segments are read from the directory.
+        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
+            .expect("should read segments");
+
+        // A MultiSegmentReader is created to read from multiple segments.
+        let reader = MultiSegmentReader::new(sr)?;
+
+        // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
+        let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
+
+        // A TxReader is created from the Reader to read transactions.
+        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
+
+        // A TxRecord is created to hold the transactions. The maximum number of entries per transaction is specified.
+        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+
+        // An Option is created to hold the segment ID and offset in case of corruption.
+        let mut corruption_info: Option<(u64, u64)> = None;
+
+        // A loop is started to read transactions.
         loop {
-            // Reset the transaction record before reading into it.
-            // Keeping the same transaction record instance avoids
-            // unnecessary allocations.
+            // The TxRecord is reset for each iteration.
             tx.reset();
 
-            // Read the next transaction record from the log.
-            let value_offsets = match tx_reader.read_into(&mut tx) {
-                Ok(value_offsets) => value_offsets,
-                Err(e) => {
-                    if let Error::LogError(LogError::Eof(_)) = e {
-                        break;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+            // The TxReader attempts to read into the TxRecord.
+            match tx_reader.read_into(&mut tx) {
+                // If the read is successful, the entries are processed.
+                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
 
-            Core::process_entries(&tx, opts, &value_offsets, indexer)?;
+                // If the end of the file is reached, the loop is broken.
+                Err(Error::LogError(LogError::Eof(_))) => break,
+
+                // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
+                Err(Error::LogError(LogError::Corruption(err))) => {
+                    corruption_info = Some((err.segment_id, err.offset));
+                    break;
+                }
+
+                // If any other error is encountered, it is returned immediately.
+                Err(err) => return Err(err),
+            };
+        }
+
+        // If a corruption was encountered, the last segment is repaired using the stored segment ID and offset.
+        // The reason why the last segment is repaired is because the last segment is the one that was being actively
+        // written to and acts like the active WAL file. Any corruption in the previous immutable segments is pure
+        // corruption of the data and should be handled by the user.
+        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
+            eprintln!(
+                "Repairing corrupted segment with id: {} and offset: {}",
+                corrupted_segment_id, corrupted_offset
+            );
+            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
         }
 
         Ok(())
@@ -354,59 +415,91 @@ impl Core {
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs = Vec::new();
+        let mut kv_pairs: Vec<KV<vart::VariableSizeKey, Bytes>> = tx
+            .entries
+            .iter()
+            .map(|entry| {
+                let index_value = ValueRef::encode(
+                    &entry.key,
+                    &entry.value,
+                    entry.metadata.as_ref(),
+                    value_offsets,
+                    opts.max_value_threshold,
+                );
 
-        for entry in &tx.entries {
-            let index_value = ValueRef::encode(
-                &entry.key,
-                &entry.value,
-                entry.metadata.as_ref(),
-                value_offsets,
-                opts.max_value_threshold,
-            );
-
-            kv_pairs.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: tx.header.id,
-                ts: tx.header.ts,
-            });
-        }
+                KV {
+                    key: entry.key[..].into(),
+                    value: index_value,
+                    version: tx.header.id,
+                    ts: tx.header.ts,
+                }
+            })
+            .collect();
 
         indexer.bulk_insert(&mut kv_pairs)
     }
 
-    fn load_or_create_metadata(
-        opts: &Options,
-        mopts: &LogOptions,
-        manifest: &mut Aol,
-    ) -> Result<Metadata> {
+    fn load_options(opts: &Options, manifest: &mut Aol) -> Result<Options> {
         let current_metadata = opts.to_metadata();
-        let existing_metadata = if !manifest.size()? > 0 {
-            Core::load_manifest(opts, mopts)?
+        let existing_metadata_list = if !manifest.size()? > 0 {
+            Core::load_manifests(opts)?
         } else {
-            None
+            Vec::new()
         };
 
-        match existing_metadata {
-            Some(existing) if existing == current_metadata => Ok(current_metadata),
-            _ => {
-                let md_bytes = current_metadata.to_bytes()?;
-                let mut buf = Vec::new();
-                write_field(&md_bytes, &mut buf)?;
-                manifest.append(&buf)?;
+        Core::validate_options(opts, &existing_metadata_list)?;
 
-                Ok(current_metadata)
+        if let Some(existing) = existing_metadata_list.last() {
+            if *existing == current_metadata {
+                return Options::from_metadata(current_metadata, opts.dir.clone());
             }
         }
+
+        let md_bytes = current_metadata.to_bytes()?;
+        let mut buf = Vec::new();
+
+        // Write the metadata to the manifest [md_len: u32][md_bytes: Vec<u8>]
+        write_field(&md_bytes, &mut buf)?;
+        manifest.append(&buf)?;
+
+        // Update options with the loaded metadata.
+        Options::from_metadata(current_metadata, opts.dir.clone())
     }
 
-    fn load_manifest(opts: &Options, mopts: &LogOptions) -> Result<Option<Metadata>> {
-        let manifest_subdir = opts.dir.join("manifest");
-        let mlog = Aol::open(&manifest_subdir, mopts)?;
-        let mut reader = Reader::new_from(mlog, 0, BLOCK_SIZE)?;
+    fn validate_options(opts: &Options, existing_metadata_list: &[Metadata]) -> Result<()> {
+        let mut last_max_value_size = 0;
+        let mut last_max_key_size = 0;
+        for metadata in existing_metadata_list {
+            let options = Options::from_metadata(metadata.clone(), opts.dir.clone())?;
+            if options.max_value_size < last_max_value_size {
+                return Err(Error::MaxValueSizeCannotBeDecreased);
+            }
+            if options.max_key_size < last_max_key_size {
+                return Err(Error::MaxKeySizeCannotBeDecreased);
+            }
+            last_max_value_size = options.max_value_size;
+            last_max_key_size = options.max_key_size;
+        }
 
-        let mut md: Option<Metadata> = None; // Initialize with None
+        // Include current opts in the comparison
+        if opts.max_value_size < last_max_value_size {
+            return Err(Error::MaxValueSizeCannotBeDecreased);
+        }
+        if opts.max_key_size < last_max_key_size {
+            return Err(Error::MaxKeySizeCannotBeDecreased);
+        }
+
+        Ok(())
+    }
+    /// Loads the latest options from the manifest log.
+    fn load_manifests(opts: &Options) -> Result<Vec<Metadata>> {
+        let manifest_subdir = opts.dir.join("manifest");
+        let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
+            .expect("should read segments");
+        let reader = MultiSegmentReader::new(sr)?;
+        let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
+
+        let mut manifests: Vec<Metadata> = Vec::new(); // Initialize with an empty Vec
 
         loop {
             // Read the next transaction record from the log.
@@ -423,10 +516,10 @@ impl Core {
             let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
             let mut md_bytes = vec![0u8; len];
             reader.read(&mut md_bytes)?; // Read the actual metadata
-            md = Some(Metadata::new(Some(md_bytes))); // Update md with the new metadata
+            manifests.push(Metadata::new(Some(md_bytes))); // Add the new metadata to the Vec
         }
 
-        Ok(md)
+        Ok(manifests)
     }
 
     fn is_closed(&self) -> bool {
@@ -587,7 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_insert() {
+    async fn bulk_insert_and_reload() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -634,10 +727,11 @@ mod tests {
         // Drop the store to simulate closing it
         store.close().await.unwrap();
 
-        // Create a new Core instance with VariableKey after dropping the previous one
+        // Create a new store instance but with values read from disk
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 3;
+        // This is to ensure values are read from disk
+        opts.max_value_threshold = 0;
 
         let store = Store::new(opts).expect("should create store");
 
@@ -664,8 +758,6 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         store.close().await.unwrap();
 
-        drop(store);
-
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
         opts.max_value_cache_size = 5;
@@ -673,6 +765,77 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
         assert_eq!(store_opts, opts);
+    }
+
+    #[tokio::test]
+    async fn increasing_max_key_value_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        let mut opts = opts.clone();
+        opts.max_key_size += 1;
+        opts.max_value_size += 1;
+
+        // Try to create a new store instance with the updated options
+        let result = Store::new(opts.clone());
+        assert!(
+            result.is_ok(),
+            "should not throw an error when max_key_size or max_value_size is increased"
+        );
+    }
+
+    #[tokio::test]
+    async fn decreasing_max_key_value_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        {
+            let mut opts = opts.clone();
+            opts.max_key_size -= 1;
+
+            let result = Store::new(opts.clone());
+            assert!(
+                result.is_err(),
+                "should throw an error when max_key_size is decreased"
+            );
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "Max key size cannot be decreased".to_string()
+            );
+        }
+
+        {
+            let mut opts = opts.clone();
+            opts.max_value_size -= 1;
+            let result = Store::new(opts.clone());
+            assert!(
+                result.is_err(),
+                "should throw an error when max_value_size is decreased"
+            );
+
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "Max value size cannot be decreased".to_string()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1043,7 +1206,7 @@ mod tests {
         pairs
     }
 
-    async fn test_durability(durability: Durability) {
+    async fn test_durability(durability: Durability, wait_enabled: bool) {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1072,6 +1235,11 @@ mod tests {
             drop(store);
         }
 
+        // Wait for a while to let close be called on drop as it is executed asynchronously
+        if wait_enabled {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
         let store = Store::new(opts.clone()).expect("should create store");
         let txn = store.begin().unwrap();
 
@@ -1089,16 +1257,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn weak_durability() {
-        test_durability(Durability::Weak).await;
+        test_durability(Durability::Weak, true).await;
     }
 
     #[tokio::test]
     async fn eventual_durability() {
-        test_durability(Durability::Eventual).await;
+        test_durability(Durability::Eventual, false).await;
     }
 
     #[tokio::test]
     async fn immediate_durability() {
-        test_durability(Durability::Immediate).await;
+        test_durability(Durability::Immediate, false).await;
     }
 }

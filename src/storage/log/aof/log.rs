@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lru::LruCache;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -20,22 +20,22 @@ const RECORD_HEADER_SIZE: usize = 0;
 /// writing data in a sequential manner.
 pub struct Aol {
     /// The currently active segment where data is being written.
-    active_segment: Segment<RECORD_HEADER_SIZE>,
+    pub(crate) active_segment: Segment<RECORD_HEADER_SIZE>,
 
     /// The ID of the currently active segment.
-    active_segment_id: u64,
+    pub(crate) active_segment_id: u64,
 
     /// The directory where the segment files are located.
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
 
     /// Configuration options for the AOL instance.
-    opts: Options,
+    pub(crate) opts: Options,
 
     /// A flag indicating whether the AOL instance is closed or not.
     closed: bool,
 
     /// A read-write lock used to synchronize concurrent access to the AOL instance.
-    mutex: RwLock<()>,
+    mutex: Mutex<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
     segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
@@ -77,7 +77,7 @@ impl Aol {
             dir: dir.to_path_buf(),
             opts: opts.clone(),
             closed: false,
-            mutex: RwLock::new(()),
+            mutex: Mutex::new(()),
             segment_cache: RwLock::new(cache),
             fsync_failed: Default::default(),
         })
@@ -110,7 +110,7 @@ impl Aol {
     // Helper function to calculate the active segment ID
     fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
         let (_, last) = get_segment_range(dir)?;
-        Ok(if last > 0 { last + 1 } else { 0 })
+        Ok(last)
     }
 
     /// Appends a record to the active segment.
@@ -146,11 +146,10 @@ impl Aol {
 
         // Check if the record is larger than the maximum file size
         if rec.len() > self.opts.max_file_size as usize {
-            eprintln!("rec len {} {}", rec.len(), self.opts.max_file_size);
             return Err(Error::RecordTooLarge);
         }
 
-        let _lock = self.mutex.write();
+        let _lock = self.mutex.lock();
 
         // Get options and initialize variables
         let opts = &self.opts;
@@ -281,7 +280,7 @@ impl Aol {
         // During read, we acquire a lock to not allow concurrent writes and reads
         // to the active segment file to avoid seek errors.
         if segment_id == self.active_segment.id {
-            let _lock = self.mutex.write();
+            let _lock = self.mutex.lock();
             self.active_segment.read_at(buf, read_offset)
         } else {
             let mut cache = self.segment_cache.write();
@@ -298,19 +297,28 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let _lock = self.mutex.write();
+        let _lock = self.mutex.lock();
         self.active_segment.close()?;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
-        let _lock = self.mutex.read();
-        Ok((self.active_segment_id * self.opts.max_file_size) + self.active_segment.offset())
+        // Lock the mutex to ensure thread safety
+        let _lock = self.mutex.lock();
+
+        // Calculate the base offset
+        let base_offset = self.calculate_offset();
+
+        // Get the offset of the active segment
+        let active_segment_offset = self.active_segment.offset();
+
+        // Add the calculated offset to the offset of the active segment
+        Ok(base_offset + active_segment_offset)
     }
 
     pub fn size(&self) -> Result<u64> {
-        let _lock = self.mutex.read();
+        let _lock = self.mutex.lock();
         let cur_segment_size = self.active_segment.file_offset;
         let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
@@ -570,5 +578,36 @@ mod tests {
         let mut read_data = vec![0; 1024];
         let r = a.read_at(&mut read_data, 0);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn append_and_reload_to_check_active_segment_id() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create aol options and open a aol file
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        let large_record = vec![1; 1024];
+        let small_record = vec![1; 512];
+        let r = a.append(&large_record);
+        assert!(r.is_ok());
+        assert_eq!(1024, a.offset().unwrap());
+
+        assert_eq!(0, a.active_segment_id);
+
+        a.close().expect("should close");
+
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        assert_eq!(0, a.active_segment_id);
+
+        let r = a.append(&small_record);
+        assert!(r.is_ok());
+        assert_eq!(1536, a.offset().unwrap());
+        assert_eq!(1, a.active_segment_id);
     }
 }

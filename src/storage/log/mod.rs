@@ -159,40 +159,40 @@ pub struct Options {
     /// If specified, this option sets the permission mode for creating directories. It determines
     /// the access rights for creating new directories. If not specified, the default directory
     /// creation mode will be used.
-    dir_mode: Option<u32>,
+    pub(crate) dir_mode: Option<u32>,
 
     /// The file mode to set for the segment file.
     ///
     /// If specified, this option sets the permission mode for the segment file. It determines who
     /// can read, write, and execute the file. If not specified, the default file mode will be used.
-    file_mode: Option<u32>,
+    pub(crate) file_mode: Option<u32>,
 
     /// The compression format to apply to the segment's data.
     ///
     /// If specified, this option sets the compression format that will be used to compress the
     /// data written to the segment. Compression can help save storage space but might introduce
     /// some overhead in terms of CPU usage during read and write operations.
-    compression_format: Option<CompressionFormat>,
+    pub(crate) compression_format: Option<CompressionFormat>,
 
     /// The compression level to use with the selected compression format.
     ///
     /// This option specifies the compression level that will be applied when compressing the data.
     /// Higher levels usually provide better compression ratios but require more computational
     /// resources. If not specified, a default compression level will be used.
-    compression_level: Option<CompressionLevel>,
+    pub(crate) compression_level: Option<CompressionLevel>,
 
     /// The metadata associated with the segment.
     ///
     /// This option allows you to attach metadata to the segment. Metadata can be useful for storing
     /// additional information about the segment's contents or usage. If not specified, no metadata
     /// will be associated with the segment.
-    metadata: Option<Metadata>,
+    pub(crate) metadata: Option<Metadata>,
 
     /// The extension to use for the segment file.
     ///
     /// If specified, this option sets the extension for the segment file. The extension is used
     /// when creating the segment file on disk. If not specified, a default extension might be used.
-    file_extension: Option<String>,
+    pub(crate) file_extension: Option<String>,
 
     /// The maximum size of the segment file.
     ///
@@ -201,7 +201,7 @@ pub struct Options {
     /// there is no maximum size limit for the file.
     ///
     /// This is used by aol to cycle segments when the max file size is reached.
-    max_file_size: u64,
+    pub(crate) max_file_size: u64,
 
     /// A flag indicating whether the segment is a Write-Ahead Logging (WAL).
     ///
@@ -218,7 +218,7 @@ pub struct Options {
     /// If specified, this option sets the maximum number of open files allowed.
     ///
     /// This is used by aol to initialize the segment cache.
-    max_open_files: usize,
+    pub(crate) max_open_files: usize,
 }
 
 impl Default for Options {
@@ -531,7 +531,7 @@ pub(crate) fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
     Ok(())
 }
 
-fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
+pub(crate) fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
     // Read the header using read_field
     read_field(file)
 }
@@ -781,6 +781,8 @@ fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 
     Ok(refs)
 }
+
+#[derive(Debug)]
 pub(crate) struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
@@ -861,7 +863,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 
     #[allow(dead_code)]
     /// The path where the segment file is located.
-    file_path: PathBuf,
+    pub(crate) file_path: PathBuf,
 
     /// The active block for buffering data.
     block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
@@ -943,7 +945,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
     fn open_file(file_path: &Path, opts: &Options) -> Result<File> {
         let mut open_options = OpenOptions::new();
-        open_options.read(true).write(true);
+        open_options.read(true).append(true);
 
         #[cfg(unix)]
         {
@@ -1026,11 +1028,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
         let n = p.unwritten();
 
-        // write_all will write the entire buffer to the file
-        // hence ensuring atomic writes to the file
-
-        // Seek to the end of the file before writing because the cursor might have been moved during read
-        self.file.seek(SeekFrom::End(0))?;
+        // write_all does atomic writes to the file (in this case the os buffer)
         self.file.write_all(&p.buf[p.flushed..p.written])?;
         p.flushed += n;
         self.file_offset += n as u64;
@@ -1200,6 +1198,7 @@ pub enum Error {
     IO(IOError),
     Poison(String),
     RecordTooLarge,
+    SegmentNotFound,
 }
 
 // Implementation of Display trait for Error
@@ -1212,7 +1211,11 @@ impl fmt::Display for Error {
             Error::IO(err) => write!(f, "IO error: {}", err),
             Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
             Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
-            Error::RecordTooLarge => write!(f, "Record too large"),
+            Error::RecordTooLarge => write!(
+                f,
+                "Record is too large to fit in a segment. Increase max segment size"
+            ),
+            Error::SegmentNotFound => write!(f, "Segment not found"),
         }
     }
 }
@@ -1262,12 +1265,12 @@ impl fmt::Display for IOError {
 pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,
-    segment_id: u64,
-    offset: usize,
+    pub(crate) segment_id: u64,
+    pub(crate) offset: u64,
 }
 
 impl CorruptionError {
-    fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: usize) -> Self {
+    pub(crate) fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: u64) -> Self {
         CorruptionError {
             kind,
             message: message.to_string(),
@@ -1377,11 +1380,11 @@ impl MultiSegmentReader {
         Ok(())
     }
 
-    fn current_segment_id(&self) -> u64 {
+    pub(crate) fn current_segment_id(&self) -> u64 {
         self.segments[self.cur].id
     }
 
-    fn current_offset(&self) -> usize {
+    pub(crate) fn current_offset(&self) -> usize {
         self.off
     }
 }
@@ -1393,7 +1396,7 @@ impl Read for MultiSegmentReader {
         }
 
         // Note: This could create a problem when reading a partial block
-        // spread over multiple segments. Currently aol and wal do not
+        // spread over multiple segments. Currently wal do not
         // write partial blocks spanning multiple segments.
         if !self.is_eof()? {
             self.read_to_buffer(buf)
@@ -1407,9 +1410,11 @@ impl Read for MultiSegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::io::Seek;
+    use std::io::{Read, SeekFrom, Write};
     use tempdir::TempDir;
 
     #[test]
@@ -2436,5 +2441,127 @@ mod tests {
         let r = segment.sync();
         assert!(r.is_ok());
         assert_eq!(segment.offset(), 11);
+    }
+
+    #[test]
+    fn multi_segment_rec() {
+        // Create a temporary directory to hold the segment files
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a sample segment file and populate it with data
+        let opts = Options::default();
+        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
+
+        // Test appending a non-empty buffer
+        let r = segment1.append(&[0, 1, 2, 3]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        // Test appending another buffer
+        let r = segment2.append(&[4, 5, 6, 7]);
+        assert!(r.is_ok());
+        assert_eq!(4, r.unwrap().1);
+
+        let r = segment2.append(&[8, 9]);
+        assert!(r.is_ok());
+        assert_eq!(2, r.unwrap().1);
+
+        segment1.close().expect("should close segment");
+        segment2.close().expect("should close segment");
+
+        // Create a Vec of segments containing our sample segment
+        let segments: Vec<SegmentRef> = vec![
+            create_test_segment_ref(&segment1),
+            create_test_segment_ref(&segment2),
+        ];
+
+        // Create a MultiSegmentReader for testing
+        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
+
+        // Read first record from the MultiSegmentReader
+        let mut bs = [0u8; 4];
+        let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        assert_eq!(bytes_read, 4);
+        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
+
+        let mut bs = [0u8; 6];
+        let bytes_read = buf_reader.read(&mut bs).expect("should read");
+        assert_eq!(bytes_read, 6);
+        assert_eq!(&[4, 5, 6, 7, 8, 9].to_vec(), &bs[..]);
+    }
+
+    #[test]
+    fn file_option_with_write_mode() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a path to the file in the temporary directory
+        let file_path = temp_dir.path().join("testfile.txt");
+
+        // Create a new file in the temporary directory
+        let mut file = File::create(&file_path).unwrap();
+
+        // Write some content to the file
+        file.write_all(b"Hello, world!").unwrap();
+
+        // Open the file with append and read permissions
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        // Read the first 5 bytes from the file
+        let mut buffer = [0; 5];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"Hello");
+
+        // Append more content to the file
+        file.write_all(b" More content.").unwrap();
+
+        // Read from the start of the file again
+        let mut new_content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut new_content).unwrap();
+        // Should have overwritten the data in the file
+        assert_ne!(new_content, "Hello, world! More content.");
+    }
+
+    #[test]
+    fn file_option_with_append_mode() {
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+
+        // Create a path to the file in the temporary directory
+        let file_path = temp_dir.path().join("testfile.txt");
+
+        // Create a new file in the temporary directory
+        let mut file = File::create(&file_path).unwrap();
+
+        // Write some content to the file
+        file.write_all(b"Hello, world!").unwrap();
+
+        // Open the file with append and read permissions
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&file_path)
+            .unwrap();
+
+        // Read the first 5 bytes from the file
+        let mut buffer = [0; 5];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"Hello");
+
+        // Append more content to the file
+        file.write_all(b" More content.").unwrap();
+
+        // Read from the start of the file again
+        let mut new_content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut new_content).unwrap();
+        // Should not have overwritten the data in the file
+        assert_eq!(new_content, "Hello, world! More content.");
     }
 }

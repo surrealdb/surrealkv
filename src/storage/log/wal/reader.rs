@@ -104,7 +104,7 @@ impl Reader {
                     io::ErrorKind::Other,
                     e.to_string().as_str(),
                     segment_id,
-                    offset,
+                    offset as u64,
                 ));
                 self.err = Some(err.clone());
                 return Err(err);
@@ -429,7 +429,7 @@ mod tests {
                     assert_eq!(corruption_error.segment_id, 4);
                     assert_eq!(corruption_error.offset, 22);
                     corrupted_segment_id = corruption_error.segment_id;
-                    corrupted_offset_marker = corruption_error.offset as u64;
+                    corrupted_offset_marker = corruption_error.offset;
                 }
                 _ => panic!("Expected a CorruptionError, but got a different error"),
             }
