@@ -45,6 +45,9 @@ pub struct Options {
     pub max_entries_per_txn: u32,   // Maximum entries in a transaction.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
+
+    // Field to indicate whether the data should be stored completely in memory
+    pub disk_persistence: bool, // If false, data will be stored completely in memory. If true, data will be stored on disk too.
 }
 
 impl Default for Options {
@@ -54,11 +57,12 @@ impl Default for Options {
             dir: PathBuf::from(""),
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            max_entries_per_txn: 1 << 10,
-            max_value_threshold: 64, // 64 bytes
+            max_entries_per_txn: 1 << 12, // 4096 entries
+            max_value_threshold: 64,      // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_segment_size: 1 << 29, // 512 MB
             max_value_cache_size: 100000,
+            disk_persistence: true,
         }
     }
 }
@@ -101,7 +105,13 @@ impl Options {
             max_entries_per_txn: metadata.get_uint(META_KEY_MAX_ENTRIES_PER_TX)? as u32,
             max_segment_size: metadata.get_uint(META_KEY_MAX_FILE_SIZE)?,
             max_value_cache_size: metadata.get_uint(META_KEY_MAX_VALUE_CACHE_SIZE)?,
+            disk_persistence: true,
         })
+    }
+
+    /// Returns true if the data should be persisted on disk.
+    pub fn should_persist_data(&self) -> bool {
+        self.disk_persistence
     }
 }
 
@@ -123,6 +133,7 @@ mod tests {
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
         assert_eq!(options.max_value_cache_size, 100000);
+        assert!(options.disk_persistence);
     }
 
     #[test]
@@ -136,6 +147,7 @@ mod tests {
             isolation_level: IsolationLevel::SerializableSnapshotIsolation,
             max_segment_size: 1 << 25, // 32 MB
             max_value_cache_size: 200000,
+            disk_persistence: true,
         };
 
         let metadata = options.to_metadata();
@@ -190,5 +202,6 @@ mod tests {
         );
         assert_eq!(options.max_segment_size, 1 << 25);
         assert_eq!(options.max_value_cache_size, 200000);
+        assert!(options.disk_persistence);
     }
 }
