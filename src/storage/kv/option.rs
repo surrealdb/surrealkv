@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from(""));
         assert_eq!(options.max_key_size, 1024);
         assert_eq!(options.max_value_size, 1024 * 1024);
-        assert_eq!(options.max_entries_per_txn, 1 << 10);
+        assert_eq!(options.max_entries_per_txn, 1 << 12);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
