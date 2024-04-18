@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    ops::Bound,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -12,7 +13,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
-use vart::TrieError;
+use vart::{TrieError, VariableSizeKey};
 
 use crate::storage::kv::{
     error::{Error, Result},
@@ -243,6 +244,20 @@ impl CommitTracker {
         if read_set.is_empty() {
             false
         } else {
+            // For each object in the changeset of the already committed transactions, check if it lies
+            // within the predicates of the current transaction.
+            for committed_tx in self.committed_transactions.iter() {
+                if committed_tx.ts > txn.read_ts {
+                    for conflict_key in committed_tx.conflict_keys.iter() {
+                        for range in txn.read_key_ranges.lock().iter() {
+                            if key_in_range(conflict_key, range) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
             self.committed_transactions
                 .iter()
                 .filter(|committed_txn| committed_txn.ts > txn.read_ts)
@@ -253,6 +268,24 @@ impl CommitTracker {
                 })
         }
     }
+}
+
+fn key_in_range(key: &Bytes, range: &(Bound<VariableSizeKey>, Bound<VariableSizeKey>)) -> bool {
+    let key = VariableSizeKey::from_slice_with_termination(key);
+
+    let start_inclusive = match &range.0 {
+        Bound::Included(start) => key >= *start,
+        Bound::Excluded(start) => key > *start,
+        Bound::Unbounded => true,
+    };
+
+    let end_exclusive = match &range.1 {
+        Bound::Included(end) => key <= *end,
+        Bound::Excluded(end) => key < *end,
+        Bound::Unbounded => true,
+    };
+
+    start_inclusive && end_exclusive
 }
 
 /// Serializable Snapshot Isolation (SSI):

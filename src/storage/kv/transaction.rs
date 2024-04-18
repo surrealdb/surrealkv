@@ -109,6 +109,9 @@ pub struct Transaction {
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
+    /// `read_key_ranges` is the key ranges that are read in the transaction from the snapshot. This is used for conflict detection.
+    pub(crate) read_key_ranges: Mutex<Vec<(Bound<VariableSizeKey>, Bound<VariableSizeKey>)>>,
+
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
 
@@ -138,6 +141,7 @@ impl Transaction {
             write_order_map: HashMap::new(),
             write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
+            read_key_ranges: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
             durability: Durability::Eventual,
             closed: false,
@@ -314,6 +318,24 @@ impl Transaction {
                 Bound::Unbounded => Bound::Unbounded,
             },
         );
+
+        // Keep track of the range bound predicates for conflict detection in case of SSI.
+        {
+            let range = (
+                match range.start_bound() {
+                    Bound::Included(start) => Bound::Included((*start).clone()),
+                    Bound::Excluded(start) => Bound::Included((*start).clone()),
+                    Bound::Unbounded => Bound::Unbounded,
+                },
+                match range.end_bound() {
+                    Bound::Included(end) => Bound::Included((*end).clone()),
+                    Bound::Excluded(end) => Bound::Included((*end).clone()),
+                    Bound::Unbounded => Bound::Unbounded,
+                },
+            );
+
+            self.read_key_ranges.lock().push(range);
+        }
 
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
@@ -1701,5 +1723,84 @@ mod tests {
             .unwrap();
             txn3.commit().await.unwrap();
         }
+    }
+
+    async fn g2_item_predicate(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi).await;
+
+        let key3 = Bytes::from("k3");
+        let key4 = Bytes::from("k4");
+        let key5 = Bytes::from("k5");
+        let key6 = Bytes::from("k6");
+        let key7 = Bytes::from("k7");
+        let value3 = Bytes::from("v3");
+        let value4 = Bytes::from("v4");
+
+        // inserts into read ranges of already-committed transaction(s) should fail
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            let range = "k1".as_bytes()..="k4".as_bytes();
+            txn1.scan(range.clone(), None).unwrap();
+            txn2.scan(range.clone(), None).unwrap();
+
+            txn1.set(&key3, &value3).unwrap();
+            txn2.set(&key4, &value4).unwrap();
+
+            txn1.commit().await.unwrap();
+
+            assert!(match txn2.commit().await {
+                Err(err) => {
+                    matches!(err, Error::TransactionReadConflict)
+                }
+                _ => false,
+            });
+        }
+
+        // k1, k2, k3 already committed
+        // inserts beyond scan range should pass
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            txn1.scan(range.clone(), None).unwrap();
+            txn2.scan(range.clone(), None).unwrap();
+
+            txn1.set(&key4, &value3).unwrap();
+            txn2.set(&key5, &value4).unwrap();
+
+            txn1.commit().await.unwrap();
+            txn2.commit().await.unwrap();
+        }
+
+        // k1, k2, k3, k4, k5 already committed
+        // inserts in subset scan ranges should fail
+        {
+            let mut txn1 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+
+            let range = "k1".as_bytes()..="k7".as_bytes();
+            txn1.scan(range.clone(), None).unwrap();
+            let range = "k3".as_bytes()..="k7".as_bytes();
+            txn2.scan(range.clone(), None).unwrap();
+
+            txn1.set(&key6, &value3).unwrap();
+            txn2.set(&key7, &value4).unwrap();
+
+            txn1.commit().await.unwrap();
+            assert!(match txn2.commit().await {
+                Err(err) => {
+                    matches!(err, Error::TransactionReadConflict)
+                }
+                _ => false,
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn g2_predicate() {
+        g2_item_predicate(true).await;
     }
 }
