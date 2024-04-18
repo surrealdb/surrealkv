@@ -322,20 +322,6 @@ impl Core {
             }
         }
 
-        // // Determine options for the manifest file and open or create it.
-        // let mut manifest = Self::initialize_manifest(&opts)?;
-
-        // // Load options from the manifest file.
-        // let opts = Core::load_options(&opts, &mut manifest)?;
-
-        // // Determine options for the commit log file and open or create it.
-        // let mut clog = Self::initialize_clog(&opts)?;
-
-        // // Load the index from the commit log if it exists.
-        // if clog.size()? > 0 {
-        //     Core::load_index(&opts, &mut clog, &mut indexer)?;
-        // }
-
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
@@ -1023,7 +1009,7 @@ mod tests {
         txn.commit().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_test() {
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
