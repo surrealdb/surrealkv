@@ -1698,7 +1698,7 @@ mod tests {
         let value3 = Bytes::from("v3");
         let value4 = Bytes::from("v4");
 
-        // concurrent inserts between scans should fail
+        // inserts into read ranges of already-committed transaction(s) should fail
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
