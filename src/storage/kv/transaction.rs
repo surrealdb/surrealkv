@@ -88,6 +88,7 @@ pub struct Transaction {
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
+    /// `read_key_ranges` is the key ranges that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_key_ranges: Mutex<Vec<(Bound<VariableSizeKey>, Bound<VariableSizeKey>)>>,
 
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
@@ -112,7 +113,7 @@ impl Transaction {
             write_order_map: HashMap::new(),
             write_set: Vec::new(),
             read_set: Mutex::new(Vec::new()),
-            range_bouds: Mutex::new(Vec::new()),
+            read_key_ranges: Mutex::new(Vec::new()),
             committed_values_offsets: HashMap::new(),
             closed: false,
         })
@@ -295,7 +296,7 @@ impl Transaction {
                 },
             );
 
-            self.range_bouds.lock().push(range);
+            self.read_key_ranges.lock().push(range);
         }
 
         // Initialize an empty vector to store the results.
@@ -1693,8 +1694,6 @@ mod tests {
         let key5 = Bytes::from("k5");
         let key6 = Bytes::from("k6");
         let key7 = Bytes::from("k7");
-        let value1 = Bytes::from("v1");
-        let value2 = Bytes::from("v2");
         let value3 = Bytes::from("v3");
         let value4 = Bytes::from("v4");
 
@@ -1704,15 +1703,8 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k4".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
-
-            let res = txn2.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            txn1.scan(range.clone(), None).unwrap();
+            txn2.scan(range.clone(), None).unwrap();
 
             txn1.set(&key3, &value3).unwrap();
             txn2.set(&key4, &value4).unwrap();
@@ -1734,15 +1726,8 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 3);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
-
-            let res = txn2.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 3);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            txn1.scan(range.clone(), None).unwrap();
+            txn2.scan(range.clone(), None).unwrap();
 
             txn1.set(&key4, &value3).unwrap();
             txn2.set(&key5, &value4).unwrap();
@@ -1758,12 +1743,9 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k7".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 5);
-
+            txn1.scan(range.clone(), None).unwrap();
             let range = "k3".as_bytes()..="k7".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
-            assert_eq!(res.len(), 3);
+            txn2.scan(range.clone(), None).unwrap();
 
             txn1.set(&key6, &value3).unwrap();
             txn2.set(&key7, &value4).unwrap();

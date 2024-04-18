@@ -249,7 +249,7 @@ impl CommitTracker {
             for committed_tx in self.committed_transactions.iter() {
                 if committed_tx.ts > txn.read_ts {
                     for conflict_key in committed_tx.conflict_keys.iter() {
-                        for range in txn.range_bouds.lock().iter() {
+                        for range in txn.read_key_ranges.lock().iter() {
                             if key_in_range(conflict_key, range) {
                                 return true;
                             }
