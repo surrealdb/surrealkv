@@ -88,7 +88,7 @@ pub struct Transaction {
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
 
-    pub(crate) range_bouds: Mutex<Vec<(Bound<VariableSizeKey>, Bound<VariableSizeKey>)>>,
+    pub(crate) read_key_ranges: Mutex<Vec<(Bound<VariableSizeKey>, Bound<VariableSizeKey>)>>,
 
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
