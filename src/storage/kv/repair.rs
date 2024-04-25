@@ -316,8 +316,15 @@ mod tests {
         segment_num: usize,
         corruption_offset: u64,
     ) {
-        let mut clog = store.inner.as_ref().unwrap().core.clog.write();
-
+        let mut clog = store
+            .inner
+            .as_ref()
+            .unwrap()
+            .core
+            .clog
+            .as_ref()
+            .unwrap()
+            .write();
         let clog_subdir = opts.dir.join("clog");
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");

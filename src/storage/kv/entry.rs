@@ -438,7 +438,7 @@ impl ValueRef {
 
         // Read the value from the commit log at the specified offset
         let mut buf = vec![0; self.value_length];
-        let vlog = self.store.clog.read();
+        let vlog = self.store.clog.as_ref().unwrap().read();
         vlog.read_at(&mut buf, value_offset)?;
 
         // Store the offset and value in value_cache

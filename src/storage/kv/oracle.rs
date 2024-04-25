@@ -224,9 +224,7 @@ impl CommitTracker {
     /// Cleans up committed transactions with timestamps greater than the given maximum read timestamp.
     /// It updates the last cleanup timestamp and removes committed transactions with timestamps greater than the maximum read timestamp.
     fn cleanup_committed_transactions(&mut self, max_read_ts: u64) {
-        assert!(max_read_ts >= self.last_cleanup_ts);
-
-        if max_read_ts == self.last_cleanup_ts {
+        if max_read_ts <= self.last_cleanup_ts {
             return;
         }
 

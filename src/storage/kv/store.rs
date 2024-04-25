@@ -225,9 +225,9 @@ pub struct Core {
     /// Options for store.
     pub(crate) opts: Options,
     /// Commit log for store.
-    pub(crate) clog: Arc<RwLock<Aol>>,
+    pub(crate) clog: Option<Arc<RwLock<Aol>>>,
     /// Manifest for store to track Store state.
-    pub(crate) manifest: RwLock<Aol>,
+    pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
     /// Value cache for store.
@@ -240,7 +240,6 @@ pub struct Core {
     /// Channel to send write requests to the writer
     writes_tx: Sender<Task>,
 }
-
 /// A Task contains multiple entries to be written to the disk.
 #[derive(Clone)]
 pub struct Task {
@@ -304,18 +303,23 @@ impl Core {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
-        // Determine options for the manifest file and open or create it.
-        let mut manifest = Self::initialize_manifest(&opts)?;
+        let mut manifest = None;
+        let mut clog = None;
 
-        // Load options from the manifest file.
-        let opts = Core::load_options(&opts, &mut manifest)?;
+        if opts.should_persist_data() {
+            // Determine options for the manifest file and open or create it.
+            manifest = Some(Self::initialize_manifest(&opts)?);
 
-        // Determine options for the commit log file and open or create it.
-        let mut clog = Self::initialize_clog(&opts)?;
+            // Load options from the manifest file.
+            let opts = Core::load_options(&opts, manifest.as_mut().unwrap())?;
 
-        // Load the index from the commit log if it exists.
-        if clog.size()? > 0 {
-            Core::load_index(&opts, &mut clog, &mut indexer)?;
+            // Determine options for the commit log file and open or create it.
+            clog = Some(Self::initialize_clog(&opts)?);
+
+            // Load the index from the commit log if it exists.
+            if clog.as_ref().unwrap().size()? > 0 {
+                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+            }
         }
 
         // Create and initialize an Oracle.
@@ -329,8 +333,8 @@ impl Core {
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
-            manifest: RwLock::new(manifest),
-            clog: Arc::new(RwLock::new(clog)),
+            manifest: manifest.map(RwLock::new),
+            clog: clog.map(|c| Arc::new(RwLock::new(c))),
             oracle: Arc::new(oracle),
             value_cache,
             is_closed: AtomicBool::new(false),
@@ -539,12 +543,15 @@ impl Core {
         // Close the indexer
         self.indexer.write().close()?;
 
-        // Close the commit log
-        self.clog.write().close()?;
+        // Close the commit log if it exists
+        if let Some(clog) = &self.clog {
+            clog.write().close()?;
+        }
 
-        // Close the manifest
-        self.manifest.write().close()?;
-
+        // Close the manifest if it exists
+        if let Some(manifest) = &self.manifest {
+            manifest.write().close()?;
+        }
         self.is_closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -568,21 +575,31 @@ impl Core {
             return Ok(());
         }
 
-        let current_offset = self.clog.read().offset()?;
+        if self.opts.should_persist_data() {
+            self.write_entries_to_disk(req)
+        } else {
+            self.write_entries_to_memory(req)
+        }
+    }
+
+    fn write_entries_to_disk(&self, req: Task) -> Result<()> {
+        let current_offset = self.clog.as_ref().unwrap().read().offset()?;
         let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
         let mut committed_values_offsets = HashMap::new();
 
         tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
 
-        self.append_to_log(&buf, req.durability)?;
-        self.write_to_index(&req, &committed_values_offsets)?;
-
-        Ok(())
+        self.append_log(&buf, req.durability)?;
+        self.write_index_with_committed_offsets(&req, &committed_values_offsets)
     }
 
-    fn append_to_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
-        let mut clog = self.clog.write();
+    fn write_entries_to_memory(&self, req: Task) -> Result<()> {
+        self.write_index_in_memory(&req)
+    }
+
+    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
+        let mut clog = self.clog.as_ref().unwrap().write();
 
         match durability {
             Durability::Immediate => {
@@ -609,34 +626,49 @@ impl Core {
         Ok(())
     }
 
-    fn write_to_index(
-        &self,
-        req: &Task,
-        committed_values_offsets: &HashMap<Bytes, usize>,
-    ) -> Result<()> {
+    fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
+    where
+        F: Fn(&Entry) -> Bytes,
+    {
         let mut index = self.indexer.write();
         let mut kv_pairs = Vec::new();
 
-        for entry in &req.entries {
-            let index_value = ValueRef::encode(
-                &entry.key,
-                &entry.value,
-                entry.metadata.as_ref(),
-                committed_values_offsets,
-                self.opts.max_value_threshold,
-            );
+        for entry in &task.entries {
+            let index_value = encode_entry(entry);
 
             kv_pairs.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
-                version: req.tx_id,
-                ts: req.commit_ts,
+                version: task.tx_id,
+                ts: task.commit_ts,
             });
         }
 
         index.bulk_insert(&mut kv_pairs)?;
 
         Ok(())
+    }
+
+    fn write_index_with_committed_offsets(
+        &self,
+        task: &Task,
+        committed_values_offsets: &HashMap<Bytes, usize>,
+    ) -> Result<()> {
+        self.write_entries_to_index(task, |entry| {
+            ValueRef::encode(
+                &entry.key,
+                &entry.value,
+                entry.metadata.as_ref(),
+                committed_values_offsets,
+                self.opts.max_value_threshold,
+            )
+        })
+    }
+
+    fn write_index_in_memory(&self, task: &Task) -> Result<()> {
+        self.write_entries_to_index(task, |entry| {
+            ValueRef::encode_mem(&entry.value, entry.metadata.as_ref())
+        })
     }
 
     pub(crate) async fn send_to_write_channel(
@@ -720,7 +752,7 @@ mod tests {
             // Start a new read transaction
             let txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            // Assert that the value retrieved in txn3 matches default_value
+            // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
 
@@ -977,7 +1009,7 @@ mod tests {
         txn.commit().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_test() {
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
@@ -1268,5 +1300,64 @@ mod tests {
     #[tokio::test]
     async fn immediate_durability() {
         test_durability(Durability::Immediate, false).await;
+    }
+
+    #[tokio::test]
+    async fn store_without_persistance() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.disk_persistence = false;
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Number of keys to generate
+        let num_keys = 10000;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for (counter, _) in (1..=num_keys).enumerate() {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Write the keys to the store
+        for key in keys.iter() {
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Read the keys to the store
+        for key in keys.iter() {
+            // Start a new read transaction
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap().unwrap();
+            // Assert that the value retrieved in txn matches default_value
+            assert_eq!(val, default_value.as_ref());
+        }
+
+        // Drop the store to simulate closing it
+        store.close().await.unwrap();
+
+        let store = Store::new(opts).expect("should create store");
+
+        // No keys should be found in the store
+        for key in keys.iter() {
+            // Start a new read transaction
+            let txn = store.begin().unwrap();
+            assert!(txn.get(key).unwrap().is_none());
+        }
     }
 }
