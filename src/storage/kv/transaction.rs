@@ -431,7 +431,7 @@ impl Transaction {
             .await;
 
         if let Err(err) = done {
-            oracle.committed_upto(commit_ts);
+            oracle.committed_upto(tx_id);
             return Err(err);
         }
 
