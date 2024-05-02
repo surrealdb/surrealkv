@@ -1,6 +1,6 @@
 # surrealkv
 
-surrealkv is a versioned, low-level, embedded key-value database implemented in Rust. This ACID-compliant database offers the following features:
+surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust. This ACID-compliant database offers the following features:
 
 - **Transaction Support**: SurrealKV supports rich transactions, allowing multiple items to be inserted, updated, or deleted simultaneously. These transactions are applied atomically, ensuring atomicity and consistency in line with ACID principles. This makes updates invisible until they are committed.
 
