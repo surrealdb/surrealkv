@@ -480,9 +480,12 @@ impl WaterMark {
         }
 
         let mark = self.mark.read(); // Re-acquire the read lock.
-        let wp = mark.waiters.get(&t).unwrap().clone();
+        let wp = mark.waiters.get(&t).cloned();
         drop(mark);
-        matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
+
+        if let Some(wp) = wp {
+            matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
+        }
     }
 
     /// Gets the highest completed timestamp.

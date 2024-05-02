@@ -431,7 +431,7 @@ impl Transaction {
             .await;
 
         if let Err(err) = done {
-            oracle.committed_upto(commit_ts);
+            oracle.committed_upto(tx_id);
             return Err(err);
         }
 
@@ -439,7 +439,11 @@ impl Transaction {
 
         // Check if the transaction is written to the transaction log.
         let done = done.unwrap();
-        let ret = done.recv().await?;
+        let ret = done.recv().await;
+        if let Err(err) = ret {
+            oracle.committed_upto(tx_id);
+            return Err(err.into());
+        }
 
         // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
         oracle.committed_upto(tx_id);
@@ -447,8 +451,7 @@ impl Transaction {
         // Mark the transaction as closed.
         self.closed = true;
 
-        // Ok(())
-        ret
+        ret.unwrap()
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
