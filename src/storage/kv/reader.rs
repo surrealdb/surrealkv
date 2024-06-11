@@ -311,12 +311,12 @@ mod tests {
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         a.close().expect("should close aol");
 
@@ -362,7 +362,7 @@ mod tests {
         for i in 0..num_items {
             let r = a.append(&[i; REC_SIZE]); // Each record is a 4-byte array filled with `i`
             assert!(r.is_ok());
-            assert_eq!(REC_SIZE, r.unwrap().1);
+            assert_eq!(REC_SIZE, r.unwrap().2);
         }
 
         a.close().expect("should close aol");

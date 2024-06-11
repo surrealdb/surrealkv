@@ -172,6 +172,21 @@ impl Record {
         self.crc32 = 0;
     }
 
+    pub(crate) fn from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Record {
+        let crc32 = entry.crc32();
+        Record {
+            id: tx_id,
+            ts: commit_ts,
+            version: RECORD_VERSION,
+            key_len: entry.key.len() as u32,
+            key: entry.key,
+            metadata: entry.metadata,
+            value_len: entry.value.len() as u32,
+            value: entry.value,
+            crc32: crc32,
+        }
+    }
+
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // This function encodes an Record into a buffer. The encoding format is as follows:
         // - CRC32 Checksum (4 bytes)
@@ -284,6 +299,8 @@ impl ValueRef {
         if value.len() <= max_value_threshold {
             buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
             buf.put_u32(value.len() as u32);
+            let val_off = value_offsets.get(key).unwrap();
+            buf.put_u64(*val_off as u64);
             buf.put(value.as_ref());
         } else {
             buf.put_u8(0);
@@ -309,6 +326,7 @@ impl ValueRef {
 
         buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
         buf.put_u32(value.len() as u32);
+        buf.put_u64(0);
         buf.put(value.as_ref());
 
         if let Some(metadata) = &metadata {
@@ -334,6 +352,7 @@ impl ValueRef {
 
         // Decode value length and value
         self.value_length = cursor.get_u32() as usize;
+        self.value_offset = Some(cursor.get_u64());
 
         if self.flag == 1 {
             let value_bytes =
@@ -343,7 +362,7 @@ impl ValueRef {
             self.value = Some(Bytes::copy_from_slice(value_bytes));
         } else {
             // Decode version, value length, and value offset
-            self.value_offset = Some(cursor.get_u64());
+            // self.value_offset = Some(cursor.get_u64());
         }
 
         // Decode key-value metadata

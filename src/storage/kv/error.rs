@@ -40,6 +40,7 @@ pub enum Error {
     MismatchedSegmentID(u64, u64),
     MaxKeySizeCannotBeDecreased, // The maximum key size cannot be decreased
     MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
+    MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
 }
 
 /// Error structure for encoding errors
@@ -113,6 +114,9 @@ impl fmt::Display for Error {
             ),
             Error::MaxKeySizeCannotBeDecreased => write!(f, "Max key size cannot be decreased"),
             Error::MaxValueSizeCannotBeDecreased => write!(f, "Max value size cannot be decreased"),
+            Error::MaxSegmentSizeCannotBeChanged => {
+                write!(f, "Max segment size cannot be changed")
+            }
         }
     }
 }

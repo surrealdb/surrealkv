@@ -479,6 +479,7 @@ impl Core {
     fn validate_options(opts: &Options, existing_metadata_list: &[Metadata]) -> Result<()> {
         let mut last_max_value_size = 0;
         let mut last_max_key_size = 0;
+        let mut last_max_segment_size = 0;
         for metadata in existing_metadata_list {
             let options = Options::from_metadata(metadata.clone(), opts.dir.clone())?;
             if options.max_value_size < last_max_value_size {
@@ -487,8 +488,12 @@ impl Core {
             if options.max_key_size < last_max_key_size {
                 return Err(Error::MaxKeySizeCannotBeDecreased);
             }
+            if options.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
+                return Err(Error::MaxSegmentSizeCannotBeChanged);
+            }
             last_max_value_size = options.max_value_size;
             last_max_key_size = options.max_key_size;
+            last_max_segment_size = options.max_segment_size;
         }
 
         // Include current opts in the comparison
@@ -498,9 +503,13 @@ impl Core {
         if opts.max_key_size < last_max_key_size {
             return Err(Error::MaxKeySizeCannotBeDecreased);
         }
+        if opts.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
+            return Err(Error::MaxSegmentSizeCannotBeChanged);
+        }
 
         Ok(())
     }
+
     /// Loads the latest options from the manifest log.
     fn load_manifests(opts: &Options) -> Result<Vec<Metadata>> {
         let manifest_subdir = opts.dir.join("manifest");
@@ -884,6 +893,35 @@ mod tests {
                 "Max value size cannot be decreased".to_string()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn changing_max_segment_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        let mut opts = opts.clone();
+        opts.max_segment_size += 1;
+
+        // Try to create a new store instance with the updated options
+        let result = Store::new(opts.clone());
+        assert!(
+            result.is_err(),
+            "should throw an error when max_segment_size is changed"
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "Max segment size cannot be changed".to_string()
+        );
     }
 
     #[tokio::test]

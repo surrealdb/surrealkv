@@ -133,7 +133,7 @@ impl Aol {
     ///
     /// This function may return an error if the active segment is closed, the provided record
     /// is empty, or any I/O error occurs during the appending process.
-    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, usize)> {
+    pub fn append(&mut self, rec: &[u8]) -> Result<(u64, u64, usize)> {
         if self.closed {
             return Err(Error::SegmentClosed);
         }
@@ -194,7 +194,7 @@ impl Aol {
         // Calculate offset only for the first chunk of data
         let offset = off + self.calculate_offset();
 
-        Ok((offset, rec.len()))
+        Ok((self.active_segment_id, offset, rec.len()))
     }
 
     /// Flushes and syncs the active segment.
@@ -232,7 +232,7 @@ impl Aol {
     ///
     /// This function may return an error if the provided buffer is empty, or any I/O error occurs
     /// during the reading process.
-    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
+    pub fn read_at(&self, buf: &mut [u8], off: u64) -> Result<(u64, usize)> {
         self.check_if_fsync_failed()?;
 
         if buf.is_empty() {
@@ -243,31 +243,29 @@ impl Aol {
         }
 
         let mut r = 0;
-        while r < buf.len() {
-            let offset = off + r as u64;
-            let segment_id = off / self.opts.max_file_size;
-            let read_offset = offset % self.opts.max_file_size;
+        let offset = off + r as u64;
+        let segment_id = off / self.opts.max_file_size;
+        let read_offset = offset % self.opts.max_file_size;
 
-            // Read data from the appropriate segment
-            match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
-                Ok(bytes_read) => {
-                    r += bytes_read;
-                }
-                Err(e) => match e {
-                    Error::Eof(n) => {
-                        r = n;
-                        if n > 0 {
-                            continue;
-                        } else {
-                            return Err(Error::Eof(n));
-                        }
-                    }
-                    _ => return Err(e),
-                },
+        // Read data from the appropriate segment
+        match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
+            Ok(bytes_read) => {
+                r += bytes_read;
             }
+            Err(e) => match e {
+                Error::Eof(n) => {
+                    return Err(Error::Eof(n));
+                    // if n > 0 {
+                    //     continue;
+                    // } else {
+                    //     return Err(Error::Eof(n));
+                    // }
+                }
+                _ => return Err(e),
+            },
         }
 
-        Ok(r)
+        Ok((segment_id, r))
     }
 
     // Helper function to read data from the appropriate segment
@@ -315,6 +313,18 @@ impl Aol {
 
         // Add the calculated offset to the offset of the active segment
         Ok(base_offset + active_segment_offset)
+    }
+
+    // Returns the current offset within the segment.
+    pub fn segment_offset(&self) -> Result<(u64, u64)> {
+        // Lock the mutex to ensure thread safety
+        let _lock = self.mutex.lock();
+
+        // Get the offset of the active segment
+        let active_segment_offset = self.active_segment.offset();
+
+        // Add the calculated offset to the offset of the active segment
+        Ok((self.active_segment_id, active_segment_offset))
     }
 
     pub fn size(&self) -> Result<u64> {
@@ -381,12 +391,12 @@ mod tests {
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
         assert!(r.is_ok());
-        assert_eq!(7, r.unwrap().1);
+        assert_eq!(7, r.unwrap().2);
 
         // Validate offset after appending
         // 4 + 7 = 11
@@ -398,13 +408,13 @@ mod tests {
         // Test reading from segment
         let mut bs = vec![0; 4];
         let n = a.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(4, n);
+        assert_eq!(4, n.1);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 7];
         let n = a.read_at(&mut bs, 4).expect("should read");
-        assert_eq!(7, n);
+        assert_eq!(7, n.1);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
@@ -415,7 +425,7 @@ mod tests {
         // Test appending another buffer
         let r = a.append(&[11, 12, 13, 14]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         // Validate offset after appending
         // 11 + 4 = 15
@@ -424,7 +434,7 @@ mod tests {
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
         let n = a.read_at(&mut bs, 11).expect("should read");
-        assert_eq!(4, n);
+        assert_eq!(4, n.1);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
         // Test closing segment
@@ -447,23 +457,23 @@ mod tests {
         // Append the first data slice to the aol
         let r1 = a.append(&data1);
         assert!(r1.is_ok());
-        assert_eq!(31 * 1024, r1.unwrap().1);
+        assert_eq!(31 * 1024, r1.unwrap().2);
 
         // Append the second data slice to the aol
         let r2 = a.append(&data2);
         assert!(r2.is_ok());
-        assert_eq!(2 * 1024, r2.unwrap().1);
+        assert_eq!(2 * 1024, r2.unwrap().2);
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a.read_at(&mut read_data1, 0).expect("should read");
-        assert_eq!(31 * 1024, n1);
+        assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
 
         // Read the second data slice back from the aol
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a.read_at(&mut read_data2, 31 * 1024).expect("should read");
-        assert_eq!(2 * 1024, n2);
+        assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
 
         // Test closing segment
@@ -488,39 +498,39 @@ mod tests {
         // Append the first data slice to the aol
         let r1 = a.append(&data1);
         assert!(r1.is_ok());
-        assert_eq!(31 * 1024, r1.unwrap().1);
+        assert_eq!(31 * 1024, r1.unwrap().2);
 
         // Append the second data slice to the aol
         let r2 = a.append(&data2);
         assert!(r2.is_ok());
-        assert_eq!(2 * 1024, r2.unwrap().1);
+        assert_eq!(2 * 1024, r2.unwrap().2);
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a.read_at(&mut read_data1, 0).expect("should read");
-        assert_eq!(31 * 1024, n1);
+        assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
 
         // Append the third data slice to the aol
         let r3 = a.append(&data4);
         assert!(r3.is_ok());
-        assert_eq!(1024, r3.unwrap().1);
+        assert_eq!(1024, r3.unwrap().2);
 
         // Append the third data slice to the aol
         let r4 = a.append(&data3);
         assert!(r4.is_ok());
-        assert_eq!(1024, r4.unwrap().1);
+        assert_eq!(1024, r4.unwrap().2);
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a.read_at(&mut read_data1, 0).expect("should read");
-        assert_eq!(31 * 1024, n1);
+        assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
 
         // Read the second data slice back from the aol
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a.read_at(&mut read_data2, 31 * 1024).expect("should read");
-        assert_eq!(2 * 1024, n2);
+        assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
 
         // Test closing segment
