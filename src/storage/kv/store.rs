@@ -15,12 +15,12 @@ use vart::art::KV;
 
 use crate::storage::{
     kv::{
-        entry::{Entry, TxRecord, ValueRef},
+        entry::{Entry, Record, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
         option::Options,
         oracle::Oracle,
-        reader::{Reader, TxReader},
+        reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
         transaction::{Mode, Transaction},
     },
@@ -30,7 +30,7 @@ use crate::storage::{
     },
 };
 
-use super::transaction::Durability;
+use super::{entry::Records, transaction::Durability};
 
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
@@ -365,21 +365,21 @@ impl Core {
         // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
         let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
 
-        // A TxReader is created from the Reader to read transactions.
-        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
+        // A RecordReader is created from the Reader to read transactions.
+        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
 
-        // A TxRecord is created to hold the transactions. The maximum number of entries per transaction is specified.
-        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+        // A Record is created to hold the transactions. The maximum number of entries per transaction is specified.
+        let mut tx = Record::new();
 
         // An Option is created to hold the segment ID and offset in case of corruption.
         let mut corruption_info: Option<(u64, u64)> = None;
 
         // A loop is started to read transactions.
         loop {
-            // The TxRecord is reset for each iteration.
+            // The Record is reset for each iteration.
             tx.reset();
 
-            // The TxReader attempts to read into the TxRecord.
+            // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
                 Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
@@ -389,6 +389,7 @@ impl Core {
 
                 // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
                 Err(Error::LogError(LogError::Corruption(err))) => {
+                    eprintln!("Corruption error: {:?}", err);
                     corruption_info = Some((err.segment_id, err.offset));
                     break;
                 }
@@ -414,7 +415,7 @@ impl Core {
     }
 
     fn process_entries(
-        tx: &TxRecord,
+        entry: &Record,
         opts: &Options,
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
@@ -422,14 +423,12 @@ impl Core {
         let mut to_insert = Vec::new();
         let mut to_delete = Vec::new();
 
-        for entry in &tx.entries {
-            if let Some(metadata) = entry.metadata.as_ref() {
-                if metadata.deleted() {
-                    to_delete.push(entry.key[..].into());
-                    continue;
-                }
+        if let Some(metadata) = entry.metadata.as_ref() {
+            if metadata.deleted() {
+                to_delete.push(entry.key[..].into());
             }
-
+            indexer.bulk_delete(&mut to_delete)?;
+        } else {
             let index_value = ValueRef::encode(
                 &entry.key,
                 &entry.value,
@@ -441,13 +440,11 @@ impl Core {
             to_insert.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
-                version: tx.header.id,
-                ts: tx.header.ts,
+                version: entry.id,
+                ts: entry.ts,
             });
+            indexer.bulk_insert(&mut to_insert)?;
         }
-
-        indexer.bulk_insert(&mut to_insert)?;
-        indexer.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }
@@ -593,7 +590,7 @@ impl Core {
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
         let current_offset = self.clog.as_ref().unwrap().read().offset()?;
-        let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
+        let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
         let mut committed_values_offsets = HashMap::new();
 

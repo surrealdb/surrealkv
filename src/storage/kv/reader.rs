@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 
 use crate::storage::{
     kv::{
-        entry::{TxEntry, TxRecord, MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE},
+        entry::{Record, Records, MAX_KV_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
         util::calculate_crc32,
@@ -14,8 +14,10 @@ use crate::storage::{
     log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
 
+use super::util::calculate_crc32_combined;
+
 /// `Reader` is a generic reader for reading data from an Aol. It is used
-/// by the `TxReader` to read data from the Aol source.
+/// by the `RecordReader` to read data from the Aol source.
 pub(crate) struct Reader {
     rdr: MultiSegmentReader,
     buffer: Vec<u8>,
@@ -141,11 +143,11 @@ impl Reader {
     }
 }
 
-/// `TxReader` is a public struct within the crate that is used for reading transaction records.
+/// `RecordReader` is a public struct within the crate that is used for reading transaction records.
 ///
 /// # Fields
 /// * `r: Reader` - The `Reader` instance used to read data.
-pub(crate) struct TxReader {
+pub(crate) struct RecordReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
@@ -153,14 +155,14 @@ pub(crate) struct TxReader {
     max_value_size: u64,
 }
 
-impl TxReader {
-    /// Creates a new `TxReader` with the given `Reader`.
+impl RecordReader {
+    /// Creates a new `RecordReader` with the given `Reader`.
     ///
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
     pub(crate) fn new(r: Reader, max_key_size: u64, max_value_size: u64) -> Self {
-        TxReader {
+        RecordReader {
             r,
             err: None,
             rec: Vec::new(),
@@ -169,12 +171,8 @@ impl TxReader {
         }
     }
 
-    /// Reads the header of a transaction record.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx: &mut TxRecord` - The transaction record to read the header into.    
-    pub(crate) fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
+    /// Reads a transaction entry.
+    fn read_entry_into(&mut self, rec: &mut Record) -> Result<u64> {
         let id = self.r.read_uint64()?;
 
         // Either the header is corrupted or we have reached the end of the file
@@ -183,41 +181,9 @@ impl TxReader {
             return Err(Error::InvalidTransactionRecordId);
         }
 
-        tx.header.id = id;
-        tx.header.ts = self.r.read_uint64()?;
-        tx.header.version = self.r.read_uint16()?;
-        tx.header.num_entries = self.r.read_uint32()?;
+        let ts = self.r.read_uint64()?;
+        let version = self.r.read_uint16()?;
 
-        let md_len = self.r.read_uint16()? as usize;
-        if md_len > MAX_TX_METADATA_SIZE {
-            let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-            return Err(Error::LogError(Corruption(CorruptionError::new(
-                std::io::ErrorKind::Other,
-                Error::CorruptedTransactionHeader("metadata length exceeds maximum".to_string())
-                    .to_string()
-                    .as_str(),
-                segment_id,
-                offset,
-            ))));
-        }
-
-        let mut txmd: Option<Metadata> = None;
-        if md_len > 0 {
-            let mut md_bs = [0; MAX_TX_METADATA_SIZE];
-            self.r.read(&mut md_bs[..md_len])?;
-
-            let metadata = Metadata::from_bytes(&md_bs)?;
-            txmd = Some(metadata);
-        }
-
-        tx.header.metadata = txmd;
-
-        Ok(())
-    }
-
-    /// Reads a transaction entry.
-    fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_KV_METADATA_SIZE {
             return self.corrupt_record_error("metadata length exceeds maximum");
@@ -245,56 +211,9 @@ impl TxReader {
 
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
-        let crc32 = self.r.read_uint32()?;
-
-        Ok((
-            TxEntry {
-                metadata: kvmd,
-                key: k.into(),
-                value: v.into(),
-                value_len: v_len as u32,
-                key_len: k_len as u32,
-                crc32,
-            },
-            offset,
-        ))
-    }
-
-    fn corrupt_record_error(&self, message: &str) -> Result<(TxEntry, u64)> {
-        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-        Err(Error::LogError(Corruption(CorruptionError::new(
-            std::io::ErrorKind::Other,
-            Error::CorruptedTransactionRecord(message.to_string())
-                .to_string()
-                .as_str(),
-            segment_id,
-            offset,
-        ))))
-    }
-
-    /// Reads a transaction record into the provided `TxRecord`.
-    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
-        self.read_header(tx)?;
-
-        let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
-        for i in 0..tx.header.num_entries as usize {
-            let (entry, offset) = self.read_entry()?;
-            let key = entry.key.clone();
-            tx.entries.insert(i, entry);
-            value_offsets.insert(key, offset as usize);
-        }
-
-        self.verify_crc(tx)?;
-
-        Ok(value_offsets)
-    }
-
-    /// Verifies the CRC of a transaction record.
-    fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
         let entry_crc = self.r.read_uint32()?;
-        let buf = Self::serialize_tx_record(tx)?;
-        let actual_crc = calculate_crc32(&buf);
+
+        let actual_crc = calculate_crc32_combined(&k, &v);
         if entry_crc != actual_crc {
             let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
 
@@ -308,22 +227,40 @@ impl TxReader {
             ))));
         }
 
-        Ok(())
+        rec.id = id;
+        rec.ts = ts;
+        rec.version = version;
+        rec.metadata = kvmd;
+        rec.key = k.into();
+        rec.value = v.into();
+        rec.value_len = v_len as u32;
+        rec.key_len = k_len as u32;
+        rec.crc32 = entry_crc;
+
+        Ok(offset)
     }
 
-    /// Serializes a transaction record.
-    pub(crate) fn serialize_tx_record(tx: &TxRecord) -> Result<Bytes> {
-        let mut buf = BytesMut::new();
-        tx.to_buf(&mut buf)?;
-        Ok(buf.freeze())
+    fn corrupt_record_error(&self, message: &str) -> Result<u64> {
+        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
+
+        Err(Error::LogError(Corruption(CorruptionError::new(
+            std::io::ErrorKind::Other,
+            Error::CorruptedTransactionRecord(message.to_string())
+                .to_string()
+                .as_str(),
+            segment_id,
+            offset,
+        ))))
     }
 
-    pub(crate) fn serialize_tx_with_crc(tx: &TxRecord) -> Result<Bytes> {
-        let mut buf = BytesMut::new();
-        tx.to_buf(&mut buf)?;
-        let crc = calculate_crc32(&buf);
-        buf.put_u32(crc);
-        Ok(buf.freeze())
+    /// Reads a transaction record into the provided `Record`.
+    pub(crate) fn read_into(&mut self, entry: &mut Record) -> Result<HashMap<bytes::Bytes, usize>> {
+        let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
+        let offset = self.read_entry_into(entry)?;
+        let key = entry.key.clone();
+        value_offsets.insert(key, offset as usize);
+
+        Ok(value_offsets)
     }
 
     pub(crate) fn read(&mut self, max_entries: usize) -> Result<(&[u8], u64)> {
@@ -333,14 +270,17 @@ impl TxReader {
 
         self.rec.clear();
 
-        let mut tx = TxRecord::new(max_entries);
+        let mut tx = Record::new();
         match self.read_into(&mut tx) {
             Ok(value_offsets) => value_offsets,
             Err(e) => return Err(e),
         };
 
-        let rec = Self::serialize_tx_with_crc(&tx)?;
-        self.rec.extend(&rec);
+        let mut rec = BytesMut::new();
+        tx.encode(&mut rec)?;
+        let rec = rec.freeze();
+
+        self.rec.extend(rec);
 
         Ok((&self.rec, self.r.current_offset()))
     }

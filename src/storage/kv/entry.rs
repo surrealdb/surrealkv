@@ -13,8 +13,7 @@ use crate::storage::{
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
-pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
-pub(crate) const TRANSACTION_HEADER_VERSION: u16 = 1; // Version of the transaction header
+pub(crate) const RECORD_VERSION: u16 = 1; // Version of the transaction header
 
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
@@ -48,31 +47,20 @@ impl Entry {
             false
         }
     }
+
+    pub(crate) fn crc32(&self) -> u32 {
+        calculate_crc32_combined(&self.key, &self.value)
+    }
 }
 
-// Tx struct encoded format:
+// Record encoded format:
 //
 //   +---------------------------------------------------------+
-//   |                     Tx (Transaction)                    |
+//   |                        Record                           |
 //   |---------------------------------------------------------|
-//   | header: TxHeader                                        |
-//   | entries: Vec<TxEntry>                                   |
-//   | crc: u32                                                |
-//   +---------------------------------------------------------+
-
-//   +---------------------------------------------------------+
-//   |                     TxHeader                            |
-//   |---------------------------------------------------------|
-//   | id: u64                                                 |
+//   | tx_id: u64                                              |
 //   | ts: u64                                                 |
 //   | version: u16                                            |
-//   | num_entries: u16                                        |
-//   | metadata: Option<Metadata>                              |
-//   +---------------------------------------------------------+
-
-//   +---------------------------------------------------------+
-//   |                        TxEntry                          |
-//   |---------------------------------------------------------|
 //   | key: Bytes                                              |
 //   | key_len: u32                                            |
 //   | md: Option<Metadata>                                    |
@@ -82,62 +70,53 @@ impl Entry {
 //   +---------------------------------------------------------+
 //
 //
-// TxHeader encoded format:
+// Record encoded format:
 //
-//   |------------------------------------------------------------------------------------|------------------|
-//   |                              TxHeader                                              |     TxEntry[]    |
-//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
-//   | crc(4) | id(8) | ts(8) | version(2) | num_entries(2)  | metadata_len(2) | metadata |  ...entries...   |
-//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
-//
-// TxEntry encoded format:
-//
-//   |-----------------|----------|------------|-----|--------------|-------|-------|
-//   | metadata_len(4) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
-//   |-----------------|----------|------------|-----|--------------|-------|-------|
+//   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
+//   | tx_id(8) |   ts(8)  | version(2) | metadata_len(4) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
+//   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
 //
 #[derive(Debug)]
-pub(crate) struct TxRecord {
-    pub(crate) header: TxHeader,
-    pub(crate) entries: Vec<TxEntry>,
+pub(crate) struct Records {
+    max_entries: usize,
+    pub(crate) entries: Vec<Record>,
 }
 
-impl TxRecord {
+impl Records {
     pub(crate) fn new(max_entries: usize) -> Self {
-        TxRecord {
-            header: TxHeader::new(),
+        Records {
+            max_entries,
             entries: Vec::with_capacity(max_entries),
         }
     }
 
     pub(crate) fn reset(&mut self) {
-        self.header.reset();
         self.entries.clear();
     }
 
     pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
-        let mut tx_record = TxRecord::new(entries.len());
-        tx_record.header.id = tx_id;
-        tx_record.header.ts = commit_ts;
+        let mut tx_record = Records::new(entries.len());
 
         for entry in entries {
-            tx_record.add_entry(entry);
+            tx_record.add_entry(entry, tx_id, commit_ts);
         }
         tx_record
     }
 
-    pub(crate) fn add_entry(&mut self, entry: Entry) {
-        let crc32 = calculate_crc32_combined(&entry.key, &entry.value);
-        let tx_record_entry = TxEntry {
+    pub(crate) fn add_entry(&mut self, entry: Entry, tx_id: u64, commit_ts: u64) {
+        let crc32 = entry.crc32();
+        let tx_record_entry = Record {
+            id: tx_id,
+            ts: commit_ts,
+            version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32,
+            crc32: crc32,
         };
         self.entries.push(tx_record_entry);
-        self.header.num_entries += 1;
     }
 
     pub(crate) fn encode(
@@ -146,9 +125,6 @@ impl TxRecord {
         current_offset: u64,
         offset_tracker: &mut HashMap<Bytes, usize>,
     ) -> Result<()> {
-        // Encode header
-        self.header.encode(buf);
-
         // Encode entries and store offsets
         for entry in &self.entries {
             let mut offset = entry.encode(buf)?;
@@ -158,16 +134,10 @@ impl TxRecord {
             offset_tracker.insert(entry.key.clone(), offset);
         }
 
-        let crc = calculate_crc32(buf);
-        buf.put_u32(crc);
-
         Ok(())
     }
 
     pub(crate) fn to_buf(&self, buf: &mut BytesMut) -> Result<()> {
-        // Encode header
-        self.header.encode(buf);
-
         // Encode entries and store offsets
         for entry in &self.entries {
             entry.encode(buf)?;
@@ -178,22 +148,30 @@ impl TxRecord {
 }
 
 #[derive(Debug)]
-pub(crate) struct TxHeader {
+pub(crate) struct Record {
     pub(crate) id: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
-    pub(crate) num_entries: u32,
     pub(crate) metadata: Option<Metadata>,
+    pub(crate) key: Bytes,
+    pub(crate) key_len: u32,
+    pub(crate) value_len: u32,
+    pub(crate) value: Bytes,
+    pub(crate) crc32: u32,
 }
 
-impl TxHeader {
+impl Record {
     pub(crate) fn new() -> Self {
-        TxHeader {
+        Record {
             id: 0,
             ts: 0,
-            version: TRANSACTION_HEADER_VERSION,
-            num_entries: 0,
+            version: 0,
             metadata: None,
+            key: Bytes::new(),
+            key_len: 0,
+            value_len: 0,
+            value: Bytes::new(),
+            crc32: 0,
         }
     }
 
@@ -202,43 +180,19 @@ impl TxHeader {
         self.ts = 0;
         self.version = 0;
         self.metadata = None;
-        self.num_entries = 0;
+        self.key.clear();
+        self.key_len = 0;
+        self.value_len = 0;
+        self.value.clear();
+        self.crc32 = 0;
     }
 
-    pub(crate) fn encode(&self, buf: &mut BytesMut) {
-        let (md_len, md_bytes) = match &self.metadata {
-            Some(metadata) => {
-                let md_bytes = metadata.to_bytes();
-                let md_len = md_bytes.len() as u16;
-                (md_len, md_bytes)
-            }
-            None => (0, Bytes::new()),
-        };
-
-        // tx_id(8) + ts(8) + version(2) + num_entries(4) + meta_data_len(2) + metadata
+    pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
+        // tx_id(8) + ts(8) + version(2)
         buf.put_u64(self.id);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
-        buf.put_u32(self.num_entries);
-        buf.put_u16(md_len);
-        if md_len > 0 {
-            buf.put(md_bytes);
-        }
-    }
-}
 
-#[derive(Debug)]
-pub(crate) struct TxEntry {
-    pub(crate) key: Bytes,
-    pub(crate) key_len: u32,
-    pub(crate) metadata: Option<Metadata>,
-    pub(crate) value_len: u32,
-    pub(crate) value: Bytes,
-    pub(crate) crc32: u32,
-}
-
-impl TxEntry {
-    pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // Encode metadata, if present
         if let Some(metadata) = &self.metadata {
             let md_bytes = metadata.to_bytes();

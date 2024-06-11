@@ -6,7 +6,7 @@ use crate::storage::{
     kv::{
         error::{Error, Result},
         option::Options,
-        reader::{Reader, TxReader},
+        reader::{Reader, RecordReader},
         util::sanitize_directory,
     },
     log::{aof::log::Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
@@ -157,7 +157,7 @@ fn repair_segment(
 
     // Initialize a reader for the segment
     let reader = Reader::new_from(segment_reader, aol.opts.max_file_size, BLOCK_SIZE);
-    let mut reader = TxReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
+    let mut reader = RecordReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
 
     let mut count = 0;
     // Read records until the offset marker is reached
@@ -246,7 +246,7 @@ mod tests {
 
     use super::*;
 
-    use crate::storage::kv::entry::TxRecord;
+    use crate::storage::kv::entry::Record;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
     use crate::storage::kv::transaction::Durability;
@@ -354,8 +354,8 @@ mod tests {
             opts.max_segment_size,
             1000,
         );
-        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
-        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
+        let mut tx = Record::new();
 
         loop {
             tx.reset();
