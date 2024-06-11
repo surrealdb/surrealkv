@@ -383,7 +383,7 @@ impl Core {
             // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+                Ok((value_offsets)) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
 
                 // If the end of the file is reached, the loop is broken.
                 Err(Error::LogError(LogError::Eof(_))) => break,
@@ -418,7 +418,7 @@ impl Core {
     fn process_entries(
         entry: &Record,
         opts: &Options,
-        value_offsets: &HashMap<Bytes, usize>,
+        value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
         let mut to_insert = Vec::new();
@@ -430,12 +430,13 @@ impl Core {
             }
             indexer.bulk_delete(&mut to_delete)?;
         } else {
-            let val_off = *value_offsets.get(&entry.key).unwrap() as u64;
+            let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
+
             let index_value = ValueRef::encode(
-                &entry.key,
+                *segment_id,
                 &entry.value,
                 entry.metadata.as_ref(),
-                val_off,
+                *val_off as u64,
                 opts.max_value_threshold,
             );
 
@@ -600,20 +601,19 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
-        // let current_offset = self.clog.as_ref().unwrap().read().offset()?;
         let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
-        let mut committed_values_offsets = HashMap::new();
+        let mut values_offsets = HashMap::new();
 
-        tx_record.encode(&mut buf, &mut committed_values_offsets)?;
+        tx_record.encode(&mut buf, &mut values_offsets)?;
 
         let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
-        self.write_index_with_committed_offsets(
-            &req,
-            segment_id,
-            current_offset,
-            &committed_values_offsets,
-        )
+
+        values_offsets.iter_mut().for_each(|(_, val_off)| {
+            *val_off += current_offset;
+        });
+
+        self.write_index_with_committed_offsets(&req, segment_id, &values_offsets)
     }
 
     fn write_entries_to_memory(&self, req: Task) -> Result<()> {
@@ -688,18 +688,14 @@ impl Core {
         &self,
         task: &Task,
         segment_id: u64,
-        current_offset: u64,
-        committed_values_offsets: &HashMap<Bytes, usize>,
+        committed_values_offsets: &HashMap<Bytes, u64>,
     ) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
-            let mut val_off = *committed_values_offsets.get(&entry.key).unwrap() as u64;
-            val_off += current_offset;
-
             ValueRef::encode(
-                &entry.key,
+                segment_id,
                 &entry.value,
                 entry.metadata.as_ref(),
-                val_off,
+                *committed_values_offsets.get(&entry.key).unwrap() as u64,
                 self.opts.max_value_threshold,
             )
         })

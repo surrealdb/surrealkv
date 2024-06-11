@@ -191,10 +191,10 @@ impl Aol {
         };
 
         let (off, _) = result.unwrap();
-        // Calculate offset only for the first chunk of data
-        let offset = off + self.calculate_offset();
+        // // Calculate offset only for the first chunk of data
+        // let offset = off + self.calculate_offset();
 
-        Ok((self.active_segment_id, offset, rec.len()))
+        Ok((self.active_segment_id, off, rec.len()))
     }
 
     /// Flushes and syncs the active segment.
@@ -246,6 +246,44 @@ impl Aol {
         let offset = off + r as u64;
         let segment_id = off / self.opts.max_file_size;
         let read_offset = offset % self.opts.max_file_size;
+
+        // Read data from the appropriate segment
+        match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
+            Ok(bytes_read) => {
+                r += bytes_read;
+            }
+            Err(e) => match e {
+                Error::Eof(n) => {
+                    return Err(Error::Eof(n));
+                    // if n > 0 {
+                    //     continue;
+                    // } else {
+                    //     return Err(Error::Eof(n));
+                    // }
+                }
+                _ => return Err(e),
+            },
+        }
+
+        Ok((segment_id, r))
+    }
+
+    pub fn read_at_segment(
+        &self,
+        buf: &mut [u8],
+        segment_id: u64,
+        read_offset: u64,
+    ) -> Result<(u64, usize)> {
+        self.check_if_fsync_failed()?;
+
+        if buf.is_empty() {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::UnexpectedEof,
+                "Buffer is empty",
+            )));
+        }
+
+        let mut r = 0;
 
         // Read data from the appropriate segment
         match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {

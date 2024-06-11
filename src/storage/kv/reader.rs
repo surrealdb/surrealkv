@@ -40,7 +40,7 @@ impl Reader {
 
     /// Returns the current offset of the `Reader`.
     fn offset(&self) -> u64 {
-        self.rdr.current_segment_id() * self.file_size + self.rdr.current_offset() as u64
+        self.rdr.current_offset() as u64
     }
 
     fn current_segment_id(&self) -> u64 {
@@ -170,8 +170,11 @@ impl RecordReader {
     }
 
     /// Reads a transaction entry.
-    fn read_entry_into(&mut self, rec: &mut Record) -> Result<u64> {
+    fn read_entry_into(&mut self, rec: &mut Record) -> Result<(u64, u64)> {
         let entry_crc = self.r.read_uint32()?;
+
+        let segment_id = self.r.current_segment_id();
+
         let version = self.r.read_uint16()?;
         let id = self.r.read_uint64()?;
 
@@ -235,10 +238,10 @@ impl RecordReader {
         rec.key_len = k_len as u32;
         rec.crc32 = entry_crc;
 
-        Ok(offset)
+        Ok((segment_id, offset))
     }
 
-    fn corrupt_record_error(&self, message: &str) -> Result<u64> {
+    fn corrupt_record_error(&self, message: &str) -> Result<(u64, u64)> {
         let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
 
         Err(Error::LogError(Corruption(CorruptionError::new(
@@ -252,11 +255,14 @@ impl RecordReader {
     }
 
     /// Reads a transaction record into the provided `Record`.
-    pub(crate) fn read_into(&mut self, entry: &mut Record) -> Result<HashMap<bytes::Bytes, usize>> {
-        let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
-        let offset = self.read_entry_into(entry)?;
+    pub(crate) fn read_into(
+        &mut self,
+        entry: &mut Record,
+    ) -> Result<(HashMap<bytes::Bytes, (u64, usize)>)> {
+        let mut value_offsets = HashMap::new();
+        let (segment_id, offset) = self.read_entry_into(entry)?;
         let key = entry.key.clone();
-        value_offsets.insert(key, offset as usize);
+        value_offsets.insert(key, (segment_id, offset as usize));
 
         Ok(value_offsets)
     }

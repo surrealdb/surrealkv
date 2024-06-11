@@ -117,7 +117,7 @@ impl Records {
         &self,
         buf: &mut BytesMut,
         // current_offset: u64,
-        offset_tracker: &mut HashMap<Bytes, usize>,
+        offset_tracker: &mut HashMap<Bytes, u64>,
     ) -> Result<()> {
         // Encode entries and store offsets
         for entry in &self.entries {
@@ -125,7 +125,7 @@ impl Records {
             // offset += current_offset as usize;
 
             // Store the offset for the current entry
-            offset_tracker.insert(entry.key.clone(), offset);
+            offset_tracker.insert(entry.key.clone(), offset as u64);
         }
 
         Ok(())
@@ -235,6 +235,7 @@ pub(crate) trait Value {
 pub struct ValueRef {
     pub(crate) flag: u8,
     pub(crate) ts: u64,
+    pub(crate) segment_id: u64,
     pub(crate) value_length: usize,
     pub(crate) value_offset: Option<u64>,
     pub(crate) value: Option<Bytes>,
@@ -278,6 +279,7 @@ impl ValueRef {
         ValueRef {
             ts: 0,
             flag: 0,
+            segment_id: 0,
             value_offset: None,
             value_length: 0,
             value: None,
@@ -288,7 +290,7 @@ impl ValueRef {
 
     /// Encode the valueRef into a byte representation.
     pub(crate) fn encode(
-        key: &Bytes,
+        segment_id: u64,
         value: &Bytes,
         metadata: Option<&Metadata>,
         value_offset: u64,
@@ -298,11 +300,13 @@ impl ValueRef {
 
         if value.len() <= max_value_threshold {
             buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
+            buf.put_u64(segment_id);
             buf.put_u32(value.len() as u32);
             buf.put_u64(value_offset);
             buf.put(value.as_ref());
         } else {
             buf.put_u8(0);
+            buf.put_u64(segment_id);
             buf.put_u32(value.len() as u32);
             buf.put_u64(value_offset);
         }
@@ -323,6 +327,7 @@ impl ValueRef {
         let mut buf = BytesMut::new();
 
         buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
+        buf.put_u64(0);
         buf.put_u32(value.len() as u32);
         buf.put_u64(0);
         buf.put(value.as_ref());
@@ -349,6 +354,7 @@ impl ValueRef {
         self.flag = cursor.get_u8();
 
         // Decode value length and value
+        self.segment_id = cursor.get_u64();
         self.value_length = cursor.get_u32() as usize;
         self.value_offset = Some(cursor.get_u64());
 
@@ -404,7 +410,7 @@ impl ValueRef {
         // Read the value from the commit log at the specified offset
         let mut buf = vec![0; self.value_length];
         let vlog = self.store.clog.as_ref().unwrap().read();
-        vlog.read_at(&mut buf, value_offset)?;
+        vlog.read_at_segment(&mut buf, self.segment_id, value_offset)?;
 
         // Store the offset and value in value_cache
         self.store

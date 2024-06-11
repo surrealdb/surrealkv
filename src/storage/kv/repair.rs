@@ -396,6 +396,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_across_segments_from_disk() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 50;
+        opts.max_value_threshold = 2;
+
+        let keys = vec![Bytes::from("k1"), Bytes::from("k2"), Bytes::from("k3")];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let expected_keys = vec!["k1", "k2", "k3"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
     async fn repair_with_one_record_per_segment() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
