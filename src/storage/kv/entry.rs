@@ -61,9 +61,9 @@ impl Entry {
 //   | tx_id: u64                                              |
 //   | ts: u64                                                 |
 //   | version: u16                                            |
-//   | key: Bytes                                              |
-//   | key_len: u32                                            |
 //   | md: Option<Metadata>                                    |
+//   | key_len: u32                                            |
+//   | key: Bytes                                              |
 //   | value_len: u32                                          |
 //   | value: Bytes                                            |
 //   | crc32: u32                                              |
@@ -73,7 +73,7 @@ impl Entry {
 // Record encoded format:
 //
 //   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
-//   | tx_id(8) |   ts(8)  | version(2) | metadata_len(4) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
+//   | tx_id(8) |   ts(8)  | version(2) | metadata_len(2) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
 //   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
 //
 #[derive(Debug)]
