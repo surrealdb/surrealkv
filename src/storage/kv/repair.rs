@@ -161,7 +161,7 @@ fn repair_segment(
 
     let mut count = 0;
     // Read records until the offset marker is reached
-    while let Ok((data, cur_offset)) = reader.read(db_opts.max_entries_per_txn as usize) {
+    while let Ok((data, cur_offset)) = reader.read() {
         if cur_offset >= corrupted_offset_marker {
             break;
         }

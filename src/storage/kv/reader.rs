@@ -1,20 +1,18 @@
 use std::io::Read;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::BytesMut;
 
 use hashbrown::HashMap;
 
 use crate::storage::{
     kv::{
-        entry::{Record, Records, MAX_KV_METADATA_SIZE},
+        entry::{Record, MAX_KV_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
-        util::calculate_crc32,
+        util::calculate_crc32_combined,
     },
     log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
-
-use super::util::calculate_crc32_combined;
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `RecordReader` to read data from the Aol source.
@@ -263,7 +261,7 @@ impl RecordReader {
         Ok(value_offsets)
     }
 
-    pub(crate) fn read(&mut self, max_entries: usize) -> Result<(&[u8], u64)> {
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }

@@ -376,7 +376,7 @@ impl Transaction {
             if val_ref.ts() <= self.read_ts {
                 self.read_set.lock().push((
                     Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the vart leaf are terminated with a null byte
-                    val_ref.ts,
+                    val_ref.ts(),
                 ));
             }
 

@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 /// Calculates the CRC32 hash of a byte array.
 /// It creates a new CRC32 hasher, updates it with the byte array, and finalizes the hash.
 /// It returns the hash as a 32-bit unsigned integer.
+#[allow(unused)]
 pub(crate) fn calculate_crc32(buf: &[u8]) -> u32 {
     let mut hasher = crc32Hasher::new();
     hasher.update(buf);

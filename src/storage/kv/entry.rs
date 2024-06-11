@@ -8,7 +8,7 @@ use crate::storage::{
     kv::error::{Error, Result},
     kv::meta::Metadata,
     kv::store::Core,
-    kv::util::{calculate_crc32, calculate_crc32_combined},
+    kv::util::calculate_crc32_combined,
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
@@ -78,20 +78,14 @@ impl Entry {
 //
 #[derive(Debug)]
 pub(crate) struct Records {
-    max_entries: usize,
     pub(crate) entries: Vec<Record>,
 }
 
 impl Records {
     pub(crate) fn new(max_entries: usize) -> Self {
         Records {
-            max_entries,
             entries: Vec::with_capacity(max_entries),
         }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.entries.clear();
     }
 
     pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
@@ -132,15 +126,6 @@ impl Records {
 
             // Store the offset for the current entry
             offset_tracker.insert(entry.key.clone(), offset);
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn to_buf(&self, buf: &mut BytesMut) -> Result<()> {
-        // Encode entries and store offsets
-        for entry in &self.entries {
-            entry.encode(buf)?;
         }
 
         Ok(())
@@ -188,12 +173,22 @@ impl Record {
     }
 
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
-        // tx_id(8) + ts(8) + version(2)
+        // This function encodes an Record into a buffer. The encoding format is as follows:
+        // - Transaction ID (8 bytes)
+        // - Timestamp (8 bytes)
+        // - Version (2 bytes)
+        // - Metadata Length (2 bytes)
+        // - Metadata (variable length, defined by Metadata Length)
+        // - Key Length (4 bytes)
+        // - Key (variable length, defined by Key Length)
+        // - Value Length (4 bytes)
+        // - Value (variable length, defined by Value Length)
+        // - CRC32 Checksum (4 bytes)
+        // The function returns the offset position in the buffer after the Value field.
         buf.put_u64(self.id);
         buf.put_u64(self.ts);
         buf.put_u16(self.version);
 
-        // Encode metadata, if present
         if let Some(metadata) = &self.metadata {
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
@@ -203,7 +198,6 @@ impl Record {
             buf.put_u16(0);
         }
 
-        // Encode key length, key, value length, value, and crc32
         buf.put_u32(self.key_len);
         buf.put(self.key.as_ref());
         buf.put_u32(self.value_len);
