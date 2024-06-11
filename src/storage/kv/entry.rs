@@ -58,23 +58,23 @@ impl Entry {
 //   +---------------------------------------------------------+
 //   |                        Record                           |
 //   |---------------------------------------------------------|
+//   | crc32: u32                                              |
+//   | version: u16                                            |
 //   | tx_id: u64                                              |
 //   | ts: u64                                                 |
-//   | version: u16                                            |
 //   | md: Option<Metadata>                                    |
 //   | key_len: u32                                            |
 //   | key: Bytes                                              |
 //   | value_len: u32                                          |
 //   | value: Bytes                                            |
-//   | crc32: u32                                              |
 //   +---------------------------------------------------------+
 //
 //
 // Record encoded format:
 //
-//   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
-//   | tx_id(8) |   ts(8)  | version(2) | metadata_len(2) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
-//   |----------|----------|------------|-----------------|----------|------------|-----|--------------|-------|-------|
+//   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
+//   | crc32(4) | version(2) |  tx_id(8)  |  ts(8)  | metadata_len(2) |  metadata  | key_len(4) | key | value_len(4) | value |
+//   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
 #[derive(Debug)]
 pub(crate) struct Records {
@@ -174,20 +174,21 @@ impl Record {
 
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // This function encodes an Record into a buffer. The encoding format is as follows:
+        // - CRC32 Checksum (4 bytes)
+        // - Version (2 bytes)
         // - Transaction ID (8 bytes)
         // - Timestamp (8 bytes)
-        // - Version (2 bytes)
         // - Metadata Length (2 bytes)
         // - Metadata (variable length, defined by Metadata Length)
         // - Key Length (4 bytes)
         // - Key (variable length, defined by Key Length)
         // - Value Length (4 bytes)
         // - Value (variable length, defined by Value Length)
-        // - CRC32 Checksum (4 bytes)
         // The function returns the offset position in the buffer after the Value field.
+        buf.put_u32(self.crc32);
+        buf.put_u16(self.version);
         buf.put_u64(self.id);
         buf.put_u64(self.ts);
-        buf.put_u16(self.version);
 
         if let Some(metadata) = &self.metadata {
             let md_bytes = metadata.to_bytes();
@@ -203,7 +204,6 @@ impl Record {
         buf.put_u32(self.value_len);
         let offset = buf.len();
         buf.put(self.value.as_ref());
-        buf.put_u32(self.crc32);
 
         Ok(offset)
     }

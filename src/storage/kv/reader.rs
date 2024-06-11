@@ -171,6 +171,8 @@ impl RecordReader {
 
     /// Reads a transaction entry.
     fn read_entry_into(&mut self, rec: &mut Record) -> Result<u64> {
+        let entry_crc = self.r.read_uint32()?;
+        let version = self.r.read_uint16()?;
         let id = self.r.read_uint64()?;
 
         // Either the header is corrupted or we have reached the end of the file
@@ -180,7 +182,6 @@ impl RecordReader {
         }
 
         let ts = self.r.read_uint64()?;
-        let version = self.r.read_uint16()?;
 
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_KV_METADATA_SIZE {
@@ -209,7 +210,6 @@ impl RecordReader {
 
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
-        let entry_crc = self.r.read_uint32()?;
 
         let actual_crc = calculate_crc32_combined(&k, &v);
         if entry_crc != actual_crc {
