@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::vec;
 
 use async_channel::{bounded, Receiver, Sender};
+use chrono::offset;
 use futures::{select, FutureExt};
 use tokio::task::{spawn, JoinHandle};
 
@@ -429,11 +430,12 @@ impl Core {
             }
             indexer.bulk_delete(&mut to_delete)?;
         } else {
+            let val_off = *value_offsets.get(&entry.key).unwrap() as u64;
             let index_value = ValueRef::encode(
                 &entry.key,
                 &entry.value,
                 entry.metadata.as_ref(),
-                value_offsets,
+                val_off,
                 opts.max_value_threshold,
             );
 
@@ -598,47 +600,55 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
-        let current_offset = self.clog.as_ref().unwrap().read().offset()?;
+        // let current_offset = self.clog.as_ref().unwrap().read().offset()?;
         let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
         let mut committed_values_offsets = HashMap::new();
 
-        tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
+        tx_record.encode(&mut buf, &mut committed_values_offsets)?;
 
-        self.append_log(&buf, req.durability)?;
-        self.write_index_with_committed_offsets(&req, &committed_values_offsets)
+        let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
+        self.write_index_with_committed_offsets(
+            &req,
+            segment_id,
+            current_offset,
+            &committed_values_offsets,
+        )
     }
 
     fn write_entries_to_memory(&self, req: Task) -> Result<()> {
         self.write_index_in_memory(&req)
     }
 
-    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
+    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
         let mut clog = self.clog.as_ref().unwrap().write();
 
-        match durability {
+        let (segment_id, offset) = match durability {
             Durability::Immediate => {
                 // Immediate durability means that the transaction is made to
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
                 clog.sync()?;
+                (segment_id, offset)
             }
             Durability::Eventual => {
                 // Eventual durability means that the transaction is made to
                 // write to disk using the write_all method. But it does not
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
                 clog.flush()?;
+                (segment_id, offset)
             }
             Durability::Weak => {
                 // Weak durability means that the transaction is made to
                 // write to disk in size of BLOCK_SIZE. And it does not
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
+                (segment_id, offset)
             }
-        }
+        };
 
-        Ok(())
+        Ok((segment_id, offset))
     }
 
     fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
@@ -677,14 +687,19 @@ impl Core {
     fn write_index_with_committed_offsets(
         &self,
         task: &Task,
+        segment_id: u64,
+        current_offset: u64,
         committed_values_offsets: &HashMap<Bytes, usize>,
     ) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
+            let mut val_off = *committed_values_offsets.get(&entry.key).unwrap() as u64;
+            val_off += current_offset;
+
             ValueRef::encode(
                 &entry.key,
                 &entry.value,
                 entry.metadata.as_ref(),
-                committed_values_offsets,
+                val_off,
                 self.opts.max_value_threshold,
             )
         })

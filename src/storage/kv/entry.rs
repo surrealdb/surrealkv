@@ -116,13 +116,13 @@ impl Records {
     pub(crate) fn encode(
         &self,
         buf: &mut BytesMut,
-        current_offset: u64,
+        // current_offset: u64,
         offset_tracker: &mut HashMap<Bytes, usize>,
     ) -> Result<()> {
         // Encode entries and store offsets
         for entry in &self.entries {
             let mut offset = entry.encode(buf)?;
-            offset += current_offset as usize;
+            // offset += current_offset as usize;
 
             // Store the offset for the current entry
             offset_tracker.insert(entry.key.clone(), offset);
@@ -291,7 +291,7 @@ impl ValueRef {
         key: &Bytes,
         value: &Bytes,
         metadata: Option<&Metadata>,
-        value_offsets: &HashMap<bytes::Bytes, usize>,
+        value_offset: u64,
         max_value_threshold: usize,
     ) -> Bytes {
         let mut buf = BytesMut::new();
@@ -299,14 +299,12 @@ impl ValueRef {
         if value.len() <= max_value_threshold {
             buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
             buf.put_u32(value.len() as u32);
-            let val_off = value_offsets.get(key).unwrap();
-            buf.put_u64(*val_off as u64);
+            buf.put_u64(value_offset);
             buf.put(value.as_ref());
         } else {
             buf.put_u8(0);
             buf.put_u32(value.len() as u32);
-            let val_off = value_offsets.get(key).unwrap();
-            buf.put_u64(*val_off as u64);
+            buf.put_u64(value_offset);
         }
 
         if let Some(metadata) = &metadata {
