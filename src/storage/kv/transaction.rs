@@ -1806,4 +1806,56 @@ mod tests {
     async fn g2_predicate() {
         g2_item_predicate(true).await;
     }
+
+    #[tokio::test]
+    async fn transaction_delete_from_index() {
+        let (store, temp_dir) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("foo1");
+        let value = Bytes::from("baz");
+        let key2 = Bytes::from("foo2");
+
+        {
+            // Start a new read-write transaction (txn1)
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value).unwrap();
+            txn1.set(&key2, &value).unwrap();
+            txn1.commit().await.unwrap();
+        }
+
+        {
+            // Start another read-write transaction (txn2)
+            let mut txn2 = store.begin().unwrap();
+            txn2.delete(&key1).unwrap();
+            txn2.commit().await.unwrap();
+        }
+
+        {
+            // Start a read-only transaction (txn3)
+            let txn3 = store.begin().unwrap();
+            let val = txn3.get(&key1).unwrap();
+            assert!(val.is_none());
+            let val = txn3.get(&key2).unwrap().unwrap();
+            assert_eq!(val, value.as_ref());
+        }
+
+        // Drop the store to simulate closing it
+        store.close().await.unwrap();
+
+        // sleep for a while to ensure the store is closed
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Create a new Core instance with VariableSizeKey after dropping the previous one
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Store::new(opts).expect("should create store");
+
+        // Start a read-only transaction (txn4)
+        let txn4 = store.begin().unwrap();
+        let val = txn4.get(&key1).unwrap();
+        assert!(val.is_none());
+        let val = txn4.get(&key2).unwrap().unwrap();
+        assert_eq!(val, value.as_ref());
+    }
 }

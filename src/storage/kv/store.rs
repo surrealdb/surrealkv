@@ -419,28 +419,37 @@ impl Core {
         value_offsets: &HashMap<Bytes, usize>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<vart::VariableSizeKey, Bytes>> = tx
-            .entries
-            .iter()
-            .map(|entry| {
-                let index_value = ValueRef::encode(
-                    &entry.key,
-                    &entry.value,
-                    entry.metadata.as_ref(),
-                    value_offsets,
-                    opts.max_value_threshold,
-                );
+        let mut to_insert = Vec::new();
+        let mut to_delete = Vec::new();
 
-                KV {
-                    key: entry.key[..].into(),
-                    value: index_value,
-                    version: tx.header.id,
-                    ts: tx.header.ts,
+        for entry in &tx.entries {
+            if let Some(metadata) = entry.metadata.as_ref() {
+                if metadata.deleted() {
+                    to_delete.push(entry.key[..].into());
+                    continue;
                 }
-            })
-            .collect();
+            }
 
-        indexer.bulk_insert(&mut kv_pairs)
+            let index_value = ValueRef::encode(
+                &entry.key,
+                &entry.value,
+                entry.metadata.as_ref(),
+                value_offsets,
+                opts.max_value_threshold,
+            );
+
+            to_insert.push(KV {
+                key: entry.key[..].into(),
+                value: index_value,
+                version: tx.header.id,
+                ts: tx.header.ts,
+            });
+        }
+
+        indexer.bulk_insert(&mut to_insert)?;
+        indexer.bulk_delete(&mut to_delete)?;
+
+        Ok(())
     }
 
     fn load_options(opts: &Options, manifest: &mut Aol) -> Result<Options> {
@@ -631,12 +640,21 @@ impl Core {
         F: Fn(&Entry) -> Bytes,
     {
         let mut index = self.indexer.write();
-        let mut kv_pairs = Vec::new();
+        let mut to_insert = Vec::new();
+        let mut to_delete = Vec::new();
 
         for entry in &task.entries {
+            // If the entry is marked as deleted, add it to the to_delete list.
+            if let Some(metadata) = entry.metadata.as_ref() {
+                if metadata.deleted() {
+                    to_delete.push(entry.key[..].into());
+                    continue;
+                }
+            }
+
             let index_value = encode_entry(entry);
 
-            kv_pairs.push(KV {
+            to_insert.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
                 version: task.tx_id,
@@ -644,7 +662,8 @@ impl Core {
             });
         }
 
-        index.bulk_insert(&mut kv_pairs)?;
+        index.bulk_insert(&mut to_insert)?;
+        index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }

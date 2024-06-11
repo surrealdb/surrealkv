@@ -39,6 +39,18 @@ impl Indexer {
         Ok(())
     }
 
+    pub fn bulk_delete(&mut self, kv_pairs: &mut [VariableSizeKey]) -> Result<()> {
+        kv_pairs.iter_mut().for_each(|kv| {
+            *kv = kv.terminate();
+        });
+
+        for kv in kv_pairs.iter() {
+            self.index.remove(kv)?;
+        }
+
+        Ok(())
+    }
+
     /// Returns the current version of the index.
     pub fn version(&self) -> u64 {
         self.index.version()
