@@ -312,7 +312,8 @@ mod tests {
 
         // Test initial offset
         let sz = a.offset().unwrap();
-        assert_eq!(0, sz);
+        assert_eq!(0, sz.0);
+        assert_eq!(0, sz.1);
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);

@@ -441,7 +441,7 @@ impl ValueRef {
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; self.value_length];
         let clog = self.store.clog.as_ref().unwrap().read();
-        clog.read_at_segment(&mut buf, self.segment_id, value_offset)?;
+        clog.read_at(&mut buf, self.segment_id, value_offset)?;
 
         // Cache the newly read value for future use
         self.store
