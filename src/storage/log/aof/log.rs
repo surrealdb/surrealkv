@@ -166,11 +166,9 @@ impl Aol {
             }
         };
 
-        let (off, _) = result.unwrap();
-        // // Calculate offset only for the first chunk of data
-        // let offset = off + self.calculate_offset();
+        let (offset, _) = result.unwrap();
 
-        Ok((self.active_segment_id, off, rec.len()))
+        Ok((self.active_segment_id, offset, rec.len()))
     }
 
     /// Flushes and syncs the active segment.
@@ -309,6 +307,7 @@ impl Drop for Aol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
@@ -588,5 +587,206 @@ mod tests {
         assert_eq!(1, segment_id);
         assert_eq!(512, offset);
         assert_eq!(1, a.active_segment_id);
+    }
+
+    #[test]
+    fn append_records_across_two_files_and_read() {
+        // Create a temporary directory
+        let temp_dir = create_temp_directory();
+
+        // Create AOL options with a small max file size to force a new file creation on overflow
+        let opts = Options {
+            max_file_size: 1024, // Small enough to ensure the second append creates a new file
+            ..Default::default()
+        };
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Append a record that fits within the first file
+        let first_record = vec![1; 512];
+        a.append(&first_record)
+            .expect("first append should succeed");
+        let (first_segment_id, first_offset) = a.offset().unwrap();
+        assert_eq!(0, first_segment_id);
+        assert_eq!(512, first_offset);
+
+        // Append another record that causes a new file (segment) to be created
+        let second_record = vec![2; 1024]; // This will exceed the max_file_size
+        a.append(&second_record)
+            .expect("second append should succeed");
+        let (second_segment_id, second_offset) = a.offset().unwrap();
+        assert_eq!(1, second_segment_id); // Expecting a new segment/file
+        assert_eq!(1024, second_offset);
+
+        // Read back the first record using its segment ID and offset
+        let mut read_buf = vec![0; 512];
+        a.read_at(&mut read_buf, first_segment_id, 0) // Start at offset 0 of the first segment
+            .expect("failed to read first record");
+        assert_eq!(first_record, read_buf, "First record data mismatch");
+
+        // Read back the second record using its segment ID and offset
+        let mut read_buf = vec![0; 1024];
+        a.read_at(&mut read_buf, second_segment_id, 0) // Start at offset 0 of the second segment
+            .expect("failed to read second record");
+        assert_eq!(second_record, read_buf, "Second record data mismatch");
+    }
+
+    #[test]
+    fn read_beyond_current_offset_should_fail() {
+        // Setup: Create a temporary directory and initialize the log with default options
+        let temp_dir = create_temp_directory();
+        let opts = Options::default();
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Append a single record to ensure there is some data in the log
+        let record = vec![1; 512];
+        a.append(&record).expect("append should succeed");
+
+        // Attempt to read beyond the current offset
+        let mut read_buf = vec![0; 1024]; // Buffer size is larger than the appended record
+        let result = a.read_at(&mut read_buf, 0, 1024); // Attempt to read at an offset beyond the single appended record
+
+        // Verify: The read operation should fail or return an error indicating the offset is out of bounds
+        assert!(
+            result.is_err(),
+            "Reading beyond the current offset should fail"
+        );
+    }
+
+    #[test]
+    fn append_after_reopening_log() {
+        // Setup: Create a temporary directory and initialize the log
+        let temp_dir = create_temp_directory();
+        let opts = Options::default();
+        let record = vec![1; 512];
+
+        // Step 1: Open the log, append a record, and then close it
+        {
+            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            a.append(&record).expect("append should succeed");
+        } // Log is closed here as `a` goes out of scope
+
+        // Step 2: Reopen the log and append another record
+        {
+            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            a.append(&record)
+                .expect("append after reopen should succeed");
+
+            // Verify: Ensure the log contains both records by reading them back
+            let mut read_buf = vec![0; 512];
+            a.read_at(&mut read_buf, 0, 0)
+                .expect("failed to read first record after reopen");
+            assert_eq!(record, read_buf, "First record data mismatch after reopen");
+
+            a.read_at(&mut read_buf, 0, 512)
+                .expect("failed to read second record after reopen");
+            assert_eq!(record, read_buf, "Second record data mismatch after reopen");
+        }
+    }
+
+    #[test]
+    fn append_across_two_files_and_read() {
+        // Setup: Create a temporary directory and initialize the log with small max file size
+        let temp_dir = create_temp_directory();
+        let opts = Options {
+            max_file_size: 512, // Set max file size to 512 bytes to force new file creation on second append
+            ..Default::default()
+        };
+        let record = vec![1; 512]; // Each record is 512 bytes
+
+        // Step 1: Open the log, append a record, and then close it
+        {
+            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            a.append(&record).expect("first append should succeed");
+            a.append(&record).expect("first append should succeed");
+        } // Log is closed here as `a` goes out of scope
+
+        // Step 2: Reopen the log and append another record, which should create a new file
+        {
+            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+
+            // Verify: Ensure the first record is in a new file by reading it back
+            let mut read_buf = vec![0; 512];
+            // The first record should be at the start of the first file (segment), hence segment_id = 1 and offset = 0.
+            a.read_at(&mut read_buf, 0, 0)
+                .expect("failed to read first record from new file");
+            assert_eq!(record, read_buf, "Record data mismatch in first file");
+
+            // Verify: Ensure the second record is in a new file by reading it back
+            let mut read_buf = vec![0; 512];
+            // The second record should be at the start of the second file (segment), hence segment_id = 1 and offset = 0.
+            a.read_at(&mut read_buf, 1, 0)
+                .expect("failed to read second record from new file");
+            assert_eq!(record, read_buf, "Record data mismatch in second file");
+
+            a.append(&record).expect("first append should succeed");
+            // Verify: Ensure the third record is in a new file by reading it back
+
+            let mut read_buf = vec![0; 512];
+            // The third record should be at the start of the third file (segment), hence segment_id = 1 and offset = 0.
+            a.read_at(&mut read_buf, 2, 0)
+                .expect("failed to read third record from new file");
+            assert_eq!(record, read_buf, "Record data mismatch in third file");
+        }
+    }
+
+    // TODO: add to benchmarks
+    #[test]
+    fn sequential_read_performance() {
+        let temp_dir = create_temp_directory();
+        let opts = Options::default();
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Append 1000 records to ensure we have enough data
+        let record = vec![1; 512]; // Each record is 512 bytes
+        for _ in 0..1000 {
+            a.append(&record).expect("append should succeed");
+        }
+
+        let start_time = std::time::Instant::now();
+
+        // Sequentially read all records
+        let mut read_buf = vec![0; 512];
+        for offset in (0..512000).step_by(512) {
+            a.read_at(&mut read_buf, 0, offset as u64)
+                .expect("failed to read record");
+        }
+
+        let duration = start_time.elapsed();
+
+        println!("Sequential read of 1000 records took: {:?}", duration);
+    }
+
+    // TODO: add to benchmarks
+    #[test]
+    fn random_access_read_performance() {
+        let temp_dir = create_temp_directory();
+        let opts = Options::default();
+        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Append 1000 records to ensure we have enough data
+        let record = vec![1; 512]; // Each record is 512 bytes
+        for _ in 0..1000 {
+            a.append(&record).expect("append should succeed");
+        }
+
+        // Generate a list of random offsets within the range of the data written
+        let mut offsets = (0..1000)
+            .map(|_| rand::thread_rng().gen_range(0..1000) * 512)
+            .collect::<Vec<u64>>();
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        let start_time = std::time::Instant::now();
+
+        // Randomly read records based on the generated offsets
+        let mut read_buf = vec![0; 512];
+        for offset in offsets {
+            a.read_at(&mut read_buf, 0, offset)
+                .expect("failed to read record");
+        }
+
+        let duration = start_time.elapsed();
+
+        println!("Random access read of 1000 records took: {:?}", duration);
     }
 }

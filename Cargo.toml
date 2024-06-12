@@ -41,7 +41,6 @@ jemallocator = "0.5.4"
 nanoid = "0.4.0"
 fastrand = "2.0.1"
 
-
 [[bench]]
 name = "store_bench"
 harness = false
