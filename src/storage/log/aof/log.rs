@@ -789,4 +789,47 @@ mod tests {
 
         println!("Random access read of 1000 records took: {:?}", duration);
     }
+
+    #[test]
+    fn test_rotate_functionality() {
+        let temp_dir = create_temp_directory();
+        let opts = Options::default();
+        let mut aol = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+
+        // Ensure there's data in the current segment to necessitate a rotation
+        aol.append(b"data 1").unwrap();
+
+        // Capture the current active_segment_id before rotation
+        let current_segment_id = aol.active_segment_id;
+
+        // Perform the rotation
+        aol.rotate().unwrap();
+
+        // Verify the active_segment_id is incremented
+        assert_eq!(
+            aol.active_segment_id,
+            current_segment_id + 1,
+            "Segment ID should be incremented after rotation"
+        );
+
+        // Append new data to the new segment
+        let data_to_append = b"data 2";
+        let (_, record_offset_start, _) = aol.append(data_to_append).unwrap();
+
+        // Use the offset method to verify the append operation is in the new segment
+        let (segment_id, current_offset) = aol.offset().unwrap();
+        assert!(
+            current_offset > 0,
+            "Offset should be greater than 0 after appending to a new segment"
+        );
+
+        // Use read_at to verify the data integrity
+        let mut read_data = vec![0u8; data_to_append.len()];
+        aol.read_at(&mut read_data, segment_id, record_offset_start)
+            .unwrap();
+        assert_eq!(
+            read_data, data_to_append,
+            "Data read from the new segment should match the data appended"
+        );
+    }
 }
