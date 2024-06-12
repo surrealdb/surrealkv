@@ -31,7 +31,6 @@ sha2 = "0.10.8"
 quick_cache = "0.4.0"
 vart = "0.2.1"
 
-
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempdir = "0.3"
@@ -40,6 +39,7 @@ criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 jemallocator = "0.5.4"
 nanoid = "0.4.0"
 fastrand = "2.0.1"
+libc = "0.2.155"
 
 [[bench]]
 name = "store_bench"
