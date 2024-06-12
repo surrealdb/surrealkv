@@ -108,7 +108,7 @@ impl Records {
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32: crc32,
+            crc32,
         };
         self.entries.push(tx_record_entry);
     }
@@ -121,7 +121,7 @@ impl Records {
     ) -> Result<()> {
         // Encode entries and store offsets
         for entry in &self.entries {
-            let mut offset = entry.encode(buf)?;
+            let offset = entry.encode(buf)?;
             // offset += current_offset as usize;
 
             // Store the offset for the current entry
@@ -183,7 +183,7 @@ impl Record {
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32: crc32,
+            crc32,
         }
     }
 
@@ -298,99 +298,128 @@ impl ValueRef {
     ) -> Bytes {
         let mut buf = BytesMut::new();
 
+        // Memory layout:
+        // | swizzle flag (1 byte) | segment_id (8 bytes) | value length (4 bytes) |
+        // | value_offset (8 bytes) | value (variable length, if inlined) |
+        // | metadata length (2 bytes) | metadata (variable length) |
+
         if value.len() <= max_value_threshold {
+            // Inline value case
             buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
-            buf.put_u64(segment_id);
-            buf.put_u32(value.len() as u32);
-            buf.put_u64(value_offset);
-            buf.put(value.as_ref());
+            buf.put_u64(segment_id); // Segment ID
+            buf.put_u32(value.len() as u32); // Length of the value
+            buf.put_u64(value_offset); // Offset where the value is stored
+            buf.put(value.as_ref()); // The value itself
         } else {
-            buf.put_u8(0);
-            buf.put_u64(segment_id);
-            buf.put_u32(value.len() as u32);
-            buf.put_u64(value_offset);
+            // Reference value case
+            buf.put_u8(0); // swizzle flag to indicate value is not inlined
+            buf.put_u64(segment_id); // Segment ID
+            buf.put_u32(value.len() as u32); // Length of the value
+            buf.put_u64(value_offset); // Offset where the value is stored
+                                       // Note: The actual value is not included in the buffer for this case
         }
 
         if let Some(metadata) = &metadata {
+            // If metadata is present
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
-            buf.put_u16(md_len);
-            buf.put(md_bytes);
+            buf.put_u16(md_len); // Put the length of metadata
+            buf.put(md_bytes); // Put the metadata bytes
         } else {
-            buf.put_u16(0);
+            // If no metadata is present, just write a length of 0
+            buf.put_u16(0); // Metadata length indicator for no metadata
         }
-        buf.freeze()
+        buf.freeze() // Converts the buffer into `Bytes` without copying
     }
 
     /// Encode the valueRef into an in-memory byte representation.
     pub(crate) fn encode_mem(value: &Bytes, metadata: Option<&Metadata>) -> Bytes {
         let mut buf = BytesMut::new();
 
+        // Memory layout for encoding a value with optional metadata into memory:
+        // | swizzle flag (1 byte) | reserved (8 bytes) | value length (4 bytes) |
+        // | reserved (8 bytes) | value (variable length) |
+        // | metadata length (2 bytes) | metadata (variable length) |
+
         buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
-        buf.put_u64(0);
-        buf.put_u32(value.len() as u32);
-        buf.put_u64(0);
-        buf.put(value.as_ref());
+        buf.put_u64(0); // Reserved 8 bytes, currently set to 0
+        buf.put_u32(value.len() as u32); // Length of the value
+        buf.put_u64(0); // Another reserved 8 bytes, currently set to 0
+        buf.put(value.as_ref()); // The actual value bytes
 
         if let Some(metadata) = &metadata {
+            // If metadata is provided
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
-            buf.put_u16(md_len);
-            buf.put(md_bytes);
+            buf.put_u16(md_len); // Write the length of metadata
+            buf.put(md_bytes); // Write the metadata bytes themselves
         } else {
-            buf.put_u16(0);
+            // If no metadata is provided, indicate this with a length of 0
+            buf.put_u16(0); // Metadata length set to 0 to indicate absence
         }
-        buf.freeze()
+        buf.freeze() // Converts the buffer into `Bytes` without copying, ready for use
     }
 
     /// Decode the byte representation into a valueRef.
     pub(crate) fn decode(&mut self, ts: u64, encoded_bytes: &Bytes) -> Result<()> {
         let mut cursor = Cursor::new(encoded_bytes);
 
-        // Set ts
+        // Set the timestamp for the entry
         self.ts = ts;
 
-        // Read flag which indicates if value is inlined or not
+        // Read the flag to determine if the value is inlined or referenced externally
         self.flag = cursor.get_u8();
 
-        // Decode value length and value
+        // Decode the segment ID, value length, and value offset from the encoded bytes
         self.segment_id = cursor.get_u64();
         self.value_length = cursor.get_u32() as usize;
         self.value_offset = Some(cursor.get_u64());
 
+        // If the flag indicates the value is inlined, extract it directly from the encoded bytes
         if self.flag == 1 {
+            // Calculate the start and end positions of the value within the encoded bytes
             let value_bytes =
-                cursor.get_ref()[cursor.position() as usize..][..self.value_length].as_ref();
+                cursor.get_ref()[cursor.position() as usize..][..self.value_length].to_vec();
+            // Advance the cursor past the value to continue decoding any remaining data
             cursor.advance(self.value_length);
 
-            self.value = Some(Bytes::copy_from_slice(value_bytes));
+            // Store the extracted value
+            self.value = Some(Bytes::from(value_bytes));
         } else {
-            // Decode version, value length, and value offset
-            // self.value_offset = Some(cursor.get_u64());
+            // For non-inlined values, the value offset is already set, and the actual value is not in the encoded bytes
         }
 
-        // Decode key-value metadata
+        // Decode key-value metadata, if present
+        // Check if there's enough data left for metadata size; if not, the data is corrupted
         if encoded_bytes.len() < cursor.position() as usize + MD_SIZE {
             return Err(Error::CorruptedIndex);
         }
 
+        // Read the length of the key-value metadata
         let kv_metadata_len = cursor.get_u16() as usize;
         if kv_metadata_len > 0 {
+            // Validate the metadata size to prevent processing invalid or malicious data
             if kv_metadata_len > MAX_KV_METADATA_SIZE {
                 return Err(Error::CorruptedIndex);
             }
+            // Ensure there's enough data left for the actual metadata; if not, the data is corrupted
             if encoded_bytes.len() < cursor.position() as usize + kv_metadata_len {
                 return Err(Error::CorruptedIndex);
             }
+            // Extract the metadata bytes and advance the cursor
             let kv_metadata_bytes =
-                cursor.get_ref()[cursor.position() as usize..][..kv_metadata_len].as_ref();
+                cursor.get_ref()[cursor.position() as usize..][..kv_metadata_len].to_vec();
             cursor.advance(kv_metadata_len);
-            self.key_value_metadata = Some(Metadata::from_bytes(kv_metadata_bytes)?);
+
+            // Convert the raw metadata bytes into a Metadata object and store it
+            self.key_value_metadata = Some(Metadata::from_bytes(&kv_metadata_bytes)?);
         } else {
+            // If there's no metadata, set the corresponding field to None
             self.key_value_metadata = None;
         }
 
-        // Ensure all the data is read
+        // After processing all expected data, ensure the cursor is at the end of the encoded bytes
+        // If not, it indicates the encoded data may be corrupted or improperly formatted
         if cursor.position() as usize != encoded_bytes.len() {
             return Err(Error::CorruptedIndex);
         }
@@ -402,20 +431,22 @@ impl ValueRef {
     /// If the offset exists in the value cache, it returns the cached value.
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
     fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
-        // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.get(&value_offset) {
+        // Attempt to return the cached value if it exists
+        let cache_key = (self.segment_id, value_offset);
+
+        if let Some(value) = self.store.value_cache.get(&cache_key) {
             return Ok(value.to_vec());
         }
 
-        // Read the value from the commit log at the specified offset
+        // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; self.value_length];
-        let vlog = self.store.clog.as_ref().unwrap().read();
-        vlog.read_at_segment(&mut buf, self.segment_id, value_offset)?;
+        let clog = self.store.clog.as_ref().unwrap().read();
+        clog.read_at_segment(&mut buf, self.segment_id, value_offset)?;
 
-        // Store the offset and value in value_cache
+        // Cache the newly read value for future use
         self.store
             .value_cache
-            .insert(value_offset, Bytes::from(buf.clone()));
+            .insert(cache_key, Bytes::from(buf.clone()));
 
         Ok(buf)
     }

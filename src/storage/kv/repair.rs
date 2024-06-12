@@ -407,7 +407,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let expected_keys = vec!["k1", "k2", "k3"];
+        let expected_keys = vec!["k1", "k2", "k3", "k1"];
         for key in expected_keys {
             let key = Bytes::from(key);
 

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::vec;
 
 use async_channel::{bounded, Receiver, Sender};
-use chrono::offset;
 use futures::{select, FutureExt};
 use tokio::task::{spawn, JoinHandle};
 
@@ -235,7 +234,7 @@ pub struct Core {
     /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Cache<u64, Bytes>,
+    pub(crate) value_cache: Cache<(u64, u64), Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Channel to send write requests to the writer
@@ -383,7 +382,7 @@ impl Core {
             // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok((value_offsets)) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
 
                 // If the end of the file is reached, the loop is broken.
                 Err(Error::LogError(LogError::Eof(_))) => break,
@@ -695,7 +694,7 @@ impl Core {
                 segment_id,
                 &entry.value,
                 entry.metadata.as_ref(),
-                *committed_values_offsets.get(&entry.key).unwrap() as u64,
+                *committed_values_offsets.get(&entry.key).unwrap(),
                 self.opts.max_value_threshold,
             )
         })

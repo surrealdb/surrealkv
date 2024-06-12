@@ -293,11 +293,6 @@ impl Aol {
             Err(e) => match e {
                 Error::Eof(n) => {
                     return Err(Error::Eof(n));
-                    // if n > 0 {
-                    //     continue;
-                    // } else {
-                    //     return Err(Error::Eof(n));
-                    // }
                 }
                 _ => return Err(e),
             },
@@ -338,6 +333,14 @@ impl Aol {
         Ok(())
     }
 
+    pub fn rotate(&mut self) -> Result<()> {
+        let _lock = self.mutex.lock();
+        self.active_segment.close()?;
+        self.active_segment_id += 1;
+        self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+        Ok(())
+    }
+
     // Returns the current offset within the segment.
     pub fn offset(&self) -> Result<u64> {
         // Lock the mutex to ensure thread safety
@@ -351,18 +354,6 @@ impl Aol {
 
         // Add the calculated offset to the offset of the active segment
         Ok(base_offset + active_segment_offset)
-    }
-
-    // Returns the current offset within the segment.
-    pub fn segment_offset(&self) -> Result<(u64, u64)> {
-        // Lock the mutex to ensure thread safety
-        let _lock = self.mutex.lock();
-
-        // Get the offset of the active segment
-        let active_segment_offset = self.active_segment.offset();
-
-        // Add the calculated offset to the offset of the active segment
-        Ok((self.active_segment_id, active_segment_offset))
     }
 
     pub fn size(&self) -> Result<u64> {

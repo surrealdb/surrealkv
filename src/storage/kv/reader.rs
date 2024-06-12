@@ -258,7 +258,7 @@ impl RecordReader {
     pub(crate) fn read_into(
         &mut self,
         entry: &mut Record,
-    ) -> Result<(HashMap<bytes::Bytes, (u64, usize)>)> {
+    ) -> Result<HashMap<bytes::Bytes, (u64, usize)>> {
         let mut value_offsets = HashMap::new();
         let (segment_id, offset) = self.read_entry_into(entry)?;
         let key = entry.key.clone();
