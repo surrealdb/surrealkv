@@ -1,4 +1,5 @@
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
@@ -10,6 +11,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
+use revision::Revisioned;
 use tokio::sync::Mutex as AsyncMutex;
 use vart::art::KV;
 
@@ -30,11 +32,13 @@ use crate::storage::{
     },
 };
 
+use super::manifest::Manifest;
 use super::{entry::Records, transaction::Durability};
 
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
+    pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
@@ -56,14 +60,19 @@ impl StoreInner {
             core,
             stop_tx,
             is_closed: AtomicBool::new(false),
+            is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
         })
     }
 
     /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
     pub async fn close(&self) -> Result<()> {
-        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.is_closed.load(Ordering::SeqCst) {
             return Ok(());
+        }
+
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionInProgress);
         }
 
         // Send stop signal
@@ -84,8 +93,43 @@ impl StoreInner {
 
         self.core.close()?;
 
-        self.is_closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.is_closed.store(true, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub async fn compact(&self) -> Result<()> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionInProgress);
+        }
+
+        // Check if the commit log is enabled
+        if self.core.clog.is_none() {
+            return Ok(());
+        }
+
+        // should take lock on oracle to avoid all operations?
+
+        let mut clog = self.core.clog.as_ref().unwrap().write();
+        let new_segment_id = clog.rotate()?;
+
+        // Get all segments
+
+        // Create temp directory
+
+        // Start a new RecordReader
+        // (or) Start a new read from snapshot
+
+        // Do compaction and write
+
+        drop(clog);
+
+        // self.is_compacting
+        //     .store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -311,7 +355,7 @@ impl Core {
             manifest = Some(Self::initialize_manifest(&opts)?);
 
             // Load options from the manifest file.
-            let opts = Core::load_options(&opts, manifest.as_mut().unwrap())?;
+            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
 
             // Determine options for the commit log file and open or create it.
             clog = Some(Self::initialize_clog(&opts)?);
@@ -451,51 +495,50 @@ impl Core {
         Ok(())
     }
 
-    fn load_options(opts: &Options, manifest: &mut Aol) -> Result<Options> {
-        let current_metadata = opts.to_metadata();
-        let existing_metadata_list = if !manifest.size()? > 0 {
-            Core::load_manifests(opts)?
+    fn load_manifest(current_opts: &Options, manifest: &mut Aol) -> Result<Options> {
+        // Load existing manifests if any, else create a new one
+        let existing_manifest = if manifest.size()? > 0 {
+            Core::load_manifests(current_opts)?
         } else {
-            Vec::new()
+            Manifest::new()
         };
 
-        Core::validate_options(opts, &existing_metadata_list)?;
+        // Validate the current options against the existing manifest's options
+        let options_changeset = existing_manifest.extract_options();
+        Core::validate_options(current_opts, &options_changeset)?;
 
-        if let Some(existing) = existing_metadata_list.last() {
-            if *existing == current_metadata {
-                return Options::from_metadata(current_metadata, opts.dir.clone());
-            }
+        // Check if the current options are already the last option in the manifest
+        if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
+            return Ok(current_opts.clone());
         }
 
-        let md_bytes = current_metadata.to_bytes()?;
-        let mut buf = Vec::new();
+        // If not, create a changeset with an update operation for the current options
+        let changeset = Manifest::with_update_option_change(current_opts);
 
-        // Write the metadata to the manifest [md_len: u32][md_bytes: Vec<u8>]
-        write_field(&md_bytes, &mut buf)?;
+        // Serialize the changeset and append it to the manifest
+        let buf = changeset.serialize()?;
         manifest.append(&buf)?;
 
-        // Update options with the loaded metadata.
-        Options::from_metadata(current_metadata, opts.dir.clone())
+        Ok(current_opts.clone())
     }
 
-    fn validate_options(opts: &Options, existing_metadata_list: &[Metadata]) -> Result<()> {
+    fn validate_options(opts: &Options, existing_metadata_list: &Vec<Options>) -> Result<()> {
         let mut last_max_value_size = 0;
         let mut last_max_key_size = 0;
         let mut last_max_segment_size = 0;
-        for metadata in existing_metadata_list {
-            let options = Options::from_metadata(metadata.clone(), opts.dir.clone())?;
-            if options.max_value_size < last_max_value_size {
+        for option in existing_metadata_list {
+            if option.max_value_size < last_max_value_size {
                 return Err(Error::MaxValueSizeCannotBeDecreased);
             }
-            if options.max_key_size < last_max_key_size {
+            if option.max_key_size < last_max_key_size {
                 return Err(Error::MaxKeySizeCannotBeDecreased);
             }
-            if options.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
+            if option.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
                 return Err(Error::MaxSegmentSizeCannotBeChanged);
             }
-            last_max_value_size = options.max_value_size;
-            last_max_key_size = options.max_key_size;
-            last_max_segment_size = options.max_segment_size;
+            last_max_value_size = option.max_value_size;
+            last_max_key_size = option.max_key_size;
+            last_max_segment_size = option.max_segment_size;
         }
 
         // Include current opts in the comparison
@@ -513,14 +556,14 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    fn load_manifests(opts: &Options) -> Result<Vec<Metadata>> {
+    fn load_manifests(opts: &Options) -> Result<Manifest> {
         let manifest_subdir = opts.dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
         let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
 
-        let mut manifests: Vec<Metadata> = Vec::new(); // Initialize with an empty Vec
+        let mut manifests = Manifest::new(); // Initialize with an empty Vec
 
         loop {
             // Read the next transaction record from the log.
@@ -537,14 +580,15 @@ impl Core {
             let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
             let mut md_bytes = vec![0u8; len];
             reader.read(&mut md_bytes)?; // Read the actual metadata
-            manifests.push(Metadata::new(Some(md_bytes))); // Add the new metadata to the Vec
+            let manifest = Manifest::deserialize_revisioned(&mut md_bytes.as_slice())?;
+            manifests.changes.extend(manifest.changes);
         }
 
         Ok(manifests)
     }
 
     fn is_closed(&self) -> bool {
-        self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
+        self.is_closed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn close(&self) -> Result<()> {
@@ -569,8 +613,7 @@ impl Core {
         if let Some(manifest) = &self.manifest {
             manifest.write().close()?;
         }
-        self.is_closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.is_closed.store(true, Ordering::Relaxed);
 
         Ok(())
     }

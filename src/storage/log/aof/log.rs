@@ -249,12 +249,12 @@ impl Aol {
         Ok(())
     }
 
-    pub fn rotate(&mut self) -> Result<()> {
+    pub fn rotate(&mut self) -> Result<u64> {
         let _lock = self.mutex.lock();
         self.active_segment.close()?;
         self.active_segment_id += 1;
         self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
-        Ok(())
+        Ok(self.active_segment_id)
     }
 
     // Returns the current offset within the segment.

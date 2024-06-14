@@ -37,10 +37,12 @@ pub enum Error {
     TransactionWriteOnly,               // The transaction is write-only
     SendError(String),
     ReceiveError(String),
+    RevisionError(String),
     MismatchedSegmentID(u64, u64),
     MaxKeySizeCannotBeDecreased, // The maximum key size cannot be decreased
     MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
     MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
+    CompactionInProgress,        // Compaction is in progress
 }
 
 /// Error structure for encoding errors
@@ -117,6 +119,8 @@ impl fmt::Display for Error {
             Error::MaxSegmentSizeCannotBeChanged => {
                 write!(f, "Max segment size cannot be changed")
             }
+            Error::CompactionInProgress => write!(f, "Compaction is in progress"),
+            Error::RevisionError(err) => write!(f, "Revision error: {}", err),
         }
     }
 }
@@ -158,5 +162,11 @@ impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
 impl From<async_channel::RecvError> for Error {
     fn from(error: async_channel::RecvError) -> Self {
         Error::ReceiveError(format!("Async channel receive error: {}", error))
+    }
+}
+
+impl From<revision::Error> for Error {
+    fn from(err: revision::Error) -> Self {
+        Error::RevisionError(err.to_string())
     }
 }
