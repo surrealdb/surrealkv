@@ -1,7 +1,12 @@
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
+
+use std::fs::{self, File};
+use std::io::copy;
+use walkdir::WalkDir;
 
 use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
@@ -17,7 +22,7 @@ use vart::art::KV;
 
 use crate::storage::{
     kv::{
-        entry::{Entry, Record, ValueRef},
+        entry::{Entry, Record, Value, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
         option::Options,
@@ -27,8 +32,8 @@ use crate::storage::{
         transaction::{Mode, Transaction},
     },
     log::{
-        aof::log::Aol, write_field, Error as LogError, Metadata, MultiSegmentReader,
-        Options as LogOptions, SegmentRef, BLOCK_SIZE,
+        aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
+        BLOCK_SIZE,
     },
 };
 
@@ -98,6 +103,31 @@ impl StoreInner {
         Ok(())
     }
 
+    fn copy_manifest_folder(&self, temp_merge_dir: &PathBuf) -> Result<()> {
+        let source = self.core.opts.dir.join("manifest");
+        let destination = temp_merge_dir.clone();
+
+        for entry in WalkDir::new(&source) {
+            let entry = entry?;
+            let path = entry.path();
+            let relative_path = path.strip_prefix(&source).unwrap();
+            let dest_path = destination.join(relative_path);
+
+            if path.is_dir() {
+                fs::create_dir_all(&dest_path)?;
+            } else {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut source_file = File::open(path)?;
+                let mut dest_file = File::create(&dest_path)?;
+                copy(&mut source_file, &mut dest_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn compact(&self) -> Result<()> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Ok(());
@@ -112,26 +142,123 @@ impl StoreInner {
             return Ok(());
         }
 
+        // IMP!!! Don't start compaction if there is already a .merge or .tmp.merge directory
+        // IMP!!! On restart, save current folder as .backup and clean it in next run (or periodically)
+
+        let _guard = CompactionGuard::new(&self.is_compacting);
+
         // should take lock on oracle to avoid all operations?
+        let oracle = self.core.oracle.clone();
+        let oracle_ch_lock = oracle.write_lock.lock().await;
 
         let mut clog = self.core.clog.as_ref().unwrap().write();
         let new_segment_id = clog.rotate()?;
 
-        // Get all segments
-
-        // Create temp directory
-
-        // Start a new RecordReader
-        // (or) Start a new read from snapshot
-
-        // Do compaction and write
+        let last_updated_segment_id = new_segment_id - 1;
 
         drop(clog);
 
-        // self.is_compacting
-        //     .store(true, Ordering::Relaxed);
+        // Create temp directory
+        // check if this repo already exists to understand if previous compaction was already done (maybe check on .merge too)
+
+        // IMP!!!! Create manifest inside the tmp directory to be safe to read the right last_updated_segment_id
+        let temp_merge_dir = self.core.opts.dir.join(".tmp.merge");
+
+        // // create a hard copy of the manifest folder and (files inside it) inside self.core.opts.dir and copy it into the temp_merge_dir
+        // let temp_manifest_dir = temp_merge_dir.join("manifest");
+
+        // Add last_updated_segment_id inside current manifest
+
+        // Should copy or just add a new manifest with last_updated_segment_id?
+        // self.copy_manifest_folder(&temp_manifest_dir)?;
+        let mut manifest = Core::initialize_manifest(&temp_merge_dir)?;
+        let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
+
+        // Serialize the changeset and append it to the manifest
+        let buf = changeset.serialize()?;
+        manifest.append(&buf)?;
+        manifest.close()?;
+
+        // Should we also replicate the manifest into the merge dir?
+
+        let temp_clog_dir = temp_merge_dir.join("clog");
+        let tm_opts = LogOptions::default()
+            .with_max_file_size(self.core.opts.max_segment_size * 2) // Should we take last file size and double it?
+            .with_file_extension("clog".to_string());
+        let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
+
+        // Start a new RecordReader
+        // (or) Start a new read from snapshot
+        let snapshot_lock = self.core.indexer.write();
+        let mut snapshot = snapshot_lock.snapshot()?;
+        let snapshot_iter = snapshot.new_reader()?;
+        drop(snapshot_lock);
+        drop(oracle_ch_lock);
+
+        // Do compaction and write
+        'outer: for (key, value, version, ts) in snapshot_iter.iter() {
+            let mut val_ref = ValueRef::new(self.core.clone());
+            let val_bytes_ref: &Bytes = value;
+            val_ref.decode(*version, val_bytes_ref)?;
+
+            // println!("val_ref: {:?}", val_ref.metadata);
+
+            // IMP!!! only check for keys whose swizzle is?
+
+            if val_ref.segment_id() > last_updated_segment_id {
+                continue 'outer;
+            }
+
+            if let Some(md) = val_ref.metadata() {
+                if md.deleted() {
+                    println!("we got a deleted key: {:?}", key);
+                    continue 'outer;
+                }
+            }
+
+            let mut key = key;
+            key.truncate(key.len() - 1);
+
+            // Resolve the value reference to get the actual value.
+            let v = val_ref.resolve()?;
+
+            let mut entry = Entry::new(&key, &v);
+            entry.set_ts(*ts);
+            if let Some(md) = val_ref.metadata() {
+                entry.set_metadata(md.clone());
+            }
+
+            let tx_record = Record::from_entry(entry, *version);
+            let mut buf = BytesMut::new();
+            tx_record.encode(&mut buf)?;
+
+            // TODO: Ensure for each append, the segment_id is less than or equal to last_updated_segment_id
+            temp_writer.append(&buf)?;
+        }
+
+        temp_writer.close()?;
+
+        // Change .tmp.merge to .merge
+        std::fs::rename(temp_merge_dir, self.core.opts.dir.join(".merge"))?;
 
         Ok(())
+    }
+}
+
+struct CompactionGuard<'a> {
+    is_compacting: &'a AtomicBool,
+}
+
+impl<'a> CompactionGuard<'a> {
+    fn new(is_compacting: &'a AtomicBool) -> Self {
+        is_compacting.store(true, Ordering::Relaxed);
+        CompactionGuard { is_compacting }
+    }
+}
+
+impl<'a> Drop for CompactionGuard<'a> {
+    fn drop(&mut self) {
+        self.is_compacting.store(false, Ordering::Relaxed);
     }
 }
 
@@ -305,8 +432,8 @@ impl Core {
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    fn initialize_manifest(opts: &Options) -> Result<Aol> {
-        let manifest_subdir = opts.dir.join("manifest");
+    fn initialize_manifest(dir: &PathBuf) -> Result<Aol> {
+        let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
     }
@@ -337,6 +464,104 @@ impl Core {
         Aol::open(&clog_subdir, &copts).map_err(Error::from)
     }
 
+    /// Restores the store from a compaction process by handling .tmp.merge and .merge directories.
+    /// TODO: This should happen post repair
+    pub fn restore_from_compaction(opts: &Options) -> Result<()> {
+        let tmp_merge_dir = opts.dir.join(".tmp.merge");
+        let merge_dir = opts.dir.join(".merge");
+
+        // 1) Check if there is a .tmp.merge directory, delete it
+        if tmp_merge_dir.exists() {
+            std::fs::remove_dir_all(&tmp_merge_dir).map_err(Error::from)?;
+        }
+
+        // 2) If there is a .merge directory, try reading manifest from it
+        if merge_dir.exists() {
+            let manifest_dir = merge_dir.join("manifest");
+            if manifest_dir.exists() {
+                // Assuming Manifest::open reads the manifest from the given directory
+                // Load options from the manifest file.
+                let manifest = Self::initialize_manifest(&merge_dir)?;
+                let existing_manifest = if manifest.size()? > 0 {
+                    Core::read_manifest(&merge_dir)?
+                } else {
+                    // Delete the merge directory as the manifest is empty
+                    // which means the merge directory is corrupted
+                    // because the manifest should always be present
+                    // when compaction is done.
+                    std::fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
+                    // Return error as manifest is empty and is a corrupted merge directory
+                    return Ok(());
+                };
+
+                let compacted_upto_segments = existing_manifest.extract_compacted_up_to_segments();
+                if compacted_upto_segments.len() == 0 || compacted_upto_segments.len() > 1 {
+                    // Delete the merge directory as the manifest is corrupted
+                    // because the manifest should always have a single entry
+                    // for the last compacted segment.
+                    std::fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
+                    // Return error as manifest is corrupted
+                    return Ok(());
+                }
+
+                let compacted_upto_segment_id = compacted_upto_segments[0];
+
+                // Create a temporary directory for old segment files
+                let temp_dir_for_old_segs = opts.dir.join("temp_old_segments");
+                std::fs::create_dir_all(&temp_dir_for_old_segs).map_err(Error::from)?;
+
+                // Get all segments
+                let clog_subdir = opts.dir.join("clog");
+                let segs = SegmentRef::read_segments_from_directory(&clog_subdir)?;
+                // Step 4: Delete all files up to `compacted_upto_segment_id` in the original clog directory
+                // Assuming `SegmentRef::id` gives the segment ID and `SegmentRef::file_path` gives the file path
+                for seg in segs.iter() {
+                    if seg.id <= compacted_upto_segment_id {
+                        // TODO: create backup, and if anything fails during copying in the next steps, restore from this backup
+
+                        // let dest_path = temp_dir_for_old_segs.join(&seg.file_path);
+                        // println!("dest_path: {:?}", dest_path);
+                        // // Move the file to the temporary directory for backup
+                        // std::fs::rename(&seg.file_path, &dest_path).map_err(Error::from)?;
+
+                        // Check if the path points to a regular file
+                        match std::fs::metadata(&seg.file_path) {
+                            Ok(metadata) => {
+                                if metadata.is_file() {
+                                    // Proceed to delete the file
+                                    match std::fs::remove_file(&seg.file_path) {
+                                        Ok(_) => println!("File deleted successfully"),
+                                        Err(e) => println!("Error deleting file: {:?}", e),
+                                    }
+                                } else {
+                                    println!("Path is not a regular file: {:?}", &seg.file_path);
+                                }
+                            }
+                            Err(e) => println!("Error accessing file metadata: {:?}", e),
+                        }
+                    }
+                }
+
+                // Copy files from the `.merge` directory into the `clog` directory
+                let merge_clog_subdir = merge_dir.join("clog");
+                let merge_files = std::fs::read_dir(&merge_clog_subdir).map_err(Error::from)?;
+                for entry in merge_files {
+                    let entry = entry.map_err(Error::from)?;
+                    let dest_path = clog_subdir.join(entry.file_name());
+                    println!("dest_path: {:?}", dest_path);
+                    println!("entry.path: {:?}", entry.path());
+                    std::fs::copy(entry.path(), &dest_path).map_err(Error::from)?;
+                }
+
+                // Delete the temporary directory with old segment files
+                std::fs::remove_dir_all(&temp_dir_for_old_segs).map_err(Error::from)?;
+                std::fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Creates a new Core with the given options.
     /// It initializes a new Indexer, opens or creates the manifest file,
     /// loads or creates metadata from the manifest file, updates the options with the loaded metadata,
@@ -352,13 +577,16 @@ impl Core {
 
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
-            manifest = Some(Self::initialize_manifest(&opts)?);
+            manifest = Some(Self::initialize_manifest(&opts.dir)?);
 
             // Load options from the manifest file.
             let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
 
             // Determine options for the commit log file and open or create it.
             clog = Some(Self::initialize_clog(&opts)?);
+
+            // Restore the store from a compaction process if necessary.
+            Self::restore_from_compaction(&opts)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
@@ -464,6 +692,7 @@ impl Core {
         value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
+        println!("entry: {:?}", entry);
         let mut to_insert = Vec::new();
         let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 
@@ -490,7 +719,7 @@ impl Core {
     fn load_manifest(current_opts: &Options, manifest: &mut Aol) -> Result<Options> {
         // Load existing manifests if any, else create a new one
         let existing_manifest = if manifest.size()? > 0 {
-            Core::load_manifests(current_opts)?
+            Core::read_manifest(&current_opts.dir)?
         } else {
             Manifest::new()
         };
@@ -548,8 +777,8 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    fn load_manifests(opts: &Options) -> Result<Manifest> {
-        let manifest_subdir = opts.dir.join("manifest");
+    fn read_manifest(dir: &PathBuf) -> Result<Manifest> {
+        let manifest_subdir = dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
@@ -1447,6 +1676,75 @@ mod tests {
             // Start a new read transaction
             let txn = store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn basic_compaction() {
+        // Create a temporary directory for testing
+        // let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        // opts.dir = temp_dir.path().to_path_buf();
+        let current_dir = std::env::current_dir().expect("Failed to get current directory");
+        let current_dir = current_dir.join("test");
+        opts.dir = current_dir.clone();
+        opts.max_value_threshold = 0;
+        opts.max_value_cache_size = 0;
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Number of keys to generate and write
+        let num_keys_to_write = 20;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for counter in 1usize..=num_keys_to_write {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Write the keys to the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Number of keys to delete
+        let num_keys_to_delete = 5;
+
+        // Delete the first 5 keys from the store
+        for key in keys.iter().take(num_keys_to_delete) {
+            let mut txn = store.begin().unwrap();
+            txn.delete(key).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        store.inner.as_ref().unwrap().compact().await.unwrap();
+        store.close().await.unwrap();
+
+        println!("------------------------->");
+
+        // let tmp_dir = current_dir.join(".merge");
+        // opts.dir = tmp_dir;
+        let store = Store::new(opts).expect("should create store");
+
+        // Read the keys to the store
+        for key in keys.iter().skip(num_keys_to_delete) {
+            // Start a new read transaction
+            let txn = store.begin().unwrap();
+            let val = txn.get(key).unwrap().unwrap();
+            // Assert that the value retrieved in txn matches default_value
+            assert_eq!(val, default_value.as_ref());
         }
     }
 }

@@ -11,6 +11,7 @@ use crate::{Error, Options, Result};
 #[derive(Debug, Clone)]
 pub(crate) enum ManifestChangeType {
     Options(Options),
+    CompactedUpToSegment(u64),
 }
 
 #[revisioned(revision = 1)]
@@ -72,6 +73,23 @@ impl Manifest {
         changes.push(ManifestChangeType::Options(opt.clone()));
 
         Manifest { changes }
+    }
+
+    pub fn with_compacted_up_to_segment(segment: u64) -> Self {
+        let mut changes = Vec::new();
+        changes.push(ManifestChangeType::CompactedUpToSegment(segment));
+
+        Manifest { changes }
+    }
+
+    pub fn extract_compacted_up_to_segments(&self) -> Vec<u64> {
+        self.changes
+            .iter()
+            .filter_map(|change_op| match change_op {
+                ManifestChangeType::CompactedUpToSegment(segment) => Some(*segment),
+                _ => None,
+            })
+            .collect()
     }
 
     // Load Vec<Manifest> from a dir

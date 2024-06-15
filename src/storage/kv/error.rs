@@ -43,6 +43,7 @@ pub enum Error {
     MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
     MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
     CompactionInProgress,        // Compaction is in progress
+    WalkdirError(String),        // The walkdir error
 }
 
 /// Error structure for encoding errors
@@ -121,6 +122,7 @@ impl fmt::Display for Error {
             }
             Error::CompactionInProgress => write!(f, "Compaction is in progress"),
             Error::RevisionError(err) => write!(f, "Revision error: {}", err),
+            Error::WalkdirError(err) => write!(f, "Walkdir error: {}", err),
         }
     }
 }
@@ -168,5 +170,11 @@ impl From<async_channel::RecvError> for Error {
 impl From<revision::Error> for Error {
     fn from(err: revision::Error) -> Self {
         Error::RevisionError(err.to_string())
+    }
+}
+
+impl From<walkdir::Error> for Error {
+    fn from(error: walkdir::Error) -> Self {
+        Error::WalkdirError(error.to_string())
     }
 }

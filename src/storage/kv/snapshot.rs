@@ -84,7 +84,7 @@ pub(crate) trait FilterFn {
 }
 
 fn ignore_deleted(val_ref: &ValueRef, _: u64) -> Result<()> {
-    let md = val_ref.key_value_metadata();
+    let md = val_ref.metadata();
     if let Some(md) = md {
         if md.deleted() {
             return Err(Error::IndexError(TrieError::KeyNotFound));

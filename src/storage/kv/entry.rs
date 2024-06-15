@@ -33,6 +33,14 @@ impl Entry {
         }
     }
 
+    pub(crate) fn set_metadata(&mut self, metadata: Metadata) {
+        self.metadata = Some(metadata);
+    }
+
+    pub(crate) fn set_ts(&mut self, ts: u64) {
+        self.ts = ts;
+    }
+
     pub(crate) fn mark_delete(&mut self) {
         if self.metadata.is_none() {
             self.metadata = Some(Metadata::new());
@@ -98,18 +106,7 @@ impl Records {
     }
 
     pub(crate) fn add_entry(&mut self, entry: Entry, tx_id: u64, commit_ts: u64) {
-        let crc32 = entry.crc32();
-        let tx_record_entry = Record {
-            id: tx_id,
-            ts: commit_ts,
-            version: RECORD_VERSION,
-            key_len: entry.key.len() as u32,
-            key: entry.key,
-            metadata: entry.metadata,
-            value_len: entry.value.len() as u32,
-            value: entry.value,
-            crc32,
-        };
+        let tx_record_entry = Record::new_from_entry(entry, tx_id, commit_ts);
         self.entries.push(tx_record_entry);
     }
 
@@ -122,7 +119,6 @@ impl Records {
         // Encode entries and store offsets
         for entry in &self.entries {
             let offset = entry.encode(buf)?;
-            // offset += current_offset as usize;
 
             // Store the offset for the current entry
             offset_tracker.insert(entry.key.clone(), offset as u64);
@@ -160,6 +156,20 @@ impl Record {
         }
     }
 
+    pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
+        Record {
+            id: tx_id,
+            ts: commit_ts,
+            crc32: entry.crc32(),
+            version: RECORD_VERSION,
+            key_len: entry.key.len() as u32,
+            key: entry.key,
+            metadata: entry.metadata,
+            value_len: entry.value.len() as u32,
+            value: entry.value,
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         self.id = 0;
         self.ts = 0;
@@ -172,11 +182,11 @@ impl Record {
         self.crc32 = 0;
     }
 
-    pub(crate) fn from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Record {
+    pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
         let crc32 = entry.crc32();
         Record {
             id: tx_id,
-            ts: commit_ts,
+            ts: entry.ts,
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
@@ -227,8 +237,9 @@ impl Record {
 pub(crate) trait Value {
     fn resolve(&self) -> Result<Vec<u8>>;
     fn ts(&self) -> u64;
-    fn key_value_metadata(&self) -> Option<&Metadata>;
+    fn metadata(&self) -> Option<&Metadata>;
     fn length(&self) -> usize;
+    fn segment_id(&self) -> u64;
 }
 
 /// Value reference implementation.
@@ -239,7 +250,7 @@ pub struct ValueRef {
     pub(crate) value_length: usize,
     pub(crate) value_offset: Option<u64>,
     pub(crate) value: Option<Bytes>,
-    pub(crate) key_value_metadata: Option<Metadata>,
+    pub(crate) metadata: Option<Metadata>,
     /// The underlying store for the transaction.
     store: Arc<Core>,
 }
@@ -265,12 +276,16 @@ impl Value for ValueRef {
         self.ts
     }
 
-    fn key_value_metadata(&self) -> Option<&Metadata> {
-        self.key_value_metadata.as_ref()
+    fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 
     fn length(&self) -> usize {
         self.value_length
+    }
+
+    fn segment_id(&self) -> u64 {
+        self.segment_id
     }
 }
 
@@ -283,7 +298,7 @@ impl ValueRef {
             value_offset: None,
             value_length: 0,
             value: None,
-            key_value_metadata: None,
+            metadata: None,
             store,
         }
     }
@@ -412,10 +427,10 @@ impl ValueRef {
             cursor.advance(kv_metadata_len);
 
             // Convert the raw metadata bytes into a Metadata object and store it
-            self.key_value_metadata = Some(Metadata::from_bytes(&kv_metadata_bytes)?);
+            self.metadata = Some(Metadata::from_bytes(&kv_metadata_bytes)?);
         } else {
             // If there's no metadata, set the corresponding field to None
-            self.key_value_metadata = None;
+            self.metadata = None;
         }
 
         // After processing all expected data, ensure the cursor is at the end of the encoded bytes
@@ -486,7 +501,7 @@ mod tests {
         let mut value_ref = ValueRef::new(store.inner.as_ref().unwrap().core.clone());
         value_ref.value_length = 100;
         value_ref.value_offset = Some(200);
-        value_ref.key_value_metadata = Some(kvmd);
+        value_ref.metadata = Some(kvmd);
 
         // // Encode the valueRef
         // let encoded_bytes = value_ref.encode();
@@ -500,8 +515,8 @@ mod tests {
         // assert_eq!(decoded_value_ref.value_length, value_ref.value_length);
         // assert_eq!(decoded_value_ref.value_offset, value_ref.value_offset);
         // assert_eq!(
-        //     decoded_value_ref.key_value_metadata.unwrap().deleted(),
-        //     value_ref.key_value_metadata.unwrap().deleted()
+        //     decoded_value_ref.metadata.unwrap().deleted(),
+        //     value_ref.metadata.unwrap().deleted()
         // );
     }
 
