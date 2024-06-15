@@ -44,6 +44,7 @@ pub enum Error {
     MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
     CompactionInProgress,        // Compaction is in progress
     WalkdirError(String),        // The walkdir error
+    MergeManifestMissing,        // The merge manifest is missing
 }
 
 /// Error structure for encoding errors
@@ -123,6 +124,7 @@ impl fmt::Display for Error {
             Error::CompactionInProgress => write!(f, "Compaction is in progress"),
             Error::RevisionError(err) => write!(f, "Revision error: {}", err),
             Error::WalkdirError(err) => write!(f, "Walkdir error: {}", err),
+            Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
         }
     }
 }
