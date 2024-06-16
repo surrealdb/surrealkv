@@ -45,6 +45,15 @@ impl Snapshot {
         Ok(())
     }
 
+    pub fn delete(&mut self, key: &VariableSizeKey) -> Result<()> {
+        // TODO: need to fix this to avoid cloning the key
+        // This happens because the VariableSizeKey transfrom from
+        // a &[u8] does not terminate the key with a null byte.
+        let key = &key.terminate();
+        self.snap.remove(key)?;
+        Ok(())
+    }
+
     /// Retrieves the value and timestamp associated with the given key from the snapshot.
     pub fn get(&self, key: &VariableSizeKey) -> Result<Box<dyn Value>> {
         // TODO: need to fix this to avoid cloning the key

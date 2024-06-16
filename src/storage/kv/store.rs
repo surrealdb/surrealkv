@@ -189,7 +189,6 @@ impl StoreInner {
             // Skip deleted keys
             if let Some(md) = val_ref.metadata() {
                 if md.deleted() {
-                    println!("we got a deleted key: {:?}", key);
                     continue;
                 }
             }
@@ -800,7 +799,6 @@ impl Core {
 
         for entry in &task.entries {
             let index_value = encode_entry(entry);
-
             to_insert.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
@@ -2030,20 +2028,35 @@ mod tests {
             txn.commit().await.expect("Failed to commit deletion");
         }
 
-        // // Trigger compaction
-        // store.inner.as_ref().expect("Store inner is None").compact().await.expect("Failed to compact");
+        // Trigger compaction
+        store
+            .inner
+            .as_ref()
+            .expect("Store inner is None")
+            .compact()
+            .await
+            .expect("Failed to compact");
 
-        // store.close().await.expect("Failed to close store");
+        store.close().await.expect("Failed to close store");
 
-        // // Reopen the store to verify all keys are deleted
-        // let reopened_store = Store::new(opts).expect("Failed to reopen store");
+        // Reopen the store to verify all keys are deleted
+        let reopened_store = Store::new(opts).expect("Failed to reopen store");
 
-        // for key in &keys {
-        //     let txn = reopened_store.begin().expect("Failed to begin transaction on reopened store");
-        //     assert!(txn.get(key).expect("Failed to get key").is_none(), "Key {:?} was not deleted", key);
-        // }
+        for key in &keys {
+            let txn = reopened_store
+                .begin()
+                .expect("Failed to begin transaction on reopened store");
+            assert!(
+                txn.get(key).expect("Failed to get key").is_none(),
+                "Key {:?} was not deleted",
+                key
+            );
+        }
 
-        // reopened_store.close().await.expect("Failed to close reopened store");
+        reopened_store
+            .close()
+            .await
+            .expect("Failed to close reopened store");
     }
 
     #[tokio::test]
