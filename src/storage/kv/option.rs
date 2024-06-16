@@ -29,12 +29,13 @@ pub struct Options {
     pub isolation_level: IsolationLevel, // Isolation level for transactions.
 
     // Fine tuning options.
-    pub max_key_size: u64,          // Maximum size in bytes for key.
-    pub max_value_size: u64,        // Maximum size in bytes for value.
+    pub max_key_size: u64,                // Maximum size in bytes for key.
+    pub max_value_size: u64,              // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
     pub max_entries_per_txn: u32,   // Maximum entries in a transaction.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
+    pub max_compaction_segment_size: u64, // Maximum size of a single compaction.
 
     // Field to indicate whether the data should be stored completely in memory
     pub disk_persistence: bool, // If false, data will be stored completely in memory. If true, data will be stored on disk too.
@@ -53,6 +54,7 @@ impl Default for Options {
             max_segment_size: 1 << 29, // 512 MB
             max_value_cache_size: 100000,
             disk_persistence: true,
+            max_compaction_segment_size: 1 << 30, // 1 GB
         }
     }
 }
@@ -86,6 +88,7 @@ mod tests {
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
         assert_eq!(options.max_value_cache_size, 100000);
+        assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
     }
 }

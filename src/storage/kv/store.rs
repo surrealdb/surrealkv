@@ -156,7 +156,7 @@ impl StoreInner {
 
         let temp_clog_dir = temp_merge_dir.join("clog");
         let tm_opts = LogOptions::default()
-            .with_max_file_size(self.core.opts.max_segment_size * 2) // Should we take last file size and double it?
+            .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
         let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
 
