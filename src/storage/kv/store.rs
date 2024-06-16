@@ -465,32 +465,24 @@ impl Core {
         indexer: &mut Indexer,
     ) -> Result<()> {
         let mut to_insert = Vec::new();
-        let mut to_delete = Vec::new();
+        let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 
-        if let Some(metadata) = entry.metadata.as_ref() {
-            if metadata.deleted() {
-                to_delete.push(entry.key[..].into());
-            }
-            indexer.bulk_delete(&mut to_delete)?;
-        } else {
-            let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
+        let index_value = ValueRef::encode(
+            *segment_id,
+            &entry.value,
+            entry.metadata.as_ref(),
+            *val_off as u64,
+            opts.max_value_threshold,
+        );
 
-            let index_value = ValueRef::encode(
-                *segment_id,
-                &entry.value,
-                entry.metadata.as_ref(),
-                *val_off as u64,
-                opts.max_value_threshold,
-            );
+        to_insert.push(KV {
+            key: entry.key[..].into(),
+            value: index_value,
+            version: entry.id,
+            ts: entry.ts,
+        });
 
-            to_insert.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: entry.id,
-                ts: entry.ts,
-            });
-            indexer.bulk_insert(&mut to_insert)?;
-        }
+        indexer.bulk_insert(&mut to_insert)?;
 
         Ok(())
     }
@@ -699,17 +691,8 @@ impl Core {
     {
         let mut index = self.indexer.write();
         let mut to_insert = Vec::new();
-        let mut to_delete = Vec::new();
 
         for entry in &task.entries {
-            // If the entry is marked as deleted, add it to the to_delete list.
-            if let Some(metadata) = entry.metadata.as_ref() {
-                if metadata.deleted() {
-                    to_delete.push(entry.key[..].into());
-                    continue;
-                }
-            }
-
             let index_value = encode_entry(entry);
 
             to_insert.push(KV {
@@ -721,7 +704,6 @@ impl Core {
         }
 
         index.bulk_insert(&mut to_insert)?;
-        index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }
