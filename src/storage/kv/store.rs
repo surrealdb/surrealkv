@@ -29,9 +29,9 @@ use crate::storage::{
         option::Options,
         oracle::Oracle,
         reader::{Reader, RecordReader},
+        recovery::restore_from_compaction,
         repair::{repair_last_corrupted_segment, restore_repair_files},
         transaction::{Durability, Mode, Transaction},
-        util::copy_dir_all,
     },
     log::{
         aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
@@ -102,31 +102,6 @@ impl StoreInner {
         Ok(())
     }
 
-    fn copy_manifest_folder(&self, temp_merge_dir: &PathBuf) -> Result<()> {
-        let source = self.core.opts.dir.join("manifest");
-        let destination = temp_merge_dir.clone();
-
-        for entry in WalkDir::new(&source) {
-            let entry = entry?;
-            let path = entry.path();
-            let relative_path = path.strip_prefix(&source).unwrap();
-            let dest_path = destination.join(relative_path);
-
-            if path.is_dir() {
-                fs::create_dir_all(&dest_path)?;
-            } else {
-                if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut source_file = File::open(path)?;
-                let mut dest_file = File::create(&dest_path)?;
-                copy(&mut source_file, &mut dest_file)?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn compact(&self) -> Result<()> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Ok(());
@@ -169,7 +144,6 @@ impl StoreInner {
         // Add last_updated_segment_id inside current manifest
 
         // Should copy or just add a new manifest with last_updated_segment_id?
-        // self.copy_manifest_folder(&temp_manifest_dir)?;
         let mut manifest = Core::initialize_manifest(&temp_merge_dir)?;
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
 
@@ -431,7 +405,7 @@ impl Core {
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    fn initialize_manifest(dir: &PathBuf) -> Result<Aol> {
+    pub(crate) fn initialize_manifest(dir: &PathBuf) -> Result<Aol> {
         let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
@@ -463,142 +437,6 @@ impl Core {
         Aol::open(&clog_subdir, &copts).map_err(Error::from)
     }
 
-    /// Restores the store from a compaction process by handling .tmp.merge and .merge directories.
-    /// TODO: This should happen post repair
-    pub fn restore_from_compaction(opts: &Options) -> Result<()> {
-        let tmp_merge_dir = opts.dir.join(".tmp.merge");
-        let merge_dir = opts.dir.join(".merge");
-        let backup_dir = opts.dir.join(".backup");
-        let clog_dir = opts.dir.join("clog");
-        let manifest_dir = merge_dir.join("manifest");
-
-        // 1) Check if there is a .tmp.merge directory, delete it
-        if tmp_merge_dir.exists() {
-            fs::remove_dir_all(&tmp_merge_dir).map_err(Error::from)?;
-            return Ok(());
-        }
-
-        // Create a backup directory
-        if !merge_dir.exists() {
-            return Ok(());
-        }
-
-        // Copy clog_dir and manifest_dir into the backup directory
-        fs::create_dir_all(&backup_dir)?;
-        copy_dir_all(&clog_dir, &backup_dir.join("clog"))?;
-        copy_dir_all(&manifest_dir, &backup_dir.join("manifest"))?;
-
-        // Encapsulate operations in a closure for easier rollback
-        let result = (|| {
-            // Original operations with modifications for transactional integrity
-            // For example, deleting the .tmp.merge directory is now safe to skip as it's already backed up
-
-            // If there is a .merge directory, try reading manifest from it
-            let manifest = Self::initialize_manifest(&merge_dir)?;
-            let existing_manifest = if manifest.size()? > 0 {
-                Core::read_manifest(&merge_dir)?
-            } else {
-                return Err(Error::MergeManifestMissing);
-            };
-
-            let compacted_upto_segments = existing_manifest.extract_compacted_up_to_segments();
-            if compacted_upto_segments.len() == 0 || compacted_upto_segments.len() > 1 {
-                return Err(Error::MergeManifestMissing);
-            }
-
-            let compacted_upto_segment_id = compacted_upto_segments[0];
-            let segs = SegmentRef::read_segments_from_directory(&clog_dir)?;
-            // Step 4: Copy files from clog dir to merge clog dir and then copy it back to clog dir to avoid
-            // creating a backup directory
-            let merge_clog_subdir = merge_dir.join("clog");
-            for seg in segs.iter() {
-                if seg.id > compacted_upto_segment_id {
-                    // Check if the path points to a regular file
-                    match fs::metadata(&seg.file_path) {
-                        Ok(metadata) => {
-                            if metadata.is_file() {
-                                // Proceed to copy the file
-                                let dest_path =
-                                    merge_clog_subdir.join(seg.file_path.file_name().unwrap());
-                                match fs::copy(&seg.file_path, &dest_path) {
-                                    Ok(_) => println!("File copied successfully"),
-                                    Err(e) => {
-                                        println!("Error copying file: {:?}", e);
-                                        return Err(Error::from(e));
-                                    }
-                                }
-                            } else {
-                                println!("Path is not a regular file: {:?}", &seg.file_path);
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error accessing file metadata: {:?}", e);
-                            return Err(Error::from(e));
-                        }
-                    }
-                }
-            }
-
-            // Copy files from the `.merge/clog` directory into the `clog` directory
-
-            // Delete the `clog` directory
-            if let Err(e) = fs::remove_dir_all(&clog_dir) {
-                println!("Error deleting clog directory: {:?}", e);
-                return Err(Error::from(e));
-            }
-
-            // Rename `merge_clog_subdir` to `clog`
-            if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
-                println!("Error renaming merge_clog_subdir to clog: {:?}", e);
-                return Err(Error::from(e));
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(_) => {
-                // Commit changes by removing the backup
-                if backup_dir.exists() {
-                    fs::remove_dir_all(&backup_dir)?;
-                }
-            }
-            Err(e) => {
-                // Rollback changes
-                if backup_dir.exists() {
-                    // Restore from backup
-                    // Define paths to the backup clog and manifest directories
-                    let backup_clog_dir = backup_dir.join("clog");
-                    let backup_manifest_dir = backup_dir.join("manifest");
-
-                    // Delete existing clog and manifest directories if they exist
-                    if clog_dir.exists() {
-                        fs::remove_dir_all(&clog_dir)?;
-                    }
-                    if manifest_dir.exists() {
-                        fs::remove_dir_all(&manifest_dir)?;
-                    }
-
-                    // Replace existing clog and manifest directories with those from the backup
-                    if backup_clog_dir.exists() {
-                        fs::rename(&backup_clog_dir, &clog_dir)?;
-                    }
-                    if backup_manifest_dir.exists() {
-                        fs::rename(&backup_manifest_dir, &manifest_dir)?;
-                    }
-
-                    // Remove the backup directory after restoration
-                    fs::remove_dir_all(&backup_dir)?;
-                }
-                return Err(e);
-            }
-        }
-
-        fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
-
-        Ok(())
-    }
-
     /// Creates a new Core with the given options.
     /// It initializes a new Indexer, opens or creates the manifest file,
     /// loads or creates metadata from the manifest file, updates the options with the loaded metadata,
@@ -623,7 +461,7 @@ impl Core {
             clog = Some(Self::initialize_clog(&opts)?);
 
             // Restore the store from a compaction process if necessary.
-            Self::restore_from_compaction(&opts)?;
+            restore_from_compaction(&opts)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
@@ -814,7 +652,7 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    fn read_manifest(dir: &PathBuf) -> Result<Manifest> {
+    pub(crate) fn read_manifest(dir: &PathBuf) -> Result<Manifest> {
         let manifest_subdir = dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");

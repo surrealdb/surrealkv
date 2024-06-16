@@ -6,6 +6,7 @@ pub(crate) mod meta;
 pub mod option;
 pub(crate) mod oracle;
 pub(crate) mod reader;
+pub(crate) mod recovery;
 pub(crate) mod repair;
 pub mod snapshot;
 pub mod store;

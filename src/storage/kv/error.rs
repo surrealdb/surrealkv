@@ -45,6 +45,7 @@ pub enum Error {
     CompactionInProgress,        // Compaction is in progress
     WalkdirError(String),        // The walkdir error
     MergeManifestMissing,        // The merge manifest is missing
+    CustomError(String),         // Custom error
 }
 
 /// Error structure for encoding errors
@@ -125,6 +126,7 @@ impl fmt::Display for Error {
             Error::RevisionError(err) => write!(f, "Revision error: {}", err),
             Error::WalkdirError(err) => write!(f, "Walkdir error: {}", err),
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
+            Error::CustomError(err) => write!(f, "Error: {}", err),
         }
     }
 }
