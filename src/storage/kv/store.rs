@@ -468,102 +468,6 @@ impl Core {
     pub fn restore_from_compaction(opts: &Options) -> Result<()> {
         let tmp_merge_dir = opts.dir.join(".tmp.merge");
         let merge_dir = opts.dir.join(".merge");
-
-        // 1) Check if there is a .tmp.merge directory, delete it
-        if tmp_merge_dir.exists() {
-            fs::remove_dir_all(&tmp_merge_dir).map_err(Error::from)?;
-        }
-
-        // 2) If there is a .merge directory, try reading manifest from it
-        if merge_dir.exists() {
-            let manifest_dir = merge_dir.join("manifest");
-            if manifest_dir.exists() {
-                // Assuming Manifest::open reads the manifest from the given directory
-                // Load options from the manifest file.
-                let manifest = Self::initialize_manifest(&merge_dir)?;
-                let existing_manifest = if manifest.size()? > 0 {
-                    Core::read_manifest(&merge_dir)?
-                } else {
-                    // Delete the merge directory as the manifest is empty
-                    // which means the merge directory is corrupted
-                    // because the manifest should always be present
-                    // when compaction is done.
-                    fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
-                    // Return error as manifest is empty and is a corrupted merge directory
-                    return Ok(());
-                };
-
-                let compacted_upto_segments = existing_manifest.extract_compacted_up_to_segments();
-                if compacted_upto_segments.len() == 0 || compacted_upto_segments.len() > 1 {
-                    // Delete the merge directory as the manifest is corrupted
-                    // because the manifest should always have a single entry
-                    // for the last compacted segment.
-                    fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
-                    // Return error as manifest is corrupted
-                    return Ok(());
-                }
-
-                let compacted_upto_segment_id = compacted_upto_segments[0];
-
-                // Create a temporary directory for old segment files
-                let temp_dir_for_old_segs = opts.dir.join("temp_old_segments");
-                fs::create_dir_all(&temp_dir_for_old_segs).map_err(Error::from)?;
-
-                // Get all segments
-                let clog_subdir = opts.dir.join("clog");
-                let segs = SegmentRef::read_segments_from_directory(&clog_subdir)?;
-                // Step 4: Delete all files up to `compacted_upto_segment_id` in the original clog directory
-                // Assuming `SegmentRef::id` gives the segment ID and `SegmentRef::file_path` gives the file path
-                for seg in segs.iter() {
-                    if seg.id <= compacted_upto_segment_id {
-                        // TODO: create backup, and if anything fails during copying in the next steps, restore from this backup
-
-                        // let dest_path = temp_dir_for_old_segs.join(&seg.file_path);
-                        // println!("dest_path: {:?}", dest_path);
-                        // // Move the file to the temporary directory for backup
-                        // fs::rename(&seg.file_path, &dest_path).map_err(Error::from)?;
-
-                        // Check if the path points to a regular file
-                        match fs::metadata(&seg.file_path) {
-                            Ok(metadata) => {
-                                if metadata.is_file() {
-                                    // Proceed to delete the file
-                                    match fs::remove_file(&seg.file_path) {
-                                        Ok(_) => println!("File deleted successfully"),
-                                        Err(e) => println!("Error deleting file: {:?}", e),
-                                    }
-                                } else {
-                                    println!("Path is not a regular file: {:?}", &seg.file_path);
-                                }
-                            }
-                            Err(e) => println!("Error accessing file metadata: {:?}", e),
-                        }
-                    }
-                }
-
-                // Copy files from the `.merge` directory into the `clog` directory
-                let merge_clog_subdir = merge_dir.join("clog");
-                let merge_files = fs::read_dir(&merge_clog_subdir).map_err(Error::from)?;
-                for entry in merge_files {
-                    let entry = entry.map_err(Error::from)?;
-                    let dest_path = clog_subdir.join(entry.file_name());
-                    println!("dest_path: {:?}", dest_path);
-                    println!("entry.path: {:?}", entry.path());
-                    fs::copy(entry.path(), &dest_path).map_err(Error::from)?;
-                }
-
-                // Delete the temporary directory with old segment files
-                fs::remove_dir_all(&temp_dir_for_old_segs).map_err(Error::from)?;
-                fs::remove_dir_all(&merge_dir).map_err(Error::from)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn restore_from_compaction2(opts: &Options) -> Result<()> {
-        let tmp_merge_dir = opts.dir.join(".tmp.merge");
-        let merge_dir = opts.dir.join(".merge");
         let backup_dir = opts.dir.join(".backup");
         let clog_dir = opts.dir.join("clog");
         let manifest_dir = merge_dir.join("manifest");
@@ -579,8 +483,8 @@ impl Core {
             return Ok(());
         }
 
-        fs::create_dir_all(&backup_dir)?;
         // Copy clog_dir and manifest_dir into the backup directory
+        fs::create_dir_all(&backup_dir)?;
         copy_dir_all(&clog_dir, &backup_dir.join("clog"))?;
         copy_dir_all(&manifest_dir, &backup_dir.join("manifest"))?;
 
@@ -604,19 +508,22 @@ impl Core {
 
             let compacted_upto_segment_id = compacted_upto_segments[0];
             let segs = SegmentRef::read_segments_from_directory(&clog_dir)?;
-            // Step 4: Delete all files up to `compacted_upto_segment_id` in the original clog directory
-            // Assuming `SegmentRef::id` gives the segment ID and `SegmentRef::file_path` gives the file path
+            // Step 4: Copy files from clog dir to merge clog dir and then copy it back to clog dir to avoid
+            // creating a backup directory
+            let merge_clog_subdir = merge_dir.join("clog");
             for seg in segs.iter() {
-                if seg.id <= compacted_upto_segment_id {
+                if seg.id > compacted_upto_segment_id {
                     // Check if the path points to a regular file
                     match fs::metadata(&seg.file_path) {
                         Ok(metadata) => {
                             if metadata.is_file() {
-                                // Proceed to delete the file
-                                match fs::remove_file(&seg.file_path) {
-                                    Ok(_) => println!("File deleted successfully"),
+                                // Proceed to copy the file
+                                let dest_path =
+                                    merge_clog_subdir.join(seg.file_path.file_name().unwrap());
+                                match fs::copy(&seg.file_path, &dest_path) {
+                                    Ok(_) => println!("File copied successfully"),
                                     Err(e) => {
-                                        println!("Error deleting file: {:?}", e);
+                                        println!("Error copying file: {:?}", e);
                                         return Err(Error::from(e));
                                     }
                                 }
@@ -632,15 +539,18 @@ impl Core {
                 }
             }
 
-            // Copy files from the `.merge` directory into the `clog` directory
-            let merge_clog_subdir = merge_dir.join("clog");
-            let merge_files = fs::read_dir(&merge_clog_subdir).map_err(Error::from)?;
-            for entry in merge_files {
-                let entry = entry.map_err(Error::from)?;
-                let dest_path = clog_dir.join(entry.file_name());
-                println!("dest_path: {:?}", dest_path);
-                println!("entry.path: {:?}", entry.path());
-                fs::copy(entry.path(), &dest_path).map_err(Error::from)?;
+            // Copy files from the `.merge/clog` directory into the `clog` directory
+
+            // Delete the `clog` directory
+            if let Err(e) = fs::remove_dir_all(&clog_dir) {
+                println!("Error deleting clog directory: {:?}", e);
+                return Err(Error::from(e));
+            }
+
+            // Rename `merge_clog_subdir` to `clog`
+            if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
+                println!("Error renaming merge_clog_subdir to clog: {:?}", e);
+                return Err(Error::from(e));
             }
 
             Ok(())
@@ -677,7 +587,7 @@ impl Core {
                         fs::rename(&backup_manifest_dir, &manifest_dir)?;
                     }
 
-                    // Optionally, remove the backup directory after restoration
+                    // Remove the backup directory after restoration
                     fs::remove_dir_all(&backup_dir)?;
                 }
                 return Err(e);
@@ -713,7 +623,7 @@ impl Core {
             clog = Some(Self::initialize_clog(&opts)?);
 
             // Restore the store from a compaction process if necessary.
-            Self::restore_from_compaction2(&opts)?;
+            Self::restore_from_compaction(&opts)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
