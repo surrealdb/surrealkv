@@ -1,23 +1,22 @@
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
-use std::fs::{self, File};
-use std::io::copy;
-use walkdir::WalkDir;
-
 use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
-use tokio::task::{spawn, JoinHandle};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    task::{spawn, JoinHandle},
+};
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
-use tokio::sync::Mutex as AsyncMutex;
 use vart::art::KV;
 
 use crate::storage::{
@@ -29,8 +28,8 @@ use crate::storage::{
         option::Options,
         oracle::Oracle,
         reader::{Reader, RecordReader},
-        recovery::restore_from_compaction,
         repair::{repair_last_corrupted_segment, restore_repair_files},
+        rollback::restore_from_compaction,
         transaction::{Durability, Mode, Transaction},
     },
     log::{
@@ -76,7 +75,7 @@ impl StoreInner {
         }
 
         if self.is_compacting.load(Ordering::SeqCst) {
-            return Err(Error::CompactionInProgress);
+            return Err(Error::CompactionAlreadyInProgress);
         }
 
         // Send stop signal
@@ -103,58 +102,62 @@ impl StoreInner {
     }
 
     pub async fn compact(&self) -> Result<()> {
-        if self.is_closed.load(Ordering::SeqCst) {
-            return Ok(());
+        // Early return if the store is closed or compaction is already in progress
+        if self.is_closed.load(Ordering::SeqCst) || self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::InvalidOperation);
         }
 
-        if self.is_compacting.load(Ordering::SeqCst) {
-            return Err(Error::CompactionInProgress);
-        }
-
-        // Check if the commit log is enabled
+        // Ensure commit log is enabled
         if self.core.clog.is_none() {
-            return Ok(());
+            return Err(Error::CommitLogNotEnabled);
+        }
+
+        // Prevent starting compaction if a .merge or .tmp.merge directory exists
+        let merge_dir = self.core.opts.dir.join(".merge");
+        let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
+        if merge_dir.exists() || tmp_merge_dir.exists() {
+            return Err(Error::CompactionAlreadyInProgress);
         }
 
         // IMP!!! Don't start compaction if there is already a .merge or .tmp.merge directory
         // IMP!!! On restart, save current folder as .backup and clean it in next run (or periodically)
 
+        // Acquire compaction guard
         let _guard = CompactionGuard::new(&self.is_compacting);
 
-        // should take lock on oracle to avoid all operations?
+        // Lock the oracle to prevent operations during compaction
         let oracle = self.core.oracle.clone();
-        let oracle_ch_lock = oracle.write_lock.lock().await;
+        let oracle_lock = oracle.write_lock.lock().await;
 
+        // Rotate the commit log and get the new segment ID
         let mut clog = self.core.clog.as_ref().unwrap().write();
         let new_segment_id = clog.rotate()?;
-
         let last_updated_segment_id = new_segment_id - 1;
-
-        drop(clog);
+        drop(clog); // Explicitly drop the lock
 
         // Create temp directory
         // check if this repo already exists to understand if previous compaction was already done (maybe check on .merge too)
 
         // IMP!!!! Create manifest inside the tmp directory to be safe to read the right last_updated_segment_id
-        let temp_merge_dir = self.core.opts.dir.join(".tmp.merge");
+
+        // Create a temporary directory for compaction
+        fs::create_dir_all(&tmp_merge_dir)?;
 
         // // create a hard copy of the manifest folder and (files inside it) inside self.core.opts.dir and copy it into the temp_merge_dir
         // let temp_manifest_dir = temp_merge_dir.join("manifest");
 
         // Add last_updated_segment_id inside current manifest
 
-        // Should copy or just add a new manifest with last_updated_segment_id?
-        let mut manifest = Core::initialize_manifest(&temp_merge_dir)?;
+        // Initialize a new manifest in the temporary directory
+        let mut manifest = Core::initialize_manifest(&tmp_merge_dir)?;
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
-
-        // Serialize the changeset and append it to the manifest
-        let buf = changeset.serialize()?;
-        manifest.append(&buf)?;
+        manifest.append(&changeset.serialize()?)?;
         manifest.close()?;
 
         // Should we also replicate the manifest into the merge dir?
 
-        let temp_clog_dir = temp_merge_dir.join("clog");
+        // Prepare a temporary commit log directory
+        let temp_clog_dir = tmp_merge_dir.join("clog");
         let tm_opts = LogOptions::default()
             .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
@@ -162,40 +165,39 @@ impl StoreInner {
 
         // Start a new RecordReader
         // (or) Start a new read from snapshot
+
+        // Start compaction process
         let snapshot_lock = self.core.indexer.write();
         let mut snapshot = snapshot_lock.snapshot()?;
         let snapshot_iter = snapshot.new_reader()?;
-        drop(snapshot_lock);
-        drop(oracle_ch_lock);
+        drop(snapshot_lock); // Explicitly drop the lock
+                             // Release the oracle lock
+        drop(oracle_lock);
 
         // Do compaction and write
-        'outer: for (key, value, version, ts) in snapshot_iter.iter() {
+        for (key, value, version, ts) in snapshot_iter.iter() {
             let mut val_ref = ValueRef::new(self.core.clone());
-            let val_bytes_ref: &Bytes = value;
-            val_ref.decode(*version, val_bytes_ref)?;
-
-            // println!("val_ref: {:?}", val_ref.metadata);
+            val_ref.decode(*version, &value)?;
 
             // IMP!!! only check for keys whose swizzle is?
 
+            // Skip keys from segments newer than the last updated segment
             if val_ref.segment_id() > last_updated_segment_id {
-                continue 'outer;
+                continue;
             }
 
+            // Skip deleted keys
             if let Some(md) = val_ref.metadata() {
                 if md.deleted() {
                     println!("we got a deleted key: {:?}", key);
-                    continue 'outer;
+                    continue;
                 }
             }
 
+            // Prepare the entry for the temporary commit log
             let mut key = key;
             key.truncate(key.len() - 1);
-
-            // Resolve the value reference to get the actual value.
-            let v = val_ref.resolve()?;
-
-            let mut entry = Entry::new(&key, &v);
+            let mut entry = Entry::new(&key, &val_ref.resolve()?);
             entry.set_ts(*ts);
             if let Some(md) = val_ref.metadata() {
                 entry.set_metadata(md.clone());
@@ -211,8 +213,8 @@ impl StoreInner {
 
         temp_writer.close()?;
 
-        // Change .tmp.merge to .merge
-        fs::rename(temp_merge_dir, self.core.opts.dir.join(".merge"))?;
+        // Finalize compaction by renaming the temporary directory
+        fs::rename(tmp_merge_dir, merge_dir)?;
 
         Ok(())
     }
@@ -1611,6 +1613,8 @@ mod tests {
 
         // let tmp_dir = current_dir.join(".merge");
         // opts.dir = tmp_dir;
+        opts.max_value_threshold = 20;
+        opts.max_value_cache_size = 20;
         let store = Store::new(opts).expect("should create store");
 
         // Read the keys to the store

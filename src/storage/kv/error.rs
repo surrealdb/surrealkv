@@ -42,10 +42,12 @@ pub enum Error {
     MaxKeySizeCannotBeDecreased, // The maximum key size cannot be decreased
     MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
     MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
-    CompactionInProgress,        // Compaction is in progress
+    CompactionAlreadyInProgress, // Compaction is in progress
     WalkdirError(String),        // The walkdir error
     MergeManifestMissing,        // The merge manifest is missing
     CustomError(String),         // Custom error
+    InvalidOperation,            // Invalid operation
+    CommitLogNotEnabled,         // Commit log is not enabled
 }
 
 /// Error structure for encoding errors
@@ -122,11 +124,13 @@ impl fmt::Display for Error {
             Error::MaxSegmentSizeCannotBeChanged => {
                 write!(f, "Max segment size cannot be changed")
             }
-            Error::CompactionInProgress => write!(f, "Compaction is in progress"),
+            Error::CompactionAlreadyInProgress => write!(f, "Compaction is in progress"),
             Error::RevisionError(err) => write!(f, "Revision error: {}", err),
             Error::WalkdirError(err) => write!(f, "Walkdir error: {}", err),
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
             Error::CustomError(err) => write!(f, "Error: {}", err),
+            Error::InvalidOperation => write!(f, "Invalid operation"),
+            Error::CommitLogNotEnabled => write!(f, "Commit log is not enabled"),
         }
     }
 }
