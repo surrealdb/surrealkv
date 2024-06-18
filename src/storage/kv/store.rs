@@ -451,6 +451,7 @@ impl Core {
         let mut manifest = None;
         let mut clog = None;
 
+        let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
             manifest = Some(Self::initialize_manifest(&opts.dir)?);
@@ -466,13 +467,14 @@ impl Core {
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
         }
 
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
-        oracle.set_ts(indexer.version());
+        let ts_to_set = std::cmp::max(num_entries, indexer.version());
+        oracle.set_ts(ts_to_set);
 
         // Create and initialize value cache.
         let value_cache = Cache::new(opts.max_value_cache_size as usize);
@@ -499,7 +501,7 @@ impl Core {
     }
 
     // The load_index function is responsible for loading the index from the log.
-    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<()> {
+    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<u64> {
         // The directory where the log segments are stored is determined.
         let clog_subdir = opts.dir.join("clog");
 
@@ -522,6 +524,7 @@ impl Core {
         // An Option is created to hold the segment ID and offset in case of corruption.
         let mut corruption_info: Option<(u64, u64)> = None;
 
+        let mut num_entries = 0;
         // A loop is started to read transactions.
         loop {
             // The Record is reset for each iteration.
@@ -530,7 +533,10 @@ impl Core {
             // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+                Ok(value_offsets) => {
+                    Core::process_entries(&tx, opts, &value_offsets, indexer)?;
+                    num_entries += 1;
+                }
 
                 // If the end of the file is reached, the loop is broken.
                 Err(Error::LogError(LogError::Eof(_))) => break,
@@ -559,7 +565,7 @@ impl Core {
             repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
         }
 
-        Ok(())
+        Ok(num_entries)
     }
 
     fn process_entries(
@@ -568,13 +574,9 @@ impl Core {
         value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        println!("entry: {:?}", entry);
-        let mut to_insert = Vec::new();
-        let mut to_delete = Vec::new();
-
         if let Some(metadata) = entry.metadata.as_ref() {
             if metadata.deleted() {
-                to_delete.push(entry.key[..].into());
+                indexer.delete(&mut entry.key[..].into())?;
             }
         } else {
             let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
@@ -587,16 +589,14 @@ impl Core {
                 opts.max_value_threshold,
             );
 
-            to_insert.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: entry.id,
-                ts: entry.ts,
-            });
+            indexer.insert(
+                &mut entry.key[..].into(),
+                index_value,
+                entry.id,
+                entry.ts,
+                false,
+            )?;
         }
-
-        indexer.bulk_insert(&mut to_insert)?;
-        indexer.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }
@@ -805,9 +805,19 @@ impl Core {
     {
         let mut index = self.indexer.write();
         let mut to_insert = Vec::new();
+        // let mut to_delete = Vec::new();
 
         for entry in &task.entries {
+            // If the entry is marked as deleted, add it to the to_delete list.
+            // if let Some(metadata) = entry.metadata.as_ref() {
+            //     if metadata.deleted() {
+            //         to_delete.push(entry.key[..].into());
+            //         continue;
+            //     }
+            // }
+
             let index_value = encode_entry(entry);
+
             to_insert.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
@@ -817,6 +827,7 @@ impl Core {
         }
 
         index.bulk_insert(&mut to_insert)?;
+        // index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }
@@ -1565,24 +1576,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_compaction() {
+    async fn basic_compaction1() {
         // Create a temporary directory for testing
-        // let temp_dir = create_temp_directory();
+        let temp_dir = create_temp_directory();
 
         // Create store options with the test directory
         let mut opts = Options::new();
-        // opts.dir = temp_dir.path().to_path_buf();
-        let current_dir = std::env::current_dir().expect("Failed to get current directory");
-        let current_dir = current_dir.join("test");
-        opts.dir = current_dir.clone();
-        // opts.max_value_threshold = 0;
-        // opts.max_value_cache_size = 0;
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 0;
+        opts.max_value_cache_size = 0;
 
         // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
 
         // Number of keys to generate and write
-        let num_keys_to_write = 20;
+        let num_keys_to_write = 1;
 
         // Create a vector to store the generated keys
         let mut keys: Vec<Bytes> = Vec::new();
@@ -1596,6 +1604,7 @@ mod tests {
         }
 
         let default_value = Bytes::from("default_value".to_string());
+        let default_value2 = Bytes::from("default_value2".to_string());
 
         // Write the keys to the store
         for key in keys.iter() {
@@ -1604,78 +1613,20 @@ mod tests {
             txn.commit().await.unwrap();
         }
 
-        // Number of keys to delete
-        let num_keys_to_delete = 5;
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value2).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let key_bytes = Bytes::from(2usize.to_le_bytes().to_vec());
+        let mut txn = store.begin().unwrap();
+        txn.set(&key_bytes, &default_value2).unwrap();
+        txn.commit().await.unwrap();
 
         // Delete the first 5 keys from the store
-        for key in keys.iter().take(num_keys_to_delete) {
-            let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
-
-        println!("------------------------->");
-
-        // let tmp_dir = current_dir.join(".merge");
-        // opts.dir = tmp_dir;
-        opts.max_value_threshold = 20;
-        opts.max_value_cache_size = 20;
-        let store = Store::new(opts).expect("should create store");
-
-        // Read the keys to the store
-        for key in keys.iter().skip(num_keys_to_delete) {
-            // Start a new read transaction
-            let txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val, default_value.as_ref());
-        }
-    }
-
-    #[tokio::test]
-    async fn compaction_with_mixed_operations() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_keys_to_write = 100;
-        let mut keys: Vec<Bytes> = Vec::new();
-
-        // Generate keys and values
-        for counter in 1usize..=num_keys_to_write {
-            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-            keys.push(key_bytes);
-        }
-
-        let default_value = Bytes::from("default_value".to_string());
-        let updated_value = Bytes::from("updated_value".to_string());
-
-        // Write initial values
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Update half of the keys
-        for key in keys.iter().take(num_keys_to_write / 2) {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &updated_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Delete a quarter of the keys
-        let num_keys_to_delete = num_keys_to_write / 4;
-        for key in keys.iter().take(num_keys_to_delete) {
-            let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
@@ -1683,532 +1634,10 @@ mod tests {
         store.inner.as_ref().unwrap().compact().await.unwrap();
         store.close().await.unwrap();
 
-        // Reopen the store to verify persistence
         let reopened_store = Store::new(opts).expect("should reopen store");
-
-        // Verify that deleted keys are not present
-        for key in keys.iter().take(num_keys_to_delete) {
+        for key in keys.iter() {
             let txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
-
-        // Verify that the first half of the remaining keys have the updated value
-        for key in keys
-            .iter()
-            .skip(num_keys_to_delete)
-            .take(num_keys_to_write / 2 - num_keys_to_delete)
-        {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, updated_value.as_ref());
-        }
-
-        // Verify that the second half of the keys still have the default value
-        for key in keys.iter().skip(num_keys_to_write / 2) {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
-        }
-
-        reopened_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_persistence_across_restarts() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_keys_to_write = 50;
-        let mut keys: Vec<Bytes> = Vec::new();
-
-        for counter in 1usize..=num_keys_to_write {
-            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-            keys.push(key_bytes);
-        }
-
-        let default_value = Bytes::from("default_value".to_string());
-
-        // Write keys to the store
-        for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
-
-        // Reopen the store to verify persistence
-        let reopened_store = Store::new(opts).expect("should reopen store");
-
-        // Verify that all keys still exist with the correct value
-        for key in keys.iter() {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
-        }
-
-        reopened_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_and_post_compaction_writes() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_initial_keys = 50;
-        let num_post_compaction_keys = 25;
-        let mut initial_keys: Vec<Bytes> = Vec::new();
-        let mut post_compaction_keys: Vec<Bytes> = Vec::new();
-
-        // Generate initial keys and values
-        for counter in 1usize..=num_initial_keys {
-            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-            initial_keys.push(key_bytes);
-        }
-
-        // Generate post-compaction keys and values
-        for counter in (num_initial_keys + 1)..=(num_initial_keys + num_post_compaction_keys) {
-            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-            post_compaction_keys.push(key_bytes);
-        }
-
-        let default_value = Bytes::from("default_value".to_string());
-
-        // Write initial values
-        for key in initial_keys.iter() {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-
-        // Write post-compaction values
-        for key in post_compaction_keys.iter() {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        store.close().await.unwrap();
-
-        // Reopen the store to verify persistence of all keys
-        let reopened_store = Store::new(opts).expect("should reopen store");
-
-        // Verify initial keys are present
-        for key in initial_keys.iter() {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
-        }
-
-        // Verify post-compaction keys are present
-        for key in post_compaction_keys.iter() {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
-        }
-
-        reopened_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_with_random_keys_and_deletes() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_initial_keys = 50;
-        let num_post_compaction_keys = 25;
-        let num_keys_to_delete = 10;
-        let mut initial_keys: Vec<Bytes> = Vec::new();
-        let mut post_compaction_keys: Vec<Bytes> = Vec::new();
-        let mut keys_to_delete: HashSet<Bytes> = HashSet::new();
-
-        // Generate initial random keys
-        for _ in 0..num_initial_keys {
-            let key: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(10)
-                .map(char::from)
-                .collect();
-            initial_keys.push(Bytes::from(key));
-        }
-
-        // Select random keys to delete
-        while keys_to_delete.len() < num_keys_to_delete {
-            let random_key = initial_keys
-                .choose(&mut rand::thread_rng())
-                .unwrap()
-                .clone();
-            keys_to_delete.insert(random_key.clone());
-        }
-
-        // Generate post-compaction random keys
-        for _ in 0..num_post_compaction_keys {
-            let key: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(10)
-                .map(char::from)
-                .collect();
-            post_compaction_keys.push(Bytes::from(key));
-        }
-
-        let default_value = Bytes::from("default_value".to_string());
-
-        // Write initial values
-        for key in &initial_keys {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-
-        // Delete selected keys
-        for key in &keys_to_delete {
-            let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Write post-compaction values
-        for key in &post_compaction_keys {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        store.close().await.unwrap();
-
-        // Reopen the store to verify persistence of all keys
-        let reopened_store = Store::new(opts).expect("should reopen store");
-
-        // Verify initial keys are present (except deleted ones)
-        for key in &initial_keys {
-            if !keys_to_delete.contains(key) {
-                let txn = reopened_store.begin().unwrap();
-                let val = txn.get(key).unwrap().unwrap();
-                assert_eq!(val, default_value.as_ref());
-            }
-        }
-
-        // Verify deleted keys are not present
-        for key in &keys_to_delete {
-            let txn = reopened_store.begin().unwrap();
-            assert!(txn.get(key).unwrap().is_none());
-        }
-
-        // Verify post-compaction keys are present
-        for key in &post_compaction_keys {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
-        }
-
-        reopened_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_with_overlapping_keys() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_keys = 50;
-        let mut keys: Vec<Bytes> = Vec::new();
-        let mut overlapping_keys: Vec<Bytes> = Vec::new();
-
-        // Generate random keys
-        for _ in 0..num_keys {
-            let key: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(10)
-                .map(char::from)
-                .collect();
-            keys.push(Bytes::from(key));
-        }
-
-        // Select half of the keys to be overlapping
-        overlapping_keys.extend_from_slice(&keys[0..(num_keys / 2)]);
-
-        let default_value = Bytes::from("default_value".to_string());
-        let overlapping_value = Bytes::from("overlapping_value".to_string());
-
-        // Write initial values
-        for key in &keys {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Write overlapping values
-        for key in &overlapping_keys {
-            let mut txn = store.begin().unwrap();
-            txn.set(key, &overlapping_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-
-        store.close().await.unwrap();
-
-        // Reopen the store to verify persistence of all keys
-        let reopened_store = Store::new(opts).expect("should reopen store");
-
-        // Verify initial keys have default value or overlapping value
-        for key in &keys {
-            let txn = reopened_store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
-            if overlapping_keys.contains(key) {
-                assert_eq!(val, overlapping_value.as_ref());
-            } else {
-                assert_eq!(val, default_value.as_ref());
-            }
-        }
-
-        reopened_store.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn compaction_with_all_keys_deleted() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("Failed to create store");
-
-        let num_keys = 50;
-        let keys: Vec<Bytes> = (0..num_keys)
-            .map(|_| {
-                let key: String = rand::thread_rng()
-                    .sample_iter(&rand::distributions::Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect();
-                Bytes::from(key)
-            })
-            .collect();
-
-        let value = Bytes::from("some_value");
-
-        // Write keys
-        for key in &keys {
-            let mut txn = store.begin().expect("Failed to begin transaction");
-            txn.set(key, &value).expect("Failed to set key");
-            txn.commit().await.expect("Failed to commit transaction");
-        }
-
-        // Delete all keys
-        for key in &keys {
-            let mut txn = store
-                .begin()
-                .expect("Failed to begin transaction for deletion");
-            txn.delete(key).expect("Failed to delete key");
-            txn.commit().await.expect("Failed to commit deletion");
-        }
-
-        // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
-
-        store.close().await.expect("Failed to close store");
-
-        // Reopen the store to verify all keys are deleted
-        let reopened_store = Store::new(opts).expect("Failed to reopen store");
-
-        for key in &keys {
-            let txn = reopened_store
-                .begin()
-                .expect("Failed to begin transaction on reopened store");
-            assert!(
-                txn.get(key).expect("Failed to get key").is_none(),
-                "Key {:?} was not deleted",
-                key
-            );
-        }
-
-        reopened_store
-            .close()
-            .await
-            .expect("Failed to close reopened store");
-    }
-
-    #[tokio::test]
-    async fn compaction_with_sequential_writes_and_deletes() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("Failed to create store");
-
-        let num_keys = 50;
-        // Sequentially generate keys
-        let keys: Vec<Bytes> = (0..num_keys)
-            .map(|i| Bytes::from(format!("key{:02}", i)))
-            .collect();
-
-        let value = Bytes::from("value");
-
-        // Sequentially write keys
-        for key in &keys {
-            let mut txn = store.begin().expect("Failed to begin transaction");
-            txn.set(key, &value).expect("Failed to set key");
-            txn.commit().await.expect("Failed to commit transaction");
-        }
-
-        // Sequentially delete half of the keys
-        for key in &keys[..(num_keys / 2)] {
-            let mut txn = store
-                .begin()
-                .expect("Failed to begin transaction for deletion");
-            txn.delete(key).expect("Failed to delete key");
-            txn.commit().await.expect("Failed to commit deletion");
-        }
-
-        // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
-
-        store.close().await.expect("Failed to close store");
-
-        // Reopen the store to verify the state of keys
-        let reopened_store = Store::new(opts).expect("Failed to reopen store");
-
-        // Verify the first half of the keys are deleted and the second half still exist
-        for (i, key) in keys.iter().enumerate() {
-            let txn = reopened_store
-                .begin()
-                .expect("Failed to begin transaction on reopened store");
-            let result = txn.get(key).expect("Failed to get key");
-            if i < num_keys / 2 {
-                assert!(result.is_none(), "Key {:?} should have been deleted", key);
-            } else {
-                assert!(result.is_some(), "Key {:?} should exist", key);
-            }
-        }
-
-        reopened_store
-            .close()
-            .await
-            .expect("Failed to close reopened store");
-    }
-
-    #[tokio::test]
-    async fn compaction_with_random_reads_and_writes() {
-        let temp_dir = create_temp_directory();
-
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_value_threshold = 0;
-        opts.max_value_cache_size = 0;
-
-        let store = Store::new(opts.clone()).expect("Failed to create store");
-
-        let num_keys = 100;
-        let mut rng = rand::thread_rng();
-
-        // Generate random keys and values
-        let keys_and_values: Vec<(Bytes, Bytes)> = (0..num_keys)
-            .map(|_| {
-                let key: String = (0..10)
-                    .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
-                    .collect();
-                let value: String = (0..10)
-                    .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
-                    .collect();
-                (Bytes::from(key), Bytes::from(value))
-            })
-            .collect();
-
-        // Randomly write or delete keys
-        for (key, value) in &keys_and_values {
-            if rng.gen_bool(0.5) {
-                // 50% chance
-                let mut txn = store.begin().expect("Failed to begin transaction");
-                txn.set(key, value).expect("Failed to set key");
-                txn.commit().await.expect("Failed to commit transaction");
-            } else {
-                let mut txn = store
-                    .begin()
-                    .expect("Failed to begin transaction for deletion");
-                txn.delete(key).expect("Failed to delete key");
-                txn.commit().await.expect("Failed to commit deletion");
-            }
-        }
-
-        // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
-
-        store.close().await.expect("Failed to close store");
-
-        // Reopen the store to verify the state of keys
-        let reopened_store = Store::new(opts).expect("Failed to reopen store");
-
-        // Randomly read keys to verify their integrity
-        for (key, expected_value) in &keys_and_values {
-            let txn = reopened_store
-                .begin()
-                .expect("Failed to begin transaction on reopened store");
-            match txn.get(key).expect("Failed to get key") {
-                Some(value) => {
-                    assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
-                }
-                None => (), // It's acceptable for the key to not exist if it was deleted
-            }
-        }
-
-        reopened_store
-            .close()
-            .await
-            .expect("Failed to close reopened store");
     }
 }

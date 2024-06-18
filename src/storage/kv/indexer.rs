@@ -35,19 +35,31 @@ impl Indexer {
         kv_pairs.iter_mut().for_each(|kv| {
             kv.key = kv.key.terminate();
         });
-        self.index.bulk_insert(kv_pairs)?;
+        self.index.bulk_insert(kv_pairs, true)?;
         Ok(())
     }
 
-    pub fn bulk_delete(&mut self, kv_pairs: &mut [VariableSizeKey]) -> Result<()> {
-        kv_pairs.iter_mut().for_each(|kv| {
-            *kv = kv.terminate();
-        });
-
-        for kv in kv_pairs.iter() {
-            self.index.remove(kv)?;
+    pub fn insert(
+        &mut self,
+        key: &mut VariableSizeKey,
+        value: Bytes,
+        version: u64,
+        ts: u64,
+        check_version: bool,
+    ) -> Result<()> {
+        *key = key.terminate();
+        if check_version {
+            self.index.insert(&key, value.clone(), version, ts)?;
+        } else {
+            self.index
+                .insert_without_version_increment_check(&key, value.clone(), version, ts)?;
         }
+        Ok(())
+    }
 
+    pub fn delete(&mut self, key: &mut VariableSizeKey) -> Result<()> {
+        *key = key.terminate();
+        self.index.remove(&key)?;
         Ok(())
     }
 
