@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -177,7 +177,7 @@ impl StoreInner {
         // Do compaction and write
         for (key, value, version, ts) in snapshot_iter.iter() {
             let mut val_ref = ValueRef::new(self.core.clone());
-            val_ref.decode(*version, &value)?;
+            val_ref.decode(*version, value)?;
 
             // IMP!!! only check for keys whose swizzle is?
 
@@ -303,6 +303,14 @@ impl Store {
 
         Ok(())
     }
+
+    pub async fn compact(&self) -> Result<()> {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.compact().await?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Store {
@@ -406,7 +414,7 @@ impl Core {
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    pub(crate) fn initialize_manifest(dir: &PathBuf) -> Result<Aol> {
+    pub(crate) fn initialize_manifest(dir: &Path) -> Result<Aol> {
         let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
@@ -513,7 +521,7 @@ impl Core {
         let reader = MultiSegmentReader::new(sr)?;
 
         // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
-        let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
+        let reader = Reader::new_from(reader, BLOCK_SIZE);
 
         // A RecordReader is created from the Reader to read transactions.
         let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
@@ -662,12 +670,12 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    pub(crate) fn read_manifest(dir: &PathBuf) -> Result<Manifest> {
+    pub(crate) fn read_manifest(dir: &Path) -> Result<Manifest> {
         let manifest_subdir = dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
+        let mut reader = Reader::new_from(reader, BLOCK_SIZE);
 
         let mut manifests = Manifest::new(); // Initialize with an empty Vec
 
@@ -878,8 +886,8 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use rand::prelude::SliceRandom;
-    use rand::{distributions::Alphanumeric, Rng};
-    use std::collections::HashSet;
+    use rand::Rng;
+
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;

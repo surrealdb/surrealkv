@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use libc;
+
 use rand::Rng;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -7,7 +7,11 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 fn create_large_file<P: AsRef<Path>>(path: P, size: u64) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
 
     let buffer = vec![0u8; 1024 * 1024]; // 1 MB buffer
     let mut written = 0;
@@ -109,7 +113,7 @@ fn random_read(file: &mut File, buffer: &mut [u8], use_fadvise: bool) -> io::Res
         // Adjust the number of reads based on your benchmarking needs
         let offset = rng.gen_range(0..file_size);
         file.seek(SeekFrom::Start(offset))?;
-        file.read(buffer)?;
+        file.read_exact(buffer)?;
     }
 
     Ok(())

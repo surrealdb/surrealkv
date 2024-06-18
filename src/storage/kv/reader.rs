@@ -21,19 +21,17 @@ pub(crate) struct Reader {
     buffer: Vec<u8>,
     read: usize,
     start: usize,
-    file_size: u64,
     err: Option<Error>,
 }
 
 impl Reader {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    pub(crate) fn new_from(rdr: MultiSegmentReader, file_size: u64, size: usize) -> Self {
+    pub(crate) fn new_from(rdr: MultiSegmentReader, size: usize) -> Self {
         Reader {
             rdr,
             buffer: vec![0; size],
             read: 0,
             start: 0,
-            file_size,
             err: None,
         }
     }
@@ -311,7 +309,7 @@ mod tests {
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
-        let sz = a.offset().unwrap();
+        let sz = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, sz.0);
         assert_eq!(0, sz.1);
 
@@ -331,7 +329,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 0, 200000);
+        let mut r = Reader::new_from(sr, 200000);
 
         let mut bs = vec![0; 4];
         let n = r.read(&mut bs).expect("should read");
@@ -378,7 +376,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 0, 200000);
+        let mut r = Reader::new_from(sr, 200000);
 
         // Read and verify the 10 records
         for i in 0..num_items {

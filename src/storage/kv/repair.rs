@@ -156,7 +156,7 @@ fn repair_segment(
     let segment_reader = MultiSegmentReader::new(segments)?;
 
     // Initialize a reader for the segment
-    let reader = Reader::new_from(segment_reader, aol.opts.max_file_size, BLOCK_SIZE);
+    let reader = Reader::new_from(segment_reader, BLOCK_SIZE);
     let mut reader = RecordReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
 
     let mut count = 0;
@@ -349,11 +349,7 @@ mod tests {
 
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let reader = Reader::new_from(
-            MultiSegmentReader::new(sr).expect("should create"),
-            opts.max_segment_size,
-            1000,
-        );
+        let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"), 1000);
         let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
         let mut tx = Record::new();
 

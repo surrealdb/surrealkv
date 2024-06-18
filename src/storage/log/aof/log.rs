@@ -257,18 +257,6 @@ impl Aol {
         Ok(self.active_segment_id)
     }
 
-    // Returns the current offset within the segment.
-    pub fn offset(&self) -> Result<(u64, u64)> {
-        // Lock the mutex to ensure thread safety
-        let _lock = self.mutex.lock();
-
-        // Get the offset of the active segment
-        let active_segment_offset = self.active_segment.offset();
-
-        // Add the calculated offset to the offset of the active segment
-        Ok((self.active_segment_id, active_segment_offset))
-    }
-
     pub fn size(&self) -> Result<u64> {
         let _lock = self.mutex.lock();
         let cur_segment_size = self.active_segment.file_offset;
@@ -324,7 +312,7 @@ mod tests {
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
-        let sz = a.offset().unwrap();
+        let sz = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, sz.0);
         assert_eq!(0, sz.1);
 
@@ -342,7 +330,7 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().2);
 
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
 
         // Validate offset after appending
         // 4 + 7 = 11
@@ -370,7 +358,7 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().2);
 
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         // Validate offset after appending
         // 11 + 4 = 15
         assert_eq!(offset, 15);
@@ -408,7 +396,7 @@ mod tests {
         assert!(r2.is_ok());
         assert_eq!(2 * 1024, r2.unwrap().2);
 
-        let (segment_id, _) = a.offset().unwrap();
+        let (segment_id, _) = (a.active_segment_id, a.active_segment.offset());
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
@@ -457,7 +445,7 @@ mod tests {
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
-        let (segment_id, _) = a.offset().unwrap();
+        let (segment_id, _) = (a.active_segment_id, a.active_segment.offset());
         let n1 = a
             .read_at(&mut read_data1, segment_id, 0)
             .expect("should read");
@@ -474,7 +462,7 @@ mod tests {
         assert!(r4.is_ok());
         assert_eq!(1024, r4.unwrap().2);
 
-        let (segment_id, _) = a.offset().unwrap();
+        let (segment_id, _) = (a.active_segment_id, a.active_segment.offset());
 
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
@@ -512,13 +500,13 @@ mod tests {
         let small_record = vec![1; 1024];
         let r = a.append(&small_record);
         assert!(r.is_ok());
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, segment_id);
         assert_eq!(1024, offset);
 
         let r = a.append(&large_record);
         assert!(r.is_err());
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, segment_id);
         assert_eq!(1024, offset);
     }
@@ -538,7 +526,7 @@ mod tests {
         let small_record = vec![1; 1024];
         let r = a.append(&small_record);
         assert!(r.is_ok());
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(1024, offset);
 
         // Simulate fsync failure
@@ -570,7 +558,7 @@ mod tests {
         let small_record = vec![1; 512];
         let r = a.append(&large_record);
         assert!(r.is_ok());
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, segment_id);
         assert_eq!(1024, offset);
 
@@ -583,7 +571,7 @@ mod tests {
 
         let r = a.append(&small_record);
         assert!(r.is_ok());
-        let (segment_id, offset) = a.offset().unwrap();
+        let (segment_id, offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(1, segment_id);
         assert_eq!(512, offset);
         assert_eq!(1, a.active_segment_id);
@@ -605,7 +593,7 @@ mod tests {
         let first_record = vec![1; 512];
         a.append(&first_record)
             .expect("first append should succeed");
-        let (first_segment_id, first_offset) = a.offset().unwrap();
+        let (first_segment_id, first_offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(0, first_segment_id);
         assert_eq!(512, first_offset);
 
@@ -613,7 +601,7 @@ mod tests {
         let second_record = vec![2; 1024]; // This will exceed the max_file_size
         a.append(&second_record)
             .expect("second append should succeed");
-        let (second_segment_id, second_offset) = a.offset().unwrap();
+        let (second_segment_id, second_offset) = (a.active_segment_id, a.active_segment.offset());
         assert_eq!(1, second_segment_id); // Expecting a new segment/file
         assert_eq!(1024, second_offset);
 
@@ -817,7 +805,7 @@ mod tests {
         let (_, record_offset_start, _) = aol.append(data_to_append).unwrap();
 
         // Use the offset method to verify the append operation is in the new segment
-        let (segment_id, current_offset) = aol.offset().unwrap();
+        let (segment_id, current_offset) = (aol.active_segment_id, aol.active_segment.offset());
         assert!(
             current_offset > 0,
             "Offset should be greater than 0 after appending to a new segment"

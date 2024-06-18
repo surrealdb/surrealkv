@@ -28,13 +28,6 @@ impl Manifest {
     }
 
     // Append a Manifest to a file containing a Vec<Manifest>
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.serialize_revisioned(&mut buf)?;
-        Ok(buf)
-    }
-
-    // Append a Manifest to a file containing a Vec<Manifest>
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         self.serialize_revisioned(&mut data)?;
@@ -63,22 +56,18 @@ impl Manifest {
                 ManifestChangeType::Options(options) => Some(options),
                 _ => None,
             })
-            .cloned()
             .last()
+            .cloned()
     }
 
     // Create a new manifest with an update change for an option
     pub fn with_update_option_change(opt: &Options) -> Self {
-        let mut changes = Vec::new();
-        changes.push(ManifestChangeType::Options(opt.clone()));
-
+        let changes = vec![ManifestChangeType::Options(opt.clone())];
         Manifest { changes }
     }
 
     pub fn with_compacted_up_to_segment(segment: u64) -> Self {
-        let mut changes = Vec::new();
-        changes.push(ManifestChangeType::CompactedUpToSegment(segment));
-
+        let changes = vec![ManifestChangeType::CompactedUpToSegment(segment)];
         Manifest { changes }
     }
 
@@ -93,6 +82,7 @@ impl Manifest {
     }
 
     // Load Vec<Manifest> from a dir
+    #[allow(unused)]
     pub fn load_from_dir(path: &Path) -> Result<Self> {
         let mut manifests = Manifest::new();
         if !path.exists() {
@@ -101,7 +91,7 @@ impl Manifest {
 
         let sr = SegmentRef::read_segments_from_directory(path)?;
         let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
+        let mut reader = Reader::new_from(reader, BLOCK_SIZE);
 
         loop {
             // Read the next transaction record from the log.
@@ -166,8 +156,8 @@ mod tests {
     fn test_add_and_read_multiple_manifests() {
         // Step 1: Create a temporary directory
         let temp_dir = create_temp_directory();
-        let opts = LogOptions::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let log_opts = LogOptions::default();
+        let mut a = Aol::open(temp_dir.path(), &log_opts).expect("should create aol");
 
         // Step 2: Create the first Manifest instance and append it to the file
         let first_manifest = Manifest {
@@ -179,7 +169,7 @@ mod tests {
         a.append(&buf).expect("should append record");
 
         // Step 4: Create a new Manifest instance with changes and append it to the same file
-        let mut opt = Options::default();
+        let mut opt = Options::new();
         opt.max_entries_per_txn = 1;
 
         let second_manifest = Manifest {
@@ -204,7 +194,7 @@ mod tests {
                 assert_eq!(options.max_entries_per_txn, 1);
             }
             _ => {
-                assert!(false, "option change is not of type Update");
+                unreachable!("option change is not of type Update");
             }
         }
     }

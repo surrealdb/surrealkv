@@ -45,6 +45,7 @@ impl Snapshot {
         Ok(())
     }
 
+    #[allow(unused)]
     pub fn delete(&mut self, key: &VariableSizeKey) -> Result<()> {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from

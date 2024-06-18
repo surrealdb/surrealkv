@@ -25,6 +25,8 @@ For more information on the underlying immutable versioned adaptive radix tries 
 - [x] **Multi-Version Concurrency Control (MVCC) support**
 - [x] **Multiple Concurrent Readers and Writers**
 - [x] **Persistence through an append-only File**
+- [x] **Compaction**
+
 
 ## Important Notice
 

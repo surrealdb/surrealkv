@@ -49,17 +49,17 @@ impl Indexer {
     ) -> Result<()> {
         *key = key.terminate();
         if check_version {
-            self.index.insert(&key, value.clone(), version, ts)?;
+            self.index.insert(key, value.clone(), version, ts)?;
         } else {
             self.index
-                .insert_without_version_increment_check(&key, value.clone(), version, ts)?;
+                .insert_without_version_increment_check(key, value.clone(), version, ts)?;
         }
         Ok(())
     }
 
     pub fn delete(&mut self, key: &mut VariableSizeKey) -> Result<()> {
         *key = key.terminate();
-        self.index.remove(&key)?;
+        self.index.remove(key)?;
         Ok(())
     }
 

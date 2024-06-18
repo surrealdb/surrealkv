@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::storage::kv::util::copy_dir_all;
 use crate::storage::log::SegmentRef;
@@ -16,7 +16,7 @@ pub(crate) enum RecoveryState {
 }
 
 impl RecoveryState {
-    pub(crate) fn load(dir: &PathBuf) -> Result<Self> {
+    pub(crate) fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(".recovery_state");
         if path.exists() {
             let mut file = File::open(path)?;
@@ -32,7 +32,7 @@ impl RecoveryState {
         }
     }
 
-    pub(crate) fn save(&self, dir: &PathBuf) -> Result<()> {
+    pub(crate) fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(".recovery_state");
         let mut file = File::create(path)?;
         match self {
@@ -50,7 +50,7 @@ impl RecoveryState {
         }
     }
 
-    pub(crate) fn clear(dir: &PathBuf) -> Result<()> {
+    pub(crate) fn clear(dir: &Path) -> Result<()> {
         let path = dir.join(".recovery_state");
         if path.exists() {
             fs::remove_file(path)?;
@@ -78,7 +78,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         };
 
         let compacted_upto_segments = existing_manifest.extract_compacted_up_to_segments();
-        if compacted_upto_segments.len() == 0 || compacted_upto_segments.len() > 1 {
+        if compacted_upto_segments.is_empty() || compacted_upto_segments.len() > 1 {
             return Err(Error::MergeManifestMissing);
         }
 
@@ -163,7 +163,7 @@ fn cleanup_after_recovery(opts: &Options) -> Result<()> {
     Ok(())
 }
 
-fn rollback(backup_dir: &PathBuf, clog_dir: &PathBuf, checkpoint: RecoveryState) -> Result<()> {
+fn rollback(backup_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
     match checkpoint {
         RecoveryState::ClogBackedUp => {
             // Restore the clog directory from backup
@@ -944,11 +944,8 @@ mod tests {
             let txn = reopened_store
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
-            match txn.get(key).expect("Failed to get key") {
-                Some(value) => {
-                    assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
-                }
-                None => (), // It's acceptable for the key to not exist if it was deleted
+            if let Some(value) = txn.get(key).expect("Failed to get key") {
+                assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
             }
         }
 

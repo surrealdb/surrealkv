@@ -2578,12 +2578,12 @@ mod tests {
             .unwrap();
 
         // Write initial content
-        file.write(b"Line 1\n").unwrap();
-        file.write(b"Line 2\n").unwrap();
+        file.write_all(b"Line 1\n").unwrap();
+        file.write_all(b"Line 2\n").unwrap();
 
         // Seek to the beginning of the file and attempt to write
         file.seek(SeekFrom::Start(0)).unwrap();
-        file.write(b"Line 3\n").unwrap();
+        file.write_all(b"Line 3\n").unwrap();
 
         // Read back the file content
         let mut content = String::new();
@@ -2602,18 +2602,19 @@ mod tests {
         let path = PathBuf::from("test_non_append_mode.txt");
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .read(true)
             .open(&path)
             .unwrap();
 
         // Write initial content
-        file.write(b"Line 1\n").unwrap();
-        file.write(b"Line 2\n").unwrap();
+        file.write_all(b"Line 1\n").unwrap();
+        file.write_all(b"Line 2\n").unwrap();
 
         // Seek to the beginning of the file and attempt to write
         file.seek(SeekFrom::Start(0)).unwrap();
-        file.write(b"Line 3\n").unwrap();
+        file.write_all(b"Line 3\n").unwrap();
 
         // Read back the file content
         let mut content = String::new();
