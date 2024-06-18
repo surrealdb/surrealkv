@@ -47,7 +47,6 @@ pub enum Error {
     MergeManifestMissing,        // The merge manifest is missing
     CustomError(String),         // Custom error
     InvalidOperation,            // Invalid operation
-    CommitLogNotEnabled,         // Commit log is not enabled
 }
 
 /// Error structure for encoding errors
@@ -130,7 +129,6 @@ impl fmt::Display for Error {
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
             Error::CustomError(err) => write!(f, "Error: {}", err),
             Error::InvalidOperation => write!(f, "Invalid operation"),
-            Error::CommitLogNotEnabled => write!(f, "Commit log is not enabled"),
         }
     }
 }

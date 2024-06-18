@@ -1,3 +1,4 @@
+pub(crate) mod compaction;
 pub mod entry;
 pub mod error;
 pub(crate) mod indexer;
@@ -7,7 +8,6 @@ pub mod option;
 pub(crate) mod oracle;
 pub(crate) mod reader;
 pub(crate) mod repair;
-pub(crate) mod rollback;
 pub mod snapshot;
 pub mod store;
 pub mod transaction;

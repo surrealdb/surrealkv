@@ -1,12 +1,157 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::storage::kv::util::copy_dir_all;
-use crate::storage::log::SegmentRef;
-use crate::{Error, Options, Result};
+use bytes::BytesMut;
 
-use super::store::Core;
+use crate::storage::{
+    kv::{
+        entry::{Entry, Record, Value, ValueRef},
+        error::{Error, Result},
+        manifest::Manifest,
+        option::Options,
+        store::{Core, StoreInner},
+        util::copy_dir_all,
+    },
+    log::{aof::log::Aol, Options as LogOptions, SegmentRef},
+};
+
+struct CompactionGuard<'a> {
+    is_compacting: &'a AtomicBool,
+}
+
+impl<'a> CompactionGuard<'a> {
+    fn new(is_compacting: &'a AtomicBool) -> Self {
+        is_compacting.store(true, Ordering::Relaxed);
+        CompactionGuard { is_compacting }
+    }
+}
+
+impl<'a> Drop for CompactionGuard<'a> {
+    fn drop(&mut self) {
+        self.is_compacting.store(false, Ordering::Relaxed);
+    }
+}
+
+impl StoreInner {
+    pub async fn compact(&self) -> Result<()> {
+        // Early return if the store is closed or compaction is already in progress
+        if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
+            return Err(Error::InvalidOperation);
+        }
+
+        // Check if compaction is already in progress
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionAlreadyInProgress);
+        }
+
+        // Prevent starting compaction if a .merge or .tmp.merge directory exists
+        let merge_dir = self.core.opts.dir.join(".merge");
+        let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
+        if merge_dir.exists() || tmp_merge_dir.exists() {
+            return Err(Error::CompactionAlreadyInProgress);
+        }
+
+        // IMP!!! Don't start compaction if there is already a .merge or .tmp.merge directory
+        // IMP!!! On restart, save current folder as .backup and clean it in next run (or periodically)
+
+        // Acquire compaction guard
+        let _guard = CompactionGuard::new(&self.is_compacting);
+
+        // Lock the oracle to prevent operations during compaction
+        let oracle = self.core.oracle.clone();
+        let oracle_lock = oracle.write_lock.lock().await;
+
+        // Rotate the commit log and get the new segment ID
+        let mut clog = self.core.clog.as_ref().unwrap().write();
+        let new_segment_id = clog.rotate()?;
+        let last_updated_segment_id = new_segment_id - 1;
+        drop(clog); // Explicitly drop the lock
+
+        // Create temp directory
+        // check if this repo already exists to understand if previous compaction was already done (maybe check on .merge too)
+
+        // IMP!!!! Create manifest inside the tmp directory to be safe to read the right last_updated_segment_id
+
+        // Create a temporary directory for compaction
+        fs::create_dir_all(&tmp_merge_dir)?;
+
+        // // create a hard copy of the manifest folder and (files inside it) inside self.core.opts.dir and copy it into the temp_merge_dir
+        // let temp_manifest_dir = temp_merge_dir.join("manifest");
+
+        // Add last_updated_segment_id inside current manifest
+
+        // Initialize a new manifest in the temporary directory
+        let mut manifest = Core::initialize_manifest(&tmp_merge_dir)?;
+        let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
+        manifest.append(&changeset.serialize()?)?;
+        manifest.close()?;
+
+        // Should we also replicate the manifest into the merge dir?
+
+        // Prepare a temporary commit log directory
+        let temp_clog_dir = tmp_merge_dir.join("clog");
+        let tm_opts = LogOptions::default()
+            .with_max_file_size(self.core.opts.max_compaction_segment_size)
+            .with_file_extension("clog".to_string());
+        let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
+
+        // Start a new RecordReader
+        // (or) Start a new read from snapshot
+
+        // Start compaction process
+        let snapshot_lock = self.core.indexer.write();
+        let mut snapshot = snapshot_lock.snapshot()?;
+        let snapshot_iter = snapshot.new_reader()?;
+        drop(snapshot_lock); // Explicitly drop the lock
+                             // Release the oracle lock
+        drop(oracle_lock);
+
+        // Do compaction and write
+        for (key, value, version, ts) in snapshot_iter.iter() {
+            let mut val_ref = ValueRef::new(self.core.clone());
+            val_ref.decode(*version, value)?;
+
+            // IMP!!! only check for keys whose swizzle is?
+
+            // Skip keys from segments newer than the last updated segment
+            if val_ref.segment_id() > last_updated_segment_id {
+                continue;
+            }
+
+            // Skip deleted keys
+            if let Some(md) = val_ref.metadata() {
+                if md.deleted() {
+                    continue;
+                }
+            }
+
+            // Prepare the entry for the temporary commit log
+            let mut key = key;
+            key.truncate(key.len() - 1);
+            let mut entry = Entry::new(&key, &val_ref.resolve()?);
+            entry.set_ts(*ts);
+            if let Some(md) = val_ref.metadata() {
+                entry.set_metadata(md.clone());
+            }
+
+            let tx_record = Record::from_entry(entry, *version);
+            let mut buf = BytesMut::new();
+            tx_record.encode(&mut buf)?;
+
+            // TODO: Ensure for each append, the segment_id is less than or equal to last_updated_segment_id
+            temp_writer.append(&buf)?;
+        }
+
+        temp_writer.close()?;
+
+        // Finalize compaction by renaming the temporary directory
+        fs::rename(tmp_merge_dir, merge_dir)?;
+
+        Ok(())
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum RecoveryState {
