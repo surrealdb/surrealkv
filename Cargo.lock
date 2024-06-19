@@ -1379,7 +1379,6 @@ dependencies = [
  "tempdir",
  "tokio",
  "vart",
- "walkdir",
 ]
 
 [[package]]
