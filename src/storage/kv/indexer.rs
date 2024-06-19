@@ -35,7 +35,7 @@ impl Indexer {
         kv_pairs.iter_mut().for_each(|kv| {
             kv.key = kv.key.terminate();
         });
-        self.index.bulk_insert(kv_pairs)?;
+        self.index.bulk_insert(kv_pairs, true)?;
         Ok(())
     }
 
