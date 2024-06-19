@@ -29,8 +29,8 @@ bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.5.1"
-vart = {path = "/Users/kfarhan/workspace/surrealdb/vart"}
-revision = {path = "/Users/kfarhan/workspace/surrealdb/revision"}
+vart = "0.3.0"
+revision = "0.7.1"
 walkdir = "2.5.0"
 
 [dev-dependencies]
