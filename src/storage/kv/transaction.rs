@@ -260,10 +260,6 @@ impl Transaction {
             return Err(Error::MaxValueLengthExceeded);
         }
 
-        if self.write_set.len() as u32 >= self.core.opts.max_entries_per_txn {
-            return Err(Error::MaxTransactionEntriesLimitExceeded);
-        }
-
         // If the transaction mode is not write-only, update the snapshot.
         if !self.mode.is_write_only() {
             // Convert the value to Bytes.
@@ -1403,41 +1399,6 @@ mod tests {
         require_sync(txn);
     }
 
-    #[tokio::test]
-    async fn max_transaction_entries_limit_exceeded() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.max_entries_per_txn = 5;
-
-        let store = Store::new(opts.clone()).expect("should create store");
-
-        let num_keys = 6;
-        let mut keys = Vec::new();
-
-        for (counter, _) in (1..=num_keys).enumerate() {
-            // Convert the counter to Bytes
-            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
-
-            // Add the key to the vector
-            keys.push(key_bytes);
-        }
-
-        let default_value = Bytes::from("default_value".to_string());
-
-        // Writing the 6th key should fail
-        let mut txn = store.begin().unwrap();
-
-        for (i, key) in keys.iter().enumerate() {
-            // Start a new write transaction
-            if i < 5 {
-                assert!(txn.set(key, &default_value).is_ok());
-            } else {
-                assert!(txn.set(key, &default_value).is_err());
-            }
-        }
-    }
-
     const ENTRIES: usize = 400_000;
     const KEY_SIZE: usize = 24;
     const VALUE_SIZE: usize = 150;
@@ -1489,7 +1450,6 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_entries_per_txn = ENTRIES as u32;
 
         let store = Store::new(opts.clone()).expect("should create store");
         let mut rng = make_rng();

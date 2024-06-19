@@ -170,7 +170,7 @@ mod tests {
 
         // Step 4: Create a new Manifest instance with changes and append it to the same file
         let mut opt = Options::new();
-        opt.max_entries_per_txn = 1;
+        opt.max_value_size = 1;
 
         let second_manifest = Manifest {
             changes: vec![ManifestChangeType::Options(opt)],
@@ -191,7 +191,7 @@ mod tests {
 
         match updated_change {
             ManifestChangeType::Options(options) => {
-                assert_eq!(options.max_entries_per_txn, 1);
+                assert_eq!(options.max_value_size, 1);
             }
             _ => {
                 unreachable!("option change is not of type Update");

@@ -49,7 +49,7 @@ impl StoreInner {
         // Prevent starting compaction if a .merge or .tmp.merge directory exists
         let merge_dir = self.core.opts.dir.join(".merge");
         let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
-        if merge_dir.exists() || tmp_merge_dir.exists() {
+        if tmp_merge_dir.exists() || merge_dir.exists() {
             return Err(Error::CompactionAlreadyInProgress);
         }
 
@@ -69,26 +69,15 @@ impl StoreInner {
         let last_updated_segment_id = new_segment_id - 1;
         drop(clog); // Explicitly drop the lock
 
-        // Create temp directory
-        // check if this repo already exists to understand if previous compaction was already done (maybe check on .merge too)
-
-        // IMP!!!! Create manifest inside the tmp directory to be safe to read the right last_updated_segment_id
-
         // Create a temporary directory for compaction
         fs::create_dir_all(&tmp_merge_dir)?;
 
-        // // create a hard copy of the manifest folder and (files inside it) inside self.core.opts.dir and copy it into the temp_merge_dir
-        // let temp_manifest_dir = temp_merge_dir.join("manifest");
-
-        // Add last_updated_segment_id inside current manifest
-
         // Initialize a new manifest in the temporary directory
         let mut manifest = Core::initialize_manifest(&tmp_merge_dir)?;
+        // Add the last updated segment ID to the manifest
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
         manifest.append(&changeset.serialize()?)?;
         manifest.close()?;
-
-        // Should we also replicate the manifest into the merge dir?
 
         // Prepare a temporary commit log directory
         let temp_clog_dir = tmp_merge_dir.join("clog");
@@ -97,23 +86,22 @@ impl StoreInner {
             .with_file_extension("clog".to_string());
         let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
 
-        // Start a new RecordReader
-        // (or) Start a new read from snapshot
+        // TODO: Check later to add a new way for compaction by reading from the files first and then
+        // check in memory for the keys that are not found in the files to handle deletion
 
         // Start compaction process
         let snapshot_lock = self.core.indexer.write();
         let mut snapshot = snapshot_lock.snapshot()?;
         let snapshot_iter = snapshot.new_reader()?;
         drop(snapshot_lock); // Explicitly drop the lock
-                             // Release the oracle lock
-        drop(oracle_lock);
+        drop(oracle_lock); // Release the oracle lock
 
         // Do compaction and write
         for (key, value, version, ts) in snapshot_iter.iter() {
             let mut val_ref = ValueRef::new(self.core.clone());
             val_ref.decode(*version, value)?;
 
-            // IMP!!! only check for keys whose swizzle is?
+            // IMP!!! What happnes to keys with the swizzle bit set to 1?
 
             // Skip keys from segments newer than the last updated segment
             if val_ref.segment_id() > last_updated_segment_id {

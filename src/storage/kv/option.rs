@@ -32,7 +32,6 @@ pub struct Options {
     pub max_key_size: u64,                // Maximum size in bytes for key.
     pub max_value_size: u64,              // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
-    pub max_entries_per_txn: u32,   // Maximum entries in a transaction.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
     pub max_compaction_segment_size: u64, // Maximum size of a single compaction.
@@ -48,8 +47,7 @@ impl Default for Options {
             dir: PathBuf::from(""),
             max_key_size: 1024,
             max_value_size: 1024 * 1024,
-            max_entries_per_txn: 1 << 12, // 4096 entries
-            max_value_threshold: 64,      // 64 bytes
+            max_value_threshold: 64, // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_segment_size: 1 << 29, // 512 MB
             max_value_cache_size: 100000,
@@ -83,7 +81,6 @@ mod tests {
         assert_eq!(options.dir, PathBuf::from(""));
         assert_eq!(options.max_key_size, 1024);
         assert_eq!(options.max_value_size, 1024 * 1024);
-        assert_eq!(options.max_entries_per_txn, 1 << 12);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
