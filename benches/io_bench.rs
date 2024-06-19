@@ -64,11 +64,12 @@ fn advise_file(fd: i32, advice: i32) -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn advise_file(fd: i32, advice: i32) -> io::Result<()> {
+    use libc::{posix_fadvise, POSIX_FADV_RANDOM, POSIX_FADV_SEQUENTIAL};
     match advice {
         ADVICE_RANDOM => {
             // Enable read-ahead
             unsafe {
-                let result = libc::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+                let result = posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
                 if result == 0 {
                     Ok(())
                 } else {
@@ -79,7 +80,7 @@ fn advise_file(fd: i32, advice: i32) -> io::Result<()> {
         ADVICE_SEQUENTIAL => {
             // Enable read-ahead
             unsafe {
-                let result = libc::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                let result = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
                 if result == 0 {
                     Ok(())
                 } else {
