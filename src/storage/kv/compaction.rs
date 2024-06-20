@@ -12,7 +12,6 @@ use crate::storage::{
         manifest::Manifest,
         option::Options,
         store::{Core, StoreInner},
-        util::copy_dir_all,
     },
     log::{aof::log::Aol, Options as LogOptions, SegmentRef},
 };
@@ -91,7 +90,7 @@ impl StoreInner {
         let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
-        // check in memory for the keys that are not found in the files to handle deletion
+        // check in files for the keys that are not found in memory to handle deletion
 
         // Start compaction process
         let snapshot_lock = self.core.indexer.write();
@@ -132,8 +131,14 @@ impl StoreInner {
             let mut buf = BytesMut::new();
             tx_record.encode(&mut buf)?;
 
-            // TODO: Ensure for each append, the segment_id is less than or equal to last_updated_segment_id
-            temp_writer.append(&buf)?;
+            let (segment_id, _, _) = temp_writer.append(&buf)?;
+            if segment_id > last_updated_segment_id {
+                eprintln!(
+                    "Segment ID: {} exceeds last updated segment ID: {}",
+                    segment_id, last_updated_segment_id
+                );
+                return Err(Error::SegmentIdExceedsLastUpdated);
+            }
         }
 
         temp_writer.close()?;
@@ -284,19 +289,16 @@ fn cleanup_after_recovery(opts: &Options) -> Result<()> {
 }
 
 fn rollback(merge_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
-    match checkpoint {
-        RecoveryState::ClogDeleted => {
-            // Restore the clog directory from merge directory if it exists
-            // At this point the merge directory should exist and the clog directory should not
-            // So, we can safely rename the merge clog directory to clog directory
-            if !clog_dir.exists() && merge_dir.exists() {
-                let merge_clog_subdir = merge_dir.join("clog");
-                if merge_clog_subdir.exists() {
-                    fs::rename(&merge_clog_subdir, clog_dir)?;
-                }
+    if checkpoint == RecoveryState::ClogDeleted {
+        // Restore the clog directory from merge directory if it exists
+        // At this point the merge directory should exist and the clog directory should not
+        // So, we can safely rename the merge clog directory to clog directory
+        if !clog_dir.exists() && merge_dir.exists() {
+            let merge_clog_subdir = merge_dir.join("clog");
+            if merge_clog_subdir.exists() {
+                fs::rename(&merge_clog_subdir, clog_dir)?;
             }
         }
-        _ => (),
     }
 
     Ok(())

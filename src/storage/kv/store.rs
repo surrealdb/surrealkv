@@ -530,6 +530,9 @@ impl Core {
         if opts.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
             return Err(Error::MaxSegmentSizeCannotBeChanged);
         }
+        if opts.max_compaction_segment_size < opts.max_segment_size {
+            return Err(Error::CompactionSegmentSizeTooSmall);
+        }
 
         Ok(())
     }

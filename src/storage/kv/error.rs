@@ -45,6 +45,8 @@ pub enum Error {
     MergeManifestMissing,        // The merge manifest is missing
     CustomError(String),         // Custom error
     InvalidOperation,            // Invalid operation
+    CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
+    SegmentIdExceedsLastUpdated, // The segment ID exceeds the last updated segment
 }
 
 /// Error structure for encoding errors
@@ -123,6 +125,12 @@ impl fmt::Display for Error {
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
             Error::CustomError(err) => write!(f, "Error: {}", err),
             Error::InvalidOperation => write!(f, "Invalid operation"),
+            Error::CompactionSegmentSizeTooSmall => {
+                write!(f, "Segment size is too small for compaction")
+            }
+            Error::SegmentIdExceedsLastUpdated => {
+                write!(f, "Segment ID exceeds the last updated segment")
+            }
         }
     }
 }

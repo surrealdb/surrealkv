@@ -74,6 +74,7 @@ pub(crate) fn sanitize_directory(directory: &str) -> std::io::Result<PathBuf> {
 }
 
 // Utility function to recursively copy a directory
+#[allow(unused)]
 pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         fs::create_dir_all(dst)?;
