@@ -148,7 +148,6 @@ impl StoreInner {
 #[derive(Debug, PartialEq)]
 pub(crate) enum RecoveryState {
     None,
-    ClogBackedUp,
     ClogDeleted,
 }
 
@@ -160,7 +159,6 @@ impl RecoveryState {
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
             match contents.as_str() {
-                "ClogBackedUp" => Ok(RecoveryState::ClogBackedUp),
                 "ClogDeleted" => Ok(RecoveryState::ClogDeleted),
                 _ => Ok(RecoveryState::None),
             }
@@ -173,11 +171,6 @@ impl RecoveryState {
         let path = dir.join(".recovery_state");
         let mut file = File::create(path)?;
         match self {
-            RecoveryState::ClogBackedUp => {
-                write!(file, "ClogBackedUp")
-                    .map_err(|e| Error::CustomError(format!("recovery file write error: {}", e)))?;
-                Ok(())
-            }
             RecoveryState::ClogDeleted => {
                 write!(file, "ClogDeleted")
                     .map_err(|e| Error::CustomError(format!("recovery file write error: {}", e)))?;
@@ -218,8 +211,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
 
         let compacted_upto_segment_id = compacted_upto_segments[0];
         let segs = SegmentRef::read_segments_from_directory(&clog_dir)?;
-        // Step 4: Copy files from clog dir to merge clog dir and then copy it back to clog dir to avoid
-        // creating a backup directory
+        // Step 4: Copy files from clog dir to merge clog dir
         for seg in segs.iter() {
             if seg.id > compacted_upto_segment_id {
                 // Check if the path points to a regular file
@@ -248,8 +240,6 @@ fn perform_recovery(opts: &Options) -> Result<()> {
             }
         }
 
-        // Copy files from the `.merge/clog` directory into the `clog` directory
-
         // Clear any previous recovery state before setting a new one
         RecoveryState::clear(&opts.dir)?;
         // After successful operation, update recovery state to indicate clog can be deleted
@@ -276,54 +266,37 @@ fn perform_recovery(opts: &Options) -> Result<()> {
     match result() {
         Ok(_) => Ok(()),
         Err(e) => {
-            let backup_dir = opts.dir.join(".backup");
+            let merge_dir = opts.dir.join(".merge");
             let clog_dir = opts.dir.join("clog");
-            rollback(&backup_dir, &clog_dir, RecoveryState::load(&opts.dir)?)?;
+            rollback(&merge_dir, &clog_dir, RecoveryState::load(&opts.dir)?)?;
             Err(e)
         }
     }
 }
 
 fn cleanup_after_recovery(opts: &Options) -> Result<()> {
-    let backup_dir = opts.dir.join(".backup");
     let merge_dir = opts.dir.join(".merge");
 
-    if backup_dir.exists() {
-        fs::remove_dir_all(&backup_dir)?;
-    }
     if merge_dir.exists() {
         fs::remove_dir_all(&merge_dir)?;
     }
     Ok(())
 }
 
-fn rollback(backup_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
+fn rollback(merge_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
     match checkpoint {
-        RecoveryState::ClogBackedUp => {
-            // Restore the clog directory from backup
-            let backup_clog_dir = backup_dir.join("clog");
-            if backup_clog_dir.exists() {
-                // Remove the target directory if it exists
-                if clog_dir.exists() {
-                    fs::remove_dir_all(clog_dir)?;
-                }
-                // Rename the backup directory to the target directory
-                fs::rename(&backup_clog_dir, clog_dir)?;
-            }
-        }
         RecoveryState::ClogDeleted => {
-            // Restore the clog directory from backup
-            let backup_clog_dir = backup_dir.join("clog");
-            if backup_clog_dir.exists() {
-                fs::rename(&backup_clog_dir, clog_dir)?;
+            // Restore the clog directory from merge directory if it exists
+            // At this point the merge directory should exist and the clog directory should not
+            // So, we can safely rename the merge clog directory to clog directory
+            if !clog_dir.exists() && merge_dir.exists() {
+                let merge_clog_subdir = merge_dir.join("clog");
+                if merge_clog_subdir.exists() {
+                    fs::rename(&merge_clog_subdir, clog_dir)?;
+                }
             }
         }
         _ => (),
-    }
-
-    // Clean up backup directory after rollback
-    if backup_dir.exists() {
-        fs::remove_dir_all(backup_dir)?;
     }
 
     Ok(())
@@ -333,32 +306,10 @@ fn needs_recovery(opts: &Options) -> Result<bool> {
     Ok(opts.dir.join(".merge").exists())
 }
 
-fn handle_clog_backed_up_state(opts: &Options) -> Result<()> {
-    let backup_dir = opts.dir.join(".backup");
-    let clog_dir = opts.dir.join("clog");
-    rollback(&backup_dir, &clog_dir, RecoveryState::ClogBackedUp)
-}
-
 fn handle_clog_deleted_state(opts: &Options) -> Result<()> {
-    let backup_dir = opts.dir.join(".backup");
+    let merge_dir = opts.dir.join(".merge");
     let clog_dir = opts.dir.join("clog");
-    rollback(&backup_dir, &clog_dir, RecoveryState::ClogDeleted)
-}
-
-fn backup_and_prepare_for_recovery(opts: &Options) -> Result<()> {
-    let backup_dir = opts.dir.join(".backup");
-    let clog_dir = opts.dir.join("clog");
-
-    // Check if there is a .backup directory, delete it before taking a new backup
-    if backup_dir.exists() {
-        fs::remove_dir_all(&backup_dir)?;
-    }
-
-    fs::create_dir_all(&backup_dir)?;
-    copy_dir_all(&clog_dir, &backup_dir.join("clog"))?;
-    RecoveryState::ClogBackedUp.save(&opts.dir)?;
-
-    Ok(())
+    rollback(&merge_dir, &clog_dir, RecoveryState::ClogDeleted)
 }
 
 /// Restores the store from a compaction process by handling .tmp.merge and .merge directories.
@@ -367,6 +318,8 @@ pub fn restore_from_compaction(opts: &Options) -> Result<()> {
     let tmp_merge_dir = opts.dir.join(".tmp.merge");
     // 1) Check if there is a .tmp.merge directory, delete it
     if tmp_merge_dir.exists() {
+        // This means there was a previous compaction process that failed
+        // so we don't need to do anything here and just return
         fs::remove_dir_all(&tmp_merge_dir)?;
         return Ok(());
     }
@@ -376,9 +329,8 @@ pub fn restore_from_compaction(opts: &Options) -> Result<()> {
     }
 
     match RecoveryState::load(&opts.dir)? {
-        RecoveryState::ClogBackedUp => handle_clog_backed_up_state(opts)?,
         RecoveryState::ClogDeleted => handle_clog_deleted_state(opts)?,
-        RecoveryState::None => backup_and_prepare_for_recovery(opts)?,
+        RecoveryState::None => (),
     }
 
     perform_recovery(opts)?;
@@ -412,13 +364,6 @@ mod tests {
         let path = temp_dir.join(".recovery_state");
         let temp_dir = &temp_dir.to_path_buf();
 
-        // Test saving and loading ClogBackedUp
-        RecoveryState::ClogBackedUp.save(temp_dir).unwrap();
-        assert_eq!(
-            RecoveryState::load(temp_dir).unwrap(),
-            RecoveryState::ClogBackedUp
-        );
-
         // Clear state and re-setup for next test
         RecoveryState::clear(temp_dir).unwrap();
         assert!(!path.exists());
@@ -436,15 +381,6 @@ mod tests {
 
         // Test loading None when no state is saved
         assert_eq!(RecoveryState::load(temp_dir).unwrap(), RecoveryState::None);
-
-        // Test save contents for ClogBackedUp
-        RecoveryState::ClogBackedUp.save(temp_dir).unwrap();
-        let contents = read_to_string(&path).unwrap();
-        assert_eq!(contents, "ClogBackedUp");
-
-        // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
-        assert!(!path.exists());
 
         // Test save contents for ClogDeleted
         RecoveryState::ClogDeleted.save(temp_dir).unwrap();
