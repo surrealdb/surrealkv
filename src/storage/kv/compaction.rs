@@ -46,15 +46,19 @@ impl StoreInner {
             return Err(Error::CompactionAlreadyInProgress);
         }
 
-        // Prevent starting compaction if a .merge or .tmp.merge directory exists
-        let merge_dir = self.core.opts.dir.join(".merge");
+        // Clear files before starting compaction if a .merge or .tmp.merge directory exists
         let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
-        if tmp_merge_dir.exists() || merge_dir.exists() {
-            return Err(Error::CompactionAlreadyInProgress);
+        if tmp_merge_dir.exists() {
+            fs::remove_dir_all(&tmp_merge_dir)?;
         }
 
-        // IMP!!! Don't start compaction if there is already a .merge or .tmp.merge directory
-        // IMP!!! On restart, save current folder as .backup and clean it in next run (or periodically)
+        let merge_dir = self.core.opts.dir.join(".merge");
+        if merge_dir.exists() {
+            fs::remove_dir_all(&merge_dir)?;
+        }
+
+        // Clean recovery state before starting compaction
+        RecoveryState::clear(&self.core.opts.dir)?;
 
         // Acquire compaction guard
         let _guard = CompactionGuard::new(&self.is_compacting);
@@ -199,9 +203,6 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         let clog_dir = opts.dir.join("clog");
         let merge_clog_subdir = merge_dir.join("clog");
 
-        // Original operations with modifications for transactional integrity
-        // For example, deleting the .tmp.merge directory is now safe to skip as it's already backed up
-
         // If there is a .merge directory, try reading manifest from it
         let manifest = Core::initialize_manifest(&merge_dir)?;
         let existing_manifest = if manifest.size()? > 0 {
@@ -301,10 +302,12 @@ fn rollback(backup_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Re
         RecoveryState::ClogBackedUp => {
             // Restore the clog directory from backup
             let backup_clog_dir = backup_dir.join("clog");
-            if backup_clog_dir.exists() && clog_dir.exists() {
-                fs::remove_dir_all(clog_dir)?;
-            }
             if backup_clog_dir.exists() {
+                // Remove the target directory if it exists
+                if clog_dir.exists() {
+                    fs::remove_dir_all(clog_dir)?;
+                }
+                // Rename the backup directory to the target directory
                 fs::rename(&backup_clog_dir, clog_dir)?;
             }
         }
@@ -345,13 +348,16 @@ fn handle_clog_deleted_state(opts: &Options) -> Result<()> {
 fn backup_and_prepare_for_recovery(opts: &Options) -> Result<()> {
     let backup_dir = opts.dir.join(".backup");
     let clog_dir = opts.dir.join("clog");
-    let merge_dir = opts.dir.join(".merge");
 
-    if merge_dir.exists() {
-        fs::create_dir_all(&backup_dir)?;
-        copy_dir_all(&clog_dir, &backup_dir.join("clog"))?;
-        RecoveryState::ClogBackedUp.save(&opts.dir)?;
+    // Check if there is a .backup directory, delete it before taking a new backup
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir)?;
     }
+
+    fs::create_dir_all(&backup_dir)?;
+    copy_dir_all(&clog_dir, &backup_dir.join("clog"))?;
+    RecoveryState::ClogBackedUp.save(&opts.dir)?;
+
     Ok(())
 }
 
@@ -361,7 +367,7 @@ pub fn restore_from_compaction(opts: &Options) -> Result<()> {
     let tmp_merge_dir = opts.dir.join(".tmp.merge");
     // 1) Check if there is a .tmp.merge directory, delete it
     if tmp_merge_dir.exists() {
-        fs::remove_dir_all(&tmp_merge_dir).map_err(Error::from)?;
+        fs::remove_dir_all(&tmp_merge_dir)?;
         return Ok(());
     }
 
