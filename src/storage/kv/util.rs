@@ -1,13 +1,19 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use bytes::Bytes;
 use chrono::Utc;
 use crc32fast::Hasher as crc32Hasher;
 use sha2::{Digest, Sha256};
 
+use crate::Result;
+
 /// Calculates the CRC32 hash of a byte array.
 /// It creates a new CRC32 hasher, updates it with the byte array, and finalizes the hash.
 /// It returns the hash as a 32-bit unsigned integer.
+#[allow(unused)]
 pub(crate) fn calculate_crc32(buf: &[u8]) -> u32 {
     let mut hasher = crc32Hasher::new();
     hasher.update(buf);
@@ -65,4 +71,22 @@ pub(crate) fn sanitize_directory(directory: &str) -> std::io::Result<PathBuf> {
     }
 
     Ok(path)
+}
+
+// Utility function to recursively copy a directory
+#[allow(unused)]
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }

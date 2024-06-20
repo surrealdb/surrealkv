@@ -6,7 +6,7 @@ use crate::storage::{
     kv::{
         error::{Error, Result},
         option::Options,
-        reader::{Reader, TxReader},
+        reader::{Reader, RecordReader},
         util::sanitize_directory,
     },
     log::{aof::log::Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
@@ -156,12 +156,12 @@ fn repair_segment(
     let segment_reader = MultiSegmentReader::new(segments)?;
 
     // Initialize a reader for the segment
-    let reader = Reader::new_from(segment_reader, aol.opts.max_file_size, BLOCK_SIZE);
-    let mut reader = TxReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
+    let reader = Reader::new_from(segment_reader, BLOCK_SIZE);
+    let mut reader = RecordReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
 
     let mut count = 0;
     // Read records until the offset marker is reached
-    while let Ok((data, cur_offset)) = reader.read(db_opts.max_entries_per_txn as usize) {
+    while let Ok((data, cur_offset)) = reader.read() {
         if cur_offset >= corrupted_offset_marker {
             break;
         }
@@ -246,7 +246,7 @@ mod tests {
 
     use super::*;
 
-    use crate::storage::kv::entry::TxRecord;
+    use crate::storage::kv::entry::Record;
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
     use crate::storage::kv::transaction::Durability;
@@ -349,13 +349,9 @@ mod tests {
 
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let reader = Reader::new_from(
-            MultiSegmentReader::new(sr).expect("should create"),
-            opts.max_segment_size,
-            1000,
-        );
-        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
-        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+        let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"), 1000);
+        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
+        let mut tx = Record::new();
 
         loop {
             tx.reset();
@@ -396,17 +392,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_across_segments_from_disk() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 50;
+        opts.max_value_threshold = 2;
+
+        let keys = vec![Bytes::from("k1"), Bytes::from("k2"), Bytes::from("k3")];
+        let default_value = Bytes::from("val");
+
+        let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
+        let expected_keys = vec!["k1", "k2", "k3", "k1"];
+        for key in expected_keys {
+            let key = Bytes::from(key);
+
+            // Start a new read-write transaction (txn)
+            let txn = store.begin().unwrap();
+            let val = txn.get(&key).unwrap().unwrap();
+            assert_eq!(val, default_value);
+        }
+    }
+
+    #[tokio::test]
     async fn repair_with_one_record_per_segment() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 47;
+        opts.max_segment_size = 37;
 
         let keys = vec![Bytes::from("k1"), Bytes::from("k2")];
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 17; // 24bytes is length of txn header
+        let corruption_offset = 29; // 24bytes is length of header
         corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
 
         // Close the store
@@ -435,7 +454,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
+        opts.max_segment_size = 74;
 
         let keys = vec![
             Bytes::from("k1"),
@@ -447,7 +466,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 17; // 24bytes is length of txn header
+        let corruption_offset = 29; // 24bytes is length of txn header
         corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
 
         // Close the store
@@ -498,7 +517,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 17; // 24bytes is length of txn header
+        let corruption_offset = 29; // 24bytes is length of txn header
         corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
 
         // Close the store
@@ -545,7 +564,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 17; // 24bytes is length of txn header
+        let corruption_offset = 29; // 24bytes is length of txn header
         corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
 
         // Close the store
@@ -582,6 +601,7 @@ mod tests {
         opts.dir = temp_dir.path().to_path_buf();
         opts.max_segment_size = 470;
 
+        // each record len (37)
         let keys = vec![
             Bytes::from("k1"),
             Bytes::from("k2"),
@@ -593,7 +613,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 220 + 17; // 24bytes is length of txn header
+        let corruption_offset = 148 + 29; // 24bytes is length of txn header
         corrupt_at_offset(opts.clone(), 1, corruption_offset);
 
         // Check if a new transaction can be appended post repair
@@ -636,8 +656,9 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
+        opts.max_segment_size = 74;
 
+        // each record len (37)
         let keys = vec![
             Bytes::from("k1"),
             Bytes::from("k2"),
@@ -649,7 +670,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 47 + 17; // 24bytes is length of txn header
+        let corruption_offset = 37 + 29; // 24bytes is length of txn header
         corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
 
         // Close the store
@@ -678,7 +699,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
+        opts.max_segment_size = 74;
 
         let keys = vec![
             Bytes::from("k1"),
@@ -691,7 +712,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 47 + 17; // 24bytes is length of txn header
+        let corruption_offset = 37 + 29; // 24bytes is length of txn header
         corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
 
         // Close the store
@@ -720,7 +741,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 110;
+        opts.max_segment_size = 74;
 
         let keys = vec![
             Bytes::from("k1"),
@@ -733,7 +754,7 @@ mod tests {
         let default_value = Bytes::from("val");
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
-        let corruption_offset = 47 + 17; // 24bytes is length of txn header
+        let corruption_offset = 37 + 29; // 24bytes is length of txn header
         corrupt_at_offset(opts.clone(), 3, corruption_offset);
 
         // Close the store

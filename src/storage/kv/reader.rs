@@ -1,46 +1,44 @@
 use std::io::Read;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::BytesMut;
 
 use hashbrown::HashMap;
 
 use crate::storage::{
     kv::{
-        entry::{TxEntry, TxRecord, MAX_KV_METADATA_SIZE, MAX_TX_METADATA_SIZE},
+        entry::{Record, MAX_KV_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
-        util::calculate_crc32,
+        util::calculate_crc32_combined,
     },
     log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
-/// by the `TxReader` to read data from the Aol source.
+/// by the `RecordReader` to read data from the Aol source.
 pub(crate) struct Reader {
     rdr: MultiSegmentReader,
     buffer: Vec<u8>,
     read: usize,
     start: usize,
-    file_size: u64,
     err: Option<Error>,
 }
 
 impl Reader {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    pub(crate) fn new_from(rdr: MultiSegmentReader, file_size: u64, size: usize) -> Self {
+    pub(crate) fn new_from(rdr: MultiSegmentReader, size: usize) -> Self {
         Reader {
             rdr,
             buffer: vec![0; size],
             read: 0,
             start: 0,
-            file_size,
             err: None,
         }
     }
 
     /// Returns the current offset of the `Reader`.
     fn offset(&self) -> u64 {
-        self.rdr.current_segment_id() * self.file_size + self.rdr.current_offset() as u64
+        self.rdr.current_offset() as u64
     }
 
     fn current_segment_id(&self) -> u64 {
@@ -141,11 +139,11 @@ impl Reader {
     }
 }
 
-/// `TxReader` is a public struct within the crate that is used for reading transaction records.
+/// `RecordReader` is a public struct within the crate that is used for reading transaction records.
 ///
 /// # Fields
 /// * `r: Reader` - The `Reader` instance used to read data.
-pub(crate) struct TxReader {
+pub(crate) struct RecordReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
@@ -153,14 +151,14 @@ pub(crate) struct TxReader {
     max_value_size: u64,
 }
 
-impl TxReader {
-    /// Creates a new `TxReader` with the given `Reader`.
+impl RecordReader {
+    /// Creates a new `RecordReader` with the given `Reader`.
     ///
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
     pub(crate) fn new(r: Reader, max_key_size: u64, max_value_size: u64) -> Self {
-        TxReader {
+        RecordReader {
             r,
             err: None,
             rec: Vec::new(),
@@ -169,12 +167,13 @@ impl TxReader {
         }
     }
 
-    /// Reads the header of a transaction record.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx: &mut TxRecord` - The transaction record to read the header into.    
-    pub(crate) fn read_header(&mut self, tx: &mut TxRecord) -> Result<()> {
+    /// Reads a transaction entry.
+    fn read_entry_into(&mut self, rec: &mut Record) -> Result<(u64, u64)> {
+        let entry_crc = self.r.read_uint32()?;
+
+        let segment_id = self.r.current_segment_id();
+
+        let version = self.r.read_uint16()?;
         let id = self.r.read_uint64()?;
 
         // Either the header is corrupted or we have reached the end of the file
@@ -183,41 +182,8 @@ impl TxReader {
             return Err(Error::InvalidTransactionRecordId);
         }
 
-        tx.header.id = id;
-        tx.header.ts = self.r.read_uint64()?;
-        tx.header.version = self.r.read_uint16()?;
-        tx.header.num_entries = self.r.read_uint32()?;
+        let ts = self.r.read_uint64()?;
 
-        let md_len = self.r.read_uint16()? as usize;
-        if md_len > MAX_TX_METADATA_SIZE {
-            let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-            return Err(Error::LogError(Corruption(CorruptionError::new(
-                std::io::ErrorKind::Other,
-                Error::CorruptedTransactionHeader("metadata length exceeds maximum".to_string())
-                    .to_string()
-                    .as_str(),
-                segment_id,
-                offset,
-            ))));
-        }
-
-        let mut txmd: Option<Metadata> = None;
-        if md_len > 0 {
-            let mut md_bs = [0; MAX_TX_METADATA_SIZE];
-            self.r.read(&mut md_bs[..md_len])?;
-
-            let metadata = Metadata::from_bytes(&md_bs)?;
-            txmd = Some(metadata);
-        }
-
-        tx.header.metadata = txmd;
-
-        Ok(())
-    }
-
-    /// Reads a transaction entry.
-    fn read_entry(&mut self) -> Result<(TxEntry, u64)> {
         let md_len = self.r.read_uint16()? as usize;
         if md_len > MAX_KV_METADATA_SIZE {
             return self.corrupt_record_error("metadata length exceeds maximum");
@@ -245,56 +211,8 @@ impl TxReader {
 
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
-        let crc32 = self.r.read_uint32()?;
 
-        Ok((
-            TxEntry {
-                metadata: kvmd,
-                key: k.into(),
-                value: v.into(),
-                value_len: v_len as u32,
-                key_len: k_len as u32,
-                crc32,
-            },
-            offset,
-        ))
-    }
-
-    fn corrupt_record_error(&self, message: &str) -> Result<(TxEntry, u64)> {
-        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-        Err(Error::LogError(Corruption(CorruptionError::new(
-            std::io::ErrorKind::Other,
-            Error::CorruptedTransactionRecord(message.to_string())
-                .to_string()
-                .as_str(),
-            segment_id,
-            offset,
-        ))))
-    }
-
-    /// Reads a transaction record into the provided `TxRecord`.
-    pub(crate) fn read_into(&mut self, tx: &mut TxRecord) -> Result<HashMap<bytes::Bytes, usize>> {
-        self.read_header(tx)?;
-
-        let mut value_offsets: HashMap<bytes::Bytes, usize> = HashMap::new();
-        for i in 0..tx.header.num_entries as usize {
-            let (entry, offset) = self.read_entry()?;
-            let key = entry.key.clone();
-            tx.entries.insert(i, entry);
-            value_offsets.insert(key, offset as usize);
-        }
-
-        self.verify_crc(tx)?;
-
-        Ok(value_offsets)
-    }
-
-    /// Verifies the CRC of a transaction record.
-    fn verify_crc(&mut self, tx: &TxRecord) -> Result<()> {
-        let entry_crc = self.r.read_uint32()?;
-        let buf = Self::serialize_tx_record(tx)?;
-        let actual_crc = calculate_crc32(&buf);
+        let actual_crc = calculate_crc32_combined(&k, &v);
         if entry_crc != actual_crc {
             let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
 
@@ -308,39 +226,63 @@ impl TxReader {
             ))));
         }
 
-        Ok(())
+        rec.id = id;
+        rec.ts = ts;
+        rec.version = version;
+        rec.metadata = kvmd;
+        rec.key = k.into();
+        rec.value = v.into();
+        rec.value_len = v_len as u32;
+        rec.key_len = k_len as u32;
+        rec.crc32 = entry_crc;
+
+        Ok((segment_id, offset))
     }
 
-    /// Serializes a transaction record.
-    pub(crate) fn serialize_tx_record(tx: &TxRecord) -> Result<Bytes> {
-        let mut buf = BytesMut::new();
-        tx.to_buf(&mut buf)?;
-        Ok(buf.freeze())
+    fn corrupt_record_error(&self, message: &str) -> Result<(u64, u64)> {
+        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
+
+        Err(Error::LogError(Corruption(CorruptionError::new(
+            std::io::ErrorKind::Other,
+            Error::CorruptedTransactionRecord(message.to_string())
+                .to_string()
+                .as_str(),
+            segment_id,
+            offset,
+        ))))
     }
 
-    pub(crate) fn serialize_tx_with_crc(tx: &TxRecord) -> Result<Bytes> {
-        let mut buf = BytesMut::new();
-        tx.to_buf(&mut buf)?;
-        let crc = calculate_crc32(&buf);
-        buf.put_u32(crc);
-        Ok(buf.freeze())
+    /// Reads a transaction record into the provided `Record`.
+    pub(crate) fn read_into(
+        &mut self,
+        entry: &mut Record,
+    ) -> Result<HashMap<bytes::Bytes, (u64, usize)>> {
+        let mut value_offsets = HashMap::new();
+        let (segment_id, offset) = self.read_entry_into(entry)?;
+        let key = entry.key.clone();
+        value_offsets.insert(key, (segment_id, offset as usize));
+
+        Ok(value_offsets)
     }
 
-    pub(crate) fn read(&mut self, max_entries: usize) -> Result<(&[u8], u64)> {
+    pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
 
         self.rec.clear();
 
-        let mut tx = TxRecord::new(max_entries);
+        let mut tx = Record::new();
         match self.read_into(&mut tx) {
             Ok(value_offsets) => value_offsets,
             Err(e) => return Err(e),
         };
 
-        let rec = Self::serialize_tx_with_crc(&tx)?;
-        self.rec.extend(&rec);
+        let mut rec = BytesMut::new();
+        tx.encode(&mut rec)?;
+        let rec = rec.freeze();
+
+        self.rec.extend(rec);
 
         Ok((&self.rec, self.r.current_offset()))
     }
@@ -367,18 +309,19 @@ mod tests {
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
-        let sz = a.offset().unwrap();
-        assert_eq!(0, sz);
+        let sz = (a.active_segment_id, a.active_segment.offset());
+        assert_eq!(0, sz.0);
+        assert_eq!(0, sz.1);
 
         // Test appending a non-empty buffer
         let r = a.append(&[0, 1, 2, 3]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         // Test appending another buffer
         let r = a.append(&[4, 5, 6, 7]);
         assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(4, r.unwrap().2);
 
         a.close().expect("should close aol");
 
@@ -386,7 +329,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 0, 200000);
+        let mut r = Reader::new_from(sr, 200000);
 
         let mut bs = vec![0; 4];
         let n = r.read(&mut bs).expect("should read");
@@ -424,7 +367,7 @@ mod tests {
         for i in 0..num_items {
             let r = a.append(&[i; REC_SIZE]); // Each record is a 4-byte array filled with `i`
             assert!(r.is_ok());
-            assert_eq!(REC_SIZE, r.unwrap().1);
+            assert_eq!(REC_SIZE, r.unwrap().2);
         }
 
         a.close().expect("should close aol");
@@ -433,7 +376,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 0, 200000);
+        let mut r = Reader::new_from(sr, 200000);
 
         // Read and verify the 10 records
         for i in 0..num_items {

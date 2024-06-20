@@ -8,13 +8,12 @@ use crate::storage::{
     kv::error::{Error, Result},
     kv::meta::Metadata,
     kv::store::Core,
-    kv::util::{calculate_crc32, calculate_crc32_combined},
+    kv::util::calculate_crc32_combined,
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
-pub(crate) const MAX_TX_METADATA_SIZE: usize = 0; // Maximum size of transaction metadata in bytes
-pub(crate) const TRANSACTION_HEADER_VERSION: u16 = 1; // Version of the transaction header
+pub(crate) const RECORD_VERSION: u16 = 1; // Version of the transaction header
 
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
@@ -34,6 +33,14 @@ impl Entry {
         }
     }
 
+    pub(crate) fn set_metadata(&mut self, metadata: Metadata) {
+        self.metadata = Some(metadata);
+    }
+
+    pub(crate) fn set_ts(&mut self, ts: u64) {
+        self.ts = ts;
+    }
+
     pub(crate) fn mark_delete(&mut self) {
         if self.metadata.is_none() {
             self.metadata = Some(Metadata::new());
@@ -48,129 +55,73 @@ impl Entry {
             false
         }
     }
+
+    pub(crate) fn crc32(&self) -> u32 {
+        calculate_crc32_combined(&self.key, &self.value)
+    }
 }
 
-// Tx struct encoded format:
+// Record encoded format:
 //
 //   +---------------------------------------------------------+
-//   |                     Tx (Transaction)                    |
+//   |                        Record                           |
 //   |---------------------------------------------------------|
-//   | header: TxHeader                                        |
-//   | entries: Vec<TxEntry>                                   |
-//   | crc: u32                                                |
-//   +---------------------------------------------------------+
-
-//   +---------------------------------------------------------+
-//   |                     TxHeader                            |
-//   |---------------------------------------------------------|
-//   | id: u64                                                 |
-//   | ts: u64                                                 |
+//   | crc32: u32                                              |
 //   | version: u16                                            |
-//   | num_entries: u16                                        |
-//   | metadata: Option<Metadata>                              |
-//   +---------------------------------------------------------+
-
-//   +---------------------------------------------------------+
-//   |                        TxEntry                          |
-//   |---------------------------------------------------------|
-//   | key: Bytes                                              |
-//   | key_len: u32                                            |
+//   | tx_id: u64                                              |
+//   | ts: u64                                                 |
 //   | md: Option<Metadata>                                    |
+//   | key_len: u32                                            |
+//   | key: Bytes                                              |
 //   | value_len: u32                                          |
 //   | value: Bytes                                            |
-//   | crc32: u32                                              |
 //   +---------------------------------------------------------+
 //
 //
-// TxHeader encoded format:
+// Record encoded format:
 //
-//   |------------------------------------------------------------------------------------|------------------|
-//   |                              TxHeader                                              |     TxEntry[]    |
-//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
-//   | crc(4) | id(8) | ts(8) | version(2) | num_entries(2)  | metadata_len(2) | metadata |  ...entries...   |
-//   |--------|-------|-------|------------|-----------------|-----------------|----------|------------------|
-//
-// TxEntry encoded format:
-//
-//   |-----------------|----------|------------|-----|--------------|-------|-------|
-//   | metadata_len(4) | metadata | key_len(4) | key | value_len(4) | value | crc32 |
-//   |-----------------|----------|------------|-----|--------------|-------|-------|
+//   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
+//   | crc32(4) | version(2) |  tx_id(8)  |  ts(8)  | metadata_len(2) |  metadata  | key_len(4) | key | value_len(4) | value |
+//   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
 #[derive(Debug)]
-pub(crate) struct TxRecord {
-    pub(crate) header: TxHeader,
-    pub(crate) entries: Vec<TxEntry>,
+pub(crate) struct Records {
+    pub(crate) entries: Vec<Record>,
 }
 
-impl TxRecord {
+impl Records {
     pub(crate) fn new(max_entries: usize) -> Self {
-        TxRecord {
-            header: TxHeader::new(),
+        Records {
             entries: Vec::with_capacity(max_entries),
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        self.header.reset();
-        self.entries.clear();
-    }
-
     pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
-        let mut tx_record = TxRecord::new(entries.len());
-        tx_record.header.id = tx_id;
-        tx_record.header.ts = commit_ts;
+        let mut tx_record = Records::new(entries.len());
 
         for entry in entries {
-            tx_record.add_entry(entry);
+            tx_record.add_entry(entry, tx_id, commit_ts);
         }
         tx_record
     }
 
-    pub(crate) fn add_entry(&mut self, entry: Entry) {
-        let crc32 = calculate_crc32_combined(&entry.key, &entry.value);
-        let tx_record_entry = TxEntry {
-            key_len: entry.key.len() as u32,
-            key: entry.key,
-            metadata: entry.metadata,
-            value_len: entry.value.len() as u32,
-            value: entry.value,
-            crc32,
-        };
+    pub(crate) fn add_entry(&mut self, entry: Entry, tx_id: u64, commit_ts: u64) {
+        let tx_record_entry = Record::new_from_entry(entry, tx_id, commit_ts);
         self.entries.push(tx_record_entry);
-        self.header.num_entries += 1;
     }
 
     pub(crate) fn encode(
         &self,
         buf: &mut BytesMut,
-        current_offset: u64,
-        offset_tracker: &mut HashMap<Bytes, usize>,
+        // current_offset: u64,
+        offset_tracker: &mut HashMap<Bytes, u64>,
     ) -> Result<()> {
-        // Encode header
-        self.header.encode(buf);
-
         // Encode entries and store offsets
         for entry in &self.entries {
-            let mut offset = entry.encode(buf)?;
-            offset += current_offset as usize;
+            let offset = entry.encode(buf)?;
 
             // Store the offset for the current entry
-            offset_tracker.insert(entry.key.clone(), offset);
-        }
-
-        let crc = calculate_crc32(buf);
-        buf.put_u32(crc);
-
-        Ok(())
-    }
-
-    pub(crate) fn to_buf(&self, buf: &mut BytesMut) -> Result<()> {
-        // Encode header
-        self.header.encode(buf);
-
-        // Encode entries and store offsets
-        for entry in &self.entries {
-            entry.encode(buf)?;
+            offset_tracker.insert(entry.key.clone(), offset as u64);
         }
 
         Ok(())
@@ -178,22 +129,44 @@ impl TxRecord {
 }
 
 #[derive(Debug)]
-pub(crate) struct TxHeader {
+pub(crate) struct Record {
     pub(crate) id: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
-    pub(crate) num_entries: u32,
     pub(crate) metadata: Option<Metadata>,
+    pub(crate) key: Bytes,
+    pub(crate) key_len: u32,
+    pub(crate) value_len: u32,
+    pub(crate) value: Bytes,
+    pub(crate) crc32: u32,
 }
 
-impl TxHeader {
+impl Record {
     pub(crate) fn new() -> Self {
-        TxHeader {
+        Record {
             id: 0,
             ts: 0,
-            version: TRANSACTION_HEADER_VERSION,
-            num_entries: 0,
+            version: 0,
             metadata: None,
+            key: Bytes::new(),
+            key_len: 0,
+            value_len: 0,
+            value: Bytes::new(),
+            crc32: 0,
+        }
+    }
+
+    pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
+        Record {
+            id: tx_id,
+            ts: commit_ts,
+            crc32: entry.crc32(),
+            version: RECORD_VERSION,
+            key_len: entry.key.len() as u32,
+            key: entry.key,
+            metadata: entry.metadata,
+            value_len: entry.value.len() as u32,
+            value: entry.value,
         }
     }
 
@@ -202,44 +175,46 @@ impl TxHeader {
         self.ts = 0;
         self.version = 0;
         self.metadata = None;
-        self.num_entries = 0;
+        self.key.clear();
+        self.key_len = 0;
+        self.value_len = 0;
+        self.value.clear();
+        self.crc32 = 0;
     }
 
-    pub(crate) fn encode(&self, buf: &mut BytesMut) {
-        let (md_len, md_bytes) = match &self.metadata {
-            Some(metadata) => {
-                let md_bytes = metadata.to_bytes();
-                let md_len = md_bytes.len() as u16;
-                (md_len, md_bytes)
-            }
-            None => (0, Bytes::new()),
-        };
-
-        // tx_id(8) + ts(8) + version(2) + num_entries(4) + meta_data_len(2) + metadata
-        buf.put_u64(self.id);
-        buf.put_u64(self.ts);
-        buf.put_u16(self.version);
-        buf.put_u32(self.num_entries);
-        buf.put_u16(md_len);
-        if md_len > 0 {
-            buf.put(md_bytes);
+    pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
+        let crc32 = entry.crc32();
+        Record {
+            id: tx_id,
+            ts: entry.ts,
+            version: RECORD_VERSION,
+            key_len: entry.key.len() as u32,
+            key: entry.key,
+            metadata: entry.metadata,
+            value_len: entry.value.len() as u32,
+            value: entry.value,
+            crc32,
         }
     }
-}
 
-#[derive(Debug)]
-pub(crate) struct TxEntry {
-    pub(crate) key: Bytes,
-    pub(crate) key_len: u32,
-    pub(crate) metadata: Option<Metadata>,
-    pub(crate) value_len: u32,
-    pub(crate) value: Bytes,
-    pub(crate) crc32: u32,
-}
-
-impl TxEntry {
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
-        // Encode metadata, if present
+        // This function encodes an Record into a buffer. The encoding format is as follows:
+        // - CRC32 Checksum (4 bytes)
+        // - Version (2 bytes)
+        // - Transaction ID (8 bytes)
+        // - Timestamp (8 bytes)
+        // - Metadata Length (2 bytes)
+        // - Metadata (variable length, defined by Metadata Length)
+        // - Key Length (4 bytes)
+        // - Key (variable length, defined by Key Length)
+        // - Value Length (4 bytes)
+        // - Value (variable length, defined by Value Length)
+        // The function returns the offset position in the buffer after the Value field.
+        buf.put_u32(self.crc32);
+        buf.put_u16(self.version);
+        buf.put_u64(self.id);
+        buf.put_u64(self.ts);
+
         if let Some(metadata) = &self.metadata {
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
@@ -249,13 +224,11 @@ impl TxEntry {
             buf.put_u16(0);
         }
 
-        // Encode key length, key, value length, value, and crc32
         buf.put_u32(self.key_len);
         buf.put(self.key.as_ref());
         buf.put_u32(self.value_len);
         let offset = buf.len();
         buf.put(self.value.as_ref());
-        buf.put_u32(self.crc32);
 
         Ok(offset)
     }
@@ -264,18 +237,20 @@ impl TxEntry {
 pub(crate) trait Value {
     fn resolve(&self) -> Result<Vec<u8>>;
     fn ts(&self) -> u64;
-    fn key_value_metadata(&self) -> Option<&Metadata>;
+    fn metadata(&self) -> Option<&Metadata>;
     fn length(&self) -> usize;
+    fn segment_id(&self) -> u64;
 }
 
 /// Value reference implementation.
 pub struct ValueRef {
     pub(crate) flag: u8,
     pub(crate) ts: u64,
+    pub(crate) segment_id: u64,
     pub(crate) value_length: usize,
     pub(crate) value_offset: Option<u64>,
     pub(crate) value: Option<Bytes>,
-    pub(crate) key_value_metadata: Option<Metadata>,
+    pub(crate) metadata: Option<Metadata>,
     /// The underlying store for the transaction.
     store: Arc<Core>,
 }
@@ -301,12 +276,16 @@ impl Value for ValueRef {
         self.ts
     }
 
-    fn key_value_metadata(&self) -> Option<&Metadata> {
-        self.key_value_metadata.as_ref()
+    fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
     }
 
     fn length(&self) -> usize {
         self.value_length
+    }
+
+    fn segment_id(&self) -> u64 {
+        self.segment_id
     }
 }
 
@@ -315,111 +294,147 @@ impl ValueRef {
         ValueRef {
             ts: 0,
             flag: 0,
+            segment_id: 0,
             value_offset: None,
             value_length: 0,
             value: None,
-            key_value_metadata: None,
+            metadata: None,
             store,
         }
     }
 
     /// Encode the valueRef into a byte representation.
     pub(crate) fn encode(
-        key: &Bytes,
+        segment_id: u64,
         value: &Bytes,
         metadata: Option<&Metadata>,
-        value_offsets: &HashMap<bytes::Bytes, usize>,
+        value_offset: u64,
         max_value_threshold: usize,
     ) -> Bytes {
         let mut buf = BytesMut::new();
 
+        // Memory layout:
+        // | swizzle flag (1 byte) | segment_id (8 bytes) | value length (4 bytes) |
+        // | value_offset (8 bytes) | value (variable length, if inlined) |
+        // | metadata length (2 bytes) | metadata (variable length) |
+
         if value.len() <= max_value_threshold {
+            // Inline value case
             buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
-            buf.put_u32(value.len() as u32);
-            buf.put(value.as_ref());
+            buf.put_u64(segment_id); // Segment ID
+            buf.put_u32(value.len() as u32); // Length of the value
+            buf.put_u64(value_offset); // Offset where the value is stored
+            buf.put(value.as_ref()); // The value itself
         } else {
-            buf.put_u8(0);
-            buf.put_u32(value.len() as u32);
-            let val_off = value_offsets.get(key).unwrap();
-            buf.put_u64(*val_off as u64);
+            // Reference value case
+            buf.put_u8(0); // swizzle flag to indicate value is not inlined
+            buf.put_u64(segment_id); // Segment ID
+            buf.put_u32(value.len() as u32); // Length of the value
+            buf.put_u64(value_offset); // Offset where the value is stored
+                                       // Note: The actual value is not included in the buffer for this case
         }
 
         if let Some(metadata) = &metadata {
+            // If metadata is present
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
-            buf.put_u16(md_len);
-            buf.put(md_bytes);
+            buf.put_u16(md_len); // Put the length of metadata
+            buf.put(md_bytes); // Put the metadata bytes
         } else {
-            buf.put_u16(0);
+            // If no metadata is present, just write a length of 0
+            buf.put_u16(0); // Metadata length indicator for no metadata
         }
-        buf.freeze()
+        buf.freeze() // Converts the buffer into `Bytes` without copying
     }
 
     /// Encode the valueRef into an in-memory byte representation.
     pub(crate) fn encode_mem(value: &Bytes, metadata: Option<&Metadata>) -> Bytes {
         let mut buf = BytesMut::new();
 
+        // Memory layout for encoding a value with optional metadata into memory:
+        // | swizzle flag (1 byte) | reserved (8 bytes) | value length (4 bytes) |
+        // | reserved (8 bytes) | value (variable length) |
+        // | metadata length (2 bytes) | metadata (variable length) |
+
         buf.put_u8(1); // swizzle flag to indicate value is inlined or stored in log
-        buf.put_u32(value.len() as u32);
-        buf.put(value.as_ref());
+        buf.put_u64(0); // Reserved 8 bytes, currently set to 0
+        buf.put_u32(value.len() as u32); // Length of the value
+        buf.put_u64(0); // Another reserved 8 bytes, currently set to 0
+        buf.put(value.as_ref()); // The actual value bytes
 
         if let Some(metadata) = &metadata {
+            // If metadata is provided
             let md_bytes = metadata.to_bytes();
             let md_len = md_bytes.len() as u16;
-            buf.put_u16(md_len);
-            buf.put(md_bytes);
+            buf.put_u16(md_len); // Write the length of metadata
+            buf.put(md_bytes); // Write the metadata bytes themselves
         } else {
-            buf.put_u16(0);
+            // If no metadata is provided, indicate this with a length of 0
+            buf.put_u16(0); // Metadata length set to 0 to indicate absence
         }
-        buf.freeze()
+        buf.freeze() // Converts the buffer into `Bytes` without copying, ready for use
     }
 
     /// Decode the byte representation into a valueRef.
     pub(crate) fn decode(&mut self, ts: u64, encoded_bytes: &Bytes) -> Result<()> {
         let mut cursor = Cursor::new(encoded_bytes);
 
-        // Set ts
+        // Set the timestamp for the entry
         self.ts = ts;
 
-        // Read flag which indicates if value is inlined or not
+        // Read the flag to determine if the value is inlined or referenced externally
         self.flag = cursor.get_u8();
 
-        // Decode value length and value
+        // Decode the segment ID, value length, and value offset from the encoded bytes
+        self.segment_id = cursor.get_u64();
         self.value_length = cursor.get_u32() as usize;
+        self.value_offset = Some(cursor.get_u64());
 
+        // If the flag indicates the value is inlined, extract it directly from the encoded bytes
         if self.flag == 1 {
+            // Calculate the start and end positions of the value within the encoded bytes
             let value_bytes =
-                cursor.get_ref()[cursor.position() as usize..][..self.value_length].as_ref();
+                cursor.get_ref()[cursor.position() as usize..][..self.value_length].to_vec();
+            // Advance the cursor past the value to continue decoding any remaining data
             cursor.advance(self.value_length);
 
-            self.value = Some(Bytes::copy_from_slice(value_bytes));
+            // Store the extracted value
+            self.value = Some(Bytes::from(value_bytes));
         } else {
-            // Decode version, value length, and value offset
-            self.value_offset = Some(cursor.get_u64());
+            // For non-inlined values, the value offset is already set, and the actual value is not in the encoded bytes
         }
 
-        // Decode key-value metadata
+        // Decode key-value metadata, if present
+        // Check if there's enough data left for metadata size; if not, the data is corrupted
         if encoded_bytes.len() < cursor.position() as usize + MD_SIZE {
             return Err(Error::CorruptedIndex);
         }
 
+        // Read the length of the key-value metadata
         let kv_metadata_len = cursor.get_u16() as usize;
         if kv_metadata_len > 0 {
+            // Validate the metadata size to prevent processing invalid or malicious data
             if kv_metadata_len > MAX_KV_METADATA_SIZE {
                 return Err(Error::CorruptedIndex);
             }
+            // Ensure there's enough data left for the actual metadata; if not, the data is corrupted
             if encoded_bytes.len() < cursor.position() as usize + kv_metadata_len {
                 return Err(Error::CorruptedIndex);
             }
+            // Extract the metadata bytes and advance the cursor
             let kv_metadata_bytes =
-                cursor.get_ref()[cursor.position() as usize..][..kv_metadata_len].as_ref();
+                cursor.get_ref()[cursor.position() as usize..][..kv_metadata_len].to_vec();
             cursor.advance(kv_metadata_len);
-            self.key_value_metadata = Some(Metadata::from_bytes(kv_metadata_bytes)?);
+
+            // Convert the raw metadata bytes into a Metadata object and store it
+            self.metadata = Some(Metadata::from_bytes(&kv_metadata_bytes)?);
         } else {
-            self.key_value_metadata = None;
+            // If there's no metadata, set the corresponding field to None
+            self.metadata = None;
         }
 
-        // Ensure all the data is read
+        // After processing all expected data, ensure the cursor is at the end of the encoded bytes
+        // If not, it indicates the encoded data may be corrupted or improperly formatted
         if cursor.position() as usize != encoded_bytes.len() {
             return Err(Error::CorruptedIndex);
         }
@@ -431,20 +446,22 @@ impl ValueRef {
     /// If the offset exists in the value cache, it returns the cached value.
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
     fn resolve_from_offset(&self, value_offset: u64) -> Result<Vec<u8>> {
-        // Check if the offset exists in value_cache and return if found
-        if let Some(value) = self.store.value_cache.get(&value_offset) {
+        // Attempt to return the cached value if it exists
+        let cache_key = (self.segment_id, value_offset);
+
+        if let Some(value) = self.store.value_cache.get(&cache_key) {
             return Ok(value.to_vec());
         }
 
-        // Read the value from the commit log at the specified offset
+        // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; self.value_length];
-        let vlog = self.store.clog.as_ref().unwrap().read();
-        vlog.read_at(&mut buf, value_offset)?;
+        let clog = self.store.clog.as_ref().unwrap().read();
+        clog.read_at(&mut buf, self.segment_id, value_offset)?;
 
-        // Store the offset and value in value_cache
+        // Cache the newly read value for future use
         self.store
             .value_cache
-            .insert(value_offset, Bytes::from(buf.clone()));
+            .insert(cache_key, Bytes::from(buf.clone()));
 
         Ok(buf)
     }
@@ -484,7 +501,7 @@ mod tests {
         let mut value_ref = ValueRef::new(store.inner.as_ref().unwrap().core.clone());
         value_ref.value_length = 100;
         value_ref.value_offset = Some(200);
-        value_ref.key_value_metadata = Some(kvmd);
+        value_ref.metadata = Some(kvmd);
 
         // // Encode the valueRef
         // let encoded_bytes = value_ref.encode();
@@ -498,8 +515,8 @@ mod tests {
         // assert_eq!(decoded_value_ref.value_length, value_ref.value_length);
         // assert_eq!(decoded_value_ref.value_offset, value_ref.value_offset);
         // assert_eq!(
-        //     decoded_value_ref.key_value_metadata.unwrap().deleted(),
-        //     value_ref.key_value_metadata.unwrap().deleted()
+        //     decoded_value_ref.metadata.unwrap().deleted(),
+        //     value_ref.metadata.unwrap().deleted()
         // );
     }
 

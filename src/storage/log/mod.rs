@@ -2566,4 +2566,83 @@ mod tests {
         // Should not have overwritten the data in the file
         assert_eq!(new_content, "Hello, world! More content.");
     }
+
+    #[test]
+    fn append_mode_seek_and_write() {
+        let path = PathBuf::from("test_append_mode.txt");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        // Write initial content
+        file.write_all(b"Line 1\n").unwrap();
+        file.write_all(b"Line 2\n").unwrap();
+
+        // Seek to the beginning of the file and attempt to write
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"Line 3\n").unwrap();
+
+        // Read back the file content
+        let mut content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap(); // Seek back to start to read
+        file.read_to_string(&mut content).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&path).unwrap();
+
+        // Check that "Line 3" was appended at the end, despite the seek
+        assert!(content.ends_with("Line 3\n"));
+    }
+
+    #[test]
+    fn non_append_mode_seek_and_write() {
+        let path = PathBuf::from("test_non_append_mode.txt");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+
+        // Write initial content
+        file.write_all(b"Line 1\n").unwrap();
+        file.write_all(b"Line 2\n").unwrap();
+
+        // Seek to the beginning of the file and attempt to write
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"Line 3\n").unwrap();
+
+        // Read back the file content
+        let mut content = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap(); // Seek back to start to read
+        file.read_to_string(&mut content).unwrap();
+
+        // Clean up
+        std::fs::remove_file(&path).unwrap();
+
+        // Check that "Line 3" was written at the beginning, not appended
+        assert!(content.starts_with("Line 3\n"));
+    }
+
+    #[test]
+    fn test_list_segment_ids() {
+        // Create a temporary directory
+        let temp_dir = TempDir::new("test").expect("should create temp dir");
+        let dir_path = temp_dir.path();
+
+        // Populate the directory with segment files and some other files
+        create_segment_file(dir_path, &segment_name(1, ""));
+        create_segment_file(dir_path, &segment_name(2, ""));
+        create_segment_file(dir_path, &segment_name(10, ""));
+
+        // Call the function under test
+        let segment_ids = list_segment_ids(dir_path).unwrap();
+
+        // Verify the output
+        assert_eq!(segment_ids, vec![1, 2, 10]);
+    }
 }

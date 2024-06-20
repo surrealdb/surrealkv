@@ -1,40 +1,46 @@
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
 use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
-use tokio::task::{spawn, JoinHandle};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    task::{spawn, JoinHandle},
+};
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
-use tokio::sync::Mutex as AsyncMutex;
+use revision::Revisioned;
 use vart::art::KV;
 
 use crate::storage::{
     kv::{
-        entry::{Entry, TxRecord, ValueRef},
+        compaction::restore_from_compaction,
+        entry::{Entry, Record, Records, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
+        manifest::Manifest,
         option::Options,
         oracle::Oracle,
-        reader::{Reader, TxReader},
+        reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
-        transaction::{Mode, Transaction},
+        transaction::{Durability, Mode, Transaction},
     },
     log::{
-        aof::log::Aol, write_field, Error as LogError, Metadata, MultiSegmentReader,
-        Options as LogOptions, SegmentRef, BLOCK_SIZE,
+        aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
+        BLOCK_SIZE,
     },
 };
-
-use super::transaction::Durability;
 
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
+    pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
@@ -56,14 +62,19 @@ impl StoreInner {
             core,
             stop_tx,
             is_closed: AtomicBool::new(false),
+            is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
         })
     }
 
     /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
     pub async fn close(&self) -> Result<()> {
-        if self.is_closed.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.is_closed.load(Ordering::SeqCst) {
             return Ok(());
+        }
+
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionAlreadyInProgress);
         }
 
         // Send stop signal
@@ -84,8 +95,7 @@ impl StoreInner {
 
         self.core.close()?;
 
-        self.is_closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.is_closed.store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -154,6 +164,14 @@ impl Store {
     pub async fn close(&self) -> Result<()> {
         if let Some(inner) = self.inner.as_ref() {
             inner.close().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn compact(&self) -> Result<()> {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.compact().await?;
         }
 
         Ok(())
@@ -234,7 +252,7 @@ pub struct Core {
     /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Cache<u64, Bytes>,
+    pub(crate) value_cache: Cache<(u64, u64), Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Channel to send write requests to the writer
@@ -261,8 +279,8 @@ impl Core {
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    fn initialize_manifest(opts: &Options) -> Result<Aol> {
-        let manifest_subdir = opts.dir.join("manifest");
+    pub(crate) fn initialize_manifest(dir: &Path) -> Result<Aol> {
+        let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
     }
@@ -306,25 +324,30 @@ impl Core {
         let mut manifest = None;
         let mut clog = None;
 
+        let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
-            manifest = Some(Self::initialize_manifest(&opts)?);
+            manifest = Some(Self::initialize_manifest(&opts.dir)?);
 
             // Load options from the manifest file.
-            let opts = Core::load_options(&opts, manifest.as_mut().unwrap())?;
+            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
 
             // Determine options for the commit log file and open or create it.
             clog = Some(Self::initialize_clog(&opts)?);
 
+            // Restore the store from a compaction process if necessary.
+            restore_from_compaction(&opts)?;
+
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
         }
 
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
-        oracle.set_ts(indexer.version());
+        let ts_to_set = std::cmp::max(num_entries, indexer.version());
+        oracle.set_ts(ts_to_set);
 
         // Create and initialize value cache.
         let value_cache = Cache::new(opts.max_value_cache_size as usize);
@@ -351,7 +374,7 @@ impl Core {
     }
 
     // The load_index function is responsible for loading the index from the log.
-    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<()> {
+    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<u64> {
         // The directory where the log segments are stored is determined.
         let clog_subdir = opts.dir.join("clog");
 
@@ -363,32 +386,37 @@ impl Core {
         let reader = MultiSegmentReader::new(sr)?;
 
         // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
-        let reader = Reader::new_from(reader, opts.max_segment_size, BLOCK_SIZE);
+        let reader = Reader::new_from(reader, BLOCK_SIZE);
 
-        // A TxReader is created from the Reader to read transactions.
-        let mut tx_reader = TxReader::new(reader, opts.max_key_size, opts.max_value_size);
+        // A RecordReader is created from the Reader to read transactions.
+        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
 
-        // A TxRecord is created to hold the transactions. The maximum number of entries per transaction is specified.
-        let mut tx = TxRecord::new(opts.max_entries_per_txn as usize);
+        // A Record is created to hold the transactions. The maximum number of entries per transaction is specified.
+        let mut tx = Record::new();
 
         // An Option is created to hold the segment ID and offset in case of corruption.
         let mut corruption_info: Option<(u64, u64)> = None;
 
+        let mut num_entries = 0;
         // A loop is started to read transactions.
         loop {
-            // The TxRecord is reset for each iteration.
+            // The Record is reset for each iteration.
             tx.reset();
 
-            // The TxReader attempts to read into the TxRecord.
+            // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok(value_offsets) => Core::process_entries(&tx, opts, &value_offsets, indexer)?,
+                Ok(value_offsets) => {
+                    Core::process_entries(&tx, opts, &value_offsets, indexer)?;
+                    num_entries += 1;
+                }
 
                 // If the end of the file is reached, the loop is broken.
                 Err(Error::LogError(LogError::Eof(_))) => break,
 
                 // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
                 Err(Error::LogError(LogError::Corruption(err))) => {
+                    eprintln!("Corruption error: {:?}", err);
                     corruption_info = Some((err.segment_id, err.offset));
                     break;
                 }
@@ -410,79 +438,86 @@ impl Core {
             repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
         }
 
-        Ok(())
+        Ok(num_entries)
     }
 
     fn process_entries(
-        tx: &TxRecord,
+        entry: &Record,
         opts: &Options,
-        value_offsets: &HashMap<Bytes, usize>,
+        value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        let mut kv_pairs: Vec<KV<vart::VariableSizeKey, Bytes>> = tx
-            .entries
-            .iter()
-            .map(|entry| {
-                let index_value = ValueRef::encode(
-                    &entry.key,
-                    &entry.value,
-                    entry.metadata.as_ref(),
-                    value_offsets,
-                    opts.max_value_threshold,
-                );
-
-                KV {
-                    key: entry.key[..].into(),
-                    value: index_value,
-                    version: tx.header.id,
-                    ts: tx.header.ts,
-                }
-            })
-            .collect();
-
-        indexer.bulk_insert(&mut kv_pairs)
-    }
-
-    fn load_options(opts: &Options, manifest: &mut Aol) -> Result<Options> {
-        let current_metadata = opts.to_metadata();
-        let existing_metadata_list = if !manifest.size()? > 0 {
-            Core::load_manifests(opts)?
-        } else {
-            Vec::new()
-        };
-
-        Core::validate_options(opts, &existing_metadata_list)?;
-
-        if let Some(existing) = existing_metadata_list.last() {
-            if *existing == current_metadata {
-                return Options::from_metadata(current_metadata, opts.dir.clone());
+        if let Some(metadata) = entry.metadata.as_ref() {
+            if metadata.deleted() {
+                indexer.delete(&mut entry.key[..].into())?;
             }
+        } else {
+            let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
+
+            let index_value = ValueRef::encode(
+                *segment_id,
+                &entry.value,
+                entry.metadata.as_ref(),
+                *val_off as u64,
+                opts.max_value_threshold,
+            );
+
+            indexer.insert(
+                &mut entry.key[..].into(),
+                index_value,
+                entry.id,
+                entry.ts,
+                false,
+            )?;
         }
 
-        let md_bytes = current_metadata.to_bytes()?;
-        let mut buf = Vec::new();
-
-        // Write the metadata to the manifest [md_len: u32][md_bytes: Vec<u8>]
-        write_field(&md_bytes, &mut buf)?;
-        manifest.append(&buf)?;
-
-        // Update options with the loaded metadata.
-        Options::from_metadata(current_metadata, opts.dir.clone())
+        Ok(())
     }
 
-    fn validate_options(opts: &Options, existing_metadata_list: &[Metadata]) -> Result<()> {
+    fn load_manifest(current_opts: &Options, manifest: &mut Aol) -> Result<Options> {
+        // Load existing manifests if any, else create a new one
+        let existing_manifest = if manifest.size()? > 0 {
+            Core::read_manifest(&current_opts.dir)?
+        } else {
+            Manifest::new()
+        };
+
+        // Validate the current options against the existing manifest's options
+        let options_changeset = existing_manifest.extract_options();
+        Core::validate_options(current_opts, &options_changeset)?;
+
+        // Check if the current options are already the last option in the manifest
+        if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
+            return Ok(current_opts.clone());
+        }
+
+        // If not, create a changeset with an update operation for the current options
+        let changeset = Manifest::with_update_option_change(current_opts);
+
+        // Serialize the changeset and append it to the manifest
+        let buf = changeset.serialize()?;
+        manifest.append(&buf)?;
+
+        Ok(current_opts.clone())
+    }
+
+    fn validate_options(opts: &Options, existing_metadata_list: &Vec<Options>) -> Result<()> {
         let mut last_max_value_size = 0;
         let mut last_max_key_size = 0;
-        for metadata in existing_metadata_list {
-            let options = Options::from_metadata(metadata.clone(), opts.dir.clone())?;
-            if options.max_value_size < last_max_value_size {
+        let mut last_max_segment_size = 0;
+        for option in existing_metadata_list {
+            if option.max_value_size < last_max_value_size {
                 return Err(Error::MaxValueSizeCannotBeDecreased);
             }
-            if options.max_key_size < last_max_key_size {
+            if option.max_key_size < last_max_key_size {
                 return Err(Error::MaxKeySizeCannotBeDecreased);
             }
-            last_max_value_size = options.max_value_size;
-            last_max_key_size = options.max_key_size;
+            if option.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
+                return Err(Error::MaxSegmentSizeCannotBeChanged);
+            }
+            last_max_value_size = option.max_value_size;
+            last_max_key_size = option.max_key_size;
+            last_max_segment_size = option.max_segment_size;
         }
 
         // Include current opts in the comparison
@@ -492,18 +527,25 @@ impl Core {
         if opts.max_key_size < last_max_key_size {
             return Err(Error::MaxKeySizeCannotBeDecreased);
         }
+        if opts.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
+            return Err(Error::MaxSegmentSizeCannotBeChanged);
+        }
+        if opts.max_compaction_segment_size < opts.max_segment_size {
+            return Err(Error::CompactionSegmentSizeTooSmall);
+        }
 
         Ok(())
     }
+
     /// Loads the latest options from the manifest log.
-    fn load_manifests(opts: &Options) -> Result<Vec<Metadata>> {
-        let manifest_subdir = opts.dir.join("manifest");
+    pub(crate) fn read_manifest(dir: &Path) -> Result<Manifest> {
+        let manifest_subdir = dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader, 0, BLOCK_SIZE);
+        let mut reader = Reader::new_from(reader, BLOCK_SIZE);
 
-        let mut manifests: Vec<Metadata> = Vec::new(); // Initialize with an empty Vec
+        let mut manifests = Manifest::new(); // Initialize with an empty Vec
 
         loop {
             // Read the next transaction record from the log.
@@ -520,14 +562,15 @@ impl Core {
             let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
             let mut md_bytes = vec![0u8; len];
             reader.read(&mut md_bytes)?; // Read the actual metadata
-            manifests.push(Metadata::new(Some(md_bytes))); // Add the new metadata to the Vec
+            let manifest = Manifest::deserialize_revisioned(&mut md_bytes.as_slice())?;
+            manifests.changes.extend(manifest.changes);
         }
 
         Ok(manifests)
     }
 
     fn is_closed(&self) -> bool {
-        self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
+        self.is_closed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn close(&self) -> Result<()> {
@@ -552,8 +595,7 @@ impl Core {
         if let Some(manifest) = &self.manifest {
             manifest.write().close()?;
         }
-        self.is_closed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.is_closed.store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -583,47 +625,54 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
-        let current_offset = self.clog.as_ref().unwrap().read().offset()?;
-        let tx_record = TxRecord::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
+        let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
-        let mut committed_values_offsets = HashMap::new();
+        let mut values_offsets = HashMap::new();
 
-        tx_record.encode(&mut buf, current_offset, &mut committed_values_offsets)?;
+        tx_record.encode(&mut buf, &mut values_offsets)?;
 
-        self.append_log(&buf, req.durability)?;
-        self.write_index_with_committed_offsets(&req, &committed_values_offsets)
+        let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
+
+        values_offsets.iter_mut().for_each(|(_, val_off)| {
+            *val_off += current_offset;
+        });
+
+        self.write_index_with_committed_offsets(&req, segment_id, &values_offsets)
     }
 
     fn write_entries_to_memory(&self, req: Task) -> Result<()> {
         self.write_index_in_memory(&req)
     }
 
-    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<()> {
+    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
         let mut clog = self.clog.as_ref().unwrap().write();
 
-        match durability {
+        let (segment_id, offset) = match durability {
             Durability::Immediate => {
                 // Immediate durability means that the transaction is made to
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
                 clog.sync()?;
+                (segment_id, offset)
             }
             Durability::Eventual => {
                 // Eventual durability means that the transaction is made to
                 // write to disk using the write_all method. But it does not
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
                 clog.flush()?;
+                (segment_id, offset)
             }
             Durability::Weak => {
                 // Weak durability means that the transaction is made to
                 // write to disk in size of BLOCK_SIZE. And it does not
                 // fsync the data to disk before returning.
-                clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record)?;
+                (segment_id, offset)
             }
-        }
+        };
 
-        Ok(())
+        Ok((segment_id, offset))
     }
 
     fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
@@ -631,12 +680,21 @@ impl Core {
         F: Fn(&Entry) -> Bytes,
     {
         let mut index = self.indexer.write();
-        let mut kv_pairs = Vec::new();
+        let mut to_insert = Vec::new();
+        // let mut to_delete = Vec::new();
 
         for entry in &task.entries {
+            // If the entry is marked as deleted, add it to the to_delete list.
+            // if let Some(metadata) = entry.metadata.as_ref() {
+            //     if metadata.deleted() {
+            //         to_delete.push(entry.key[..].into());
+            //         continue;
+            //     }
+            // }
+
             let index_value = encode_entry(entry);
 
-            kv_pairs.push(KV {
+            to_insert.push(KV {
                 key: entry.key[..].into(),
                 value: index_value,
                 version: task.tx_id,
@@ -644,7 +702,8 @@ impl Core {
             });
         }
 
-        index.bulk_insert(&mut kv_pairs)?;
+        index.bulk_insert(&mut to_insert)?;
+        // index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }
@@ -652,14 +711,15 @@ impl Core {
     fn write_index_with_committed_offsets(
         &self,
         task: &Task,
-        committed_values_offsets: &HashMap<Bytes, usize>,
+        segment_id: u64,
+        committed_values_offsets: &HashMap<Bytes, u64>,
     ) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
             ValueRef::encode(
-                &entry.key,
+                segment_id,
                 &entry.value,
                 entry.metadata.as_ref(),
-                committed_values_offsets,
+                *committed_values_offsets.get(&entry.key).unwrap(),
                 self.opts.max_value_threshold,
             )
         })
@@ -695,6 +755,7 @@ impl Core {
 mod tests {
     use rand::prelude::SliceRandom;
     use rand::Rng;
+
     use std::sync::Arc;
 
     use crate::storage::kv::option::Options;
@@ -868,6 +929,35 @@ mod tests {
                 "Max value size cannot be decreased".to_string()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn changing_max_segment_size() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+        store.close().await.unwrap();
+
+        // Update the options and use them to update the new store instance
+        let mut opts = opts.clone();
+        opts.max_segment_size += 1;
+
+        // Try to create a new store instance with the updated options
+        let result = Store::new(opts.clone());
+        assert!(
+            result.is_err(),
+            "should throw an error when max_segment_size is changed"
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "Max segment size cannot be changed".to_string()
+        );
     }
 
     #[tokio::test]
@@ -1357,6 +1447,72 @@ mod tests {
         for key in keys.iter() {
             // Start a new read transaction
             let txn = store.begin().unwrap();
+            assert!(txn.get(key).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn basic_compaction1() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 0;
+        opts.max_value_cache_size = 0;
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Number of keys to generate and write
+        let num_keys_to_write = 1;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for counter in 1usize..=num_keys_to_write {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+        let default_value2 = Bytes::from("default_value2".to_string());
+
+        // Write the keys to the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value2).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let key_bytes = Bytes::from(2usize.to_le_bytes().to_vec());
+        let mut txn = store.begin().unwrap();
+        txn.set(&key_bytes, &default_value2).unwrap();
+        txn.commit().await.unwrap();
+
+        // Delete the first 5 keys from the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.delete(key).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        store.inner.as_ref().unwrap().compact().await.unwrap();
+        store.close().await.unwrap();
+
+        let reopened_store = Store::new(opts).expect("should reopen store");
+        for key in keys.iter() {
+            let txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
     }

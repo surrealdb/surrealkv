@@ -33,13 +33,20 @@ pub enum Error {
     InvalidTransactionRecordId,         // The transaction record ID is invalid
     EmptyValue,                         // The value in the record is empty
     ManifestNotFound,                   // The manifest was not found
-    MaxTransactionEntriesLimitExceeded, // The maximum number of entries in a transaction was exceeded
     TransactionWriteOnly,               // The transaction is write-only
     SendError(String),
     ReceiveError(String),
+    RevisionError(String),
     MismatchedSegmentID(u64, u64),
     MaxKeySizeCannotBeDecreased, // The maximum key size cannot be decreased
     MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
+    MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
+    CompactionAlreadyInProgress, // Compaction is in progress
+    MergeManifestMissing,        // The merge manifest is missing
+    CustomError(String),         // Custom error
+    InvalidOperation,            // Invalid operation
+    CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
+    SegmentIdExceedsLastUpdated, // The segment ID exceeds the last updated segment
 }
 
 /// Error structure for encoding errors
@@ -100,9 +107,6 @@ impl fmt::Display for Error {
             Error::InvalidTransactionRecordId => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
             Error::ManifestNotFound => write!(f, "Manifest not found"),
-            Error::MaxTransactionEntriesLimitExceeded => {
-                write!(f, "Max transaction entries limit exceeded")
-            }
             Error::TransactionWriteOnly => write!(f, "Transaction is write-only"),
             Error::SendError(err) => write!(f, "Send error: {}", err),
             Error::ReceiveError(err) => write!(f, "Receive error: {}", err),
@@ -113,6 +117,20 @@ impl fmt::Display for Error {
             ),
             Error::MaxKeySizeCannotBeDecreased => write!(f, "Max key size cannot be decreased"),
             Error::MaxValueSizeCannotBeDecreased => write!(f, "Max value size cannot be decreased"),
+            Error::MaxSegmentSizeCannotBeChanged => {
+                write!(f, "Max segment size cannot be changed")
+            }
+            Error::CompactionAlreadyInProgress => write!(f, "Compaction is in progress"),
+            Error::RevisionError(err) => write!(f, "Revision error: {}", err),
+            Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
+            Error::CustomError(err) => write!(f, "Error: {}", err),
+            Error::InvalidOperation => write!(f, "Invalid operation"),
+            Error::CompactionSegmentSizeTooSmall => {
+                write!(f, "Segment size is too small for compaction")
+            }
+            Error::SegmentIdExceedsLastUpdated => {
+                write!(f, "Segment ID exceeds the last updated segment")
+            }
         }
     }
 }
@@ -154,5 +172,11 @@ impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
 impl From<async_channel::RecvError> for Error {
     fn from(error: async_channel::RecvError) -> Self {
         Error::ReceiveError(format!("Async channel receive error: {}", error))
+    }
+}
+
+impl From<revision::Error> for Error {
+    fn from(err: revision::Error) -> Self {
+        Error::RevisionError(err.to_string())
     }
 }

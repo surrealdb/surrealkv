@@ -1,6 +1,8 @@
+pub(crate) mod compaction;
 pub mod entry;
 pub mod error;
 pub(crate) mod indexer;
+pub(crate) mod manifest;
 pub(crate) mod meta;
 pub mod option;
 pub(crate) mod oracle;
