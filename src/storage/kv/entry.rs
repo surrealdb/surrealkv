@@ -48,7 +48,14 @@ impl Entry {
         self.metadata.as_mut().unwrap().as_deleted(true).unwrap();
     }
 
-    pub(crate) fn is_deleted(&self) -> bool {
+    pub(crate) fn mark_tombstone(&mut self) {
+        if self.metadata.is_none() {
+            self.metadata = Some(Metadata::new());
+        }
+        self.metadata.as_mut().unwrap().as_tombstone(true).unwrap();
+    }
+
+    pub(crate) fn is_deleted_or_tombstone(&self) -> bool {
         if let Some(metadata) = &self.metadata {
             metadata.is_deleted_or_tombstone()
         } else {

@@ -77,6 +77,16 @@ impl Metadata {
         Ok(())
     }
 
+    pub(crate) fn as_tombstone(&mut self, tombstone: bool) -> Result<()> {
+        if tombstone {
+            self.attributes.insert(Attribute::Tombstone);
+        } else {
+            self.attributes.remove(&Attribute::Tombstone);
+        }
+
+        Ok(())
+    }
+
     /// Checks if the 'deleted' attribute is present.
     pub(crate) fn is_deleted(&self) -> bool {
         self.attributes.contains(&Attribute::Deleted)

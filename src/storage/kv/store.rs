@@ -450,10 +450,12 @@ impl Core {
         value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        if let Some(metadata) = entry.metadata.as_ref() {
-            if metadata.is_deleted() {
-                indexer.delete(&mut entry.key[..].into())?;
-            }
+        if entry
+            .metadata
+            .as_ref()
+            .map_or(false, |metadata| metadata.is_deleted())
+        {
+            indexer.delete(&mut entry.key[..].into())?;
         } else {
             let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 

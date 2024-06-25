@@ -1486,7 +1486,9 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 
 [[package]]
 name = "vart"
-version = "0.3.0"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "858e0a7c88fd62d483dd906e2ae63f8601939204cac227cb31dac6b530616ac8"
 dependencies = [
  "hashbrown",
 ]
