@@ -29,6 +29,7 @@ use crate::storage::{
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
+        stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
     },
     log::{
@@ -43,6 +44,7 @@ pub(crate) struct StoreInner {
     pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
+    pub(crate) stats: Arc<StorageStats>,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
@@ -64,6 +66,7 @@ impl StoreInner {
             is_closed: AtomicBool::new(false),
             is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
+            stats: Arc::new(StorageStats::new()),
         })
     }
 
