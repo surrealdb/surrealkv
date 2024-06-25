@@ -10,6 +10,7 @@ use crate::storage::{
         entry::{Entry, Record, Value, ValueRef},
         error::{Error, Result},
         manifest::Manifest,
+        meta::Metadata,
         option::Options,
         store::{Core, StoreInner},
     },
@@ -100,34 +101,24 @@ impl StoreInner {
         drop(oracle_lock); // Release the oracle lock
 
         // Do compaction and write
-        for (key, value, version, ts) in snapshot_iter.iter() {
-            let mut val_ref = ValueRef::new(self.core.clone());
-            val_ref.decode(*version, value)?;
 
-            // IMP!!! What happnes to keys with the swizzle bit set to 1?
-
-            // Skip keys from segments newer than the last updated segment
-            if val_ref.segment_id() > last_updated_segment_id {
-                continue;
-            }
-
-            // Skip deleted keys
-            if let Some(md) = val_ref.metadata() {
-                if md.deleted() {
-                    continue;
-                }
-            }
-
-            // Prepare the entry for the temporary commit log
+        // Define a closure for writing entries to the temporary commit log
+        let mut write_entry = |key: Vec<u8>,
+                               value: Vec<u8>,
+                               version: u64,
+                               ts: u64,
+                               metadata: Option<Metadata>|
+         -> Result<()> {
             let mut key = key;
             key.truncate(key.len() - 1);
-            let mut entry = Entry::new(&key, &val_ref.resolve()?);
-            entry.set_ts(*ts);
-            if let Some(md) = val_ref.metadata() {
-                entry.set_metadata(md.clone());
+            let mut entry = Entry::new(&key, &value);
+            entry.set_ts(ts);
+
+            if let Some(md) = metadata {
+                entry.set_metadata(md);
             }
 
-            let tx_record = Record::from_entry(entry, *version);
+            let tx_record = Record::from_entry(entry, version);
             let mut buf = BytesMut::new();
             tx_record.encode(&mut buf)?;
 
@@ -138,6 +129,65 @@ impl StoreInner {
                     segment_id, last_updated_segment_id
                 );
                 return Err(Error::SegmentIdExceedsLastUpdated);
+            }
+
+            Ok(())
+        };
+
+        // IMP! TODO! This is wrong because we are not storing each version of the key
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut entries_buffer = Vec::new();
+        let mut skip_current_key = false;
+
+        for (key, value, version, ts) in snapshot_iter.versioned_iter() {
+            let mut val_ref = ValueRef::new(self.core.clone());
+            val_ref.decode(*version, value)?;
+
+            // IMP!!! What happnes to keys with the swizzle bit set to 1?
+
+            // Skip keys from segments newer than the last updated segment
+            if val_ref.segment_id() > last_updated_segment_id {
+                continue;
+            }
+
+            let metadata = val_ref.metadata();
+
+            // If we've moved to a new key, decide whether to write the previous key's entries
+            if Some(&key) != current_key.as_ref() {
+                if !skip_current_key {
+                    // Write buffered entries of the previous key to disk
+                    for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
+                        write_entry(key, value, version, ts, metadata)?;
+                    }
+                } else {
+                    // Clear the buffer without writing if the last version was marked as deleted
+                    entries_buffer.clear();
+                }
+
+                // Reset flags for the new key
+                current_key = Some(key.clone());
+                skip_current_key = false;
+            }
+
+            // Determine if the current key should be skipped based on deletion status
+            if let Some(md) = metadata {
+                if md.is_deleted() {
+                    skip_current_key = true;
+                    entries_buffer.clear(); // Clear any previously buffered entries for this key
+                    continue;
+                }
+            }
+
+            // Buffer the current entry if not skipping
+            if !skip_current_key {
+                entries_buffer.push((key, val_ref.resolve()?, *version, *ts, metadata.cloned()));
+            }
+        }
+
+        // Handle the last key
+        if !skip_current_key {
+            for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
+                write_entry(key, value, version, ts, metadata)?;
             }
         }
 

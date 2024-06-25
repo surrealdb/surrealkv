@@ -448,7 +448,7 @@ impl Core {
         indexer: &mut Indexer,
     ) -> Result<()> {
         if let Some(metadata) = entry.metadata.as_ref() {
-            if metadata.deleted() {
+            if metadata.is_deleted() {
                 indexer.delete(&mut entry.key[..].into())?;
             }
         } else {
@@ -681,16 +681,15 @@ impl Core {
     {
         let mut index = self.indexer.write();
         let mut to_insert = Vec::new();
-        // let mut to_delete = Vec::new();
 
         for entry in &task.entries {
-            // If the entry is marked as deleted, add it to the to_delete list.
-            // if let Some(metadata) = entry.metadata.as_ref() {
-            //     if metadata.deleted() {
-            //         to_delete.push(entry.key[..].into());
-            //         continue;
-            //     }
-            // }
+            // If the entry is marked as deleted, delete it.
+            if let Some(metadata) = entry.metadata.as_ref() {
+                if metadata.is_deleted() {
+                    index.delete(&mut entry.key[..].into())?;
+                    continue;
+                }
+            }
 
             let index_value = encode_entry(entry);
 
@@ -703,7 +702,6 @@ impl Core {
         }
 
         index.bulk_insert(&mut to_insert)?;
-        // index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }

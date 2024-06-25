@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use hashbrown::HashSet;
 
 use crate::storage::kv::error::{Error, Result};
@@ -8,6 +8,7 @@ use crate::storage::kv::error::{Error, Result};
 /// More attribute types can be added as variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Attribute {
+    Tombstone,
     Deleted,
 }
 
@@ -16,7 +17,8 @@ impl Attribute {
     /// Returns `None` if the value does not correspond to a known attribute.
     fn from_u8(value: u8) -> Option<Attribute> {
         match value {
-            0 => Some(Attribute::Deleted),
+            0 => Some(Attribute::Tombstone),
+            1 => Some(Attribute::Deleted),
             _ => None,
         }
     }
@@ -24,27 +26,28 @@ impl Attribute {
     /// Returns a `u8` that represents the kind of the attribute.
     fn kind(&self) -> u8 {
         match self {
-            Attribute::Deleted => 0,
+            Attribute::Tombstone => 0,
+            Attribute::Deleted => 1,
         }
     }
 
     /// Serializes the attribute into a `Bytes` object.
     fn serialize(&self) -> Bytes {
-        match self {
-            Attribute::Deleted => Bytes::new(),
-        }
+        let mut bytes = BytesMut::with_capacity(1); // Allocate buffer for 1 byte
+        bytes.put_u8(self.kind()); // Serialize the kind of the attribute into the buffer
+        bytes.freeze() // Convert BytesMut into Bytes
     }
 
     /// Deserializes an attribute from a byte slice.
     /// Returns `Error::UnknownAttributeType` if the attribute type is unknown.
     fn deserialize(&self, bytes: &mut &[u8]) -> Result<Attribute> {
         if bytes.is_empty() {
-            return Ok(Attribute::Deleted);
+            return Err(Error::UnknownAttributeType);
         }
 
-        let _value = bytes[0];
+        let value = bytes[0];
         *bytes = &bytes[1..]; // Consume the attribute byte
-        Err(Error::UnknownAttributeType)
+        Self::from_u8(value).ok_or(Error::UnknownAttributeType)
     }
 }
 
@@ -75,8 +78,18 @@ impl Metadata {
     }
 
     /// Checks if the 'deleted' attribute is present.
-    pub(crate) fn deleted(&self) -> bool {
+    pub(crate) fn is_deleted(&self) -> bool {
         self.attributes.contains(&Attribute::Deleted)
+    }
+
+    /// Checks if the 'tombstone' attribute is present.
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.attributes.contains(&Attribute::Tombstone)
+    }
+
+    /// Checks if either the 'deleted' or 'tombstone' attribute is present.
+    pub(crate) fn is_deleted_or_tombstone(&self) -> bool {
+        self.is_deleted() || self.is_tombstone()
     }
 
     /// Serializes the metadata into a byte vector.
@@ -126,12 +139,12 @@ mod tests {
         // Test setting 'deleted' attribute
         metadata.as_deleted(true).unwrap();
         assert_eq!(metadata.attributes.len(), 1);
-        assert!(metadata.deleted());
+        assert!(metadata.is_deleted());
 
         // Test unsetting 'deleted' attribute
         metadata.as_deleted(false).unwrap();
         assert_eq!(metadata.attributes.len(), 0);
-        assert!(!metadata.deleted());
+        assert!(!metadata.is_deleted());
     }
 
     #[test]
@@ -140,8 +153,9 @@ mod tests {
 
         // Test serialization with 'deleted' attribute
         metadata.as_deleted(true).unwrap();
+        assert_eq!(metadata.attributes.len(), 1);
         let bytes = metadata.to_bytes();
-        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes.len(), 2);
         assert_eq!(bytes[0], Attribute::Deleted as u8);
 
         // Test serialization without 'deleted' attribute
@@ -162,6 +176,6 @@ mod tests {
             metadata.attributes.len(),
             deserialized_metadata.attributes.len()
         );
-        assert_eq!(metadata.deleted(), deserialized_metadata.deleted());
+        assert_eq!(metadata.is_deleted(), deserialized_metadata.is_deleted());
     }
 }
