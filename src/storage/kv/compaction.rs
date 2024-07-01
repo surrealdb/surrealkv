@@ -1426,13 +1426,9 @@ mod tests {
 
         let store = Store::new(opts.clone()).expect("should create store");
 
-        // let num_keys = 100; // Total number of keys
-        // let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
-        // let clear_threshold = 75; // Keys above this index will be marked as deleted in their last version
-
-        let num_keys = 5; // Total number of keys
-        let multiple_versions_threshold = 1; // Keys above this index will have multiple versions
-        let clear_threshold = 3; // Keys above this index will be marked as deleted in their last version
+        let num_keys = 100; // Total number of keys
+        let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
+        let clear_threshold = 75; // Keys above this index will be marked as deleted in their last version
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
@@ -1466,8 +1462,8 @@ mod tests {
 
         // Perform compaction
         store.compact().await.expect("compaction should succeed");
-        // let stats = &store.inner.as_ref().unwrap().stats;
-        // assert_eq!(stats.compaction_stats.get_records_added(), 175);
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 175);
 
         // Reopen the store
         drop(store);
@@ -1487,48 +1483,48 @@ mod tests {
             }
         }
 
-        // // Verify the results
-        // for key_index in 1..=num_keys {
-        //     let txn = store.begin().unwrap();
-        //     let key = format!("key{}", key_index).as_bytes().to_vec();
+        // Verify the results
+        for key_index in 1..=num_keys {
+            let txn = store.begin().unwrap();
+            let key = format!("key{}", key_index).as_bytes().to_vec();
 
-        //     if key_index > clear_threshold {
-        //         // Keys marked as deleted in their last version should not be present
-        //         assert!(
-        //             txn.get(&key).unwrap().is_none(),
-        //             "Deleted key{} should not be present after compaction",
-        //             key_index
-        //         );
-        //     } else if key_index > multiple_versions_threshold {
-        //         // Keys with multiple versions should have their last version
-        //         let expected_value = format!("value{}_2", key_index);
-        //         let val = txn
-        //             .get(&key)
-        //             .unwrap()
-        //             .expect("key should exist after compaction");
-        //         assert_eq!(
-        //             val,
-        //             expected_value.as_bytes(),
-        //             "key{}'s value should be the last version after compaction",
-        //             key_index
-        //         );
-        //     } else {
-        //         // Keys with a single version should remain unchanged
-        //         let expected_value = format!("value{}_1", key_index);
-        //         let val = txn
-        //             .get(&key)
-        //             .unwrap()
-        //             .expect("key should exist after compaction");
-        //         assert_eq!(
-        //             val,
-        //             expected_value.as_bytes(),
-        //             "key{}'s value should remain unchanged after compaction",
-        //             key_index
-        //         );
-        //     }
-        // }
+            if key_index > clear_threshold {
+                // Keys marked as cleared in their last version should not be present
+                assert!(
+                    txn.get(&key).unwrap().is_none(),
+                    "Cleared key{} should not be present after compaction",
+                    key_index
+                );
+            } else if key_index > multiple_versions_threshold {
+                // Keys with multiple versions should have their last version
+                let expected_value = format!("value{}_2", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should be the last version after compaction",
+                    key_index
+                );
+            } else {
+                // Keys with a single version should remain unchanged
+                let expected_value = format!("value{}_1", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should remain unchanged after compaction",
+                    key_index
+                );
+            }
+        }
 
-        // // Close the store
-        // store.close().await.unwrap();
+        // Close the store
+        store.close().await.unwrap();
     }
 }

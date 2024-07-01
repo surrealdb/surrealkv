@@ -20,10 +20,12 @@ impl CompactionStats {
         self.records_added.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(unused)]
     pub(crate) fn delete_record(&self) {
         self.records_deleted.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(unused)]
     pub(crate) fn add_tombstone(&self) {
         self.tombstones.fetch_add(1, Ordering::SeqCst);
     }
@@ -32,6 +34,7 @@ impl CompactionStats {
         self.records_deleted.fetch_add(n, Ordering::SeqCst);
     }
 
+    #[allow(unused)]
     pub(crate) fn add_multiple_records(&self, n: u64) {
         self.records_added.fetch_add(n, Ordering::SeqCst);
     }
@@ -44,14 +47,17 @@ impl CompactionStats {
     }
 
     // Getters
+    #[allow(unused)]
     pub(crate) fn get_records_added(&self) -> u64 {
         self.records_added.load(Ordering::SeqCst)
     }
 
+    #[allow(unused)]
     pub(crate) fn get_records_deleted(&self) -> u64 {
         self.records_deleted.load(Ordering::SeqCst)
     }
 
+    #[allow(unused)]
     pub(crate) fn get_tombstones(&self) -> u64 {
         self.tombstones.load(Ordering::SeqCst)
     }
@@ -72,14 +78,17 @@ impl StorageStats {
     }
 
     // Methods to interact with keys_deleted and tombstone_count
+    #[allow(unused)]
     pub(crate) fn key_deleted(&self) {
         self.keys_deleted.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(unused)]
     pub(crate) fn tombstone_counted(&self) {
         self.tombstone_count.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(unused)]
     pub(crate) fn reset(&self) {
         self.compaction_stats.reset();
         self.keys_deleted.store(0, Ordering::SeqCst);

@@ -165,7 +165,7 @@ impl Transaction {
         Ok(())
     }
 
-    // Delete all the versions of a key.
+    // Delete all the versions of a key. This is a hard delete.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         let value = Bytes::new();
         let mut entry = Entry::new(key, &value);
@@ -174,7 +174,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Clear the key but not delete it.
+    /// Clear the key but not delete it. This is a soft delete.
     pub fn clear(&mut self, key: &[u8]) -> Result<()> {
         let value = Bytes::new();
         let mut entry = Entry::new(key, &value);
