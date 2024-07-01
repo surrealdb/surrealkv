@@ -10,6 +10,7 @@ use crate::storage::{
         entry::{Entry, Record, Value, ValueRef},
         error::{Error, Result},
         manifest::Manifest,
+        meta::Metadata,
         option::Options,
         store::{Core, StoreInner},
     },
@@ -59,6 +60,9 @@ impl StoreInner {
         // Clean recovery state before starting compaction
         RecoveryState::clear(&self.core.opts.dir)?;
 
+        // Clear compaction stats before starting compaction
+        self.stats.compaction_stats.reset();
+
         // Acquire compaction guard
         let _guard = CompactionGuard::new(&self.is_compacting);
 
@@ -100,34 +104,24 @@ impl StoreInner {
         drop(oracle_lock); // Release the oracle lock
 
         // Do compaction and write
-        for (key, value, version, ts) in snapshot_iter.iter() {
-            let mut val_ref = ValueRef::new(self.core.clone());
-            val_ref.decode(*version, value)?;
 
-            // IMP!!! What happnes to keys with the swizzle bit set to 1?
-
-            // Skip keys from segments newer than the last updated segment
-            if val_ref.segment_id() > last_updated_segment_id {
-                continue;
-            }
-
-            // Skip deleted keys
-            if let Some(md) = val_ref.metadata() {
-                if md.deleted() {
-                    continue;
-                }
-            }
-
-            // Prepare the entry for the temporary commit log
+        // Define a closure for writing entries to the temporary commit log
+        let mut write_entry = |key: Vec<u8>,
+                               value: Vec<u8>,
+                               version: u64,
+                               ts: u64,
+                               metadata: Option<Metadata>|
+         -> Result<()> {
             let mut key = key;
             key.truncate(key.len() - 1);
-            let mut entry = Entry::new(&key, &val_ref.resolve()?);
-            entry.set_ts(*ts);
-            if let Some(md) = val_ref.metadata() {
-                entry.set_metadata(md.clone());
+            let mut entry = Entry::new(&key, &value);
+            entry.set_ts(ts);
+
+            if let Some(md) = metadata {
+                entry.set_metadata(md);
             }
 
-            let tx_record = Record::from_entry(entry, *version);
+            let tx_record = Record::from_entry(entry, version);
             let mut buf = BytesMut::new();
             tx_record.encode(&mut buf)?;
 
@@ -138,6 +132,74 @@ impl StoreInner {
                     segment_id, last_updated_segment_id
                 );
                 return Err(Error::SegmentIdExceedsLastUpdated);
+            }
+
+            // increment the compaction stats
+            self.stats.compaction_stats.add_record();
+
+            Ok(())
+        };
+
+        // IMP! TODO! This is wrong because we are not storing each version of the key
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut entries_buffer = Vec::new();
+        let mut skip_current_key = false;
+
+        for (key, value, version, ts) in snapshot_iter.iter_with_versions() {
+            let mut val_ref = ValueRef::new(self.core.clone());
+            val_ref.decode(*version, value)?;
+
+            // IMP!!! What happnes to keys with the swizzle bit set to 1?
+
+            // Skip keys from segments newer than the last updated segment
+            if val_ref.segment_id() > last_updated_segment_id {
+                continue;
+            }
+
+            let metadata = val_ref.metadata();
+
+            // If we've moved to a new key, decide whether to write the previous key's entries
+            if Some(&key) != current_key.as_ref() {
+                if !skip_current_key {
+                    // Write buffered entries of the previous key to disk
+                    for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
+                        write_entry(key, value, version, ts, metadata)?;
+                    }
+                } else {
+                    // Clear the buffer without writing if the last version was marked as deleted
+                    entries_buffer.clear();
+                }
+
+                // Reset flags for the new key
+                current_key = Some(key.clone());
+                skip_current_key = false;
+            }
+
+            // Determine if the current key should be skipped based on deletion status
+            if let Some(md) = metadata {
+                if md.is_deleted() {
+                    skip_current_key = true;
+
+                    let num_records_deleted = 1 + entries_buffer.len() as u64;
+                    self.stats
+                        .compaction_stats
+                        .add_multiple_deleted_records(num_records_deleted);
+
+                    entries_buffer.clear(); // Clear any previously buffered entries for this key
+                    continue;
+                }
+            }
+
+            // Buffer the current entry if not skipping
+            if !skip_current_key {
+                entries_buffer.push((key, val_ref.resolve()?, *version, *ts, metadata.cloned()));
+            }
+        }
+
+        // Handle the last key
+        if !skip_current_key {
+            for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
+                write_entry(key, value, version, ts, metadata)?;
             }
         }
 
@@ -1071,5 +1133,398 @@ mod tests {
             // Close the store again
             store.close().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn compact_skips_all_versions_if_last_is_deleted() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Initialize the store
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Open a transaction to populate the store with versions of keys
+        {
+            let mut txn = store.begin().unwrap();
+            // Insert a key with two versions, where the last one is marked as deleted
+            txn.set(b"key1", b"value1").unwrap(); // First version
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            // Insert a key with two versions, where the last one is marked as deleted
+            txn.delete(b"key1").unwrap(); // Second version marked as deleted
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            // Insert another key with a single version not marked as deleted
+            txn.set(b"key2", b"value2").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Perform compaction
+        store.compact().await.expect("compaction should succeed");
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_deleted(), 0);
+        assert_eq!(stats.compaction_stats.get_records_added(), 1);
+
+        // Reopen the store to ensure compaction changes are applied
+        drop(store);
+        let store = Store::new(opts).expect("should reopen store");
+
+        // Begin a new transaction to verify compaction results
+        let txn = store.begin().unwrap();
+
+        // Check that "key1" is not present because its last version was marked as deleted
+        assert!(
+            txn.get(b"key1").unwrap().is_none(),
+            "key1 should be skipped by compaction"
+        );
+
+        // Check that "key2" is still present because it was not marked as deleted
+        let val = txn
+            .get(b"key2")
+            .unwrap()
+            .expect("key2 should exist after compaction");
+        assert_eq!(
+            val, b"value2",
+            "key2's value should remain unchanged after compaction"
+        );
+
+        // Close the store
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_versions_stored_post_compaction() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Initialize the store
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Open a transaction to populate the store with multiple versions of a key
+        // Insert multiple versions for the same key
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(b"key1", b"value1").unwrap(); // First version
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(b"key1", b"value2").unwrap(); // Second version
+            txn.commit().await.unwrap();
+        }
+
+        // Perform compaction
+        store.compact().await.expect("compaction should succeed");
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 2);
+
+        // Reopen the store to ensure compaction changes are applied
+        drop(store);
+        let store = Store::new(opts).expect("should reopen store");
+
+        // Begin a new transaction to verify compaction results
+        let txn = store.begin().unwrap();
+
+        // Check that "key1" is present and its value is the last inserted value
+        let val = txn
+            .get(b"key1")
+            .unwrap()
+            .expect("key1 should exist after compaction");
+        assert_eq!(
+            val, b"value2",
+            "key1's value should be the last version after compaction"
+        );
+
+        // Close the store
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_versions_and_single_version_keys_post_compaction() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        let num_keys = 100; // Total number of keys
+        let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
+
+        // Insert keys into the store
+        for key_index in 1..=num_keys {
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+            {
+                let mut txn = store.begin().unwrap();
+                let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+
+                // Insert first version for all keys
+                txn.set(&key, &value1).unwrap();
+                txn.commit().await.unwrap();
+            }
+
+            if key_index > multiple_versions_threshold {
+                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                {
+                    let mut txn = store.begin().unwrap();
+                    // Insert a second version for keys above the multiple_versions_threshold
+                    txn.set(&key, &value2).unwrap();
+                    txn.commit().await.unwrap();
+                }
+            }
+        }
+
+        // Perform compaction
+        store.compact().await.expect("compaction should succeed");
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 150);
+
+        // Reopen the store
+        drop(store);
+        let store = Store::new(opts).expect("should reopen store");
+
+        // Verify the results
+        for key_index in 1..=num_keys {
+            let txn = store.begin().unwrap();
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let expected_value = if key_index > multiple_versions_threshold {
+                format!("value{}_2", key_index)
+            } else {
+                format!("value{}_1", key_index)
+            };
+
+            let val = txn
+                .get(&key)
+                .unwrap()
+                .expect("key should exist after compaction");
+            assert_eq!(
+                val,
+                expected_value.as_bytes(),
+                "key's value should be the expected version after compaction"
+            );
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_handles_various_key_versions_correctly() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        let num_keys = 100; // Total number of keys
+        let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
+        let delete_threshold = 75; // Keys above this index will be marked as deleted in their last version
+
+        // Insert keys into the store with each operation in its own transaction
+        for key_index in 1..=num_keys {
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+
+            // Insert first version for all keys in its own transaction
+            {
+                let mut txn = store.begin().unwrap();
+                txn.set(&key, &value1).unwrap();
+                txn.commit().await.unwrap();
+            }
+
+            // Insert a second version for keys above the multiple_versions_threshold in its own transaction
+            if key_index > multiple_versions_threshold {
+                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                {
+                    let mut txn = store.begin().unwrap();
+                    txn.set(&key, &value2).unwrap();
+                    txn.commit().await.unwrap();
+                }
+
+                // Mark the last version as deleted for keys above the delete_threshold in its own transaction
+                if key_index > delete_threshold {
+                    let mut txn = store.begin().unwrap();
+                    txn.delete(&key).unwrap();
+                    txn.commit().await.unwrap();
+                }
+            }
+        }
+
+        // Perform compaction
+        store.compact().await.expect("compaction should succeed");
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 100);
+
+        // Reopen the store
+        drop(store);
+        let store = Store::new(opts).expect("should reopen store");
+
+        // Verify the results
+        for key_index in 1..=num_keys {
+            let txn = store.begin().unwrap();
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+
+            if key_index > delete_threshold {
+                // Keys marked as deleted in their last version should not be present
+                assert!(
+                    txn.get(&key).unwrap().is_none(),
+                    "Deleted key{} should not be present after compaction",
+                    key_index
+                );
+            } else if key_index > multiple_versions_threshold {
+                // Keys with multiple versions should have their last version
+                let expected_value = format!("value{}_2", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should be the last version after compaction",
+                    key_index
+                );
+            } else {
+                // Keys with a single version should remain unchanged
+                let expected_value = format!("value{}_1", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should remain unchanged after compaction",
+                    key_index
+                );
+            }
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_handles_various_key_versions_correctly_with_clear() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        let num_keys = 100; // Total number of keys
+        let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
+        let clear_threshold = 75; // Keys above this index will be marked as deleted in their last version
+
+        // Insert keys into the store with each operation in its own transaction
+        for key_index in 1..=num_keys {
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+
+            // Insert first version for all keys in its own transaction
+            {
+                let mut txn = store.begin().unwrap();
+                txn.set(&key, &value1).unwrap();
+                txn.commit().await.unwrap();
+            }
+
+            // Insert a second version for keys above the multiple_versions_threshold in its own transaction
+            if key_index > multiple_versions_threshold {
+                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                {
+                    let mut txn = store.begin().unwrap();
+                    txn.set(&key, &value2).unwrap();
+                    txn.commit().await.unwrap();
+                }
+
+                // Mark the last version as deleted for keys above the clear_threshold in its own transaction
+                if key_index > clear_threshold {
+                    let mut txn = store.begin().unwrap();
+                    txn.clear(&key).unwrap();
+                    txn.commit().await.unwrap();
+                }
+            }
+        }
+
+        // Perform compaction
+        store.compact().await.expect("compaction should succeed");
+        let stats = &store.inner.as_ref().unwrap().stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 175);
+
+        // Reopen the store
+        drop(store);
+        let store = Store::new(opts).expect("should reopen store");
+
+        for key_index in 1..=num_keys {
+            let txn = store.begin().unwrap();
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+
+            if key_index > clear_threshold {
+                // Keys marked as deleted in their last version should not be present
+                assert!(
+                    txn.get(&key).unwrap().is_none(),
+                    "Deleted key{} should not be present after compaction",
+                    key_index
+                );
+            }
+        }
+
+        // Verify the results
+        for key_index in 1..=num_keys {
+            let txn = store.begin().unwrap();
+            let key = format!("key{}", key_index).as_bytes().to_vec();
+
+            if key_index > clear_threshold {
+                // Keys marked as cleared in their last version should not be present
+                assert!(
+                    txn.get(&key).unwrap().is_none(),
+                    "Cleared key{} should not be present after compaction",
+                    key_index
+                );
+            } else if key_index > multiple_versions_threshold {
+                // Keys with multiple versions should have their last version
+                let expected_value = format!("value{}_2", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should be the last version after compaction",
+                    key_index
+                );
+            } else {
+                // Keys with a single version should remain unchanged
+                let expected_value = format!("value{}_1", key_index);
+                let val = txn
+                    .get(&key)
+                    .unwrap()
+                    .expect("key should exist after compaction");
+                assert_eq!(
+                    val,
+                    expected_value.as_bytes(),
+                    "key{}'s value should remain unchanged after compaction",
+                    key_index
+                );
+            }
+        }
+
+        // Close the store
+        store.close().await.unwrap();
     }
 }

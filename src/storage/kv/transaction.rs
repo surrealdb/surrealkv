@@ -165,11 +165,20 @@ impl Transaction {
         Ok(())
     }
 
-    /// Deletes a key from the store.
+    // Delete all the versions of a key. This is a hard delete.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         let value = Bytes::new();
         let mut entry = Entry::new(key, &value);
         entry.mark_delete();
+        self.write(entry)?;
+        Ok(())
+    }
+
+    /// Clear the key but not delete it. This is a soft delete.
+    pub fn clear(&mut self, key: &[u8]) -> Result<()> {
+        let value = Bytes::new();
+        let mut entry = Entry::new(key, &value);
+        entry.mark_tombstone();
         self.write(entry)?;
         Ok(())
     }
@@ -201,7 +210,7 @@ impl Transaction {
                 // Check if the key is in the write set by checking in the write_order_map map.
                 if let Some(order) = self.write_order_map.get(&hashed_key) {
                     if let Some(entry) = self.write_set.get(*order as usize) {
-                        return Ok(if entry.1.is_deleted() {
+                        return Ok(if entry.1.is_deleted_or_tombstone() {
                             None
                         } else {
                             Some(entry.1.value.clone().to_vec())
@@ -1817,5 +1826,41 @@ mod tests {
         assert!(val.is_none());
         let val = txn4.get(&key2).unwrap().unwrap();
         assert_eq!(val, value.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_insert_clear_read_key() {
+        let (store, _) = create_store(false);
+
+        // Key-value pair for the test
+        let key = Bytes::from("test_key");
+        let value1 = Bytes::from("test_value1");
+        let value2 = Bytes::from("test_value2");
+
+        // Insert key-value pair in a new transaction
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &value2).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Clear the key in a separate transaction
+        {
+            let mut txn = store.begin().unwrap();
+            txn.clear(&key).unwrap(); // Assuming delete method clears the key
+            txn.commit().await.unwrap();
+        }
+
+        // Read the key in a new transaction to verify it does not exist
+        {
+            let txn = store.begin().unwrap();
+            assert!(txn.get(&key).unwrap().is_none());
+        }
     }
 }

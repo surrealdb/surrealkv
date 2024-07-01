@@ -29,6 +29,7 @@ use crate::storage::{
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
+        stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
     },
     log::{
@@ -43,6 +44,7 @@ pub(crate) struct StoreInner {
     pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
+    pub(crate) stats: Arc<StorageStats>,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
@@ -64,6 +66,7 @@ impl StoreInner {
             is_closed: AtomicBool::new(false),
             is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
+            stats: Arc::new(StorageStats::new()),
         })
     }
 
@@ -447,10 +450,12 @@ impl Core {
         value_offsets: &HashMap<Bytes, (u64, usize)>,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        if let Some(metadata) = entry.metadata.as_ref() {
-            if metadata.deleted() {
-                indexer.delete(&mut entry.key[..].into())?;
-            }
+        if entry
+            .metadata
+            .as_ref()
+            .map_or(false, |metadata| metadata.is_deleted())
+        {
+            indexer.delete(&mut entry.key[..].into())?;
         } else {
             let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 
@@ -681,16 +686,15 @@ impl Core {
     {
         let mut index = self.indexer.write();
         let mut to_insert = Vec::new();
-        // let mut to_delete = Vec::new();
 
         for entry in &task.entries {
-            // If the entry is marked as deleted, add it to the to_delete list.
-            // if let Some(metadata) = entry.metadata.as_ref() {
-            //     if metadata.deleted() {
-            //         to_delete.push(entry.key[..].into());
-            //         continue;
-            //     }
-            // }
+            // If the entry is marked as deleted, delete it.
+            if let Some(metadata) = entry.metadata.as_ref() {
+                if metadata.is_deleted() {
+                    index.delete(&mut entry.key[..].into())?;
+                    continue;
+                }
+            }
 
             let index_value = encode_entry(entry);
 
@@ -703,7 +707,6 @@ impl Core {
         }
 
         index.bulk_insert(&mut to_insert)?;
-        // index.bulk_delete(&mut to_delete)?;
 
         Ok(())
     }

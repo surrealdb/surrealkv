@@ -9,6 +9,7 @@ pub(crate) mod oracle;
 pub(crate) mod reader;
 pub(crate) mod repair;
 pub mod snapshot;
+pub(crate) mod stats;
 pub mod store;
 pub mod transaction;
 pub(crate) mod util;

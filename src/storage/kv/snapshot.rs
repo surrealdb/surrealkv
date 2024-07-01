@@ -96,7 +96,7 @@ pub(crate) trait FilterFn {
 fn ignore_deleted(val_ref: &ValueRef, _: u64) -> Result<()> {
     let md = val_ref.metadata();
     if let Some(md) = md {
-        if md.deleted() {
+        if md.is_deleted_or_tombstone() {
             return Err(Error::IndexError(TrieError::KeyNotFound));
         }
     }

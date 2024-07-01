@@ -12,7 +12,7 @@ use crate::storage::{
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
-pub(crate) const MAX_KV_METADATA_SIZE: usize = 1; // Maximum size of key-value metadata in bytes
+pub(crate) const MAX_KV_METADATA_SIZE: usize = 2; // Maximum size of key-value metadata in bytes
 pub(crate) const RECORD_VERSION: u16 = 1; // Version of the transaction header
 
 #[derive(Debug, Clone)]
@@ -48,9 +48,16 @@ impl Entry {
         self.metadata.as_mut().unwrap().as_deleted(true).unwrap();
     }
 
-    pub(crate) fn is_deleted(&self) -> bool {
+    pub(crate) fn mark_tombstone(&mut self) {
+        if self.metadata.is_none() {
+            self.metadata = Some(Metadata::new());
+        }
+        self.metadata.as_mut().unwrap().as_tombstone(true).unwrap();
+    }
+
+    pub(crate) fn is_deleted_or_tombstone(&self) -> bool {
         if let Some(metadata) = &self.metadata {
-            metadata.deleted()
+            metadata.is_deleted_or_tombstone()
         } else {
             false
         }
