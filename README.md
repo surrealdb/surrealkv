@@ -21,7 +21,7 @@ For more information on the underlying immutable versioned adaptive radix tries 
 - [x] **Embeddable**
 - [x] **ACID Semantics** 
 - [x] **Transaction Support:** 
-- [ ] **Built-in Item Versioning API**
+- [x] **Built-in Item Versioning API**
 - [x] **Multi-Version Concurrency Control (MVCC) support**
 - [x] **Multiple Concurrent Readers and Writers**
 - [x] **Persistence through an append-only File**
