@@ -16,6 +16,7 @@ use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
+
 use vart::art::KV;
 
 use crate::storage::{
@@ -29,8 +30,10 @@ use crate::storage::{
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
+        snapshot::Snapshot,
         stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
+        util::now,
     },
     log::{
         aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
@@ -172,12 +175,49 @@ impl Store {
         Ok(())
     }
 
+    /// Compacts the store.
     pub async fn compact(&self) -> Result<()> {
         if let Some(inner) = self.inner.as_ref() {
             inner.compact().await?;
         }
 
         Ok(())
+    }
+
+    /// Returns the value associated with the key.
+    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        let core = self.inner.as_ref().unwrap().core.clone();
+        let snapshot = Snapshot::take(core, now())?;
+        let val_ref = snapshot.get(&key[..].into())?;
+        val_ref.resolve()
+    }
+
+    /// Returns the value associated with the key at the given timestamp.
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+        let core = self.inner.as_ref().unwrap().core.clone();
+        let snapshot = Snapshot::take(core, now())?;
+        let val_ref = snapshot.get_at_ts(&key[..].into(), ts)?;
+        val_ref.resolve()
+    }
+
+    /// Returns all the versioned values and timestamps associated with the key.
+    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+        let mut results = Vec::new();
+        let core = self.inner.as_ref().unwrap().core.clone();
+        let snapshot = Snapshot::take(core, now())?;
+        let values_ref = snapshot.get_version_history(&key[..].into())?;
+        for (value, ts) in values_ref {
+            let resolved_value = value.resolve()?;
+            results.push((resolved_value, ts));
+        }
+        Ok(results)
+    }
+
+    /// Returns a point-in-time snapshot of the store.
+    pub fn get_snapshot(&self) -> Result<Snapshot> {
+        let core = self.inner.as_ref().unwrap().core.clone();
+        let snapshot = Snapshot::take(core, now())?;
+        Ok(snapshot)
     }
 }
 

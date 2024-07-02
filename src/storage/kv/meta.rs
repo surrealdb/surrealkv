@@ -54,7 +54,7 @@ impl Attribute {
 /// A structure representing metadata for a key-value pair.
 /// The metadata consists of a set of attributes.
 #[derive(Clone, Debug)]
-pub(crate) struct Metadata {
+pub struct Metadata {
     attributes: HashSet<Attribute>,
 }
 

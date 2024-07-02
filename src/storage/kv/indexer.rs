@@ -52,7 +52,7 @@ impl Indexer {
             self.index.insert(key, value.clone(), version, ts)?;
         } else {
             self.index
-                .insert_without_version_increment_check(key, value.clone(), version, ts)?;
+                .insert_unchecked(key, value.clone(), version, ts)?;
         }
         Ok(())
     }

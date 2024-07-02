@@ -241,7 +241,7 @@ impl Record {
     }
 }
 
-pub(crate) trait Value {
+pub trait Value {
     fn resolve(&self) -> Result<Vec<u8>>;
     fn ts(&self) -> u64;
     fn metadata(&self) -> Option<&Metadata>;

@@ -345,15 +345,13 @@ impl Transaction {
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
 
-        // Create a new reader for the snapshot.
-        let iterator = match self.snapshot.as_ref().unwrap().write().new_reader() {
+        // Get a range iterator for the specified range.
+        let snap = self.snapshot.as_ref().unwrap().read();
+        let ranger = match snap.range(range) {
             Ok(reader) => reader,
             Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-
-        // Get a range iterator for the specified range.
-        let ranger = iterator.range(range);
 
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
