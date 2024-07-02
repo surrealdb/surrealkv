@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::RangeBounds, sync::Arc};
 
 use bytes::Bytes;
 
@@ -9,7 +9,9 @@ use crate::storage::{
 };
 
 use vart::{
-    iter::IterationPointer, snapshot::Snapshot as TartSnapshot, TrieError, VariableSizeKey,
+    iter::{Iter, VersionedIter},
+    snapshot::Snapshot as VartSnapshot,
+    TrieError, VariableSizeKey,
 };
 
 pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
@@ -20,7 +22,7 @@ pub struct Snapshot {
     /// key-value pairs in the snapshot. It can be used to filter out expired key-value
     /// pairs or deleted key-value pairs based on the read timestamp.
     start_ts: u64,
-    snap: TartSnapshot<VariableSizeKey, Bytes>,
+    snap: VartSnapshot<VariableSizeKey, Bytes>,
     store: Arc<Core>,
 }
 
@@ -53,10 +55,6 @@ impl Snapshot {
         let key = &key.terminate();
         self.snap.remove(key)?;
         Ok(())
-    }
-
-    pub fn new_reader(&mut self) -> Result<IterationPointer<VariableSizeKey, Bytes>> {
-        Ok(self.snap.new_reader()?)
     }
 
     fn decode_and_apply_filters(
@@ -105,6 +103,38 @@ impl Snapshot {
         }
 
         Ok(results)
+    }
+
+    /// Retrieves an iterator over the key-value pairs in the snapshot.
+    pub fn iter(&self) -> Result<Iter<VariableSizeKey, Bytes>> {
+        self.snap.iter().map_err(|e| e.into())
+    }
+
+    /// Retrieves a versioned iterator over the key-value pairs in the snapshot.
+    pub fn versioned_iter(&self) -> Result<VersionedIter<VariableSizeKey, Bytes>> {
+        self.snap.iter_with_versions().map_err(|e| e.into())
+    }
+
+    /// Returns a range query iterator over the Trie.
+    pub fn range<'a, R>(
+        &'a self,
+        range: R,
+    ) -> Result<impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>>
+    where
+        R: RangeBounds<VariableSizeKey> + 'a,
+    {
+        self.snap.range(range).map_err(|e| e.into())
+    }
+
+    /// Returns a versioned range query iterator over the Trie.
+    pub fn range_with_versions<'a, R>(
+        &'a self,
+        range: R,
+    ) -> Result<impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>>
+    where
+        R: RangeBounds<VariableSizeKey> + 'a,
+    {
+        self.snap.range_with_versions(range).map_err(|e| e.into())
     }
 }
 

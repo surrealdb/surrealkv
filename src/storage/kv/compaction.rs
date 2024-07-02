@@ -98,8 +98,8 @@ impl StoreInner {
 
         // Start compaction process
         let snapshot_lock = self.core.indexer.write();
-        let mut snapshot = snapshot_lock.snapshot()?;
-        let snapshot_iter = snapshot.new_reader()?;
+        let snapshot = snapshot_lock.snapshot()?;
+        let snapshot_versioned_iter = snapshot.iter_with_versions()?;
         drop(snapshot_lock); // Explicitly drop the lock
         drop(oracle_lock); // Release the oracle lock
 
@@ -145,7 +145,7 @@ impl StoreInner {
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
 
-        for (key, value, version, ts) in snapshot_iter.iter_with_versions() {
+        for (key, value, version, ts) in snapshot_versioned_iter {
             let mut val_ref = ValueRef::new(self.core.clone());
             val_ref.decode(*version, value)?;
 
