@@ -1487,8 +1487,7 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 [[package]]
 name = "vart"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "858e0a7c88fd62d483dd906e2ae63f8601939204cac227cb31dac6b530616ac8"
+source = "git+https://github.com/surrealdb/vart?branch=chore/add-versioned-apis#3695e0897988b6ca8d564db8ff295df61088f5b0"
 dependencies = [
  "hashbrown",
 ]

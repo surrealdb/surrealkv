@@ -29,7 +29,7 @@ bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 sha2 = "0.10.8"
 quick_cache = "0.5.1"
-vart = "0.3.1"
+vart = {git = "https://github.com/surrealdb/vart", branch = "chore/add-versioned-apis"}
 revision = "0.7.1"
 
 [dev-dependencies]
