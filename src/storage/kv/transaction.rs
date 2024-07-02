@@ -485,6 +485,80 @@ impl Transaction {
     }
 }
 
+/// Implement Versioned APIs for read-only transactions.
+impl Transaction {
+    /// Returns the value associated with the key at the given timestamp.
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // If the key is empty, return an error.
+        if key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Do not allow reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+
+        // Attempt to get the value for the key from the snapshot.
+        match self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_at_ts(&key[..].into(), ts)
+        {
+            Ok(val_ref) => {
+                // Resolve the value reference to get the actual value.
+                val_ref.resolve()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns all the versioned values and timestamps associated with the key.
+    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // If the key is empty, return an error.
+        if key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Do not allow reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+
+        let mut results = Vec::new();
+
+        // Attempt to get the value for the key from the snapshot.
+        match self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_version_history(&key[..].into())
+        {
+            Ok(values_ref) => {
+                // Resolve the value reference to get the actual value.
+                for (value, ts) in values_ref {
+                    let resolved_value = value.resolve()?;
+                    results.push((resolved_value, ts));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(results)
+    }
+}
+
 impl Drop for Transaction {
     fn drop(&mut self) {
         self.rollback();
