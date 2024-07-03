@@ -628,9 +628,6 @@ impl Core {
         let last_commit_ts = oracle.read_ts();
         oracle.wait_for(last_commit_ts);
 
-        // Close the indexer
-        self.indexer.write().close()?;
-
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
             clog.write().close()?;

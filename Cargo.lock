@@ -1487,7 +1487,7 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 [[package]]
 name = "vart"
 version = "0.3.1"
-source = "git+https://github.com/surrealdb/vart?branch=chore/add-versioned-apis#306abfb09bf3e5d5b78125cf613d4b7580b8713a"
+source = "git+https://github.com/surrealdb/vart?branch=main#bf8002685f7d1e3e06c8307bb1e11898e6fbea66"
 dependencies = [
  "hashbrown",
 ]

@@ -67,10 +67,4 @@ impl Indexer {
     pub fn version(&self) -> u64 {
         self.index.version()
     }
-
-    /// Closes the index.
-    pub(crate) fn close(&mut self) -> Result<()> {
-        self.index.close()?;
-        Ok(())
-    }
 }

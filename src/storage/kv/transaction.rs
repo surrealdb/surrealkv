@@ -4,14 +4,14 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
-use vart::{TrieError, VariableSizeKey};
+use vart::{art::QueryType, TrieError, VariableSizeKey};
 
 use crate::storage::kv::{
     entry::{Entry, Value, ValueRef},
     error::{Error, Result},
     snapshot::{FilterFn, Snapshot, FILTERS},
     store::Core,
-    util::{now, sha256},
+    util::{convert_range_bounds, now, sha256},
 };
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -303,26 +303,7 @@ impl Transaction {
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
-        let range = (
-            match range.start_bound() {
-                Bound::Included(start) => {
-                    Bound::Included(VariableSizeKey::from_slice_with_termination(start))
-                }
-                Bound::Excluded(start) => {
-                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-            match range.end_bound() {
-                Bound::Included(end) => {
-                    Bound::Included(VariableSizeKey::from_slice_with_termination(end))
-                }
-                Bound::Excluded(end) => {
-                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(end))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-        );
+        let range = convert_range_bounds(range);
 
         // Keep track of the range bound predicates for conflict detection in case of SSI.
         {
@@ -556,6 +537,82 @@ impl Transaction {
         }
 
         Ok(results)
+    }
+
+    pub fn scan_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, Bytes)>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+
+        // Do not allow reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+        let result = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .scan_at_ts(range, self.read_ts)?;
+
+        Ok(result)
+    }
+
+    pub fn keys_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+
+        // Do not allow reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+        let result = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .keys_at_ts(range, self.read_ts)?;
+
+        Ok(result)
+    }
+
+    pub fn get_value_by_query(
+        &self,
+        key: &VariableSizeKey,
+        query_type: QueryType,
+    ) -> Result<(Bytes, u64, u64)> {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+
+        // Do not allow reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+
+        let result = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_value_by_query(key, query_type)?;
+        Ok(result)
     }
 }
 

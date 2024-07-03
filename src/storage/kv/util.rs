@@ -1,5 +1,6 @@
 use std::{
     fs,
+    ops::{Bound, RangeBounds},
     path::{Path, PathBuf},
 };
 
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use crc32fast::Hasher as crc32Hasher;
 use sha2::{Digest, Sha256};
+use vart::VariableSizeKey;
 
 use crate::Result;
 
@@ -89,4 +91,28 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn convert_range_bounds<'a, R>(
+    range: R,
+) -> (Bound<VariableSizeKey>, Bound<VariableSizeKey>)
+where
+    R: RangeBounds<&'a [u8]>,
+{
+    // Step 2: Apply the conversion logic for both start and end bounds
+    let start_bound = match range.start_bound() {
+        Bound::Included(start) => {
+            Bound::Included(VariableSizeKey::from_slice_with_termination(start))
+        }
+        Bound::Excluded(start) => {
+            Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
+        }
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end_bound = match range.end_bound() {
+        Bound::Included(end) => Bound::Included(VariableSizeKey::from_slice_with_termination(end)),
+        Bound::Excluded(end) => Bound::Excluded(VariableSizeKey::from_slice_with_termination(end)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (start_bound, end_bound)
 }

@@ -9,6 +9,7 @@ use crate::storage::{
 };
 
 use vart::{
+    art::QueryType,
     iter::{Iter, VersionedIter},
     snapshot::Snapshot as VartSnapshot,
     TrieError, VariableSizeKey,
@@ -135,6 +136,30 @@ impl Snapshot {
         R: RangeBounds<VariableSizeKey> + 'a,
     {
         self.snap.range_with_versions(range).map_err(|e| e.into())
+    }
+
+    pub fn get_value_by_query(
+        &self,
+        key: &VariableSizeKey,
+        query_type: QueryType,
+    ) -> Result<(Bytes, u64, u64)> {
+        self.snap
+            .get_value_by_query(key, query_type)
+            .map_err(|e| e.into())
+    }
+
+    pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Result<Vec<(Vec<u8>, Bytes)>>
+    where
+        R: RangeBounds<VariableSizeKey>,
+    {
+        self.snap.scan_at_ts(range, ts).map_err(|e| e.into())
+    }
+
+    pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
+    where
+        R: RangeBounds<VariableSizeKey>,
+    {
+        self.snap.keys_at_ts(range, ts).map_err(|e| e.into())
     }
 }
 
