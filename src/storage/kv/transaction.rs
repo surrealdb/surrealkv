@@ -538,7 +538,7 @@ impl Transaction {
     }
 
     /// Returns key-value pairs within the specified range, at the given timestamp.
-    pub fn scan_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, Bytes)>>
+    pub fn scan_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<(Vec<u8>, Bytes)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -551,13 +551,13 @@ impl Transaction {
             .as_ref()
             .unwrap()
             .read()
-            .scan_at_ts(range, self.read_ts)?;
+            .scan_at_ts(range, ts)?;
 
         Ok(result)
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -570,7 +570,7 @@ impl Transaction {
             .as_ref()
             .unwrap()
             .read()
-            .keys_at_ts(range, self.read_ts)?;
+            .keys_at_ts(range, ts)?;
 
         Ok(result)
     }

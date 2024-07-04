@@ -190,6 +190,7 @@ where
 mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
+    use crate::storage::kv::util::{convert_range_bounds, now};
     use crate::Mode;
 
     use bytes::Bytes;
@@ -199,69 +200,137 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[tokio::test]
-    async fn test_versioned_key_value_apis() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
+    async fn set_value(store: &Store, key: &Bytes, value: &Bytes) {
+        let mut txn = store.begin().expect("Failed to begin transaction");
+        txn.set(key, value).expect("Failed to set value");
+        txn.commit().await.expect("Failed to commit transaction");
+    }
 
-        // Setup store options with the temporary directory
+    #[tokio::test]
+    async fn test_versioned_apis() {
+        let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-
-        // Initialize the store with VariableKey as the key type
         let store = Store::new(opts).expect("Failed to create store");
 
-        // Define key and its versioned values
-        let key = Bytes::from("testKey");
-        let initial_value = Bytes::from("initialValue");
-        let updated_value = Bytes::from("updatedValue");
+        // Define multiple keys and their versioned values
+        let keys_values = [(
+                Bytes::from("k1"),
+                Bytes::from("value1"),
+                Bytes::from("value1Updated"),
+            ),
+            (
+                Bytes::from("k2"),
+                Bytes::from("value2"),
+                Bytes::from("value2Updated"),
+            )];
 
-        // Helper function to reduce repetition
-        async fn set_value(store: &Store, key: &Bytes, value: &Bytes) {
-            let mut txn = store.begin().expect("Failed to begin transaction");
-            txn.set(key, value).expect("Failed to set value");
-            txn.commit().await.expect("Failed to commit transaction");
+        // Set and update values for all keys
+        for (key, initial_value, updated_value) in keys_values.iter() {
+            set_value(&store, key, initial_value).await;
+            set_value(&store, key, updated_value).await;
         }
 
-        // Set initial value
-        set_value(&store, &key, &initial_value).await;
+        // Test keys_at_ts
+        let ts = now();
+        let txn = store
+            .begin_with_mode(Mode::ReadOnly)
+            .expect("Failed to begin transaction");
 
-        // Update value
-        set_value(&store, &key, &updated_value).await;
+        let range = "k1".as_bytes()..="k2".as_bytes();
+        let keys = txn
+            .keys_at_ts(range.clone(), ts)
+            .expect("Failed to get keys at timestamp");
+        assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
+        assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
 
-        // Retrieve and verify the history
-        let txn = store.begin_with_mode(Mode::ReadOnly).expect("Failed to begin transaction");
-        let history = txn.get_history(&key).expect("Failed to get history");
-        assert_eq!(history.len(), 2, "History should contain two entries");
+        // Test scan_at_ts
+        let entries = txn
+            .scan_at_ts(range, ts)
+            .expect("Failed to scan at timestamp");
         assert_eq!(
-            history[0].0, initial_value,
-            "First entry should match initial value"
-        );
-        assert_eq!(
-            history[1].0, updated_value,
-            "Second entry should match updated value"
-        );
-
-        // Verify timestamps are in increasing order
-        assert!(
-            history[0].1 < history[1].1,
-            "Timestamps should be in increasing order"
+            entries.len(),
+            keys_values.len(),
+            "Should match the number of keys"
         );
 
-        // Verify retrieval at specific timestamps
-        let initial_ts = history[0].1;
-        let updated_ts = history[1].1;
+        // Enhance get_history testing
+        for (key, initial_value, updated_value) in keys_values.iter() {
+            let history = txn.get_history(key).expect("Failed to get history");
+            assert_eq!(
+                history.len(),
+                2,
+                "History should contain two entries for each key"
+            );
+            assert_eq!(
+                history[0].0, *initial_value,
+                "First entry should match initial value"
+            );
+            assert_eq!(
+                history[1].0, *updated_value,
+                "Second entry should match updated value"
+            );
+
+            let initial_ts = history[0].1;
+            let updated_ts = history[1].1;
+            assert_eq!(
+                txn.get_at_ts(key, initial_ts)
+                    .expect("Failed to get value at initial timestamp"),
+                *initial_value
+            );
+            assert_eq!(
+                txn.get_at_ts(key, updated_ts)
+                    .expect("Failed to get value at updated timestamp"),
+                *updated_value
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_versioned_apis_with_snapshot() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Store::new(opts).expect("Failed to create store");
+
+        // Define multiple keys and their versioned values
+        let keys_values = [(
+                Bytes::from("k1"),
+                Bytes::from("value1"),
+                Bytes::from("value1Updated"),
+            ),
+            (
+                Bytes::from("k2"),
+                Bytes::from("value2"),
+                Bytes::from("value2Updated"),
+            )];
+
+        // Set and update values for all keys
+        for (key, initial_value, updated_value) in keys_values.iter() {
+            set_value(&store, key, initial_value).await;
+            set_value(&store, key, updated_value).await;
+        }
+
+        // Test keys_at_ts
+        let ts = now();
+        let snap = store.get_snapshot().expect("Failed to get snapshot");
+
+        let range = "k1".as_bytes()..="k2".as_bytes();
+        let range = convert_range_bounds(range);
+        let keys = snap
+            .keys_at_ts(range.clone(), ts)
+            .expect("Failed to get keys at timestamp");
+        assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
+        assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
+
+        // Test scan_at_ts
+        let entries = snap
+            .scan_at_ts(range, ts)
+            .expect("Failed to scan at timestamp");
         assert_eq!(
-            txn
-                .get_at_ts(&key, initial_ts)
-                .expect("Failed to get value at initial timestamp"),
-            initial_value
-        );
-        assert_eq!(
-            txn
-                .get_at_ts(&key, updated_ts)
-                .expect("Failed to get value at updated timestamp"),
-            updated_value
+            entries.len(),
+            keys_values.len(),
+            "Should match the number of keys"
         );
     }
 }
