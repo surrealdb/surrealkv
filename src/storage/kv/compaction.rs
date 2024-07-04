@@ -98,8 +98,8 @@ impl StoreInner {
 
         // Start compaction process
         let snapshot_lock = self.core.indexer.write();
-        let snapshot = snapshot_lock.snapshot()?;
-        let snapshot_versioned_iter = snapshot.iter_with_versions()?;
+        let snapshot = snapshot_lock.snapshot();
+        let snapshot_versioned_iter = snapshot.iter_with_versions();
         drop(snapshot_lock); // Explicitly drop the lock
         drop(oracle_lock); // Release the oracle lock
 

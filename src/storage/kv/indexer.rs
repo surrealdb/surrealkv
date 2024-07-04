@@ -16,16 +16,14 @@ pub(crate) struct Indexer {
 
 impl Indexer {
     /// Creates a new `Indexer` instance.
-    /// The maximum number of active snapshots is set based on the provided options.
     pub(crate) fn new() -> Self {
         let index = VartIndex::new();
         Self { index }
     }
 
     /// Creates a snapshot of the current state of the index.
-    pub(crate) fn snapshot(&self) -> Result<VartSnapshot<VariableSizeKey, Bytes>> {
-        let snapshot = self.index.create_snapshot()?;
-        Ok(snapshot)
+    pub(crate) fn snapshot(&self) -> VartSnapshot<VariableSizeKey, Bytes> {
+        self.index.create_snapshot()
     }
 
     /// Inserts multiple key-value pairs into the index.
@@ -57,10 +55,9 @@ impl Indexer {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &mut VariableSizeKey) -> Result<()> {
+    pub fn delete(&mut self, key: &mut VariableSizeKey) {
         *key = key.terminate();
-        self.index.remove(key)?;
-        Ok(())
+        self.index.remove(key);
     }
 
     /// Returns the current version of the index.
