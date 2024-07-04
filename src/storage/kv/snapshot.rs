@@ -190,6 +190,7 @@ where
 mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
+    use crate::Mode;
 
     use bytes::Bytes;
     use tempdir::TempDir;
@@ -199,7 +200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_versioned_key_value_updates() {
+    async fn test_versioned_key_value_apis() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -229,7 +230,8 @@ mod tests {
         set_value(&store, &key, &updated_value).await;
 
         // Retrieve and verify the history
-        let history = store.get_history(&key).expect("Failed to get history");
+        let txn = store.begin_with_mode(Mode::ReadOnly).expect("Failed to begin transaction");
+        let history = txn.get_history(&key).expect("Failed to get history");
         assert_eq!(history.len(), 2, "History should contain two entries");
         assert_eq!(
             history[0].0, initial_value,
@@ -250,13 +252,13 @@ mod tests {
         let initial_ts = history[0].1;
         let updated_ts = history[1].1;
         assert_eq!(
-            store
+            txn
                 .get_at_ts(&key, initial_ts)
                 .expect("Failed to get value at initial timestamp"),
             initial_value
         );
         assert_eq!(
-            store
+            txn
                 .get_at_ts(&key, updated_ts)
                 .expect("Failed to get value at updated timestamp"),
             updated_value
