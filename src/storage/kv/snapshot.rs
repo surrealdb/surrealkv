@@ -95,7 +95,10 @@ impl Snapshot {
 
         let mut results = Vec::new();
 
-        let items = self.snap.get_version_history(key).ok_or(Error::KeyNotFound)?;
+        let items = self
+            .snap
+            .get_version_history(key)
+            .ok_or(Error::KeyNotFound)?;
         for (value, version, ts) in items {
             let result = self.decode_and_apply_filters(&value, version, &FILTERS)?;
             results.push((result, ts));
@@ -142,7 +145,8 @@ impl Snapshot {
         query_type: QueryType,
     ) -> Result<(Bytes, u64, u64)> {
         self.snap
-            .get_value_by_query(key, query_type).ok_or(Error::KeyNotFound)
+            .get_value_by_query(key, query_type)
+            .ok_or(Error::KeyNotFound)
     }
 
     pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, Bytes)>
