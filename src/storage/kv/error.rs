@@ -47,6 +47,7 @@ pub enum Error {
     InvalidOperation,            // Invalid operation
     CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
     SegmentIdExceedsLastUpdated, // The segment ID exceeds the last updated segment
+    TransactionMustBeReadOnly,   // The transaction must be read-only
 }
 
 /// Error structure for encoding errors
@@ -130,6 +131,9 @@ impl fmt::Display for Error {
             }
             Error::SegmentIdExceedsLastUpdated => {
                 write!(f, "Segment ID exceeds the last updated segment")
+            }
+            Error::TransactionMustBeReadOnly => {
+                write!(f, "Transaction must be read-only")
             }
         }
     }

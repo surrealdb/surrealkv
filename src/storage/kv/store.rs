@@ -16,6 +16,7 @@ use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
+
 use vart::art::KV;
 
 use crate::storage::{
@@ -29,8 +30,10 @@ use crate::storage::{
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
+        snapshot::Snapshot,
         stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
+        util::now,
     },
     log::{
         aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
@@ -172,12 +175,20 @@ impl Store {
         Ok(())
     }
 
+    /// Compacts the store.
     pub async fn compact(&self) -> Result<()> {
         if let Some(inner) = self.inner.as_ref() {
             inner.compact().await?;
         }
 
         Ok(())
+    }
+
+    /// Returns a point-in-time snapshot of the store.
+    pub fn get_snapshot(&self) -> Result<Snapshot> {
+        let core = self.inner.as_ref().unwrap().core.clone();
+        let snapshot = Snapshot::take(core, now())?;
+        Ok(snapshot)
     }
 }
 
@@ -455,7 +466,7 @@ impl Core {
             .as_ref()
             .map_or(false, |metadata| metadata.is_deleted())
         {
-            indexer.delete(&mut entry.key[..].into())?;
+            indexer.delete(&mut entry.key[..].into());
         } else {
             let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 
@@ -588,9 +599,6 @@ impl Core {
         let last_commit_ts = oracle.read_ts();
         oracle.wait_for(last_commit_ts);
 
-        // Close the indexer
-        self.indexer.write().close()?;
-
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
             clog.write().close()?;
@@ -691,7 +699,7 @@ impl Core {
             // If the entry is marked as deleted, delete it.
             if let Some(metadata) = entry.metadata.as_ref() {
                 if metadata.is_deleted() {
-                    index.delete(&mut entry.key[..].into())?;
+                    index.delete(&mut entry.key[..].into());
                     continue;
                 }
             }

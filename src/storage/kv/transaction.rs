@@ -4,14 +4,14 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
-use vart::{TrieError, VariableSizeKey};
+use vart::{art::QueryType, VariableSizeKey};
 
 use crate::storage::kv::{
     entry::{Entry, Value, ValueRef},
     error::{Error, Result},
     snapshot::{FilterFn, Snapshot, FILTERS},
     store::Core,
-    util::{now, sha256},
+    util::{convert_range_bounds, now, sha256},
 };
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -231,11 +231,9 @@ impl Transaction {
                 match &e {
                     // If the key is not found in the index, and the transaction is not read-only,
                     // add the key to the read set with a timestamp of 0.
-                    Error::IndexError(trie_error) => {
-                        if let TrieError::KeyNotFound = trie_error {
-                            if !self.mode.is_read_only() {
-                                self.read_set.lock().push((key, 0));
-                            }
+                    Error::KeyNotFound => {
+                        if !self.mode.is_read_only() {
+                            self.read_set.lock().push((key, 0));
                         }
                         Ok(None)
                     }
@@ -279,7 +277,7 @@ impl Transaction {
                 .as_ref()
                 .unwrap()
                 .write()
-                .set(&e.key[..].into(), index_value)?;
+                .set(&e.key[..].into(), index_value);
         }
 
         // Add the entry to the set of pending writes.
@@ -303,26 +301,7 @@ impl Transaction {
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
-        let range = (
-            match range.start_bound() {
-                Bound::Included(start) => {
-                    Bound::Included(VariableSizeKey::from_slice_with_termination(start))
-                }
-                Bound::Excluded(start) => {
-                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-            match range.end_bound() {
-                Bound::Included(end) => {
-                    Bound::Included(VariableSizeKey::from_slice_with_termination(end))
-                }
-                Bound::Excluded(end) => {
-                    Bound::Excluded(VariableSizeKey::from_slice_with_termination(end))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-        );
+        let range = convert_range_bounds(range);
 
         // Keep track of the range bound predicates for conflict detection in case of SSI.
         {
@@ -345,15 +324,9 @@ impl Transaction {
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
 
-        // Create a new reader for the snapshot.
-        let iterator = match self.snapshot.as_ref().unwrap().write().new_reader() {
-            Ok(reader) => reader,
-            Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-
         // Get a range iterator for the specified range.
-        let ranger = iterator.range(range);
+        let snap = self.snapshot.as_ref().unwrap().read();
+        let ranger = snap.range(range);
 
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
@@ -484,6 +457,125 @@ impl Transaction {
         self.write_set.clear();
         self.read_set.lock().clear();
         self.snapshot.take();
+    }
+}
+
+/// Implement Versioned APIs for read-only transactions.
+impl Transaction {
+    fn ensure_read_only_transaction(&self) -> Result<()> {
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // Do not allow versioned reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Returns the value associated with the key at the given timestamp.
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+        self.ensure_read_only_transaction()?;
+
+        // If the key is empty, return an error.
+        if key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Attempt to get the value for the key from the snapshot.
+        match self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_at_ts(&key[..].into(), ts)
+        {
+            Ok(val_ref) => {
+                // Resolve the value reference to get the actual value.
+                val_ref.resolve()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns all the versioned values and timestamps associated with the key.
+    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+        self.ensure_read_only_transaction()?;
+
+        // If the key is empty, return an error.
+        if key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        let mut results = Vec::new();
+
+        // Attempt to get the value for the key from the snapshot.
+        match self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_version_history(&key[..].into())
+        {
+            Ok(values_ref) => {
+                // Resolve the value reference to get the actual value.
+                for (value, ts) in values_ref {
+                    let resolved_value = value.resolve()?;
+                    results.push((resolved_value, ts));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(results)
+    }
+
+    /// Returns key-value pairs within the specified range, at the given timestamp.
+    pub fn scan_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<(Vec<u8>, Bytes)>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        self.ensure_read_only_transaction()?;
+
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+        let result = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
+
+        Ok(result)
+    }
+
+    /// Returns keys within the specified range, at the given timestamp.
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        self.ensure_read_only_transaction()?;
+
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+        let result = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
+
+        Ok(result)
+    }
+
+    /// Returns the value associated with the key at the given timestamp.
+    /// The query type specifies the type of query to perform.
+    /// The query type can be `LatestByVersion`, `LatestByTs`, `LastLessThanTs`, `LastLessOrEqualTs`, `FirstGreaterOrEqualTs` or `FirstGreaterThanTs`.
+    pub fn get_value_by_query(
+        &self,
+        key: &VariableSizeKey,
+        query_type: QueryType,
+    ) -> Result<(Bytes, u64, u64)> {
+        self.ensure_read_only_transaction()?;
+
+        let result = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .read()
+            .get_value_by_query(key, query_type)?;
+        Ok(result)
     }
 }
 
