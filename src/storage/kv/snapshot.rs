@@ -214,7 +214,8 @@ mod tests {
         let store = Store::new(opts).expect("Failed to create store");
 
         // Define multiple keys and their versioned values
-        let keys_values = [(
+        let keys_values = [
+            (
                 Bytes::from("k1"),
                 Bytes::from("value1"),
                 Bytes::from("value1Updated"),
@@ -223,7 +224,8 @@ mod tests {
                 Bytes::from("k2"),
                 Bytes::from("value2"),
                 Bytes::from("value2Updated"),
-            )];
+            ),
+        ];
 
         // Set and update values for all keys
         for (key, initial_value, updated_value) in keys_values.iter() {
@@ -294,7 +296,8 @@ mod tests {
         let store = Store::new(opts).expect("Failed to create store");
 
         // Define multiple keys and their versioned values
-        let keys_values = [(
+        let keys_values = [
+            (
                 Bytes::from("k1"),
                 Bytes::from("value1"),
                 Bytes::from("value1Updated"),
@@ -303,7 +306,8 @@ mod tests {
                 Bytes::from("k2"),
                 Bytes::from("value2"),
                 Bytes::from("value2Updated"),
-            )];
+            ),
+        ];
 
         // Set and update values for all keys
         for (key, initial_value, updated_value) in keys_values.iter() {
