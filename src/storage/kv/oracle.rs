@@ -13,7 +13,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
-use vart::{TrieError, VariableSizeKey};
+use vart::VariableSizeKey;
 
 use crate::storage::kv::{
     error::{Error, Result},
@@ -169,7 +169,7 @@ impl SnapshotIsolation {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
-                Err(Error::IndexError(TrieError::KeyNotFound)) => {
+                Err(Error::KeyNotFound) => {
                     if *ts > 0 {
                         return Err(Error::TransactionReadConflict);
                     }

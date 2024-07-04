@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
-use vart::{art::QueryType, TrieError, VariableSizeKey};
+use vart::{art::QueryType, VariableSizeKey};
 
 use crate::storage::kv::{
     entry::{Entry, Value, ValueRef},
@@ -231,11 +231,9 @@ impl Transaction {
                 match &e {
                     // If the key is not found in the index, and the transaction is not read-only,
                     // add the key to the read set with a timestamp of 0.
-                    Error::IndexError(trie_error) => {
-                        if let TrieError::KeyNotFound = trie_error {
-                            if !self.mode.is_read_only() {
-                                self.read_set.lock().push((key, 0));
-                            }
+                    Error::KeyNotFound => {
+                        if !self.mode.is_read_only() {
+                            self.read_set.lock().push((key, 0));
                         }
                         Ok(None)
                     }
@@ -279,7 +277,7 @@ impl Transaction {
                 .as_ref()
                 .unwrap()
                 .write()
-                .set(&e.key[..].into(), index_value)?;
+                .set(&e.key[..].into(), index_value);
         }
 
         // Add the entry to the set of pending writes.
@@ -328,11 +326,7 @@ impl Transaction {
 
         // Get a range iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap().read();
-        let ranger = match snap.range(range) {
-            Ok(reader) => reader,
-            Err(Error::IndexError(TrieError::SnapshotEmpty)) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let ranger = snap.range(range);
 
         // Iterate over the keys in the range.
         'outer: for (key, value, version, ts) in ranger {
@@ -546,12 +540,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .read()
-            .scan_at_ts(range, ts)?;
+        let result = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
 
         Ok(result)
     }
@@ -565,12 +554,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .read()
-            .keys_at_ts(range, ts)?;
+        let result = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
 
         Ok(result)
     }

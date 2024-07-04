@@ -12,7 +12,7 @@ use vart::{
     art::QueryType,
     iter::{Iter, VersionedIter},
     snapshot::Snapshot as VartSnapshot,
-    TrieError, VariableSizeKey,
+    VariableSizeKey,
 };
 
 pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
@@ -29,7 +29,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub(crate) fn take(store: Arc<Core>, start_ts: u64) -> Result<Self> {
-        let snapshot = store.indexer.write().snapshot()?;
+        let snapshot = store.indexer.write().snapshot();
 
         Ok(Self {
             start_ts,
@@ -39,23 +39,21 @@ impl Snapshot {
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &VariableSizeKey, value: Bytes) -> Result<()> {
+    pub fn set(&mut self, key: &VariableSizeKey, value: Bytes) {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.snap.version())?;
-        Ok(())
+        self.snap.insert(key, value, self.snap.version());
     }
 
     #[allow(unused)]
-    pub fn delete(&mut self, key: &VariableSizeKey) -> Result<()> {
+    pub fn delete(&mut self, key: &VariableSizeKey) -> bool {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.remove(key)?;
-        Ok(())
+        self.snap.remove(key)
     }
 
     fn decode_and_apply_filters(
@@ -80,14 +78,14 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        let (val, version, _) = self.snap.get(key)?;
+        let (val, version, _) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
         self.decode_and_apply_filters(&val, version, &FILTERS)
     }
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
     pub fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<Box<dyn Value>> {
         let key = &key.terminate();
-        let (val, version) = self.snap.get_at_ts(key, ts)?;
+        let (val, version) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
         self.decode_and_apply_filters(&val, version, &FILTERS)
     }
 
@@ -97,7 +95,10 @@ impl Snapshot {
 
         let mut results = Vec::new();
 
-        let items = self.snap.get_version_history(key)?;
+        let items = self
+            .snap
+            .get_version_history(key)
+            .ok_or(Error::KeyNotFound)?;
         for (value, version, ts) in items {
             let result = self.decode_and_apply_filters(&value, version, &FILTERS)?;
             results.push((result, ts));
@@ -107,35 +108,35 @@ impl Snapshot {
     }
 
     /// Retrieves an iterator over the key-value pairs in the snapshot.
-    pub fn iter(&self) -> Result<Iter<VariableSizeKey, Bytes>> {
-        self.snap.iter().map_err(|e| e.into())
+    pub fn iter(&self) -> Iter<VariableSizeKey, Bytes> {
+        self.snap.iter()
     }
 
     /// Retrieves a versioned iterator over the key-value pairs in the snapshot.
-    pub fn versioned_iter(&self) -> Result<VersionedIter<VariableSizeKey, Bytes>> {
-        self.snap.iter_with_versions().map_err(|e| e.into())
+    pub fn versioned_iter(&self) -> VersionedIter<VariableSizeKey, Bytes> {
+        self.snap.iter_with_versions()
     }
 
     /// Returns a range query iterator over the Trie.
     pub fn range<'a, R>(
         &'a self,
         range: R,
-    ) -> Result<impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>>
+    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
-        self.snap.range(range).map_err(|e| e.into())
+        self.snap.range(range)
     }
 
     /// Returns a versioned range query iterator over the Trie.
     pub fn range_with_versions<'a, R>(
         &'a self,
         range: R,
-    ) -> Result<impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>>
+    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
-        self.snap.range_with_versions(range).map_err(|e| e.into())
+        self.snap.range_with_versions(range)
     }
 
     pub fn get_value_by_query(
@@ -145,21 +146,21 @@ impl Snapshot {
     ) -> Result<(Bytes, u64, u64)> {
         self.snap
             .get_value_by_query(key, query_type)
-            .map_err(|e| e.into())
+            .ok_or(Error::KeyNotFound)
     }
 
-    pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Result<Vec<(Vec<u8>, Bytes)>>
+    pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, Bytes)>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.scan_at_ts(range, ts).map_err(|e| e.into())
+        self.snap.scan_at_ts(range, ts)
     }
 
-    pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
+    pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.keys_at_ts(range, ts).map_err(|e| e.into())
+        self.snap.keys_at_ts(range, ts)
     }
 }
 
@@ -171,7 +172,7 @@ fn ignore_deleted(val_ref: &ValueRef, _: u64) -> Result<()> {
     let md = val_ref.metadata();
     if let Some(md) = md {
         if md.is_deleted_or_tombstone() {
-            return Err(Error::IndexError(TrieError::KeyNotFound));
+            return Err(Error::KeyNotFound);
         }
     }
     Ok(())
@@ -321,16 +322,12 @@ mod tests {
 
         let range = "k1".as_bytes()..="k2".as_bytes();
         let range = convert_range_bounds(range);
-        let keys = snap
-            .keys_at_ts(range.clone(), ts)
-            .expect("Failed to get keys at timestamp");
+        let keys = snap.keys_at_ts(range.clone(), ts);
         assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
         assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
 
         // Test scan_at_ts
-        let entries = snap
-            .scan_at_ts(range, ts)
-            .expect("Failed to scan at timestamp");
+        let entries = snap.scan_at_ts(range, ts);
         assert_eq!(
             entries.len(),
             keys_values.len(),
