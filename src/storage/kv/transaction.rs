@@ -468,20 +468,25 @@ impl Transaction {
 
 /// Implement Versioned APIs for read-only transactions.
 impl Transaction {
-    /// Returns the value associated with the key at the given timestamp.
-    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+    fn ensure_read_only_transaction(&self) -> Result<()> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
         }
+        // Do not allow versioned reads if it is not a read-only transaction
+        if !self.mode.is_read_only() {
+            return Err(Error::TransactionMustBeReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Returns the value associated with the key at the given timestamp.
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+        self.ensure_read_only_transaction()?;
+
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
-        }
-
-        // Do not allow reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
         }
 
         // Attempt to get the value for the key from the snapshot.
@@ -502,18 +507,11 @@ impl Transaction {
 
     /// Returns all the versioned values and timestamps associated with the key.
     pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
-        // If the transaction is closed, return an error.
-        if self.closed {
-            return Err(Error::TransactionClosed);
-        }
+        self.ensure_read_only_transaction()?;
+
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
-        }
-
-        // Do not allow reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
         }
 
         let mut results = Vec::new();
@@ -539,19 +537,12 @@ impl Transaction {
         Ok(results)
     }
 
+    /// Returns key-value pairs within the specified range, at the given timestamp.
     pub fn scan_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<(Vec<u8>, Bytes)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
-        // If the transaction is closed, return an error.
-        if self.closed {
-            return Err(Error::TransactionClosed);
-        }
-
-        // Do not allow reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
-        }
+        self.ensure_read_only_transaction()?;
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
@@ -565,19 +556,12 @@ impl Transaction {
         Ok(result)
     }
 
+    /// Returns keys within the specified range, at the given timestamp.
     pub fn keys_at_ts<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
-        // If the transaction is closed, return an error.
-        if self.closed {
-            return Err(Error::TransactionClosed);
-        }
-
-        // Do not allow reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
-        }
+        self.ensure_read_only_transaction()?;
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
@@ -591,20 +575,15 @@ impl Transaction {
         Ok(result)
     }
 
+    /// Returns the value associated with the key at the given timestamp.
+    /// The query type specifies the type of query to perform.
+    /// The query type can be `LatestByVersion`, `LatestByTs`, `LastLessThanTs`, `LastLessOrEqualTs`, `FirstGreaterOrEqualTs` or `FirstGreaterThanTs`.
     pub fn get_value_by_query(
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
     ) -> Result<(Bytes, u64, u64)> {
-        // If the transaction is closed, return an error.
-        if self.closed {
-            return Err(Error::TransactionClosed);
-        }
-
-        // Do not allow reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
-        }
+        self.ensure_read_only_transaction()?;
 
         let result = self
             .snapshot
