@@ -322,14 +322,12 @@ mod tests {
 
         let range = "k1".as_bytes()..="k2".as_bytes();
         let range = convert_range_bounds(range);
-        let keys = snap
-            .keys_at_ts(range.clone(), ts);
+        let keys = snap.keys_at_ts(range.clone(), ts);
         assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
         assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
 
         // Test scan_at_ts
-        let entries = snap
-            .scan_at_ts(range, ts);
+        let entries = snap.scan_at_ts(range, ts);
         assert_eq!(
             entries.len(),
             keys_values.len(),

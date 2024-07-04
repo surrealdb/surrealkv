@@ -540,12 +540,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .read()
-            .scan_at_ts(range, ts);
+        let result = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
 
         Ok(result)
     }
@@ -559,12 +554,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .read()
-            .keys_at_ts(range, ts);
+        let result = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
 
         Ok(result)
     }
