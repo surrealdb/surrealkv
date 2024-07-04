@@ -140,7 +140,6 @@ impl StoreInner {
             Ok(())
         };
 
-        // IMP! TODO! This is wrong because we are not storing each version of the key
         let mut current_key: Option<Vec<u8>> = None;
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
