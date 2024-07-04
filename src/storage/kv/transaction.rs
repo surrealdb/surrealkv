@@ -1945,7 +1945,7 @@ mod tests {
         // Clear the key in a separate transaction
         {
             let mut txn = store.begin().unwrap();
-            txn.clear(&key).unwrap(); // Assuming delete method clears the key
+            txn.clear(&key).unwrap();
             txn.commit().await.unwrap();
         }
 
