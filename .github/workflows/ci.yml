@@ -35,7 +35,7 @@ jobs:
 
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.75.0
+          toolchain: stable
           target: ${{ matrix.target }}
           components: rustfmt, clippy
           default: true
@@ -69,12 +69,12 @@ jobs:
 
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.75.0
+          toolchain: stable
           components: rustfmt, clippy
           default: true
 
       - name: Install cargo-deny
-        run: rustup run --install 1.70 cargo install --force --version 0.14.3 cargo-deny --locked
+        run: cargo install --debug --locked cargo-deny@0.14.11
 
       - name: Run tests
         run: make test
