@@ -37,7 +37,7 @@ tokio = { version = "1", features = ["full"] }
 tempdir = "0.3"
 rand = "0.8.5"
 criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
-jemallocator = "0.5.4"
+mimalloc = { version = "0.1.39", default-features = false }
 nanoid = "0.4.0"
 fastrand = "2.0.1"
 libc = "0.2.155"

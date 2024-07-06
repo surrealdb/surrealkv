@@ -3,14 +3,14 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use jemallocator::Jemalloc;
 
 use surrealkv::Options;
 use surrealkv::Store;
 use tempdir::TempDir;
 
+// Should be kept in sync with https://github.com/surrealdb/surrealdb/blob/main/src/mem/mod.rs
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), global_allocator)]
-static ALLOC: Jemalloc = Jemalloc;
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn create_temp_directory() -> TempDir {
     TempDir::new("test").unwrap()
@@ -52,6 +52,9 @@ fn bulk_insert(c: &mut Criterion) {
                 })
             },
         );
+        rt.block_on(async {
+            drop(db);
+        });
         rt.shutdown_background();
     };
 
@@ -161,7 +164,7 @@ fn concurrent_insert(c: &mut Criterion) {
     }
 
     rt.block_on(async {
-        db.close().await.unwrap();
+        drop(db);
     });
 
     rt.shutdown_background();
