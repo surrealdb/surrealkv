@@ -8,8 +8,8 @@ use std::{
     },
 };
 
+use async_channel::{bounded, Receiver, Sender};
 use bytes::Bytes;
-use crossbeam_channel::{bounded, Receiver, Sender};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
@@ -484,7 +484,7 @@ impl WaterMark {
         drop(mark);
 
         if let Some(wp) = wp {
-            matches!(wp.closer.recv(), Err(crossbeam_channel::RecvError));
+            matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
         }
     }
 
