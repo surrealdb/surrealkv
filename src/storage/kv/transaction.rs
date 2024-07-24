@@ -59,7 +59,7 @@ impl Mode {
 }
 
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
-pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
+pub type ScanResult = (Vec<u8>, Vec<u8>, u64);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
@@ -329,7 +329,7 @@ impl Transaction {
         let ranger = snap.range(range);
 
         // Iterate over the keys in the range.
-        'outer: for (key, value, version, ts) in ranger {
+        'outer: for (key, value, version) in ranger {
             // If a limit is set and we've already got enough results, break the loop.
             if let Some(limit) = limit {
                 if results.len() >= limit {
@@ -364,7 +364,7 @@ impl Transaction {
             // Add the value, version, and timestamp to the results vector.
             let mut key = key;
             key.truncate(key.len() - 1);
-            results.push((key, v, *version, *ts));
+            results.push((key, v, *version));
         }
 
         // Return the results.
@@ -566,7 +566,7 @@ impl Transaction {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<(Bytes, u64, u64)> {
+    ) -> Result<(Bytes, u64)> {
         self.ensure_read_only_transaction()?;
 
         let result = self

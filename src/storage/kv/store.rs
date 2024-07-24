@@ -478,13 +478,7 @@ impl Core {
                 opts.max_value_threshold,
             );
 
-            indexer.insert(
-                &mut entry.key[..].into(),
-                index_value,
-                entry.id,
-                entry.ts,
-                false,
-            )?;
+            indexer.insert(&mut entry.key[..].into(), index_value, entry.ts, false)?;
         }
 
         Ok(())
@@ -638,7 +632,7 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
-        let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
+        let tx_record = Records::new_with_entries(req.entries.clone(), req.commit_ts);
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::new();
 
@@ -710,7 +704,6 @@ impl Core {
                 key: entry.key[..].into(),
                 value: index_value,
                 version: task.tx_id,
-                ts: task.commit_ts,
             });
         }
 

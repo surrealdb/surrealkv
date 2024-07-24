@@ -44,7 +44,7 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.snap.version());
+        self.snap.insert(key, value);
     }
 
     #[allow(unused)]
@@ -78,14 +78,17 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        let (val, version, _) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
+        let (val, version) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
         self.decode_and_apply_filters(&val, version, &FILTERS)
     }
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
     pub fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<Box<dyn Value>> {
         let key = &key.terminate();
-        let (val, version) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
+        let (val, version) = self
+            .snap
+            .get_at_version(key, ts)
+            .ok_or(Error::KeyNotFound)?;
         self.decode_and_apply_filters(&val, version, &FILTERS)
     }
 
@@ -99,9 +102,9 @@ impl Snapshot {
             .snap
             .get_version_history(key)
             .ok_or(Error::KeyNotFound)?;
-        for (value, version, ts) in items {
+        for (value, version) in items {
             let result = self.decode_and_apply_filters(&value, version, &FILTERS)?;
-            results.push((result, ts));
+            results.push((result, version));
         }
 
         Ok(results)
@@ -118,10 +121,7 @@ impl Snapshot {
     }
 
     /// Returns a range query iterator over the Trie.
-    pub fn range<'a, R>(
-        &'a self,
-        range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
+    pub fn range<'a, R>(&'a self, range: R) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -132,7 +132,7 @@ impl Snapshot {
     pub fn range_with_versions<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -143,7 +143,7 @@ impl Snapshot {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<(Bytes, u64, u64)> {
+    ) -> Result<(Bytes, u64)> {
         self.snap
             .get_value_by_query(key, query_type)
             .ok_or(Error::KeyNotFound)
@@ -153,14 +153,14 @@ impl Snapshot {
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.scan_at_ts(range, ts)
+        self.snap.scan_at_version(range, ts)
     }
 
     pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.keys_at_ts(range, ts)
+        self.snap.keys_at_version(range, ts)
     }
 }
 

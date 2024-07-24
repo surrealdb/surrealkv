@@ -103,17 +103,17 @@ impl Records {
         }
     }
 
-    pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
+    pub(crate) fn new_with_entries(entries: Vec<Entry>, commit_ts: u64) -> Self {
         let mut tx_record = Records::new(entries.len());
 
         for entry in entries {
-            tx_record.add_entry(entry, tx_id, commit_ts);
+            tx_record.add_entry(entry, commit_ts);
         }
         tx_record
     }
 
-    pub(crate) fn add_entry(&mut self, entry: Entry, tx_id: u64, commit_ts: u64) {
-        let tx_record_entry = Record::new_from_entry(entry, tx_id, commit_ts);
+    pub(crate) fn add_entry(&mut self, entry: Entry, commit_ts: u64) {
+        let tx_record_entry = Record::new_from_entry(entry, commit_ts);
         self.entries.push(tx_record_entry);
     }
 
@@ -137,7 +137,6 @@ impl Records {
 
 #[derive(Debug)]
 pub(crate) struct Record {
-    pub(crate) id: u64,
     pub(crate) ts: u64,
     pub(crate) version: u16,
     pub(crate) metadata: Option<Metadata>,
@@ -151,7 +150,6 @@ pub(crate) struct Record {
 impl Record {
     pub(crate) fn new() -> Self {
         Record {
-            id: 0,
             ts: 0,
             version: 0,
             metadata: None,
@@ -163,9 +161,8 @@ impl Record {
         }
     }
 
-    pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
+    pub(crate) fn new_from_entry(entry: Entry, commit_ts: u64) -> Self {
         Record {
-            id: tx_id,
             ts: commit_ts,
             crc32: entry.crc32(),
             version: RECORD_VERSION,
@@ -178,7 +175,6 @@ impl Record {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.id = 0;
         self.ts = 0;
         self.version = 0;
         self.metadata = None;
@@ -189,10 +185,9 @@ impl Record {
         self.crc32 = 0;
     }
 
-    pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
+    pub(crate) fn from_entry(entry: Entry) -> Record {
         let crc32 = entry.crc32();
         Record {
-            id: tx_id,
             ts: entry.ts,
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
@@ -219,7 +214,6 @@ impl Record {
         // The function returns the offset position in the buffer after the Value field.
         buf.put_u32(self.crc32);
         buf.put_u16(self.version);
-        buf.put_u64(self.id);
         buf.put_u64(self.ts);
 
         if let Some(metadata) = &self.metadata {

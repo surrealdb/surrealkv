@@ -41,16 +41,14 @@ impl Indexer {
         &mut self,
         key: &mut VariableSizeKey,
         value: Bytes,
-        version: u64,
         ts: u64,
         check_version: bool,
     ) -> Result<()> {
         *key = key.terminate();
         if check_version {
-            self.index.insert(key, value.clone(), version, ts)?;
+            self.index.insert(key, value.clone(), ts)?;
         } else {
-            self.index
-                .insert_unchecked(key, value.clone(), version, ts)?;
+            self.index.insert_unchecked(key, value.clone(), ts)?;
         }
         Ok(())
     }

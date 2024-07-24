@@ -106,45 +106,41 @@ impl StoreInner {
         // Do compaction and write
 
         // Define a closure for writing entries to the temporary commit log
-        let mut write_entry = |key: Vec<u8>,
-                               value: Vec<u8>,
-                               version: u64,
-                               ts: u64,
-                               metadata: Option<Metadata>|
-         -> Result<()> {
-            let mut key = key;
-            key.truncate(key.len() - 1);
-            let mut entry = Entry::new(&key, &value);
-            entry.set_ts(ts);
+        let mut write_entry =
+            |key: Vec<u8>, value: Vec<u8>, ts: u64, metadata: Option<Metadata>| -> Result<()> {
+                let mut key = key;
+                key.truncate(key.len() - 1);
+                let mut entry = Entry::new(&key, &value);
+                entry.set_ts(ts);
 
-            if let Some(md) = metadata {
-                entry.set_metadata(md);
-            }
+                if let Some(md) = metadata {
+                    entry.set_metadata(md);
+                }
 
-            let tx_record = Record::from_entry(entry, version);
-            let mut buf = BytesMut::new();
-            tx_record.encode(&mut buf)?;
+                let tx_record = Record::from_entry(entry);
+                let mut buf = BytesMut::new();
+                tx_record.encode(&mut buf)?;
 
-            let (segment_id, _, _) = temp_writer.append(&buf)?;
-            if segment_id > last_updated_segment_id {
-                eprintln!(
-                    "Segment ID: {} exceeds last updated segment ID: {}",
-                    segment_id, last_updated_segment_id
-                );
-                return Err(Error::SegmentIdExceedsLastUpdated);
-            }
+                let (segment_id, _, _) = temp_writer.append(&buf)?;
+                if segment_id > last_updated_segment_id {
+                    eprintln!(
+                        "Segment ID: {} exceeds last updated segment ID: {}",
+                        segment_id, last_updated_segment_id
+                    );
+                    return Err(Error::SegmentIdExceedsLastUpdated);
+                }
 
-            // increment the compaction stats
-            self.stats.compaction_stats.add_record();
+                // increment the compaction stats
+                self.stats.compaction_stats.add_record();
 
-            Ok(())
-        };
+                Ok(())
+            };
 
         let mut current_key: Option<Vec<u8>> = None;
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
 
-        for (key, value, version, ts) in snapshot_versioned_iter {
+        for (key, value, version) in snapshot_versioned_iter {
             let mut val_ref = ValueRef::new(self.core.clone());
             val_ref.decode(*version, value)?;
 
@@ -161,8 +157,8 @@ impl StoreInner {
             if Some(&key) != current_key.as_ref() {
                 if !skip_current_key {
                     // Write buffered entries of the previous key to disk
-                    for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
-                        write_entry(key, value, version, ts, metadata)?;
+                    for (key, value, version, metadata) in entries_buffer.drain(..) {
+                        write_entry(key, value, version, metadata)?;
                     }
                 } else {
                     // Clear the buffer without writing if the last version was marked as deleted
@@ -191,14 +187,14 @@ impl StoreInner {
 
             // Buffer the current entry if not skipping
             if !skip_current_key {
-                entries_buffer.push((key, val_ref.resolve()?, *version, *ts, metadata.cloned()));
+                entries_buffer.push((key, val_ref.resolve()?, *version, metadata.cloned()));
             }
         }
 
         // Handle the last key
         if !skip_current_key {
-            for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
-                write_entry(key, value, version, ts, metadata)?;
+            for (key, value, version, metadata) in entries_buffer.drain(..) {
+                write_entry(key, value, version, metadata)?;
             }
         }
 

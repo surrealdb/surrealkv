@@ -174,13 +174,6 @@ impl RecordReader {
         let segment_id = self.r.current_segment_id();
 
         let version = self.r.read_uint16()?;
-        let id = self.r.read_uint64()?;
-
-        // Either the header is corrupted or we have reached the end of the file
-        // and encountered the padded zeros towards the end of the file.
-        if id == 0 {
-            return Err(Error::InvalidTransactionRecordId);
-        }
 
         let ts = self.r.read_uint64()?;
 
@@ -226,7 +219,6 @@ impl RecordReader {
             ))));
         }
 
-        rec.id = id;
         rec.ts = ts;
         rec.version = version;
         rec.metadata = kvmd;
