@@ -8,9 +8,9 @@ use std::{
     },
 };
 
+use ahash::{HashMap, HashMapExt, HashSet};
 use async_channel::{bounded, Receiver, Sender};
 use bytes::Bytes;
-use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
@@ -363,8 +363,7 @@ impl SerializableSnapshotIsolation {
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
         // Add the transaction to the list of committed transactions with conflict keys.
-        let conflict_keys: HashSet<Bytes> =
-            txn.write_set.iter().map(|(key, _)| key.clone()).collect();
+        let conflict_keys: HashSet<Bytes> = txn.write_set.iter().map(|e| e.key.clone()).collect();
 
         commit_tracker
             .committed_transactions

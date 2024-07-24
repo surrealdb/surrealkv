@@ -1317,6 +1317,7 @@ dependencies = [
 name = "surrealkv"
 version = "0.3.0"
 dependencies = [
+ "ahash",
  "async-channel",
  "bytes",
  "chrono",
@@ -1325,7 +1326,6 @@ dependencies = [
  "fastrand",
  "fmmap",
  "futures",
- "hashbrown",
  "libc",
  "lru",
  "memmap2",

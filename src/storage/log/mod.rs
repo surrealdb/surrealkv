@@ -9,8 +9,8 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
+use ahash::{HashMap, HashMapExt};
 use crc32fast::Hasher;
-use hashbrown::HashMap;
 
 /// The size of a single block in bytes.
 ///

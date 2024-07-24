@@ -1,4 +1,4 @@
-use hashbrown::HashMap;
+use ahash::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -68,6 +68,20 @@ impl Entry {
     }
 }
 
+pub(crate) fn encode_entries(
+    entries: &[Entry],
+    tx_id: u64,
+    commit_ts: u64,
+    buf: &mut BytesMut,
+    offset_tracker: &mut HashMap<Bytes, u64>,
+) {
+    for entry in entries {
+        let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id, commit_ts);
+        let offset = tx_record_entry.encode(buf).unwrap();
+        offset_tracker.insert(entry.key.clone(), offset as u64);
+    }
+}
+
 // Record encoded format:
 //
 //   +---------------------------------------------------------+
@@ -91,49 +105,6 @@ impl Entry {
 //   | crc32(4) | version(2) |  tx_id(8)  |  ts(8)  | metadata_len(2) |  metadata  | key_len(4) | key | value_len(4) | value |
 //   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
-#[derive(Debug)]
-pub(crate) struct Records {
-    pub(crate) entries: Vec<Record>,
-}
-
-impl Records {
-    pub(crate) fn new(max_entries: usize) -> Self {
-        Records {
-            entries: Vec::with_capacity(max_entries),
-        }
-    }
-
-    pub(crate) fn new_with_entries(entries: Vec<Entry>, tx_id: u64, commit_ts: u64) -> Self {
-        let mut tx_record = Records::new(entries.len());
-
-        for entry in entries {
-            tx_record.add_entry(entry, tx_id, commit_ts);
-        }
-        tx_record
-    }
-
-    pub(crate) fn add_entry(&mut self, entry: Entry, tx_id: u64, commit_ts: u64) {
-        let tx_record_entry = Record::new_from_entry(entry, tx_id, commit_ts);
-        self.entries.push(tx_record_entry);
-    }
-
-    pub(crate) fn encode(
-        &self,
-        buf: &mut BytesMut,
-        // current_offset: u64,
-        offset_tracker: &mut HashMap<Bytes, u64>,
-    ) -> Result<()> {
-        // Encode entries and store offsets
-        for entry in &self.entries {
-            let offset = entry.encode(buf)?;
-
-            // Store the offset for the current entry
-            offset_tracker.insert(entry.key.clone(), offset as u64);
-        }
-
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct Record {

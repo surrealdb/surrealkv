@@ -1,7 +1,7 @@
 /// This is an experimental implementation of a cache that uses the S3-FIFO algorithm. This is not yet
 /// used in the main codebase. But the implementation is kept here for future reference for replacing it
 /// with the current LRU cache for caching recently accessed values.
-use hashbrown::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::cmp::min;
 use std::collections::LinkedList;
 use std::fmt::Debug;

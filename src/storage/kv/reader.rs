@@ -2,7 +2,7 @@ use std::io::Read;
 
 use bytes::BytesMut;
 
-use hashbrown::HashMap;
+use ahash::{HashMap, HashMapExt};
 
 use crate::storage::{
     kv::{
