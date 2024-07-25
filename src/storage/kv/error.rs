@@ -50,32 +50,6 @@ pub enum Error {
     TransactionMustBeReadOnly,   // The transaction must be read-only
 }
 
-/// Error structure for encoding errors
-#[derive(Debug)]
-pub struct EncodeError {
-    message: String,
-}
-
-/// Error structure for decoding errors
-#[derive(Debug)]
-pub struct DecodeError {
-    message: String,
-}
-
-// Implementation of Display trait for EncodeError
-impl fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "encode error: {}", self.message)
-    }
-}
-
-// Implementation of Display trait for DecodeError
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "decode error: {}", self.message)
-    }
-}
-
 // Implementation of Display trait for Error
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

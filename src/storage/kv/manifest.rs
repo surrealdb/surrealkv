@@ -119,7 +119,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::log::aof::log::Aol;
+    use crate::storage::log::Aol;
     use crate::storage::log::Options as LogOptions;
 
     use super::*;

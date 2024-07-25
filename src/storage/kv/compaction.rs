@@ -14,7 +14,7 @@ use crate::storage::{
         option::Options,
         store::{Core, StoreInner},
     },
-    log::{aof::log::Aol, Options as LogOptions, SegmentRef},
+    log::{Aol, Options as LogOptions, SegmentRef},
 };
 
 struct CompactionGuard<'a> {

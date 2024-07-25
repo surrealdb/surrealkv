@@ -36,8 +36,7 @@ use crate::storage::{
         util::now,
     },
     log::{
-        aof::log::Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef,
-        BLOCK_SIZE,
+        Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef, BLOCK_SIZE,
     },
 };
 
