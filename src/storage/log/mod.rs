@@ -1,6 +1,7 @@
-pub mod aof;
-pub mod wal;
+mod aol;
+pub use aol::Aol;
 
+use ahash::{HashMap, HashMapExt};
 use std::fmt;
 use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
@@ -9,23 +10,12 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
-use ahash::{HashMap, HashMapExt};
-use crc32fast::Hasher;
-
 /// The size of a single block in bytes.
 ///
 /// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
 /// write-ahead log. It determines the maximum amount of data that can be held in memory before
 /// flushing to disk. Larger block sizes can improve write performance but might use more memory.
 pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
-
-/// Length of the record header in bytes.
-///
-/// This constant represents the length, in bytes, of the record header structure
-/// used in the write-ahead log. The record header contains information
-/// about the type of the record, the length of the payload, and a checksum value.
-/// The constant is set to 7, reflecting the size of the record header structure.
-pub const WAL_RECORD_HEADER_SIZE: usize = 7;
 
 /// The magic value for identifying file headers.
 ///
@@ -203,16 +193,6 @@ pub struct Options {
     /// This is used by aol to cycle segments when the max file size is reached.
     pub(crate) max_file_size: u64,
 
-    /// A flag indicating whether the segment is a Write-Ahead Logging (WAL).
-    ///
-    /// If this flag is set to `true`, the segment's records will be encoded with the WAL header.
-    ///
-    /// If this flag is set to `false`, Write-Ahead Logging will be disabled, and records are encoded
-    /// without the WAL header.
-    ///
-    /// By default, this flag is set to `false`, indicating that Write-Ahead Logging is not enabled.
-    is_wal: bool,
-
     /// The maximum number of open files allowed.
     ///
     /// If specified, this option sets the maximum number of open files allowed.
@@ -231,7 +211,6 @@ impl Default for Options {
             metadata: None,                                       // default metadata
             file_extension: None,                                 // default extension
             max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
-            is_wal: false,
             max_open_files: DEFAULT_MAX_OPEN_FILES,
         }
     }
@@ -288,12 +267,6 @@ impl Options {
     #[allow(dead_code)]
     pub fn with_dir_mode(mut self, dir_mode: u32) -> Self {
         self.dir_mode = Some(dir_mode);
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_wal(mut self) -> Self {
-        self.is_wal = true;
         self
     }
 }
@@ -443,75 +416,6 @@ impl Metadata {
     }
 }
 
-/// Enum representing different types of records in a write-ahead log.
-///
-/// This enumeration defines different types of records that can be used in a write-ahead log.
-/// Each record type indicates a particular state of a record in the log. The enum variants
-/// represent various stages of a record, including full records, fragments, and special cases.
-///
-/// # Variants
-///
-/// - `Empty`: Indicates that the rest of the block is empty.
-/// - `Full`: Represents a full record.
-/// - `First`: Denotes the first fragment of a record.
-/// - `Middle`: Denotes middle fragments of a record.
-/// - `Last`: Denotes the final fragment of a record.
-#[derive(PartialEq)]
-enum RecordType {
-    Empty = 0,  // Rest of block is empty.
-    Full = 1,   // Full record.
-    First = 2,  // First fragment of a record.
-    Middle = 3, // Middle fragments of a record.
-    Last = 4,   // Final fragment of a record.
-}
-
-impl RecordType {
-    fn from_u8(value: u8) -> Result<Self> {
-        match value {
-            0 => Ok(RecordType::Empty),
-            1 => Ok(RecordType::Full),
-            2 => Ok(RecordType::First),
-            3 => Ok(RecordType::Middle),
-            4 => Ok(RecordType::Last),
-            _ => Err(Error::IO(IOError::new(
-                std::io::ErrorKind::InvalidInput,
-                "Invalid Record Type",
-            ))),
-        }
-    }
-}
-
-/*
-    Encodes a record with the provided information into the given buffer.
-
-    It has the following format:
-
-    Record Header
-
-        0      1      2      3      4      5      6      7
-        +------+------+------+------+------+------+------+------+------+------+
-        | Type |    Length   |         CRC32             |       Payload      |
-        +------+------+------+------+------+------+------+------+------+------+
-*/
-fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
-    let typ = if i == 0 && part.len() == rec_len {
-        RecordType::Full
-    } else if part.len() == rec_len {
-        RecordType::Last
-    } else if i == 0 {
-        RecordType::First
-    } else {
-        RecordType::Middle
-    };
-
-    buf[0] = typ as u8;
-    let len_part = part.len() as u16;
-    buf[1..3].copy_from_slice(&len_part.to_be_bytes());
-    // calculate the CRC32 checksum based on the record type and data
-    let crc = calculate_crc32(&buf[0..1], part);
-    buf[3..7].copy_from_slice(&crc.to_be_bytes());
-}
-
 // Reads a field from the given reader
 pub(crate) fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0; 4];
@@ -638,58 +542,6 @@ fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn validate_record_type(record_type: &RecordType, i: usize) -> Result<()> {
-    match record_type {
-        RecordType::Full => {
-            if i != 0 {
-                return Err(Error::IO(IOError::new(
-                    io::ErrorKind::Other,
-                    "Unexpected full record: first record expected",
-                )));
-            }
-        }
-        RecordType::First => {
-            if i != 0 {
-                return Err(Error::IO(IOError::new(
-                    io::ErrorKind::Other,
-                    "Unexpected first record: no previous records expected",
-                )));
-            }
-        }
-        RecordType::Middle => {
-            if i == 0 {
-                return Err(Error::IO(IOError::new(
-                    io::ErrorKind::Other,
-                    "Unexpected middle record: missing previous records",
-                )));
-            }
-        }
-        RecordType::Last => {
-            if i == 0 {
-                return Err(Error::IO(IOError::new(
-                    io::ErrorKind::Other,
-                    "Unexpected last record: missing previous records",
-                )));
-            }
-        }
-        _ => {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Invalid record type",
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(record_type);
-    hasher.update(data);
-    hasher.finalize()
 }
 
 /// Copies elements from `src` into `dest` until either `dest` is full or all elements in `src` have been copied.
@@ -883,9 +735,6 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 
     /// A flag indicating whether the segment is closed or not.
     closed: bool,
-
-    /// A flag indicating whether the segment is a Write-Ahead Logging (WAL).
-    is_wal: bool,
 }
 
 impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
@@ -938,7 +787,6 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             id,
             closed: false,
             block: Block::new(),
-            is_wal: opts.is_wal,
             file_size: opts.max_file_size,
         })
     }
@@ -966,16 +814,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
     fn flush(&mut self) -> Result<()> {
         if self.block.written > 0 {
-            // Flush the full block to disk if it is a WAL with zero padded
-            // to the end of the last block. This is done to avoid writing
-            // partial records to the WAL, and for detecting corruption.
-            //
-            // Else flush the block as it is without zero padding.
-            if self.is_wal {
-                self.flush_block(true)?;
-            } else {
-                self.flush_block(false)?;
-            }
+            self.flush_block(false)?;
         }
 
         Ok(())
@@ -1074,31 +913,22 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
         let offset = self.offset();
         let mut n = 0;
-        let mut i = 0;
 
-        while i == 0 || !rec.is_empty() {
-            n += self.write_record(&mut rec, i)?;
-            i += 1;
+        while !rec.is_empty() {
+            n += self.write_record(&mut rec)?;
         }
 
         Ok((offset, n))
     }
 
-    fn write_record(&mut self, rec: &mut &[u8], i: usize) -> Result<usize> {
+    fn write_record(&mut self, rec: &mut &[u8]) -> Result<usize> {
         let active_block = &mut self.block;
         let remaining = std::cmp::min(active_block.remaining(), rec.len());
         let partial_record = &rec[..remaining];
         let buf = &mut active_block.buf[active_block.written..];
 
-        if self.is_wal {
-            encode_record_header(buf, rec.len(), partial_record, i);
-            // Copy the 'partial_record' into the buffer starting from the WAL_RECORD_HEADER_SIZE offset
-            copy_slice(&mut buf[WAL_RECORD_HEADER_SIZE..], partial_record);
-            active_block.written += partial_record.len() + WAL_RECORD_HEADER_SIZE;
-        } else {
-            copy_slice(buf, partial_record);
-            active_block.written += partial_record.len();
-        }
+        copy_slice(buf, partial_record);
+        active_block.written += partial_record.len();
 
         if active_block.is_full() {
             self.flush_block(true)?;
@@ -1414,7 +1244,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::io::Seek;
-    use std::io::{Read, SeekFrom, Write};
+    use std::io::Write;
     use tempdir::TempDir;
 
     #[test]
@@ -1633,53 +1463,6 @@ mod tests {
         let file_path = dir.join(name);
         let mut file = File::create(file_path).unwrap();
         file.write_all(b"dummy content").unwrap();
-    }
-
-    #[test]
-    fn remaining() {
-        let block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
-            written: 100,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert_eq!(block.remaining(), 3996 - WAL_RECORD_HEADER_SIZE);
-
-        let block: Block<4096, 0> = Block {
-            written: 100,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert_eq!(block.remaining(), 3996);
-    }
-
-    #[test]
-    fn is_full() {
-        let block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
-            written: 4096 - WAL_RECORD_HEADER_SIZE,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert!(block.is_full());
-
-        let block: Block<4096, 0> = Block {
-            written: 4096,
-            flushed: 0,
-            buf: [0; 4096],
-        };
-        assert!(block.is_full());
-    }
-
-    #[test]
-    fn reset() {
-        let mut block: Block<4096, WAL_RECORD_HEADER_SIZE> = Block {
-            written: 100,
-            flushed: 0,
-            buf: [1; 4096],
-        };
-        block.reset();
-        assert_eq!(block.buf, [0; 4096]);
-        assert_eq!(block.written, 0);
-        assert_eq!(block.flushed, 0);
     }
 
     #[test]
@@ -1972,93 +1755,6 @@ mod tests {
     }
 
     #[test]
-    fn wal_append() {
-        // Create a temporary directory
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create segment options and open a segment
-        let opts = Options::default().with_wal();
-        let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-
-        // Test initial offset
-        let sz = segment.offset();
-        assert_eq!(0, sz);
-
-        // Test appending an empty buffer
-        let r = segment.append(&[]);
-        assert!(r.is_err());
-
-        // Test appending a non-empty buffer
-        let r = segment.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        // Test appending another buffer
-        let r = segment.append(&[4, 5, 6, 7, 8, 9, 10]);
-        assert!(r.is_ok());
-        assert_eq!(7, r.unwrap().1);
-
-        // Validate offset after appending
-        // 7 + 4 + 7 + 7 = 25
-        assert_eq!(segment.offset(), 25);
-
-        // Test syncing segment
-        let r = segment.sync();
-        assert!(r.is_ok());
-
-        // Validate offset after syncing
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64);
-
-        // Test reading from segment
-        let mut bs = vec![0; 11];
-        let n = segment.read_at(&mut bs, 0).expect("should read");
-        assert_eq!(11, n);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Test reading another portion of data from segment
-        let mut bs = vec![0; 14];
-        let n = segment.read_at(&mut bs, 11).expect("should read");
-        assert_eq!(14, n);
-        assert_eq!(
-            &[4, 5, 6, 7, 8, 9, 10].to_vec(),
-            &bs[WAL_RECORD_HEADER_SIZE..]
-        );
-
-        // Test reading beyond segment's current size
-        let mut bs = vec![0; 14];
-        let r = segment.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
-        assert!(r.is_err());
-
-        // Test appending another buffer after syncing
-        let r = segment.append(&[11, 12, 13, 14]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        // Validate offset after appending
-        // BLOCK_SIZE + 7 + 4 = 4107
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 + 7 + 4);
-
-        // Test reading from segment after appending
-        let mut bs = vec![0; 11];
-        let n = segment
-            .read_at(&mut bs, BLOCK_SIZE as u64)
-            .expect("should read");
-        assert_eq!(11, n);
-        assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Test syncing segment again
-        let r = segment.sync();
-        assert!(r.is_ok());
-
-        // Validate offset after syncing again
-        assert_eq!(segment.offset(), BLOCK_SIZE as u64 * 2);
-
-        // Test closing segment
-        assert!(segment.close().is_ok());
-    }
-
-    #[test]
     fn segment_append_read_append() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -2093,279 +1789,6 @@ mod tests {
 
         // Close the segment
         segment.close().expect("should close segment");
-    }
-
-    fn create_test_segment_ref(segment: &Segment<WAL_RECORD_HEADER_SIZE>) -> SegmentRef {
-        SegmentRef {
-            file_path: segment.file_path.clone(),
-            file_header_offset: segment.file_header_offset,
-            id: segment.id,
-        }
-    }
-
-    fn create_test_segment(
-        temp_dir: &TempDir,
-        id: u64,
-        data: &[u8],
-    ) -> Segment<WAL_RECORD_HEADER_SIZE> {
-        let opts = Options::default().with_wal();
-        let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
-        let r = segment.append(data);
-        assert!(r.is_ok());
-        assert_eq!(data.len(), r.unwrap().1);
-        segment
-    }
-
-    #[test]
-    fn single_segment() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
-            create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
-
-        // Test appending another buffer
-        let r = segment.append(&[4, 5, 6, 7]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        segment.close().expect("should close segment");
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
-
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 11];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Read second record from the MultiSegmentReader
-        let mut bs = [0u8; 11];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Read remaining empty block
-        const REMAINING: usize = BLOCK_SIZE - 11 - 11;
-        let mut bs = [0u8; REMAINING];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, REMAINING);
-
-        let mut bs = [0u8; 11];
-        buf_reader.read(&mut bs).expect_err("should not read");
-    }
-
-    #[test]
-    fn multi_segment() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let opts = Options::default().with_wal();
-        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment1.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        // Test appending another buffer
-        let r = segment2.append(&[4, 5, 6, 7]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        segment1.close().expect("should close segment");
-        segment2.close().expect("should close segment");
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![
-            create_test_segment_ref(&segment1),
-            create_test_segment_ref(&segment2),
-        ];
-
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 11];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Read remaining empty block
-        const REMAINING: usize = BLOCK_SIZE - 11;
-        let mut bs = [0u8; REMAINING];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, REMAINING);
-
-        // Read second record from the MultiSegmentReader
-        let mut bs = [0u8; 11];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-        // Read remaining empty block
-        let mut bs = [0u8; REMAINING];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, REMAINING);
-
-        let mut bs = [0u8; 11];
-        buf_reader.read(&mut bs).expect_err("should not read");
-    }
-
-    #[test]
-    fn partial_block() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let opts = Options::default().with_wal();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment.append(&[1, 2, 3, 4]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        segment.close().expect("should close segment");
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
-
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read data from the MultiSegmentReader
-        let mut bs = [0u8; 50];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
-        assert_eq!(buf_reader.off, 50);
-
-        // Read remaining empty block
-        let mut bs = [0u8; BLOCK_SIZE - 50];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, BLOCK_SIZE - 50);
-
-        let mut read_buffer = [0u8; 50];
-        buf_reader
-            .read(&mut read_buffer)
-            .expect_err("should not read");
-        assert_eq!(buf_reader.off, BLOCK_SIZE);
-    }
-
-    #[test]
-    fn full_synced_block() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let opts = Options::default().with_wal();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment.append(&[1, 2, 3, 4]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        assert!(segment.sync().is_ok());
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![create_test_segment_ref(&segment)];
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read data from the MultiSegmentReader
-        let mut bs = [0u8; 50];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 50);
-        assert_eq!(&[1, 2, 3, 4].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
-        assert_eq!(buf_reader.off, 50);
-
-        let mut read_buffer = [0u8; 50];
-        let bytes_read = buf_reader.read(&mut read_buffer).expect("should read");
-        assert_eq!(bytes_read, 50);
-        assert_eq!(buf_reader.off, 100);
-        assert!(read_buffer.iter().all(|&byte| byte == 0));
-
-        assert!(segment.close().is_ok());
-    }
-
-    #[test]
-    fn multi_segment_with_sync() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let opts = Options::default().with_wal();
-        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment1.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-        assert!(segment1.sync().is_ok());
-
-        // Test appending another buffer
-        let r = segment2.append(&[4, 5, 6, 7]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-        assert!(segment2.sync().is_ok());
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![
-            create_test_segment_ref(&segment1),
-            create_test_segment_ref(&segment2),
-        ];
-
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; BLOCK_SIZE];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
-
-        // Read second record from the MultiSegmentReader
-        let mut bs = [0u8; BLOCK_SIZE];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, BLOCK_SIZE);
-        assert_eq!(&[4, 5, 6, 7].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..11]);
-
-        let mut bs = [0u8; 11];
-        buf_reader.read(&mut bs).expect_err("should not read");
-
-        assert!(segment1.close().is_ok());
-        assert!(segment2.close().is_ok());
-    }
-
-    #[test]
-    fn segment_ref() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create sample segment files and populate it with data
-        let mut segment1 = create_test_segment(&temp_dir, 4, &[1, 2, 3, 4]);
-        let mut segment2 = create_test_segment(&temp_dir, 6, &[5, 6]);
-        let mut segment3 = create_test_segment(&temp_dir, 8, &[7, 8, 9]);
-        assert!(segment1.close().is_ok());
-        assert!(segment2.close().is_ok());
-        assert!(segment3.close().is_ok());
-
-        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
-            .expect("should read segments");
-        assert!(sr.len() == 3);
-        assert!(sr[0].id == 4);
-        assert!(sr[1].id == 6);
-        assert!(sr[2].id == 8);
     }
 
     #[test]
@@ -2443,189 +1866,6 @@ mod tests {
         let r = segment.sync();
         assert!(r.is_ok());
         assert_eq!(segment.offset(), 11);
-    }
-
-    #[test]
-    fn multi_segment_rec() {
-        // Create a temporary directory to hold the segment files
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a sample segment file and populate it with data
-        let opts = Options::default();
-        let mut segment1 = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
-        let mut segment2 = Segment::open(temp_dir.path(), 1, &opts).expect("should create segment");
-
-        // Test appending a non-empty buffer
-        let r = segment1.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        // Test appending another buffer
-        let r = segment2.append(&[4, 5, 6, 7]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
-
-        let r = segment2.append(&[8, 9]);
-        assert!(r.is_ok());
-        assert_eq!(2, r.unwrap().1);
-
-        segment1.close().expect("should close segment");
-        segment2.close().expect("should close segment");
-
-        // Create a Vec of segments containing our sample segment
-        let segments: Vec<SegmentRef> = vec![
-            create_test_segment_ref(&segment1),
-            create_test_segment_ref(&segment2),
-        ];
-
-        // Create a MultiSegmentReader for testing
-        let mut buf_reader = MultiSegmentReader::new(segments).expect("should create");
-
-        // Read first record from the MultiSegmentReader
-        let mut bs = [0u8; 4];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 4);
-        assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
-
-        let mut bs = [0u8; 6];
-        let bytes_read = buf_reader.read(&mut bs).expect("should read");
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&[4, 5, 6, 7, 8, 9].to_vec(), &bs[..]);
-    }
-
-    #[test]
-    fn file_option_with_write_mode() {
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a path to the file in the temporary directory
-        let file_path = temp_dir.path().join("testfile.txt");
-
-        // Create a new file in the temporary directory
-        let mut file = File::create(&file_path).unwrap();
-
-        // Write some content to the file
-        file.write_all(b"Hello, world!").unwrap();
-
-        // Open the file with append and read permissions
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .unwrap();
-
-        // Read the first 5 bytes from the file
-        let mut buffer = [0; 5];
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, b"Hello");
-
-        // Append more content to the file
-        file.write_all(b" More content.").unwrap();
-
-        // Read from the start of the file again
-        let mut new_content = String::new();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_to_string(&mut new_content).unwrap();
-        // Should have overwritten the data in the file
-        assert_ne!(new_content, "Hello, world! More content.");
-    }
-
-    #[test]
-    fn file_option_with_append_mode() {
-        let temp_dir = TempDir::new("test").expect("should create temp dir");
-
-        // Create a path to the file in the temporary directory
-        let file_path = temp_dir.path().join("testfile.txt");
-
-        // Create a new file in the temporary directory
-        let mut file = File::create(&file_path).unwrap();
-
-        // Write some content to the file
-        file.write_all(b"Hello, world!").unwrap();
-
-        // Open the file with append and read permissions
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&file_path)
-            .unwrap();
-
-        // Read the first 5 bytes from the file
-        let mut buffer = [0; 5];
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_exact(&mut buffer).unwrap();
-        assert_eq!(&buffer, b"Hello");
-
-        // Append more content to the file
-        file.write_all(b" More content.").unwrap();
-
-        // Read from the start of the file again
-        let mut new_content = String::new();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_to_string(&mut new_content).unwrap();
-        // Should not have overwritten the data in the file
-        assert_eq!(new_content, "Hello, world! More content.");
-    }
-
-    #[test]
-    fn append_mode_seek_and_write() {
-        let path = PathBuf::from("test_append_mode.txt");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
-
-        // Write initial content
-        file.write_all(b"Line 1\n").unwrap();
-        file.write_all(b"Line 2\n").unwrap();
-
-        // Seek to the beginning of the file and attempt to write
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(b"Line 3\n").unwrap();
-
-        // Read back the file content
-        let mut content = String::new();
-        file.seek(SeekFrom::Start(0)).unwrap(); // Seek back to start to read
-        file.read_to_string(&mut content).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&path).unwrap();
-
-        // Check that "Line 3" was appended at the end, despite the seek
-        assert!(content.ends_with("Line 3\n"));
-    }
-
-    #[test]
-    fn non_append_mode_seek_and_write() {
-        let path = PathBuf::from("test_non_append_mode.txt");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(&path)
-            .unwrap();
-
-        // Write initial content
-        file.write_all(b"Line 1\n").unwrap();
-        file.write_all(b"Line 2\n").unwrap();
-
-        // Seek to the beginning of the file and attempt to write
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(b"Line 3\n").unwrap();
-
-        // Read back the file content
-        let mut content = String::new();
-        file.seek(SeekFrom::Start(0)).unwrap(); // Seek back to start to read
-        file.read_to_string(&mut content).unwrap();
-
-        // Clean up
-        std::fs::remove_file(&path).unwrap();
-
-        // Check that "Line 3" was written at the beginning, not appended
-        assert!(content.starts_with("Line 3\n"));
     }
 
     #[test]

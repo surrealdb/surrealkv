@@ -9,7 +9,7 @@ use crate::storage::{
         reader::{Reader, RecordReader},
         util::sanitize_directory,
     },
-    log::{aof::log::Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
+    log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
 };
 
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
