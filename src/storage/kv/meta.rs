@@ -1,5 +1,5 @@
+use ahash::{HashSet, HashSetExt};
 use bytes::{BufMut, Bytes, BytesMut};
-use hashbrown::HashSet;
 
 use crate::storage::kv::error::{Error, Result};
 

@@ -1,5 +1,5 @@
+use ahash::{HashSet, HashSetExt};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use hashbrown::HashSet;
 use rand::{thread_rng, Rng};
 use std::collections::VecDeque;
 

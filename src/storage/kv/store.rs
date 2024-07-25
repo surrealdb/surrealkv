@@ -11,8 +11,8 @@ use tokio::{
     task::{spawn, JoinHandle},
 };
 
+use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
-use hashbrown::HashMap;
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
@@ -22,7 +22,7 @@ use vart::art::KV;
 use crate::storage::{
     kv::{
         compaction::restore_from_compaction,
-        entry::{Entry, Record, Records, ValueRef},
+        entry::{encode_entries, Entry, Record, ValueRef},
         error::{Error, Result},
         indexer::Indexer,
         manifest::Manifest,
@@ -638,11 +638,16 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
-        let tx_record = Records::new_with_entries(req.entries.clone(), req.tx_id, req.commit_ts);
         let mut buf = BytesMut::new();
-        let mut values_offsets = HashMap::new();
+        let mut values_offsets = HashMap::with_capacity(req.entries.len());
 
-        tx_record.encode(&mut buf, &mut values_offsets)?;
+        encode_entries(
+            &req.entries,
+            req.tx_id,
+            req.commit_ts,
+            &mut buf,
+            &mut values_offsets,
+        );
 
         let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
 

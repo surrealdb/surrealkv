@@ -1,9 +1,10 @@
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
+use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
-use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
 
 use crate::storage::kv::{
@@ -102,9 +103,9 @@ pub struct Transaction {
     /// `write_order_map` is a mapping from sha256 of keys to their order in the write_set.
     pub(crate) write_order_map: HashMap<Bytes, u32>,
 
-    /// `write_set` is a vector of tuples, where each tuple contains a key and its corresponding entry.
+    /// `write_set` is a vector of  entries.
     /// These are the changes that the transaction intends to make to the data.
-    pub(crate) write_set: Vec<(Bytes, Entry)>,
+    pub(crate) write_set: Vec<Entry>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
@@ -210,10 +211,10 @@ impl Transaction {
                 // Check if the key is in the write set by checking in the write_order_map map.
                 if let Some(order) = self.write_order_map.get(&hashed_key) {
                     if let Some(entry) = self.write_set.get(*order as usize) {
-                        return Ok(if entry.1.is_deleted_or_tombstone() {
+                        return Ok(if entry.is_deleted_or_tombstone() {
                             None
                         } else {
-                            Some(entry.1.value.clone().to_vec())
+                            Some(entry.value.clone().to_vec())
                         });
                     }
                 }
@@ -284,13 +285,14 @@ impl Transaction {
         let hashed_key = sha256(e.key.clone());
 
         // Check if the key already exists in write_order_map, if so, update the entry in write_set.
-        if let Some(order) = self.write_order_map.get(&hashed_key) {
-            self.write_set[*order as usize] = (e.key.clone(), e);
-        } else {
-            self.write_set.push((e.key.clone(), e));
-            self.write_order_map
-                .insert(hashed_key, self.write_order_map.len() as u32);
-        }
+        let write_order_map_len = self.write_order_map.len() as u32;
+        match self.write_order_map.entry(hashed_key) {
+            HashEntry::Occupied(oe) => self.write_set[*oe.get() as usize] = e,
+            HashEntry::Vacant(ve) => {
+                ve.insert(write_order_map_len);
+                self.write_set.push(e);
+            }
+        };
 
         Ok(())
     }
@@ -395,12 +397,8 @@ impl Transaction {
         // Prepare for the commit by getting a transaction ID and a commit timestamp.
         let (tx_id, commit_ts) = self.prepare_commit()?;
 
-        // Sort the keys in the write set and create a vector of entries.
-        let entries: Vec<Entry> = self
-            .write_set
-            .iter()
-            .map(|(_, entry)| entry.clone())
-            .collect();
+        // Extract the vector of entries for the current transaction.
+        let entries: Vec<Entry> = std::mem::take(&mut self.write_set);
 
         // Commit the changes to the store index.
         let done = self
@@ -443,7 +441,7 @@ impl Transaction {
     /// Assigns commit timestamps to transaction entries.
     fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
-        self.write_set.iter_mut().for_each(|(_, entry)| {
+        self.write_set.iter_mut().for_each(|entry| {
             entry.ts = commit_ts;
         });
         commit_ts
