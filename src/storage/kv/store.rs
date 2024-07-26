@@ -677,14 +677,6 @@ impl Core {
                 // write to disk using the write_all method. But it does not
                 // fsync the data to disk before returning.
                 let (segment_id, offset, _) = clog.append(tx_record)?;
-                clog.flush()?;
-                (segment_id, offset)
-            }
-            Durability::Weak => {
-                // Weak durability means that the transaction is made to
-                // write to disk in size of BLOCK_SIZE. And it does not
-                // fsync the data to disk before returning.
-                let (segment_id, offset, _) = clog.append(tx_record)?;
                 (segment_id, offset)
             }
         };
@@ -1276,22 +1268,9 @@ mod tests {
         }
     }
 
-    // This test is relevant today because unless the store is dropped, the data will not be persisted to disk.
-    // Once the store automatically syncs the data to disk, this test will not verify the intended behaviour.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn weak_durability_records_persist_after_drop() {
-        test_records_when_store_is_dropped(Durability::Weak, true, true).await;
-    }
-
     #[tokio::test]
     async fn eventual_durability_records_persist_after_drop() {
         test_records_when_store_is_dropped(Durability::Eventual, true, true).await;
-    }
-
-    // This simulates the case where the store is dropped and not closed, which will cause the data to be lost.
-    #[tokio::test]
-    async fn weak_durability_records_lost_without_wait() {
-        test_records_when_store_is_dropped(Durability::Weak, false, false).await;
     }
 
     #[tokio::test]
@@ -1390,11 +1369,6 @@ mod tests {
                 assert_eq!(&val, value);
             }
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn weak_durability() {
-        test_durability(Durability::Weak, true).await;
     }
 
     #[tokio::test]

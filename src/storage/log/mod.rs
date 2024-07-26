@@ -10,11 +10,8 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
-/// The size of a single block in bytes.
-///
-/// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
-/// write-ahead log. It determines the maximum amount of data that can be held in memory before
-/// flushing to disk. Larger block sizes can improve write performance but might use more memory.
+/// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk reads from
+/// the append-only log.
 pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
 
 /// The magic value for identifying file headers.
@@ -26,7 +23,7 @@ const MAGIC: u64 = 0xFB98F92D;
 
 /// The version number of the file format.
 ///
-/// The `VERSION` constant represents the version number of the file format used in write-ahead log
+/// The `VERSION` constant represents the version number of the file format used in append-only log
 /// segments. It provides information about the structure and layout of the data within the segment.
 const VERSION: u64 = 1;
 
@@ -83,57 +80,6 @@ impl CompressionLevel {
         match *self {
             CompressionLevel::BestSpeed => 0,
         }
-    }
-}
-
-/// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
-/// batch writes to improve performance by reducing the number of individual disk writes. If the
-/// data to be written exceeds the `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
-/// keeps track of the allocated space, flushed data, and other details related to the write process.
-/// It can also be used to align data to the size of a direct I/O block, if applicable.
-///
-/// # Type Parameters
-///
-/// - `BLOCK_SIZE`: The size of the block in bytes.
-/// - `RECORD_HEADER_SIZE`: The size of the record header in bytes.
-pub(crate) struct Block<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize> {
-    /// The number of bytes currently written in the block.
-    written: usize,
-
-    /// The number of bytes that have been flushed to disk.
-    flushed: usize,
-
-    /// The buffer that holds the actual data.
-    buf: [u8; BLOCK_SIZE],
-}
-
-impl<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize>
-    Block<BLOCK_SIZE, RECORD_HEADER_SIZE>
-{
-    fn new() -> Self {
-        Block {
-            written: 0,
-            flushed: 0,
-            buf: [0; BLOCK_SIZE],
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        BLOCK_SIZE - self.written - RECORD_HEADER_SIZE
-    }
-
-    fn is_full(&self) -> bool {
-        BLOCK_SIZE - self.written <= RECORD_HEADER_SIZE
-    }
-
-    fn reset(&mut self) {
-        self.buf = [0u8; BLOCK_SIZE];
-        self.written = 0;
-        self.flushed = 0;
-    }
-
-    fn unwritten(&self) -> usize {
-        self.written - self.flushed
     }
 }
 
@@ -544,26 +490,6 @@ fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Copies elements from `src` into `dest` until either `dest` is full or all elements in `src` have been copied.
-/// Returns the number of elements copied.
-fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
-    let min_len = dest.len().min(src.len());
-
-    for (d, s) in dest.iter_mut().zip(src.iter()) {
-        *d = *s;
-    }
-
-    min_len
-}
-
-/// Tries to copy `dest.len()` bytes from `src`, starting at `dest_len`, but not more than `src_len`.
-/// Returns the length of `dest`.
-fn copy_into_dest_from_src(dest: &mut [u8], dest_len: usize, src: &[u8], src_len: usize) -> usize {
-    let min_len = std::cmp::min(dest.len() - dest_len, src_len);
-    dest[dest_len..(min_len + dest_len)].copy_from_slice(&src[..min_len]);
-    dest.len()
-}
-
 fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
     let parts: Vec<&str> = name.split('.').collect();
 
@@ -709,16 +635,13 @@ impl SegmentRef {
      .                                                       |
      +------+------+------+------+------+------+------+------+
 */
-pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
+pub(crate) struct Segment {
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
     #[allow(dead_code)]
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
-
-    /// The active block for buffering data.
-    block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
 
     /// The underlying file for storing the segment's data.
     file: File,
@@ -737,7 +660,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
     closed: bool,
 }
 
-impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
+impl Segment {
     pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
@@ -786,7 +709,6 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             file_path,
             id,
             closed: false,
-            block: Block::new(),
             file_size: opts.max_file_size,
         })
     }
@@ -812,21 +734,6 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         Ok(file)
     }
 
-    fn flush(&mut self) -> Result<()> {
-        if self.block.written > 0 {
-            self.flush_block(false)?;
-        }
-
-        Ok(())
-    }
-
-    fn flush_and_sync(&mut self) -> Result<()> {
-        self.flush()?;
-        self.file.sync_all()?;
-
-        Ok(())
-    }
-
     // Flushes the current block to disk.
     // This method also synchronize file metadata to the filesystem
     // hence it is a bit slower than fdatasync (sync_data).
@@ -838,57 +745,22 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             )));
         }
 
-        self.flush_and_sync()
-    }
-
-    pub(crate) fn close(&mut self) -> Result<()> {
-        if self.closed {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Segment is closed",
-            )));
-        }
-
-        self.flush_and_sync()?;
-
-        self.closed = true;
+        self.file.sync_all()?;
         Ok(())
     }
 
-    pub(crate) fn flush_block(&mut self, clear: bool) -> Result<()> {
-        let p = &mut self.block;
-        let clear = clear || p.is_full();
-
-        // No more data will fit into the block. Clear it and write to disk.
-        // The remaining data in the block will be zeroed out.
-        if clear {
-            p.written = BLOCK_SIZE; // Write till end of block.
-        }
-
-        let n = p.unwritten();
-
-        // write_all does atomic writes to the file (in this case the os buffer)
-        self.file.write_all(&p.buf[p.flushed..p.written])?;
-        p.flushed += n;
-        self.file_offset += n as u64;
-
-        // We flushed an entire block, prepare a new one.
-        if clear {
-            p.reset();
-        }
-
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.sync()?;
+        self.closed = true;
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub(crate) fn offset(&self) -> u64 {
-        self.file_offset + self.block.unwritten() as u64
+        self.file_offset
     }
 
     /// Appends data to the segment.
-    ///
-    /// This method appends the given data to the segment. If the block is full, it is flushed
-    /// to disk. The data is written in chunks to the current block until the block is full.
     ///
     /// # Parameters
     ///
@@ -896,12 +768,12 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
     ///
     /// # Returns
     ///
-    /// Returns the offset, and the number of bytes successfully appended.
+    /// Returns the offset.
     ///
     /// # Errors
     ///
     /// Returns an error if the segment is closed.
-    pub(crate) fn append(&mut self, mut rec: &[u8]) -> Result<(u64, usize)> {
+    pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
         // If the segment is closed, return an error
         if self.closed {
             return Err(Error::SegmentClosed);
@@ -912,37 +784,16 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
         }
 
         let offset = self.offset();
-        let mut n = 0;
 
-        while !rec.is_empty() {
-            n += self.write_record(&mut rec)?;
-        }
+        // write_all does atomic writes to the file (in this case the os buffer)
+        self.file.write_all(rec)?;
+        self.file_offset += rec.len() as u64;
 
-        Ok((offset, n))
+        Ok(offset)
     }
 
-    fn write_record(&mut self, rec: &mut &[u8]) -> Result<usize> {
-        let active_block = &mut self.block;
-        let remaining = std::cmp::min(active_block.remaining(), rec.len());
-        let partial_record = &rec[..remaining];
-        let buf = &mut active_block.buf[active_block.written..];
-
-        copy_slice(buf, partial_record);
-        active_block.written += partial_record.len();
-
-        if active_block.is_full() {
-            self.flush_block(true)?;
-        }
-
-        *rec = &rec[remaining..];
-        Ok(remaining)
-    }
-
-    /// Reads data from the segment at the specified offset.
-    ///
-    /// This method reads data from the segment starting from the given offset. It reads
-    /// from the underlying file if the offset is beyond the current block's buffer. The
-    /// read data is then copied into the provided byte slice `bs`.
+    /// Reads data from the segment at the specified offset from the underlying file.
+    /// The read data is then copied into the provided byte slice `bs`.
     ///
     /// # Parameters
     ///
@@ -972,43 +823,27 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
             )));
         }
 
-        // Calculate buffer offset
-        let mut boff = 0;
+        // Read from the file
+        let actual_read_offset = self.file_header_offset + off;
+        let bytes_read;
 
-        let mut n = 0;
-        if off < self.file_offset {
-            // Read from the file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            bytes_read = self.file.read_at(bs, actual_read_offset)?;
+        }
+        #[cfg(not(unix))]
+        {
             let mut file = &self.file;
             file.seek(SeekFrom::Start(self.file_header_offset + off))?;
-            n = file.read(bs)?;
-        } else {
-            boff = (off - self.file_offset) as usize;
+            bytes_read = file.read(bs)?;
         }
 
-        let pending = bs.len() - n;
-        if pending > 0 {
-            let available = self.block.unwritten() - boff;
-            let remaining = std::cmp::min(pending, available);
-
-            if remaining > 0 {
-                let buf = &self.block.buf
-                    [self.block.flushed + boff..self.block.flushed + boff + remaining];
-                copy_into_dest_from_src(bs, n, buf, buf.len());
-                n += remaining;
-            }
-
-            if remaining == pending {
-                return Ok(n);
-            } else {
-                return Err(Error::Eof(n));
-            }
-        }
-
-        Ok(n)
+        Ok(bytes_read)
     }
 }
 
-impl<const RECORD_HEADER_SIZE: usize> Drop for Segment<RECORD_HEADER_SIZE> {
+impl Drop for Segment {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -1472,8 +1307,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1485,13 +1319,11 @@ mod tests {
 
         // Test appending a non-empty buffer
         let r = segment.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(r, Ok(0));
 
         // Test appending another buffer
         let r = segment.append(&[4, 5, 6, 7, 8, 9, 10]);
-        assert!(r.is_ok());
-        assert_eq!(7, r.unwrap().1);
+        assert_eq!(r, Ok(4));
 
         // Validate offset after appending
         // 4 + 7 = 11
@@ -1523,8 +1355,7 @@ mod tests {
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(r, Ok(11));
 
         // Validate offset after appending
         // 11 + 4 = 4100
@@ -1554,8 +1385,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1563,8 +1393,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1577,21 +1406,18 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
 
         // Test appending a non-empty buffer
         let r = segment.append(&[0, 1, 2, 3]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(r, Ok(0));
 
         // Test appending another buffer
         let r = segment.append(&[4, 5, 6, 7, 8, 9, 10]);
-        assert!(r.is_ok());
-        assert_eq!(7, r.unwrap().1);
+        assert_eq!(r, Ok(4));
 
         // Validate offset after appending
         // 4 + 7 = 11
@@ -1609,8 +1435,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 11);
@@ -1634,8 +1459,7 @@ mod tests {
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
-        assert!(r.is_ok());
-        assert_eq!(4, r.unwrap().1);
+        assert_eq!(r, Ok(11));
 
         // Validate offset after appending
         // 11 + 4 = 4100
@@ -1651,8 +1475,7 @@ mod tests {
         assert!(segment.close().is_ok());
 
         // Reopen segment
-        let segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
         // Test initial offset
         assert_eq!(segment.offset(), 11 + 4);
 
@@ -1668,8 +1491,7 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1677,8 +1499,7 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1692,8 +1513,7 @@ mod tests {
         // Create segment options
         let opts = Options::default();
 
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1714,8 +1534,7 @@ mod tests {
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
-        let reopened_segment: std::result::Result<Segment<0>, Error> =
-            Segment::open(temp_dir.path(), 0, &opts);
+        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts);
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
     }
 
@@ -1728,8 +1547,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1746,8 +1564,7 @@ mod tests {
         assert!(n.is_err()); // Reading should fail
 
         // Reopen the closed segment
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
 
         // Try to perform operations on the reopened segment
         let r = segment.append(&[4, 5, 6, 7]);
@@ -1763,8 +1580,7 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Append data to the segment
         let append_result = segment.append(&[0, 1, 2, 3]);
@@ -1792,45 +1608,13 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_into_dest_from_src() {
-        // Scenario 1: dest has one byte and rest in src
-        let mut dest = vec![1, 0, 0, 0, 0];
-        let src = vec![2, 3, 4, 5];
-        let dest_len = copy_into_dest_from_src(&mut dest, 1, &src, src.len());
-        assert_eq!(dest_len, 5);
-        assert_eq!(dest, vec![1, 2, 3, 4, 5]);
-
-        // Scenario 2: src is smaller than dest
-        let mut dest = vec![0; 10];
-        let src = vec![1, 2, 3, 4, 5];
-        let dest_len = copy_into_dest_from_src(&mut dest, 0, &src, src.len());
-        assert_eq!(dest_len, 10);
-        assert_eq!(dest, vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0]);
-
-        // Scenario 3: src is larger than dest
-        let mut dest = vec![0; 5];
-        let src = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-        let dest_len = copy_into_dest_from_src(&mut dest, 0, &src, src.len());
-        assert_eq!(dest_len, 5);
-        assert_eq!(dest, vec![1, 2, 3, 4, 5]);
-
-        // Scenario 4: dest is already partially filled
-        let mut dest = vec![1, 2, 3, 4, 5, 0, 0, 0, 0, 0];
-        let src = vec![6, 7, 8, 9, 10];
-        let dest_len = copy_into_dest_from_src(&mut dest, 5, &src, src.len());
-        assert_eq!(dest_len, 10);
-        assert_eq!(dest, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    }
-
-    #[test]
     fn sync_on_synced_segment() {
         // Create a temporary directory
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1838,8 +1622,7 @@ mod tests {
 
         // Test appending a non-empty buffer
         let r = segment.append(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        assert!(r.is_ok());
-        assert_eq!(11, r.unwrap().1);
+        assert_eq!(r, Ok(0));
 
         // Validate offset after appending
         assert_eq!(segment.offset(), 11);
@@ -1856,8 +1639,7 @@ mod tests {
         segment.close().expect("should close segment");
 
         // Reopen segment and validate offset
-        let mut segment: Segment<0> =
-            Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();

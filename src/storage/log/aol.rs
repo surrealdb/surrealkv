@@ -12,15 +12,13 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
-const RECORD_HEADER_SIZE: usize = 0;
-
 /// Append-Only Log (Aol) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
 /// writing data in a sequential manner.
 pub struct Aol {
     /// The currently active segment where data is being written.
-    pub(crate) active_segment: Segment<RECORD_HEADER_SIZE>,
+    pub(crate) active_segment: Segment,
 
     /// The ID of the currently active segment.
     pub(crate) active_segment_id: u64,
@@ -38,7 +36,7 @@ pub struct Aol {
     mutex: Mutex<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RwLock<LruCache<u64, Segment<RECORD_HEADER_SIZE>>>,
+    segment_cache: RwLock<LruCache<u64, Segment>>,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
@@ -156,8 +154,8 @@ impl Aol {
 
         // Write the record to the segment
         let result = self.active_segment.append(rec);
-        match result {
-            Ok((off, _)) => off,
+        let offset = match result {
+            Ok(off) => off,
             Err(e) => {
                 if let Error::IO(_) = e {
                     self.set_fsync_failed(true);
@@ -166,8 +164,6 @@ impl Aol {
             }
         };
 
-        let (offset, _) = result.unwrap();
-
         Ok((self.active_segment_id, offset, rec.len()))
     }
 
@@ -175,12 +171,6 @@ impl Aol {
     pub fn sync(&mut self) -> Result<()> {
         self.check_if_fsync_failed()?;
         self.active_segment.sync()
-    }
-
-    /// Flushes the active segment.
-    pub fn flush(&mut self) -> Result<()> {
-        self.check_if_fsync_failed()?;
-        self.active_segment.flush()
     }
 
     /// Reads data from the segment at the specified offset into the provided buffer.
