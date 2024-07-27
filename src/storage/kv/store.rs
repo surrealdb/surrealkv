@@ -35,9 +35,7 @@ use crate::storage::{
         transaction::{Durability, Mode, Transaction},
         util::now,
     },
-    log::{
-        Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef, BLOCK_SIZE,
-    },
+    log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
 };
 
 pub(crate) struct StoreInner {
@@ -399,7 +397,7 @@ impl Core {
         let reader = MultiSegmentReader::new(sr)?;
 
         // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
-        let reader = Reader::new_from(reader, BLOCK_SIZE);
+        let reader = Reader::new_from(reader);
 
         // A RecordReader is created from the Reader to read transactions.
         let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
@@ -425,7 +423,7 @@ impl Core {
                 }
 
                 // If the end of the file is reached, the loop is broken.
-                Err(Error::LogError(LogError::Eof(_))) => break,
+                Err(Error::LogError(LogError::Eof)) => break,
 
                 // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
                 Err(Error::LogError(LogError::Corruption(err))) => {
@@ -558,7 +556,7 @@ impl Core {
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader, BLOCK_SIZE);
+        let mut reader = Reader::new_from(reader);
 
         let mut manifests = Manifest::new(); // Initialize with an empty Vec
 
@@ -567,7 +565,7 @@ impl Core {
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::LogError(LogError::Eof(_)) = e {
+                if let Error::LogError(LogError::Eof) = e {
                     break;
                 } else {
                     return Err(e);
