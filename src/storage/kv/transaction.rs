@@ -64,12 +64,6 @@ pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
-    /// Commits with this durability level will be queued for persitance to disk, and will be
-    /// written to disk in batches of BLOCK_SIZE. This helps reduce the number of disk writes,
-    /// and increases throughput as the data is written to disk in batches. But it does not
-    /// guarantee that the data will be persisted to disk as soon as [Transaction::commit] returns.
-    Weak,
-
     /// Commits with this durability level are guaranteed to be persistent eventually. The data
     /// is written to the disk, but it is not fsynced before returning from [Transaction::commit].
     #[default]
