@@ -10,9 +10,9 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
-/// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk reads from
+/// The `READ_BUF_SIZE` constant represents the size of a buffer for disk reads from
 /// the append-only log.
-pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
+const READ_BUF_SIZE: usize = 32 * 1024;
 
 /// The magic value for identifying file headers.
 ///
@@ -859,7 +859,7 @@ pub enum Error {
     Corruption(CorruptionError), // New variant for CorruptionError
     SegmentClosed,
     EmptyBuffer,
-    Eof(usize),
+    Eof,
     IO(IOError),
     Poison(String),
     RecordTooLarge,
@@ -874,7 +874,7 @@ impl fmt::Display for Error {
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
             Error::IO(err) => write!(f, "IO error: {}", err),
-            Error::Eof(n) => write!(f, "EOF error after reading {} bytes", n),
+            Error::Eof => write!(f, "EOF"),
             Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
             Error::RecordTooLarge => write!(
                 f,
@@ -986,7 +986,7 @@ impl MultiSegmentReader {
         let mut file = File::open(&segments[cur].file_path)?;
         file.seek(SeekFrom::Start(segments[cur].file_header_offset))?;
 
-        let buf = BufReader::with_capacity(BLOCK_SIZE, file);
+        let buf = BufReader::with_capacity(READ_BUF_SIZE, file);
 
         Ok(MultiSegmentReader {
             buf,
@@ -1001,32 +1001,6 @@ impl MultiSegmentReader {
         Ok(bytes_read.is_empty())
     }
 
-    fn read_to_buffer(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let bytes_read = self.buf.read(buf)?;
-        self.off += bytes_read;
-
-        // If we read less than the buffer size, we've reached the end of the current segment.
-        // If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
-        // This is to avoid detecting the wrong segment as corrupt.
-        if self.off % BLOCK_SIZE != 0 {
-            // Fill the rest of the buffer with zeros.
-            let i = self.fill_with_zeros(buf, bytes_read);
-            self.off += i;
-            return Ok(bytes_read + i);
-        }
-
-        Ok(bytes_read)
-    }
-
-    fn fill_with_zeros(&mut self, buf: &mut [u8], bytes_read: usize) -> usize {
-        let mut i = 0;
-        while bytes_read + i < buf.len() && (self.off + i) % BLOCK_SIZE != 0 {
-            buf[bytes_read + i] = 0;
-            i += 1;
-        }
-        i
-    }
-
     fn load_next_segment(&mut self) -> io::Result<()> {
         if self.cur + 1 >= self.segments.len() {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -1037,7 +1011,7 @@ impl MultiSegmentReader {
 
         let next_file = File::open(&self.segments[self.cur].file_path)?;
         let header_offset = self.segments[self.cur].file_header_offset;
-        let mut next_buf_reader = BufReader::with_capacity(BLOCK_SIZE, next_file);
+        let mut next_buf_reader = BufReader::with_capacity(READ_BUF_SIZE, next_file);
         next_buf_reader.seek(SeekFrom::Start(header_offset))?;
 
         self.buf = next_buf_reader;
@@ -1063,12 +1037,14 @@ impl Read for MultiSegmentReader {
         // Note: This could create a problem when reading a partial block
         // spread over multiple segments. Currently wal do not
         // write partial blocks spanning multiple segments.
-        if !self.is_eof()? {
-            self.read_to_buffer(buf)
+        let bytes_read = if !self.is_eof()? {
+            self.buf.read(buf)?
         } else {
             self.load_next_segment()?;
-            self.read_to_buffer(buf)
-        }
+            self.buf.read(buf)?
+        };
+        self.off += bytes_read;
+        Ok(bytes_read)
     }
 }
 
@@ -1454,7 +1430,7 @@ mod tests {
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
-        let r = segment.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
+        let r = segment.read_at(&mut bs, READ_BUF_SIZE as u64 + 1);
         assert!(r.is_err());
 
         // Test appending another buffer after syncing

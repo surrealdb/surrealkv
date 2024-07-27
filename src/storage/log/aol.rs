@@ -197,8 +197,8 @@ impl Aol {
                 r += bytes_read;
             }
             Err(e) => match e {
-                Error::Eof(n) => {
-                    return Err(Error::Eof(n));
+                Error::Eof => {
+                    return Err(Error::Eof);
                 }
                 _ => return Err(e),
             },

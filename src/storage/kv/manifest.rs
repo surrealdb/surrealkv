@@ -2,9 +2,7 @@ use revision::{revisioned, Revisioned};
 use std::path::Path;
 
 use super::reader::Reader;
-use crate::storage::log::{
-    write_field, Error as LogError, MultiSegmentReader, SegmentRef, BLOCK_SIZE,
-};
+use crate::storage::log::{write_field, Error as LogError, MultiSegmentReader, SegmentRef};
 use crate::{Error, Options, Result};
 
 #[revisioned(revision = 1)]
@@ -91,14 +89,14 @@ impl Manifest {
 
         let sr = SegmentRef::read_segments_from_directory(path)?;
         let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader, BLOCK_SIZE);
+        let mut reader = Reader::new_from(reader);
 
         loop {
             // Read the next transaction record from the log.
             let mut len_buf = [0; 4];
             let res = reader.read(&mut len_buf); // Read 4 bytes for the length
             if let Err(e) = res {
-                if let Error::LogError(LogError::Eof(_)) = e {
+                if let Error::LogError(LogError::Eof) = e {
                     break;
                 } else {
                     return Err(e);

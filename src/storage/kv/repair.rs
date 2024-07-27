@@ -9,7 +9,7 @@ use crate::storage::{
         reader::{Reader, RecordReader},
         util::sanitize_directory,
     },
-    log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef, BLOCK_SIZE},
+    log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef},
 };
 
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
@@ -156,7 +156,7 @@ fn repair_segment(
     let segment_reader = MultiSegmentReader::new(segments)?;
 
     // Initialize a reader for the segment
-    let reader = Reader::new_from(segment_reader, BLOCK_SIZE);
+    let reader = Reader::new_from(segment_reader);
     let mut reader = RecordReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
 
     let mut count = 0;
@@ -349,7 +349,7 @@ mod tests {
 
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"), 1000);
+        let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"));
         let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
         let mut tx = Record::new();
 

@@ -18,22 +18,13 @@ use crate::storage::{
 /// by the `RecordReader` to read data from the Aol source.
 pub(crate) struct Reader {
     rdr: MultiSegmentReader,
-    buffer: Vec<u8>,
-    read: usize,
-    start: usize,
     err: Option<Error>,
 }
 
 impl Reader {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    pub(crate) fn new_from(rdr: MultiSegmentReader, size: usize) -> Self {
-        Reader {
-            rdr,
-            buffer: vec![0; size],
-            read: 0,
-            start: 0,
-            err: None,
-        }
+    pub(crate) fn new_from(rdr: MultiSegmentReader) -> Self {
+        Reader { rdr, err: None }
     }
 
     /// Returns the current offset of the `Reader`.
@@ -55,47 +46,28 @@ impl Reader {
             return Err(err.clone());
         }
 
-        let mut n = 0;
-        let buf_len = buf.len();
+        if let Err(e) = self.rdr.read_exact(buf) {
+            let (segment_id, offset) = (self.rdr.current_segment_id(), self.rdr.current_offset());
 
-        while n < buf_len {
-            let bn = std::cmp::min(self.read - self.start, buf_len - n);
-            buf[n..n + bn].copy_from_slice(&self.buffer[self.start..self.start + bn]);
-            self.start += bn;
-            n += bn;
-            if n == buf_len {
-                break;
-            }
-
-            match self.rdr.read_exact(&mut self.buffer[..buf_len]) {
-                Ok(_) => n,
-                Err(e) => {
-                    let (segment_id, offset) =
-                        (self.rdr.current_segment_id(), self.rdr.current_offset());
-
-                    let err = match e.kind() {
-                        std::io::ErrorKind::UnexpectedEof => Error::LogError(LogError::Eof(n)),
-                        _ => {
-                            // Default action for other errors
-                            Error::LogError(Corruption(CorruptionError::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string().as_str(),
-                                segment_id,
-                                offset as u64,
-                            )))
-                        }
-                    };
-
-                    self.err = Some(err.clone());
-
-                    return Err(err);
+            let err = match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => Error::LogError(LogError::Eof),
+                _ => {
+                    // Default action for other errors
+                    Error::LogError(Corruption(CorruptionError::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string().as_str(),
+                        segment_id,
+                        offset as u64,
+                    )))
                 }
             };
 
-            self.read = buf_len;
-            self.start = 0;
+            self.err = Some(err.clone());
+
+            return Err(err);
         }
-        Ok(n)
+
+        Ok(buf.len())
     }
 
     /// Reads a single byte from the data source.
@@ -331,7 +303,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 200000);
+        let mut r = Reader::new_from(sr);
 
         let mut bs = vec![0; 4];
         let n = r.read(&mut bs).expect("should read");
@@ -346,7 +318,7 @@ mod tests {
         let mut bs = vec![0; 4];
         assert!(match r.read(&mut bs) {
             Err(err) => {
-                matches!(err, Error::LogError(LogError::Eof(_)))
+                matches!(err, Error::LogError(LogError::Eof))
             }
             _ => false,
         });
@@ -380,7 +352,7 @@ mod tests {
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
-        let mut r = Reader::new_from(sr, 200000);
+        let mut r = Reader::new_from(sr);
 
         // Read and verify the 10 records
         for i in 0..num_items {
@@ -394,7 +366,7 @@ mod tests {
         let mut bs = vec![0; REC_SIZE];
         assert!(match r.read(&mut bs) {
             Err(err) => {
-                matches!(err, Error::LogError(LogError::Eof(_)))
+                matches!(err, Error::LogError(LogError::Eof))
             }
             _ => false,
         });
