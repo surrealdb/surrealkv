@@ -1028,6 +1028,7 @@ impl MultiSegmentReader {
     }
 }
 
+#[allow(clippy::unused_io_amount)]
 impl Read for MultiSegmentReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.cur >= self.segments.len() {

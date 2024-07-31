@@ -1,14 +1,15 @@
 use ahash::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crc32fast::Hasher as crc32Hasher;
 
 use crate::storage::{
     kv::error::{Error, Result},
     kv::meta::Metadata,
     kv::store::Core,
-    kv::util::calculate_crc32_combined,
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
@@ -61,10 +62,6 @@ impl Entry {
         } else {
             false
         }
-    }
-
-    pub(crate) fn crc32(&self) -> u32 {
-        calculate_crc32_combined(&self.key, &self.value)
     }
 }
 
@@ -119,6 +116,19 @@ pub(crate) struct Record {
     pub(crate) crc32: u32,
 }
 
+impl Hash for Record {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.ts.hash(state);
+        self.version.hash(state);
+        self.key_len.hash(state);
+        self.key.hash(state);
+        self.metadata.hash(state);
+        self.value_len.hash(state);
+        self.value.hash(state);
+    }
+}
+
 impl Record {
     pub(crate) fn new() -> Self {
         Record {
@@ -134,18 +144,29 @@ impl Record {
         }
     }
 
+    pub(crate) fn calculate_crc32(&self) -> u32 {
+        let mut hasher = crc32Hasher::new();
+        self.hash(&mut hasher);
+        hasher.finalize()
+    }
+
     pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
-        Record {
+        let rec = Record {
             id: tx_id,
             ts: commit_ts,
-            crc32: entry.crc32(),
+            crc32: 0, // Temporarily set to 0, will be updated after initialization
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-        }
+        };
+
+        let crc32 = rec.calculate_crc32();
+
+        // Return a new Record instance with the correct crc32 value
+        Record { crc32, ..rec }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -161,18 +182,22 @@ impl Record {
     }
 
     pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
-        let crc32 = entry.crc32();
-        Record {
+        let rec = Record {
             id: tx_id,
             ts: entry.ts,
+            crc32: 0, // Temporarily set to 0, will be updated after initialization
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32,
-        }
+        };
+
+        let crc32 = rec.calculate_crc32();
+
+        // Return a new Record instance with the correct crc32 value
+        Record { crc32, ..rec }
     }
 
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {

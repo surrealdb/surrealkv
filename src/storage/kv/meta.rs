@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use ahash::{HashSet, HashSetExt};
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -129,6 +131,14 @@ impl Metadata {
         }
 
         Ok(Metadata { attributes })
+    }
+}
+
+impl Hash for Metadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for attribute in &self.attributes {
+            attribute.hash(state);
+        }
     }
 }
 
