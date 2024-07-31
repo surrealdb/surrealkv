@@ -183,16 +183,16 @@ impl RecordReader {
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
 
-        let actual_crc = Record::calculate_checksum_from_fields(
-            id,
-            ts,
-            version,
-            &k,
-            k_len as u32,
-            &v,
-            v_len as u32,
-            &kvmd,
-        );
+        rec.id = id;
+        rec.ts = ts;
+        rec.version = version;
+        rec.metadata = kvmd;
+        rec.key = k.into();
+        rec.value = v.into();
+        rec.value_len = v_len as u32;
+        rec.key_len = k_len as u32;
+
+        let actual_crc = rec.calculate_crc32();
         if entry_crc != actual_crc {
             let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
 
@@ -206,14 +206,6 @@ impl RecordReader {
             ))));
         }
 
-        rec.id = id;
-        rec.ts = ts;
-        rec.version = version;
-        rec.metadata = kvmd;
-        rec.key = k.into();
-        rec.value = v.into();
-        rec.value_len = v_len as u32;
-        rec.key_len = k_len as u32;
         rec.crc32 = entry_crc;
 
         Ok((segment_id, offset))

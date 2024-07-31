@@ -116,6 +116,19 @@ pub(crate) struct Record {
     pub(crate) crc32: u32,
 }
 
+impl Hash for Record {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.ts.hash(state);
+        self.version.hash(state);
+        self.key_len.hash(state);
+        self.key.hash(state);
+        self.metadata.hash(state);
+        self.value_len.hash(state);
+        self.value.hash(state);
+    }
+}
+
 impl Record {
     pub(crate) fn new() -> Self {
         Record {
@@ -131,40 +144,10 @@ impl Record {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn calculate_checksum_from_fields(
-        id: u64,
-        ts: u64,
-        version: u16,
-        key: &[u8],
-        key_len: u32,
-        value: &[u8],
-        value_len: u32,
-        metadata: &Option<Metadata>, // Assuming Metadata is a type that implements Hash
-    ) -> u32 {
+    pub(crate) fn calculate_crc32(&self) -> u32 {
         let mut hasher = crc32Hasher::new();
-        id.hash(&mut hasher);
-        ts.hash(&mut hasher);
-        version.hash(&mut hasher);
-        key_len.hash(&mut hasher);
-        key.hash(&mut hasher);
-        metadata.hash(&mut hasher);
-        value_len.hash(&mut hasher);
-        value.hash(&mut hasher);
+        self.hash(&mut hasher);
         hasher.finalize()
-    }
-
-    pub(crate) fn calculate_checksum(&self) -> u32 {
-        Self::calculate_checksum_from_fields(
-            self.id,
-            self.ts,
-            self.version,
-            &self.key,
-            self.key_len,
-            &self.value,
-            self.value_len,
-            &self.metadata,
-        )
     }
 
     pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
@@ -180,7 +163,7 @@ impl Record {
             value: entry.value,
         };
 
-        let crc32 = rec.calculate_checksum();
+        let crc32 = rec.calculate_crc32();
 
         // Return a new Record instance with the correct crc32 value
         Record { crc32, ..rec }
@@ -211,7 +194,7 @@ impl Record {
             value: entry.value,
         };
 
-        let crc32 = rec.calculate_checksum();
+        let crc32 = rec.calculate_crc32();
 
         // Return a new Record instance with the correct crc32 value
         Record { crc32, ..rec }
