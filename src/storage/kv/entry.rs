@@ -1,14 +1,15 @@
 use ahash::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crc32fast::Hasher as crc32Hasher;
 
 use crate::storage::{
     kv::error::{Error, Result},
     kv::meta::Metadata,
     kv::store::Core,
-    kv::util::calculate_crc32_combined,
 };
 
 pub(crate) const MD_SIZE: usize = 1; // Size of txmdLen and kvmdLen in bytes
@@ -61,10 +62,6 @@ impl Entry {
         } else {
             false
         }
-    }
-
-    pub(crate) fn crc32(&self) -> u32 {
-        calculate_crc32_combined(&self.key, &self.value)
     }
 }
 
@@ -134,18 +131,59 @@ impl Record {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn calculate_checksum_from_fields(
+        id: u64,
+        ts: u64,
+        version: u16,
+        key: &[u8],
+        key_len: u32,
+        value: &[u8],
+        value_len: u32,
+        metadata: &Option<Metadata>, // Assuming Metadata is a type that implements Hash
+    ) -> u32 {
+        let mut hasher = crc32Hasher::new();
+        id.hash(&mut hasher);
+        ts.hash(&mut hasher);
+        version.hash(&mut hasher);
+        key_len.hash(&mut hasher);
+        key.hash(&mut hasher);
+        metadata.hash(&mut hasher);
+        value_len.hash(&mut hasher);
+        value.hash(&mut hasher);
+        hasher.finalize()
+    }
+
+    pub(crate) fn calculate_checksum(&self) -> u32 {
+        Self::calculate_checksum_from_fields(
+            self.id,
+            self.ts,
+            self.version,
+            &self.key,
+            self.key_len,
+            &self.value,
+            self.value_len,
+            &self.metadata,
+        )
+    }
+
     pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
-        Record {
+        let rec = Record {
             id: tx_id,
             ts: commit_ts,
-            crc32: entry.crc32(),
+            crc32: 0, // Temporarily set to 0, will be updated after initialization
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-        }
+        };
+
+        let crc32 = rec.calculate_checksum();
+
+        // Return a new Record instance with the correct crc32 value
+        Record { crc32, ..rec }
     }
 
     pub(crate) fn reset(&mut self) {
@@ -161,18 +199,22 @@ impl Record {
     }
 
     pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
-        let crc32 = entry.crc32();
-        Record {
+        let rec = Record {
             id: tx_id,
             ts: entry.ts,
+            crc32: 0, // Temporarily set to 0, will be updated after initialization
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
             key: entry.key,
             metadata: entry.metadata,
             value_len: entry.value.len() as u32,
             value: entry.value,
-            crc32,
-        }
+        };
+
+        let crc32 = rec.calculate_checksum();
+
+        // Return a new Record instance with the correct crc32 value
+        Record { crc32, ..rec }
     }
 
     pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {

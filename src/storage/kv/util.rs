@@ -22,13 +22,6 @@ pub(crate) fn calculate_crc32(buf: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-pub(crate) fn calculate_crc32_combined(buf1: &[u8], buf2: &[u8]) -> u32 {
-    let mut hasher = crc32Hasher::new();
-    hasher.update(buf1);
-    hasher.update(buf2);
-    hasher.finalize()
-}
-
 /// Gets the current time in nanoseconds since the Unix epoch.
 /// It gets the current time in UTC, extracts the timestamp in nanoseconds, and asserts that the timestamp is positive.
 /// It returns the timestamp as a 64-bit unsigned integer.

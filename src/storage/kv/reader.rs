@@ -9,7 +9,6 @@ use crate::storage::{
         entry::{Record, MAX_KV_METADATA_SIZE},
         error::{Error, Result},
         meta::Metadata,
-        util::calculate_crc32_combined,
     },
     log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
 };
@@ -184,7 +183,16 @@ impl RecordReader {
         let offset = self.r.offset();
         let v = self.r.read_bytes(v_len)?;
 
-        let actual_crc = calculate_crc32_combined(&k, &v);
+        let actual_crc = Record::calculate_checksum_from_fields(
+            id,
+            ts,
+            version,
+            &k,
+            k_len as u32,
+            &v,
+            v_len as u32,
+            &kvmd,
+        );
         if entry_crc != actual_crc {
             let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
 
