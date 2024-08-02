@@ -262,6 +262,8 @@ impl RecordReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::storage::log::{Aol, Options, SegmentRef};
     use tempdir::TempDir;
@@ -276,11 +278,11 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 4,
             ..Options::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        });
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Test initial offset
         let sz = (a.active_segment_id, a.active_segment.offset());
@@ -332,12 +334,12 @@ mod tests {
         const REC_SIZE: usize = 20;
         let num_items = 100;
         // Create aol options and open a aol file
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 40,
             ..Options::default()
-        };
+        });
 
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a = Aol::open(temp_dir.path(), opts).expect("should create aol");
 
         // Append 10 records
         for i in 0..num_items {

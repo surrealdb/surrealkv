@@ -292,8 +292,8 @@ impl Core {
     // This function initializes the manifest log for the database to store all settings.
     pub(crate) fn initialize_manifest(dir: &Path) -> Result<Aol> {
         let manifest_subdir = dir.join("manifest");
-        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
+        let mopts = Arc::new(LogOptions::default().with_file_extension("manifest".to_string()));
+        Aol::open(&manifest_subdir, mopts).map_err(Error::from)
     }
 
     // This function initializes the commit log (clog) for the database.
@@ -304,9 +304,11 @@ impl Core {
         // Then it creates a LogOptions object to configure the clog.
         // The maximum file size for the clog is set to the max_segment_size option from the database options.
         // The file extension for the clog files is set to "clog".
-        let copts = LogOptions::default()
-            .with_max_file_size(opts.max_segment_size)
-            .with_file_extension("clog".to_string());
+        let copts = Arc::new(
+            LogOptions::default()
+                .with_max_file_size(opts.max_segment_size)
+                .with_file_extension("clog".to_string()),
+        );
 
         // It then attempts to restore any repair files in the clog subdirectory.
         // If this fails, the error is propagated up to the caller of the function.
@@ -319,7 +321,7 @@ impl Core {
 
         // Finally, it attempts to open the clog with the specified options.
         // If this fails, the error is converted to a database error and then propagated up to the caller of the function.
-        Aol::open(&clog_subdir, &copts).map_err(Error::from)
+        Aol::open(&clog_subdir, copts).map_err(Error::from)
     }
 
     /// Creates a new Core with the given options.

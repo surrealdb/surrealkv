@@ -117,6 +117,8 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::storage::log::Aol;
     use crate::storage::log::Options as LogOptions;
 
@@ -131,8 +133,8 @@ mod tests {
     fn test_manifest_append_and_load() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
-        let opts = LogOptions::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(LogOptions::default());
+        let mut a = Aol::open(temp_dir.path(), opts).expect("should create aol");
 
         let manifest = Manifest {
             changes: vec![ManifestChangeType::Options(Options::default())],
@@ -154,8 +156,8 @@ mod tests {
     fn test_add_and_read_multiple_manifests() {
         // Step 1: Create a temporary directory
         let temp_dir = create_temp_directory();
-        let log_opts = LogOptions::default();
-        let mut a = Aol::open(temp_dir.path(), &log_opts).expect("should create aol");
+        let log_opts = Arc::new(LogOptions::default());
+        let mut a = Aol::open(temp_dir.path(), log_opts).expect("should create aol");
 
         // Step 2: Create the first Manifest instance and append it to the file
         let first_manifest = Manifest {

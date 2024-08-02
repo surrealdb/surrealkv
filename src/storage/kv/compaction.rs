@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use bytes::BytesMut;
 
@@ -88,10 +89,12 @@ impl StoreInner {
 
         // Prepare a temporary commit log directory
         let temp_clog_dir = tmp_merge_dir.join("clog");
-        let tm_opts = LogOptions::default()
-            .with_max_file_size(self.core.opts.max_compaction_segment_size)
-            .with_file_extension("clog".to_string());
-        let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
+        let tm_opts = Arc::new(
+            LogOptions::default()
+                .with_max_file_size(self.core.opts.max_compaction_segment_size)
+                .with_file_extension("clog".to_string()),
+        );
+        let mut temp_writer = Aol::open(&temp_clog_dir, tm_opts)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
         // check in files for the keys that are not found in memory to handle deletion

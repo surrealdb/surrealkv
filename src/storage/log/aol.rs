@@ -1,16 +1,17 @@
 use std::fs;
 use std::io;
 use std::mem;
-use std::num::NonZeroUsize;
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
+
+use super::fd::FileDescriptorTable;
 
 /// Append-Only Log (Aol) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -27,7 +28,7 @@ pub struct Aol {
     pub(crate) dir: PathBuf,
 
     /// Configuration options for the AOL instance.
-    pub(crate) opts: Options,
+    pub(crate) opts: Arc<Options>,
 
     /// A flag indicating whether the AOL instance is closed or not.
     closed: bool,
@@ -36,7 +37,7 @@ pub struct Aol {
     mutex: Mutex<()>,
 
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RwLock<LruCache<u64, Segment>>,
+    readers: FileDescriptorTable,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
@@ -47,22 +48,18 @@ impl Aol {
     ///
     /// This function prepares the AOL instance by creating the necessary directory,
     /// determining the active segment ID, and initializing the active segment.
-    pub fn open(dir: &Path, opts: &Options) -> Result<Self> {
+    pub fn open(dir: &Path, opts: Arc<Options>) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(dir, opts)?;
+        Self::prepare_directory(dir, opts.clone())?;
 
         // Determine the active segment ID
         let active_segment_id = Self::calculate_current_write_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts)?;
-
-        // Create the segment cache
-        // TODO: fix unwrap and return error
-        let cache = LruCache::new(NonZeroUsize::new(opts.max_open_files).unwrap());
+        let active_segment = Segment::open(dir, active_segment_id, opts.clone())?;
 
         Ok(Self {
             active_segment,
@@ -71,13 +68,13 @@ impl Aol {
             opts: opts.clone(),
             closed: false,
             mutex: Mutex::new(()),
-            segment_cache: RwLock::new(cache),
+            readers: FileDescriptorTable::new(opts.max_open_fds),
             fsync_failed: Default::default(),
         })
     }
 
     // Helper function to prepare the directory with proper permissions
-    fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
+    fn prepare_directory(dir: &Path, opts: Arc<Options>) -> Result<()> {
         fs::create_dir_all(dir)?;
 
         if let Ok(metadata) = fs::metadata(dir) {
@@ -126,7 +123,7 @@ impl Aol {
         let _lock = self.mutex.lock();
 
         // Get options and initialize variables
-        let opts = &self.opts;
+        let opts = self.opts.clone();
 
         // Calculate available space in the active segment
         let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
@@ -146,7 +143,7 @@ impl Aol {
             self.active_segment_id += 1;
 
             // Open a new segment for writing
-            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+            let new_segment = Segment::open(&self.dir, self.active_segment_id, self.opts.clone())?;
 
             // Retrieve the previous active segment and replace it with the new one
             let _ = mem::replace(&mut self.active_segment, new_segment);
@@ -220,14 +217,16 @@ impl Aol {
             let _lock = self.mutex.lock();
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let mut cache = self.segment_cache.write();
-            match cache.get(&segment_id) {
-                Some(segment) => segment.read_at(buf, read_offset),
-                None => {
-                    let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
-                    let read_bytes = segment.read_at(buf, read_offset)?;
-                    cache.push(segment_id, segment);
-                    Ok(read_bytes)
+            let readers = &self.readers;
+            match readers.read_at(segment_id, buf, read_offset) {
+                Ok(value) => Ok(value),
+                Err(e) => {
+                    if let Error::SegmentNotFound = e {
+                        readers.insert_segment(&self.dir, segment_id, self.opts.clone())?;
+                        readers.read_at(segment_id, buf, read_offset)
+                    } else {
+                        Err(e)
+                    }
                 }
             }
         }
@@ -243,7 +242,7 @@ impl Aol {
         let _lock = self.mutex.lock();
         self.active_segment.close()?;
         self.active_segment_id += 1;
-        self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+        self.active_segment = Segment::open(&self.dir, self.active_segment_id, self.opts.clone())?;
         Ok(self.active_segment_id)
     }
 
@@ -298,8 +297,8 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Test initial offset
         let sz = (a.active_segment_id, a.active_segment.offset());
@@ -369,8 +368,8 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
@@ -414,8 +413,8 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
@@ -480,11 +479,11 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 1024,
             ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        });
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         let large_record = vec![1; 1025];
         let small_record = vec![1; 1024];
@@ -507,11 +506,11 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 1024,
             ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        });
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         let small_record = vec![1; 1024];
         let r = a.append(&small_record);
@@ -538,11 +537,11 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create aol options and open a aol file
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 1024,
             ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        });
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         let large_record = vec![1; 1024];
         let small_record = vec![1; 512];
@@ -556,7 +555,7 @@ mod tests {
 
         a.close().expect("should close");
 
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
         assert_eq!(0, a.active_segment_id);
 
         let r = a.append(&small_record);
@@ -573,11 +572,11 @@ mod tests {
         let temp_dir = create_temp_directory();
 
         // Create AOL options with a small max file size to force a new file creation on overflow
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 1024, // Small enough to ensure the second append creates a new file
             ..Default::default()
-        };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        });
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Append a record that fits within the first file
         let first_record = vec![1; 512];
@@ -612,8 +611,8 @@ mod tests {
     fn read_beyond_current_offset_should_fail() {
         // Setup: Create a temporary directory and initialize the log with default options
         let temp_dir = create_temp_directory();
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Append a single record to ensure there is some data in the log
         let record = vec![1; 512];
@@ -634,18 +633,18 @@ mod tests {
     fn append_after_reopening_log() {
         // Setup: Create a temporary directory and initialize the log
         let temp_dir = create_temp_directory();
-        let opts = Options::default();
+        let opts = Arc::new(Options::default());
         let record = vec![1; 512];
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
             a.append(&record).expect("append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should reopen aol");
             a.append(&record)
                 .expect("append after reopen should succeed");
 
@@ -665,22 +664,22 @@ mod tests {
     fn append_across_two_files_and_read() {
         // Setup: Create a temporary directory and initialize the log with small max file size
         let temp_dir = create_temp_directory();
-        let opts = Options {
+        let opts = Arc::new(Options {
             max_file_size: 512, // Set max file size to 512 bytes to force new file creation on second append
             ..Default::default()
-        };
+        });
         let record = vec![1; 512]; // Each record is 512 bytes
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
             a.append(&record).expect("first append should succeed");
             a.append(&record).expect("first append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record, which should create a new file
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should reopen aol");
 
             // Verify: Ensure the first record is in a new file by reading it back
             let mut read_buf = vec![0; 512];
@@ -711,8 +710,8 @@ mod tests {
     #[test]
     fn sequential_read_performance() {
         let temp_dir = create_temp_directory();
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
@@ -738,8 +737,8 @@ mod tests {
     #[test]
     fn random_access_read_performance() {
         let temp_dir = create_temp_directory();
-        let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut a = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
@@ -771,8 +770,8 @@ mod tests {
     #[test]
     fn test_rotate_functionality() {
         let temp_dir = create_temp_directory();
-        let opts = Options::default();
-        let mut aol = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let opts = Arc::new(Options::default());
+        let mut aol = Aol::open(temp_dir.path(), opts.clone()).expect("should create aol");
 
         // Ensure there's data in the current segment to necessitate a rotation
         aol.append(b"data 1").unwrap();

@@ -1,4 +1,5 @@
 mod aol;
+mod fd;
 pub use aol::Aol;
 
 use ahash::{HashMap, HashMapExt};
@@ -8,7 +9,7 @@ use std::fs::{read_dir, OpenOptions};
 use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 
 /// The `READ_BUF_SIZE` constant represents the size of a buffer for disk reads from
 /// the append-only log.
@@ -44,7 +45,7 @@ const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
 const DEFAULT_FILE_SIZE: u64 = 4096 * 256 * 20; // 20mb
 
 /// Default maximum number of open files allowed.
-const DEFAULT_MAX_OPEN_FILES: usize = 16;
+const DEFAULT_MAX_OPEN_FILES: usize = 4;
 
 /// Constants for key names used in the file header.
 const KEY_MAGIC: &str = "magic";
@@ -139,12 +140,8 @@ pub struct Options {
     /// This is used by aol to cycle segments when the max file size is reached.
     pub(crate) max_file_size: u64,
 
-    /// The maximum number of open files allowed.
-    ///
-    /// If specified, this option sets the maximum number of open files allowed.
-    ///
-    /// This is used by aol to initialize the segment cache.
-    pub(crate) max_open_files: usize,
+    /// The maximum number of open file descriptors per segment allowed.
+    pub(crate) max_open_fds: usize,
 }
 
 impl Default for Options {
@@ -157,7 +154,7 @@ impl Default for Options {
             metadata: None,                                       // default metadata
             file_extension: None,                                 // default extension
             max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
-            max_open_files: DEFAULT_MAX_OPEN_FILES,
+            max_open_fds: DEFAULT_MAX_OPEN_FILES,
         }
     }
 }
@@ -261,7 +258,7 @@ impl Metadata {
     /// # Returns
     ///
     /// Returns a `Metadata` instance containing the file header information.
-    fn new_file_header(id: u64, opts: &Options) -> Result<Self> {
+    fn new_file_header(id: u64, opts: Arc<Options>) -> Result<Self> {
         let mut buf = Metadata::new(None);
 
         // Set file header key-value pairs using constants
@@ -386,7 +383,7 @@ pub(crate) fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
     read_field(file)
 }
 
-fn write_file_header(file: &mut File, id: u64, opts: &Options) -> Result<usize> {
+fn write_file_header(file: &mut File, id: u64, opts: Arc<Options>) -> Result<usize> {
     // Create a buffer to hold the header
     let mut buf = Vec::new();
 
@@ -403,16 +400,16 @@ fn write_file_header(file: &mut File, id: u64, opts: &Options) -> Result<usize> 
     Ok(buf.len())
 }
 
-fn validate_file_header(header: &[u8], id: u64, opts: &Options) -> Result<()> {
+fn validate_file_header(header: &[u8], id: u64, opts: Arc<Options>) -> Result<()> {
     validate_magic_version(header)?;
     validate_segment_id(header, id)?;
-    validate_compression(header, opts)?;
+    validate_compression(header, opts.clone())?;
     validate_metadata(header, opts)?;
 
     Ok(())
 }
 
-fn validate_metadata(header: &[u8], opts: &Options) -> Result<()> {
+fn validate_metadata(header: &[u8], opts: Arc<Options>) -> Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
     let additional_md = meta.get(KEY_ADDITIONAL_METADATA);
@@ -462,7 +459,7 @@ fn validate_segment_id(header: &[u8], id: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
+fn validate_compression(header: &[u8], opts: Arc<Options>) -> Result<()> {
     let mut meta = Metadata::new(None);
     meta.read_from(&mut &header[..])?;
 
@@ -661,7 +658,7 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
-    pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
+    pub(crate) fn open(dir: &Path, id: u64, opts: Arc<Options>) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
@@ -673,7 +670,7 @@ impl Segment {
         let file_path_is_file = file_path.is_file();
 
         // Open the file with the specified options
-        let mut file = Self::open_file(&file_path, opts)?;
+        let mut file = Self::open_file(&file_path, opts.clone())?;
 
         // Initialize the file header offset
         let mut file_header_offset = 0;
@@ -682,7 +679,7 @@ impl Segment {
         if file_path_exists && file_path_is_file {
             // Handle existing file
             let header = read_file_header(&mut file)?;
-            validate_file_header(&header, id, opts)?;
+            validate_file_header(&header, id, opts.clone())?;
 
             file_header_offset += 4 + header.len();
             let (index, _) = parse_segment_name(&file_name)?;
@@ -694,7 +691,7 @@ impl Segment {
             }
         } else {
             // Write new file header
-            let header_len = write_file_header(&mut file, id, opts)?;
+            let header_len = write_file_header(&mut file, id, opts.clone())?;
             file_header_offset += header_len;
         }
 
@@ -713,7 +710,7 @@ impl Segment {
         })
     }
 
-    fn open_file(file_path: &Path, opts: &Options) -> Result<File> {
+    fn open_file(file_path: &Path, opts: Arc<Options>) -> Result<File> {
         let mut open_options = OpenOptions::new();
         open_options.read(true).append(true);
 
@@ -1104,10 +1101,10 @@ mod tests {
     #[test]
     fn metadata_extension() {
         let id = 12345;
-        let opts = Options::default();
+        let opts = Arc::new(Options::default());
 
         // Create a new metadata using new_file_header
-        let mut meta = Metadata::new_file_header(id, &opts).unwrap();
+        let mut meta = Metadata::new_file_header(id, opts.clone()).unwrap();
 
         // Create an extended metadata
         let mut extended_meta = Metadata::new(None);
@@ -1151,6 +1148,8 @@ mod tests {
         metadata.put_uint("key2", 456);
         opts.metadata = Some(metadata);
 
+        let opts = Arc::new(opts);
+
         // Create a new segment file and write the header
         let segment_path = temp_dir.path().join("00000000000000000000");
         let mut file = OpenOptions::new()
@@ -1162,7 +1161,7 @@ mod tests {
             .expect("should create file");
 
         let id = 0;
-        write_file_header(&mut file, id, &opts).expect("should write header");
+        write_file_header(&mut file, id, opts.clone()).expect("should write header");
         file.seek(io::SeekFrom::Start(0))
             .expect("should seek to start"); // Reset the cursor
 
@@ -1170,7 +1169,7 @@ mod tests {
         let header = read_file_header(&mut file).expect("should read header");
 
         // Validate the file header
-        let result = validate_file_header(&header, id, &opts);
+        let result = validate_file_header(&header, id, opts.clone());
         assert!(result.is_ok());
     }
 
@@ -1180,7 +1179,7 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options
-        let mut opts = Options::default();
+        let opts = Arc::new(Options::default());
 
         // Create a new segment file and write the header
         let segment_path = temp_dir.path().join("00000000000000000000");
@@ -1193,7 +1192,7 @@ mod tests {
             .expect("should create file");
 
         let id = 0;
-        write_file_header(&mut file, id, &opts).expect("should write header");
+        write_file_header(&mut file, id, opts.clone()).expect("should write header");
         file.seek(io::SeekFrom::Start(0))
             .expect("should seek to start"); // Reset the cursor
 
@@ -1201,10 +1200,14 @@ mod tests {
         let header = read_file_header(&mut file).expect("should read header");
 
         // Modify the metadata to an unexpected value
-        opts.metadata = Some(Metadata::new(None)); // This doesn't match the default metadata
+        let opts = Options {
+            metadata: Some(Metadata::new(None)),
+            ..Default::default()
+        };
+        let opts = Arc::new(opts);
 
         // Validate the file header, expecting an error due to mismatched compression level
-        let result = validate_file_header(&header, id, &opts);
+        let result = validate_file_header(&header, id, opts.clone());
         assert!(result.is_err()); // Header validation should throw an error
     }
 
@@ -1247,23 +1250,23 @@ mod tests {
     #[test]
     fn segments_empty_directory() {
         let temp_dir = create_temp_directory();
-        let dir = temp_dir.path().to_path_buf();
+        let dir = &temp_dir.path().to_path_buf();
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(dir).unwrap();
         assert_eq!(result, (0, 0));
     }
 
     #[test]
     fn segments_non_empty_directory() {
         let temp_dir = create_temp_directory();
-        let dir = temp_dir.path().to_path_buf();
+        let dir = &temp_dir.path().to_path_buf();
 
-        create_segment_file(&dir, "00000000000000000001.log");
-        create_segment_file(&dir, "00000000000000000003.log");
-        create_segment_file(&dir, "00000000000000000002.log");
-        create_segment_file(&dir, "00000000000000000004.log");
+        create_segment_file(dir, "00000000000000000001.log");
+        create_segment_file(dir, "00000000000000000003.log");
+        create_segment_file(dir, "00000000000000000002.log");
+        create_segment_file(dir, "00000000000000000004.log");
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(dir).unwrap();
         assert_eq!(result, (1, 4));
     }
 
@@ -1283,8 +1286,9 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
-        let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let opts = Arc::new(Options::default());
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1361,8 +1365,9 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
-        let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let opts = Arc::new(Options::default());
+        let segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1370,7 +1375,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1382,8 +1388,9 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
-        let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let opts = Arc::new(Options::default());
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1412,7 +1419,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 11);
@@ -1452,7 +1460,8 @@ mod tests {
         assert!(segment.close().is_ok());
 
         // Reopen segment
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
         // Test initial offset
         assert_eq!(segment.offset(), 11 + 4);
 
@@ -1467,8 +1476,9 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
-        let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let opts = Arc::new(Options::default());
+        let segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1476,7 +1486,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1488,9 +1499,10 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options
-        let opts = Options::default();
+        let opts = Arc::new(Options::default());
 
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1511,7 +1523,7 @@ mod tests {
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
-        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts);
+        let reopened_segment = Segment::open(temp_dir.path(), 0, opts.clone());
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
     }
 
@@ -1521,10 +1533,11 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options
-        let opts = Options::default();
+        let opts = Arc::new(Options::default());
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1541,7 +1554,8 @@ mod tests {
         assert!(n.is_err()); // Reading should fail
 
         // Reopen the closed segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should reopen segment");
 
         // Try to perform operations on the reopened segment
         let r = segment.append(&[4, 5, 6, 7]);
@@ -1554,10 +1568,11 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options
-        let opts = Options::default();
+        let opts = Arc::new(Options::default());
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Append data to the segment
         let append_result = segment.append(&[0, 1, 2, 3]);
@@ -1590,8 +1605,9 @@ mod tests {
         let temp_dir = TempDir::new("test").expect("should create temp dir");
 
         // Create segment options and open a segment
-        let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let opts = Arc::new(Options::default());
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1616,7 +1632,8 @@ mod tests {
         segment.close().expect("should close segment");
 
         // Reopen segment and validate offset
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let mut segment =
+            Segment::open(temp_dir.path(), 0, opts.clone()).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
