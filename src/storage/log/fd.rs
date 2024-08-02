@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ pub struct SysFile {
 }
 
 impl SysFile {
-    fn new(dir: &PathBuf, id: u64, opts: Arc<Options>) -> Result<Self> {
+    fn new(dir: &Path, id: u64, opts: Arc<Options>) -> Result<Self> {
         Ok(SysFile {
             file: Mutex::new(Segment::open(dir, id, opts.clone())?),
             in_use: AtomicBool::new(false),
@@ -36,11 +36,11 @@ struct FileHandle {
 }
 
 impl FileHandle {
-    fn new(dir: &PathBuf, segment_id: u64, opts: Arc<Options>, max_fds: usize) -> Result<Self> {
+    fn new(dir: &Path, segment_id: u64, opts: Arc<Options>, max_fds: usize) -> Result<Self> {
         let file = SysFile::new(dir, segment_id, opts.clone())?.into();
         Ok(FileHandle {
             segment_id,
-            dir: dir.clone(),
+            dir: dir.to_path_buf(),
             file_descriptors: vec![(file)],
             max_fds,
             opts,
@@ -89,7 +89,7 @@ impl FileDescriptorTable {
         }
     }
 
-    pub fn insert_segment(&self, dir: &PathBuf, segment_id: u64, opts: Arc<Options>) -> Result<()> {
+    pub fn insert_segment(&self, dir: &Path, segment_id: u64, opts: Arc<Options>) -> Result<()> {
         let file_handle = FileHandle::new(dir, segment_id, opts.clone(), self.max_fds_per_file)?;
         self.table
             .insert(segment_id, Arc::new(Mutex::new(file_handle)));
@@ -145,7 +145,7 @@ mod tests {
         let opts = create_segment_file(&temp_dir, segment_id);
 
         table
-            .insert_segment(&temp_dir.path().to_path_buf(), segment_id, opts)
+            .insert_segment(temp_dir.path(), segment_id, opts)
             .unwrap();
 
         let mut buffer = [0; 4];
@@ -163,7 +163,7 @@ mod tests {
         let opts = create_segment_file(&temp_dir, segment_id);
 
         table
-            .insert_segment(&temp_dir.path().to_path_buf(), segment_id, opts)
+            .insert_segment(temp_dir.path(), segment_id, opts)
             .unwrap();
 
         let mut handles = vec![];
