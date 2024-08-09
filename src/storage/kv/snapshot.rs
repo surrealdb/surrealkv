@@ -244,18 +244,20 @@ mod tests {
         let keys = txn
             .keys_at_ts(range.clone(), ts)
             .expect("Failed to get keys at timestamp");
-        assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
-        assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
+        assert_eq!(keys[0], b"k1");
+        assert_eq!(keys[1], b"k2");
 
         // Test scan_at_ts
         let entries = txn
-            .scan_at_ts(range, ts)
+            .scan_at_ts(range, ts, Some(10))
             .expect("Failed to scan at timestamp");
         assert_eq!(
             entries.len(),
             keys_values.len(),
             "Should match the number of keys"
         );
+        assert_eq!(entries[0], (b"k1".to_vec(), b"value1Updated".to_vec()));
+        assert_eq!(entries[1], (b"k2".to_vec(), b"value2Updated".to_vec()));
 
         // Enhance get_history testing
         for (key, initial_value, updated_value) in keys_values.iter() {
