@@ -524,17 +524,50 @@ impl Transaction {
     }
 
     /// Returns key-value pairs within the specified range, at the given timestamp.
-    pub fn scan_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<(Vec<u8>, Bytes)>>
+    pub fn scan_at_ts<'b, R>(
+        &'b self,
+        range: R,
+        ts: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
-        self.ensure_read_only_transaction()?;
-
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
+        let items = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
 
-        Ok(result)
+        let mut results = Vec::new();
+        'outer: for (mut key, value) in items {
+            // If a limit is set and we've already got enough results, break the loop.
+            if let Some(limit) = limit {
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            // Create a new value reference and decode the value.
+            let mut val_ref = ValueRef::new(self.core.clone());
+            // The version is not used for decoding and resolving of the actual
+            // value, so just use 0 as a placeholder.
+            val_ref.decode(0, &value)?;
+
+            // Apply all filters. If any filter fails, skip this key and continue with the next one.
+            for filter in &FILTERS {
+                if filter.apply(&val_ref, ts).is_err() {
+                    continue 'outer;
+                }
+            }
+
+            // Resolve the value reference to get the actual value.
+            let v = val_ref.resolve()?;
+
+            // Remove the trailing `\0`.
+            key.truncate(key.len() - 1);
+            results.push((key, v));
+        }
+
+        Ok(results)
     }
 
     /// Returns keys within the specified range, at the given timestamp.
@@ -546,7 +579,16 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let result = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
+        let keys = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
+
+        // Remove the trailing `\0`.
+        let result = keys
+            .into_iter()
+            .map(|mut key| {
+                key.truncate(key.len() - 1);
+                key
+            })
+            .collect();
 
         Ok(result)
     }
