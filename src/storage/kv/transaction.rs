@@ -468,8 +468,6 @@ impl Transaction {
 
     /// Returns the value associated with the key at the given timestamp.
     pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
-        self.ensure_read_only_transaction()?;
-
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
