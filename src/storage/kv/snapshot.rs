@@ -281,12 +281,12 @@ mod tests {
             assert_eq!(
                 txn.get_at_ts(key, initial_ts)
                     .expect("Failed to get value at initial timestamp"),
-                *initial_value
+                Some(initial_value.to_vec())
             );
             assert_eq!(
                 txn.get_at_ts(key, updated_ts)
                     .expect("Failed to get value at updated timestamp"),
-                *updated_value
+                Some(updated_value.to_vec())
             );
         }
     }

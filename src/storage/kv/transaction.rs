@@ -160,6 +160,14 @@ impl Transaction {
         Ok(())
     }
 
+    /// Adds a key-value pair to the store with the given timestamp.
+    pub fn set_at_ts(&mut self, key: &[u8], value: &[u8], ts: u64) -> Result<()> {
+        let mut entry = Entry::new(key, value);
+        entry.set_ts(ts);
+        self.write(entry)?;
+        Ok(())
+    }
+
     // Delete all the versions of a key. This is a hard delete.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         let value = Bytes::new();
@@ -388,8 +396,8 @@ impl Transaction {
         let oracle = self.core.oracle.clone();
         let write_ch_lock = oracle.write_lock.lock().await;
 
-        // Prepare for the commit by getting a transaction ID and a commit timestamp.
-        let (tx_id, commit_ts) = self.prepare_commit()?;
+        // Prepare for the commit by getting a transaction ID.
+        let tx_id = self.prepare_commit()?;
 
         // Extract the vector of entries for the current transaction.
         let entries: Vec<Entry> = std::mem::take(&mut self.write_set);
@@ -397,7 +405,7 @@ impl Transaction {
         // Commit the changes to the store index.
         let done = self
             .core
-            .send_to_write_channel(entries, tx_id, commit_ts, self.durability)
+            .send_to_write_channel(entries, tx_id, self.durability)
             .await;
 
         if let Err(err) = done {
@@ -425,20 +433,21 @@ impl Transaction {
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<(u64, u64)> {
+    fn prepare_commit(&mut self) -> Result<u64> {
         let oracle = self.core.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
-        let commit_ts = self.assign_commit_ts();
-        Ok((tx_id, commit_ts))
+        self.assign_commit_ts();
+        Ok(tx_id)
     }
 
     /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_ts(&mut self) -> u64 {
+    fn assign_commit_ts(&mut self) {
         let commit_ts = now();
         self.write_set.iter_mut().for_each(|entry| {
-            entry.ts = commit_ts;
+            if entry.ts == 0 {
+                entry.ts = commit_ts;
+            }
         });
-        commit_ts
     }
 
     /// Rolls back the transaction by removing all updated entries.
@@ -467,7 +476,7 @@ impl Transaction {
     }
 
     /// Returns the value associated with the key at the given timestamp.
-    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Vec<u8>> {
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
@@ -483,8 +492,9 @@ impl Transaction {
         {
             Ok(val_ref) => {
                 // Resolve the value reference to get the actual value.
-                val_ref.resolve()
+                val_ref.resolve().map(Some)
             }
+            Err(Error::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
     }

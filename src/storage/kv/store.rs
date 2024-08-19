@@ -278,8 +278,6 @@ pub struct Task {
     done: Option<Sender<Result<()>>>,
     /// Transaction ID
     tx_id: u64,
-    /// Commit timestamp
-    commit_ts: u64,
     /// Durability
     durability: Durability,
 }
@@ -638,13 +636,7 @@ impl Core {
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(req.entries.len());
 
-        encode_entries(
-            &req.entries,
-            req.tx_id,
-            req.commit_ts,
-            &mut buf,
-            &mut values_offsets,
-        );
+        encode_entries(&req.entries, req.tx_id, &mut buf, &mut values_offsets);
 
         let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
 
@@ -704,7 +696,7 @@ impl Core {
                 key: entry.key[..].into(),
                 value: index_value,
                 version: task.tx_id,
-                ts: task.commit_ts,
+                ts: entry.ts,
             });
         }
 
@@ -740,7 +732,6 @@ impl Core {
         &self,
         entries: Vec<Entry>,
         tx_id: u64,
-        commit_ts: u64,
         durability: Durability,
     ) -> Result<Receiver<Result<()>>> {
         let (tx, rx) = bounded(1);
@@ -748,7 +739,6 @@ impl Core {
             entries,
             done: Some(tx),
             tx_id,
-            commit_ts,
             durability,
         };
         self.writes_tx.send(req).await?;
@@ -1072,7 +1062,6 @@ mod tests {
                     entries: vec![],
                     done: Some(done_tx),
                     tx_id: i,
-                    commit_ts: i,
                     durability: Durability::default(),
                 })
                 .await
