@@ -68,12 +68,11 @@ impl Entry {
 pub(crate) fn encode_entries(
     entries: &[Entry],
     tx_id: u64,
-    commit_ts: u64,
     buf: &mut BytesMut,
     offset_tracker: &mut HashMap<Bytes, u64>,
 ) {
     for entry in entries {
-        let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id, commit_ts);
+        let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
         let offset = tx_record_entry.encode(buf).unwrap();
         offset_tracker.insert(entry.key.clone(), offset as u64);
     }
@@ -150,10 +149,10 @@ impl Record {
         hasher.finalize()
     }
 
-    pub(crate) fn new_from_entry(entry: Entry, tx_id: u64, commit_ts: u64) -> Self {
+    pub(crate) fn new_from_entry(entry: Entry, tx_id: u64) -> Self {
         let rec = Record {
             id: tx_id,
-            ts: commit_ts,
+            ts: entry.ts,
             crc32: 0, // Temporarily set to 0, will be updated after initialization
             version: RECORD_VERSION,
             key_len: entry.key.len() as u32,
