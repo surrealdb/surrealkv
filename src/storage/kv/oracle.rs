@@ -162,15 +162,15 @@ impl SnapshotIsolation {
         let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts())?;
         let read_set = txn.read_set.lock();
 
-        for (key, ts) in read_set.iter() {
-            match current_snapshot.get(&key[..].into()) {
+        for entry in read_set.iter() {
+            match current_snapshot.get(&entry.key[..].into()) {
                 Ok(val_ref) => {
-                    if *ts != val_ref.ts() {
+                    if entry.ts != val_ref.ts() {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
                 Err(Error::KeyNotFound) => {
-                    if *ts > 0 {
+                    if entry.ts > 0 {
                         return Err(Error::TransactionReadConflict);
                     }
                     continue;
@@ -247,8 +247,8 @@ impl CommitTracker {
             for committed_tx in self.committed_transactions.iter() {
                 if committed_tx.ts > txn.read_ts {
                     for conflict_key in committed_tx.conflict_keys.iter() {
-                        for range in txn.read_key_ranges.lock().iter() {
-                            if key_in_range(conflict_key, range) {
+                        for rs_entry in txn.read_key_ranges.lock().iter() {
+                            if key_in_range(conflict_key, &rs_entry.start, &rs_entry.end) {
                                 return true;
                             }
                         }
@@ -262,22 +262,26 @@ impl CommitTracker {
                 .any(|committed_txn| {
                     read_set
                         .iter()
-                        .any(|read| committed_txn.conflict_keys.contains(&read.0))
+                        .any(|read| committed_txn.conflict_keys.contains(&read.key))
                 })
         }
     }
 }
 
-fn key_in_range(key: &Bytes, range: &(Bound<VariableSizeKey>, Bound<VariableSizeKey>)) -> bool {
+fn key_in_range(
+    key: &Bytes,
+    range_start: &Bound<VariableSizeKey>,
+    range_end: &Bound<VariableSizeKey>,
+) -> bool {
     let key = VariableSizeKey::from_slice_with_termination(key);
 
-    let start_inclusive = match &range.0 {
+    let start_inclusive = match &range_start {
         Bound::Included(start) => key >= *start,
         Bound::Excluded(start) => key > *start,
         Bound::Unbounded => true,
     };
 
-    let end_exclusive = match &range.1 {
+    let end_exclusive = match &range_end {
         Bound::Included(end) => key <= *end,
         Bound::Excluded(end) => key < *end,
         Bound::Unbounded => true,
@@ -363,7 +367,7 @@ impl SerializableSnapshotIsolation {
         assert!(ts >= commit_tracker.last_cleanup_ts);
 
         // Add the transaction to the list of committed transactions with conflict keys.
-        let conflict_keys: HashSet<Bytes> = txn.write_set.iter().map(|e| e.key.clone()).collect();
+        let conflict_keys: HashSet<Bytes> = txn.write_set.iter().map(|e| e.e.key.clone()).collect();
 
         commit_tracker
             .committed_transactions

@@ -77,6 +77,53 @@ pub enum Durability {
     Immediate,
 }
 
+pub(crate) struct WriteSetEntry {
+    pub(crate) e: Entry,
+    pub(crate) savepoint_no: u32,
+}
+
+impl WriteSetEntry {
+    pub(crate) fn new(e: Entry, savepoint_no: u32) -> Self {
+        Self { e, savepoint_no }
+    }
+}
+
+pub(crate) struct ReadSetEntry {
+    pub(crate) key: Bytes,
+    pub(crate) ts: u64,
+    pub(crate) savepoint_no: u32,
+}
+
+impl ReadSetEntry {
+    pub(crate) fn new(key: Bytes, ts: u64, savepoint_no: u32) -> Self {
+        Self {
+            key,
+            ts,
+            savepoint_no,
+        }
+    }
+}
+
+pub(crate) struct ReadScanEntry {
+    pub(crate) start: Bound<VariableSizeKey>,
+    pub(crate) end: Bound<VariableSizeKey>,
+    pub(crate) savepoint_no: u32,
+}
+
+impl ReadScanEntry {
+    pub(crate) fn new(
+        start: Bound<VariableSizeKey>,
+        end: Bound<VariableSizeKey>,
+        savepoint_no: u32,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            savepoint_no,
+        }
+    }
+}
+
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
     /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
@@ -99,13 +146,13 @@ pub struct Transaction {
 
     /// `write_set` is a vector of  entries.
     /// These are the changes that the transaction intends to make to the data.
-    pub(crate) write_set: Vec<Entry>,
+    pub(crate) write_set: Vec<WriteSetEntry>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
-    pub(crate) read_set: Mutex<Vec<(Bytes, u64)>>,
+    pub(crate) read_set: Mutex<Vec<ReadSetEntry>>,
 
     /// `read_key_ranges` is the key ranges that are read in the transaction from the snapshot. This is used for conflict detection.
-    pub(crate) read_key_ranges: Mutex<Vec<(Bound<VariableSizeKey>, Bound<VariableSizeKey>)>>,
+    pub(crate) read_key_ranges: Mutex<Vec<ReadScanEntry>>,
 
     /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
     committed_values_offsets: HashMap<Bytes, usize>,
@@ -115,6 +162,9 @@ pub struct Transaction {
 
     /// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
     closed: bool,
+
+    /// `savepoints` indicates the current number of stacked savepoints; zero means none.
+    savepoints: u32,
 }
 
 impl Transaction {
@@ -140,6 +190,7 @@ impl Transaction {
             committed_values_offsets: HashMap::new(),
             durability: Durability::Eventual,
             closed: false,
+            savepoints: 0,
         })
     }
 
@@ -213,10 +264,10 @@ impl Transaction {
                 // Check if the key is in the write set by checking in the write_order_map map.
                 if let Some(order) = self.write_order_map.get(&hashed_key) {
                     if let Some(entry) = self.write_set.get(*order as usize) {
-                        return Ok(if entry.is_deleted_or_tombstone() {
+                        return Ok(if entry.e.is_deleted_or_tombstone() {
                             None
                         } else {
-                            Some(entry.value.clone().to_vec())
+                            Some(entry.e.value.clone().to_vec())
                         });
                     }
                 }
@@ -224,7 +275,8 @@ impl Transaction {
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
                 if !self.mode.is_read_only() && val_ref.ts() > 0 {
-                    self.read_set.lock().push((key, val_ref.ts()));
+                    let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
+                    self.read_set.lock().push(entry);
                 }
 
                 // Resolve the value reference to get the actual value.
@@ -236,7 +288,8 @@ impl Transaction {
                     // add the key to the read set with a timestamp of 0.
                     Error::KeyNotFound => {
                         if !self.mode.is_read_only() {
-                            self.read_set.lock().push((key, 0));
+                            let entry = ReadSetEntry::new(key, 0, self.savepoints);
+                            self.read_set.lock().push(entry);
                         }
                         Ok(None)
                     }
@@ -286,13 +339,16 @@ impl Transaction {
         // Add the entry to the set of pending writes.
         let hashed_key = sha256(e.key.clone());
 
+        // Set the transaction's latest savepoint number.
+        let ws_entry = WriteSetEntry::new(e, self.savepoints);
+
         // Check if the key already exists in write_order_map, if so, update the entry in write_set.
         let write_order_map_len = self.write_order_map.len() as u32;
         match self.write_order_map.entry(hashed_key) {
-            HashEntry::Occupied(oe) => self.write_set[*oe.get() as usize] = e,
+            HashEntry::Occupied(oe) => self.write_set[*oe.get() as usize] = ws_entry,
             HashEntry::Vacant(ve) => {
                 ve.insert(write_order_map_len);
-                self.write_set.push(e);
+                self.write_set.push(ws_entry);
             }
         };
 
@@ -309,20 +365,20 @@ impl Transaction {
 
         // Keep track of the range bound predicates for conflict detection in case of SSI.
         {
-            let range = (
-                match range.start_bound() {
-                    Bound::Included(start) => Bound::Included((*start).clone()),
-                    Bound::Excluded(start) => Bound::Included((*start).clone()),
-                    Bound::Unbounded => Bound::Unbounded,
-                },
-                match range.end_bound() {
-                    Bound::Included(end) => Bound::Included((*end).clone()),
-                    Bound::Excluded(end) => Bound::Included((*end).clone()),
-                    Bound::Unbounded => Bound::Unbounded,
-                },
-            );
+            let range_start = match range.start_bound() {
+                Bound::Included(start) => Bound::Included((*start).clone()),
+                Bound::Excluded(start) => Bound::Included((*start).clone()),
+                Bound::Unbounded => Bound::Unbounded,
+            };
 
-            self.read_key_ranges.lock().push(range);
+            let range_end = match range.end_bound() {
+                Bound::Included(end) => Bound::Included((*end).clone()),
+                Bound::Excluded(end) => Bound::Included((*end).clone()),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+
+            let rs_entry = ReadScanEntry::new(range_start, range_end, self.savepoints);
+            self.read_key_ranges.lock().push(rs_entry);
         }
 
         // Initialize an empty vector to store the results.
@@ -356,10 +412,10 @@ impl Transaction {
             // Only add the key to the read set if the timestamp is less than or equal to the
             // read timestamp. This is to prevent adding keys that are added during the transaction.
             if val_ref.ts() <= self.read_ts {
-                self.read_set.lock().push((
-                    Bytes::copy_from_slice(&key[..&key.len() - 1]), // the keys in the vart leaf are terminated with a null byte
-                    val_ref.ts(),
-                ));
+                // the keys in the vart leaf are terminated with a null byte
+                let key = Bytes::copy_from_slice(&key[..&key.len() - 1]);
+                let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
+                self.read_set.lock().push(entry);
             }
 
             // Resolve the value reference to get the actual value.
@@ -400,7 +456,10 @@ impl Transaction {
         let tx_id = self.prepare_commit()?;
 
         // Extract the vector of entries for the current transaction.
-        let entries: Vec<Entry> = std::mem::take(&mut self.write_set);
+        let entries: Vec<Entry> = std::mem::take(&mut self.write_set)
+            .into_iter()
+            .map(|ws_entry| ws_entry.e)
+            .collect();
 
         // Commit the changes to the store index.
         let done = self
@@ -444,8 +503,8 @@ impl Transaction {
     fn assign_commit_ts(&mut self) {
         let commit_ts = now();
         self.write_set.iter_mut().for_each(|entry| {
-            if entry.ts == 0 {
-                entry.ts = commit_ts;
+            if entry.e.ts == 0 {
+                entry.e.ts = commit_ts;
             }
         });
     }
@@ -458,6 +517,84 @@ impl Transaction {
         self.write_set.clear();
         self.read_set.lock().clear();
         self.snapshot.take();
+    }
+
+    /// After calling this method the subsequent modifications within this
+    /// transaction can be rolled back by calling [`rollback_to_savepoint`].
+    ///
+    /// This method is stackable and can be called multiple times with the
+    /// corresponding calls to [`rollback_to_savepoint`].
+    ///
+    /// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
+    pub fn set_savepoint(&mut self) -> Result<()> {
+        // If the transaction mode is not mutable (i.e., it's read-only), return an error.
+        if !self.mode.mutable() {
+            return Err(Error::TransactionReadOnly);
+        }
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+
+        // Bump the latest savepoint number.
+        self.savepoints += 1;
+
+        Ok(())
+    }
+
+    /// Rollback the state of the transaction to the latest savepoint set by
+    /// calling [`set_savepoint`].
+    ///
+    /// [`set_savepoint`]: Transaction::set_savepoint
+    pub fn rollback_to_savepoint(&mut self) -> Result<()> {
+        // If the transaction mode is not mutable (i.e., it's read-only), return an error.
+        if !self.mode.mutable() {
+            return Err(Error::TransactionReadOnly);
+        }
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // Check that the savepoint is set
+        if self.savepoints == 0 {
+            return Err(Error::TransactionWithoutSavepoint);
+        }
+
+        // Remove entries marked for rollback since the last call
+        // to set_savepoint() from the write set, the write order map
+        // and the snapshot.
+        self.write_set.retain(|entry| {
+            if entry.savepoint_no == self.savepoints {
+                let hashed_key = sha256(entry.e.key.clone());
+                self.write_order_map.remove(&hashed_key);
+                self.snapshot
+                    .as_ref()
+                    .unwrap()
+                    .write()
+                    .delete(&entry.e.key[..].into());
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove marked entries from the read set to
+        // prevent unnecessary read-write conflicts.
+        self.read_set
+            .lock()
+            .retain(|entry| entry.savepoint_no != self.savepoints);
+
+        // And also from the read scan set.
+        self.read_key_ranges
+            .lock()
+            .retain(|entry| entry.savepoint_no != self.savepoints);
+
+        // Decrement the latest savepoint number unless it's zero.
+        if self.savepoints > 0 {
+            self.savepoints -= 1;
+        }
+
+        Ok(())
     }
 }
 
@@ -1996,5 +2133,274 @@ mod tests {
             let txn = store.begin().unwrap();
             assert!(txn.get(&key).unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn multiple_savepoints_without_ssi() {
+        let (store, _) = create_store(false);
+
+        // Key-value pair for the test
+        let key1 = Bytes::from("test_key1");
+        let value1 = Bytes::from("test_value1");
+        let key2 = Bytes::from("test_key2");
+        let value2 = Bytes::from("test_value2");
+        let key3 = Bytes::from("test_key3");
+        let value3 = Bytes::from("test_value3");
+
+        // Start the transaction and write key1.
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&key1, &value1).unwrap();
+
+        // Set the first savepoint.
+        txn1.set_savepoint().unwrap();
+
+        // Write key2 after the savepoint.
+        txn1.set(&key2, &value2).unwrap();
+
+        // Set another savepoint, stacking it onto the first one.
+        txn1.set_savepoint().unwrap();
+
+        txn1.set(&key3, &value3).unwrap();
+
+        // Just a sanity check that all three keys are present.
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert_eq!(txn1.get(&key3).unwrap().unwrap(), value3);
+
+        // Rollback to the latest (second) savepoint. This should make key3
+        // go away while keeping key1 and key2.
+        txn1.rollback_to_savepoint().unwrap();
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert!(txn1.get(&key3).unwrap().is_none());
+
+        // Now roll back to the first savepoint. This should only
+        // keep key1 around.
+        txn1.rollback_to_savepoint().unwrap();
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert!(txn1.get(&key2).unwrap().is_none());
+        assert!(txn1.get(&key3).unwrap().is_none());
+
+        // Check that without any savepoints set the error is returned.
+        assert!(matches!(
+            txn1.rollback_to_savepoint(),
+            Err(Error::TransactionWithoutSavepoint)
+        ),);
+
+        // Commit the transaction.
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        // Start another transaction and check again for the keys.
+        let mut txn2 = store.begin().unwrap();
+        assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+        assert!(txn2.get(&key2).unwrap().is_none());
+        assert!(txn2.get(&key3).unwrap().is_none());
+        txn2.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_savepoints_with_ssi() {
+        let (store, _) = create_store(true);
+
+        // Key-value pair for the test
+        let key1 = Bytes::from("test_key1");
+        let value1 = Bytes::from("test_value1");
+        let key2 = Bytes::from("test_key2");
+        let value2 = Bytes::from("test_value2");
+        let key3 = Bytes::from("test_key3");
+        let value3 = Bytes::from("test_value3");
+
+        // Start the transaction and write key1.
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&key1, &value1).unwrap();
+
+        // Set the first savepoint.
+        txn1.set_savepoint().unwrap();
+
+        // Write key2 after the savepoint.
+        txn1.set(&key2, &value2).unwrap();
+
+        // Set another savepoint, stacking it onto the first one.
+        txn1.set_savepoint().unwrap();
+
+        txn1.set(&key3, &value3).unwrap();
+
+        // Just a sanity check that all three keys are present.
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert_eq!(txn1.get(&key3).unwrap().unwrap(), value3);
+
+        // Rollback to the latest (second) savepoint. This should make key3
+        // go away while keeping key1 and key2.
+        txn1.rollback_to_savepoint().unwrap();
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert!(txn1.get(&key3).unwrap().is_none());
+
+        // Now roll back to the first savepoint. This should only
+        // keep key1 around.
+        txn1.rollback_to_savepoint().unwrap();
+        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert!(txn1.get(&key2).unwrap().is_none());
+        assert!(txn1.get(&key3).unwrap().is_none());
+
+        // Check that without any savepoints set the error is returned.
+        assert!(matches!(
+            txn1.rollback_to_savepoint(),
+            Err(Error::TransactionWithoutSavepoint)
+        ),);
+
+        // Commit the transaction.
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        // Start another transaction and check again for the keys.
+        let mut txn2 = store.begin().unwrap();
+        assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+        assert!(txn2.get(&key2).unwrap().is_none());
+        assert!(txn2.get(&key3).unwrap().is_none());
+        txn2.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn savepont_with_concurrent_read_txn_without_ssi() {
+        let (store, _) = create_store(false);
+
+        // Key-value pair for the test
+        let key = Bytes::from("test_key1");
+        let value = Bytes::from("test_value");
+        let updated_value = Bytes::from("updated_test_value");
+        let key2 = Bytes::from("test_key2");
+        let value2 = Bytes::from("test_value2");
+
+        // Store the entry.
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&key, &value).unwrap();
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        // Now open two concurrent transaction, where one
+        // is reading the value and the other one is
+        // updating it. Normally this would lead to a read-write
+        // conflict aborting the reading transaction.
+        // However, if the reading transaction rolls back
+        // to a savepoint before reading the vealu, as
+        // if it never happened, there should be no conflict.
+        let mut read_txn = store.begin().unwrap();
+        let mut update_txn = store.begin().unwrap();
+
+        // This write is needed to force oracle.new_commit_ts().
+        read_txn.set(&key2, &value2).unwrap();
+
+        read_txn.set_savepoint().unwrap();
+
+        read_txn.get(&key).unwrap().unwrap();
+        update_txn.set(&key, &updated_value).unwrap();
+
+        // Commit the transaction.
+        update_txn.commit().await.unwrap();
+        // Read transaction should commit without conflict after
+        // rolling back to the savepoint before reading `key`.
+        read_txn.rollback_to_savepoint().unwrap();
+        read_txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn savepont_with_concurrent_read_txn_with_ssi() {
+        let (store, _) = create_store(true);
+
+        let key = Bytes::from("test_key1");
+        let value = Bytes::from("test_value");
+        let updated_value = Bytes::from("updated_test_value");
+        let key2 = Bytes::from("test_key2");
+        let value2 = Bytes::from("test_value2");
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&key, &value).unwrap();
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        let mut read_txn = store.begin().unwrap();
+        let mut update_txn = store.begin().unwrap();
+
+        read_txn.set(&key2, &value2).unwrap();
+
+        read_txn.set_savepoint().unwrap();
+
+        read_txn.get(&key).unwrap().unwrap();
+        update_txn.set(&key, &updated_value).unwrap();
+
+        update_txn.commit().await.unwrap();
+        read_txn.rollback_to_savepoint().unwrap();
+        read_txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn savepont_with_concurrent_scan_txn() {
+        // Scan set is only considered for SSI.
+        let (store, _) = create_store(true);
+
+        let k1 = Bytes::from("k1");
+        let value = Bytes::from("test_value");
+        let updated_value = Bytes::from("updated_test_value");
+        let k2 = Bytes::from("k2");
+        let value2 = Bytes::from("test_value2");
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&k1, &value).unwrap();
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        let mut read_txn = store.begin().unwrap();
+        let mut update_txn = store.begin().unwrap();
+
+        read_txn.set(&k2, &value2).unwrap();
+
+        read_txn.set_savepoint().unwrap();
+
+        let range = "k0".as_bytes()..="k10".as_bytes();
+        read_txn.scan(range, None).unwrap();
+        update_txn.set(&k1, &updated_value).unwrap();
+
+        update_txn.commit().await.unwrap();
+        read_txn.rollback_to_savepoint().unwrap();
+        read_txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn savepont_with_concurrent_scan_txn_with_new_write() {
+        // Scan set is only considered for SSI.
+        let (store, _) = create_store(true);
+
+        let k1 = Bytes::from("k1");
+        let value = Bytes::from("test_value");
+        let k2 = Bytes::from("k2");
+        let value2 = Bytes::from("test_value2");
+        let k3 = Bytes::from("k3");
+        let value3 = Bytes::from("test_value3");
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&k1, &value).unwrap();
+        txn1.commit().await.unwrap();
+        drop(txn1);
+
+        let mut read_txn = store.begin().unwrap();
+        let mut update_txn = store.begin().unwrap();
+
+        read_txn.set(&k2, &value2).unwrap();
+        // Put k1 into the read_txn's read set in order
+        // to force the conflict resolution check.
+        read_txn.get(&k1).unwrap();
+
+        read_txn.set_savepoint().unwrap();
+
+        let range = "k1".as_bytes()..="k3".as_bytes();
+        read_txn.scan(range, None).unwrap();
+        update_txn.set(&k3, &value3).unwrap();
+
+        update_txn.commit().await.unwrap();
+        read_txn.rollback_to_savepoint().unwrap();
+        read_txn.commit().await.unwrap();
     }
 }

@@ -48,6 +48,7 @@ pub enum Error {
     CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
     SegmentIdExceedsLastUpdated, // The segment ID exceeds the last updated segment
     TransactionMustBeReadOnly,   // The transaction must be read-only
+    TransactionWithoutSavepoint, // The transaction does not have a savepoint set
 }
 
 // Implementation of Display trait for Error
@@ -108,6 +109,9 @@ impl fmt::Display for Error {
             }
             Error::TransactionMustBeReadOnly => {
                 write!(f, "Transaction must be read-only")
+            }
+            Error::TransactionWithoutSavepoint => {
+                write!(f, "Transaction does not have a savepoint set")
             }
         }
     }
