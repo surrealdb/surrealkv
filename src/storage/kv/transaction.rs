@@ -2,7 +2,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use ahash::{HashMap, HashMapExt};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
@@ -12,7 +12,7 @@ use crate::storage::kv::{
     error::{Error, Result},
     snapshot::{FilterFn, Snapshot, FILTERS},
     store::Core,
-    util::{convert_range_bounds, now, sha256},
+    util::{convert_range_bounds, now},
 };
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -79,12 +79,17 @@ pub enum Durability {
 
 pub(crate) struct WriteSetEntry {
     pub(crate) e: Entry,
-    pub(crate) savepoint_no: u32,
+    savepoint_no: u32,
+    seqno: u32,
 }
 
 impl WriteSetEntry {
-    pub(crate) fn new(e: Entry, savepoint_no: u32) -> Self {
-        Self { e, savepoint_no }
+    pub(crate) fn new(e: Entry, savepoint_no: u32, seqno: u32) -> Self {
+        Self {
+            e,
+            savepoint_no,
+            seqno,
+        }
     }
 }
 
@@ -132,30 +137,24 @@ pub struct Transaction {
     /// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
     mode: Mode,
 
-    /// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
+    /// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data
+    ///  at the time the transaction started.
     pub(crate) snapshot: Option<RwLock<Snapshot>>,
-
-    /// `buf` is a reusable buffer for encoding transaction records. This is used to reduce memory allocations.
-    buf: BytesMut,
 
     /// `core` is the underlying core for the transaction. This is shared between transactions.
     pub(crate) core: Arc<Core>,
 
-    /// `write_order_map` is a mapping from sha256 of keys to their order in the write_set.
-    pub(crate) write_order_map: HashMap<Bytes, u32>,
-
-    /// `write_set` is a vector of  entries.
+    /// `write_set` is a map of keys to entries.
     /// These are the changes that the transaction intends to make to the data.
-    pub(crate) write_set: Vec<WriteSetEntry>,
+    /// The entries vec is used to keep different values for the same key for
+    /// savepoints and rollbacks.
+    pub(crate) write_set: HashMap<Bytes, Vec<WriteSetEntry>>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_set: Mutex<Vec<ReadSetEntry>>,
 
     /// `read_key_ranges` is the key ranges that are read in the transaction from the snapshot. This is used for conflict detection.
     pub(crate) read_key_ranges: Mutex<Vec<ReadScanEntry>>,
-
-    /// `committed_values_offsets` is the offsets of values in the transaction post commit to the transaction log. This is used to locate the data in the transaction log.
-    committed_values_offsets: HashMap<Bytes, usize>,
 
     /// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
     durability: Durability,
@@ -165,6 +164,9 @@ pub struct Transaction {
 
     /// `savepoints` indicates the current number of stacked savepoints; zero means none.
     savepoints: u32,
+
+    /// write sequence number is used for real-time ordering of writes within a transaction.
+    write_seqno: u32,
 }
 
 impl Transaction {
@@ -181,17 +183,21 @@ impl Transaction {
             read_ts,
             mode,
             snapshot,
-            buf: BytesMut::new(),
             core,
-            write_order_map: HashMap::new(),
-            write_set: Vec::new(),
+            write_set: HashMap::new(),
             read_set: Mutex::new(Vec::new()),
             read_key_ranges: Mutex::new(Vec::new()),
-            committed_values_offsets: HashMap::new(),
             durability: Durability::Eventual,
             closed: false,
             savepoints: 0,
+            write_seqno: 0,
         })
+    }
+
+    /// Bump the write sequence number and return it.
+    fn next_write_seqno(&mut self) -> u32 {
+        self.write_seqno += 1;
+        self.write_seqno
     }
 
     /// Returns the transaction mode.
@@ -253,28 +259,23 @@ impl Transaction {
             return Err(Error::TransactionWriteOnly);
         }
 
-        // Create a copy of the key.
-        let key = Bytes::copy_from_slice(key);
-        let hashed_key = sha256(key.clone());
+        // RYOW semantics: Read your own writes. If the value is in the write set, return it.
+        if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
+            let val = if last_entry.e.is_deleted_or_tombstone() {
+                None
+            } else {
+                Some(last_entry.e.value.clone().to_vec())
+            };
+            return Ok(val);
+        }
 
-        // Attempt to get the value for the key from the snapshot.
+        // The value is not in the write set, so attempt to get it from the snapshot.
         match self.snapshot.as_ref().unwrap().read().get(&key[..].into()) {
             Ok(val_ref) => {
-                // RYOW semantics: Read your own write. If the key is in the write set, return the value.
-                // Check if the key is in the write set by checking in the write_order_map map.
-                if let Some(order) = self.write_order_map.get(&hashed_key) {
-                    if let Some(entry) = self.write_set.get(*order as usize) {
-                        return Ok(if entry.e.is_deleted_or_tombstone() {
-                            None
-                        } else {
-                            Some(entry.e.value.clone().to_vec())
-                        });
-                    }
-                }
-
                 // If the transaction is not read-only and the value reference has a timestamp greater than 0,
                 // add the key and its timestamp to the read set for conflict detection.
                 if !self.mode.is_read_only() && val_ref.ts() > 0 {
+                    let key = Bytes::copy_from_slice(key);
                     let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
                     self.read_set.lock().push(entry);
                 }
@@ -288,6 +289,7 @@ impl Transaction {
                     // add the key to the read set with a timestamp of 0.
                     Error::KeyNotFound => {
                         if !self.mode.is_read_only() {
+                            let key = Bytes::copy_from_slice(key);
                             let entry = ReadSetEntry::new(key, 0, self.savepoints);
                             self.read_set.lock().push(entry);
                         }
@@ -336,19 +338,28 @@ impl Transaction {
                 .set(&e.key[..].into(), index_value);
         }
 
-        // Add the entry to the set of pending writes.
-        let hashed_key = sha256(e.key.clone());
-
-        // Set the transaction's latest savepoint number.
-        let ws_entry = WriteSetEntry::new(e, self.savepoints);
-
-        // Check if the key already exists in write_order_map, if so, update the entry in write_set.
-        let write_order_map_len = self.write_order_map.len() as u32;
-        match self.write_order_map.entry(hashed_key) {
-            HashEntry::Occupied(oe) => self.write_set[*oe.get() as usize] = ws_entry,
+        // Set the transaction's latest savepoint number and add it to the write set.
+        let key = e.key.clone();
+        let write_seqno = self.next_write_seqno();
+        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno);
+        match self.write_set.entry(key) {
+            HashEntry::Occupied(mut oe) => {
+                let entries = oe.get_mut();
+                // If the latest existing value for this key belongs to the same
+                // savepoint as the value we are about to write, then we can
+                // overwrite it with the new value.
+                if let Some(last_entry) = entries.last_mut() {
+                    if last_entry.savepoint_no == ws_entry.savepoint_no {
+                        *last_entry = ws_entry;
+                    } else {
+                        entries.push(ws_entry);
+                    }
+                } else {
+                    entries.push(ws_entry)
+                }
+            }
             HashEntry::Vacant(ve) => {
-                ve.insert(write_order_map_len);
-                self.write_set.push(ws_entry);
+                ve.insert(vec![ws_entry]);
             }
         };
 
@@ -455,8 +466,14 @@ impl Transaction {
         // Prepare for the commit by getting a transaction ID.
         let tx_id = self.prepare_commit()?;
 
-        // Extract the vector of entries for the current transaction.
-        let entries: Vec<Entry> = std::mem::take(&mut self.write_set)
+        // Extract the vector of entries for the current transaction,
+        // respecting the insertion order recorded with WriteSetEntry::seqno.
+        let mut latest_writes: Vec<WriteSetEntry> = std::mem::take(&mut self.write_set)
+            .into_values()
+            .filter_map(|mut entries| entries.pop())
+            .collect();
+        latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+        let entries: Vec<Entry> = latest_writes
             .into_iter()
             .map(|ws_entry| ws_entry.e)
             .collect();
@@ -502,21 +519,23 @@ impl Transaction {
     /// Assigns commit timestamps to transaction entries.
     fn assign_commit_ts(&mut self) {
         let commit_ts = now();
-        self.write_set.iter_mut().for_each(|entry| {
-            if entry.e.ts == 0 {
-                entry.e.ts = commit_ts;
+        for entries in self.write_set.values_mut() {
+            if let Some(entry) = entries.last_mut() {
+                if entry.e.ts == 0 {
+                    entry.e.ts = commit_ts;
+                }
             }
-        });
+        }
     }
 
     /// Rolls back the transaction by removing all updated entries.
     pub fn rollback(&mut self) {
         self.closed = true;
-        self.committed_values_offsets.clear();
-        self.buf.clear();
         self.write_set.clear();
         self.read_set.lock().clear();
         self.snapshot.take();
+        self.savepoints = 0;
+        self.write_seqno = 0;
     }
 
     /// After calling this method the subsequent modifications within this
@@ -560,23 +579,44 @@ impl Transaction {
             return Err(Error::TransactionWithoutSavepoint);
         }
 
-        // Remove entries marked for rollback since the last call
-        // to set_savepoint() from the write set, the write order map
-        // and the snapshot.
-        self.write_set.retain(|entry| {
-            if entry.savepoint_no == self.savepoints {
-                let hashed_key = sha256(entry.e.key.clone());
-                self.write_order_map.remove(&hashed_key);
+        // For every key in the write set, remove entries marked
+        // for rollback since the last call to set_savepoint()
+        // from its vec and the snapshot.
+        // HashMap does not really like when items are removed,
+        // so let's just keep empty `entries` vectors around.
+        for entries in self.write_set.values_mut() {
+            let pre_retain_len = entries.len();
+            entries.retain(|entry| {
+                if entry.savepoint_no == self.savepoints {
+                    self.snapshot
+                        .as_ref()
+                        .unwrap()
+                        .write()
+                        .delete(&entry.e.key[..].into());
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // If the transaction's mode is write-only, or if no values for this
+            // key were removed due to the rollback, continue to the next key.
+            if pre_retain_len == entries.len() || self.mode.is_write_only() {
+                continue;
+            }
+
+            // Otherwise, the value just before the rollback needs to be added
+            // back to the snapshot in order to keep scan() working.
+            if let Some(latest_entry) = entries.last() {
+                let index_value =
+                    ValueRef::encode_mem(&latest_entry.e.value, latest_entry.e.metadata.as_ref());
                 self.snapshot
                     .as_ref()
                     .unwrap()
                     .write()
-                    .delete(&entry.e.key[..].into());
-                false
-            } else {
-                true
+                    .set(&latest_entry.e.key[..].into(), index_value);
             }
-        });
+        }
 
         // Remove marked entries from the read set to
         // prevent unnecessary read-write conflicts.
@@ -590,9 +630,8 @@ impl Transaction {
             .retain(|entry| entry.savepoint_no != self.savepoints);
 
         // Decrement the latest savepoint number unless it's zero.
-        if self.savepoints > 0 {
-            self.savepoints -= 1;
-        }
+        // Cannot undeflow due to the zero check above.
+        self.savepoints -= 1;
 
         Ok(())
     }
@@ -740,7 +779,8 @@ impl Transaction {
 
     /// Returns the value associated with the key at the given timestamp.
     /// The query type specifies the type of query to perform.
-    /// The query type can be `LatestByVersion`, `LatestByTs`, `LastLessThanTs`, `LastLessOrEqualTs`, `FirstGreaterOrEqualTs` or `FirstGreaterThanTs`.
+    /// The query type can be `LatestByVersion`, `LatestByTs`, `LastLessThanTs`,
+    /// `LastLessOrEqualTs`, `FirstGreaterOrEqualTs` or `FirstGreaterThanTs`.
     pub fn get_value_by_query(
         &self,
         key: &VariableSizeKey,
@@ -2402,5 +2442,100 @@ mod tests {
         update_txn.commit().await.unwrap();
         read_txn.rollback_to_savepoint().unwrap();
         read_txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn savepoint_rollback_on_updated_key() {
+        let (store, _) = create_store(false);
+
+        let k1 = Bytes::from("k1");
+        let value1 = Bytes::from("value1");
+        let value2 = Bytes::from("value2");
+        let value3 = Bytes::from("value3");
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&k1, &value1).unwrap();
+        txn1.set(&k1, &value2).unwrap();
+        txn1.set_savepoint().unwrap();
+        txn1.set(&k1, &value3).unwrap();
+        txn1.rollback_to_savepoint().unwrap();
+
+        // The read value should be the one before the savepoint.
+        assert_eq!(txn1.get(&k1).unwrap().unwrap(), value2);
+    }
+
+    #[tokio::test]
+    async fn savepoint_rollback_on_updated_key_with_scan() {
+        let (store, _) = create_store(false);
+
+        let k1 = Bytes::from("k1");
+        let value = Bytes::from("value1");
+        let value2 = Bytes::from("value2");
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(&k1, &value).unwrap();
+        txn1.set_savepoint().unwrap();
+        txn1.set(&k1, &value2).unwrap();
+        txn1.rollback_to_savepoint().unwrap();
+
+        // The scanned value should be the one before the savepoint.
+        let range = "k1".as_bytes()..="k3".as_bytes();
+        let sr = txn1.scan(range, None).unwrap();
+        assert_eq!(sr[0].0, k1.to_vec());
+        assert_eq!(
+            sr[0].1,
+            value.to_vec(),
+            "{}",
+            String::from_utf8_lossy(&sr[0].1)
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_writes() {
+        // This test ensures that the real time order of writes
+        // is preserved within a transaction.
+        use crate::storage::kv::entry::Record;
+        use crate::storage::kv::reader::{Reader, RecordReader};
+        use crate::storage::log::Error as LogError;
+        use crate::storage::log::{MultiSegmentReader, SegmentRef};
+
+        let k1 = Bytes::from("k1");
+        let v1 = Bytes::from("v1");
+        let k2 = Bytes::from("k2");
+        let v2 = Bytes::from("v2");
+        let v3 = Bytes::from("v3");
+
+        let (store, tmp_dir) = create_store(false);
+        let mut txn = store.begin().unwrap();
+        txn.set(&k1, &v1).unwrap();
+        txn.set(&k2, &v2).unwrap();
+        txn.set(&k1, &v3).unwrap();
+        txn.commit().await.unwrap();
+        store.close().await.unwrap();
+
+        let clog_subdir = tmp_dir.path().join("clog");
+        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
+        let reader = MultiSegmentReader::new(sr).unwrap();
+        let reader = Reader::new_from(reader);
+        let mut tx_reader = RecordReader::new(reader, 100, 100);
+
+        // Expect ("k2", "v2")
+        let mut log_rec = Record::new();
+        tx_reader.read_into(&mut log_rec).unwrap();
+        assert_eq!(log_rec.key, k2);
+        assert_eq!(log_rec.value, v2);
+
+        // Expect ("k1", "v3")
+        let mut log_rec = Record::new();
+        tx_reader.read_into(&mut log_rec).unwrap();
+        assert_eq!(log_rec.key, k1);
+        assert_eq!(log_rec.value, v3);
+
+        // Eof
+        let mut log_rec = Record::new();
+        assert!(matches!(
+            tx_reader.read_into(&mut log_rec),
+            Err(Error::LogError(LogError::Eof))
+        ),);
     }
 }
