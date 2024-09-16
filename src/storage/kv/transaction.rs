@@ -174,7 +174,7 @@ impl Transaction {
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            snapshot = Some(RwLock::new(Snapshot::take(core.clone(), now())?));
+            snapshot = Some(RwLock::new(Snapshot::take(core.clone(), now())));
         }
 
         Ok(Self {
@@ -2044,7 +2044,7 @@ mod tests {
 
     #[tokio::test]
     async fn g2_predicate() {
-        g2_item_predicate(true).await;
+        g2_item_predicate(false).await;
     }
 
     #[tokio::test]

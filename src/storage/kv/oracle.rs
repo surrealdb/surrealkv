@@ -1,12 +1,4 @@
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    ops::Bound,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{cmp::Reverse, collections::BinaryHeap, ops::Bound, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet};
 use async_channel::{bounded, Receiver, Sender};
@@ -138,20 +130,28 @@ impl IsolationLevel {
 /// Struct representing the Snapshot Isolation level in a transaction.
 /// It uses an atomic u64 to keep track of the next transaction ID.
 pub(crate) struct SnapshotIsolation {
-    next_tx_id: AtomicU64,
+    // The `commit_tracker` keeps track of committed transactions and their timestamps.
+    commit_tracker: RwLock<CommitTracker>,
+
+    // `read_mark` marks the visibility of read operations to other transactions.
+    read_mark: Arc<RwLock<BinaryHeap<Reverse<u64>>>>,
 }
 
 impl SnapshotIsolation {
     /// Creates a new SnapshotIsolation instance with the next transaction ID set to 0.
     pub(crate) fn new() -> Self {
         Self {
-            next_tx_id: AtomicU64::new(0),
+            commit_tracker: RwLock::new(CommitTracker::new()),
+            read_mark: Arc::new(RwLock::new(BinaryHeap::new())),
         }
     }
 
     /// Sets the next transaction ID to the given timestamp.
     pub(crate) fn set_ts(&self, ts: u64) {
-        self.next_tx_id.store(ts, Ordering::SeqCst);
+        self.commit_tracker.write().next_ts = ts;
+
+        // Mark that reads are done up to the given timestamp.
+        self.read_mark.write().retain(|&read_ts| read_ts.0 > ts);
     }
 
     /// Generates a new commit timestamp for the given transaction.
@@ -159,39 +159,56 @@ impl SnapshotIsolation {
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(txn.core.clone(), self.read_ts())?;
-        let read_set = txn.read_set.lock();
+        let current_snapshot_ts = self.read_ts();
+        let mut commit_tracker = self.commit_tracker.write();
 
-        for entry in read_set.iter() {
-            match current_snapshot.get(&entry.key[..].into()) {
-                Ok(val_ref) => {
-                    if entry.ts != val_ref.ts() {
-                        return Err(Error::TransactionReadConflict);
-                    }
-                }
-                Err(Error::KeyNotFound) => {
-                    if entry.ts > 0 {
-                        return Err(Error::TransactionReadConflict);
-                    }
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        // Check for conflicts between the transaction and committed transactions.
+        commit_tracker.check_conflict(txn, current_snapshot_ts)?;
 
-        let ts = self.next_tx_id.load(Ordering::SeqCst);
-        self.increment_ts();
+        // Mark that read operations are done up to the transaction's read timestamp.
+        self.mark_read_operations_done(txn.read_ts);
+
+        // Clean up committed transactions up to the current read mark.
+        let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
+        commit_tracker.cleanup_committed_transactions(max_read_ts);
+
+        let ts = commit_tracker.next_ts;
+        commit_tracker.next_ts += 1;
+
+        assert!(ts >= commit_tracker.last_cleanup_ts);
+
+        // Add the transaction to the list of committed transactions with conflict keys.
+        let conflict_keys: HashSet<Bytes> = txn.write_set.iter().map(|e| e.e.key.clone()).collect();
+
+        commit_tracker
+            .committed_transactions
+            .push(CommitMarker { ts, conflict_keys });
+
         Ok(ts)
+    }
+
+    // Helper method to mark read operations as done up to a given timestamp.
+    fn mark_read_operations_done(&self, read_ts: u64) {
+        self.read_mark
+            .write()
+            .retain(|&read_timestamp| read_timestamp.0 > read_ts);
     }
 
     /// Returns the read timestamp, which is the next transaction ID minus 1.
     pub(crate) fn read_ts(&self) -> u64 {
-        self.next_tx_id.load(Ordering::SeqCst) - 1
+        let commit_tracker = self.commit_tracker.read();
+        let read_ts = commit_tracker.next_ts - 1;
+
+        // Keep track of the read timestamp for active transactions.
+        self.read_mark.write().push(Reverse(read_ts));
+
+        read_ts
     }
 
     /// Increments the next transaction ID by 1.
     pub(crate) fn increment_ts(&self) {
-        self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+        let mut commit_info = self.commit_tracker.write();
+        commit_info.next_ts += 1;
     }
 }
 
@@ -265,6 +282,45 @@ impl CommitTracker {
                         .any(|read| committed_txn.conflict_keys.contains(&read.key))
                 })
         }
+    }
+
+    // Placeholder to replace the has_conflict method post removal of serializable snapshot isolation.
+    fn check_conflict(&self, txn: &Transaction, snapshot_ts: u64) -> Result<()> {
+        let current_snapshot = Snapshot::take(txn.core.clone(), snapshot_ts);
+        let read_set = txn.read_set.lock();
+
+        // For each object in the changeset of the already committed transactions, check if it lies
+        // within the predicates of the current transaction.
+        for committed_tx in self.committed_transactions.iter() {
+            if committed_tx.ts > txn.read_ts {
+                for conflict_key in committed_tx.conflict_keys.iter() {
+                    for rs_entry in txn.read_key_ranges.lock().iter() {
+                        if key_in_range(conflict_key, &rs_entry.start, &rs_entry.end) {
+                            return Err(Error::TransactionReadConflict);
+                        }
+                    }
+                }
+            }
+        }
+
+        for entry in read_set.iter() {
+            match current_snapshot.get(&entry.key[..].into()) {
+                Ok(val_ref) => {
+                    if entry.ts != val_ref.ts() {
+                        return Err(Error::TransactionReadConflict);
+                    }
+                }
+                Err(Error::KeyNotFound) => {
+                    if entry.ts > 0 {
+                        return Err(Error::TransactionReadConflict);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -28,14 +28,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: Arc<Core>, start_ts: u64) -> Result<Self> {
+    pub(crate) fn take(store: Arc<Core>, start_ts: u64) -> Self {
         let snapshot = store.indexer.write().snapshot();
 
-        Ok(Self {
+        Self {
             start_ts,
             snap: snapshot,
             store,
-        })
+        }
     }
 
     /// Set a key-value pair into the snapshot.
