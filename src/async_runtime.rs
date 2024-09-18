@@ -23,4 +23,5 @@ pub trait TaskSpawner: Send + Sync + 'static {
         F::Output: Send + 'static;
 }
 
+#[cfg(feature = "tokio")]
 pub mod tokio;

@@ -19,7 +19,7 @@ use revision::Revisioned;
 use vart::art::KV;
 
 use crate::{
-    async_runtime::{tokio::TokioSpawner, JoinHandle, TaskSpawner},
+    async_runtime::{JoinHandle, TaskSpawner},
     storage::{
         kv::{
             compaction::restore_from_compaction,
@@ -40,7 +40,13 @@ use crate::{
     },
 };
 
+#[cfg(feature = "tokio")]
+use crate::async_runtime::tokio::TokioSpawner;
+
+#[cfg(feature = "tokio")]
 pub type Store = StoreImpl<TokioSpawner>;
+
+#[cfg(feature = "tokio")]
 pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
 
 pub(crate) struct StoreInner<T: TaskSpawner> {
