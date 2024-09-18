@@ -132,13 +132,22 @@ impl<T: TaskSpawner> StoreInner<T> {
 #[derive(Default)]
 pub struct StoreImpl<T: TaskSpawner> {
     pub(crate) inner: Option<StoreInner<T>>,
+    spawner: T,
+}
+
+impl<T: TaskSpawner + Default> StoreImpl<T> {
+    /// Creates a new MVCC key-value store with the given options.
+    pub fn new(opts: Options) -> Result<Self> {
+        Self::with_spawner(opts, T::default())
+    }
 }
 
 impl<T: TaskSpawner> StoreImpl<T> {
     /// Creates a new MVCC key-value store with the given options.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn with_spawner(opts: Options, spawner: T) -> Result<Self> {
         Ok(Self {
             inner: Some(StoreInner::new(opts)?),
+            spawner,
         })
     }
 
@@ -212,7 +221,7 @@ impl<T: TaskSpawner> Drop for StoreImpl<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // Close the store asynchronously
-            T::spawn(async move {
+            self.spawner.spawn(async move {
                 if let Err(err) = inner.close().await {
                     // TODO: use log/tracing instead of eprintln
                     eprintln!("Error occurred while closing the kv store: {}", err);
@@ -226,21 +235,32 @@ pub(crate) struct TaskRunnerImpl<T: TaskSpawner> {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
     stop_rx: Receiver<()>,
-    _phantom: PhantomData<T>,
+    spawner: T,
+}
+
+impl<T: TaskSpawner + Default> TaskRunnerImpl<T> {
+    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+        Self::with_spawner(core, writes_rx, stop_rx, T::default())
+    }
 }
 
 impl<T: TaskSpawner> TaskRunnerImpl<T> {
-    fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+    fn with_spawner(
+        core: Arc<Core>,
+        writes_rx: Receiver<Task>,
+        stop_rx: Receiver<()>,
+        spawner: T,
+    ) -> Self {
         Self {
             core,
             writes_rx,
             stop_rx,
-            _phantom: PhantomData,
+            spawner,
         }
     }
 
     fn spawn(self) -> Pin<Box<dyn JoinHandle<()>>> {
-        T::spawn(async move {
+        self.spawner.spawn(async move {
             loop {
                 select! {
                     req = self.writes_rx.recv().fuse() => {

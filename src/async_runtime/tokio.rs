@@ -7,10 +7,11 @@ use std::{
 
 use super::{JoinError, JoinHandle, TaskSpawner};
 
+#[derive(Copy, Clone, Default)]
 pub struct TokioSpawner;
 
 impl TaskSpawner for TokioSpawner {
-    fn spawn<F>(f: F) -> Pin<Box<dyn JoinHandle<F::Output>>>
+    fn spawn<F>(self, f: F) -> Pin<Box<dyn JoinHandle<F::Output>>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,

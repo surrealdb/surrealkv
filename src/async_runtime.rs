@@ -16,8 +16,8 @@ impl Display for JoinError {
 
 pub trait JoinHandle<T>: Future<Output = Result<T, JoinError>> + Send {}
 
-pub trait TaskSpawner: Send + Sync + 'static {
-    fn spawn<F>(f: F) -> Pin<Box<dyn JoinHandle<F::Output>>>
+pub trait TaskSpawner: Copy + Send + Sync + 'static {
+    fn spawn<F>(self, f: F) -> Pin<Box<dyn JoinHandle<F::Output>>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static;
