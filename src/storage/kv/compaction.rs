@@ -5,16 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
 
-use crate::storage::{
-    kv::{
-        entry::{Entry, Record, Value, ValueRef},
-        error::{Error, Result},
-        manifest::Manifest,
-        meta::Metadata,
-        option::Options,
-        store::{Core, StoreInner},
+use crate::{
+    async_runtime::TaskSpawner,
+    storage::{
+        kv::{
+            entry::{Entry, Record, Value, ValueRef},
+            error::{Error, Result},
+            manifest::Manifest,
+            meta::Metadata,
+            option::Options,
+            store::{Core, StoreInner},
+        },
+        log::{Aol, Options as LogOptions, SegmentRef},
     },
-    log::{Aol, Options as LogOptions, SegmentRef},
 };
 
 struct CompactionGuard<'a> {
@@ -34,7 +37,7 @@ impl<'a> Drop for CompactionGuard<'a> {
     }
 }
 
-impl StoreInner {
+impl<T: TaskSpawner> StoreInner<T> {
     pub async fn compact(&self) -> Result<()> {
         // Early return if the store is closed or compaction is already in progress
         if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {

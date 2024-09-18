@@ -1,0 +1,32 @@
+use std::{
+    future::Future,
+    pin::{pin, Pin},
+    result::Result,
+    task::{Context, Poll},
+};
+
+use super::{JoinError, JoinHandle, TaskSpawner};
+
+pub struct TokioSpawner;
+
+impl TaskSpawner for TokioSpawner {
+    fn spawn<F>(f: F) -> impl JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        TokioJoinHandle(tokio::spawn(f))
+    }
+}
+
+pub struct TokioJoinHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Future for TokioJoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        pin!(&mut self.0).poll(cx).map_err(|_| JoinError)
+    }
+}
+
+impl<T: Send> JoinHandle<T> for TokioJoinHandle<T> {}
