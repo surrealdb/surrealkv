@@ -304,8 +304,8 @@ mod tests {
 
     fn corrupt_at_offset(opts: Options, segment_num: usize, corruption_offset: u64) {
         let clog_subdir = opts.dir.join("clog");
-        let sr =
-            SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
+        let sr = SegmentRef::read_segments_from_directory(&clog_subdir, &crate::vfs::Dummy)
+            .expect("should read segments");
 
         // Open the nth segment file for corrupting
         let file_path = &sr[segment_num - 1].file_path;
@@ -316,11 +316,12 @@ mod tests {
     // This is useful for testing the repair process because when opening
     // the store, the repair process will only repair the corrupted segment
     // if it is the last segment in the directory.
-    fn corrupt_and_repair(
+    fn corrupt_and_repair<V: FileSystem>(
         store: &Store,
         opts: Options,
         segment_num: usize,
         corruption_offset: u64,
+        vfs: &V,
     ) {
         let mut clog = store
             .inner
@@ -332,8 +333,8 @@ mod tests {
             .unwrap()
             .write();
         let clog_subdir = opts.dir.join("clog");
-        let sr =
-            SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
+        let sr = SegmentRef::read_segments_from_directory(&clog_subdir, &crate::vfs::Dummy)
+            .expect("should read segments");
 
         // Open the nth segment file for corruption
         corrupt_at_offset(opts.clone(), segment_num, corruption_offset);
@@ -346,6 +347,7 @@ mod tests {
             &opts,
             corrupted_segment_id,
             corrupted_offset_marker,
+            vfs,
         )
         .unwrap();
 
@@ -432,7 +434,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of header
-        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            2,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -473,7 +481,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            3,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -524,7 +538,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            1,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -571,7 +591,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            3,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -677,7 +703,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 37 + 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            1,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -719,7 +751,13 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 37 + 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+        corrupt_and_repair(
+            &store,
+            opts.clone(),
+            2,
+            corruption_offset,
+            &crate::vfs::Dummy,
+        );
 
         // Close the store
         store.close().await.expect("should close store");
@@ -801,7 +839,7 @@ mod tests {
         let mut file2 = File::create(dir.path().join("0002.clog")).unwrap();
         file1.write_all(b"Data for 0001.clog").unwrap();
         file2.write_all(b"Data for 0002.clog").unwrap();
-        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
     }
@@ -811,7 +849,7 @@ mod tests {
         let dir = create_temp_directory();
         File::create(dir.path().join("001.repair")).unwrap();
         File::create(dir.path().join("002.repair")).unwrap();
-        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("001.clog").exists());
         assert!(dir.path().join("002.clog").exists());
         assert!(!dir.path().join("001.repair").exists());
@@ -825,7 +863,7 @@ mod tests {
         File::create(dir.path().join("0002.clog")).unwrap();
         File::create(dir.path().join("0001.repair")).unwrap();
         File::create(dir.path().join("0002.repair")).unwrap();
-        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
         assert!(!dir.path().join("0001.repair").exists());
@@ -838,7 +876,7 @@ mod tests {
         File::create(dir.path().join("0001.clog")).unwrap();
         File::create(dir.path().join("0002.clog")).unwrap();
         File::create(dir.path().join("0001.repair")).unwrap();
-        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
         assert!(!dir.path().join("0001.repair").exists());
@@ -855,7 +893,7 @@ mod tests {
         file2.write_all(b"Data for 0002.clog").unwrap();
         repair_file1.write_all(b"Data for 0001.repair").unwrap();
         repair_file2.write_all(b"Data for 0002.repair").unwrap();
-        assert!(restore_repair_files(dir.path().to_str().unwrap()).is_ok());
+        assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
         assert!(!dir.path().join("0001.repair").exists());

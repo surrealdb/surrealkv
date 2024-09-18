@@ -2514,7 +2514,9 @@ mod tests {
         store.close().await.unwrap();
 
         let clog_subdir = tmp_dir.path().join("clog");
-        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
+        let sr =
+            SegmentRef::read_segments_from_directory(clog_subdir.as_path(), &crate::vfs::Dummy)
+                .unwrap();
         let reader = MultiSegmentReader::new(sr).unwrap();
         let reader = Reader::new_from(reader);
         let mut tx_reader = RecordReader::new(reader, 100, 100);

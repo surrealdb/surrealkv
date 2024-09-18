@@ -299,7 +299,8 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Test initial offset
         let sz = (a.active_segment_id, a.active_segment.offset());
@@ -370,7 +371,8 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
@@ -415,7 +417,8 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
@@ -484,7 +487,8 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let large_record = vec![1; 1025];
         let small_record = vec![1; 1024];
@@ -511,7 +515,8 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let small_record = vec![1; 1024];
         let r = a.append(&small_record);
@@ -542,7 +547,8 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let large_record = vec![1; 1024];
         let small_record = vec![1; 512];
@@ -556,7 +562,8 @@ mod tests {
 
         a.close().expect("should close");
 
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
         assert_eq!(0, a.active_segment_id);
 
         let r = a.append(&small_record);
@@ -577,7 +584,8 @@ mod tests {
             max_file_size: 1024, // Small enough to ensure the second append creates a new file
             ..Default::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append a record that fits within the first file
         let first_record = vec![1; 512];
@@ -613,7 +621,8 @@ mod tests {
         // Setup: Create a temporary directory and initialize the log with default options
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append a single record to ensure there is some data in the log
         let record = vec![1; 512];
@@ -639,13 +648,15 @@ mod tests {
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            let mut a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
             a.append(&record).expect("append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            let mut a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should reopen aol");
             a.append(&record)
                 .expect("append after reopen should succeed");
 
@@ -673,14 +684,16 @@ mod tests {
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+            let mut a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
             a.append(&record).expect("first append should succeed");
             a.append(&record).expect("first append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record, which should create a new file
         {
-            let mut a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            let mut a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should reopen aol");
 
             // Verify: Ensure the first record is in a new file by reading it back
             let mut read_buf = vec![0; 512];
@@ -712,7 +725,8 @@ mod tests {
     fn sequential_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
@@ -739,7 +753,8 @@ mod tests {
     fn random_access_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
@@ -772,7 +787,8 @@ mod tests {
     fn test_rotate_functionality() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let mut aol = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut aol =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Ensure there's data in the current segment to necessitate a rotation
         aol.append(b"data 1").unwrap();

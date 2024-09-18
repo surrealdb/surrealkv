@@ -438,30 +438,37 @@ mod tests {
         let temp_dir = &temp_dir.to_path_buf();
 
         // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
 
         // Test saving and loading ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
+        RecoveryState::ClogDeleted
+            .save(temp_dir, &crate::vfs::Dummy)
+            .unwrap();
         assert_eq!(
-            RecoveryState::load(temp_dir).unwrap(),
+            RecoveryState::load(temp_dir, &crate::vfs::Dummy).unwrap(),
             RecoveryState::ClogDeleted
         );
 
         // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
 
         // Test loading None when no state is saved
-        assert_eq!(RecoveryState::load(temp_dir).unwrap(), RecoveryState::None);
+        assert_eq!(
+            RecoveryState::load(temp_dir, &crate::vfs::Dummy).unwrap(),
+            RecoveryState::None
+        );
 
         // Test save contents for ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
+        RecoveryState::ClogDeleted
+            .save(temp_dir, &crate::vfs::Dummy)
+            .unwrap();
         let contents = read_to_string(&path).unwrap();
         assert_eq!(contents, "ClogDeleted");
 
         // Final clear to clean up
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
     }
 

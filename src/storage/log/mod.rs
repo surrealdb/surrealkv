@@ -1251,7 +1251,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let dir = temp_dir.path().to_path_buf();
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(&dir, &crate::vfs::Dummy).unwrap();
         assert_eq!(result, (0, 0));
     }
 
@@ -1265,7 +1265,7 @@ mod tests {
         create_segment_file(&dir, "00000000000000000002.log");
         create_segment_file(&dir, "00000000000000000004.log");
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(&dir, &crate::vfs::Dummy).unwrap();
         assert_eq!(result, (1, 4));
     }
 
@@ -1641,7 +1641,7 @@ mod tests {
         create_segment_file(dir_path, &segment_name(10, ""));
 
         // Call the function under test
-        let segment_ids = list_segment_ids(dir_path).unwrap();
+        let segment_ids = list_segment_ids(dir_path, &crate::vfs::Dummy).unwrap();
 
         // Verify the output
         assert_eq!(segment_ids, vec![1, 2, 10]);

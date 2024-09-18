@@ -107,6 +107,8 @@ impl<V: FileSystem> StoreInner<V> {
     }
 }
 
+pub type Store = StoreImpl<crate::vfs::Dummy>;
+
 /// An MVCC-based transactional key-value store.
 ///
 /// The store is closed asynchronously when it is dropped.
@@ -114,13 +116,19 @@ impl<V: FileSystem> StoreInner<V> {
 
 // This is a wrapper around the inner store to allow for asynchronous closing of the store.
 #[derive(Default)]
-pub struct Store<V: FileSystem> {
+pub struct StoreImpl<V: FileSystem> {
     pub(crate) inner: Option<StoreInner<V>>,
 }
 
-impl<V: FileSystem> Store<V> {
+impl StoreImpl<crate::vfs::Dummy> {
+    pub fn new(opts: Options) -> Result<Self> {
+        Self::with_vfs(opts, crate::vfs::Dummy)
+    }
+}
+
+impl<V: FileSystem> StoreImpl<V> {
     /// Creates a new MVCC key-value store with the given options.
-    pub fn new(opts: Options, vfs: V) -> Result<Self> {
+    pub fn with_vfs(opts: Options, vfs: V) -> Result<Self> {
         Ok(Self {
             inner: Some(StoreInner::<V>::new(opts, vfs)?),
         })
@@ -192,7 +200,7 @@ impl<V: FileSystem> Store<V> {
     }
 }
 
-impl<V: FileSystem> Drop for Store<V> {
+impl<V: FileSystem> Drop for StoreImpl<V> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // Close the store asynchronously
