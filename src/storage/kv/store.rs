@@ -71,7 +71,7 @@ impl<T: TaskSpawner> StoreInner<T> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn with_spawner(opts: Options, spawner: T) -> Result<Self> {
+    pub fn with_spawner(opts: Options, spawner: Arc<T>) -> Result<Self> {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
@@ -134,22 +134,22 @@ impl<T: TaskSpawner> StoreInner<T> {
 #[derive(Default)]
 pub struct StoreImpl<T: TaskSpawner> {
     pub(crate) inner: Option<StoreInner<T>>,
-    spawner: T,
+    spawner: Arc<T>,
 }
 
 impl<T: TaskSpawner + Default> StoreImpl<T> {
     /// Creates a new MVCC key-value store with the given options and a default spawner.
     #[allow(dead_code)]
     pub fn new(opts: Options) -> Result<Self> {
-        Self::with_spawner(opts, T::default())
+        Self::with_spawner(opts, Arc::new(T::default()))
     }
 }
 
 impl<T: TaskSpawner> StoreImpl<T> {
     /// Creates a new MVCC key-value store with the given options.
-    pub fn with_spawner(opts: Options, spawner: T) -> Result<Self> {
+    pub fn with_spawner(opts: Options, spawner: Arc<T>) -> Result<Self> {
         Ok(Self {
-            inner: Some(StoreInner::with_spawner(opts, spawner)?),
+            inner: Some(StoreInner::with_spawner(opts, spawner.clone())?),
             spawner,
         })
     }
