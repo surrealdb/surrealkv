@@ -68,7 +68,7 @@ impl<T: TaskSpawner> StoreInner<T> {
             stop_tx,
             is_closed: AtomicBool::new(false),
             is_compacting: AtomicBool::new(false),
-            task_runner_handle: Arc::new(AsyncMutex::new(Some(Box::pin(task_runner_handle)))),
+            task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
             stats: Arc::new(StorageStats::new()),
             _phantom: PhantomData,
         })
@@ -226,7 +226,7 @@ impl<T: TaskSpawner> TaskRunnerImpl<T> {
         }
     }
 
-    fn spawn(self) -> impl JoinHandle<()> {
+    fn spawn(self) -> Pin<Box<dyn JoinHandle<()>>> {
         T::spawn(async move {
             loop {
                 select! {

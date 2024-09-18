@@ -1,18 +1,23 @@
-use std::{fmt::Display, future::Future};
+use std::{
+    fmt::{Display, Formatter},
+    future::Future,
+    pin::Pin,
+    result::Result,
+};
 
 #[derive(Debug)]
 pub struct JoinError;
 
 impl Display for JoinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str("JoinError")
     }
 }
 
-pub trait JoinHandle<T>: Future<Output = std::result::Result<T, JoinError>> + Send {}
+pub trait JoinHandle<T>: Future<Output = Result<T, JoinError>> + Send {}
 
 pub trait TaskSpawner: Send + Sync + 'static {
-    fn spawn<F>(f: F) -> impl JoinHandle<F::Output>
+    fn spawn<F>(f: F) -> Pin<Box<dyn JoinHandle<F::Output>>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static;
