@@ -49,6 +49,12 @@ pub type Store = StoreImpl<TokioSpawner>;
 #[cfg(feature = "tokio")]
 pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
 
+#[cfg(not(feature = "tokio"))]
+pub type Store<T: TaskSpawner> = StoreImpl<T>;
+
+#[cfg(not(feature = "tokio"))]
+pub type TaskRunner<T: TaskSpawner> = TaskRunnerImpl<T>;
+
 pub(crate) struct StoreInner<T: TaskSpawner> {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
