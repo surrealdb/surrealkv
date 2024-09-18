@@ -1,6 +1,5 @@
 use std::marker::PhantomData;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -61,7 +60,7 @@ pub(crate) struct StoreInner<T: TaskSpawner> {
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
-    task_runner_handle: Arc<AsyncMutex<Option<Pin<Box<dyn JoinHandle<()>>>>>>,
+    task_runner_handle: Arc<AsyncMutex<Option<Box<dyn JoinHandle<()> + Unpin>>>>,
     pub(crate) stats: Arc<StorageStats>,
     _phantom: PhantomData<T>,
 }
@@ -238,13 +237,13 @@ pub(crate) struct TaskRunnerImpl<T: TaskSpawner> {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
     stop_rx: Receiver<()>,
-    spawner: T,
+    spawner: Arc<T>,
 }
 
 impl<T: TaskSpawner + Default> TaskRunnerImpl<T> {
     #[allow(dead_code)]
     fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
-        Self::with_spawner(core, writes_rx, stop_rx, T::default())
+        Self::with_spawner(core, writes_rx, stop_rx, Arc::new(T::default()))
     }
 }
 
@@ -253,7 +252,7 @@ impl<T: TaskSpawner> TaskRunnerImpl<T> {
         core: Arc<Core>,
         writes_rx: Receiver<Task>,
         stop_rx: Receiver<()>,
-        spawner: T,
+        spawner: Arc<T>,
     ) -> Self {
         Self {
             core,
@@ -263,8 +262,9 @@ impl<T: TaskSpawner> TaskRunnerImpl<T> {
         }
     }
 
-    fn spawn(self) -> Pin<Box<dyn JoinHandle<()>>> {
-        self.spawner.spawn(async move {
+    fn spawn(self) -> Box<dyn JoinHandle<()> + Unpin> {
+        let spawner = self.spawner.clone();
+        spawner.spawn(async move {
             loop {
                 select! {
                     req = self.writes_rx.recv().fuse() => {
