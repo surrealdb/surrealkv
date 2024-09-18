@@ -40,6 +40,9 @@ use crate::{
     },
 };
 
+pub type Store = StoreImpl<TokioSpawner>;
+pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
+
 pub(crate) struct StoreInner<T: TaskSpawner> {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
@@ -207,8 +210,6 @@ impl<T: TaskSpawner> Drop for StoreImpl<T> {
     }
 }
 
-pub type Store = StoreImpl<TokioSpawner>;
-
 pub(crate) struct TaskRunnerImpl<T: TaskSpawner> {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
@@ -254,8 +255,6 @@ impl<T: TaskSpawner> TaskRunnerImpl<T> {
         }
     }
 }
-
-pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
 
 /// Core of the key-value store.
 pub struct Core {
