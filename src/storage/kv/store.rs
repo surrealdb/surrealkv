@@ -47,6 +47,7 @@ use crate::async_runtime::tokio::TokioSpawner;
 pub type Store = StoreImpl<TokioSpawner>;
 
 #[cfg(feature = "tokio")]
+#[allow(dead_code)]
 pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
 
 #[cfg(not(feature = "tokio"))]
@@ -70,13 +71,14 @@ impl<T: TaskSpawner> StoreInner<T> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn with_spawner(opts: Options, spawner: T) -> Result<Self> {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
 
         let core = Arc::new(Core::new(opts, writes_tx)?);
-        let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
+        let task_runner_handle =
+            TaskRunnerImpl::<T>::with_spawner(core.clone(), writes_rx, stop_rx, spawner).spawn();
 
         Ok(Self {
             core,
@@ -136,7 +138,8 @@ pub struct StoreImpl<T: TaskSpawner> {
 }
 
 impl<T: TaskSpawner + Default> StoreImpl<T> {
-    /// Creates a new MVCC key-value store with the given options.
+    /// Creates a new MVCC key-value store with the given options and a default spawner.
+    #[allow(dead_code)]
     pub fn new(opts: Options) -> Result<Self> {
         Self::with_spawner(opts, T::default())
     }
@@ -146,7 +149,7 @@ impl<T: TaskSpawner> StoreImpl<T> {
     /// Creates a new MVCC key-value store with the given options.
     pub fn with_spawner(opts: Options, spawner: T) -> Result<Self> {
         Ok(Self {
-            inner: Some(StoreInner::new(opts)?),
+            inner: Some(StoreInner::with_spawner(opts, spawner)?),
             spawner,
         })
     }
@@ -239,6 +242,7 @@ pub(crate) struct TaskRunnerImpl<T: TaskSpawner> {
 }
 
 impl<T: TaskSpawner + Default> TaskRunnerImpl<T> {
+    #[allow(dead_code)]
     fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
         Self::with_spawner(core, writes_rx, stop_rx, T::default())
     }
