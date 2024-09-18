@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
 
+use crate::vfs::FileSystem;
 use vart::art::KV;
 
 use crate::storage::{
@@ -38,26 +39,27 @@ use crate::storage::{
     log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
 };
 
-pub(crate) struct StoreInner {
+pub(crate) struct StoreInner<V: FileSystem> {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
     task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
     pub(crate) stats: Arc<StorageStats>,
+    pub(crate) vfs: V,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
-impl StoreInner {
+impl<V: FileSystem> StoreInner<V> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn new(opts: Options, vfs: V) -> Result<Self> {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
 
-        let core = Arc::new(Core::new(opts, writes_tx)?);
+        let core = Arc::new(Core::new(opts, writes_tx, &vfs)?);
         let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
 
         Ok(Self {
@@ -67,6 +69,7 @@ impl StoreInner {
             is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
             stats: Arc::new(StorageStats::new()),
+            vfs,
         })
     }
 
@@ -111,15 +114,15 @@ impl StoreInner {
 
 // This is a wrapper around the inner store to allow for asynchronous closing of the store.
 #[derive(Default)]
-pub struct Store {
-    pub(crate) inner: Option<StoreInner>,
+pub struct Store<V: FileSystem> {
+    pub(crate) inner: Option<StoreInner<V>>,
 }
 
-impl Store {
+impl<V: FileSystem> Store<V> {
     /// Creates a new MVCC key-value store with the given options.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn new(opts: Options, vfs: V) -> Result<Self> {
         Ok(Self {
-            inner: Some(StoreInner::new(opts)?),
+            inner: Some(StoreInner::<V>::new(opts, vfs)?),
         })
     }
 
@@ -189,7 +192,7 @@ impl Store {
     }
 }
 
-impl Drop for Store {
+impl<V: FileSystem> Drop for Store<V> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // Close the store asynchronously
@@ -288,14 +291,14 @@ impl Core {
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    pub(crate) fn initialize_manifest(dir: &Path) -> Result<Aol> {
+    pub(crate) fn initialize_manifest<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Aol> {
         let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
+        Aol::open(&manifest_subdir, &mopts, vfs).map_err(Error::from)
     }
 
     // This function initializes the commit log (clog) for the database.
-    fn initialize_clog(opts: &Options) -> Result<Aol> {
+    fn initialize_clog<V: FileSystem>(opts: &Options, vfs: &V) -> Result<Aol> {
         // It first constructs the path to the clog subdirectory within the database directory.
         let clog_subdir = opts.dir.join("clog");
 
@@ -313,11 +316,11 @@ impl Core {
         //
         // Even though we are restoring the corrupted files, it will get repaired
         // during in the load_index function.
-        restore_repair_files(clog_subdir.as_path().to_str().unwrap())?;
+        restore_repair_files(clog_subdir.as_path().to_str().unwrap(), vfs)?;
 
         // Finally, it attempts to open the clog with the specified options.
         // If this fails, the error is converted to a database error and then propagated up to the caller of the function.
-        Aol::open(&clog_subdir, &copts).map_err(Error::from)
+        Aol::open(&clog_subdir, &copts, vfs).map_err(Error::from)
     }
 
     /// Creates a new Core with the given options.
@@ -326,7 +329,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
+    pub fn new<V: FileSystem>(opts: Options, writes_tx: Sender<Task>, vfs: &V) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
@@ -336,20 +339,20 @@ impl Core {
         let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
-            manifest = Some(Self::initialize_manifest(&opts.dir)?);
+            manifest = Some(Self::initialize_manifest(&opts.dir, vfs)?);
 
             // Load options from the manifest file.
-            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
+            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap(), vfs)?;
 
             // Determine options for the commit log file and open or create it.
-            clog = Some(Self::initialize_clog(&opts)?);
+            clog = Some(Self::initialize_clog(&opts, vfs)?);
 
             // Restore the store from a compaction process if necessary.
-            restore_from_compaction(&opts)?;
+            restore_from_compaction(&opts, vfs)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer, vfs)?;
             }
         }
 
@@ -383,12 +386,17 @@ impl Core {
     }
 
     // The load_index function is responsible for loading the index from the log.
-    fn load_index(opts: &Options, clog: &mut Aol, indexer: &mut Indexer) -> Result<u64> {
+    fn load_index<V: FileSystem>(
+        opts: &Options,
+        clog: &mut Aol,
+        indexer: &mut Indexer,
+        vfs: &V,
+    ) -> Result<u64> {
         // The directory where the log segments are stored is determined.
         let clog_subdir = opts.dir.join("clog");
 
         // The segments are read from the directory.
-        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
+        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path(), vfs)
             .expect("should read segments");
 
         // A MultiSegmentReader is created to read from multiple segments.
@@ -444,7 +452,7 @@ impl Core {
                 "Repairing corrupted segment with id: {} and offset: {}",
                 corrupted_segment_id, corrupted_offset
             );
-            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
+            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset, vfs)?;
         }
 
         Ok(num_entries)
@@ -485,10 +493,14 @@ impl Core {
         Ok(())
     }
 
-    fn load_manifest(current_opts: &Options, manifest: &mut Aol) -> Result<Options> {
+    fn load_manifest<V: FileSystem>(
+        current_opts: &Options,
+        manifest: &mut Aol,
+        vfs: &V,
+    ) -> Result<Options> {
         // Load existing manifests if any, else create a new one
         let existing_manifest = if manifest.size()? > 0 {
-            Core::read_manifest(&current_opts.dir)?
+            Core::read_manifest(&current_opts.dir, vfs)?
         } else {
             Manifest::new()
         };
@@ -549,9 +561,9 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    pub(crate) fn read_manifest(dir: &Path) -> Result<Manifest> {
+    pub(crate) fn read_manifest<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Manifest> {
         let manifest_subdir = dir.join("manifest");
-        let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
+        let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path(), vfs)
             .expect("should read segments");
         let reader = MultiSegmentReader::new(sr)?;
         let mut reader = Reader::new_from(reader);

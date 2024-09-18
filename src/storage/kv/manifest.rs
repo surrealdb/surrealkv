@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::reader::Reader;
 use crate::storage::log::{write_field, Error as LogError, MultiSegmentReader, SegmentRef};
+use crate::vfs::FileSystem;
 use crate::{Error, Options, Result};
 
 #[revisioned(revision = 1)]
@@ -81,13 +82,13 @@ impl Manifest {
 
     // Load Vec<Manifest> from a dir
     #[allow(unused)]
-    pub fn load_from_dir(path: &Path) -> Result<Self> {
+    pub fn load_from_dir<V: FileSystem>(path: &Path, vfs: &V) -> Result<Self> {
         let mut manifests = Manifest::new();
         if !path.exists() {
             return Ok(manifests);
         }
 
-        let sr = SegmentRef::read_segments_from_directory(path)?;
+        let sr = SegmentRef::read_segments_from_directory(path, vfs)?;
         let reader = MultiSegmentReader::new(sr)?;
         let mut reader = Reader::new_from(reader);
 

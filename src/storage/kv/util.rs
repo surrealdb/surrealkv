@@ -1,13 +1,10 @@
 use std::{
-    fs,
     ops::{Bound, RangeBounds},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use chrono::Utc;
 use vart::VariableSizeKey;
-
-use crate::Result;
 
 /// Gets the current time in nanoseconds since the Unix epoch.
 /// It gets the current time in UTC, extracts the timestamp in nanoseconds, and asserts that the timestamp is positive.
@@ -46,24 +43,6 @@ pub(crate) fn sanitize_directory(directory: &str) -> std::io::Result<PathBuf> {
     }
 
     Ok(path)
-}
-
-// Utility function to recursively copy a directory
-#[allow(unused)]
-pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    if !dst.exists() {
-        fs::create_dir_all(dst)?;
-    }
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn convert_range_bounds<'a, R>(

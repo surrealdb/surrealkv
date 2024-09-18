@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
@@ -7,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::vfs::FileSystem;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 
@@ -47,15 +47,15 @@ impl Aol {
     ///
     /// This function prepares the AOL instance by creating the necessary directory,
     /// determining the active segment ID, and initializing the active segment.
-    pub fn open(dir: &Path, opts: &Options) -> Result<Self> {
+    pub fn open<V: FileSystem>(dir: &Path, opts: &Options, vfs: &V) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(dir, opts)?;
+        Self::prepare_directory(dir, opts, vfs)?;
 
         // Determine the active segment ID
-        let active_segment_id = Self::calculate_current_write_segment_id(dir)?;
+        let active_segment_id = Self::calculate_current_write_segment_id(dir, vfs)?;
 
         // Open the active segment
         let active_segment = Segment::open(dir, active_segment_id, opts)?;
@@ -77,10 +77,10 @@ impl Aol {
     }
 
     // Helper function to prepare the directory with proper permissions
-    fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
-        fs::create_dir_all(dir)?;
+    fn prepare_directory<V: FileSystem>(dir: &Path, opts: &Options, vfs: &V) -> Result<()> {
+        vfs.create_dir_all(dir)?;
 
-        if let Ok(metadata) = fs::metadata(dir) {
+        if let Ok(metadata) = vfs.metadata(dir) {
             let mut permissions = metadata.permissions();
 
             #[cfg(unix)]
@@ -94,15 +94,15 @@ impl Aol {
                 permissions.set_readonly(false);
             }
 
-            fs::set_permissions(dir, permissions)?;
+            vfs.set_permissions(dir, permissions)?;
         }
 
         Ok(())
     }
 
     // Helper function to calculate the active segment ID
-    fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
-        let (_, last) = get_segment_range(dir)?;
+    fn calculate_current_write_segment_id<V: FileSystem>(dir: &Path, vfs: &V) -> Result<u64> {
+        let (_, last) = get_segment_range(dir, vfs)?;
         Ok(last)
     }
 

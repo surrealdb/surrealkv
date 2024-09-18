@@ -1,6 +1,7 @@
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+
+use crate::vfs::FileSystem;
 
 use crate::storage::{
     kv::{
@@ -15,14 +16,15 @@ use crate::storage::{
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
 /// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
 /// and also due to the asynchronous nature of calling close on the store.
-pub(crate) fn repair_last_corrupted_segment(
+pub(crate) fn repair_last_corrupted_segment<V: FileSystem>(
     aol: &mut Aol,
     db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
+    vfs: &V,
 ) -> Result<()> {
     // Read the list of segments from the directory
-    let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+    let segs = SegmentRef::read_segments_from_directory(&aol.dir, vfs)?;
 
     // Get the last segment
     let last_segment = segs
@@ -51,24 +53,26 @@ pub(crate) fn repair_last_corrupted_segment(
         corrupted_offset_marker,
         last_segment_path,
         last_segment_header_offset,
+        vfs,
     )
 }
 
 /// This function is used to repair a corrupted any given segment in the append-only log (AOL).
 /// Currently it is only being used for testing purposes.
 #[allow(unused)]
-pub(crate) fn repair_corrupted_segment(
+pub(crate) fn repair_corrupted_segment<V: FileSystem>(
     aol: &mut Aol,
     db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
+    vfs: &V,
 ) -> Result<()> {
     let mut file_path = None;
     let mut file_header_offset = 0;
 
     {
         // Read the list of segments from the directory
-        let segs = SegmentRef::read_segments_from_directory(&aol.dir)?;
+        let segs = SegmentRef::read_segments_from_directory(&aol.dir, vfs)?;
 
         // Loop through the segments
         for s in &segs {
@@ -94,6 +98,7 @@ pub(crate) fn repair_corrupted_segment(
         corrupted_offset_marker,
         file_path,
         file_header_offset,
+        vfs,
     )?;
 
     Ok(())
@@ -125,13 +130,14 @@ pub(crate) fn repair_corrupted_segment(
 /// Finally, the function opens the next segment and makes it active.
 ///
 /// If any of these operations fail, the function returns an error.
-fn repair_segment(
+fn repair_segment<V: FileSystem>(
     aol: &mut Aol,
     db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
     corrupted_segment_file_header_offset: u64,
+    vfs: &V,
 ) -> Result<()> {
     // Close the active segment if its ID matches
     if aol.active_segment_id == corrupted_segment_id {
@@ -142,7 +148,7 @@ fn repair_segment(
     let repaired_segment_path = corrupted_segment_file_path.with_extension("repair");
 
     // Rename the corrupted segment to the repaired segment
-    std::fs::rename(&corrupted_segment_file_path, &repaired_segment_path)?;
+    vfs.rename(&corrupted_segment_file_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
     let mut new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
@@ -174,12 +180,12 @@ fn repair_segment(
     new_segment.close()?;
 
     // Remove the repaired segment file
-    std::fs::remove_file(&repaired_segment_path)?;
+    vfs.remove_file(&repaired_segment_path)?;
 
     // Open the next segment and make it active
     if count == 0 {
         println!("deleting empty file {:?}", corrupted_segment_file_path);
-        std::fs::remove_file(&corrupted_segment_file_path)?;
+        vfs.remove_file(&corrupted_segment_file_path)?;
     }
     let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts)?;
     aol.active_segment = new_segment;
@@ -195,7 +201,7 @@ fn repair_segment(
 //
 // Parameters:
 // directory: A string slice that holds the path to the directory.
-pub(crate) fn restore_repair_files(directory: &str) -> std::io::Result<()> {
+pub(crate) fn restore_repair_files<V: FileSystem>(directory: &str, vfs: &V) -> std::io::Result<()> {
     // Check if the directory exists
     if !Path::new(directory).exists() {
         return Ok(());
@@ -205,7 +211,7 @@ pub(crate) fn restore_repair_files(directory: &str) -> std::io::Result<()> {
     let directory = sanitize_directory(directory)?;
 
     // Read the directory
-    let entries = fs::read_dir(directory.clone())?;
+    let entries = vfs.read_dir(directory.clone())?;
 
     // Iterate over each entry in the directory
     for entry in entries.flatten() {
@@ -222,10 +228,10 @@ pub(crate) fn restore_repair_files(directory: &str) -> std::io::Result<()> {
                 // If the '.clog' file exists
                 if clog_path.exists() {
                     // Remove the '.clog' file
-                    fs::remove_file(&clog_path)?;
+                    vfs.remove_file(&clog_path)?;
                 }
                 // Rename the '.repair' file back to '.clog'
-                fs::rename(path, clog_path)?;
+                vfs.rename(path, clog_path)?;
             }
         }
     }
