@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -6,10 +7,7 @@ use std::vec;
 
 use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
-use tokio::{
-    sync::Mutex as AsyncMutex,
-    task::{spawn, JoinHandle},
-};
+use tokio::sync::Mutex as AsyncMutex;
 
 use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
@@ -19,46 +17,67 @@ use revision::Revisioned;
 
 use vart::art::KV;
 
-use crate::storage::{
-    kv::{
-        compaction::restore_from_compaction,
-        entry::{encode_entries, Entry, Record, ValueRef},
-        error::{Error, Result},
-        indexer::Indexer,
-        manifest::Manifest,
-        option::Options,
-        oracle::Oracle,
-        reader::{Reader, RecordReader},
-        repair::{repair_last_corrupted_segment, restore_repair_files},
-        snapshot::Snapshot,
-        stats::StorageStats,
-        transaction::{Durability, Mode, Transaction},
-        util::now,
+use crate::{
+    async_runtime::{JoinHandle, TaskSpawner},
+    storage::{
+        kv::{
+            compaction::restore_from_compaction,
+            entry::{encode_entries, Entry, Record, ValueRef},
+            error::{Error, Result},
+            indexer::Indexer,
+            manifest::Manifest,
+            option::Options,
+            oracle::Oracle,
+            reader::{Reader, RecordReader},
+            repair::{repair_last_corrupted_segment, restore_repair_files},
+            snapshot::Snapshot,
+            stats::StorageStats,
+            transaction::{Durability, Mode, Transaction},
+            util::now,
+        },
+        log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
     },
-    log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
 };
 
-pub(crate) struct StoreInner {
+#[cfg(feature = "tokio")]
+use crate::async_runtime::tokio::TokioSpawner;
+
+#[cfg(feature = "tokio")]
+pub type Store = StoreImpl<TokioSpawner>;
+
+#[cfg(feature = "tokio")]
+#[allow(dead_code)]
+pub type TaskRunner = TaskRunnerImpl<TokioSpawner>;
+
+#[cfg(not(feature = "tokio"))]
+pub type Store<T: TaskSpawner> = StoreImpl<T>;
+
+#[cfg(not(feature = "tokio"))]
+pub type TaskRunner<T: TaskSpawner> = TaskRunnerImpl<T>;
+
+pub(crate) struct StoreInner<T: TaskSpawner> {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
     stop_tx: Sender<()>,
-    task_runner_handle: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
+    task_runner_handle: Arc<AsyncMutex<Option<Box<dyn JoinHandle<()> + Unpin>>>>,
     pub(crate) stats: Arc<StorageStats>,
+    _phantom: PhantomData<T>,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
-impl StoreInner {
+impl<T: TaskSpawner> StoreInner<T> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn new(opts: Options) -> Result<Self> {
+    pub fn with_spawner(opts: Options, spawner: Arc<T>) -> Result<Self> {
         // TODO: make this channel size configurable
         let (writes_tx, writes_rx) = bounded(10000);
         let (stop_tx, stop_rx) = bounded(1);
 
         let core = Arc::new(Core::new(opts, writes_tx)?);
-        let task_runner_handle = TaskRunner::new(core.clone(), writes_rx, stop_rx).spawn();
+        let task_runner_handle =
+            TaskRunnerImpl::<T>::with_spawner(core.clone(), writes_rx, stop_rx, spawner).spawn();
 
         Ok(Self {
             core,
@@ -67,6 +86,7 @@ impl StoreInner {
             is_compacting: AtomicBool::new(false),
             task_runner_handle: Arc::new(AsyncMutex::new(Some(task_runner_handle))),
             stats: Arc::new(StorageStats::new()),
+            _phantom: PhantomData,
         })
     }
 
@@ -111,15 +131,25 @@ impl StoreInner {
 
 // This is a wrapper around the inner store to allow for asynchronous closing of the store.
 #[derive(Default)]
-pub struct Store {
-    pub(crate) inner: Option<StoreInner>,
+pub struct StoreImpl<T: TaskSpawner> {
+    pub(crate) inner: Option<StoreInner<T>>,
+    spawner: Arc<T>,
 }
 
-impl Store {
-    /// Creates a new MVCC key-value store with the given options.
+impl<T: TaskSpawner + Default> StoreImpl<T> {
+    /// Creates a new MVCC key-value store with the given options and a default spawner.
+    #[allow(dead_code)]
     pub fn new(opts: Options) -> Result<Self> {
+        Self::with_spawner(opts, Arc::new(T::default()))
+    }
+}
+
+impl<T: TaskSpawner> StoreImpl<T> {
+    /// Creates a new MVCC key-value store with the given options.
+    pub fn with_spawner(opts: Options, spawner: Arc<T>) -> Result<Self> {
         Ok(Self {
-            inner: Some(StoreInner::new(opts)?),
+            inner: Some(StoreInner::with_spawner(opts, spawner.clone())?),
+            spawner,
         })
     }
 
@@ -189,11 +219,11 @@ impl Store {
     }
 }
 
-impl Drop for Store {
+impl<T: TaskSpawner> Drop for StoreImpl<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // Close the store asynchronously
-            tokio::spawn(async move {
+            self.spawner.spawn(async move {
                 if let Err(err) = inner.close().await {
                     // TODO: use log/tracing instead of eprintln
                     eprintln!("Error occurred while closing the kv store: {}", err);
@@ -203,23 +233,38 @@ impl Drop for Store {
     }
 }
 
-pub(crate) struct TaskRunner {
+pub(crate) struct TaskRunnerImpl<T: TaskSpawner> {
     core: Arc<Core>,
     writes_rx: Receiver<Task>,
     stop_rx: Receiver<()>,
+    spawner: Arc<T>,
 }
 
-impl TaskRunner {
+impl<T: TaskSpawner + Default> TaskRunnerImpl<T> {
+    #[allow(dead_code)]
     fn new(core: Arc<Core>, writes_rx: Receiver<Task>, stop_rx: Receiver<()>) -> Self {
+        Self::with_spawner(core, writes_rx, stop_rx, Arc::new(T::default()))
+    }
+}
+
+impl<T: TaskSpawner> TaskRunnerImpl<T> {
+    fn with_spawner(
+        core: Arc<Core>,
+        writes_rx: Receiver<Task>,
+        stop_rx: Receiver<()>,
+        spawner: Arc<T>,
+    ) -> Self {
         Self {
             core,
             writes_rx,
             stop_rx,
+            spawner,
         }
     }
 
-    fn spawn(self) -> JoinHandle<()> {
-        spawn(Box::pin(async move {
+    fn spawn(self) -> Box<dyn JoinHandle<()> + Unpin> {
+        let spawner = self.spawner.clone();
+        spawner.spawn(async move {
             loop {
                 select! {
                     req = self.writes_rx.recv().fuse() => {
@@ -236,7 +281,7 @@ impl TaskRunner {
                     },
                 }
             }
-        }))
+        })
     }
 
     async fn handle_task(&self, task: Task) {
