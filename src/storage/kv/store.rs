@@ -33,7 +33,6 @@ use crate::storage::{
         snapshot::Snapshot,
         stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
-        util::now,
     },
     log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
 };
@@ -184,7 +183,7 @@ impl Store {
     /// Returns a point-in-time snapshot of the store.
     pub fn get_snapshot(&self) -> Result<Snapshot> {
         let core = self.inner.as_ref().unwrap().core.clone();
-        let snapshot = Snapshot::take(core, now())?;
+        let snapshot = Snapshot::take(core)?;
         Ok(snapshot)
     }
 }
