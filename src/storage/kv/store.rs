@@ -805,7 +805,7 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -825,7 +825,7 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -984,7 +984,7 @@ mod tests {
                 let key = format!("key{}", j);
                 let value = format!("value{}", j);
                 let value = value.into_bytes();
-                let txn = store.begin().unwrap();
+                let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
 
                 assert_eq!(val, value);
@@ -1141,7 +1141,7 @@ mod tests {
 
         // Read the keys from the store
         for key in keys.iter() {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -1162,7 +1162,7 @@ mod tests {
 
         // Read the keys from the store
         for key in keys.iter() {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -1197,7 +1197,7 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Test that the item is still in the store
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
 
             assert_eq!(val.unwrap(), value);
@@ -1243,7 +1243,7 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Test that the item is still in the store
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
 
             if should_exist {
@@ -1343,7 +1343,7 @@ mod tests {
         }
 
         let store = Store::new(opts.clone()).expect("should create store");
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
 
         let mut key_order: Vec<usize> = (0..num_elements).collect();
         key_order.shuffle(&mut rand::thread_rng());
@@ -1407,7 +1407,7 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -1421,7 +1421,7 @@ mod tests {
         // No keys should be found in the store
         for key in keys.iter() {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
     }
@@ -1487,7 +1487,7 @@ mod tests {
 
         let reopened_store = Store::new(opts).expect("should reopen store");
         for key in keys.iter() {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
     }
