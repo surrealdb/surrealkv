@@ -15,24 +15,19 @@ use vart::{
     VariableSizeKey,
 };
 
-pub(crate) const FILTERS: [fn(&ValueRef, u64) -> Result<()>; 1] = [ignore_deleted];
+pub(crate) const FILTERS: [fn(&ValueRef) -> Result<()>; 1] = [ignore_deleted];
 
 /// A versioned snapshot for snapshot isolation.
 pub struct Snapshot {
-    /// The timestamp of the snapshot. This is used to determine the visibility of the
-    /// key-value pairs in the snapshot. It can be used to filter out expired key-value
-    /// pairs or deleted key-value pairs based on the read timestamp.
-    start_ts: u64,
     snap: VartSnapshot<VariableSizeKey, Bytes>,
     store: Arc<Core>,
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: Arc<Core>, start_ts: u64) -> Result<Self> {
+    pub(crate) fn take(store: Arc<Core>) -> Result<Self> {
         let snapshot = store.indexer.write().snapshot();
 
         Ok(Self {
-            start_ts,
             snap: snapshot,
             store,
         })
@@ -66,7 +61,7 @@ impl Snapshot {
         val_ref.decode(version, val_bytes)?;
 
         for filter in filters {
-            filter.apply(&val_ref, self.start_ts)?;
+            filter.apply(&val_ref)?;
         }
 
         Ok(Box::new(val_ref))
@@ -165,10 +160,10 @@ impl Snapshot {
 }
 
 pub(crate) trait FilterFn {
-    fn apply(&self, val_ref: &ValueRef, ts: u64) -> Result<()>;
+    fn apply(&self, val_ref: &ValueRef) -> Result<()>;
 }
 
-fn ignore_deleted(val_ref: &ValueRef, _: u64) -> Result<()> {
+fn ignore_deleted(val_ref: &ValueRef) -> Result<()> {
     let md = val_ref.metadata();
     if let Some(md) = md {
         if md.is_deleted_or_tombstone() {
@@ -180,10 +175,10 @@ fn ignore_deleted(val_ref: &ValueRef, _: u64) -> Result<()> {
 
 impl<F> FilterFn for F
 where
-    F: Fn(&ValueRef, u64) -> Result<()>,
+    F: Fn(&ValueRef) -> Result<()>,
 {
-    fn apply(&self, val_ref: &ValueRef, ts: u64) -> Result<()> {
-        self(val_ref, ts)
+    fn apply(&self, val_ref: &ValueRef) -> Result<()> {
+        self(val_ref)
     }
 }
 

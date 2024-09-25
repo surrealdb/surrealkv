@@ -176,7 +176,7 @@ impl Transaction {
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            snapshot = Some(RwLock::new(Snapshot::take(core.clone(), now())?));
+            snapshot = Some(RwLock::new(Snapshot::take(core.clone())?));
         }
 
         Ok(Self {
@@ -415,7 +415,7 @@ impl Transaction {
 
             // Apply all filters. If any filter fails, skip this key and continue with the next one.
             for filter in &FILTERS {
-                if filter.apply(&val_ref, self.read_ts).is_err() {
+                if filter.apply(&val_ref).is_err() {
                     continue 'outer;
                 }
             }
@@ -738,7 +738,7 @@ impl Transaction {
 
             // Apply all filters. If any filter fails, skip this key and continue with the next one.
             for filter in &FILTERS {
-                if filter.apply(&val_ref, ts).is_err() {
+                if filter.apply(&val_ref).is_err() {
                     continue 'outer;
                 }
             }
