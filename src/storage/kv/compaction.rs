@@ -512,7 +512,7 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter().skip(num_keys_to_delete) {
             // Start a new read transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
@@ -572,7 +572,7 @@ mod tests {
 
         // Verify that deleted keys are not present
         for key in keys.iter().take(num_keys_to_delete) {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
 
@@ -582,14 +582,14 @@ mod tests {
             .skip(num_keys_to_delete)
             .take(num_keys_to_write / 2 - num_keys_to_delete)
         {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, updated_value.as_ref());
         }
 
         // Verify that the second half of the keys still have the default value
         for key in keys.iter().skip(num_keys_to_write / 2) {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -633,7 +633,7 @@ mod tests {
 
         // Verify that all keys still exist with the correct value
         for key in keys.iter() {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -695,14 +695,14 @@ mod tests {
 
         // Verify initial keys are present
         for key in initial_keys.iter() {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
 
         // Verify post-compaction keys are present
         for key in post_compaction_keys.iter() {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -791,7 +791,7 @@ mod tests {
         // Verify initial keys are present (except deleted ones)
         for key in &initial_keys {
             if !keys_to_delete.contains(key) {
-                let txn = reopened_store.begin().unwrap();
+                let mut txn = reopened_store.begin().unwrap();
                 let val = txn.get(key).unwrap().unwrap();
                 assert_eq!(val, default_value.as_ref());
             }
@@ -799,13 +799,13 @@ mod tests {
 
         // Verify deleted keys are not present
         for key in &keys_to_delete {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
 
         // Verify post-compaction keys are present
         for key in &post_compaction_keys {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
@@ -868,7 +868,7 @@ mod tests {
 
         // Verify initial keys have default value or overlapping value
         for key in &keys {
-            let txn = reopened_store.begin().unwrap();
+            let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             if overlapping_keys.contains(key) {
                 assert_eq!(val, overlapping_value.as_ref());
@@ -936,7 +936,7 @@ mod tests {
         let reopened_store = Store::new(opts).expect("Failed to reopen store");
 
         for key in &keys {
-            let txn = reopened_store
+            let mut txn = reopened_store
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             assert!(
@@ -1003,7 +1003,7 @@ mod tests {
 
         // Verify the first half of the keys are deleted and the second half still exist
         for (i, key) in keys.iter().enumerate() {
-            let txn = reopened_store
+            let mut txn = reopened_store
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             let result = txn.get(key).expect("Failed to get key");
@@ -1079,7 +1079,7 @@ mod tests {
 
         // Randomly read keys to verify their integrity
         for (key, expected_value) in &keys_and_values {
-            let txn = reopened_store
+            let mut txn = reopened_store
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             if let Some(value) = txn.get(key).expect("Failed to get key") {
@@ -1123,7 +1123,7 @@ mod tests {
                 let key = format!("key{}", j);
                 let value = format!("value{}", j);
                 let value = value.into_bytes();
-                let txn = store.begin().unwrap();
+                let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
 
                 assert_eq!(val, value);
@@ -1179,7 +1179,7 @@ mod tests {
         let store = Store::new(opts).expect("should reopen store");
 
         // Begin a new transaction to verify compaction results
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
 
         // Check that "key1" is not present because its last version was marked as deleted
         assert!(
@@ -1237,7 +1237,7 @@ mod tests {
         let store = Store::new(opts).expect("should reopen store");
 
         // Begin a new transaction to verify compaction results
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
 
         // Check that "key1" is present and its value is the last inserted value
         let val = txn
@@ -1298,7 +1298,7 @@ mod tests {
 
         // Verify the results
         for key_index in 1..=num_keys {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let key = format!("key{}", key_index).as_bytes().to_vec();
             let expected_value = if key_index > multiple_versions_threshold {
                 format!("value{}_2", key_index)
@@ -1374,7 +1374,7 @@ mod tests {
 
         // Verify the results
         for key_index in 1..=num_keys {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let key = format!("key{}", key_index).as_bytes().to_vec();
 
             if key_index > delete_threshold {
@@ -1469,7 +1469,7 @@ mod tests {
         let store = Store::new(opts).expect("should reopen store");
 
         for key_index in 1..=num_keys {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let key = format!("key{}", key_index).as_bytes().to_vec();
 
             if key_index > clear_threshold {
@@ -1484,7 +1484,7 @@ mod tests {
 
         // Verify the results
         for key_index in 1..=num_keys {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let key = format!("key{}", key_index).as_bytes().to_vec();
 
             if key_index > clear_threshold {

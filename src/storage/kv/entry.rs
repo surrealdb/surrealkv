@@ -555,7 +555,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap().unwrap();
@@ -566,7 +566,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap().unwrap();
@@ -588,7 +588,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Retrieve the value associated with key3
             let val = txn.get(&key3).unwrap().unwrap();
@@ -630,7 +630,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Retrieve the value associated with key1
             let val = txn.get(&key1).unwrap().unwrap();
@@ -641,7 +641,7 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
 
             // Retrieve the value associated with key2
             let val = txn.get(&key2).unwrap().unwrap();

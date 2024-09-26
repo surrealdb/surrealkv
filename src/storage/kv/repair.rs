@@ -408,7 +408,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -443,7 +443,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -481,7 +481,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert_eq!(txn.get(&key).unwrap(), None);
         }
 
@@ -494,7 +494,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -532,7 +532,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert_eq!(txn.get(&key).unwrap(), None);
         }
 
@@ -541,7 +541,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -579,7 +579,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert_eq!(txn.get(&key).unwrap(), None);
         }
 
@@ -588,7 +588,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -632,7 +632,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert_eq!(txn.get(&key).unwrap(), None);
         }
 
@@ -645,7 +645,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -688,7 +688,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -730,7 +730,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }
@@ -769,7 +769,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert_eq!(txn.get(&key).unwrap(), None);
         }
 
@@ -782,7 +782,7 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
             assert_eq!(val, default_value);
         }

@@ -103,7 +103,7 @@ fn sequential_insert_read(c: &mut Criterion) {
 
                 let current_count = count.load(Relaxed);
                 if current_count <= max_count.load(Relaxed) {
-                    let txn = db.begin().unwrap();
+                    let mut txn = db.begin().unwrap();
                     txn.get(&current_count.to_be_bytes()[..]).unwrap();
                 }
             })

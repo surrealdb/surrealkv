@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ahash::{HashMap, HashMapExt};
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
 
@@ -151,10 +151,10 @@ pub struct Transaction {
     pub(crate) write_set: HashMap<Bytes, Vec<WriteSetEntry>>,
 
     /// `read_set` is the keys that are read in the transaction from the snapshot. This is used for conflict detection.
-    pub(crate) read_set: Mutex<Vec<ReadSetEntry>>,
+    pub(crate) read_set: Vec<ReadSetEntry>,
 
     /// `read_key_ranges` is the key ranges that are read in the transaction from the snapshot. This is used for conflict detection.
-    pub(crate) read_key_ranges: Mutex<Vec<ReadScanEntry>>,
+    pub(crate) read_key_ranges: Vec<ReadScanEntry>,
 
     /// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
     durability: Durability,
@@ -185,8 +185,8 @@ impl Transaction {
             snapshot,
             core,
             write_set: HashMap::new(),
-            read_set: Mutex::new(Vec::new()),
-            read_key_ranges: Mutex::new(Vec::new()),
+            read_set: Vec::new(),
+            read_key_ranges: Vec::new(),
             durability: Durability::Eventual,
             closed: false,
             savepoints: 0,
@@ -244,7 +244,7 @@ impl Transaction {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -277,7 +277,7 @@ impl Transaction {
                 if !self.mode.is_read_only() && val_ref.ts() > 0 {
                     let key = Bytes::copy_from_slice(key);
                     let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
-                    self.read_set.lock().push(entry);
+                    self.read_set.push(entry);
                 }
 
                 // Resolve the value reference to get the actual value.
@@ -291,7 +291,7 @@ impl Transaction {
                         if !self.mode.is_read_only() {
                             let key = Bytes::copy_from_slice(key);
                             let entry = ReadSetEntry::new(key, 0, self.savepoints);
-                            self.read_set.lock().push(entry);
+                            self.read_set.push(entry);
                         }
                         Ok(None)
                     }
@@ -367,7 +367,7 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<ScanResult>>
+    pub fn scan<'b, R>(&'b mut self, range: R, limit: Option<usize>) -> Result<Vec<ScanResult>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -389,7 +389,7 @@ impl Transaction {
             };
 
             let rs_entry = ReadScanEntry::new(range_start, range_end, self.savepoints);
-            self.read_key_ranges.lock().push(rs_entry);
+            self.read_key_ranges.push(rs_entry);
         }
 
         // Initialize an empty vector to store the results.
@@ -426,7 +426,7 @@ impl Transaction {
                 // the keys in the vart leaf are terminated with a null byte
                 let key = Bytes::copy_from_slice(&key[..&key.len() - 1]);
                 let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
-                self.read_set.lock().push(entry);
+                self.read_set.push(entry);
             }
 
             // Resolve the value reference to get the actual value.
@@ -532,7 +532,7 @@ impl Transaction {
     pub fn rollback(&mut self) {
         self.closed = true;
         self.write_set.clear();
-        self.read_set.lock().clear();
+        self.read_set.clear();
         self.snapshot.take();
         self.savepoints = 0;
         self.write_seqno = 0;
@@ -621,12 +621,10 @@ impl Transaction {
         // Remove marked entries from the read set to
         // prevent unnecessary read-write conflicts.
         self.read_set
-            .lock()
             .retain(|entry| entry.savepoint_no != self.savepoints);
 
         // And also from the read scan set.
         self.read_key_ranges
-            .lock()
             .retain(|entry| entry.savepoint_no != self.savepoints);
 
         // Decrement the latest savepoint number unless it's zero.
@@ -853,7 +851,7 @@ mod tests {
 
         {
             // Start a read-only transaction (txn3)
-            let txn3 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value1.as_ref());
         }
@@ -875,7 +873,7 @@ mod tests {
         let store = Store::new(opts).expect("should create store");
 
         // Start a read-only transaction (txn4)
-        let txn4 = store.begin().unwrap();
+        let mut txn4 = store.begin().unwrap();
         let val = txn4.get(&key1).unwrap().unwrap();
 
         // Assert that the value retrieved in txn4 matches value2
@@ -907,13 +905,13 @@ mod tests {
 
         {
             // Start another read-write transaction (txn)
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert!(txn.get(&key1).unwrap().is_none());
         }
 
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
         }
@@ -969,7 +967,7 @@ mod tests {
             txn1.commit().await.unwrap();
             txn2.commit().await.unwrap();
 
-            let txn3 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val, value2.as_ref());
         }
@@ -1043,7 +1041,7 @@ mod tests {
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), keys_to_insert.len());
     }
@@ -1067,7 +1065,7 @@ mod tests {
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].1, keys_to_insert[0]);
@@ -1093,7 +1091,7 @@ mod tests {
 
         let range = "test1".as_bytes()..="test7".as_bytes();
 
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, keys_to_insert[0]);
@@ -1281,7 +1279,7 @@ mod tests {
         }
 
         {
-            let txn3 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value3.as_ref());
             let val2 = txn3.get(&key2).unwrap().unwrap();
@@ -1327,7 +1325,7 @@ mod tests {
         }
 
         {
-            let txn3 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap().unwrap();
             assert_eq!(val1, value1.as_ref());
             let val2 = txn3.get(&key2).unwrap().unwrap();
@@ -1432,7 +1430,7 @@ mod tests {
         let value3 = Bytes::from("v3");
 
         {
-            let txn1 = store.begin().unwrap();
+            let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
             // k3 should not be visible to txn1
@@ -1784,7 +1782,7 @@ mod tests {
 
         // Read the keys from the store
         let mut rng = make_rng();
-        let txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
+        let mut txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
         for _i in 0..ENTRIES {
             let (key, _) = gen_pair(&mut rng);
             txn.get(&key).unwrap();
@@ -1797,7 +1795,7 @@ mod tests {
 
         let range = "key1".as_bytes()..="key3".as_bytes();
 
-        let txn = store.begin().unwrap();
+        let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 0);
     }
@@ -1829,7 +1827,7 @@ mod tests {
         }
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
         }
@@ -1867,7 +1865,7 @@ mod tests {
         }
 
         let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
-        let txn1 = store.begin().unwrap();
+        let mut txn1 = store.begin().unwrap();
         txn1.get(&key4).unwrap();
 
         {
@@ -2113,7 +2111,7 @@ mod tests {
 
         {
             // Start a read-only transaction (txn3)
-            let txn3 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap();
             assert!(val.is_none());
             let val = txn3.get(&key2).unwrap().unwrap();
@@ -2132,7 +2130,7 @@ mod tests {
         let store = Store::new(opts).expect("should create store");
 
         // Start a read-only transaction (txn4)
-        let txn4 = store.begin().unwrap();
+        let mut txn4 = store.begin().unwrap();
         let val = txn4.get(&key1).unwrap();
         assert!(val.is_none());
         let val = txn4.get(&key2).unwrap().unwrap();
@@ -2170,7 +2168,7 @@ mod tests {
 
         // Read the key in a new transaction to verify it does not exist
         {
-            let txn = store.begin().unwrap();
+            let mut txn = store.begin().unwrap();
             assert!(txn.get(&key).unwrap().is_none());
         }
     }

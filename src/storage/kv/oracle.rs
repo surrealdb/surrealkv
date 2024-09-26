@@ -160,9 +160,8 @@ impl SnapshotIsolation {
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         let current_snapshot = Snapshot::take(txn.core.clone())?;
-        let read_set = txn.read_set.lock();
 
-        for entry in read_set.iter() {
+        for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
                 Ok(val_ref) => {
                     if entry.ts != val_ref.ts() {
@@ -237,9 +236,7 @@ impl CommitTracker {
     /// Checks if a transaction has conflicts with committed transactions.
     /// It acquires a lock on the read set and checks if there are any conflict keys in the read set.
     fn has_conflict(&self, txn: &Transaction) -> bool {
-        let read_set = txn.read_set.lock();
-
-        if read_set.is_empty() {
+        if txn.read_set.is_empty() {
             false
         } else {
             // For each object in the changeset of the already committed transactions, check if it lies
@@ -247,7 +244,7 @@ impl CommitTracker {
             for committed_tx in self.committed_transactions.iter() {
                 if committed_tx.ts > txn.read_ts {
                     for conflict_key in committed_tx.conflict_keys.iter() {
-                        for rs_entry in txn.read_key_ranges.lock().iter() {
+                        for rs_entry in txn.read_key_ranges.iter() {
                             if key_in_range(conflict_key, &rs_entry.start, &rs_entry.end) {
                                 return true;
                             }
@@ -260,7 +257,7 @@ impl CommitTracker {
                 .iter()
                 .filter(|committed_txn| committed_txn.ts > txn.read_ts)
                 .any(|committed_txn| {
-                    read_set
+                    txn.read_set
                         .iter()
                         .any(|read| committed_txn.conflict_keys.contains(&read.key))
                 })
