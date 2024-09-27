@@ -5,11 +5,9 @@ use std::sync::Arc;
 use std::vec;
 
 use async_channel::{bounded, Receiver, Sender};
+use async_mutex::Mutex as AsyncMutex;
 use futures::{select, FutureExt};
-use tokio::{
-    sync::Mutex as AsyncMutex,
-    task::{spawn, JoinHandle},
-};
+use tokio::task::{spawn, JoinHandle};
 
 use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};

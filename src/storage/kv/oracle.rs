@@ -10,9 +10,9 @@ use std::{
 
 use ahash::{HashMap, HashMapExt, HashSet};
 use async_channel::{bounded, Receiver, Sender};
+use async_semaphore::Semaphore as AsyncSemaphore;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
 
 use crate::storage::kv::{
@@ -27,7 +27,7 @@ use crate::storage::kv::{
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
     /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: AsyncMutex<()>,
+    pub(crate) write_barrier: AsyncSemaphore,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -46,7 +46,7 @@ impl Oracle {
         };
 
         Self {
-            write_lock: AsyncMutex::new(()),
+            write_barrier: AsyncSemaphore::new(1),
             isolation,
         }
     }

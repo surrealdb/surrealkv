@@ -28,6 +28,8 @@ tokio = { version = "1.36", features = ["rt", "sync"] }
 quick_cache = "0.6.0"
 vart = "0.4.0"
 revision = "0.7.1"
+async-semaphore = "1.2.0"
+async-mutex = "1.4.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
