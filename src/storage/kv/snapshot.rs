@@ -8,12 +8,7 @@ use crate::storage::{
     kv::store::Core,
 };
 
-use vart::{
-    art::QueryType,
-    iter::{Iter, VersionedIter},
-    snapshot::Snapshot as VartSnapshot,
-    VariableSizeKey,
-};
+use vart::{art::QueryType, iter::Iter, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
 
 pub(crate) const FILTERS: [fn(&ValueRef) -> Result<()>; 1] = [ignore_deleted];
 
@@ -105,11 +100,6 @@ impl Snapshot {
     /// Retrieves an iterator over the key-value pairs in the snapshot.
     pub fn iter(&self) -> Iter<VariableSizeKey, Bytes> {
         self.snap.iter()
-    }
-
-    /// Retrieves a versioned iterator over the key-value pairs in the snapshot.
-    pub fn versioned_iter(&self) -> VersionedIter<VariableSizeKey, Bytes> {
-        self.snap.iter_with_versions()
     }
 
     /// Returns a range query iterator over the Trie.
