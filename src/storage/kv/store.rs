@@ -17,8 +17,6 @@ use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
 
-use vart::art::KV;
-
 use crate::storage::{
     kv::{
         compaction::restore_from_compaction,
@@ -415,7 +413,7 @@ impl Core {
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
                 Ok(value_offsets) => {
-                    Core::process_entries(&tx, opts, &value_offsets, indexer)?;
+                    Core::process_entry(&tx, opts, &value_offsets, indexer)?;
                     num_entries += 1;
                 }
 
@@ -449,7 +447,7 @@ impl Core {
         Ok(num_entries)
     }
 
-    fn process_entries(
+    fn process_entry(
         entry: &Record,
         opts: &Options,
         value_offsets: &HashMap<Bytes, (u64, usize)>,
@@ -678,7 +676,6 @@ impl Core {
         F: Fn(&Entry) -> Bytes,
     {
         let mut index = self.indexer.write();
-        let mut to_insert = Vec::new();
 
         for entry in &task.entries {
             // If the entry is marked as deleted, delete it.
@@ -691,15 +688,14 @@ impl Core {
 
             let index_value = encode_entry(entry);
 
-            to_insert.push(KV {
-                key: entry.key[..].into(),
-                value: index_value,
-                version: task.tx_id,
-                ts: entry.ts,
-            });
+            index.insert(
+                &mut entry.key[..].into(),
+                index_value,
+                task.tx_id,
+                entry.ts,
+                true,
+            )?;
         }
-
-        index.bulk_insert(&mut to_insert)?;
 
         Ok(())
     }

@@ -1380,9 +1380,9 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 
 [[package]]
 name = "vart"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd6bd87feca9f16f8ad061a454246178acd32881d188262ec377d4e170d63503"
+checksum = "f8e200af7cb5302b8078b2bcf49501b06fd5727b33553d72988fe3a63987e85e"
 
 [[package]]
 name = "version_check"
