@@ -1,10 +1,9 @@
 mod aol;
 pub use aol::Aol;
 
+use crate::vfs::{File, FileSystem, OpenOptions};
 use ahash::{HashMap, HashMapExt};
 use std::fmt;
-use std::fs::File;
-use std::fs::{read_dir, OpenOptions};
 use std::io::BufReader;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -526,8 +525,8 @@ pub(crate) fn segment_name(index: u64, ext: &str) -> String {
 ///
 /// This function returns a tuple containing the minimum and maximum segment IDs
 /// found in the directory. If no segments are found, the tuple will contain (0, 0).
-fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
-    let refs = list_segment_ids(dir)?;
+fn get_segment_range<V: FileSystem>(dir: &Path, vfs: &V) -> Result<(u64, u64)> {
+    let refs = list_segment_ids(dir, vfs)?;
     if refs.is_empty() {
         return Ok((0, 0));
     }
@@ -539,15 +538,15 @@ fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 /// This function reads the names of segment files in the directory and extracts the segment IDs.
 /// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
 /// vector is returned.
-fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
+fn list_segment_ids<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Vec<u64>> {
     let mut refs: Vec<u64> = Vec::new();
-    let entries = read_dir(dir)?;
+    let entries = vfs.read_dir(dir)?;
 
     for entry in entries {
         let file = entry?;
 
         // Check if the entry is a file
-        if std::fs::metadata(file.path())?.is_file() {
+        if vfs.metadata(file.path())?.is_file() {
             let fn_name = file.file_name();
             let fn_str = fn_name.to_string_lossy();
             let (index, _) = parse_segment_name(&fn_str)?;
@@ -572,11 +571,14 @@ pub(crate) struct SegmentRef {
 
 impl SegmentRef {
     /// Creates a vector of SegmentRef instances by reading segments in the specified directory.
-    pub fn read_segments_from_directory(directory_path: &Path) -> Result<Vec<SegmentRef>> {
+    pub fn read_segments_from_directory<V: FileSystem>(
+        directory_path: &Path,
+        vfs: &V,
+    ) -> Result<Vec<SegmentRef>> {
         let mut segment_refs = Vec::new();
 
         // Read the directory and iterate through its entries
-        let files = read_dir(directory_path)?;
+        let files = vfs.read_dir(directory_path)?;
         for file in files {
             let entry = file?;
             if entry.file_type()?.is_file() {
@@ -1249,7 +1251,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let dir = temp_dir.path().to_path_buf();
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(&dir, &crate::vfs::Dummy).unwrap();
         assert_eq!(result, (0, 0));
     }
 
@@ -1263,7 +1265,7 @@ mod tests {
         create_segment_file(&dir, "00000000000000000002.log");
         create_segment_file(&dir, "00000000000000000004.log");
 
-        let result = get_segment_range(&dir).unwrap();
+        let result = get_segment_range(&dir, &crate::vfs::Dummy).unwrap();
         assert_eq!(result, (1, 4));
     }
 
@@ -1639,7 +1641,7 @@ mod tests {
         create_segment_file(dir_path, &segment_name(10, ""));
 
         // Call the function under test
-        let segment_ids = list_segment_ids(dir_path).unwrap();
+        let segment_ids = list_segment_ids(dir_path, &crate::vfs::Dummy).unwrap();
 
         // Verify the output
         assert_eq!(segment_ids, vec![1, 2, 10]);

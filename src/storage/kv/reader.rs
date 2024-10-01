@@ -280,7 +280,8 @@ mod tests {
             max_file_size: 4,
             ..Options::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Test initial offset
         let sz = (a.active_segment_id, a.active_segment.offset());
@@ -299,7 +300,7 @@ mod tests {
 
         a.close().expect("should close aol");
 
-        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), &crate::vfs::Dummy)
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
@@ -337,7 +338,8 @@ mod tests {
             ..Options::default()
         };
 
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let mut a =
+            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 10 records
         for i in 0..num_items {
@@ -348,7 +350,7 @@ mod tests {
 
         a.close().expect("should close aol");
 
-        let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+        let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), &crate::vfs::Dummy)
             .expect("should read segments");
         let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
 
