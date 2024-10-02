@@ -2,11 +2,7 @@ use bytes::Bytes;
 
 use crate::storage::kv::error::Result;
 
-use vart::{
-    art::{Tree as VartIndex, KV},
-    snapshot::Snapshot as VartSnapshot,
-    VariableSizeKey,
-};
+use vart::{art::Tree as VartIndex, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
 
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
 /// It uses a `vart` index, which is a type of persistent, lock-free B+ tree.
@@ -24,17 +20,6 @@ impl Indexer {
     /// Creates a snapshot of the current state of the index.
     pub(crate) fn snapshot(&self) -> VartSnapshot<VariableSizeKey, Bytes> {
         self.index.create_snapshot()
-    }
-
-    /// Inserts multiple key-value pairs into the index.
-    /// Note: Currently, the keys are cloned to ensure they are null-terminated.
-    /// This is a known issue that needs to be fixed.
-    pub fn bulk_insert(&mut self, kv_pairs: &mut [KV<VariableSizeKey, Bytes>]) -> Result<()> {
-        kv_pairs.iter_mut().for_each(|kv| {
-            kv.key = kv.key.terminate();
-        });
-        self.index.bulk_insert(kv_pairs, true)?;
-        Ok(())
     }
 
     pub fn insert(
