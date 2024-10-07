@@ -498,7 +498,7 @@ mod tests {
         // Delete the first 5 keys from the store
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
+            txn.hard_delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -560,7 +560,7 @@ mod tests {
         let num_keys_to_delete = num_keys_to_write / 4;
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
+            txn.hard_delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -772,7 +772,7 @@ mod tests {
         // Delete selected keys
         for key in &keys_to_delete {
             let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
+            txn.hard_delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -917,7 +917,7 @@ mod tests {
             let mut txn = store
                 .begin()
                 .expect("Failed to begin transaction for deletion");
-            txn.delete(key).expect("Failed to delete key");
+            txn.hard_delete(key).expect("Failed to delete key");
             txn.commit().await.expect("Failed to commit deletion");
         }
 
@@ -983,7 +983,7 @@ mod tests {
             let mut txn = store
                 .begin()
                 .expect("Failed to begin transaction for deletion");
-            txn.delete(key).expect("Failed to delete key");
+            txn.hard_delete(key).expect("Failed to delete key");
             txn.commit().await.expect("Failed to commit deletion");
         }
 
@@ -1058,7 +1058,7 @@ mod tests {
                 let mut txn = store
                     .begin()
                     .expect("Failed to begin transaction for deletion");
-                txn.delete(key).expect("Failed to delete key");
+                txn.hard_delete(key).expect("Failed to delete key");
                 txn.commit().await.expect("Failed to commit deletion");
             }
         }
@@ -1157,7 +1157,7 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             // Insert a key with two versions, where the last one is marked as deleted
-            txn.delete(b"key1").unwrap(); // Second version marked as deleted
+            txn.hard_delete(b"key1").unwrap(); // Second version marked as deleted
             txn.commit().await.unwrap();
         }
 
@@ -1357,7 +1357,7 @@ mod tests {
                 // Mark the last version as deleted for keys above the delete_threshold in its own transaction
                 if key_index > delete_threshold {
                     let mut txn = store.begin().unwrap();
-                    txn.delete(&key).unwrap();
+                    txn.hard_delete(&key).unwrap();
                     txn.commit().await.unwrap();
                 }
             }
@@ -1453,7 +1453,7 @@ mod tests {
                 // Mark the last version as deleted for keys above the clear_threshold in its own transaction
                 if key_index > clear_threshold {
                     let mut txn = store.begin().unwrap();
-                    txn.clear(&key).unwrap();
+                    txn.soft_delete(&key).unwrap();
                     txn.commit().await.unwrap();
                 }
             }
