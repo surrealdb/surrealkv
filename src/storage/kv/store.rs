@@ -1145,7 +1145,7 @@ mod tests {
         // Delete the keys from the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
+            txn.hard_delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -1474,7 +1474,7 @@ mod tests {
         // Delete the first 5 keys from the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
-            txn.delete(key).unwrap();
+            txn.hard_delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
