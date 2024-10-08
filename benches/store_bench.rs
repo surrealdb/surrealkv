@@ -127,11 +127,11 @@ fn concurrent_insert(c: &mut Criterion) {
             .build()
             .unwrap();
 
-    let db = rt.block_on(async {
-        let mut opts = Options::new();
-        opts.dir = create_temp_directory().path().to_path_buf();
-        Arc::new(Store::new(opts).expect("should create store"))
-    });
+        let db = rt.block_on(async {
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            Arc::new(Store::new(opts).expect("should create store"))
+        });
 
         group.bench_function(
             format!("{} inserts ({} threads)", item_count, thread_count),

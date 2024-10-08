@@ -5,8 +5,10 @@ use std::fs;
 use std::fs::File;
 use std::path::Path;
 
+#[allow(unused)]
 const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
 
+#[allow(unused)]
 pub(crate) trait BenchStore {
     type T<'db>: Transaction
     where
@@ -15,14 +17,15 @@ pub(crate) trait BenchStore {
     fn transaction(&self, write: bool) -> Self::T<'_>;
 }
 
+#[allow(unused)]
 pub(crate) trait Transaction {
     type Output<'out>: AsRef<[u8]> + 'out
     where
         Self: 'out;
 
     fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()>;
-    fn get<'a>(&'a self, key: &[u8]) -> Option<Self::Output<'a>>;
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>>;
+    fn get<'a>(&'a mut self, key: &[u8]) -> Option<Self::Output<'a>>;
+    fn range(&mut self, key: &[u8]) -> Vec<Vec<u8>>;
     fn delete(&mut self, key: &[u8]) -> Result<(), ()>;
     async fn commit(self) -> Result<(), ()>;
 }
@@ -79,7 +82,7 @@ impl<'a> Transaction for RedbTransaction<'a> {
         }
     }
 
-    fn get<'b>(&'b self, key: &[u8]) -> Option<Self::Output<'b>> {
+    fn get<'b>(&'b mut self, key: &[u8]) -> Option<Self::Output<'b>> {
         match self {
             RedbTransaction::Write(_) => None,
             RedbTransaction::Read(txn) => {
@@ -90,7 +93,7 @@ impl<'a> Transaction for RedbTransaction<'a> {
         }
     }
 
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
+    fn range(&mut self, key: &[u8]) -> Vec<Vec<u8>> {
         match self {
             RedbTransaction::Write(_) => Vec::new(),
             RedbTransaction::Read(txn) => {
@@ -168,11 +171,11 @@ impl<'a> Transaction for SledTransaction<'a> {
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> Option<sled::IVec> {
+    fn get(&mut self, key: &[u8]) -> Option<sled::IVec> {
         self.db.get(key).unwrap()
     }
 
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
+    fn range(&mut self, key: &[u8]) -> Vec<Vec<u8>> {
         let iter = self.db.range(key..);
         iter.filter_map(|x| x.ok())
             .map(|(_, v)| v.to_vec())
@@ -237,14 +240,14 @@ impl<'a> Transaction for RocksdbTransaction<'a> {
         }
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         match self {
             RocksdbTransaction::Write(_) => None,
             RocksdbTransaction::Read(snapshot) => snapshot.get(key).unwrap(),
         }
     }
 
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
+    fn range(&mut self, key: &[u8]) -> Vec<Vec<u8>> {
         match self {
             RocksdbTransaction::Write(_) => Vec::new(),
             RocksdbTransaction::Read(snapshot) => {
@@ -302,7 +305,7 @@ impl<'a> Transaction for SurrealKVTransaction<'a> {
     fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
         match self {
             SurrealKVTransaction::Read(_) => Err(()),
-            SurrealKVTransaction::Write(txn) => txn.delete(key).map(|_| ()).map_err(|_| ()),
+            SurrealKVTransaction::Write(txn) => txn.hard_delete(key).map(|_| ()).map_err(|_| ()),
             _ => unreachable!(),
         }
     }
@@ -318,7 +321,7 @@ impl<'a> Transaction for SurrealKVTransaction<'a> {
         }
     }
 
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         match self {
             SurrealKVTransaction::Write(_) => None,
             SurrealKVTransaction::Read(txn) => txn.get(key).unwrap(),
@@ -326,7 +329,7 @@ impl<'a> Transaction for SurrealKVTransaction<'a> {
         }
     }
 
-    fn range(&self, key: &[u8]) -> Vec<Vec<u8>> {
+    fn range(&mut self, key: &[u8]) -> Vec<Vec<u8>> {
         match self {
             SurrealKVTransaction::Write(_) => Vec::new(),
             SurrealKVTransaction::Read(txn) => {

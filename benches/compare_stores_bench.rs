@@ -1,25 +1,3 @@
-// This code is borrowed from: https://github.com/cberner/redb/blob/master/benches/lmdb_benchmark.rs
-//
-// Copyright (c) 2021 Christopher Berner
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 use fastrand::Rng;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -32,7 +10,9 @@ use common::*;
 use std::fs::File;
 use std::time::{Duration, Instant};
 
-const ELEMENTS: usize = 1_000_00;
+// Keeping it similar to redb benchmark
+// Link: (https://github.com/cberner/redb/blob/db458e9095474fe4d370e2c992bd83ee109ac80b/benches/lmdb_benchmark.rs#L14)
+const ELEMENTS: usize = 100_000;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
@@ -78,15 +58,11 @@ fn gen_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
     (key, value)
 }
 
-fn make_rng() -> fastrand::Rng {
-    fastrand::Rng::with_seed(RNG_SEED)
-}
-
 fn make_rng_shards(shards: usize, elements: usize) -> Vec<fastrand::Rng> {
     let mut rngs = vec![];
     let elements_per_shard = elements / shards;
     for i in 0..shards {
-        let mut rng = make_rng();
+        let mut rng = fastrand::Rng::with_seed(RNG_SEED);
         for _ in 0..(i * elements_per_shard) {
             gen_pair(&mut rng);
         }
@@ -141,18 +117,14 @@ async fn batch_writes<T: BenchStore + Send + Sync>(
 }
 
 fn random_reads<T: BenchStore + Send + Sync>(db: &Arc<T>) -> Duration {
-    let mut rng = make_rng();
+    let mut rng = fastrand::Rng::with_seed(RNG_SEED);
     let start = Instant::now();
-    let txn = db.transaction(false);
-    let mut checksum = 0u64;
-    let mut expected_checksum = 0u64;
+    let mut txn = db.transaction(false);
     for _ in 0..ELEMENTS {
         let (key, value) = gen_pair(&mut rng);
         let result = txn.get(&key).unwrap();
-        checksum += result.as_ref()[0] as u64;
-        expected_checksum += value[0] as u64;
+        assert_eq!(result.as_ref(), value);
     }
-    assert_eq!(checksum, expected_checksum);
     Instant::now() - start
 }
 
@@ -183,16 +155,12 @@ fn random_reads_multithreaded<T: BenchStore + Send + Sync>(
             let db2 = db.clone();
             let mut rng = rngs.pop().unwrap();
             s.spawn(move || {
-                let txn = db2.transaction(false);
-                let mut checksum = 0u64;
-                let mut expected_checksum = 0u64;
+                let mut txn = db2.transaction(false);
                 for _ in 0..(ELEMENTS / num_threads) {
                     let (key, value) = gen_pair(&mut rng);
                     let result = txn.get(&key).unwrap();
-                    checksum += result.as_ref()[0] as u64;
-                    expected_checksum += value[0] as u64;
+                    assert_eq!(result.as_ref(), value);
                 }
-                assert_eq!(checksum, expected_checksum);
             });
         }
     });
@@ -201,7 +169,7 @@ fn random_reads_multithreaded<T: BenchStore + Send + Sync>(
 }
 
 async fn benchmark<T: BenchStore + Send + Sync>(db: T) -> Vec<(String, Duration)> {
-    let mut rng = make_rng();
+    let mut rng = fastrand::Rng::with_seed(RNG_SEED);
     let db = Arc::new(db);
 
     let mut results = Vec::new();
@@ -259,7 +227,7 @@ async fn benchmark_surrealkv() -> Vec<(String, Duration)> {
     let tmpdir: TempDir = create_temp_directory();
     let mut opts = surrealkv::Options::new();
     opts.dir = tmpdir.path().to_path_buf();
-    opts.max_value_threshold = VALUE_SIZE;
+    opts.max_value_threshold = 0;
     let db = surrealkv::Store::new(opts).unwrap();
     let table = SurrealKVBenchStore::new(&db);
     benchmark(table).await
