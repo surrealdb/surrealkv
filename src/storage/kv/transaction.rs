@@ -227,7 +227,7 @@ impl Transaction {
 
     /// Delete all the versions of a key. This is a hard delete.
     /// This will remove the key from the index and disk.
-    pub fn hard_delete(&mut self, key: &[u8]) -> Result<()> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         let value = Bytes::new();
         let mut entry = Entry::new(key, &value);
         entry.mark_delete();
@@ -902,7 +902,7 @@ mod tests {
         {
             // Start a read-only transaction (txn)
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(&key1).unwrap();
+            txn.delete(&key1).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -1006,7 +1006,7 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
-            txn2.hard_delete(&key).unwrap();
+            txn2.delete(&key).unwrap();
             assert!(txn2.commit().await.is_ok());
 
             assert!(txn3.get(&key).is_ok());
@@ -1158,7 +1158,7 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
-            txn2.hard_delete(&key4).unwrap();
+            txn2.delete(&key4).unwrap();
             txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key5".as_bytes();
@@ -1202,7 +1202,7 @@ mod tests {
             // Start a new read-write transaction (txn1)
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
-            txn1.hard_delete(&key1).unwrap();
+            txn1.delete(&key1).unwrap();
             let res = txn1.get(&key1).unwrap();
             assert!(res.is_none());
             txn1.commit().await.unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
 
-            txn2.hard_delete(&key2).unwrap();
+            txn2.delete(&key2).unwrap();
             txn1.commit().await.unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
@@ -1604,7 +1604,7 @@ mod tests {
 
             txn2.commit().await.unwrap();
 
-            txn1.hard_delete(&key2).unwrap();
+            txn1.delete(&key2).unwrap();
             assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
@@ -1645,7 +1645,7 @@ mod tests {
 
             txn2.set(&key1, &value3).unwrap();
 
-            txn1.hard_delete(&key2).unwrap();
+            txn1.delete(&key2).unwrap();
 
             txn2.set(&key2, &value4).unwrap();
 
@@ -1822,7 +1822,7 @@ mod tests {
             // Start a read-only transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.get(&key1).unwrap();
-            txn.hard_delete(&key1).unwrap();
+            txn.delete(&key1).unwrap();
             let range = "k1".as_bytes()..="k3".as_bytes();
             let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
@@ -1980,7 +1980,7 @@ mod tests {
                 98, 117, 115, 101, 114, 0,
             ]))
             .unwrap();
-            txn3.hard_delete(&Bytes::copy_from_slice(&[
+            txn3.delete(&Bytes::copy_from_slice(&[
                 47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
                 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
                 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
@@ -2108,7 +2108,7 @@ mod tests {
         {
             // Start another read-write transaction (txn2)
             let mut txn2 = store.begin().unwrap();
-            txn2.hard_delete(&key1).unwrap();
+            txn2.delete(&key1).unwrap();
             txn2.commit().await.unwrap();
         }
 
