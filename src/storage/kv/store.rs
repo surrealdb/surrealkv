@@ -20,15 +20,14 @@ use revision::Revisioned;
 use crate::storage::{
     kv::{
         compaction::restore_from_compaction,
-        entry::{encode_entries, Entry, Record, ValueRef},
+        entry::{encode_entries, Entry, Record},
         error::{Error, Result},
-        indexer::Indexer,
+        indexer::{IndexValue, Indexer},
         manifest::Manifest,
         option::Options,
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
-        snapshot::Snapshot,
         stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
     },
@@ -176,13 +175,6 @@ impl Store {
         }
 
         Ok(())
-    }
-
-    /// Returns a point-in-time snapshot of the store.
-    pub fn get_snapshot(&self) -> Result<Snapshot> {
-        let core = self.inner.as_ref().unwrap().core.clone();
-        let snapshot = Snapshot::take(core)?;
-        Ok(snapshot)
     }
 }
 
@@ -462,11 +454,11 @@ impl Core {
         } else {
             let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
 
-            let index_value = ValueRef::encode(
+            let index_value = IndexValue::new_disk(
                 *segment_id,
-                &entry.value,
-                entry.metadata.as_ref(),
                 *val_off as u64,
+                entry.metadata.clone(),
+                &entry.value,
                 opts.max_value_threshold,
             );
 
@@ -673,7 +665,7 @@ impl Core {
 
     fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
     where
-        F: Fn(&Entry) -> Bytes,
+        F: Fn(&Entry) -> IndexValue,
     {
         let mut index = self.indexer.write();
 
@@ -707,11 +699,12 @@ impl Core {
         committed_values_offsets: &HashMap<Bytes, u64>,
     ) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
-            ValueRef::encode(
+            let offset = *committed_values_offsets.get(&entry.key).unwrap();
+            IndexValue::new_disk(
                 segment_id,
+                offset,
+                entry.metadata.clone(),
                 &entry.value,
-                entry.metadata.as_ref(),
-                *committed_values_offsets.get(&entry.key).unwrap(),
                 self.opts.max_value_threshold,
             )
         })
@@ -719,7 +712,7 @@ impl Core {
 
     fn write_index_in_memory(&self, task: &Task) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
-            ValueRef::encode_mem(&entry.value, entry.metadata.as_ref())
+            IndexValue::new_mem(entry.metadata.clone(), entry.value.clone())
         })
     }
 
@@ -738,6 +731,33 @@ impl Core {
         };
         self.writes_tx.send(req).await?;
         Ok(rx)
+    }
+
+    /// Resolves the value from the given offset in the commit log.
+    /// If the offset exists in the value cache, it returns the cached value.
+    /// Otherwise, it reads the value from the commit log, caches it, and returns it.
+    pub(crate) fn resolve_from_offset(
+        &self,
+        segment_id: u64,
+        value_offset: u64,
+        value_len: usize,
+    ) -> Result<Vec<u8>> {
+        // Attempt to return the cached value if it exists
+        let cache_key = (segment_id, value_offset);
+
+        if let Some(value) = self.value_cache.get(&cache_key) {
+            return Ok(value.to_vec());
+        }
+
+        // If the value is not in the cache, read it from the commit log
+        let mut buf = vec![0; value_len];
+        let clog = self.clog.as_ref().unwrap().read();
+        clog.read_at(&mut buf, segment_id, value_offset)?;
+
+        // Cache the newly read value for future use
+        self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
+
+        Ok(buf)
     }
 }
 
