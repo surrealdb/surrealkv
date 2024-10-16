@@ -7,7 +7,7 @@ use bytes::BytesMut;
 
 use crate::storage::{
     kv::{
-        entry::{Entry, Record, Value, ValueRef},
+        entry::{Entry, Record},
         error::{Error, Result},
         manifest::Manifest,
         meta::Metadata,
@@ -145,17 +145,12 @@ impl StoreInner {
         let mut skip_current_key = false;
 
         for (key, value, version, ts) in snapshot_versioned_iter {
-            let mut val_ref = ValueRef::new(self.core.clone());
-            val_ref.decode(*version, value)?;
-
-            // IMP!!! What happnes to keys with the swizzle bit set to 1?
-
             // Skip keys from segments newer than the last updated segment
-            if val_ref.segment_id() > last_updated_segment_id {
+            if value.segment_id() > last_updated_segment_id {
                 continue;
             }
 
-            let metadata = val_ref.metadata();
+            let metadata = value.metadata();
 
             // If we've moved to a new key, decide whether to write the previous key's entries
             if Some(&key) != current_key.as_ref() {
@@ -191,7 +186,13 @@ impl StoreInner {
 
             // Buffer the current entry if not skipping
             if !skip_current_key {
-                entries_buffer.push((key, val_ref.resolve()?, *version, *ts, metadata.cloned()));
+                entries_buffer.push((
+                    key,
+                    value.resolve(&self.core)?,
+                    *version,
+                    *ts,
+                    metadata.cloned(),
+                ));
             }
         }
 

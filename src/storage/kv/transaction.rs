@@ -8,8 +8,9 @@ use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
 
 use crate::storage::kv::{
-    entry::{Entry, Value, ValueRef},
+    entry::Entry,
     error::{Error, Result},
+    indexer::IndexValue,
     snapshot::{FilterFn, Snapshot, FILTERS},
     store::Core,
     util::{convert_range_bounds, now},
@@ -274,17 +275,17 @@ impl Transaction {
 
         // The value is not in the write set, so attempt to get it from the snapshot.
         match self.snapshot.as_ref().unwrap().read().get(&key[..].into()) {
-            Ok(val_ref) => {
-                // If the transaction is not read-only and the value reference has a timestamp greater than 0,
-                // add the key and its timestamp to the read set for conflict detection.
-                if !self.mode.is_read_only() && val_ref.ts() > 0 {
+            Ok((val, version)) => {
+                // If the transaction is not read-only and the value reference has a version greater than 0,
+                // add the key and its version to the read set for conflict detection.
+                if !self.mode.is_read_only() && version > 0 {
                     let key = Bytes::copy_from_slice(key);
-                    let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
+                    let entry = ReadSetEntry::new(key, version, self.savepoints);
                     self.read_set.push(entry);
                 }
 
                 // Resolve the value reference to get the actual value.
-                val_ref.resolve().map(Some)
+                val.resolve(&self.core).map(Some)
             }
             Err(e) => {
                 match &e {
@@ -330,8 +331,7 @@ impl Transaction {
 
         // If the transaction mode is not write-only, update the snapshot.
         if !self.mode.is_write_only() {
-            // Convert the value to Bytes.
-            let index_value = ValueRef::encode_mem(&e.value, e.metadata.as_ref());
+            let index_value = IndexValue::new_mem(e.metadata.clone(), e.value.clone());
 
             // Set the key-value pair in the snapshot.
             self.snapshot
@@ -411,29 +411,24 @@ impl Transaction {
                 }
             }
 
-            // Create a new value reference and decode the value.
-            let mut val_ref = ValueRef::new(self.core.clone());
-            let val_bytes_ref: &Bytes = value;
-            val_ref.decode(*version, val_bytes_ref)?;
-
             // Apply all filters. If any filter fails, skip this key and continue with the next one.
             for filter in &FILTERS {
-                if filter.apply(&val_ref).is_err() {
+                if filter.apply(value).is_err() {
                     continue 'outer;
                 }
             }
 
-            // Only add the key to the read set if the timestamp is less than or equal to the
+            // Only add the key to the read set if the version is less than or equal to the
             // read timestamp. This is to prevent adding keys that are added during the transaction.
-            if val_ref.ts() <= self.read_ts {
+            if *version <= self.read_ts {
                 // the keys in the vart leaf are terminated with a null byte
                 let key = Bytes::copy_from_slice(&key[..&key.len() - 1]);
-                let entry = ReadSetEntry::new(key, val_ref.ts(), self.savepoints);
+                let entry = ReadSetEntry::new(key, *version, self.savepoints);
                 self.read_set.push(entry);
             }
 
             // Resolve the value reference to get the actual value.
-            let v = val_ref.resolve()?;
+            let v = value.resolve(&self.core)?;
 
             // Add the value, version, and timestamp to the results vector.
             let mut key = key;
@@ -611,8 +606,10 @@ impl Transaction {
             // Otherwise, the value just before the rollback needs to be added
             // back to the snapshot in order to keep scan() working.
             if let Some(latest_entry) = entries.last() {
-                let index_value =
-                    ValueRef::encode_mem(&latest_entry.e.value, latest_entry.e.metadata.as_ref());
+                let index_value = IndexValue::new_mem(
+                    latest_entry.e.metadata.clone(),
+                    latest_entry.e.value.clone(),
+                );
                 self.snapshot
                     .as_ref()
                     .unwrap()
@@ -667,9 +664,9 @@ impl Transaction {
             .read()
             .get_at_ts(&key[..].into(), ts)
         {
-            Ok(val_ref) => {
+            Ok(value) => {
                 // Resolve the value reference to get the actual value.
-                val_ref.resolve().map(Some)
+                value.resolve(&self.core).map(Some)
             }
             Err(Error::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
@@ -695,10 +692,10 @@ impl Transaction {
             .read()
             .get_version_history(&key[..].into())
         {
-            Ok(values_ref) => {
+            Ok(values) => {
                 // Resolve the value reference to get the actual value.
-                for (value, ts) in values_ref {
-                    let resolved_value = value.resolve()?;
+                for (value, ts) in values {
+                    let resolved_value = value.resolve(&self.core)?;
                     results.push((resolved_value, ts));
                 }
             }
@@ -731,21 +728,15 @@ impl Transaction {
                 }
             }
 
-            // Create a new value reference and decode the value.
-            let mut val_ref = ValueRef::new(self.core.clone());
-            // The version is not used for decoding and resolving of the actual
-            // value, so just use 0 as a placeholder.
-            val_ref.decode(0, &value)?;
-
             // Apply all filters. If any filter fails, skip this key and continue with the next one.
             for filter in &FILTERS {
-                if filter.apply(&val_ref).is_err() {
+                if filter.apply(&value).is_err() {
                     continue 'outer;
                 }
             }
 
             // Resolve the value reference to get the actual value.
-            let v = val_ref.resolve()?;
+            let v = value.resolve(&self.core)?;
 
             // Remove the trailing `\0`.
             key.truncate(key.len() - 1);
@@ -786,16 +777,24 @@ impl Transaction {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<(Bytes, u64, u64)> {
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
         self.ensure_read_only_transaction()?;
 
-        let result = self
+        match self
             .snapshot
             .as_ref()
             .unwrap()
             .read()
-            .get_value_by_query(key, query_type)?;
-        Ok(result)
+            .get_value_by_query(key, query_type)
+        {
+            Ok((idx_val, version, ts)) => {
+                // Resolve the value reference to get the actual value.
+                let value = idx_val.resolve(&self.core)?;
+                Ok(Some((value, version, ts)))
+            }
+            Err(Error::KeyNotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 

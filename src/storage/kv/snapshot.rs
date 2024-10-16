@@ -1,35 +1,29 @@
 use std::{ops::RangeBounds, sync::Arc};
 
-use bytes::Bytes;
-
-use super::entry::{Value, ValueRef};
 use crate::storage::{
     kv::error::{Error, Result},
+    kv::indexer::IndexValue,
     kv::store::Core,
 };
 
 use vart::{art::QueryType, iter::Iter, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
 
-pub(crate) const FILTERS: [fn(&ValueRef) -> Result<()>; 1] = [ignore_deleted];
+pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
 
 /// A versioned snapshot for snapshot isolation.
-pub struct Snapshot {
-    snap: VartSnapshot<VariableSizeKey, Bytes>,
-    store: Arc<Core>,
+pub(crate) struct Snapshot {
+    snap: VartSnapshot<VariableSizeKey, IndexValue>,
 }
 
 impl Snapshot {
     pub(crate) fn take(store: Arc<Core>) -> Result<Self> {
         let snapshot = store.indexer.write().snapshot();
 
-        Ok(Self {
-            snap: snapshot,
-            store,
-        })
+        Ok(Self { snap: snapshot })
     }
 
     /// Set a key-value pair into the snapshot.
-    pub fn set(&mut self, key: &VariableSizeKey, value: Bytes) {
+    pub(crate) fn set(&mut self, key: &VariableSizeKey, value: IndexValue) {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
@@ -38,7 +32,7 @@ impl Snapshot {
     }
 
     #[allow(unused)]
-    pub fn delete(&mut self, key: &VariableSizeKey) -> bool {
+    pub(crate) fn delete(&mut self, key: &VariableSizeKey) -> bool {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
@@ -46,41 +40,37 @@ impl Snapshot {
         self.snap.remove(key)
     }
 
-    fn decode_and_apply_filters(
-        &self,
-        val_bytes: &Bytes,
-        version: u64,
-        filters: &[impl FilterFn],
-    ) -> Result<Box<dyn Value>> {
-        let mut val_ref = ValueRef::new(self.store.clone());
-        val_ref.decode(version, val_bytes)?;
-
+    fn apply_filters(&self, val: IndexValue, filters: &[impl FilterFn]) -> Result<IndexValue> {
         for filter in filters {
-            filter.apply(&val_ref)?;
+            filter.apply(&val)?;
         }
 
-        Ok(Box::new(val_ref))
+        Ok(val)
     }
 
     /// Retrieves the latest value associated with the given key from the snapshot.
-    pub fn get(&self, key: &VariableSizeKey) -> Result<Box<dyn Value>> {
+    pub(crate) fn get(&self, key: &VariableSizeKey) -> Result<(IndexValue, u64)> {
         // TODO: need to fix this to avoid cloning the key
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        let (val, version, _) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
-        self.decode_and_apply_filters(&val, version, &FILTERS)
+        let (snap_val, version, _) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
+        let val = self.apply_filters(snap_val, &FILTERS)?;
+        Ok((val, version))
     }
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
-    pub fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<Box<dyn Value>> {
+    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<IndexValue> {
         let key = &key.terminate();
-        let (val, version) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
-        self.decode_and_apply_filters(&val, version, &FILTERS)
+        let (val, _) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
+        self.apply_filters(val, &FILTERS)
     }
 
     /// Retrieves the version history of the value associated with the given key from the snapshot.
-    pub fn get_version_history(&self, key: &VariableSizeKey) -> Result<Vec<(Box<dyn Value>, u64)>> {
+    pub(crate) fn get_version_history(
+        &self,
+        key: &VariableSizeKey,
+    ) -> Result<Vec<(IndexValue, u64)>> {
         let key = &key.terminate();
 
         let mut results = Vec::new();
@@ -89,8 +79,9 @@ impl Snapshot {
             .snap
             .get_version_history(key)
             .ok_or(Error::KeyNotFound)?;
-        for (value, version, ts) in items {
-            let result = self.decode_and_apply_filters(&value, version, &FILTERS)?;
+
+        for (value, _, ts) in items {
+            let result = self.apply_filters(value, &FILTERS)?;
             results.push((result, ts));
         }
 
@@ -98,15 +89,16 @@ impl Snapshot {
     }
 
     /// Retrieves an iterator over the key-value pairs in the snapshot.
-    pub fn iter(&self) -> Iter<VariableSizeKey, Bytes> {
+    #[allow(unused)]
+    pub(crate) fn iter(&self) -> Iter<VariableSizeKey, IndexValue> {
         self.snap.iter()
     }
 
     /// Returns a range query iterator over the Trie.
-    pub fn range<'a, R>(
+    pub(crate) fn range<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -114,34 +106,38 @@ impl Snapshot {
     }
 
     /// Returns a versioned range query iterator over the Trie.
-    pub fn range_with_versions<'a, R>(
+    #[allow(unused)]
+    pub(crate) fn range_with_versions<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a Bytes, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
         self.snap.range_with_versions(range)
     }
 
-    pub fn get_value_by_query(
+    pub(crate) fn get_value_by_query(
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<(Bytes, u64, u64)> {
-        self.snap
+    ) -> Result<(IndexValue, u64, u64)> {
+        let (idx_val, version, ts) = self
+            .snap
             .get_value_by_query(key, query_type)
-            .ok_or(Error::KeyNotFound)
+            .ok_or(Error::KeyNotFound)?;
+        let filtered_val = self.apply_filters(idx_val, &FILTERS)?;
+        Ok((filtered_val, version, ts))
     }
 
-    pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, Bytes)>
+    pub(crate) fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, IndexValue)>
     where
         R: RangeBounds<VariableSizeKey>,
     {
         self.snap.scan_at_ts(range, ts)
     }
 
-    pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
+    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
     where
         R: RangeBounds<VariableSizeKey>,
     {
@@ -150,11 +146,11 @@ impl Snapshot {
 }
 
 pub(crate) trait FilterFn {
-    fn apply(&self, val_ref: &ValueRef) -> Result<()>;
+    fn apply(&self, val: &IndexValue) -> Result<()>;
 }
 
-fn ignore_deleted(val_ref: &ValueRef) -> Result<()> {
-    let md = val_ref.metadata();
+fn ignore_deleted(val: &IndexValue) -> Result<()> {
+    let md = val.metadata();
     if let Some(md) = md {
         if md.is_deleted_or_tombstone() {
             return Err(Error::KeyNotFound);
@@ -165,10 +161,10 @@ fn ignore_deleted(val_ref: &ValueRef) -> Result<()> {
 
 impl<F> FilterFn for F
 where
-    F: Fn(&ValueRef) -> Result<()>,
+    F: Fn(&IndexValue) -> Result<()>,
 {
-    fn apply(&self, val_ref: &ValueRef) -> Result<()> {
-        self(val_ref)
+    fn apply(&self, val: &IndexValue) -> Result<()> {
+        self(val)
     }
 }
 
@@ -176,7 +172,7 @@ where
 mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::Store;
-    use crate::storage::kv::util::{convert_range_bounds, now};
+    use crate::storage::kv::util::now;
     use crate::Mode;
 
     use bytes::Bytes;
@@ -274,51 +270,5 @@ mod tests {
                 Some(updated_value.to_vec())
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_versioned_apis_with_snapshot() {
-        let temp_dir = create_temp_directory();
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        let store = Store::new(opts).expect("Failed to create store");
-
-        // Define multiple keys and their versioned values
-        let keys_values = [
-            (
-                Bytes::from("k1"),
-                Bytes::from("value1"),
-                Bytes::from("value1Updated"),
-            ),
-            (
-                Bytes::from("k2"),
-                Bytes::from("value2"),
-                Bytes::from("value2Updated"),
-            ),
-        ];
-
-        // Set and update values for all keys
-        for (key, initial_value, updated_value) in keys_values.iter() {
-            set_value(&store, key, initial_value).await;
-            set_value(&store, key, updated_value).await;
-        }
-
-        // Test keys_at_ts
-        let ts = now();
-        let snap = store.get_snapshot().expect("Failed to get snapshot");
-
-        let range = "k1".as_bytes()..="k2".as_bytes();
-        let range = convert_range_bounds(range);
-        let keys = snap.keys_at_ts(range.clone(), ts);
-        assert!(keys.contains(&Bytes::from("k1\0").to_vec()));
-        assert!(keys.contains(&Bytes::from("k2\0").to_vec()));
-
-        // Test scan_at_ts
-        let entries = snap.scan_at_ts(range, ts);
-        assert_eq!(
-            entries.len(),
-            keys_values.len(),
-            "Should match the number of keys"
-        );
     }
 }

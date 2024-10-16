@@ -163,8 +163,8 @@ impl SnapshotIsolation {
 
         for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
-                Ok(val_ref) => {
-                    if entry.ts != val_ref.ts() {
+                Ok((_, version)) => {
+                    if entry.ts != version {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
