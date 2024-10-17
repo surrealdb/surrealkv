@@ -20,8 +20,6 @@ pub enum Error {
     CorruptedMetadata,                  // The metadata is corrupted
     TransactionReadOnly,                // The transaction is read-only
     IndexError(TrieError),              // An error occurred in the index
-    MaxKeyLengthExceeded,               // The maximum key length was exceeded
-    MaxValueLengthExceeded,             // The maximum value length was exceeded
     KeyNotFound,                        // The key was not found
     CorruptedIndex,                     // The index is corrupted
     TransactionReadConflict,            // A read conflict occurred in the transaction
@@ -38,17 +36,16 @@ pub enum Error {
     ReceiveError(String),
     RevisionError(String),
     MismatchedSegmentID(u64, u64),
-    MaxKeySizeCannotBeDecreased, // The maximum key size cannot be decreased
-    MaxValueSizeCannotBeDecreased, // The maximum value size cannot be decreased
-    MaxSegmentSizeCannotBeChanged, // The maximum segment size cannot be changed
-    CompactionAlreadyInProgress, // Compaction is in progress
-    MergeManifestMissing,        // The merge manifest is missing
-    CustomError(String),         // Custom error
-    InvalidOperation,            // Invalid operation
+    CompactionAlreadyInProgress,   // Compaction is in progress
+    MergeManifestMissing,          // The merge manifest is missing
+    CustomError(String),           // Custom error
+    InvalidOperation,              // Invalid operation
     CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
-    SegmentIdExceedsLastUpdated, // The segment ID exceeds the last updated segment
-    TransactionMustBeReadOnly,   // The transaction must be read-only
-    TransactionWithoutSavepoint, // The transaction does not have a savepoint set
+    SegmentIdExceedsLastUpdated,   // The segment ID exceeds the last updated segment
+    TransactionMustBeReadOnly,     // The transaction must be read-only
+    TransactionWithoutSavepoint,   // The transaction does not have a savepoint set
+    MaxKVMetadataLengthExceeded,   // The maximum KV metadata length is exceeded
+    ChecksumMismatch(u32, u32),    // Checksum mismatch
 }
 
 // Implementation of Display trait for Error
@@ -65,8 +62,6 @@ impl fmt::Display for Error {
             Error::CorruptedMetadata => write!(f, "Corrupted metadata"),
             Error::TransactionReadOnly => write!(f, "This transaction is read-only"),
             Error::IndexError(trie_error) => write!(f, "Index error: {}", trie_error),
-            Error::MaxKeyLengthExceeded => write!(f, "Max Key length exceeded"),
-            Error::MaxValueLengthExceeded => write!(f, "Max Value length exceeded"),
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::CorruptedIndex => write!(f, "Corrupted index"),
             Error::TransactionReadConflict => write!(f, "Transaction read conflict"),
@@ -91,18 +86,16 @@ impl fmt::Display for Error {
                 "Mismatched segment ID: expected={}, found={}",
                 expected, found
             ),
-            Error::MaxKeySizeCannotBeDecreased => write!(f, "Max key size cannot be decreased"),
-            Error::MaxValueSizeCannotBeDecreased => write!(f, "Max value size cannot be decreased"),
-            Error::MaxSegmentSizeCannotBeChanged => {
-                write!(f, "Max segment size cannot be changed")
-            }
             Error::CompactionAlreadyInProgress => write!(f, "Compaction is in progress"),
             Error::RevisionError(err) => write!(f, "Revision error: {}", err),
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
             Error::CustomError(err) => write!(f, "Error: {}", err),
             Error::InvalidOperation => write!(f, "Invalid operation"),
             Error::CompactionSegmentSizeTooSmall => {
-                write!(f, "Segment size is too small for compaction")
+                write!(
+                    f,
+                    "Segment size is too small for compaction, must be >= max_segment_size"
+                )
             }
             Error::SegmentIdExceedsLastUpdated => {
                 write!(f, "Segment ID exceeds the last updated segment")
@@ -112,6 +105,16 @@ impl fmt::Display for Error {
             }
             Error::TransactionWithoutSavepoint => {
                 write!(f, "Transaction does not have a savepoint set")
+            }
+            Error::MaxKVMetadataLengthExceeded => {
+                write!(f, "Maximum KV metadata length exceeded")
+            }
+            Error::ChecksumMismatch(expected, found) => {
+                write!(
+                    f,
+                    "Checksum mismatch: expected={}, found={}",
+                    expected, found
+                )
             }
         }
     }

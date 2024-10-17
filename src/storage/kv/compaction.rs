@@ -291,7 +291,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
                             match fs::copy(&seg.file_path, &dest_path) {
                                 Ok(_) => println!("File copied successfully"),
                                 Err(e) => {
-                                    println!("Error copying file: {:?}", e);
+                                    eprintln!("Error copying file: {:?}", e);
                                     return Err(Error::from(e));
                                 }
                             }
@@ -300,7 +300,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("Error accessing file metadata: {:?}", e);
+                        eprintln!("Error accessing file metadata: {:?}", e);
                         return Err(Error::from(e));
                     }
                 }
@@ -314,13 +314,13 @@ fn perform_recovery(opts: &Options) -> Result<()> {
 
         // Delete the `clog` directory
         if let Err(e) = fs::remove_dir_all(&clog_dir) {
-            println!("Error deleting clog directory: {:?}", e);
+            eprintln!("Error deleting clog directory: {:?}", e);
             return Err(Error::from(e));
         }
 
         // Rename `merge_clog_subdir` to `clog`
         if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
-            println!("Error renaming merge_clog_subdir to clog: {:?}", e);
+            eprintln!("Error renaming merge_clog_subdir to clog: {:?}", e);
             return Err(Error::from(e));
         }
 

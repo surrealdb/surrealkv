@@ -118,8 +118,6 @@ pub(crate) struct RecordReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
-    max_key_size: u64,
-    max_value_size: u64,
 }
 
 impl RecordReader {
@@ -128,60 +126,106 @@ impl RecordReader {
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
-    pub(crate) fn new(r: Reader, max_key_size: u64, max_value_size: u64) -> Self {
+    pub(crate) fn new(r: Reader) -> Self {
         RecordReader {
             r,
             err: None,
             rec: Vec::new(),
-            max_key_size,
-            max_value_size,
         }
     }
 
     /// Reads a transaction entry.
     fn read_entry_into(&mut self, rec: &mut Record) -> Result<(u64, u64)> {
+        // Reading the first record can return an EOF, which does not indicate corruption.
         let entry_crc = self.r.read_uint32()?;
+
+        // Store initial segment and offset
+        // Note that we do not store records spanning two segments,
+        // so the initial segment and offset are sufficient to identify the record.
+        let initial_segment = self.r.current_segment_id();
+        // Note: If any record is corrupted at a later stage, this offset
+        // will not reflect the actual offset where the corruption occurred, rather
+        // the offset where the corrupted record started.
+        let initial_offset = self.r.current_offset();
+
+        // Helper closure to create errors with initial position
+        let corrupt_error = |msg: &str, e: Error| {
+            Error::LogError(Corruption(CorruptionError::new(
+                std::io::ErrorKind::Other,
+                Error::CorruptedTransactionRecord(format!("{}: {}", msg, e))
+                    .to_string()
+                    .as_str(),
+                initial_segment,
+                initial_offset,
+            )))
+        };
 
         let segment_id = self.r.current_segment_id();
 
-        let version = self.r.read_uint16()?;
-        let id = self.r.read_uint64()?;
+        let version = self
+            .r
+            .read_uint16()
+            .map_err(|e| corrupt_error("Failed to read version", e))?;
+        let id = self
+            .r
+            .read_uint64()
+            .map_err(|e| corrupt_error("Failed to read id", e))?;
 
         // Either the header is corrupted or we have reached the end of the file
         // and encountered the padded zeros towards the end of the file.
         if id == 0 {
-            return Err(Error::InvalidTransactionRecordId);
+            return Err(corrupt_error(
+                "Failed to read tx id",
+                Error::InvalidTransactionRecordId,
+            ));
         }
 
-        let ts = self.r.read_uint64()?;
+        let ts = self
+            .r
+            .read_uint64()
+            .map_err(|e| corrupt_error("Failed to read timestamp", e))?;
 
-        let md_len = self.r.read_uint16()? as usize;
+        let md_len = self
+            .r
+            .read_uint16()
+            .map_err(|e| corrupt_error("Failed to read metadata length", e))?
+            as usize;
         if md_len > MAX_KV_METADATA_SIZE {
-            return self.corrupt_record_error("metadata length exceeds maximum");
+            return Err(corrupt_error(
+                "Metadata length exceeds maximum",
+                Error::MaxKVMetadataLengthExceeded,
+            ));
         }
 
         let kvmd = if md_len > 0 {
-            let md_bs = self.r.read_bytes(md_len)?;
-            let metadata = Metadata::from_bytes(&md_bs)?;
+            let md_bs = self
+                .r
+                .read_bytes(md_len)
+                .map_err(|e| corrupt_error("Failed to read metadata bytes", e))?;
+            let metadata = Metadata::from_bytes(&md_bs)
+                .map_err(|e| corrupt_error("Failed to parse metadata", e))?;
             Some(metadata)
         } else {
             None
         };
 
-        let k_len = self.r.read_uint32()? as usize;
-        if k_len > self.max_key_size as usize {
-            return self.corrupt_record_error("key length exceeds maximum");
-        }
-
-        let k = self.r.read_bytes(k_len)?;
-
-        let v_len = self.r.read_uint32()? as usize;
-        if v_len > self.max_value_size as usize {
-            return self.corrupt_record_error("value length exceeds maximum");
-        }
-
+        let k_len =
+            self.r
+                .read_uint32()
+                .map_err(|e| corrupt_error("Failed to read key length", e))? as usize;
+        let k = self
+            .r
+            .read_bytes(k_len)
+            .map_err(|e| corrupt_error("Failed to read key bytes", e))?;
+        let v_len =
+            self.r
+                .read_uint32()
+                .map_err(|e| corrupt_error("Failed to read value length", e))? as usize;
         let offset = self.r.offset();
-        let v = self.r.read_bytes(v_len)?;
+        let v = self
+            .r
+            .read_bytes(v_len)
+            .map_err(|e| corrupt_error("Failed to read value bytes", e))?;
 
         rec.id = id;
         rec.ts = ts;
@@ -194,34 +238,15 @@ impl RecordReader {
 
         let actual_crc = rec.calculate_crc32();
         if entry_crc != actual_crc {
-            let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-            return Err(Error::LogError(Corruption(CorruptionError::new(
-                std::io::ErrorKind::Other,
-                Error::CorruptedTransactionRecord("CRC mismatch".to_string())
-                    .to_string()
-                    .as_str(),
-                segment_id,
-                offset,
-            ))));
+            return Err(corrupt_error(
+                "CRC mismatch",
+                Error::ChecksumMismatch(entry_crc, actual_crc),
+            ));
         }
 
         rec.crc32 = entry_crc;
 
         Ok((segment_id, offset))
-    }
-
-    fn corrupt_record_error(&self, message: &str) -> Result<(u64, u64)> {
-        let (segment_id, offset) = (self.r.current_segment_id(), self.r.current_offset());
-
-        Err(Error::LogError(Corruption(CorruptionError::new(
-            std::io::ErrorKind::Other,
-            Error::CorruptedTransactionRecord(message.to_string())
-                .to_string()
-                .as_str(),
-            segment_id,
-            offset,
-        ))))
     }
 
     /// Reads a transaction record into the provided `Record`.
