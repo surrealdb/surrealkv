@@ -818,19 +818,14 @@ impl Transaction {
                 }
             }
 
-            // Create a new value reference and decode the value.
-            let mut val_ref = ValueRef::new(self.core.clone());
-            let val_bytes_ref: &Bytes = value;
-            val_ref.decode(*version, val_bytes_ref)?;
-
             // Determine if the record is soft deleted based on the metadata.
             let mut is_deleted = false;
-            if let Some(md) = val_ref.metadata() {
+            if let Some(md) = value.metadata() {
                 is_deleted = md.is_tombstone();
             }
 
             // Resolve the value reference to get the actual value.
-            let v = val_ref.resolve()?;
+            let v = value.resolve(&self.core)?;
 
             // Add the key, value, version, and deletion status to the results vector.
             let mut key = key;
