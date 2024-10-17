@@ -628,6 +628,7 @@ impl Transaction {
 }
 
 /// Implement Versioned APIs for read-only transactions.
+/// These APIs do not take part in conflict detection.
 impl Transaction {
     fn ensure_read_only_transaction(&self) -> Result<()> {
         // If the transaction is closed, return an error.
@@ -787,6 +788,58 @@ impl Transaction {
             Err(Error::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
+    pub fn scan_all_versions<'b, R>(
+        &self,
+        range: R,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, u64, bool)>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+
+        // Initialize an empty vector to store the results.
+        let mut results = Vec::new();
+
+        // Get a range iterator for the specified range.
+        let snap = self.snapshot.as_ref().unwrap().read();
+        let ranger = snap.range(range);
+
+        // Iterate over the keys in the range.
+        for (key, value, version, ts) in ranger {
+            // If a limit is set and we've already got enough results, break the loop.
+            if let Some(limit) = limit {
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            // Create a new value reference and decode the value.
+            let mut val_ref = ValueRef::new(self.core.clone());
+            let val_bytes_ref: &Bytes = value;
+            val_ref.decode(*version, val_bytes_ref)?;
+
+            // Determine if the record is soft deleted based on the metadata.
+            let mut is_deleted = false;
+            if let Some(md) = val_ref.metadata() {
+                is_deleted = md.is_tombstone();
+            }
+
+            // Resolve the value reference to get the actual value.
+            let v = val_ref.resolve()?;
+
+            // Add the key, value, version, and deletion status to the results vector.
+            let mut key = key;
+            key.truncate(key.len() - 1);
+            results.push((key, v, *ts, is_deleted));
+        }
+
+        // Return the results.
+        Ok(results)
     }
 }
 
