@@ -297,7 +297,6 @@ mod tests {
 
         // Open the nth segment file for corrupting
         let file_path = &sr[segment_num - 1].file_path;
-        println!("segment file path: {} {:?}", segment_num, file_path);
         corrupt_segment(file_path, corruption_offset);
     }
 
@@ -494,7 +493,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 47;
+        opts.max_segment_size = 37;
 
         let keys = vec![
             Bytes::from("k1"),
@@ -541,7 +540,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 47;
+        opts.max_segment_size = 37;
 
         let keys = vec![
             Bytes::from("k1"),
@@ -588,7 +587,7 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        opts.max_segment_size = 470;
+        opts.max_segment_size = 370;
 
         // each record len (37)
         let keys = vec![

@@ -743,6 +743,8 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
     use crate::storage::kv::transaction::Durability;
+    use crate::storage::log::Error as LogError;
+    use crate::Error;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1378,5 +1380,84 @@ mod tests {
             let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_store_with_varying_segment_sizes() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 84; // Initial max segment size
+
+        let k1 = Bytes::from("k1");
+        let k2 = Bytes::from("k2");
+        let k3 = Bytes::from("k3");
+        let k4 = Bytes::from("k4");
+        let val = Bytes::from("val");
+
+        // Step 1: Open store with initial max segment size and commit a record
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k1.clone(), &val.clone()).unwrap();
+            txn.commit().await.unwrap();
+        }
+        store.close().await.expect("should close store");
+
+        // Step 2: Reopen store with a smaller max segment size and append a record
+        opts.max_segment_size = 37; // Smaller max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k2.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 3: Reopen store with a larger max segment size and append a record
+        opts.max_segment_size = 121; // Larger max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k3.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+
+            // Verify the third record
+            let val3 = txn.get(&k3).unwrap().unwrap();
+            assert_eq!(val3, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 4: Reopen store with a max segment size smaller than the record
+        opts.max_segment_size = 36; // Smallest max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k4.clone(), &val).unwrap();
+            let err = txn.commit().await.err().unwrap();
+            match err {
+                Error::LogError(LogError::RecordTooLarge) => (),
+                _ => panic!("expected RecordTooLarge error"),
+            };
+        }
+        store.close().await.expect("should close store");
     }
 }
