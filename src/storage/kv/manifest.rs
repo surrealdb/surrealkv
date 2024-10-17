@@ -14,7 +14,7 @@ pub(crate) enum ManifestChangeType {
 
 #[revisioned(revision = 1)]
 #[derive(Debug, Clone)]
-pub struct Manifest {
+pub(crate) struct Manifest {
     pub(crate) changes: Vec<ManifestChangeType>,
 }
 
@@ -26,7 +26,7 @@ impl Manifest {
     }
 
     // Append a Manifest to a file containing a Vec<Manifest>
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         self.serialize_revisioned(&mut data)?;
 
@@ -36,7 +36,8 @@ impl Manifest {
         Ok(buf)
     }
 
-    pub fn extract_options(&self) -> Vec<Options> {
+    #[allow(unused)]
+    pub(crate) fn extract_options(&self) -> Vec<Options> {
         self.changes
             .iter()
             .filter_map(|change_op| match change_op {
@@ -47,7 +48,7 @@ impl Manifest {
     }
 
     // Extract the last Option, irrespective of the operation type
-    pub fn extract_last_option(&self) -> Option<Options> {
+    pub(crate) fn extract_last_option(&self) -> Option<Options> {
         self.changes
             .iter()
             .filter_map(|change_op| match change_op {
@@ -59,17 +60,17 @@ impl Manifest {
     }
 
     // Create a new manifest with an update change for an option
-    pub fn with_update_option_change(opt: &Options) -> Self {
+    pub(crate) fn with_update_option_change(opt: &Options) -> Self {
         let changes = vec![ManifestChangeType::Options(opt.clone())];
         Manifest { changes }
     }
 
-    pub fn with_compacted_up_to_segment(segment: u64) -> Self {
+    pub(crate) fn with_compacted_up_to_segment(segment: u64) -> Self {
         let changes = vec![ManifestChangeType::CompactedUpToSegment(segment)];
         Manifest { changes }
     }
 
-    pub fn extract_compacted_up_to_segments(&self) -> Vec<u64> {
+    pub(crate) fn extract_compacted_up_to_segments(&self) -> Vec<u64> {
         self.changes
             .iter()
             .filter_map(|change_op| match change_op {
@@ -81,7 +82,7 @@ impl Manifest {
 
     // Load Vec<Manifest> from a dir
     #[allow(unused)]
-    pub fn load_from_dir(path: &Path) -> Result<Self> {
+    pub(crate) fn load_from_dir(path: &Path) -> Result<Self> {
         let mut manifests = Manifest::new();
         if !path.exists() {
             return Ok(manifests);
@@ -168,7 +169,7 @@ mod tests {
 
         // Step 4: Create a new Manifest instance with changes and append it to the same file
         let mut opt = Options::new();
-        opt.max_value_size = 1;
+        opt.max_value_threshold = 1;
 
         let second_manifest = Manifest {
             changes: vec![ManifestChangeType::Options(opt)],
@@ -189,7 +190,7 @@ mod tests {
 
         match updated_change {
             ManifestChangeType::Options(options) => {
-                assert_eq!(options.max_value_size, 1);
+                assert_eq!(options.max_value_threshold, 1);
             }
             _ => {
                 unreachable!("option change is not of type Update");

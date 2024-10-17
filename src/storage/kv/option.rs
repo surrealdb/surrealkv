@@ -29,8 +29,6 @@ pub struct Options {
     pub isolation_level: IsolationLevel, // Isolation level for transactions.
 
     // Fine tuning options.
-    pub max_key_size: u64,                // Maximum size in bytes for key.
-    pub max_value_size: u64,              // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
@@ -45,8 +43,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             dir: PathBuf::from(""),
-            max_key_size: 1024,
-            max_value_size: 1024 * 1024,
             max_value_threshold: 64, // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_segment_size: 1 << 29, // 512 MB
@@ -79,8 +75,6 @@ mod tests {
         let options = Options::default();
 
         assert_eq!(options.dir, PathBuf::from(""));
-        assert_eq!(options.max_key_size, 1024);
-        assert_eq!(options.max_value_size, 1024 * 1024);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);

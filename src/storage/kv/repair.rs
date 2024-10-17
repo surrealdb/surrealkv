@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use crate::storage::{
     kv::{
         error::{Error, Result},
-        option::Options,
         reader::{Reader, RecordReader},
         util::sanitize_directory,
     },
@@ -17,7 +16,6 @@ use crate::storage::{
 /// and also due to the asynchronous nature of calling close on the store.
 pub(crate) fn repair_last_corrupted_segment(
     aol: &mut Aol,
-    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -46,7 +44,6 @@ pub(crate) fn repair_last_corrupted_segment(
     // Repair the last segment
     repair_segment(
         aol,
-        db_opts,
         last_segment_id,
         corrupted_offset_marker,
         last_segment_path,
@@ -59,7 +56,6 @@ pub(crate) fn repair_last_corrupted_segment(
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment(
     aol: &mut Aol,
-    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -89,7 +85,6 @@ pub(crate) fn repair_corrupted_segment(
 
     repair_segment(
         aol,
-        db_opts,
         corrupted_segment_id,
         corrupted_offset_marker,
         file_path,
@@ -127,7 +122,6 @@ pub(crate) fn repair_corrupted_segment(
 /// If any of these operations fail, the function returns an error.
 fn repair_segment(
     aol: &mut Aol,
-    db_opts: &Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
@@ -157,7 +151,7 @@ fn repair_segment(
 
     // Initialize a reader for the segment
     let reader = Reader::new_from(segment_reader);
-    let mut reader = RecordReader::new(reader, db_opts.max_key_size, db_opts.max_value_size);
+    let mut reader = RecordReader::new(reader);
 
     let mut count = 0;
     // Read records until the offset marker is reached
@@ -303,6 +297,7 @@ mod tests {
 
         // Open the nth segment file for corrupting
         let file_path = &sr[segment_num - 1].file_path;
+        println!("segment file path: {} {:?}", segment_num, file_path);
         corrupt_segment(file_path, corruption_offset);
     }
 
@@ -335,13 +330,7 @@ mod tests {
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
-        repair_corrupted_segment(
-            &mut clog,
-            &opts,
-            corrupted_segment_id,
-            corrupted_offset_marker,
-        )
-        .unwrap();
+        repair_corrupted_segment(&mut clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
 
         // drop lock over commit log
         drop(clog);
@@ -350,7 +339,7 @@ mod tests {
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
         let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"));
-        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
+        let mut tx_reader = RecordReader::new(reader);
         let mut tx = Record::new();
 
         loop {
