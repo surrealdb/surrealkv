@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use ahash::{HashMap, HashMapExt};
 use bytes::Bytes;
-use parking_lot::RwLock;
 use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
 
@@ -143,7 +142,7 @@ pub struct Transaction {
 
     /// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data
     ///  at the time the transaction started.
-    pub(crate) snapshot: Option<RwLock<Snapshot>>,
+    pub(crate) snapshot: Option<Snapshot>,
 
     /// `core` is the underlying core for the transaction. This is shared between transactions.
     pub(crate) core: Arc<Core>,
@@ -180,7 +179,7 @@ impl Transaction {
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            snapshot = Some(RwLock::new(Snapshot::take(core.clone())?));
+            snapshot = Some(Snapshot::take(core.clone())?);
         }
 
         Ok(Self {
@@ -277,7 +276,7 @@ impl Transaction {
         }
 
         // The value is not in the write set, so attempt to get it from the snapshot.
-        match self.snapshot.as_ref().unwrap().read().get(&key[..].into()) {
+        match self.snapshot.as_ref().unwrap().get(&key[..].into()) {
             Ok((val, version)) => {
                 // If the transaction is not read-only and the value reference has a version greater than 0,
                 // add the key and its version to the read set for conflict detection.
@@ -330,9 +329,8 @@ impl Transaction {
 
             // Set the key-value pair in the snapshot.
             self.snapshot
-                .as_ref()
+                .as_mut()
                 .unwrap()
-                .write()
                 .set(&e.key[..].into(), index_value);
         }
 
@@ -394,7 +392,7 @@ impl Transaction {
         let mut results = Vec::new();
 
         // Get a range iterator for the specified range.
-        let snap = self.snapshot.as_ref().unwrap().read();
+        let snap = self.snapshot.as_ref().unwrap();
         let ranger = snap.range(range);
 
         // Iterate over the keys in the range.
@@ -582,9 +580,8 @@ impl Transaction {
             entries.retain(|entry| {
                 if entry.savepoint_no == self.savepoints {
                     self.snapshot
-                        .as_ref()
+                        .as_mut()
                         .unwrap()
-                        .write()
                         .delete(&entry.e.key[..].into());
                     false
                 } else {
@@ -606,9 +603,8 @@ impl Transaction {
                     latest_entry.e.value.clone(),
                 );
                 self.snapshot
-                    .as_ref()
+                    .as_mut()
                     .unwrap()
-                    .write()
                     .set(&latest_entry.e.key[..].into(), index_value);
             }
         }
@@ -657,7 +653,6 @@ impl Transaction {
             .snapshot
             .as_ref()
             .unwrap()
-            .read()
             .get_at_ts(&key[..].into(), ts)
         {
             Ok(value) => {
@@ -685,7 +680,6 @@ impl Transaction {
             .snapshot
             .as_ref()
             .unwrap()
-            .read()
             .get_version_history(&key[..].into())
         {
             Ok(values) => {
@@ -713,7 +707,7 @@ impl Transaction {
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let items = self.snapshot.as_ref().unwrap().read().scan_at_ts(range, ts);
+        let items = self.snapshot.as_ref().unwrap().scan_at_ts(range, ts);
 
         let mut results = Vec::new();
         'outer: for (mut key, value) in items {
@@ -751,7 +745,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let keys = self.snapshot.as_ref().unwrap().read().keys_at_ts(range, ts);
+        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
 
         // Remove the trailing `\0`.
         let result = keys
@@ -780,7 +774,6 @@ impl Transaction {
             .snapshot
             .as_ref()
             .unwrap()
-            .read()
             .get_value_by_query(key, query_type)
         {
             Ok((idx_val, version, ts)) => {
@@ -809,7 +802,7 @@ impl Transaction {
         let mut results = Vec::new();
 
         // Get a range iterator for the specified range.
-        let snap = self.snapshot.as_ref().unwrap().read();
+        let snap = self.snapshot.as_ref().unwrap();
         let ranger = snap.range_with_versions(range);
 
         // Iterate over the keys in the range.
