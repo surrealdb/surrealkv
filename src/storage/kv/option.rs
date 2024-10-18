@@ -29,10 +29,10 @@ pub struct Options {
     pub isolation_level: IsolationLevel, // Isolation level for transactions.
 
     // Deprecated field.
-    #[revision(end = 2, convert_fn = "deprecate_u64")]
+    #[revision(end = 2, convert_fn = "convert_max_key_size")]
     max_key_size: u64,
     // Deprecated field.
-    #[revision(end = 2, convert_fn = "deprecate_u64")]
+    #[revision(end = 2, convert_fn = "convert_max_value_size")]
     max_value_size: u64,
 
     // Fine tuning options.
@@ -70,7 +70,13 @@ impl Options {
         self.disk_persistence
     }
 
-    fn deprecate_u64(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+    fn convert_max_key_size(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+        // We don't use this deprecated field anymore so let's completely ignore it.
+        Ok(())
+    }
+
+    fn convert_max_value_size(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+        // We don't use this deprecated field anymore so let's completely ignore it.
         Ok(())
     }
 }
