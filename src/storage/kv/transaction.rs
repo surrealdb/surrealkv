@@ -813,7 +813,7 @@ impl Transaction {
         let ranger = snap.range_with_versions(range);
 
         // Iterate over the keys in the range.
-        for (key, value, _, ts) in ranger {
+        for (mut key, value, _, ts) in ranger {
             // If a limit is set and we've already got enough results, break the loop.
             if let Some(limit) = limit {
                 if results.len() >= limit {
@@ -822,19 +822,15 @@ impl Transaction {
             }
 
             // Determine if the record is soft deleted based on the metadata.
-            let mut is_deleted = false;
-            if let Some(md) = value.metadata() {
-                is_deleted = md.is_tombstone();
-            }
+            let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
 
             // Resolve the value reference to get the actual value.
             let v = value.resolve(&self.core)?;
 
-            // Add the key, value, version, and deletion status to the results vector.
-            let mut key = key;
-
             // Remove the trailing `\0`.
             key.truncate(key.len() - 1);
+
+            // Add the key, value, version, and deletion status to the results vector.
             results.push((key, v, *ts, is_deleted));
         }
 
