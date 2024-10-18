@@ -118,6 +118,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::kv::store::Core;
     use crate::storage::log::Aol;
     use crate::storage::log::Options as LogOptions;
 
@@ -196,5 +197,25 @@ mod tests {
                 unreachable!("option change is not of type Update");
             }
         }
+    }
+
+    #[test]
+    // Test if we can load a manifest with a different revision
+    fn test_backward_compatibility() {
+        // Test with manifest without any changes
+        let dir_name = "tests/data/manifest_revision1";
+        let manifest_path = Path::new(dir_name);
+
+        // Load the manifest from the specified path
+        let mf = Core::read_manifest(manifest_path).unwrap();
+        assert_eq!(mf.changes.len(), 1);
+
+        // Test with manifest with changes to max_value_size
+        let dir_name = "tests/data/manifest_revision1_with_updates";
+        let manifest_path = Path::new(dir_name);
+
+        // Load the manifest from the specified path
+        let mf = Core::read_manifest(manifest_path).unwrap();
+        assert_eq!(mf.changes.len(), 2);
     }
 }

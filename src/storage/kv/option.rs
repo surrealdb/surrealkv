@@ -19,7 +19,7 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     // Required options.
@@ -27,6 +27,13 @@ pub struct Options {
 
     // Usually modified options.
     pub isolation_level: IsolationLevel, // Isolation level for transactions.
+
+    // Deprecated field.
+    #[revision(end = 2, convert_fn = "deprecate_u64")]
+    max_key_size: u64,
+    // Deprecated field.
+    #[revision(end = 2, convert_fn = "deprecate_u64")]
+    max_value_size: u64,
 
     // Fine tuning options.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
@@ -61,6 +68,10 @@ impl Options {
     /// Returns true if the data should be persisted on disk.
     pub fn should_persist_data(&self) -> bool {
         self.disk_persistence
+    }
+
+    fn deprecate_u64(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+        Ok(())
     }
 }
 
