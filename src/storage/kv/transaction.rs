@@ -63,6 +63,9 @@ impl Mode {
 /// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
 pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
 
+/// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
+pub type ScanVersionResult = (Vec<u8>, Vec<u8>, u64, bool);
+
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
     /// Commits with this durability level are guaranteed to be persistent eventually. The data
@@ -628,6 +631,7 @@ impl Transaction {
 }
 
 /// Implement Versioned APIs for read-only transactions.
+/// These APIs do not take part in conflict detection.
 impl Transaction {
     fn ensure_read_only_transaction(&self) -> Result<()> {
         // If the transaction is closed, return an error.
@@ -787,6 +791,51 @@ impl Transaction {
             Err(Error::KeyNotFound) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
+    pub fn scan_all_versions<'b, R>(
+        &self,
+        range: R,
+        limit: Option<usize>,
+    ) -> Result<Vec<ScanVersionResult>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+
+        // Initialize an empty vector to store the results.
+        let mut results = Vec::new();
+
+        // Get a range iterator for the specified range.
+        let snap = self.snapshot.as_ref().unwrap().read();
+        let ranger = snap.range_with_versions(range);
+
+        // Iterate over the keys in the range.
+        for (mut key, value, _, ts) in ranger {
+            // If a limit is set and we've already got enough results, break the loop.
+            if let Some(limit) = limit {
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            // Determine if the record is soft deleted based on the metadata.
+            let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
+
+            // Resolve the value reference to get the actual value.
+            let v = value.resolve(&self.core)?;
+
+            // Remove the trailing `\0`.
+            key.truncate(key.len() - 1);
+
+            // Add the key, value, version, and deletion status to the results vector.
+            results.push((key, v, *ts, is_deleted));
+        }
+
+        // Return the results.
+        Ok(results)
     }
 }
 
@@ -2529,5 +2578,352 @@ mod tests {
             tx_reader.read_into(&mut log_rec),
             Err(Error::LogError(LogError::Eof))
         ),);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_single_key_single_version() {
+        let (store, _) = create_store(false);
+        let key = Bytes::from("key1");
+        let value = Bytes::from("value1");
+
+        let mut txn = store.begin().unwrap();
+        txn.set_at_ts(&key, &value, 1).unwrap();
+        txn.commit().await.unwrap();
+
+        let range = key.as_ref()..=key.as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let (k, v, version, is_deleted) = &results[0];
+        assert_eq!(k, &key);
+        assert_eq!(v, &value);
+        assert_eq!(*version, 1);
+        assert!(!(*is_deleted));
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_single_key_multiple_versions() {
+        let (store, _) = create_store(false);
+        let key = Bytes::from("key1");
+
+        // Insert multiple versions of the same key
+        let values = [
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        for (i, value) in values.iter().enumerate() {
+            let mut txn = store.begin().unwrap();
+            let version = (i + 1) as u64; // Incremental version
+            txn.set_at_ts(&key, value, version).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let range = key.as_ref()..=key.as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        // Verify that the output contains all the versions of the key
+        assert_eq!(results.len(), values.len());
+        for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+            assert_eq!(k, &key);
+            assert_eq!(v, &values[i]);
+            assert_eq!(*version, (i + 1) as u64);
+            assert!(!(*is_deleted));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_multiple_keys_single_version_each() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let value = Bytes::from("value1");
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.set_at_ts(key, &value, 1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        assert_eq!(results.len(), keys.len());
+        for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+            assert_eq!(k, &keys[i]);
+            assert_eq!(v, &value);
+            assert_eq!(*version, 1);
+            assert!(!(*is_deleted));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
+        let (store, _) = create_store(false);
+
+        // Define a range of keys
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+
+        // Insert multiple versions for each key
+        let values = [
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64; // Incremental version
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        let mut expected_results = Vec::new();
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                expected_results.push((key.clone(), value.clone(), (i + 1) as u64, false));
+            }
+        }
+
+        assert_eq!(results.len(), expected_results.len());
+        for (result, expected) in results.iter().zip(expected_results.iter()) {
+            let (k, v, version, is_deleted) = result;
+            let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
+            assert_eq!(k, expected_key);
+            assert_eq!(v, expected_value);
+            assert_eq!(*version, *expected_version);
+            assert_eq!(*is_deleted, *expected_is_deleted);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_deleted_records() {
+        let (store, _) = create_store(false);
+        let key = Bytes::from("key1");
+        let value = Bytes::from("value1");
+
+        let mut txn = store.begin().unwrap();
+        txn.set_at_ts(&key, &value, 1).unwrap();
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().unwrap();
+        txn.soft_delete(&key).unwrap();
+        txn.commit().await.unwrap();
+
+        let range = key.as_ref()..=key.as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        assert_eq!(results.len(), 2);
+        let (k, v, version, is_deleted) = &results[0];
+        assert_eq!(k, &key);
+        assert_eq!(v, &value);
+        assert_eq!(*version, 1);
+        assert!(!(*is_deleted));
+
+        let (k, v, _, is_deleted) = &results[1];
+        assert_eq!(k, &key);
+        assert_eq!(v, &Bytes::new());
+        assert!(*is_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let value = Bytes::from("value1");
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.set_at_ts(key, &value, 1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.soft_delete(key).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        assert_eq!(results.len(), keys.len() * 2);
+        for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+            let key_index = i / 2;
+            let is_deleted_version = i % 2 == 1;
+            assert_eq!(k, &keys[key_index]);
+            if is_deleted_version {
+                assert_eq!(v, &Bytes::new());
+                assert!(*is_deleted);
+            } else {
+                assert_eq!(v, &value);
+                assert_eq!(*version, 1);
+                assert!(!(*is_deleted));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let values = [
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.soft_delete(key).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        let mut expected_results = Vec::new();
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                expected_results.push((key.clone(), value.clone(), (i + 1) as u64, false));
+            }
+            expected_results.push((key.clone(), Bytes::new(), 0, true));
+        }
+
+        assert_eq!(results.len(), expected_results.len());
+        for (result, expected) in results.iter().zip(expected_results.iter()) {
+            let (k, v, version, is_deleted) = result;
+            let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
+            assert_eq!(k, expected_key);
+            assert_eq!(v, expected_value);
+            // Check version only if the record is not deleted
+            // This is because a soft-deleted record has version which is
+            // the commit timestamp of the transaction, and do not want to
+            // make the test complex by predicting the exact value.
+            if !expected_is_deleted {
+                assert_eq!(*version, *expected_version);
+            }
+            assert_eq!(*is_deleted, *expected_is_deleted);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_soft_and_hard_delete() {
+        let (store, _) = create_store(false);
+        let key = Bytes::from("key1");
+        let value = Bytes::from("value1");
+
+        let mut txn = store.begin().unwrap();
+        txn.set_at_ts(&key, &value, 1).unwrap();
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().unwrap();
+        txn.soft_delete(&key).unwrap();
+        txn.commit().await.unwrap();
+
+        let mut txn = store.begin().unwrap();
+        txn.delete(&key).unwrap();
+        txn.commit().await.unwrap();
+
+        let range = key.as_ref()..=key.as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_range_boundaries() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let value = Bytes::from("value1");
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.set_at_ts(key, &value, 1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Inclusive range
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+        assert_eq!(results.len(), keys.len());
+
+        // Exclusive range
+        let range = keys.first().unwrap().as_ref()..keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+        assert_eq!(results.len(), keys.len() - 1);
+
+        // Unbounded range
+        let range = ..;
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, None).unwrap();
+        assert_eq!(results.len(), keys.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_with_limit() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let value = Bytes::from("value1");
+
+        for key in &keys {
+            let mut txn = store.begin().unwrap();
+            txn.set_at_ts(key, &value, 1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, Some(2)).unwrap();
+
+        assert_eq!(results.len(), 2);
     }
 }
