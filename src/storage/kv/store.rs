@@ -387,7 +387,7 @@ impl Core {
         let reader = Reader::new_from(reader);
 
         // A RecordReader is created from the Reader to read transactions.
-        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
+        let mut tx_reader = RecordReader::new(reader);
 
         // A Record is created to hold the transactions. The maximum number of entries per transaction is specified.
         let mut tx = Record::new();
@@ -433,7 +433,7 @@ impl Core {
                 "Repairing corrupted segment with id: {} and offset: {}",
                 corrupted_segment_id, corrupted_offset
             );
-            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
+            repair_last_corrupted_segment(clog, corrupted_segment_id, corrupted_offset)?;
         }
 
         Ok(num_entries)
@@ -483,8 +483,7 @@ impl Core {
         };
 
         // Validate the current options against the existing manifest's options
-        let options_changeset = existing_manifest.extract_options();
-        Core::validate_options(current_opts, &options_changeset)?;
+        Core::validate_options(current_opts)?;
 
         // Check if the current options are already the last option in the manifest
         if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
@@ -501,35 +500,7 @@ impl Core {
         Ok(current_opts.clone())
     }
 
-    fn validate_options(opts: &Options, existing_metadata_list: &Vec<Options>) -> Result<()> {
-        let mut last_max_value_size = 0;
-        let mut last_max_key_size = 0;
-        let mut last_max_segment_size = 0;
-        for option in existing_metadata_list {
-            if option.max_value_size < last_max_value_size {
-                return Err(Error::MaxValueSizeCannotBeDecreased);
-            }
-            if option.max_key_size < last_max_key_size {
-                return Err(Error::MaxKeySizeCannotBeDecreased);
-            }
-            if option.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
-                return Err(Error::MaxSegmentSizeCannotBeChanged);
-            }
-            last_max_value_size = option.max_value_size;
-            last_max_key_size = option.max_key_size;
-            last_max_segment_size = option.max_segment_size;
-        }
-
-        // Include current opts in the comparison
-        if opts.max_value_size < last_max_value_size {
-            return Err(Error::MaxValueSizeCannotBeDecreased);
-        }
-        if opts.max_key_size < last_max_key_size {
-            return Err(Error::MaxKeySizeCannotBeDecreased);
-        }
-        if opts.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
-            return Err(Error::MaxSegmentSizeCannotBeChanged);
-        }
+    fn validate_options(opts: &Options) -> Result<()> {
         if opts.max_compaction_segment_size < opts.max_segment_size {
             return Err(Error::CompactionSegmentSizeTooSmall);
         }
@@ -622,6 +593,7 @@ impl Core {
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
+        // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(req.entries.len());
 
@@ -771,6 +743,8 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
     use crate::storage::kv::transaction::Durability;
+    use crate::storage::log::Error as LogError;
+    use crate::Error;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -868,106 +842,6 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
         assert_eq!(store_opts, opts);
-    }
-
-    #[tokio::test]
-    async fn increasing_max_key_value_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        let mut opts = opts.clone();
-        opts.max_key_size += 1;
-        opts.max_value_size += 1;
-
-        // Try to create a new store instance with the updated options
-        let result = Store::new(opts.clone());
-        assert!(
-            result.is_ok(),
-            "should not throw an error when max_key_size or max_value_size is increased"
-        );
-    }
-
-    #[tokio::test]
-    async fn decreasing_max_key_value_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        {
-            let mut opts = opts.clone();
-            opts.max_key_size -= 1;
-
-            let result = Store::new(opts.clone());
-            assert!(
-                result.is_err(),
-                "should throw an error when max_key_size is decreased"
-            );
-            assert_eq!(
-                result.err().unwrap().to_string(),
-                "Max key size cannot be decreased".to_string()
-            );
-        }
-
-        {
-            let mut opts = opts.clone();
-            opts.max_value_size -= 1;
-            let result = Store::new(opts.clone());
-            assert!(
-                result.is_err(),
-                "should throw an error when max_value_size is decreased"
-            );
-
-            assert_eq!(
-                result.err().unwrap().to_string(),
-                "Max value size cannot be decreased".to_string()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn changing_max_segment_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        let mut opts = opts.clone();
-        opts.max_segment_size += 1;
-
-        // Try to create a new store instance with the updated options
-        let result = Store::new(opts.clone());
-        assert!(
-            result.is_err(),
-            "should throw an error when max_segment_size is changed"
-        );
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Max segment size cannot be changed".to_string()
-        );
     }
 
     #[tokio::test]
@@ -1506,5 +1380,84 @@ mod tests {
             let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_store_with_varying_segment_sizes() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 84; // Initial max segment size
+
+        let k1 = Bytes::from("k1");
+        let k2 = Bytes::from("k2");
+        let k3 = Bytes::from("k3");
+        let k4 = Bytes::from("k4");
+        let val = Bytes::from("val");
+
+        // Step 1: Open store with initial max segment size and commit a record
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k1.clone(), &val.clone()).unwrap();
+            txn.commit().await.unwrap();
+        }
+        store.close().await.expect("should close store");
+
+        // Step 2: Reopen store with a smaller max segment size and append a record
+        opts.max_segment_size = 37; // Smaller max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k2.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 3: Reopen store with a larger max segment size and append a record
+        opts.max_segment_size = 121; // Larger max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k3.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+
+            // Verify the third record
+            let val3 = txn.get(&k3).unwrap().unwrap();
+            assert_eq!(val3, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 4: Reopen store with a max segment size smaller than the record
+        opts.max_segment_size = 36; // Smallest max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k4.clone(), &val).unwrap();
+            let err = txn.commit().await.err().unwrap();
+            match err {
+                Error::LogError(LogError::RecordTooLarge) => (),
+                _ => panic!("expected RecordTooLarge error"),
+            };
+        }
+        store.close().await.expect("should close store");
     }
 }

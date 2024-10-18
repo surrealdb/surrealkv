@@ -320,14 +320,6 @@ impl Transaction {
         if e.key.is_empty() {
             return Err(Error::EmptyKey);
         }
-        // If the key length exceeds the maximum allowed key size, return an error.
-        if e.key.len() as u64 > self.core.opts.max_key_size {
-            return Err(Error::MaxKeyLengthExceeded);
-        }
-        // If the value length exceeds the maximum allowed value size, return an error.
-        if e.value.len() as u64 > self.core.opts.max_value_size {
-            return Err(Error::MaxValueLengthExceeded);
-        }
 
         // If the transaction mode is not write-only, update the snapshot.
         if !self.mode.is_write_only() {
@@ -2517,7 +2509,7 @@ mod tests {
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
         let reader = MultiSegmentReader::new(sr).unwrap();
         let reader = Reader::new_from(reader);
-        let mut tx_reader = RecordReader::new(reader, 100, 100);
+        let mut tx_reader = RecordReader::new(reader);
 
         // Expect ("k2", "v2")
         let mut log_rec = Record::new();
