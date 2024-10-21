@@ -19,7 +19,7 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 2)]
+#[revisioned(revision = 3)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     // Required options.
@@ -43,6 +43,10 @@ pub struct Options {
 
     // Field to indicate whether the data should be stored completely in memory
     pub disk_persistence: bool, // If false, data will be stored completely in memory. If true, data will be stored on disk too.
+
+    // Used to enable or disable versioned values.
+    #[revision(start = 3)]
+    pub enable_versions: bool,
 }
 
 impl Default for Options {
@@ -56,6 +60,7 @@ impl Default for Options {
             max_value_cache_size: 100000,
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
+            enable_versions: true,
         }
     }
 }
@@ -98,5 +103,6 @@ mod tests {
         assert_eq!(options.max_value_cache_size, 100000);
         assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
+        assert!(options.enable_versions);
     }
 }
