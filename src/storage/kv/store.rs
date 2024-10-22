@@ -462,13 +462,23 @@ impl Core {
                 opts.max_value_threshold,
             );
 
-            indexer.insert(
-                &mut entry.key[..].into(),
-                index_value,
-                entry.id,
-                entry.ts,
-                false,
-            )?;
+            if opts.enable_versions {
+                indexer.insert(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    entry.id,
+                    entry.ts,
+                    false,
+                )?;
+            } else {
+                indexer.insert_or_replace(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    entry.id,
+                    entry.ts,
+                    false,
+                )?;
+            }
         }
 
         Ok(())
@@ -652,13 +662,23 @@ impl Core {
 
             let index_value = encode_entry(entry);
 
-            index.insert(
-                &mut entry.key[..].into(),
-                index_value,
-                task.tx_id,
-                entry.ts,
-                true,
-            )?;
+            if self.opts.enable_versions {
+                index.insert(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    task.tx_id,
+                    entry.ts,
+                    true,
+                )?;
+            } else {
+                index.insert_or_replace(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    task.tx_id,
+                    entry.ts,
+                    true,
+                )?;
+            }
         }
 
         Ok(())
@@ -1459,5 +1479,96 @@ mod tests {
             };
         }
         store.close().await.expect("should close store");
+    }
+
+    #[tokio::test]
+    async fn load_index_with_disabled_versions() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+        store.close().await.unwrap();
+
+        let store = Store::new(opts.clone()).unwrap();
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_with_disabled_versions() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_with_disabled_versions_in_memory() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            disk_persistence: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
     }
 }
