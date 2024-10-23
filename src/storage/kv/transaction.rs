@@ -823,7 +823,7 @@ impl Transaction {
             // If the key changes, process the previous key's versions.
             if current_key.as_ref().map_or(false, |k| k != &key) {
                 // Add the previous key's versions to the results.
-                results.extend(current_key_versions.drain(..));
+                results.append(&mut current_key_versions);
 
                 // Add the previous key to the set of unique keys.
                 unique_keys.insert(current_key.take().unwrap());
@@ -851,7 +851,7 @@ impl Transaction {
 
         // Process the last key's versions.
         if let Some(key) = current_key {
-            results.extend(current_key_versions.drain(..));
+            results.append(&mut current_key_versions);
             unique_keys.insert(key);
         }
 
@@ -3023,7 +3023,7 @@ mod tests {
             Bytes::from("key2"),
             Bytes::from("key3"),
         ];
-        let values = vec![
+        let values = [
             Bytes::from("value1"),
             Bytes::from("value2"),
             Bytes::from("value3"),
@@ -3209,7 +3209,7 @@ mod tests {
             Bytes::from("key6"),
             Bytes::from("key7"),
         ];
-        let values = vec![
+        let values = [
             Bytes::from("value1"),
             Bytes::from("value2"),
             Bytes::from("value3"),
@@ -3253,6 +3253,116 @@ mod tests {
                     assert_eq!(result.1, *value);
                     assert_eq!(result.2, version);
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_with_batches() {
+        let (store, _) = create_store(false);
+        let keys = [
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+            Bytes::from("key4"),
+            Bytes::from("key5"),
+        ];
+        let versions = [
+            vec![
+                Bytes::from("v1"),
+                Bytes::from("v2"),
+                Bytes::from("v3"),
+                Bytes::from("v4"),
+            ],
+            vec![Bytes::from("v1"), Bytes::from("v2")],
+            vec![
+                Bytes::from("v1"),
+                Bytes::from("v2"),
+                Bytes::from("v3"),
+                Bytes::from("v4"),
+            ],
+            vec![Bytes::from("v1")],
+            vec![Bytes::from("v1")],
+        ];
+
+        // Insert multiple versions for each key
+        for (key, key_versions) in keys.iter().zip(versions.iter()) {
+            for (i, value) in key_versions.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Set the batch size
+        let batch_size: usize = 2;
+
+        // Define a function to scan in batches
+        fn scan_in_batches(
+            store: &Store,
+            batch_size: usize,
+        ) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
+            let mut all_results = Vec::new();
+            let mut start_key: Option<Bytes> = None;
+
+            loop {
+                let range = match &start_key {
+                    Some(key) => (Bound::Excluded(key.as_ref()), Bound::Unbounded),
+                    None => (Bound::Unbounded, Bound::Unbounded),
+                };
+
+                let txn = store.begin().unwrap();
+                let results = txn.scan_all_versions(range, Some(batch_size)).unwrap();
+
+                if results.is_empty() {
+                    break;
+                }
+
+                // Convert Vec<u8> to Bytes
+                let converted_results: Vec<(Bytes, Bytes, u64, bool)> = results
+                    .into_iter()
+                    .map(|(k, v, ts, is_deleted)| (Bytes::from(k), Bytes::from(v), ts, is_deleted))
+                    .collect();
+
+                all_results.push(converted_results.clone());
+
+                // Update the start_key for the next batch
+                start_key = Some(converted_results.last().unwrap().0.clone());
+            }
+
+            all_results
+        }
+
+        // Scan in batches and collect the results
+        let all_results = scan_in_batches(&store, batch_size);
+
+        // Verify the results
+        let expected_results = [
+            vec![
+                (Bytes::from("key1"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key1"), Bytes::from("v2"), 2, false),
+                (Bytes::from("key1"), Bytes::from("v3"), 3, false),
+                (Bytes::from("key1"), Bytes::from("v4"), 4, false),
+                (Bytes::from("key2"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key2"), Bytes::from("v2"), 2, false),
+            ],
+            vec![
+                (Bytes::from("key3"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key3"), Bytes::from("v2"), 2, false),
+                (Bytes::from("key3"), Bytes::from("v3"), 3, false),
+                (Bytes::from("key3"), Bytes::from("v4"), 4, false),
+                (Bytes::from("key4"), Bytes::from("v1"), 1, false),
+            ],
+            vec![(Bytes::from("key5"), Bytes::from("v1"), 1, false)],
+        ];
+
+        assert_eq!(all_results.len(), expected_results.len());
+
+        for (batch, expected_batch) in all_results.iter().zip(expected_results.iter()) {
+            assert_eq!(batch.len(), expected_batch.len());
+            for (result, expected) in batch.iter().zip(expected_batch.iter()) {
+                assert_eq!(result, expected);
             }
         }
     }
