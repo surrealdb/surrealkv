@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -801,16 +802,37 @@ impl Transaction {
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
 
+        // Initialize a HashSet to keep track of unique keys.
+        let mut unique_keys = HashSet::new();
+
         // Get a range iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
         let ranger = snap.range_with_versions(range);
 
+        // Initialize a variable to keep track of the current key being processed.
+        let mut current_key: Option<Bytes> = None;
+
+        // Initialize a vector to store versions for the current key.
+        let mut current_key_versions = Vec::new();
+
         // Iterate over the keys in the range.
         for (mut key, value, _, ts) in ranger {
-            // If a limit is set and we've already got enough results, break the loop.
-            if let Some(limit) = limit {
-                if results.len() >= limit {
-                    break;
+            // Remove the trailing `\0`.
+            key.truncate(key.len() - 1);
+
+            // If the key changes, process the previous key's versions.
+            if current_key.as_ref().map_or(false, |k| k != &key) {
+                // Add the previous key's versions to the results.
+                results.extend(current_key_versions.drain(..));
+
+                // Add the previous key to the set of unique keys.
+                unique_keys.insert(current_key.take().unwrap());
+
+                // If a limit is set and we've already got enough unique keys, break the loop.
+                if let Some(limit) = limit {
+                    if unique_keys.len() >= limit {
+                        break;
+                    }
                 }
             }
 
@@ -820,11 +842,17 @@ impl Transaction {
             // Resolve the value reference to get the actual value.
             let v = value.resolve(&self.core)?;
 
-            // Remove the trailing `\0`.
-            key.truncate(key.len() - 1);
+            // Add the key, value, version, and deletion status to the current key's versions.
+            current_key_versions.push((key.clone(), v, *ts, is_deleted));
 
-            // Add the key, value, version, and deletion status to the results vector.
-            results.push((key, v, *ts, is_deleted));
+            // Update the current key being processed.
+            current_key = Some(key.into());
+        }
+
+        // Process the last key's versions.
+        if let Some(key) = current_key {
+            results.extend(current_key_versions.drain(..));
+            unique_keys.insert(key);
         }
 
         // Return the results.
@@ -2988,6 +3016,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let values = vec![
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        // Insert multiple versions for each key
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, Some(2)).unwrap();
+        assert_eq!(results.len(), 6);
+
+        // Collect unique keys from the results
+        let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+
+        // Verify that the number of unique keys is equal to the limit
+        assert_eq!(unique_keys.len(), 2);
+
+        // Verify that the results contain the latest version for each key
+        for key in unique_keys {
+            let latest_value = values.last().unwrap();
+            let latest_version = values.len() as u64;
+            let result = results
+                .iter()
+                .find(|(k, _, version, _)| k == &key && *version == latest_version)
+                .unwrap();
+            assert_eq!(result.1, *latest_value);
+        }
+    }
+
+    #[tokio::test]
     async fn test_soft_delete_and_reinsert() {
         let (store, _) = create_store(false);
 
@@ -3122,5 +3197,63 @@ mod tests {
         assert_eq!(results[1].1, value2);
         assert_eq!(results[2].0, key3);
         assert_eq!(results[2].1, value3);
+    }
+    async fn test_scan_all_versions_with_subsets() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+            Bytes::from("key4"),
+            Bytes::from("key5"),
+            Bytes::from("key6"),
+            Bytes::from("key7"),
+        ];
+        let values = vec![
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        // Insert multiple versions for each key
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Define subsets of the entire range
+        let subsets = vec![
+            (keys[0].as_ref()..=keys[2].as_ref()),
+            (keys[1].as_ref()..=keys[3].as_ref()),
+            (keys[2].as_ref()..=keys[4].as_ref()),
+            (keys[3].as_ref()..=keys[5].as_ref()),
+            (keys[4].as_ref()..=keys[6].as_ref()),
+        ];
+
+        // Scan each subset and collect versions
+        for subset in subsets {
+            let txn = store.begin().unwrap();
+            let results = txn.scan_all_versions(subset, None).unwrap();
+
+            // Collect unique keys from the results
+            let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+
+            // Verify that the results contain all versions for each key in the subset
+            for key in unique_keys {
+                for (i, value) in values.iter().enumerate() {
+                    let version = (i + 1) as u64;
+                    let result = results
+                        .iter()
+                        .find(|(k, v, ver, _)| k == &key && v == value && *ver == version)
+                        .unwrap();
+                    assert_eq!(result.1, *value);
+                    assert_eq!(result.2, version);
+                }
+            }
+        }
     }
 }
