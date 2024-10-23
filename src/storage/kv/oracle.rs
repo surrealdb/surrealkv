@@ -487,8 +487,19 @@ impl WaterMark {
         let wp = mark.waiters.get(&t).cloned();
         drop(mark);
 
-        if let Some(wp) = wp {
-            matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures::executor::block_on;
+            if let Some(wp) = wp {
+                matches!(block_on(wp.closer.recv()), Err(async_channel::RecvError));
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(wp) = wp {
+                matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
+            }
         }
     }
 
