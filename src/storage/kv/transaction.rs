@@ -3198,6 +3198,8 @@ mod tests {
         assert_eq!(results[2].0, key3);
         assert_eq!(results[2].1, value3);
     }
+
+    #[tokio::test]
     async fn test_scan_all_versions_with_subsets() {
         let (store, _) = create_store(false);
         let keys = vec![
