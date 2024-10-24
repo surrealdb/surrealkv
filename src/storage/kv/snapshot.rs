@@ -1,4 +1,4 @@
-use std::{ops::RangeBounds, sync::Arc};
+use std::ops::RangeBounds;
 
 use crate::storage::{
     kv::error::{Error, Result},
@@ -7,22 +7,23 @@ use crate::storage::{
     kv::util::now,
 };
 
-use vart::{art::QueryType, iter::Iter, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
+use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
 
 pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
-    snap: VartSnapshot<VariableSizeKey, IndexValue>,
+    snap: Tree<VariableSizeKey, IndexValue>,
+    version: u64,
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: Arc<Core>) -> Result<Self> {
+    pub(crate) fn take(store: &Core) -> Result<Self> {
         // Each snapshot is created at a version that is one greater than the current version.
         let version = store.read_ts()? + 1;
-        let snapshot = store.indexer.write().snapshot_at_version(version)?;
+        let snap = store.indexer.write().index.clone();
 
-        Ok(Self { snap: snapshot })
+        Ok(Self { snap, version })
     }
 
     /// Set a key-value pair into the snapshot.
@@ -31,7 +32,9 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, now());
+        self.snap
+            .insert(key, value, self.version, now())
+            .expect("incorrect snapshot version");
     }
 
     #[allow(unused)]
@@ -57,7 +60,7 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        let (snap_val, version, _) = self.snap.get(key).ok_or(Error::KeyNotFound)?;
+        let (snap_val, version, _) = self.snap.get(key, self.version).ok_or(Error::KeyNotFound)?;
         let val = self.apply_filters(snap_val, &FILTERS)?;
         Ok((val, version))
     }
@@ -65,7 +68,7 @@ impl Snapshot {
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
     pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<IndexValue> {
         let key = &key.terminate();
-        let (val, _) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
+        let (val, _, _) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
         self.apply_filters(val, &FILTERS)
     }
 
