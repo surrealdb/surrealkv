@@ -30,7 +30,7 @@ impl Indexer {
     ) -> Result<VartSnapshot<VariableSizeKey, IndexValue>> {
         self.index
             .create_snapshot_at_version(version)
-            .map_err(|e| Error::from(e))
+            .map_err(Error::from)
     }
 
     pub fn insert(
