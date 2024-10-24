@@ -180,7 +180,7 @@ impl Transaction {
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            snapshot = Some(Snapshot::take(core.clone())?);
+            snapshot = Some(Snapshot::take(&core)?);
         }
 
         Ok(Self {

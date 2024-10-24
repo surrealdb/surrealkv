@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use vart::{art::Tree as VartIndex, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
+use vart::{art::Tree as VartIndex, VariableSizeKey};
 
-use crate::storage::kv::error::{Error, Result};
+use crate::storage::kv::error::Result;
 use crate::storage::kv::meta::Metadata;
 use crate::storage::kv::store::Core;
 
@@ -19,18 +19,8 @@ impl Indexer {
     }
 
     /// Creates a snapshot of the current state of the index.
-    pub(crate) fn snapshot(&self) -> VartSnapshot<VariableSizeKey, IndexValue> {
-        self.index.create_snapshot()
-    }
-
-    /// Creates a snapshot of the current state of the index at a given version.
-    pub(crate) fn snapshot_at_version(
-        &self,
-        version: u64,
-    ) -> Result<VartSnapshot<VariableSizeKey, IndexValue>> {
-        self.index
-            .create_snapshot_at_version(version)
-            .map_err(Error::from)
+    pub(crate) fn snapshot(&self) -> VartIndex<VariableSizeKey, IndexValue> {
+        self.index.clone()
     }
 
     pub fn insert(
