@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -801,16 +802,37 @@ impl Transaction {
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
 
+        // Initialize a HashSet to keep track of unique keys.
+        let mut unique_keys = HashSet::new();
+
         // Get a range iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
         let ranger = snap.range_with_versions(range);
 
+        // Initialize a variable to keep track of the current key being processed.
+        let mut current_key: Option<Bytes> = None;
+
+        // Initialize a vector to store versions for the current key.
+        let mut current_key_versions = Vec::new();
+
         // Iterate over the keys in the range.
         for (mut key, value, _, ts) in ranger {
-            // If a limit is set and we've already got enough results, break the loop.
-            if let Some(limit) = limit {
-                if results.len() >= limit {
-                    break;
+            // Remove the trailing `\0`.
+            key.truncate(key.len() - 1);
+
+            // If the key changes, process the previous key's versions.
+            if current_key.as_ref().map_or(false, |k| k != &key) {
+                // Add the previous key's versions to the results.
+                results.append(&mut current_key_versions);
+
+                // Add the previous key to the set of unique keys.
+                unique_keys.insert(current_key.take().unwrap());
+
+                // If a limit is set and we've already got enough unique keys, break the loop.
+                if let Some(limit) = limit {
+                    if unique_keys.len() >= limit {
+                        break;
+                    }
                 }
             }
 
@@ -820,11 +842,17 @@ impl Transaction {
             // Resolve the value reference to get the actual value.
             let v = value.resolve(&self.core)?;
 
-            // Remove the trailing `\0`.
-            key.truncate(key.len() - 1);
+            // Add the key, value, version, and deletion status to the current key's versions.
+            current_key_versions.push((key.clone(), v, *ts, is_deleted));
 
-            // Add the key, value, version, and deletion status to the results vector.
-            results.push((key, v, *ts, is_deleted));
+            // Update the current key being processed.
+            current_key = Some(key.into());
+        }
+
+        // Process the last key's versions.
+        if let Some(key) = current_key {
+            results.append(&mut current_key_versions);
+            unique_keys.insert(key);
         }
 
         // Return the results.
@@ -2988,6 +3016,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+        ];
+        let values = [
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        // Insert multiple versions for each key
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
+        let txn = store.begin().unwrap();
+        let results = txn.scan_all_versions(range, Some(2)).unwrap();
+        assert_eq!(results.len(), 6);
+
+        // Collect unique keys from the results
+        let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+
+        // Verify that the number of unique keys is equal to the limit
+        assert_eq!(unique_keys.len(), 2);
+
+        // Verify that the results contain the latest version for each key
+        for key in unique_keys {
+            let latest_value = values.last().unwrap();
+            let latest_version = values.len() as u64;
+            let result = results
+                .iter()
+                .find(|(k, _, version, _)| k == &key && *version == latest_version)
+                .unwrap();
+            assert_eq!(result.1, *latest_value);
+        }
+    }
+
+    #[tokio::test]
     async fn test_soft_delete_and_reinsert() {
         let (store, _) = create_store(false);
 
@@ -3122,5 +3197,175 @@ mod tests {
         assert_eq!(results[1].1, value2);
         assert_eq!(results[2].0, key3);
         assert_eq!(results[2].1, value3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_with_subsets() {
+        let (store, _) = create_store(false);
+        let keys = vec![
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+            Bytes::from("key4"),
+            Bytes::from("key5"),
+            Bytes::from("key6"),
+            Bytes::from("key7"),
+        ];
+        let values = [
+            Bytes::from("value1"),
+            Bytes::from("value2"),
+            Bytes::from("value3"),
+        ];
+
+        // Insert multiple versions for each key
+        for key in &keys {
+            for (i, value) in values.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Define subsets of the entire range
+        let subsets = vec![
+            (keys[0].as_ref()..=keys[2].as_ref()),
+            (keys[1].as_ref()..=keys[3].as_ref()),
+            (keys[2].as_ref()..=keys[4].as_ref()),
+            (keys[3].as_ref()..=keys[5].as_ref()),
+            (keys[4].as_ref()..=keys[6].as_ref()),
+        ];
+
+        // Scan each subset and collect versions
+        for subset in subsets {
+            let txn = store.begin().unwrap();
+            let results = txn.scan_all_versions(subset, None).unwrap();
+
+            // Collect unique keys from the results
+            let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+
+            // Verify that the results contain all versions for each key in the subset
+            for key in unique_keys {
+                for (i, value) in values.iter().enumerate() {
+                    let version = (i + 1) as u64;
+                    let result = results
+                        .iter()
+                        .find(|(k, v, ver, _)| k == &key && v == value && *ver == version)
+                        .unwrap();
+                    assert_eq!(result.1, *value);
+                    assert_eq!(result.2, version);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_with_batches() {
+        let (store, _) = create_store(false);
+        let keys = [
+            Bytes::from("key1"),
+            Bytes::from("key2"),
+            Bytes::from("key3"),
+            Bytes::from("key4"),
+            Bytes::from("key5"),
+        ];
+        let versions = [
+            vec![
+                Bytes::from("v1"),
+                Bytes::from("v2"),
+                Bytes::from("v3"),
+                Bytes::from("v4"),
+            ],
+            vec![Bytes::from("v1"), Bytes::from("v2")],
+            vec![
+                Bytes::from("v1"),
+                Bytes::from("v2"),
+                Bytes::from("v3"),
+                Bytes::from("v4"),
+            ],
+            vec![Bytes::from("v1")],
+            vec![Bytes::from("v1")],
+        ];
+
+        // Insert multiple versions for each key
+        for (key, key_versions) in keys.iter().zip(versions.iter()) {
+            for (i, value) in key_versions.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                let version = (i + 1) as u64;
+                txn.set_at_ts(key, value, version).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Set the batch size
+        let batch_size: usize = 2;
+
+        // Define a function to scan in batches
+        fn scan_in_batches(
+            store: &Store,
+            batch_size: usize,
+        ) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
+            let mut all_results = Vec::new();
+            let mut start_key: Option<Bytes> = None;
+
+            loop {
+                let range = match &start_key {
+                    Some(key) => (Bound::Excluded(key.as_ref()), Bound::Unbounded),
+                    None => (Bound::Unbounded, Bound::Unbounded),
+                };
+
+                let txn = store.begin().unwrap();
+                let results = txn.scan_all_versions(range, Some(batch_size)).unwrap();
+
+                if results.is_empty() {
+                    break;
+                }
+
+                // Convert Vec<u8> to Bytes
+                let converted_results: Vec<(Bytes, Bytes, u64, bool)> = results
+                    .into_iter()
+                    .map(|(k, v, ts, is_deleted)| (Bytes::from(k), Bytes::from(v), ts, is_deleted))
+                    .collect();
+
+                all_results.push(converted_results.clone());
+
+                // Update the start_key for the next batch
+                start_key = Some(converted_results.last().unwrap().0.clone());
+            }
+
+            all_results
+        }
+
+        // Scan in batches and collect the results
+        let all_results = scan_in_batches(&store, batch_size);
+
+        // Verify the results
+        let expected_results = [
+            vec![
+                (Bytes::from("key1"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key1"), Bytes::from("v2"), 2, false),
+                (Bytes::from("key1"), Bytes::from("v3"), 3, false),
+                (Bytes::from("key1"), Bytes::from("v4"), 4, false),
+                (Bytes::from("key2"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key2"), Bytes::from("v2"), 2, false),
+            ],
+            vec![
+                (Bytes::from("key3"), Bytes::from("v1"), 1, false),
+                (Bytes::from("key3"), Bytes::from("v2"), 2, false),
+                (Bytes::from("key3"), Bytes::from("v3"), 3, false),
+                (Bytes::from("key3"), Bytes::from("v4"), 4, false),
+                (Bytes::from("key4"), Bytes::from("v1"), 1, false),
+            ],
+            vec![(Bytes::from("key5"), Bytes::from("v1"), 1, false)],
+        ];
+
+        assert_eq!(all_results.len(), expected_results.len());
+
+        for (batch, expected_batch) in all_results.iter().zip(expected_results.iter()) {
+            assert_eq!(batch.len(), expected_batch.len());
+            for (result, expected) in batch.iter().zip(expected_batch.iter()) {
+                assert_eq!(result, expected);
+            }
+        }
     }
 }
