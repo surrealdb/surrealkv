@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "surrealkv"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ahash",
  "async-channel",
@@ -1259,9 +1259,8 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 
 [[package]]
 name = "vart"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5333f3d56808a1b86455429ba0c6d2451d6d8b935fcbacb4f7c9a59baaa7a25e"
+version = "0.6.2"
+source = "git+https://github.com/surrealdb/vart?branch=chore/allow-creating-custom-snapshot#866626aee125d133c75b1aa7f56cea02f6392eb4"
 
 [[package]]
 name = "version_check"

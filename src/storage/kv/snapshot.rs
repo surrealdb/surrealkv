@@ -13,13 +13,19 @@ pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
     snap: VartSnapshot<VariableSizeKey, IndexValue>,
+    ts: u64,
 }
 
 impl Snapshot {
     pub(crate) fn take(store: Arc<Core>) -> Result<Self> {
-        let snapshot = store.indexer.write().snapshot();
+        // Each snapshot is created at a version that is one greater than the current version.
+        let version = store.read_ts()? + 1;
+        let snapshot = store.indexer.write().snapshot_at_version(version)?;
 
-        Ok(Self { snap: snapshot })
+        Ok(Self {
+            snap: snapshot,
+            ts: version,
+        })
     }
 
     /// Set a key-value pair into the snapshot.
@@ -28,7 +34,7 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.snap.version());
+        self.snap.insert(key, value, self.ts);
     }
 
     #[allow(unused)]

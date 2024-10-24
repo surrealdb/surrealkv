@@ -2919,4 +2919,176 @@ mod tests {
 
         assert_eq!(results.len(), 2);
     }
+
+    #[tokio::test]
+    async fn sdb_bug() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let k1 = Bytes::from("/*test\0*test\0*user\0!fdtest\0");
+        let k2 = Bytes::from("/!nstest\0");
+        let k3 = Bytes::from("/*test\0!dbtest\0");
+        let k4 = Bytes::from("/*test\0*test\0!tbuser\0");
+        let k5 = Bytes::from("/*test\0*test\0*user\0!fdtest\0");
+
+        let v1 = Bytes::from("\u{3}\0\u{1}\u{4}test\0\0\0");
+        let v2 = Bytes::from("\u{3}\0\u{1}\u{4}test\0\0\0\0");
+        let v3 = Bytes::from(
+            "\u{4}\0\u{1}\u{4}user\0\0\0\u{1}\u{1}\0\u{1}\0\u{1}\0\u{1}\0\0\0\0\u{1}\0\0",
+        );
+        let v4 = Bytes::from("\u{4}\u{1}\u{1}\u{2}\u{4}\u{1}\u{4}test\u{1}\u{4}user\0\0\0\0\0\0\u{1}\u{1}\u{1}\u{1}\u{1}\u{1}\u{1}\u{1}\u{1}\0\0\0");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.get(&k1).unwrap();
+            txn.get(&k2).unwrap();
+            txn.get(&k2).unwrap();
+            txn.set(&k2, &v1).unwrap();
+
+            txn.get(&k3).unwrap();
+            txn.get(&k3).unwrap();
+            txn.set(&k3, &v2).unwrap();
+
+            txn.get(&k4).unwrap();
+            txn.get(&k4).unwrap();
+            txn.set(&k4, &v3).unwrap();
+
+            txn.set(&k5, &v4).unwrap();
+
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.get(&k5).unwrap();
+            txn.delete(&k5).unwrap();
+
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.get(&k5).unwrap();
+            txn.get(&k2).unwrap();
+            txn.get(&k3).unwrap();
+            txn.get(&k4).unwrap();
+            txn.set(&k5, &v4).unwrap();
+
+            let start_key = "/*test\0*test\0*user\0!fd\0";
+            let end_key = "/*test\0*test\0*user\0!fd�";
+
+            let range = start_key.as_bytes()..end_key.as_bytes();
+            txn.scan(range, None).unwrap();
+
+            txn.commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_soft_delete_and_reinsert() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("k1");
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.soft_delete(&key1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            // txn.get(&key1).unwrap();
+            txn.set(&key1, &value1).unwrap();
+            let range = "k1".as_bytes()..="k3".as_bytes();
+
+            txn.scan(range, None).unwrap();
+            txn.commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hard_delete_and_reinsert() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("k1");
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            // txn.get(&key1).unwrap();
+            txn.set(&key1, &value1).unwrap();
+            let range = "k1".as_bytes()..="k3".as_bytes();
+
+            txn.scan(range, None).unwrap();
+            txn.commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hard_delete_and_reinsert_with_multiple_keys() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("k1");
+        let key2 = Bytes::from("k2");
+        let value1 = Bytes::from("baz");
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value1).unwrap();
+            txn.set(&key2, &value1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key1).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            // Start a new read-write transaction (txn)
+            let mut txn = store.begin().unwrap();
+            txn.get(&key1).unwrap();
+            txn.get(&key2).unwrap();
+            txn.set(&key1, &value1).unwrap();
+            let range = "k1".as_bytes()..="k3".as_bytes();
+
+            txn.scan(range, None).unwrap();
+            txn.commit().await.unwrap();
+        }
+    }
 }
