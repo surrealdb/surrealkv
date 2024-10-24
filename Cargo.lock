@@ -1259,7 +1259,8 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 [[package]]
 name = "vart"
 version = "0.6.3"
-source = "git+https://github.com/surrealdb/vart.git?branch=tree_clone#70db5ea0082623de09165b9fbff082672ccd7b94"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d02665a2dd16898d28bd1d314b067a97365facca5c39c370d55822bcbbfb48"
 
 [[package]]
 name = "version_check"
