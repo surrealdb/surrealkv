@@ -4,6 +4,7 @@ use crate::storage::{
     kv::error::{Error, Result},
     kv::indexer::IndexValue,
     kv::store::Core,
+    kv::util::now,
 };
 
 use vart::{art::QueryType, iter::Iter, snapshot::Snapshot as VartSnapshot, VariableSizeKey};
@@ -13,7 +14,6 @@ pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
     snap: VartSnapshot<VariableSizeKey, IndexValue>,
-    ts: u64,
 }
 
 impl Snapshot {
@@ -22,10 +22,7 @@ impl Snapshot {
         let version = store.read_ts()? + 1;
         let snapshot = store.indexer.write().snapshot_at_version(version)?;
 
-        Ok(Self {
-            snap: snapshot,
-            ts: version,
-        })
+        Ok(Self { snap: snapshot })
     }
 
     /// Set a key-value pair into the snapshot.
@@ -34,7 +31,7 @@ impl Snapshot {
         // This happens because the VariableSizeKey transfrom from
         // a &[u8] does not terminate the key with a null byte.
         let key = &key.terminate();
-        self.snap.insert(key, value, self.ts);
+        self.snap.insert(key, value, now());
     }
 
     #[allow(unused)]

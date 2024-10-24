@@ -1260,7 +1260,8 @@ checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
 [[package]]
 name = "vart"
 version = "0.6.2"
-source = "git+https://github.com/surrealdb/vart?branch=chore/allow-creating-custom-snapshot#866626aee125d133c75b1aa7f56cea02f6392eb4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea7fc7164de494edba1a18a45374052ed27ca9f35e35a4bc4b68b8284718ff89"
 
 [[package]]
 name = "version_check"
