@@ -3091,4 +3091,36 @@ mod tests {
             txn.commit().await.unwrap();
         }
     }
+
+    #[tokio::test]
+    async fn test_scan_includes_entries_before_commit() {
+        let (store, _) = create_store(false);
+
+        // Define key-value pairs for the test
+        let key1 = Bytes::from("key1");
+        let key2 = Bytes::from("key2");
+        let key3 = Bytes::from("key3");
+        let value1 = Bytes::from("value1");
+        let value2 = Bytes::from("value2");
+        let value3 = Bytes::from("value3");
+
+        // Start a new read-write transaction (txn)
+        let mut txn = store.begin().unwrap();
+        txn.set(&key1, &value1).unwrap();
+        txn.set(&key2, &value2).unwrap();
+        txn.set(&key3, &value3).unwrap();
+
+        // Define the range for the scan
+        let range = "key1".as_bytes()..="key3".as_bytes();
+        let results = txn.scan(range, None).unwrap();
+
+        // Verify the results
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, key1);
+        assert_eq!(results[0].1, value1);
+        assert_eq!(results[1].0, key2);
+        assert_eq!(results[1].1, value2);
+        assert_eq!(results[2].0, key3);
+        assert_eq!(results[2].1, value3);
+    }
 }
