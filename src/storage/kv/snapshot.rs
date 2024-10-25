@@ -14,15 +14,15 @@ pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
     snap: Tree<VariableSizeKey, IndexValue>,
-    version: u64,
+    pub(crate) version: u64,
 }
 
 impl Snapshot {
     pub(crate) fn take(store: &Core) -> Result<Self> {
         // Each snapshot is created at a version that is one greater than the current version.
+        let index = store.indexer.write();
         let version = store.read_ts()? + 1;
-        let snap = store.indexer.write().index.clone();
-
+        let snap = index.index.clone();
         Ok(Self { snap, version })
     }
 
