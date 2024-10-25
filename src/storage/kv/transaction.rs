@@ -176,11 +176,15 @@ pub struct Transaction {
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
-        let read_ts = core.read_ts()?;
+        let mut read_ts = core.read_ts()?;
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            snapshot = Some(Snapshot::take(&core)?);
+            let snap = Snapshot::take(&core)?;
+            // The version with which the snapshot was
+            // taken supersedes the version taken above.
+            read_ts = snap.version - 1;
+            snapshot = Some(snap);
         }
 
         Ok(Self {
