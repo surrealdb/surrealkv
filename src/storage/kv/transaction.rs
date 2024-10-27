@@ -176,7 +176,7 @@ pub struct Transaction {
 impl Transaction {
     /// Prepare a new transaction in the given mode.
     pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
-        let mut read_ts = core.read_ts()?;
+        let mut read_ts = core.read_ts();
 
         let mut snapshot = None;
         if !mode.is_write_only() {
