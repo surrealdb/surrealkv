@@ -363,12 +363,8 @@ impl Core {
         })
     }
 
-    pub(crate) fn read_ts(&self) -> Result<u64> {
-        if self.is_closed() {
-            return Err(Error::StoreClosed);
-        }
-
-        Ok(self.oracle.read_ts())
+    pub(crate) fn read_ts(&self) -> u64 {
+        self.oracle.read_ts()
     }
 
     // The load_index function is responsible for loading the index from the log.

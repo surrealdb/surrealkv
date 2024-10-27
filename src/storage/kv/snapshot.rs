@@ -21,7 +21,7 @@ impl Snapshot {
     pub(crate) fn take(store: &Core) -> Result<Self> {
         // Each snapshot is created at a version that is one greater than the current version.
         let index = store.indexer.read();
-        let version = store.read_ts()? + 1;
+        let version = store.read_ts() + 1;
         let snap = index.index.clone();
         Ok(Self { snap, version })
     }
