@@ -322,7 +322,6 @@ impl Core {
         let mut manifest = None;
         let mut clog = None;
 
-        let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
             manifest = Some(Self::initialize_manifest(&opts.dir)?);
@@ -338,14 +337,13 @@ impl Core {
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
         }
 
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
-        let ts_to_set = std::cmp::max(num_entries, indexer.version());
-        oracle.set_ts(ts_to_set);
+        oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
         let value_cache = Cache::new(opts.max_value_cache_size as usize);
@@ -1564,6 +1562,107 @@ mod tests {
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    // Common setup logic for creating a store
+    fn create_store(dir: Option<TempDir>) -> (Store, TempDir) {
+        let temp_dir = dir.unwrap_or_else(create_temp_directory);
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        (
+            Store::new(opts.clone()).expect("should create store"),
+            temp_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_reopen_store() {
+        let (store, temp_dir) = create_store(None);
+
+        // Define the number of keys, key size, and value size
+        let num_keys = 100_000u32;
+        let key_size = 32;
+        let value_size = 32;
+
+        // Generate keys and values
+        let keys: Vec<Bytes> = (0..num_keys)
+            .map(|i| {
+                let mut key = vec![0; key_size];
+                key[..4].copy_from_slice(&i.to_be_bytes());
+                Bytes::from(key)
+            })
+            .collect();
+
+        let value = Bytes::from(vec![0; value_size]);
+
+        // Insert keys into the store
+        {
+            let mut txn = store.begin().unwrap();
+            for key in &keys {
+                txn.set(key, &value).unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Measure the time it takes to reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Verify that the keys are present in the store
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        for key in &keys {
+            let history = txn.get_history(key).unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].0, value);
+        }
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_incremental_transaction_ids_post_store_open() {
+        let (store, temp_dir) = create_store(None);
+
+        // Define keys and values
+        let key1 = Bytes::from("key1");
+        let key2 = Bytes::from("key2");
+        let key3 = Bytes::from("key3");
+        let value = Bytes::from("value");
+
+        // Insert a transaction with a single key
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Insert another transaction with multiple keys
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key2, &value).unwrap();
+            txn.set(&key3, &value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Commit a new transaction with a single key
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, &value).unwrap();
+            let res = txn.commit().await.unwrap().unwrap();
+
+            // Verify that the transaction ID is 3
+            assert_eq!(res.0, 3);
+        }
 
         store.close().await.unwrap();
     }
