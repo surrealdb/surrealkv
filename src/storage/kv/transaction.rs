@@ -489,8 +489,7 @@ impl Transaction {
 
         // Check if the transaction is written to the transaction log.
         let done = done.unwrap();
-        let ret: std::result::Result<std::result::Result<(), Error>, async_channel::RecvError> =
-            done.recv().await;
+        let ret = done.recv().await;
         if let Err(err) = ret {
             oracle.committed_upto(tx_id);
             return Err(err.into());
