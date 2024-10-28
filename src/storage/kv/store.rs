@@ -1599,11 +1599,11 @@ mod tests {
 
         // Insert keys into the store
         {
-            let mut txn = store.begin().unwrap();
             for key in &keys {
+                let mut txn = store.begin().unwrap();
                 txn.set(key, &value).unwrap();
+                txn.commit().await.unwrap();
             }
-            txn.commit().await.unwrap();
         }
 
         // Close the store
@@ -1611,6 +1611,10 @@ mod tests {
 
         // Measure the time it takes to reopen the store
         let (store, _) = create_store(Some(temp_dir));
+        assert_eq!(
+            store.inner.as_ref().unwrap().core.indexer.read().version(),
+            num_keys as u64
+        );
 
         // Verify that the keys are present in the store
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
