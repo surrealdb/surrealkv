@@ -171,6 +171,9 @@ pub struct Transaction {
 
     /// write sequence number is used for real-time ordering of writes within a transaction.
     write_seqno: u32,
+
+    /// `versionstamp` is a combination of the transaction ID and the commit timestamp. For internal use only.
+    versionstamp: Option<(u64, u64)>,
 }
 
 impl Transaction {
@@ -199,6 +202,7 @@ impl Transaction {
             closed: false,
             savepoints: 0,
             write_seqno: 0,
+            versionstamp: None,
         })
     }
 
@@ -439,7 +443,7 @@ impl Transaction {
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
-    pub async fn commit(&mut self) -> Result<Option<(u64, u64)>> {
+    pub async fn commit(&mut self) -> Result<()> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -452,7 +456,7 @@ impl Transaction {
 
         // If there are no pending writes, there's nothing to commit, so return early.
         if self.write_set.is_empty() {
-            return Ok(None); // Return None when there's nothing to commit
+            return Ok(()); // Return when there's nothing to commit
         }
 
         // Lock the oracle to serialize commits to the transaction log.
@@ -501,9 +505,11 @@ impl Transaction {
         // Mark the transaction as closed.
         self.closed = true;
 
+        // Save the versionstamp for internal use.
+        self.versionstamp = Some((tx_id, commit_ts));
+
         // Return the transaction ID and commit timestamp.
-        ret.unwrap()?;
-        Ok(Some((tx_id, commit_ts)))
+        ret.unwrap()
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
@@ -3412,7 +3418,8 @@ mod tests {
                 // Start a new read-write transaction
                 let mut txn = store.begin().unwrap();
                 txn.set(&key, &value).unwrap();
-                txn.commit().await.unwrap()
+                txn.commit().await.unwrap();
+                txn.versionstamp
             });
 
             handles.push(handle);
