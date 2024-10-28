@@ -3378,14 +3378,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_transactions() {
         let (store, _) = create_store(false);
         let store = Arc::new(store);
 
+        // Define the number of concurrent transactions
+        let num_transactions = 1000;
+
         // Define key-value pairs for the test
-        let keys: Vec<Bytes> = (0..10).map(|i| Bytes::from(format!("key{}", i))).collect();
-        let values: Vec<Bytes> = (0..10)
+        let keys: Vec<Bytes> = (0..num_transactions)
+            .map(|i| Bytes::from(format!("key{}", i)))
+            .collect();
+        let values: Vec<Bytes> = (0..num_transactions)
             .map(|i| Bytes::from(format!("value{}", i)))
             .collect();
 
@@ -3425,6 +3430,11 @@ mod tests {
 
         // Verify that all transactions committed
         assert_eq!(transaction_ids.len(), keys.len());
+
+        // Sort the transaction IDs and commit timestamps because we just
+        // want to verify if the transaction ids are incremental and unique
+        transaction_ids.sort();
+        commit_timestamps.sort();
 
         // Verify that transaction IDs are incremental
         for i in 1..transaction_ids.len() {
