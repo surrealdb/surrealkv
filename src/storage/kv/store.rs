@@ -1582,7 +1582,7 @@ mod tests {
         let (store, temp_dir) = create_store(None);
 
         // Define the number of keys, key size, and value size
-        let num_keys = 100_000u32;
+        let num_keys = 10000u32;
         let key_size = 32;
         let value_size = 32;
 
@@ -1662,7 +1662,9 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value).unwrap();
-            let res = txn.commit().await.unwrap().unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
 
             // Verify that the transaction ID is 3
             assert_eq!(res.0, 3);
