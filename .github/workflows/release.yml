@@ -50,6 +50,9 @@ jobs:
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
       - name: Create and push tag
         run: |
           git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
@@ -64,7 +67,7 @@ jobs:
         env:
           OUTPUT: CHANGELOG.md
 
-      - name: Commit changelog and sync to main
+      - name: Commit changelog
         run: |
           if [[ -n $(git status --porcelain) ]]; then
             git add CHANGELOG.md
