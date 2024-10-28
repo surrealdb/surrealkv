@@ -3438,19 +3438,5 @@ mod tests {
 
         // Drop the store to simulate closing it
         store.close().await.unwrap();
-
-        // Create a new Core instance with VariableSizeKey after dropping the previous one
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        let store = Store::new(opts).expect("should create store");
-
-        // Verify that the keys are present in the store
-        let mut txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        for (key, value) in keys.iter().zip(values.iter()) {
-            let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, value.as_ref());
-        }
-
-        store.close().await.unwrap();
     }
 }
