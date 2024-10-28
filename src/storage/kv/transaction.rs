@@ -3380,7 +3380,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_transactions() {
-        let (store, temp_dir) = create_store(false);
+        let (store, _) = create_store(false);
         let store = Arc::new(store);
 
         // Define key-value pairs for the test
@@ -3400,7 +3400,7 @@ mod tests {
 
         // Spawn concurrent transactions
         for (key, value) in keys.iter().zip(values.iter()) {
-            let store = Arc::clone(&store); // Clone the Arc to increment the reference count
+            let store = Arc::clone(&store);
             let key = key.clone();
             let value = value.clone();
 
