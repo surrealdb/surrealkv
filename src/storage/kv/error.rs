@@ -36,16 +36,17 @@ pub enum Error {
     ReceiveError(String),
     RevisionError(String),
     MismatchedSegmentID(u64, u64),
-    CompactionAlreadyInProgress,   // Compaction is in progress
-    MergeManifestMissing,          // The merge manifest is missing
-    CustomError(String),           // Custom error
-    InvalidOperation,              // Invalid operation
-    CompactionSegmentSizeTooSmall, // The segment size is too small for compaction
-    SegmentIdExceedsLastUpdated,   // The segment ID exceeds the last updated segment
-    TransactionMustBeReadOnly,     // The transaction must be read-only
-    TransactionWithoutSavepoint,   // The transaction does not have a savepoint set
-    MaxKVMetadataLengthExceeded,   // The maximum KV metadata length is exceeded
-    ChecksumMismatch(u32, u32),    // Checksum mismatch
+    CompactionAlreadyInProgress,    // Compaction is in progress
+    MergeManifestMissing,           // The merge manifest is missing
+    CustomError(String),            // Custom error
+    InvalidOperation,               // Invalid operation
+    CompactionSegmentSizeTooSmall,  // The segment size is too small for compaction
+    SegmentIdExceedsLastUpdated,    // The segment ID exceeds the last updated segment
+    TransactionMustBeReadOnly,      // The transaction must be read-only
+    TransactionWithoutSavepoint,    // The transaction does not have a savepoint set
+    MaxKVMetadataLengthExceeded,    // The maximum KV metadata length is exceeded
+    ChecksumMismatch(u32, u32),     // Checksum mismatch
+    SnapshotVersionIsOld(u64, u64), // The snapshot version is too old
 }
 
 // Implementation of Display trait for Error
@@ -113,6 +114,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "Checksum mismatch: expected={}, found={}",
+                    expected, found
+                )
+            }
+            Error::SnapshotVersionIsOld(expected, found) => {
+                write!(
+                    f,
+                    "Snapshot version is old: read_ts={}, index={}",
                     expected, found
                 )
             }

@@ -439,7 +439,7 @@ impl Transaction {
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
-    pub async fn commit(&mut self) -> Result<()> {
+    pub async fn commit(&mut self) -> Result<Option<(u64, u64)>> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -452,7 +452,7 @@ impl Transaction {
 
         // If there are no pending writes, there's nothing to commit, so return early.
         if self.write_set.is_empty() {
-            return Ok(());
+            return Ok(None); // Return None when there's nothing to commit
         }
 
         // Lock the oracle to serialize commits to the transaction log.
@@ -460,7 +460,7 @@ impl Transaction {
         let write_ch_lock = oracle.write_lock.lock().await;
 
         // Prepare for the commit by getting a transaction ID.
-        let tx_id = self.prepare_commit()?;
+        let (tx_id, commit_ts) = self.prepare_commit()?;
 
         // Extract the vector of entries for the current transaction,
         // respecting the insertion order recorded with WriteSetEntry::seqno.
@@ -489,7 +489,8 @@ impl Transaction {
 
         // Check if the transaction is written to the transaction log.
         let done = done.unwrap();
-        let ret = done.recv().await;
+        let ret: std::result::Result<std::result::Result<(), Error>, async_channel::RecvError> =
+            done.recv().await;
         if let Err(err) = ret {
             oracle.committed_upto(tx_id);
             return Err(err.into());
@@ -501,19 +502,21 @@ impl Transaction {
         // Mark the transaction as closed.
         self.closed = true;
 
-        ret.unwrap()
+        // Return the transaction ID and commit timestamp.
+        ret.unwrap()?;
+        Ok(Some((tx_id, commit_ts)))
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<u64> {
+    fn prepare_commit(&mut self) -> Result<(u64, u64)> {
         let oracle = self.core.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
-        self.assign_commit_ts();
-        Ok(tx_id)
+        let commit_ts = self.assign_commit_ts();
+        Ok((tx_id, commit_ts))
     }
 
     /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_ts(&mut self) {
+    fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
         for entries in self.write_set.values_mut() {
             if let Some(entry) = entries.last_mut() {
@@ -522,6 +525,7 @@ impl Transaction {
                 }
             }
         }
+        commit_ts
     }
 
     /// Rolls back the transaction by removing all updated entries.
@@ -874,6 +878,7 @@ impl Drop for Transaction {
 mod tests {
     use bytes::Bytes;
     use std::mem::size_of;
+    use tokio::task;
 
     use super::*;
     use crate::storage::kv::option::{IsolationLevel, Options};
@@ -3371,5 +3376,81 @@ mod tests {
                 assert_eq!(result, expected);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_transactions() {
+        let (store, temp_dir) = create_store(false);
+        let store = Arc::new(store);
+
+        // Define key-value pairs for the test
+        let keys: Vec<Bytes> = (0..10).map(|i| Bytes::from(format!("key{}", i))).collect();
+        let values: Vec<Bytes> = (0..10)
+            .map(|i| Bytes::from(format!("value{}", i)))
+            .collect();
+
+        // Create a vector to store the handles of the spawned tasks
+        let mut handles = vec![];
+
+        // Create a vector to store the transaction IDs
+        let mut transaction_ids = vec![];
+
+        // Create a vector to store the commit timestamps
+        let mut commit_timestamps = vec![];
+
+        // Spawn concurrent transactions
+        for (key, value) in keys.iter().zip(values.iter()) {
+            let store = Arc::clone(&store); // Clone the Arc to increment the reference count
+            let key = key.clone();
+            let value = value.clone();
+
+            let handle = task::spawn(async move {
+                // Start a new read-write transaction
+                let mut txn = store.begin().unwrap();
+                txn.set(&key, &value).unwrap();
+                txn.commit().await.unwrap()
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete and collect the results
+        for handle in handles {
+            let result = handle.await.unwrap();
+            if let Some((transaction_id, commit_ts)) = result {
+                transaction_ids.push(transaction_id);
+                commit_timestamps.push(commit_ts);
+            }
+        }
+
+        // Verify that all transactions committed
+        assert_eq!(transaction_ids.len(), keys.len());
+
+        // Verify that transaction IDs are incremental
+        for i in 1..transaction_ids.len() {
+            assert!(transaction_ids[i] > transaction_ids[i - 1]);
+        }
+
+        // Verify that commit timestamps are incremental
+        for i in 1..commit_timestamps.len() {
+            assert!(commit_timestamps[i] >= commit_timestamps[i - 1]);
+        }
+
+        // Drop the store to simulate closing it
+        store.close().await.unwrap();
+
+        // Create a new Core instance with VariableSizeKey after dropping the previous one
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Store::new(opts).expect("should create store");
+
+        // Verify that the keys are present in the store
+        let mut txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        for (key, value) in keys.iter().zip(values.iter()) {
+            let val = txn.get(key).unwrap().unwrap();
+            assert_eq!(val, value.as_ref());
+        }
+
+        store.close().await.unwrap();
     }
 }
