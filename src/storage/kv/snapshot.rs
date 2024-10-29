@@ -18,9 +18,9 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: &Core) -> Result<Self> {
+    pub(crate) async fn take(store: &Core) -> Result<Self> {
         // Each snapshot is created at a version that is one greater than the current version.
-        let index = store.indexer.read();
+        let index = store.indexer.read().await;
         let version = store.read_ts() + 1;
         let snap = index.index.clone();
         Ok(Self { snap, version })
@@ -189,7 +189,7 @@ mod tests {
     }
 
     async fn set_value(store: &Store, key: &Bytes, value: &Bytes) {
-        let mut txn = store.begin().expect("Failed to begin transaction");
+        let mut txn = store.begin().await.expect("Failed to begin transaction");
         txn.set(key, value).expect("Failed to set value");
         txn.commit().await.expect("Failed to commit transaction");
     }
@@ -225,6 +225,7 @@ mod tests {
         let ts = now();
         let txn = store
             .begin_with_mode(Mode::ReadOnly)
+            .await
             .expect("Failed to begin transaction");
 
         let range = "k1".as_bytes()..="k2".as_bytes();
@@ -237,6 +238,7 @@ mod tests {
         // Test scan_at_ts
         let entries = txn
             .scan_at_ts(range, ts, Some(10))
+            .await
             .expect("Failed to scan at timestamp");
         assert_eq!(
             entries.len(),
@@ -248,7 +250,7 @@ mod tests {
 
         // Enhance get_history testing
         for (key, initial_value, updated_value) in keys_values.iter() {
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_history(key).await.expect("Failed to get history");
             assert_eq!(
                 history.len(),
                 2,
@@ -267,11 +269,13 @@ mod tests {
             let updated_ts = history[1].1;
             assert_eq!(
                 txn.get_at_ts(key, initial_ts)
+                    .await
                     .expect("Failed to get value at initial timestamp"),
                 Some(initial_value.to_vec())
             );
             assert_eq!(
                 txn.get_at_ts(key, updated_ts)
+                    .await
                     .expect("Failed to get value at updated timestamp"),
                 Some(updated_value.to_vec())
             );

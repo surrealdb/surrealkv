@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use tokio::{sync::Mutex, sync::RwLock};
 
 use crate::storage::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -174,7 +174,7 @@ impl Aol {
     }
 
     /// Reads data from the segment at the specified offset into the provided buffer.
-    pub fn read_at(
+    pub async fn read_at(
         &self,
         buf: &mut [u8],
         segment_id: u64,
@@ -192,7 +192,10 @@ impl Aol {
         let mut r = 0;
 
         // Read data from the appropriate segment
-        match self.read_segment_data(&mut buf[r..], segment_id, read_offset) {
+        match self
+            .read_segment_data(&mut buf[r..], segment_id, read_offset)
+            .await
+        {
             Ok(bytes_read) => {
                 r += bytes_read;
             }
@@ -208,7 +211,7 @@ impl Aol {
     }
 
     // Helper function to read data from the appropriate segment
-    fn read_segment_data(
+    async fn read_segment_data(
         &self,
         buf: &mut [u8],
         segment_id: u64,
@@ -220,7 +223,7 @@ impl Aol {
             let _lock = self.mutex.lock();
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let mut cache = self.segment_cache.write();
+            let mut cache = self.segment_cache.write().await;
             match cache.get(&segment_id) {
                 Some(segment) => segment.read_at(buf, read_offset),
                 None => {
@@ -292,8 +295,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[test]
-    fn append() {
+    #[tokio::test]
+    async fn append() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -328,19 +331,25 @@ mod tests {
 
         // Test reading from segment
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, segment_id, 0).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 0)
+            .await
+            .expect("should read");
         assert_eq!(4, n.1);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 7];
-        let n = a.read_at(&mut bs, segment_id, 4).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 4)
+            .await
+            .expect("should read");
         assert_eq!(7, n.1);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
-        let r = a.read_at(&mut bs, segment_id, 4097);
+        let r = a.read_at(&mut bs, segment_id, 4097).await;
         assert!(r.is_err());
 
         // Test appending another buffer
@@ -355,7 +364,10 @@ mod tests {
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, segment_id, 11).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 11)
+            .await
+            .expect("should read");
         assert_eq!(4, n.1);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
@@ -363,8 +375,8 @@ mod tests {
         assert!(a.close().is_ok());
     }
 
-    #[test]
-    fn append_and_read_two_blocks() {
+    #[tokio::test]
+    async fn append_and_read_two_blocks() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -392,6 +404,7 @@ mod tests {
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a
             .read_at(&mut read_data1, segment_id, 0)
+            .await
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
@@ -400,6 +413,7 @@ mod tests {
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a
             .read_at(&mut read_data2, segment_id, 31 * 1024)
+            .await
             .expect("should read");
         assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
@@ -408,8 +422,8 @@ mod tests {
         assert!(a.close().is_ok());
     }
 
-    #[test]
-    fn append_read_append_read() {
+    #[tokio::test]
+    async fn append_read_append_read() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -438,6 +452,7 @@ mod tests {
         let (segment_id, _) = (a.active_segment_id, a.active_segment.offset());
         let n1 = a
             .read_at(&mut read_data1, segment_id, 0)
+            .await
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
@@ -458,6 +473,7 @@ mod tests {
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a
             .read_at(&mut read_data1, segment_id, 0)
+            .await
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
@@ -466,6 +482,7 @@ mod tests {
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a
             .read_at(&mut read_data2, segment_id, 31 * 1024)
+            .await
             .expect("should read");
         assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
@@ -474,8 +491,8 @@ mod tests {
         assert!(a.close().is_ok());
     }
 
-    #[test]
-    fn append_large_record() {
+    #[tokio::test]
+    async fn append_large_record() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -501,8 +518,8 @@ mod tests {
         assert_eq!(1024, offset);
     }
 
-    #[test]
-    fn fsync_failure() {
+    #[tokio::test]
+    async fn fsync_failure() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -528,12 +545,12 @@ mod tests {
 
         // Reads should fail after fsync failure
         let mut read_data = vec![0; 1024];
-        let r = a.read_at(&mut read_data, segment_id, 0);
+        let r = a.read_at(&mut read_data, segment_id, 0).await;
         assert!(r.is_err());
     }
 
-    #[test]
-    fn append_and_reload_to_check_active_segment_id() {
+    #[tokio::test]
+    async fn append_and_reload_to_check_active_segment_id() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -567,8 +584,8 @@ mod tests {
         assert_eq!(1, a.active_segment_id);
     }
 
-    #[test]
-    fn append_records_across_two_files_and_read() {
+    #[tokio::test]
+    async fn append_records_across_two_files_and_read() {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
 
@@ -597,19 +614,21 @@ mod tests {
 
         // Read back the first record using its segment ID and offset
         let mut read_buf = vec![0; 512];
-        a.read_at(&mut read_buf, first_segment_id, 0) // Start at offset 0 of the first segment
+        a.read_at(&mut read_buf, first_segment_id, 0)
+            .await // Start at offset 0 of the first segment
             .expect("failed to read first record");
         assert_eq!(first_record, read_buf, "First record data mismatch");
 
         // Read back the second record using its segment ID and offset
         let mut read_buf = vec![0; 1024];
-        a.read_at(&mut read_buf, second_segment_id, 0) // Start at offset 0 of the second segment
+        a.read_at(&mut read_buf, second_segment_id, 0)
+            .await // Start at offset 0 of the second segment
             .expect("failed to read second record");
         assert_eq!(second_record, read_buf, "Second record data mismatch");
     }
 
-    #[test]
-    fn read_beyond_current_offset_should_fail() {
+    #[tokio::test]
+    async fn read_beyond_current_offset_should_fail() {
         // Setup: Create a temporary directory and initialize the log with default options
         let temp_dir = create_temp_directory();
         let opts = Options::default();
@@ -621,7 +640,7 @@ mod tests {
 
         // Attempt to read beyond the current offset
         let mut read_buf = vec![0; 1024]; // Buffer size is larger than the appended record
-        let result = a.read_at(&mut read_buf, 0, 1024); // Attempt to read at an offset beyond the single appended record
+        let result = a.read_at(&mut read_buf, 0, 1024).await; // Attempt to read at an offset beyond the single appended record
 
         // Verify: The read operation should fail or return an error indicating the offset is out of bounds
         assert!(
@@ -630,8 +649,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn append_after_reopening_log() {
+    #[tokio::test]
+    async fn append_after_reopening_log() {
         // Setup: Create a temporary directory and initialize the log
         let temp_dir = create_temp_directory();
         let opts = Options::default();
@@ -652,17 +671,19 @@ mod tests {
             // Verify: Ensure the log contains both records by reading them back
             let mut read_buf = vec![0; 512];
             a.read_at(&mut read_buf, 0, 0)
+                .await
                 .expect("failed to read first record after reopen");
             assert_eq!(record, read_buf, "First record data mismatch after reopen");
 
             a.read_at(&mut read_buf, 0, 512)
+                .await
                 .expect("failed to read second record after reopen");
             assert_eq!(record, read_buf, "Second record data mismatch after reopen");
         }
     }
 
-    #[test]
-    fn append_across_two_files_and_read() {
+    #[tokio::test]
+    async fn append_across_two_files_and_read() {
         // Setup: Create a temporary directory and initialize the log with small max file size
         let temp_dir = create_temp_directory();
         let opts = Options {
@@ -686,6 +707,7 @@ mod tests {
             let mut read_buf = vec![0; 512];
             // The first record should be at the start of the first file (segment), hence segment_id = 1 and offset = 0.
             a.read_at(&mut read_buf, 0, 0)
+                .await
                 .expect("failed to read first record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in first file");
 
@@ -693,6 +715,7 @@ mod tests {
             let mut read_buf = vec![0; 512];
             // The second record should be at the start of the second file (segment), hence segment_id = 1 and offset = 0.
             a.read_at(&mut read_buf, 1, 0)
+                .await
                 .expect("failed to read second record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in second file");
 
@@ -702,14 +725,15 @@ mod tests {
             let mut read_buf = vec![0; 512];
             // The third record should be at the start of the third file (segment), hence segment_id = 1 and offset = 0.
             a.read_at(&mut read_buf, 2, 0)
+                .await
                 .expect("failed to read third record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in third file");
         }
     }
 
     // TODO: add to benchmarks
-    #[test]
-    fn sequential_read_performance() {
+    #[tokio::test]
+    async fn sequential_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
@@ -726,6 +750,7 @@ mod tests {
         let mut read_buf = vec![0; 512];
         for offset in (0..512000).step_by(512) {
             a.read_at(&mut read_buf, 0, offset as u64)
+                .await
                 .expect("failed to read record");
         }
 
@@ -735,8 +760,8 @@ mod tests {
     }
 
     // TODO: add to benchmarks
-    #[test]
-    fn random_access_read_performance() {
+    #[tokio::test]
+    async fn random_access_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
         let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
@@ -760,6 +785,7 @@ mod tests {
         let mut read_buf = vec![0; 512];
         for offset in offsets {
             a.read_at(&mut read_buf, 0, offset)
+                .await
                 .expect("failed to read record");
         }
 
@@ -768,8 +794,8 @@ mod tests {
         println!("Random access read of 1000 records took: {:?}", duration);
     }
 
-    #[test]
-    fn test_rotate_functionality() {
+    #[tokio::test]
+    async fn test_rotate_functionality() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
         let mut aol = Aol::open(temp_dir.path(), &opts).expect("should create aol");
@@ -804,6 +830,7 @@ mod tests {
         // Use read_at to verify the data integrity
         let mut read_data = vec![0u8; data_to_append.len()];
         aol.read_at(&mut read_data, segment_id, record_offset_start)
+            .await
             .unwrap();
         assert_eq!(
             read_data, data_to_append,

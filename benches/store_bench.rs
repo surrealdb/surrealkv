@@ -45,7 +45,7 @@ fn bulk_insert(c: &mut Criterion) {
             &format!("bulk load key/value lengths {}/{}", key_len, val_len),
             |b| {
                 b.to_async(&rt).iter(|| async {
-                    let mut txn = db.begin().unwrap();
+                    let mut txn = db.begin().await.unwrap();
                     txn.set(bytes(key_len)[..].into(), bytes(val_len)[..].into())
                         .unwrap();
                     txn.commit().await.unwrap();
@@ -81,7 +81,7 @@ fn sequential_insert_read(c: &mut Criterion) {
         c.bench_function("sequential inserts", |b| {
             let count = AtomicU32::new(0_u32);
             b.iter(|| async {
-                let mut txn = db.begin().unwrap();
+                let mut txn = db.begin().await.unwrap();
                 txn.set(
                     count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
                     vec![][..].into(),
@@ -103,8 +103,8 @@ fn sequential_insert_read(c: &mut Criterion) {
 
                 let current_count = count.load(Relaxed);
                 if current_count <= max_count.load(Relaxed) {
-                    let mut txn = db.begin().unwrap();
-                    txn.get(&current_count.to_be_bytes()[..]).unwrap();
+                    let mut txn = db.begin().await.unwrap();
+                    txn.get(&current_count.to_be_bytes()[..]).await.unwrap();
                 }
             })
         });
@@ -151,7 +151,7 @@ fn concurrent_insert(c: &mut Criterion) {
                         let db = db.clone();
 
                         let handle = rt.spawn(async move {
-                            let mut txn = db.begin().unwrap();
+                            let mut txn = db.begin().await.unwrap();
                             for _ in 0..ops_per_thread {
                                 let key = nanoid::nanoid!();
                                 let value = nanoid::nanoid!();

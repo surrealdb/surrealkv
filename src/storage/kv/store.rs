@@ -8,12 +8,12 @@ use async_channel::{bounded, Receiver, Sender};
 use futures::{select, FutureExt};
 use tokio::{
     sync::Mutex as AsyncMutex,
+    sync::RwLock,
     task::{spawn, JoinHandle},
 };
 
 use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
 
@@ -92,7 +92,7 @@ impl StoreInner {
             })?;
         }
 
-        self.core.close()?;
+        self.core.close().await?;
 
         self.is_closed.store(true, Ordering::Relaxed);
 
@@ -122,24 +122,25 @@ impl Store {
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin(&self) -> Result<Transaction> {
-        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), Mode::ReadWrite)?;
+    pub async fn begin(&self) -> Result<Transaction> {
+        let txn =
+            Transaction::new(self.inner.as_ref().unwrap().core.clone(), Mode::ReadWrite).await?;
         Ok(txn)
     }
 
     /// Begins a new transaction with the given mode.
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), mode)?;
+    pub async fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), mode).await?;
         Ok(txn)
     }
 
     /// Executes a function in a read-only transaction.
     /// It begins a new read-only transaction and executes the function with the transaction.
     /// It returns the result of the function.
-    pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
+    pub async fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+        let mut txn = self.begin_with_mode(Mode::ReadOnly).await?;
         f(&mut txn)?;
 
         Ok(())
@@ -152,7 +153,7 @@ impl Store {
         self: Arc<Self>,
         f: impl FnOnce(&mut Transaction) -> Result<()>,
     ) -> Result<()> {
-        let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
+        let mut txn = self.begin_with_mode(Mode::ReadWrite).await?;
         f(&mut txn)?;
         txn.commit().await?;
 
@@ -550,7 +551,7 @@ impl Core {
         self.is_closed.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn close(&self) -> Result<()> {
+    pub(crate) async fn close(&self) -> Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -562,12 +563,12 @@ impl Core {
 
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
-            clog.write().close()?;
+            clog.write().await.close()?;
         }
 
         // Close the manifest if it exists
         if let Some(manifest) = &self.manifest {
-            manifest.write().close()?;
+            manifest.write().await.close()?;
         }
         self.is_closed.store(true, Ordering::Relaxed);
 
@@ -577,7 +578,7 @@ impl Core {
     pub(crate) async fn write_request(&self, req: Task) -> Result<()> {
         let done = req.done.clone();
 
-        let result = self.write_entries(req);
+        let result = self.write_entries(req).await;
 
         if let Some(done) = done {
             done.send(result.clone()).await?;
@@ -586,40 +587,41 @@ impl Core {
         result
     }
 
-    fn write_entries(&self, req: Task) -> Result<()> {
+    async fn write_entries(&self, req: Task) -> Result<()> {
         if req.entries.is_empty() {
             return Ok(());
         }
 
         if self.opts.should_persist_data() {
-            self.write_entries_to_disk(req)
+            self.write_entries_to_disk(req).await
         } else {
-            self.write_entries_to_memory(req)
+            self.write_entries_to_memory(req).await
         }
     }
 
-    fn write_entries_to_disk(&self, req: Task) -> Result<()> {
+    async fn write_entries_to_disk(&self, req: Task) -> Result<()> {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(req.entries.len());
 
         encode_entries(&req.entries, req.tx_id, &mut buf, &mut values_offsets);
 
-        let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
+        let (segment_id, current_offset) = self.append_log(&buf, req.durability).await?;
 
         values_offsets.iter_mut().for_each(|(_, val_off)| {
             *val_off += current_offset;
         });
 
         self.write_index_with_committed_offsets(&req, segment_id, &values_offsets)
+            .await
     }
 
-    fn write_entries_to_memory(&self, req: Task) -> Result<()> {
-        self.write_index_in_memory(&req)
+    async fn write_entries_to_memory(&self, req: Task) -> Result<()> {
+        self.write_index_in_memory(&req).await
     }
 
-    fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
-        let mut clog = self.clog.as_ref().unwrap().write();
+    async fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
+        let mut clog = self.clog.as_ref().unwrap().write().await;
 
         let (segment_id, offset) = match durability {
             Durability::Immediate => {
@@ -641,11 +643,11 @@ impl Core {
         Ok((segment_id, offset))
     }
 
-    fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
+    async fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
     where
         F: Fn(&Entry) -> IndexValue,
     {
-        let mut index = self.indexer.write();
+        let mut index = self.indexer.write().await;
 
         for entry in &task.entries {
             // If the entry is marked as deleted, delete it.
@@ -680,7 +682,7 @@ impl Core {
         Ok(())
     }
 
-    fn write_index_with_committed_offsets(
+    async fn write_index_with_committed_offsets(
         &self,
         task: &Task,
         segment_id: u64,
@@ -696,12 +698,14 @@ impl Core {
                 self.opts.max_value_threshold,
             )
         })
+        .await
     }
 
-    fn write_index_in_memory(&self, task: &Task) -> Result<()> {
+    async fn write_index_in_memory(&self, task: &Task) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
             IndexValue::new_mem(entry.metadata.clone(), entry.value.clone())
         })
+        .await
     }
 
     pub(crate) async fn send_to_write_channel(
@@ -724,7 +728,7 @@ impl Core {
     /// Resolves the value from the given offset in the commit log.
     /// If the offset exists in the value cache, it returns the cached value.
     /// Otherwise, it reads the value from the commit log, caches it, and returns it.
-    pub(crate) fn resolve_from_offset(
+    pub(crate) async fn resolve_from_offset(
         &self,
         segment_id: u64,
         value_offset: u64,
@@ -739,8 +743,8 @@ impl Core {
 
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
-        let clog = self.clog.as_ref().unwrap().read();
-        clog.read_at(&mut buf, segment_id, value_offset)?;
+        let clog = self.clog.as_ref().unwrap().read().await;
+        clog.read_at(&mut buf, segment_id, value_offset).await?;
 
         // Cache the newly read value for future use
         self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
@@ -803,7 +807,7 @@ mod tests {
         // Write the keys to the store
         for key in keys.iter() {
             // Start a new write transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
@@ -811,8 +815,8 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -831,8 +835,8 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -880,7 +884,7 @@ mod tests {
                 let id = (i - 1) * num_ops + j;
                 let key = format!("key{}", id);
                 let value = format!("value{}", id);
-                let mut txn = store.begin().unwrap();
+                let mut txn = store.begin().await.unwrap();
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
                 txn.commit().await.unwrap();
             }
@@ -890,8 +894,8 @@ mod tests {
                 let key = format!("key{}", j);
                 let value = format!("value{}", j);
                 let value = value.into_bytes();
-                let mut txn = store.begin().unwrap();
-                let val = txn.get(key.as_bytes()).unwrap().unwrap();
+                let mut txn = store.begin().await.unwrap();
+                let val = txn.get(key.as_bytes()).await.unwrap().unwrap();
 
                 assert_eq!(val, value);
             }
@@ -933,7 +937,7 @@ mod tests {
         // Write the keys to the store
         for key in keys.iter() {
             // Start a new write transaction
-            let mut txn = store1.begin().unwrap();
+            let mut txn = store1.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
@@ -993,7 +997,7 @@ mod tests {
     }
 
     async fn concurrent_task(store: Arc<Store>) {
-        let mut txn = store.begin().unwrap();
+        let mut txn = store.begin().await.unwrap();
         txn.set(b"dummy key", b"dummy value").unwrap();
         txn.commit().await.unwrap();
     }
@@ -1040,36 +1044,36 @@ mod tests {
 
         // Write the keys to the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
 
         // Read the keys from the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
 
         // Delete the keys from the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
         // ReWrite the keys to the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
 
         // Read the keys from the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap().unwrap();
             assert_eq!(val, default_value.as_ref());
         }
     }
@@ -1091,7 +1095,7 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Insert an item into the store
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, value).unwrap();
             txn.commit().await.unwrap();
 
@@ -1103,8 +1107,8 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Test that the item is still in the store
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap();
 
             assert_eq!(val.unwrap(), value);
         }
@@ -1130,7 +1134,7 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Insert an item into the store
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set_durability(durability);
             txn.set(key, value).unwrap();
             txn.commit().await.unwrap();
@@ -1149,8 +1153,8 @@ mod tests {
             let store = Store::new(opts.clone()).expect("should create store");
 
             // Test that the item is still in the store
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap();
 
             if should_exist {
                 assert_eq!(val.unwrap(), value);
@@ -1229,7 +1233,7 @@ mod tests {
             // Create a new store instance
             let store = Store::new(opts.clone()).expect("should create store");
 
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set_durability(durability);
 
             {
@@ -1249,7 +1253,7 @@ mod tests {
         }
 
         let store = Store::new(opts.clone()).expect("should create store");
-        let mut txn = store.begin().unwrap();
+        let mut txn = store.begin().await.unwrap();
 
         let mut key_order: Vec<usize> = (0..num_elements).collect();
         key_order.shuffle(&mut rand::thread_rng());
@@ -1257,7 +1261,7 @@ mod tests {
         {
             for i in &key_order {
                 let (key, value) = &pairs[*i % pairs.len()];
-                let val = txn.get(key.as_slice()).unwrap().unwrap();
+                let val = txn.get(key.as_slice()).await.unwrap().unwrap();
                 assert_eq!(&val, value);
             }
         }
@@ -1305,7 +1309,7 @@ mod tests {
         // Write the keys to the store
         for key in keys.iter() {
             // Start a new write transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
@@ -1313,8 +1317,8 @@ mod tests {
         // Read the keys to the store
         for key in keys.iter() {
             // Start a new read transaction
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(key).await.unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
             assert_eq!(val, default_value.as_ref());
         }
@@ -1327,8 +1331,8 @@ mod tests {
         // No keys should be found in the store
         for key in keys.iter() {
             // Start a new read transaction
-            let mut txn = store.begin().unwrap();
-            assert!(txn.get(key).unwrap().is_none());
+            let mut txn = store.begin().await.unwrap();
+            assert!(txn.get(key).await.unwrap().is_none());
         }
     }
 
@@ -1365,25 +1369,25 @@ mod tests {
 
         // Write the keys to the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value).unwrap();
             txn.commit().await.unwrap();
         }
 
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(key, &default_value2).unwrap();
             txn.commit().await.unwrap();
         }
 
         let key_bytes = Bytes::from(2usize.to_le_bytes().to_vec());
-        let mut txn = store.begin().unwrap();
+        let mut txn = store.begin().await.unwrap();
         txn.set(&key_bytes, &default_value2).unwrap();
         txn.commit().await.unwrap();
 
         // Delete the first 5 keys from the store
         for key in keys.iter() {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
@@ -1393,8 +1397,8 @@ mod tests {
 
         let reopened_store = Store::new(opts).expect("should reopen store");
         for key in keys.iter() {
-            let mut txn = reopened_store.begin().unwrap();
-            assert!(txn.get(key).unwrap().is_none());
+            let mut txn = reopened_store.begin().await.unwrap();
+            assert!(txn.get(key).await.unwrap().is_none());
         }
     }
 
@@ -1414,7 +1418,7 @@ mod tests {
         // Step 1: Open store with initial max segment size and commit a record
         let store = Store::new(opts.clone()).expect("should create store");
         {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(&k1.clone(), &val.clone()).unwrap();
             txn.commit().await.unwrap();
         }
@@ -1424,17 +1428,17 @@ mod tests {
         opts.max_segment_size = 37; // Smaller max segment size
         let store = Store::new(opts.clone()).expect("should create store");
         {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(&k2.clone(), &val).unwrap();
             txn.commit().await.unwrap();
 
             // Verify the first record
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&k1).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&k1).await.unwrap().unwrap();
             assert_eq!(val, val);
 
             // Verify the second record
-            let val2 = txn.get(&k2).unwrap().unwrap();
+            let val2 = txn.get(&k2).await.unwrap().unwrap();
             assert_eq!(val2, val);
         }
         store.close().await.expect("should close store");
@@ -1443,21 +1447,21 @@ mod tests {
         opts.max_segment_size = 121; // Larger max segment size
         let store = Store::new(opts.clone()).expect("should create store");
         {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(&k3.clone(), &val).unwrap();
             txn.commit().await.unwrap();
 
             // Verify the first record
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&k1).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&k1).await.unwrap().unwrap();
             assert_eq!(val, val);
 
             // Verify the second record
-            let val2 = txn.get(&k2).unwrap().unwrap();
+            let val2 = txn.get(&k2).await.unwrap().unwrap();
             assert_eq!(val2, val);
 
             // Verify the third record
-            let val3 = txn.get(&k3).unwrap().unwrap();
+            let val3 = txn.get(&k3).await.unwrap().unwrap();
             assert_eq!(val3, val);
         }
         store.close().await.expect("should close store");
@@ -1466,7 +1470,7 @@ mod tests {
         opts.max_segment_size = 36; // Smallest max segment size
         let store = Store::new(opts.clone()).expect("should create store");
         {
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set(&k4.clone(), &val).unwrap();
             let err = txn.commit().await.err().unwrap();
             match err {
@@ -1490,18 +1494,18 @@ mod tests {
         let value2 = b"value2";
 
         let store = Store::new(opts.clone()).unwrap();
-        let mut txn1 = store.begin().unwrap();
+        let mut txn1 = store.begin().await.unwrap();
         txn1.set(key, value1).unwrap();
         txn1.commit().await.unwrap();
 
-        let mut txn2 = store.begin().unwrap();
+        let mut txn2 = store.begin().await.unwrap();
         txn2.set(key, value2).unwrap();
         txn2.commit().await.unwrap();
         store.close().await.unwrap();
 
         let store = Store::new(opts.clone()).unwrap();
-        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).await.unwrap();
+        let history = txn.get_history(key).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
         store.close().await.unwrap();
@@ -1521,16 +1525,16 @@ mod tests {
 
         let store = Store::new(opts.clone()).unwrap();
 
-        let mut txn1 = store.begin().unwrap();
+        let mut txn1 = store.begin().await.unwrap();
         txn1.set(key, value1).unwrap();
         txn1.commit().await.unwrap();
 
-        let mut txn2 = store.begin().unwrap();
+        let mut txn2 = store.begin().await.unwrap();
         txn2.set(key, value2).unwrap();
         txn2.commit().await.unwrap();
 
-        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).await.unwrap();
+        let history = txn.get_history(key).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
@@ -1552,16 +1556,16 @@ mod tests {
 
         let store = Store::new(opts.clone()).unwrap();
 
-        let mut txn1 = store.begin().unwrap();
+        let mut txn1 = store.begin().await.unwrap();
         txn1.set(key, value1).unwrap();
         txn1.commit().await.unwrap();
 
-        let mut txn2 = store.begin().unwrap();
+        let mut txn2 = store.begin().await.unwrap();
         txn2.set(key, value2).unwrap();
         txn2.commit().await.unwrap();
 
-        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).await.unwrap();
+        let history = txn.get_history(key).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 

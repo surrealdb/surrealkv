@@ -283,7 +283,7 @@ mod tests {
     async fn append_data(store: &Store, keys: Vec<Bytes>, val: &Bytes) {
         for key in keys {
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
             txn.set_durability(Durability::Immediate);
             txn.set(&key, val).unwrap();
             txn.commit().await.unwrap();
@@ -304,7 +304,7 @@ mod tests {
     // This is useful for testing the repair process because when opening
     // the store, the repair process will only repair the corrupted segment
     // if it is the last segment in the directory.
-    fn corrupt_and_repair(
+    async fn corrupt_and_repair(
         store: &Store,
         opts: Options,
         segment_num: usize,
@@ -318,7 +318,8 @@ mod tests {
             .clog
             .as_ref()
             .unwrap()
-            .write();
+            .write()
+            .await;
         let clog_subdir = opts.dir.join("clog");
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
@@ -396,8 +397,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -414,7 +415,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of header
-        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -431,8 +432,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -455,7 +456,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -469,8 +470,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            assert_eq!(txn.get(&key).unwrap(), None);
+            let mut txn = store.begin().await.unwrap();
+            assert_eq!(txn.get(&key).await.unwrap(), None);
         }
 
         // Check if a new transaction can be appended post repair
@@ -482,8 +483,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -506,7 +507,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -520,8 +521,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            assert_eq!(txn.get(&key).unwrap(), None);
+            let mut txn = store.begin().await.unwrap();
+            assert_eq!(txn.get(&key).await.unwrap(), None);
         }
 
         let expected_keys = vec!["k2", "k3", "k4", "k5"];
@@ -529,8 +530,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -553,7 +554,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 3, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -567,8 +568,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            assert_eq!(txn.get(&key).unwrap(), None);
+            let mut txn = store.begin().await.unwrap();
+            assert_eq!(txn.get(&key).await.unwrap(), None);
         }
 
         let expected_keys = vec!["k1", "k2", "k4", "k5"];
@@ -576,8 +577,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -620,8 +621,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            assert_eq!(txn.get(&key).unwrap(), None);
+            let mut txn = store.begin().await.unwrap();
+            assert_eq!(txn.get(&key).await.unwrap(), None);
         }
 
         // Check if a new transaction can be appended post repair
@@ -633,8 +634,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -659,7 +660,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 37 + 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 1, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -676,8 +677,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -701,7 +702,7 @@ mod tests {
 
         let store = setup_store_with_data(opts.clone(), keys, default_value.clone()).await;
         let corruption_offset = 37 + 29; // 24bytes is length of txn header
-        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset);
+        corrupt_and_repair(&store, opts.clone(), 2, corruption_offset).await;
 
         // Close the store
         store.close().await.expect("should close store");
@@ -718,8 +719,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }
@@ -757,8 +758,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            assert_eq!(txn.get(&key).unwrap(), None);
+            let mut txn = store.begin().await.unwrap();
+            assert_eq!(txn.get(&key).await.unwrap(), None);
         }
 
         // Check if a new transaction can be appended post repair
@@ -770,8 +771,8 @@ mod tests {
             let key = Bytes::from(key);
 
             // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            let val = txn.get(&key).unwrap().unwrap();
+            let mut txn = store.begin().await.unwrap();
+            let val = txn.get(&key).await.unwrap().unwrap();
             assert_eq!(val, default_value);
         }
     }

@@ -53,8 +53,8 @@ impl Oracle {
 
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        self.isolation.new_commit_ts(txn)
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        self.isolation.new_commit_ts(txn).await
     }
 
     /// Returns the read timestamp.
@@ -109,11 +109,20 @@ macro_rules! isolation_level_method {
     };
 }
 
+macro_rules! isolation_level_method_async {
+    ($self:ident, $method:ident $(, $arg:ident)?) => {
+        match $self {
+            IsolationLevel::SnapshotIsolation(oracle) => oracle.$method($($arg)?).await,
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.$method($($arg)?).await,
+        }
+    };
+}
+
 impl IsolationLevel {
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the specific isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        isolation_level_method!(self, new_commit_ts, txn)
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        isolation_level_method_async!(self, new_commit_ts, txn)
     }
 
     /// Returns the read timestamp.
@@ -158,8 +167,8 @@ impl SnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(&txn.core)?;
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        let current_snapshot = Snapshot::take(&txn.core).await?;
 
         for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
@@ -343,7 +352,7 @@ impl SerializableSnapshotIsolation {
     }
 
     // Generate a new commit timestamp for a transaction.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) async fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         let mut commit_tracker = self.commit_tracker.lock();
 
         // Check for conflicts between the transaction and committed transactions.

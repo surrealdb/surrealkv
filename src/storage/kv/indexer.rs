@@ -133,16 +133,20 @@ impl IndexValue {
         }
     }
 
-    pub(crate) fn resolve(&self, store: &Core) -> Result<Vec<u8>> {
+    pub(crate) async fn resolve(&self, store: &Core) -> Result<Vec<u8>> {
         match self {
             Self::Mem(mem_entry) => Ok(mem_entry.value.to_vec()),
             Self::Disk(disk_entry) => match &disk_entry.inlined_value {
                 Some(value) => Ok(value.to_vec()),
-                None => store.resolve_from_offset(
-                    disk_entry.segment_id,
-                    disk_entry.value_offset,
-                    disk_entry.value_len,
-                ),
+                None => {
+                    store
+                        .resolve_from_offset(
+                            disk_entry.segment_id,
+                            disk_entry.value_offset,
+                            disk_entry.value_len,
+                        )
+                        .await
+                }
             },
         }
     }

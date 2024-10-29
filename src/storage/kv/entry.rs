@@ -263,7 +263,7 @@ mod tests {
 
         {
             // Start a new write transaction (txn)
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Set key1 and key2 with the same value
             txn.set(&key1, &value).unwrap();
@@ -275,10 +275,10 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap().unwrap();
+            let val = txn.get(&key1).await.unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -286,10 +286,10 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap().unwrap();
+            let val = txn.get(&key2).await.unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -297,7 +297,7 @@ mod tests {
 
         {
             // Start a new write transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Set key3 with the same value
             txn.set(&key3, &value).unwrap();
@@ -308,10 +308,10 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key3
-            let val = txn.get(&key3).unwrap().unwrap();
+            let val = txn.get(&key3).await.unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
@@ -338,7 +338,7 @@ mod tests {
 
         {
             // Start a new write transaction (txn)
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Set key1 and key2 with the same value
             txn.set(&key1, &value).unwrap();
@@ -350,10 +350,10 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key1
-            let val = txn.get(&key1).unwrap().unwrap();
+            let val = txn.get(&key1).await.unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(&val[..], value.as_ref());
@@ -361,10 +361,10 @@ mod tests {
 
         {
             // Start a new read-only transaction
-            let mut txn = store.begin().unwrap();
+            let mut txn = store.begin().await.unwrap();
 
             // Retrieve the value associated with key2
-            let val = txn.get(&key2).unwrap().unwrap();
+            let val = txn.get(&key2).await.unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
             assert_eq!(val, value);
