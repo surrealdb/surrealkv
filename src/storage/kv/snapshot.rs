@@ -19,11 +19,26 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     pub(crate) fn take(store: &Core) -> Result<Self> {
-        // Each snapshot is created at a version that is one greater than the current version.
+        // Acquire a read lock on the indexer to get the current index version.
         let index = store.indexer.read();
-        let version = store.read_ts() + 1;
+        let index_version = index.version();
+
+        // Calculate the snapshot version as one greater than the current read timestamp.
+        let read_version = store.read_ts() + 1;
+
+        // Ensure that the snapshot read version is not older than the current index version.
+        if read_version < index_version {
+            return Err(Error::SnapshotVersionIsOld(read_version, index_version));
+        }
+
+        // Clone the current index to create the snapshot.
         let snap = index.index.clone();
-        Ok(Self { snap, version })
+
+        // Return the new snapshot with the calculated version.
+        Ok(Self {
+            snap,
+            version: read_version,
+        })
     }
 
     /// Set a key-value pair into the snapshot.

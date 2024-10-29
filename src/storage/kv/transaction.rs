@@ -171,6 +171,9 @@ pub struct Transaction {
 
     /// write sequence number is used for real-time ordering of writes within a transaction.
     write_seqno: u32,
+
+    /// `versionstamp` is a combination of the transaction ID and the commit timestamp. For internal use only.
+    versionstamp: Option<(u64, u64)>,
 }
 
 impl Transaction {
@@ -199,6 +202,7 @@ impl Transaction {
             closed: false,
             savepoints: 0,
             write_seqno: 0,
+            versionstamp: None,
         })
     }
 
@@ -452,7 +456,7 @@ impl Transaction {
 
         // If there are no pending writes, there's nothing to commit, so return early.
         if self.write_set.is_empty() {
-            return Ok(());
+            return Ok(()); // Return when there's nothing to commit
         }
 
         // Lock the oracle to serialize commits to the transaction log.
@@ -460,7 +464,7 @@ impl Transaction {
         let write_ch_lock = oracle.write_lock.lock().await;
 
         // Prepare for the commit by getting a transaction ID.
-        let tx_id = self.prepare_commit()?;
+        let (tx_id, commit_ts) = self.prepare_commit()?;
 
         // Extract the vector of entries for the current transaction,
         // respecting the insertion order recorded with WriteSetEntry::seqno.
@@ -501,19 +505,23 @@ impl Transaction {
         // Mark the transaction as closed.
         self.closed = true;
 
+        // Save the versionstamp for internal use.
+        self.versionstamp = Some((tx_id, commit_ts));
+
+        // Return the transaction ID and commit timestamp.
         ret.unwrap()
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<u64> {
+    fn prepare_commit(&mut self) -> Result<(u64, u64)> {
         let oracle = self.core.oracle.clone();
         let tx_id = oracle.new_commit_ts(self)?;
-        self.assign_commit_ts();
-        Ok(tx_id)
+        let commit_ts = self.assign_commit_ts();
+        Ok((tx_id, commit_ts))
     }
 
     /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_ts(&mut self) {
+    fn assign_commit_ts(&mut self) -> u64 {
         let commit_ts = now();
         for entries in self.write_set.values_mut() {
             if let Some(entry) = entries.last_mut() {
@@ -522,6 +530,7 @@ impl Transaction {
                 }
             }
         }
+        commit_ts
     }
 
     /// Rolls back the transaction by removing all updated entries.
@@ -874,6 +883,7 @@ impl Drop for Transaction {
 mod tests {
     use bytes::Bytes;
     use std::mem::size_of;
+    use tokio::task;
 
     use super::*;
     use crate::storage::kv::option::{IsolationLevel, Options};
@@ -3371,5 +3381,78 @@ mod tests {
                 assert_eq!(result, expected);
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_transactions() {
+        let (store, _) = create_store(false);
+        let store = Arc::new(store);
+
+        // Define the number of concurrent transactions
+        let num_transactions = 1000;
+
+        // Define key-value pairs for the test
+        let keys: Vec<Bytes> = (0..num_transactions)
+            .map(|i| Bytes::from(format!("key{}", i)))
+            .collect();
+        let values: Vec<Bytes> = (0..num_transactions)
+            .map(|i| Bytes::from(format!("value{}", i)))
+            .collect();
+
+        // Create a vector to store the handles of the spawned tasks
+        let mut handles = vec![];
+
+        // Create a vector to store the transaction IDs
+        let mut transaction_ids = vec![];
+
+        // Create a vector to store the commit timestamps
+        let mut commit_timestamps = vec![];
+
+        // Spawn concurrent transactions
+        for (key, value) in keys.iter().zip(values.iter()) {
+            let store = Arc::clone(&store);
+            let key = key.clone();
+            let value = value.clone();
+
+            let handle = task::spawn(async move {
+                // Start a new read-write transaction
+                let mut txn = store.begin().unwrap();
+                txn.set(&key, &value).unwrap();
+                txn.commit().await.unwrap();
+                txn.versionstamp
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete and collect the results
+        for handle in handles {
+            let result = handle.await.unwrap();
+            if let Some((transaction_id, commit_ts)) = result {
+                transaction_ids.push(transaction_id);
+                commit_timestamps.push(commit_ts);
+            }
+        }
+
+        // Verify that all transactions committed
+        assert_eq!(transaction_ids.len(), keys.len());
+
+        // Sort the transaction IDs and commit timestamps because we just
+        // want to verify if the transaction ids are incremental and unique
+        transaction_ids.sort();
+        commit_timestamps.sort();
+
+        // Verify that transaction IDs are incremental
+        for i in 1..transaction_ids.len() {
+            assert!(transaction_ids[i] > transaction_ids[i - 1]);
+        }
+
+        // Verify that commit timestamps are incremental
+        for i in 1..commit_timestamps.len() {
+            assert!(commit_timestamps[i] >= commit_timestamps[i - 1]);
+        }
+
+        // Drop the store to simulate closing it
+        store.close().await.unwrap();
     }
 }
