@@ -871,6 +871,11 @@ impl Transaction {
         // Return the results.
         Ok(results)
     }
+
+    #[allow(unused)]
+    pub(crate) fn get_versionstamp(&self) -> Option<(u64, u64)> {
+        self.versionstamp
+    }
 }
 
 impl Drop for Transaction {

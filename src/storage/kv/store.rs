@@ -322,7 +322,6 @@ impl Core {
         let mut manifest = None;
         let mut clog = None;
 
-        let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
             manifest = Some(Self::initialize_manifest(&opts.dir)?);
@@ -338,14 +337,13 @@ impl Core {
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
         }
 
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
-        let ts_to_set = std::cmp::max(num_entries, indexer.version());
-        oracle.set_ts(ts_to_set);
+        oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
         let value_cache = Cache::new(opts.max_value_cache_size as usize);
@@ -1564,6 +1562,140 @@ mod tests {
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    // Common setup logic for creating a store
+    fn create_store(dir: Option<TempDir>) -> (Store, TempDir) {
+        let temp_dir = dir.unwrap_or_else(create_temp_directory);
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        (
+            Store::new(opts.clone()).expect("should create store"),
+            temp_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_store_version_after_reopen() {
+        let (store, temp_dir) = create_store(None);
+
+        // Define the number of keys, key size, and value size
+        let num_keys = 10000u32;
+        let key_size = 32;
+        let value_size = 32;
+
+        // Generate keys and values
+        let keys: Vec<Bytes> = (0..num_keys)
+            .map(|i| {
+                let mut key = vec![0; key_size];
+                key[..4].copy_from_slice(&i.to_be_bytes());
+                Bytes::from(key)
+            })
+            .collect();
+
+        let value = Bytes::from(vec![0; value_size]);
+
+        // Insert keys into the store
+        {
+            for key in &keys {
+                let mut txn = store.begin().unwrap();
+                txn.set(key, &value).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Verify if the indexer version is set correctly
+        assert_eq!(
+            store.inner.as_ref().unwrap().core.indexer.read().version(),
+            num_keys as u64
+        );
+
+        // Verify that the keys are present in the store
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        for key in &keys {
+            let history = txn.get_history(key).unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].0, value);
+        }
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_incremental_transaction_ids_post_store_open() {
+        let (store, temp_dir) = create_store(None);
+
+        let total_records = 1000;
+        let multiple_keys_records = total_records / 2;
+
+        // Define keys and values
+        let keys: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("key{}", i)))
+            .collect();
+        let values: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("value{}", i)))
+            .collect();
+
+        // Insert multiple transactions with single keys
+        for (i, key) in keys.iter().enumerate().take(multiple_keys_records) {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &values[i]).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Insert multiple transactions with multiple keys
+        for (i, key) in keys
+            .iter()
+            .enumerate()
+            .skip(multiple_keys_records)
+            .take(multiple_keys_records)
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &values[i]).unwrap();
+            txn.set(&keys[(i + 1) % keys.len()], &values[(i + 1) % values.len()])
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Add delay to ensure that the store is closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Commit a new transaction with a single key
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&keys[0], &values[0]).unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
+
+            assert_eq!(res.0, total_records as u64 + 1);
+        }
+
+        // Commit another new transaction with multiple keys
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&keys[1], &values[1]).unwrap();
+            txn.set(&keys[2], &values[2]).unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
+
+            assert_eq!(res.0, total_records as u64 + 2);
+        }
 
         store.close().await.unwrap();
     }
