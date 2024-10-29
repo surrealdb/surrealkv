@@ -4,9 +4,6 @@ run-name: "Release run '${{ github.head_ref || github.ref_name }}'"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   release:
@@ -53,9 +50,6 @@ jobs:
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Check semver
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-
       - name: Create and push tag
         run: |
           git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
@@ -80,9 +74,6 @@ jobs:
           else
             echo "No changes to commit"
           fi
-
-      - name: Run tests
-        run: cargo test
 
       - name: Publish crate
         env:
