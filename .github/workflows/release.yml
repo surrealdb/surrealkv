@@ -1,9 +1,12 @@
 name: Release
 
+run-name: "Release run '${{ github.head_ref || github.ref_name }}'"
+
 on:
-  pull_request:
+  workflow_dispatch:
+  push:
     branches:
-      - 'release/*'
+      - main
 
 jobs:
   release:
