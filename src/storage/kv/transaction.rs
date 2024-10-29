@@ -457,7 +457,7 @@ impl Transaction {
 
         // Lock the oracle to serialize commits to the transaction log.
         let oracle = self.core.oracle.clone();
-        let write_ch_lock = oracle.write_lock.lock().await;
+        let write_ch_lock = oracle.commit_lock.acquire().await?;
 
         // Prepare for the commit by getting a transaction ID.
         let tx_id = self.prepare_commit()?;
