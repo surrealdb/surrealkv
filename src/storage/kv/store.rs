@@ -1631,29 +1631,43 @@ mod tests {
     async fn test_incremental_transaction_ids_post_store_open() {
         let (store, temp_dir) = create_store(None);
 
-        // Define keys and values
-        let key1 = Bytes::from("key1");
-        let key2 = Bytes::from("key2");
-        let key3 = Bytes::from("key3");
-        let value = Bytes::from("value");
+        let total_records = 1000;
+        let multiple_keys_records = total_records / 2;
 
-        // Insert a transaction with a single key
-        {
+        // Define keys and values
+        let keys: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("key{}", i)))
+            .collect();
+        let values: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("value{}", i)))
+            .collect();
+
+        // Insert multiple transactions with single keys
+        for (i, key) in keys.iter().enumerate().take(multiple_keys_records) {
             let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value).unwrap();
+            txn.set(key, &values[i]).unwrap();
             txn.commit().await.unwrap();
         }
 
-        // Insert another transaction with multiple keys
+        // Insert multiple transactions with multiple keys
+        for (i, key) in keys
+            .iter()
+            .enumerate()
+            .skip(multiple_keys_records)
+            .take(multiple_keys_records)
         {
             let mut txn = store.begin().unwrap();
-            txn.set(&key2, &value).unwrap();
-            txn.set(&key3, &value).unwrap();
+            txn.set(key, &values[i]).unwrap();
+            txn.set(&keys[(i + 1) % keys.len()], &values[(i + 1) % values.len()])
+                .unwrap();
             txn.commit().await.unwrap();
         }
 
         // Close the store
         store.close().await.unwrap();
+
+        // Add delay to ensure that the store is closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Reopen the store
         let (store, _) = create_store(Some(temp_dir));
@@ -1661,13 +1675,24 @@ mod tests {
         // Commit a new transaction with a single key
         {
             let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value).unwrap();
+            txn.set(&keys[0], &values[0]).unwrap();
             txn.commit().await.unwrap();
 
             let res = txn.get_versionstamp().unwrap();
 
-            // Verify that the transaction ID is 3
-            assert_eq!(res.0, 3);
+            assert_eq!(res.0, total_records as u64 + 1);
+        }
+
+        // Commit another new transaction with multiple keys
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&keys[1], &values[1]).unwrap();
+            txn.set(&keys[2], &values[2]).unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
+
+            assert_eq!(res.0, total_records as u64 + 2);
         }
 
         store.close().await.unwrap();
