@@ -1578,7 +1578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_and_reopen_store() {
+    async fn test_store_version_after_reopen() {
         let (store, temp_dir) = create_store(None);
 
         // Define the number of keys, key size, and value size
@@ -1609,8 +1609,10 @@ mod tests {
         // Close the store
         store.close().await.unwrap();
 
-        // Measure the time it takes to reopen the store
+        // Reopen the store
         let (store, _) = create_store(Some(temp_dir));
+
+        // Verify if the indexer version is set correctly
         assert_eq!(
             store.inner.as_ref().unwrap().core.indexer.read().version(),
             num_keys as u64
