@@ -113,28 +113,36 @@ fn sequential_insert_read(c: &mut Criterion) {
 }
 
 fn concurrent_insert(c: &mut Criterion) {
-    let item_count = 100_000;
+    let total_items = 100_000;
+    // Test different thread counts from 1 to num_cpus
+    let thread_counts = vec![1, 2, 4, 8, num_cpus::get() as u32];
 
-    let mut group = c.benchmark_group("inserts");
+    let mut group = c.benchmark_group("concurrent_inserts");
     group.sample_size(10);
-    group.throughput(criterion::Throughput::Elements(item_count as u64));
+    group.throughput(criterion::Throughput::Elements(total_items as u64));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .enable_all()
-        .build()
-        .unwrap();
+    for &thread_count in &thread_counts {
+        // Create a runtime with the specific thread count
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(thread_count as usize)
+            .enable_all()
+            .build()
+            .unwrap();
 
-    let db = rt.block_on(async {
-        let mut opts = Options::new();
-        opts.dir = create_temp_directory().path().to_path_buf();
-        Arc::new(Store::new(opts).expect("should create store"))
-    });
+        let db = rt.block_on(async {
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            Arc::new(Store::new(opts).expect("should create store"))
+        });
 
-    {
-        let thread_count = 8_u32;
+        // Calculate operations per thread to maintain constant total work
+        let ops_per_thread = total_items / thread_count;
+
         group.bench_function(
-            format!("{} inserts ({} threads)", item_count, thread_count),
+            format!(
+                "threads={} total_ops={} ops_per_thread={}",
+                thread_count, total_items, ops_per_thread
+            ),
             |b| {
                 b.iter(|| {
                     let mut handles = vec![];
@@ -144,7 +152,7 @@ fn concurrent_insert(c: &mut Criterion) {
 
                         let handle = rt.spawn(async move {
                             let mut txn = db.begin().unwrap();
-                            for _ in 0..(item_count / thread_count) {
+                            for _ in 0..ops_per_thread {
                                 let key = nanoid::nanoid!();
                                 let value = nanoid::nanoid!();
                                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
@@ -155,21 +163,27 @@ fn concurrent_insert(c: &mut Criterion) {
                         handles.push(handle);
                     }
 
-                    for handle in handles {
-                        rt.block_on(handle).unwrap();
-                    }
+                    // Wait for all threads to complete
+                    rt.block_on(async {
+                        for handle in handles {
+                            handle.await.unwrap();
+                        }
+                    })
                 })
             },
         );
+
+        // Cleanup
+        rt.block_on(async {
+            drop(db);
+        });
+
+        rt.shutdown_background();
     }
 
-    rt.block_on(async {
-        drop(db);
-    });
-
-    rt.shutdown_background();
+    group.finish();
 }
 
 criterion_group!(benches_sequential, bulk_insert, sequential_insert_read);
 criterion_group!(benches_concurrent, concurrent_insert);
-criterion_main!(benches_sequential, benches_concurrent);
+criterion_main!(benches_concurrent);

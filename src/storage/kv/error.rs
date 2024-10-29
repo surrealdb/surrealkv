@@ -46,6 +46,7 @@ pub enum Error {
     TransactionWithoutSavepoint,   // The transaction does not have a savepoint set
     MaxKVMetadataLengthExceeded,   // The maximum KV metadata length is exceeded
     ChecksumMismatch(u32, u32),    // Checksum mismatch
+    CommitLockError(String),       // Error acquiring commit lock
 }
 
 // Implementation of Display trait for Error
@@ -116,6 +117,7 @@ impl fmt::Display for Error {
                     expected, found
                 )
             }
+            Error::CommitLockError(err) => write!(f, "Commit lock error: {}", err),
         }
     }
 }
@@ -163,5 +165,11 @@ impl From<async_channel::RecvError> for Error {
 impl From<revision::Error> for Error {
     fn from(err: revision::Error) -> Self {
         Error::RevisionError(err.to_string())
+    }
+}
+
+impl From<tokio::sync::AcquireError> for Error {
+    fn from(err: tokio::sync::AcquireError) -> Self {
+        Error::CommitLockError(format!("AcquireError: {:?}", err))
     }
 }
