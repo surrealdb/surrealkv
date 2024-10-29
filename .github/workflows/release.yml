@@ -4,9 +4,6 @@ run-name: "Release run '${{ github.head_ref || github.ref_name }}'"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
   release:
