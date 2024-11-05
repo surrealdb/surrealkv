@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -10,7 +10,6 @@ use vart::{art::QueryType, VariableSizeKey};
 use crate::storage::kv::{
     entry::Entry,
     error::{Error, Result},
-    indexer::IndexValue,
     snapshot::{FilterFn, Snapshot, FILTERS},
     store::Core,
     util::{convert_range_bounds, now},
@@ -332,17 +331,6 @@ impl Transaction {
             return Err(Error::EmptyKey);
         }
 
-        // If the transaction mode is not write-only, update the snapshot.
-        if !self.mode.is_write_only() {
-            let index_value = IndexValue::new_mem(e.metadata.clone(), e.value.clone());
-
-            // Set the key-value pair in the snapshot.
-            self.snapshot
-                .as_mut()
-                .unwrap()
-                .set(&e.key[..].into(), index_value);
-        }
-
         // Set the transaction's latest savepoint number and add it to the write set.
         let key = e.key.clone();
         let write_seqno = self.next_write_seqno();
@@ -376,18 +364,28 @@ impl Transaction {
     where
         R: RangeBounds<&'b [u8]>,
     {
-        // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(range);
+        // If the transaction is closed, return an error
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
 
-        // Keep track of the range bound predicates for conflict detection in case of SSI.
+        // Do not allow scans if it is a write-only transaction
+        if self.mode.is_write_only() {
+            return Err(Error::TransactionWriteOnly);
+        }
+
+        // Convert the range to a tuple of bounds of variable keys
+        let bound_range = convert_range_bounds(&range);
+
+        // Keep track of the range bound predicates for conflict detection in case of SSI
         {
-            let range_start = match range.start_bound() {
+            let range_start = match bound_range.start_bound() {
                 Bound::Included(start) => Bound::Included((*start).clone()),
                 Bound::Excluded(start) => Bound::Included((*start).clone()),
                 Bound::Unbounded => Bound::Unbounded,
             };
 
-            let range_end = match range.end_bound() {
+            let range_end = match bound_range.end_bound() {
                 Bound::Included(end) => Bound::Included((*end).clone()),
                 Bound::Excluded(end) => Bound::Included((*end).clone()),
                 Bound::Unbounded => Bound::Unbounded,
@@ -397,49 +395,108 @@ impl Transaction {
             self.read_key_ranges.push(rs_entry);
         }
 
-        // Initialize an empty vector to store the results.
-        let mut results = Vec::new();
+        // Initialize map to store merged results
+        let mut results_map: BTreeMap<Vec<u8>, (Vec<u8>, u64, u64)> = BTreeMap::new();
+        // First, collect results from the write set that fall within the range
+        // Also keep track of deleted keys
+        let mut deleted_keys = HashSet::new();
 
-        // Get a range iterator for the specified range.
+        // First, collect results from the write set that fall within the range
+        for (key, entries) in &self.write_set {
+            // Skip if the key is not in range
+            if !Self::is_key_in_range(key, &range) {
+                continue;
+            }
+
+            // Get the latest entry for this key
+            if let Some(last_entry) = entries.last() {
+                if !last_entry.e.is_deleted_or_tombstone() {
+                    results_map.insert(
+                        key.to_vec(),
+                        (last_entry.e.value.to_vec(), self.read_ts, last_entry.e.ts),
+                    );
+                } else {
+                    deleted_keys.insert(key.clone());
+                }
+            }
+        }
+
+        // Get results from snapshot
         let snap = self.snapshot.as_ref().unwrap();
-        let ranger = snap.range(range);
+        let ranger = snap.range(bound_range);
 
-        // Iterate over the keys in the range.
+        // Iterate over the keys in the range from the snapshot
         'outer: for (key, value, version, ts) in ranger {
-            // If a limit is set and we've already got enough results, break the loop.
+            // If a limit is set and we've already got enough results, break the loop
             if let Some(limit) = limit {
-                if results.len() >= limit {
+                if results_map.len() >= limit {
                     break;
                 }
             }
 
-            // Apply all filters. If any filter fails, skip this key and continue with the next one.
+            // Apply all filters. If any filter fails, skip this key
             for filter in &FILTERS {
                 if filter.apply(value).is_err() {
                     continue 'outer;
                 }
             }
 
-            // Only add the key to the read set if the version is less than or equal to the
-            // read timestamp. This is to prevent adding keys that are added during the transaction.
-            if *version <= self.read_ts {
-                // the keys in the vart leaf are terminated with a null byte
-                let key = Bytes::copy_from_slice(&key[..&key.len() - 1]);
-                let entry = ReadSetEntry::new(key, *version, self.savepoints);
-                self.read_set.push(entry);
+            // Remove null terminator from key for comparison
+            let mut clean_key = key.to_vec();
+            clean_key.truncate(clean_key.len() - 1);
+            let clean_key_slice = &clean_key[..];
+
+            // Skip if this key has been overwritten or deleted in write set
+            if self.write_set.contains_key(clean_key_slice)
+                || deleted_keys.contains(clean_key_slice)
+            {
+                continue;
             }
 
-            // Resolve the value reference to get the actual value.
-            let v = value.resolve(&self.core)?;
+            // Add to read set for conflict detection
+            let key_bytes = Bytes::copy_from_slice(&clean_key);
+            let entry = ReadSetEntry::new(key_bytes, *version, self.savepoints);
+            self.read_set.push(entry);
 
-            // Add the value, version, and timestamp to the results vector.
-            let mut key = key;
-            key.truncate(key.len() - 1);
-            results.push((key, v, *version, *ts));
+            if let std::collections::btree_map::Entry::Vacant(e) = results_map.entry(clean_key) {
+                if let Ok(resolved_value) = value.resolve(&self.core) {
+                    e.insert((resolved_value, *version, *ts));
+                }
+            }
         }
 
-        // Return the results.
+        // Convert the map to a vector of results
+        let mut results: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = results_map
+            .into_iter()
+            .map(|(k, (v, ver, ts))| (k, v, ver, ts))
+            .collect();
+
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            results.truncate(limit);
+        }
+
         Ok(results)
+    }
+
+    // Helper function to check if a key falls within a range
+    fn is_key_in_range<'b, R>(key: &[u8], range: &R) -> bool
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        let start_inclusive = match range.start_bound() {
+            Bound::Included(start) => key >= *start,
+            Bound::Excluded(start) => key > *start,
+            Bound::Unbounded => true,
+        };
+    
+        let end_exclusive = match range.end_bound() {
+            Bound::Included(end) => key <= *end,
+            Bound::Excluded(end) => key < *end,
+            Bound::Unbounded => true,
+        };
+    
+        start_inclusive && end_exclusive
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
@@ -542,7 +599,10 @@ impl Transaction {
         self.savepoints = 0;
         self.write_seqno = 0;
     }
+}
 
+/// Implement savepoints logic for transactions.
+impl Transaction {
     /// After calling this method the subsequent modifications within this
     /// transaction can be rolled back by calling [`rollback_to_savepoint`].
     ///
@@ -591,35 +651,12 @@ impl Transaction {
         // so let's just keep empty `entries` vectors around.
         for entries in self.write_set.values_mut() {
             let pre_retain_len = entries.len();
-            entries.retain(|entry| {
-                if entry.savepoint_no == self.savepoints {
-                    self.snapshot
-                        .as_mut()
-                        .unwrap()
-                        .delete(&entry.e.key[..].into());
-                    false
-                } else {
-                    true
-                }
-            });
+            entries.retain(|entry| entry.savepoint_no != self.savepoints);
 
             // If the transaction's mode is write-only, or if no values for this
             // key were removed due to the rollback, continue to the next key.
             if pre_retain_len == entries.len() || self.mode.is_write_only() {
                 continue;
-            }
-
-            // Otherwise, the value just before the rollback needs to be added
-            // back to the snapshot in order to keep scan() working.
-            if let Some(latest_entry) = entries.last() {
-                let index_value = IndexValue::new_mem(
-                    latest_entry.e.metadata.clone(),
-                    latest_entry.e.value.clone(),
-                );
-                self.snapshot
-                    .as_mut()
-                    .unwrap()
-                    .set(&latest_entry.e.key[..].into(), index_value);
             }
         }
 
@@ -720,7 +757,7 @@ impl Transaction {
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(range);
+        let range = convert_range_bounds(&range);
         let items = self.snapshot.as_ref().unwrap().scan_at_ts(range, ts);
 
         let mut results = Vec::new();
@@ -758,7 +795,7 @@ impl Transaction {
         self.ensure_read_only_transaction()?;
 
         // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(range);
+        let range = convert_range_bounds(&range);
         let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
 
         // Remove the trailing `\0`.
@@ -810,7 +847,7 @@ impl Transaction {
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(range);
+        let range = convert_range_bounds(&range);
 
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
