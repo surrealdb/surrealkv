@@ -380,6 +380,11 @@ fn range_scan(c: &mut Criterion) {
                 txn.scan(range, None).unwrap();
             })
         });
+
+        // Cleanup database after each configuration
+        rt.block_on(async {
+            drop(db);
+        });
     }
 
     group.finish();
@@ -456,6 +461,11 @@ fn concurrent_workload(c: &mut Criterion) {
                     })
                 },
             );
+
+            // Cleanup database after each configuration
+            rt.block_on(async {
+                drop(db);
+            });
         }
     }
 
@@ -471,4 +481,4 @@ criterion_group!(
 );
 criterion_group!(benches_range, range_scan);
 criterion_group!(benches_concurrent, concurrent_insert, concurrent_workload);
-criterion_main!(benches_sequential, benches_concurrent);
+criterion_main!(benches_sequential, benches_range, benches_concurrent);
