@@ -415,8 +415,8 @@ impl Transaction {
 
             match (snap_iter.peek(), write_set_iter.peek()) {
                 (
-                    Some(&(ref snap_key, ref snap_value, ref snap_version, ref snap_ts)),
-                    Some((ref write_key, ref write_entry)),
+                    Some((snap_key, snap_value, snap_version, snap_ts)),
+                    Some((ref write_key, write_entry)),
                 ) => {
                     // Clean snapshot key (remove null terminator) for comparison
                     let clean_snap_key = &snap_key[..snap_key.len() - 1];
@@ -484,7 +484,7 @@ impl Transaction {
                         }
                     }
                 }
-                (Some(&(ref snap_key, ref snap_value, ref snap_version, ref snap_ts)), None) => {
+                (Some((snap_key, snap_value, snap_version, snap_ts)), None) => {
                     // Only snapshot entries remaining
                     if **snap_version <= self.read_ts {
                         let clean_snap_key = &snap_key[..snap_key.len() - 1];
@@ -520,7 +520,7 @@ impl Transaction {
                     }
                     snap_iter.next();
                 }
-                (None, Some((ref write_key, ref write_entry))) => {
+                (None, Some((write_key, write_entry))) => {
                     // Only write set entries remaining
                     if !write_entry.e.is_deleted_or_tombstone() {
                         results.push((
