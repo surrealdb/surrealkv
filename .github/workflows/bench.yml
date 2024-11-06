@@ -1,0 +1,18 @@
+name: Benchmark
+
+run-name: "Benchmark run '${{ github.head_ref || github.ref_name }}'"
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  benchmarks:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Benchmarks
+        run: cargo bench --bench store_bench

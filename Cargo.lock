@@ -1180,6 +1180,7 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "nanoid",
+ "num_cpus",
  "parking_lot",
  "quick_cache",
  "rand 0.8.5",

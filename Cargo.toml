@@ -40,6 +40,7 @@ fastrand = "2.0.1"
 libc = "0.2.155"
 fmmap = "0.3.3"
 memmap2 = "0.9.4"
+num_cpus = "1.16.0"
 
 [[bench]]
 name = "store_bench"
