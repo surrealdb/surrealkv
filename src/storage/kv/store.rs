@@ -398,8 +398,8 @@ impl Core {
             // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok(value_offsets) => {
-                    Core::process_entry(&tx, opts, &value_offsets, indexer)?;
+                Ok((segment_id, value_offset)) => {
+                    Core::process_entry(&tx, opts, segment_id, value_offset, indexer)?;
                     num_entries += 1;
                 }
 
@@ -436,7 +436,8 @@ impl Core {
     fn process_entry(
         entry: &Record,
         opts: &Options,
-        value_offsets: &HashMap<Bytes, (u64, usize)>,
+        segment_id: u64,
+        value_offset: u64,
         indexer: &mut Indexer,
     ) -> Result<()> {
         if entry
@@ -446,11 +447,9 @@ impl Core {
         {
             indexer.delete(&mut entry.key[..].into());
         } else {
-            let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
-
             let index_value = IndexValue::new_disk(
-                *segment_id,
-                *val_off as u64,
+                segment_id,
+                value_offset,
                 entry.metadata.clone(),
                 &entry.value,
                 opts.max_value_threshold,
