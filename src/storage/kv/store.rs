@@ -349,9 +349,9 @@ impl Core {
             restore_from_compaction(&opts)?;
 
             // Load the index from the commit log if it exists.
-            if clog.as_ref().unwrap().size()? > 0 {
-                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
-            }
+            // if clog.as_ref().unwrap().size()? > 0 {
+            //     Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+            // }
         }
 
         // Create and initialize an Oracle.
