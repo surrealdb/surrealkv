@@ -765,6 +765,8 @@ mod tests {
     use bytes::Bytes;
     use tempdir::TempDir;
 
+    use skv44;
+
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
     }
@@ -1697,5 +1699,92 @@ mod tests {
         }
 
         store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tx_id_assignment_after_migration_from_skv44() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = skv44::Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Number of transactions
+        let num_transactions = 10;
+        // Number of keys per transaction
+        let keys_per_transaction = 5;
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for txn_id in 0..num_transactions {
+            for key_id in 0..keys_per_transaction {
+                // Generate a unique key for each transaction and key_id
+                let key_bytes = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                keys.push(key_bytes);
+            }
+        }
+
+        // Insert multiple records in each transaction and close/reopen the store
+        for txn_id in 0..num_transactions {
+            // Create a new store instance with VariableKey as the key type
+            let store = skv44::Store::new(opts.clone()).expect("should create store");
+
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+            for key_id in 0..keys_per_transaction {
+                let key = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                txn.set(&key, &default_value).unwrap();
+            }
+            txn.commit().await.unwrap();
+
+            // Drop the store to simulate closing it
+            store.close().await.unwrap();
+        }
+
+        // Create a new store instance but with values read from disk
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts).expect("should create store");
+
+        // Insert a new transaction into the reopened store
+        let new_key = Bytes::from("new_key");
+        let new_value = Bytes::from("new_value");
+
+        {
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+            txn.set(&new_key, &new_value).unwrap();
+            txn.commit().await.unwrap();
+            let (new_tx_id, _) = txn.get_versionstamp().unwrap();
+
+            let expected_tx_id = ((num_transactions - 1) * keys_per_transaction) + 2;
+            assert_eq!(expected_tx_id, new_tx_id);
+        }
+
+        // Verify the new transaction
+        {
+            // Start a new read transaction
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&new_key).unwrap().unwrap();
+            // Assert that the value retrieved in txn matches new_value
+            assert_eq!(val, new_value.as_ref());
+        }
+
+        // Read the keys from the store to verify after reopening
+        for txn_id in 0..num_transactions {
+            for key_id in 0..keys_per_transaction {
+                let key = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                // Start a new read transaction
+                let mut txn = store.begin().unwrap();
+                let val = txn.get(&key).unwrap().unwrap();
+                // Assert that the value retrieved in txn matches default_value
+                assert_eq!(val, default_value.as_ref());
+            }
+        }
     }
 }

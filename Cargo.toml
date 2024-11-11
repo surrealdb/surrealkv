@@ -41,6 +41,7 @@ libc = "0.2.155"
 fmmap = "0.3.3"
 memmap2 = "0.9.4"
 num_cpus = "1.16.0"
+skv44 = { package = "surrealkv", version = "0.4.4" }
 
 [[bench]]
 name = "store_bench"
