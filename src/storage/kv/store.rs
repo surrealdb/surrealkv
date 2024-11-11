@@ -1760,6 +1760,10 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set(&new_key, &new_value).unwrap();
             txn.commit().await.unwrap();
+            let (new_tx_id, _) = txn.get_versionstamp().unwrap();
+
+            let expected_tx_id = ((num_transactions - 1) * keys_per_transaction) + 2;
+            assert_eq!(expected_tx_id, new_tx_id);
         }
 
         // Verify the new transaction
