@@ -67,7 +67,7 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 pub(crate) fn convert_range_bounds<'a, R>(
-    range: R,
+    range: &R,
 ) -> (Bound<VariableSizeKey>, Bound<VariableSizeKey>)
 where
     R: RangeBounds<&'a [u8]>,
