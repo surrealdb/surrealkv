@@ -95,7 +95,7 @@ pub(crate) fn encode_entries(
 //   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Record {
     pub(crate) id: u64,
     pub(crate) ts: u64,

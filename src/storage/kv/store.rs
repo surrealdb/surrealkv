@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -98,6 +99,10 @@ impl StoreInner {
 
         Ok(())
     }
+
+    fn migrate_latest_version(&self) -> Result<u64> {
+        Core::migrate_latest_version(&self.core.opts)
+    }
 }
 
 /// An MVCC-based transactional key-value store.
@@ -175,6 +180,14 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    pub fn migrate_latest_version(&self) -> Result<u64> {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.migrate_latest_version()?;
+        }
+
+        Ok(0)
     }
 }
 
@@ -431,6 +444,83 @@ impl Core {
         }
 
         Ok(num_entries)
+    }
+
+    pub(crate) fn migrate_latest_version(opt: &Options) -> Result<u64> {
+        // Define paths for source and destination commit logs
+        let source_commit_log_path = opt.dir.join("clog");
+        let destination_parent_path = opt.dir.join("clog2");
+        let destination_commit_log_path = destination_parent_path.join("clog");
+        let backup_commit_log_path = opt.dir.join("clog_backup");
+
+        // Read existing segments from the source directory
+        let segment_references =
+            SegmentRef::read_segments_from_directory(source_commit_log_path.as_path())
+                .expect("Failed to read segments from directory");
+
+        // Initialize readers for processing segments
+        let multi_segment_reader = MultiSegmentReader::new(segment_references)?;
+        let base_reader = Reader::new_from(multi_segment_reader);
+        let mut transaction_reader = RecordReader::new(base_reader);
+
+        // Map to store the latest version of each unique key
+        let mut latest_records: BTreeMap<Bytes, Record> = BTreeMap::new();
+
+        // Read all transactions and keep only the latest version for each key
+        loop {
+            let mut current_transaction = Record::new();
+
+            match transaction_reader.read_into(&mut current_transaction) {
+                Ok(_) => {
+                    let record_key = current_transaction.key.clone();
+                    let existing_record = latest_records
+                        .entry(record_key)
+                        .or_insert_with(|| current_transaction.clone());
+
+                    if current_transaction.ts > existing_record.ts {
+                        *existing_record = current_transaction;
+                    }
+                }
+                Err(Error::LogError(LogError::Eof)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Initialize new commit log with updated configuration
+        let mut migration_opt = opt.clone();
+        migration_opt.dir = destination_parent_path.clone();
+        let mut destination_commit_log = Self::initialize_clog(&migration_opt)?;
+
+        // Write the latest version of each record to the new commit log
+        for record in latest_records.values() {
+            let mut buffer = BytesMut::new();
+            let mut offset_map = HashMap::new();
+
+            let encoded_offset = record.encode(&mut buffer).unwrap();
+            offset_map.insert(record.key.clone(), encoded_offset as u64);
+
+            destination_commit_log.append(&buffer)?;
+        }
+
+        // Ensure all writes are persisted
+        destination_commit_log.sync()?;
+
+        // Perform the file renaming operations
+        // First, check if backup file already exists and remove it if necessary
+        if backup_commit_log_path.exists() {
+            std::fs::remove_dir_all(&backup_commit_log_path)?;
+        }
+
+        // Rename original clog to clog_backup
+        std::fs::rename(&source_commit_log_path, &backup_commit_log_path)?;
+
+        // Move the clog directory from inside clog2 to replace the original clog
+        std::fs::rename(&destination_commit_log_path, &source_commit_log_path)?;
+
+        // Clean up the now-empty clog2 directory
+        std::fs::remove_dir_all(&destination_parent_path)?;
+
+        Ok(latest_records.len() as u64)
     }
 
     fn process_entry(
@@ -1698,5 +1788,148 @@ mod tests {
         }
 
         store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload() {
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        // Create a temporary directory for testing
+        // Specify a local directory for testing
+        let local_dir = PathBuf::from("./test_data");
+
+        // Create store options with the local directory
+        let mut opts = Options::new();
+        opts.dir = local_dir.clone();
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts).expect("should create store");
+
+        // Number of keys to generate
+        let num_keys = 8_000_000;
+
+        // Size of the key and value
+        let key_size = 256;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::with_capacity(num_keys);
+
+        // Generate a 32-byte default value
+        let default_value = Bytes::from(vec![0x42; key_size]);
+
+        // Initialize the random number generator
+        let mut rng = rand::thread_rng();
+
+        // Generate random 32-byte keys
+        for _ in 0..num_keys {
+            // Create a key_size-byte key with random values
+            let key: Vec<u8> = (0..key_size).map(|_| rng.gen()).collect();
+            keys.push(Bytes::from(key));
+        }
+
+        assert_eq!(keys.len(), num_keys);
+
+        // Write the keys to the store using a single transaction
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Close the store
+        println!("Closing store...");
+        store.close().await.unwrap();
+
+        // Measure time to reopen the store
+        println!("Reopening store...");
+        let reopen_start = Instant::now();
+
+        // Create a new store instance but with values read from disk
+        let mut opts = Options::new();
+        opts.dir = local_dir.clone();
+
+        Store::new(opts).expect("should create store");
+        let reopen_duration = reopen_start.elapsed();
+        println!("Store reopened in {:?}", reopen_duration);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_transaction_updates() {
+        use std::path::PathBuf;
+
+        // Create a temporary directory for testing
+        let test_dir = PathBuf::from("./test_transaction_data");
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = test_dir.clone();
+
+        // Create a new store instance
+        let store = Store::new(opts).expect("should create store");
+
+        // Create three test keys
+        let key1 = Bytes::from("key1");
+        let key2 = Bytes::from("key2");
+        let key3 = Bytes::from("key3");
+
+        // Initial transaction: Write initial values for all three keys
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, b"value1_initial").unwrap();
+            txn.set(&key2, b"value2_initial").unwrap();
+            txn.set(&key3, b"value3_initial").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, b"value1_update1").unwrap();
+            txn.set(&key2, b"value2_update1").unwrap();
+            txn.set(&key3, b"value3_update1").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, b"value2_update2").unwrap();
+            txn.set(&key2, b"value2_update2").unwrap();
+            txn.set(&key3, b"value3_update2").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&key1, b"value1_final").unwrap();
+            txn.set(&key2, b"value2_final").unwrap();
+            txn.set(&key3, b"value3_final").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Verify final values
+        {
+            let mut txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key1).unwrap().unwrap(), b"value1_final");
+            assert_eq!(txn.get(&key2).unwrap().unwrap(), b"value2_final");
+            assert_eq!(txn.get(&key3).unwrap().unwrap(), b"value3_final");
+        }
+
+        store.migrate_latest_version().unwrap();
+
+        // Clean up: close the store
+        store.close().await.unwrap();
+
+        // Create a new store instance but with values read from disk
+        let mut opts = Options::new();
+        opts.dir = test_dir.clone();
+        let store = Store::new(opts).expect("should create store");
+
+        // Verify final values
+        {
+            let mut txn = store.begin().unwrap();
+            assert_eq!(txn.get(&key1).unwrap().unwrap(), b"value1_final");
+            assert_eq!(txn.get(&key2).unwrap().unwrap(), b"value2_final");
+            assert_eq!(txn.get(&key3).unwrap().unwrap(), b"value3_final");
+        }
     }
 }
