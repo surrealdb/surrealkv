@@ -494,11 +494,7 @@ impl Core {
         // Write the latest version of each record to the new commit log
         for record in latest_records.values() {
             let mut buffer = BytesMut::new();
-            let mut offset_map = HashMap::new();
-
-            let encoded_offset = record.encode(&mut buffer).unwrap();
-            offset_map.insert(record.key.clone(), encoded_offset as u64);
-
+            record.encode(&mut buffer).unwrap();
             destination_commit_log.append(&buffer)?;
         }
 
