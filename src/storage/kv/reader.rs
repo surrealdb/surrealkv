@@ -2,8 +2,6 @@ use std::io::Read;
 
 use bytes::BytesMut;
 
-use ahash::{HashMap, HashMapExt};
-
 use crate::storage::{
     kv::{
         entry::{Record, MAX_KV_METADATA_SIZE},
@@ -250,16 +248,8 @@ impl RecordReader {
     }
 
     /// Reads a transaction record into the provided `Record`.
-    pub(crate) fn read_into(
-        &mut self,
-        entry: &mut Record,
-    ) -> Result<HashMap<bytes::Bytes, (u64, usize)>> {
-        let mut value_offsets = HashMap::new();
-        let (segment_id, offset) = self.read_entry_into(entry)?;
-        let key = entry.key.clone();
-        value_offsets.insert(key, (segment_id, offset as usize));
-
-        Ok(value_offsets)
+    pub(crate) fn read_into(&mut self, entry: &mut Record) -> Result<(u64, u64)> {
+        self.read_entry_into(entry)
     }
 
     pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
