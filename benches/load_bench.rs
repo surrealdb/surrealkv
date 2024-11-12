@@ -14,6 +14,15 @@ fn create_local_directory(test_name: &str) -> PathBuf {
     local_dir
 }
 
+fn remove_local_directory(local_dir: &PathBuf) {
+    for _ in 0..5 {
+        if fs::remove_dir_all(local_dir).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 async fn benchmark_load_times_kv_size() {
     println!("\n=== Benchmarking Load Times - KV Size Combinations with Key Distribution ===");
     println!("Key Size | Value Size | Distribution | Load Time (s) | Store Size (GB)");
@@ -63,9 +72,10 @@ async fn benchmark_load_times_kv_size() {
                     duration.as_secs_f64(),
                     store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
+                store.close().await.unwrap();
 
                 // Remove the local directory
-                fs::remove_dir_all(local_dir).expect("should remove local directory");
+                remove_local_directory(&local_dir);
             }
 
             // Test Random Keys
@@ -110,9 +120,10 @@ async fn benchmark_load_times_kv_size() {
                     duration.as_secs_f64(),
                     store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
+                store.close().await.unwrap();
 
                 // Remove the local directory
-                fs::remove_dir_all(local_dir).expect("should remove local directory");
+                remove_local_directory(&local_dir);
             }
         }
     }
@@ -172,8 +183,10 @@ async fn benchmark_load_times_versions() {
             store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
         );
 
+        store.close().await.unwrap();
+
         // Remove the local directory
-        fs::remove_dir_all(local_dir).expect("should remove local directory");
+        remove_local_directory(&local_dir);
     }
 }
 
