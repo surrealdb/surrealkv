@@ -162,12 +162,10 @@ async fn benchmark_load_times_versions() {
 // Helper function to calculate the size of the store directory
 fn calculate_store_size(temp_dir: &TempDir) -> u64 {
     let mut total_size = 0;
-    for entry in walkdir::WalkDir::new(temp_dir.path()) {
-        if let Ok(entry) = entry {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    total_size += metadata.len();
-                }
+    for entry in walkdir::WalkDir::new(temp_dir.path()).into_iter().flatten() {
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_file() {
+                total_size += metadata.len();
             }
         }
     }
