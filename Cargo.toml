@@ -42,7 +42,12 @@ fmmap = "0.3.3"
 memmap2 = "0.9.4"
 num_cpus = "1.16.0"
 skv44 = { package = "surrealkv", version = "0.4.4" }
+walkdir = "2.5.0"
 
 [[bench]]
 name = "store_bench"
 harness = false
+
+[[bench]]
+name = "load_bench"
+harness = false 

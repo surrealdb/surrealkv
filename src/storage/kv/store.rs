@@ -591,7 +591,7 @@ impl Core {
         if self.opts.should_persist_data() {
             self.write_entries_to_disk(req)
         } else {
-            self.write_entries_to_memory(req)
+            self.write_index_in_memory(&req)
         }
     }
 
@@ -608,11 +608,16 @@ impl Core {
             *val_off += current_offset;
         });
 
-        self.write_index_with_committed_offsets(&req, segment_id, &values_offsets)
-    }
-
-    fn write_entries_to_memory(&self, req: Task) -> Result<()> {
-        self.write_index_in_memory(&req)
+        self.write_entries_to_index(&req, |entry| {
+            let offset = *values_offsets.get(&entry.key).unwrap();
+            IndexValue::new_disk(
+                segment_id,
+                offset,
+                entry.metadata.clone(),
+                &entry.value,
+                self.opts.max_value_threshold,
+            )
+        })
     }
 
     fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
@@ -675,24 +680,6 @@ impl Core {
         }
 
         Ok(())
-    }
-
-    fn write_index_with_committed_offsets(
-        &self,
-        task: &Task,
-        segment_id: u64,
-        committed_values_offsets: &HashMap<Bytes, u64>,
-    ) -> Result<()> {
-        self.write_entries_to_index(task, |entry| {
-            let offset = *committed_values_offsets.get(&entry.key).unwrap();
-            IndexValue::new_disk(
-                segment_id,
-                offset,
-                entry.metadata.clone(),
-                &entry.value,
-                self.opts.max_value_threshold,
-            )
-        })
     }
 
     fn write_index_in_memory(&self, task: &Task) -> Result<()> {
