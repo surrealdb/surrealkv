@@ -14,5 +14,25 @@ jobs:
     name: Run Benchmarks
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install latest stable Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Run Benchmarks
-        run: cargo bench --bench store_bench
+        run: |
+          cargo bench --bench store_bench
+          cargo bench --bench load_bench
