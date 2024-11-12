@@ -1,14 +1,17 @@
 use bytes::Bytes;
 use rand::{thread_rng, Rng};
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 use surrealkv::{Options, Store};
-use tempdir::TempDir;
 
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), global_allocator)]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn create_temp_directory() -> TempDir {
-    TempDir::new("test").unwrap()
+fn create_local_directory(test_name: &str) -> PathBuf {
+    let local_dir = PathBuf::from(format!("./test_data/{}", test_name));
+    fs::create_dir_all(&local_dir).unwrap();
+    local_dir
 }
 
 async fn benchmark_load_times_kv_size() {
@@ -24,9 +27,11 @@ async fn benchmark_load_times_kv_size() {
         for value_size in &value_sizes {
             // Test Sequential Keys
             {
+                let test_name = format!("sequential_keys_{}_{}", key_size, value_size);
+                let local_dir = create_local_directory(&test_name);
+
                 let mut opts = Options::new();
-                let temp_dir = create_temp_directory();
-                opts.dir = temp_dir.path().to_path_buf();
+                opts.dir = local_dir.clone();
                 let store = Store::new(opts.clone()).expect("should create store");
 
                 let default_value = Bytes::from(vec![0x42; *value_size]);
@@ -43,7 +48,7 @@ async fn benchmark_load_times_kv_size() {
                 store.close().await.unwrap();
 
                 // Calculate store size
-                let store_size = calculate_store_size(&temp_dir);
+                let store_size = calculate_store_size(&local_dir);
 
                 // Measure load time
                 let start = Instant::now();
@@ -58,13 +63,18 @@ async fn benchmark_load_times_kv_size() {
                     duration.as_secs_f64(),
                     store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
+
+                // Remove the local directory
+                fs::remove_dir_all(local_dir).expect("should remove local directory");
             }
 
             // Test Random Keys
             {
+                let test_name = format!("random_keys_{}_{}", key_size, value_size);
+                let local_dir = create_local_directory(&test_name);
+
                 let mut opts = Options::new();
-                let temp_dir = create_temp_directory();
-                opts.dir = temp_dir.path().to_path_buf();
+                opts.dir = local_dir.clone();
                 let store = Store::new(opts.clone()).expect("should create store");
 
                 let default_value = Bytes::from(vec![0x42; *value_size]);
@@ -85,7 +95,7 @@ async fn benchmark_load_times_kv_size() {
                 store.close().await.unwrap();
 
                 // Calculate store size
-                let store_size = calculate_store_size(&temp_dir);
+                let store_size = calculate_store_size(&local_dir);
 
                 // Measure load time
                 let start = Instant::now();
@@ -98,8 +108,11 @@ async fn benchmark_load_times_kv_size() {
                     value_size,
                     "Random",
                     duration.as_secs_f64(),
-                    store_size as f64 / (1024.0 * 1024.0  * 1024.0) // Convert to GB
+                    store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
+
+                // Remove the local directory
+                fs::remove_dir_all(local_dir).expect("should remove local directory");
             }
         }
     }
@@ -118,9 +131,11 @@ async fn benchmark_load_times_versions() {
     for version_count in versions {
         let num_keys = total_records / version_count;
 
+        let test_name = format!("versions_{}", version_count);
+        let local_dir = create_local_directory(&test_name);
+
         let mut opts = Options::new();
-        let temp_dir = create_temp_directory();
-        opts.dir = temp_dir.path().to_path_buf();
+        opts.dir = local_dir.clone();
         let store = Store::new(opts.clone()).expect("should create store");
 
         let default_value = Bytes::from(vec![0x42; value_size]);
@@ -143,7 +158,7 @@ async fn benchmark_load_times_versions() {
         store.close().await.unwrap();
 
         // Calculate store size
-        let store_size = calculate_store_size(&temp_dir);
+        let store_size = calculate_store_size(&local_dir);
 
         let start = Instant::now();
         let _ = Store::new(opts).expect("should create store");
@@ -156,13 +171,16 @@ async fn benchmark_load_times_versions() {
             duration.as_secs_f64(),
             store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
         );
+
+        // Remove the local directory
+        fs::remove_dir_all(local_dir).expect("should remove local directory");
     }
 }
 
 // Helper function to calculate the size of the store directory
-fn calculate_store_size(temp_dir: &TempDir) -> u64 {
+fn calculate_store_size(local_dir: &PathBuf) -> u64 {
     let mut total_size = 0;
-    for entry in walkdir::WalkDir::new(temp_dir.path()).into_iter().flatten() {
+    for entry in walkdir::WalkDir::new(local_dir).into_iter().flatten() {
         if let Ok(metadata) = entry.metadata() {
             if metadata.is_file() {
                 total_size += metadata.len();
