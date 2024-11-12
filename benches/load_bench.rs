@@ -56,7 +56,7 @@ async fn benchmark_load_times_kv_size() {
                     value_size,
                     "Sequential",
                     duration.as_secs_f64(),
-                    store_size as f64 / (1024.0 * 1024.0) // Convert to MB
+                    store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
             }
 
@@ -98,7 +98,7 @@ async fn benchmark_load_times_kv_size() {
                     value_size,
                     "Random",
                     duration.as_secs_f64(),
-                    store_size as f64 / (1024.0 * 1024.0) // Convert to MB
+                    store_size as f64 / (1024.0 * 1024.0  * 1024.0) // Convert to GB
                 );
             }
         }
@@ -154,7 +154,7 @@ async fn benchmark_load_times_versions() {
             version_count,
             num_keys,
             duration.as_secs_f64(),
-            store_size as f64 / (1024.0 * 1024.0) // Convert to MB
+            store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
         );
     }
 }
