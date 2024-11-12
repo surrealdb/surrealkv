@@ -37,7 +37,7 @@ jobs:
 
   load_bench:
     name: Run Load Benchmark
-    runs-on: ubuntu-latest
+    runs-on: [runner-amd64-2xlarge]
     steps:
       - uses: actions/checkout@v4
 
