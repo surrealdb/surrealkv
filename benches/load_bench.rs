@@ -13,7 +13,7 @@ fn create_temp_directory() -> TempDir {
 
 async fn benchmark_load_times_kv_size() {
     println!("\n=== Benchmarking Load Times - KV Size Combinations with Key Distribution ===");
-    println!("Key Size | Value Size | Distribution | Load Time (s) | Store Size (MB)");
+    println!("Key Size | Value Size | Distribution | Load Time (s) | Store Size (GB)");
     println!("------------------------------------------------------------");
 
     let num_keys = 1_000_000;
@@ -107,7 +107,7 @@ async fn benchmark_load_times_kv_size() {
 
 async fn benchmark_load_times_versions() {
     println!("\n=== Benchmarking Load Times - Version Count ===");
-    println!("Versions | Keys    | Load Time (s) | Store Size (MB)");
+    println!("Versions | Keys    | Load Time (s) | Store Size (GB)");
     println!("------------------------------------------------");
 
     let total_records = 1_000_000;
