@@ -473,7 +473,7 @@ fn concurrent_workload(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches_sequential,
+    benches_insert,
     sequential_insert,
     random_insert,
     bulk_insert,
@@ -481,4 +481,4 @@ criterion_group!(
 );
 criterion_group!(benches_range, range_scan);
 criterion_group!(benches_concurrent, concurrent_insert, concurrent_workload);
-criterion_main!(benches_sequential, benches_range, benches_concurrent);
+criterion_main!(benches_insert, benches_range);
