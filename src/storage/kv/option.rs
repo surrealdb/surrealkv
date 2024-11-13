@@ -19,7 +19,7 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 3)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     // Required options.
@@ -28,9 +28,14 @@ pub struct Options {
     // Usually modified options.
     pub isolation_level: IsolationLevel, // Isolation level for transactions.
 
+    // Deprecated field.
+    #[revision(end = 2, convert_fn = "convert_max_key_size")]
+    max_key_size: u64,
+    // Deprecated field.
+    #[revision(end = 2, convert_fn = "convert_max_value_size")]
+    max_value_size: u64,
+
     // Fine tuning options.
-    pub max_key_size: u64,                // Maximum size in bytes for key.
-    pub max_value_size: u64,              // Maximum size in bytes for value.
     pub max_value_threshold: usize, // Threshold to decide value should be stored and read from memory or from log value files.
     pub max_segment_size: u64,      // Maximum size of a single segment.
     pub max_value_cache_size: u64,  // Maximum size of the value cache.
@@ -38,6 +43,10 @@ pub struct Options {
 
     // Field to indicate whether the data should be stored completely in memory
     pub disk_persistence: bool, // If false, data will be stored completely in memory. If true, data will be stored on disk too.
+
+    // Used to enable or disable versioned values.
+    #[revision(start = 3)]
+    pub enable_versions: bool,
 }
 
 impl Default for Options {
@@ -45,14 +54,13 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             dir: PathBuf::from(""),
-            max_key_size: 1024,
-            max_value_size: 1024 * 1024,
             max_value_threshold: 64, // 64 bytes
             isolation_level: IsolationLevel::SnapshotIsolation,
             max_segment_size: 1 << 29, // 512 MB
             max_value_cache_size: 100000,
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
+            enable_versions: true,
         }
     }
 }
@@ -65,6 +73,16 @@ impl Options {
     /// Returns true if the data should be persisted on disk.
     pub fn should_persist_data(&self) -> bool {
         self.disk_persistence
+    }
+
+    fn convert_max_key_size(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+        // We don't use this deprecated field anymore so let's completely ignore it.
+        Ok(())
+    }
+
+    fn convert_max_value_size(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
+        // We don't use this deprecated field anymore so let's completely ignore it.
+        Ok(())
     }
 }
 
@@ -79,13 +97,12 @@ mod tests {
         let options = Options::default();
 
         assert_eq!(options.dir, PathBuf::from(""));
-        assert_eq!(options.max_key_size, 1024);
-        assert_eq!(options.max_value_size, 1024 * 1024);
         assert_eq!(options.max_value_threshold, 64);
         assert_eq!(options.isolation_level, IsolationLevel::SnapshotIsolation);
         assert_eq!(options.max_segment_size, 1 << 29);
         assert_eq!(options.max_value_cache_size, 100000);
         assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
+        assert!(options.enable_versions);
     }
 }

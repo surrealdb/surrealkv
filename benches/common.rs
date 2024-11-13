@@ -305,7 +305,7 @@ impl<'a> Transaction for SurrealKVTransaction<'a> {
     fn delete(&mut self, key: &[u8]) -> Result<(), ()> {
         match self {
             SurrealKVTransaction::Read(_) => Err(()),
-            SurrealKVTransaction::Write(txn) => txn.hard_delete(key).map(|_| ()).map_err(|_| ()),
+            SurrealKVTransaction::Write(txn) => txn.delete(key).map(|_| ()).map_err(|_| ()),
             _ => unreachable!(),
         }
     }

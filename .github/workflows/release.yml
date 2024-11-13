@@ -1,0 +1,92 @@
+name: Release
+
+run-name: "Release run '${{ github.head_ref || github.ref_name }}'"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Process Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install a TOML parser
+        run: |
+          curl -L https://github.com/tamasfe/taplo/releases/download/0.8.1/taplo-full-linux-x86_64.gz | gunzip - > taplo
+          chmod +x taplo
+          sudo mv taplo /usr/bin/taplo
+
+      - name: Configure git
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config --add --bool push.autoSetupRemote true
+
+      - name: Extract version from branch name
+        id: version
+        run: |
+          BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
+          VERSION="${BRANCH_NAME#release/}"
+          echo "Version from branch: $VERSION"
+          
+          # Validate version matches Cargo.toml
+          CARGO_VERSION=$(taplo get -f Cargo.toml "package.version")
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Branch version ($VERSION) doesn't match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        run: |
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v2
+        with:
+          config: cliff.toml
+          args: --verbose --tag v${{ steps.version.outputs.version }}
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Commit changelog
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            git add CHANGELOG.md
+            git commit -m "chore(release): update changelog for ${{ steps.version.outputs.version }}"
+            git push origin HEAD
+            echo "Changes committed and pushed to branche"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release ${{ steps.version.outputs.version }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

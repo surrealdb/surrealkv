@@ -159,12 +159,12 @@ impl SnapshotIsolation {
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(txn.core.clone())?;
+        let current_snapshot = Snapshot::take(&txn.core)?;
 
         for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
-                Ok(val_ref) => {
-                    if entry.ts != val_ref.ts() {
+                Ok((_, version)) => {
+                    if entry.ts != version {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
@@ -487,8 +487,19 @@ impl WaterMark {
         let wp = mark.waiters.get(&t).cloned();
         drop(mark);
 
-        if let Some(wp) = wp {
-            matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures::executor::block_on;
+            if let Some(wp) = wp {
+                matches!(block_on(wp.closer.recv()), Err(async_channel::RecvError));
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(wp) = wp {
+                matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
+            }
         }
     }
 

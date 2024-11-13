@@ -7,7 +7,7 @@ use bytes::BytesMut;
 
 use crate::storage::{
     kv::{
-        entry::{Entry, Record, Value, ValueRef},
+        entry::{Entry, Record},
         error::{Error, Result},
         manifest::Manifest,
         meta::Metadata,
@@ -145,17 +145,12 @@ impl StoreInner {
         let mut skip_current_key = false;
 
         for (key, value, version, ts) in snapshot_versioned_iter {
-            let mut val_ref = ValueRef::new(self.core.clone());
-            val_ref.decode(*version, value)?;
-
-            // IMP!!! What happnes to keys with the swizzle bit set to 1?
-
             // Skip keys from segments newer than the last updated segment
-            if val_ref.segment_id() > last_updated_segment_id {
+            if value.segment_id() > last_updated_segment_id {
                 continue;
             }
 
-            let metadata = val_ref.metadata();
+            let metadata = value.metadata();
 
             // If we've moved to a new key, decide whether to write the previous key's entries
             if Some(&key) != current_key.as_ref() {
@@ -191,7 +186,13 @@ impl StoreInner {
 
             // Buffer the current entry if not skipping
             if !skip_current_key {
-                entries_buffer.push((key, val_ref.resolve()?, *version, *ts, metadata.cloned()));
+                entries_buffer.push((
+                    key,
+                    value.resolve(&self.core)?,
+                    *version,
+                    *ts,
+                    metadata.cloned(),
+                ));
             }
         }
 
@@ -290,7 +291,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
                             match fs::copy(&seg.file_path, &dest_path) {
                                 Ok(_) => println!("File copied successfully"),
                                 Err(e) => {
-                                    println!("Error copying file: {:?}", e);
+                                    eprintln!("Error copying file: {:?}", e);
                                     return Err(Error::from(e));
                                 }
                             }
@@ -299,7 +300,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        println!("Error accessing file metadata: {:?}", e);
+                        eprintln!("Error accessing file metadata: {:?}", e);
                         return Err(Error::from(e));
                     }
                 }
@@ -313,13 +314,13 @@ fn perform_recovery(opts: &Options) -> Result<()> {
 
         // Delete the `clog` directory
         if let Err(e) = fs::remove_dir_all(&clog_dir) {
-            println!("Error deleting clog directory: {:?}", e);
+            eprintln!("Error deleting clog directory: {:?}", e);
             return Err(Error::from(e));
         }
 
         // Rename `merge_clog_subdir` to `clog`
         if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
-            println!("Error renaming merge_clog_subdir to clog: {:?}", e);
+            eprintln!("Error renaming merge_clog_subdir to clog: {:?}", e);
             return Err(Error::from(e));
         }
 
@@ -498,7 +499,7 @@ mod tests {
         // Delete the first 5 keys from the store
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(key).unwrap();
+            txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -560,7 +561,7 @@ mod tests {
         let num_keys_to_delete = num_keys_to_write / 4;
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(key).unwrap();
+            txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -772,7 +773,7 @@ mod tests {
         // Delete selected keys
         for key in &keys_to_delete {
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(key).unwrap();
+            txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -917,7 +918,7 @@ mod tests {
             let mut txn = store
                 .begin()
                 .expect("Failed to begin transaction for deletion");
-            txn.hard_delete(key).expect("Failed to delete key");
+            txn.delete(key).expect("Failed to delete key");
             txn.commit().await.expect("Failed to commit deletion");
         }
 
@@ -983,7 +984,7 @@ mod tests {
             let mut txn = store
                 .begin()
                 .expect("Failed to begin transaction for deletion");
-            txn.hard_delete(key).expect("Failed to delete key");
+            txn.delete(key).expect("Failed to delete key");
             txn.commit().await.expect("Failed to commit deletion");
         }
 
@@ -1058,7 +1059,7 @@ mod tests {
                 let mut txn = store
                     .begin()
                     .expect("Failed to begin transaction for deletion");
-                txn.hard_delete(key).expect("Failed to delete key");
+                txn.delete(key).expect("Failed to delete key");
                 txn.commit().await.expect("Failed to commit deletion");
             }
         }
@@ -1157,7 +1158,7 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             // Insert a key with two versions, where the last one is marked as deleted
-            txn.hard_delete(b"key1").unwrap(); // Second version marked as deleted
+            txn.delete(b"key1").unwrap(); // Second version marked as deleted
             txn.commit().await.unwrap();
         }
 
@@ -1357,7 +1358,7 @@ mod tests {
                 // Mark the last version as deleted for keys above the delete_threshold in its own transaction
                 if key_index > delete_threshold {
                     let mut txn = store.begin().unwrap();
-                    txn.hard_delete(&key).unwrap();
+                    txn.delete(&key).unwrap();
                     txn.commit().await.unwrap();
                 }
             }

@@ -20,15 +20,14 @@ use revision::Revisioned;
 use crate::storage::{
     kv::{
         compaction::restore_from_compaction,
-        entry::{encode_entries, Entry, Record, ValueRef},
+        entry::{encode_entries, Entry, Record},
         error::{Error, Result},
-        indexer::Indexer,
+        indexer::{IndexValue, Indexer},
         manifest::Manifest,
         option::Options,
         oracle::Oracle,
         reader::{Reader, RecordReader},
         repair::{repair_last_corrupted_segment, restore_repair_files},
-        snapshot::Snapshot,
         stats::StorageStats,
         transaction::{Durability, Mode, Transaction},
     },
@@ -177,13 +176,6 @@ impl Store {
 
         Ok(())
     }
-
-    /// Returns a point-in-time snapshot of the store.
-    pub fn get_snapshot(&self) -> Result<Snapshot> {
-        let core = self.inner.as_ref().unwrap().core.clone();
-        let snapshot = Snapshot::take(core)?;
-        Ok(snapshot)
-    }
 }
 
 impl Drop for Store {
@@ -330,7 +322,6 @@ impl Core {
         let mut manifest = None;
         let mut clog = None;
 
-        let mut num_entries = 0;
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
             manifest = Some(Self::initialize_manifest(&opts.dir)?);
@@ -346,14 +337,13 @@ impl Core {
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                num_entries = Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
+                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer)?;
             }
         }
 
         // Create and initialize an Oracle.
         let oracle = Oracle::new(&opts);
-        let ts_to_set = std::cmp::max(num_entries, indexer.version());
-        oracle.set_ts(ts_to_set);
+        oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
         let value_cache = Cache::new(opts.max_value_cache_size as usize);
@@ -371,12 +361,8 @@ impl Core {
         })
     }
 
-    pub(crate) fn read_ts(&self) -> Result<u64> {
-        if self.is_closed() {
-            return Err(Error::StoreClosed);
-        }
-
-        Ok(self.oracle.read_ts())
+    pub(crate) fn read_ts(&self) -> u64 {
+        self.oracle.read_ts()
     }
 
     // The load_index function is responsible for loading the index from the log.
@@ -395,7 +381,7 @@ impl Core {
         let reader = Reader::new_from(reader);
 
         // A RecordReader is created from the Reader to read transactions.
-        let mut tx_reader = RecordReader::new(reader, opts.max_key_size, opts.max_value_size);
+        let mut tx_reader = RecordReader::new(reader);
 
         // A Record is created to hold the transactions. The maximum number of entries per transaction is specified.
         let mut tx = Record::new();
@@ -412,8 +398,8 @@ impl Core {
             // The RecordReader attempts to read into the Record.
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
-                Ok(value_offsets) => {
-                    Core::process_entry(&tx, opts, &value_offsets, indexer)?;
+                Ok((segment_id, value_offset)) => {
+                    Core::process_entry(&tx, opts, segment_id, value_offset, indexer)?;
                     num_entries += 1;
                 }
 
@@ -441,7 +427,7 @@ impl Core {
                 "Repairing corrupted segment with id: {} and offset: {}",
                 corrupted_segment_id, corrupted_offset
             );
-            repair_last_corrupted_segment(clog, opts, corrupted_segment_id, corrupted_offset)?;
+            repair_last_corrupted_segment(clog, corrupted_segment_id, corrupted_offset)?;
         }
 
         Ok(num_entries)
@@ -450,7 +436,8 @@ impl Core {
     fn process_entry(
         entry: &Record,
         opts: &Options,
-        value_offsets: &HashMap<Bytes, (u64, usize)>,
+        segment_id: u64,
+        value_offset: u64,
         indexer: &mut Indexer,
     ) -> Result<()> {
         if entry
@@ -460,23 +447,31 @@ impl Core {
         {
             indexer.delete(&mut entry.key[..].into());
         } else {
-            let (segment_id, val_off) = value_offsets.get(&entry.key).unwrap();
-
-            let index_value = ValueRef::encode(
-                *segment_id,
+            let index_value = IndexValue::new_disk(
+                segment_id,
+                value_offset,
+                entry.metadata.clone(),
                 &entry.value,
-                entry.metadata.as_ref(),
-                *val_off as u64,
                 opts.max_value_threshold,
             );
 
-            indexer.insert(
-                &mut entry.key[..].into(),
-                index_value,
-                entry.id,
-                entry.ts,
-                false,
-            )?;
+            if opts.enable_versions {
+                indexer.insert(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    entry.id,
+                    entry.ts,
+                    false,
+                )?;
+            } else {
+                indexer.insert_or_replace(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    entry.id,
+                    entry.ts,
+                    false,
+                )?;
+            }
         }
 
         Ok(())
@@ -491,8 +486,7 @@ impl Core {
         };
 
         // Validate the current options against the existing manifest's options
-        let options_changeset = existing_manifest.extract_options();
-        Core::validate_options(current_opts, &options_changeset)?;
+        Core::validate_options(current_opts)?;
 
         // Check if the current options are already the last option in the manifest
         if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
@@ -509,35 +503,7 @@ impl Core {
         Ok(current_opts.clone())
     }
 
-    fn validate_options(opts: &Options, existing_metadata_list: &Vec<Options>) -> Result<()> {
-        let mut last_max_value_size = 0;
-        let mut last_max_key_size = 0;
-        let mut last_max_segment_size = 0;
-        for option in existing_metadata_list {
-            if option.max_value_size < last_max_value_size {
-                return Err(Error::MaxValueSizeCannotBeDecreased);
-            }
-            if option.max_key_size < last_max_key_size {
-                return Err(Error::MaxKeySizeCannotBeDecreased);
-            }
-            if option.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
-                return Err(Error::MaxSegmentSizeCannotBeChanged);
-            }
-            last_max_value_size = option.max_value_size;
-            last_max_key_size = option.max_key_size;
-            last_max_segment_size = option.max_segment_size;
-        }
-
-        // Include current opts in the comparison
-        if opts.max_value_size < last_max_value_size {
-            return Err(Error::MaxValueSizeCannotBeDecreased);
-        }
-        if opts.max_key_size < last_max_key_size {
-            return Err(Error::MaxKeySizeCannotBeDecreased);
-        }
-        if opts.max_segment_size != last_max_segment_size && last_max_segment_size != 0 {
-            return Err(Error::MaxSegmentSizeCannotBeChanged);
-        }
+    fn validate_options(opts: &Options) -> Result<()> {
         if opts.max_compaction_segment_size < opts.max_segment_size {
             return Err(Error::CompactionSegmentSizeTooSmall);
         }
@@ -625,11 +591,12 @@ impl Core {
         if self.opts.should_persist_data() {
             self.write_entries_to_disk(req)
         } else {
-            self.write_entries_to_memory(req)
+            self.write_index_in_memory(&req)
         }
     }
 
     fn write_entries_to_disk(&self, req: Task) -> Result<()> {
+        // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(req.entries.len());
 
@@ -641,11 +608,16 @@ impl Core {
             *val_off += current_offset;
         });
 
-        self.write_index_with_committed_offsets(&req, segment_id, &values_offsets)
-    }
-
-    fn write_entries_to_memory(&self, req: Task) -> Result<()> {
-        self.write_index_in_memory(&req)
+        self.write_entries_to_index(&req, |entry| {
+            let offset = *values_offsets.get(&entry.key).unwrap();
+            IndexValue::new_disk(
+                segment_id,
+                offset,
+                entry.metadata.clone(),
+                &entry.value,
+                self.opts.max_value_threshold,
+            )
+        })
     }
 
     fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
@@ -673,7 +645,7 @@ impl Core {
 
     fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
     where
-        F: Fn(&Entry) -> Bytes,
+        F: Fn(&Entry) -> IndexValue,
     {
         let mut index = self.indexer.write();
 
@@ -688,38 +660,31 @@ impl Core {
 
             let index_value = encode_entry(entry);
 
-            index.insert(
-                &mut entry.key[..].into(),
-                index_value,
-                task.tx_id,
-                entry.ts,
-                true,
-            )?;
+            if self.opts.enable_versions {
+                index.insert(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    task.tx_id,
+                    entry.ts,
+                    true,
+                )?;
+            } else {
+                index.insert_or_replace(
+                    &mut entry.key[..].into(),
+                    index_value,
+                    task.tx_id,
+                    entry.ts,
+                    true,
+                )?;
+            }
         }
 
         Ok(())
     }
 
-    fn write_index_with_committed_offsets(
-        &self,
-        task: &Task,
-        segment_id: u64,
-        committed_values_offsets: &HashMap<Bytes, u64>,
-    ) -> Result<()> {
-        self.write_entries_to_index(task, |entry| {
-            ValueRef::encode(
-                segment_id,
-                &entry.value,
-                entry.metadata.as_ref(),
-                *committed_values_offsets.get(&entry.key).unwrap(),
-                self.opts.max_value_threshold,
-            )
-        })
-    }
-
     fn write_index_in_memory(&self, task: &Task) -> Result<()> {
         self.write_entries_to_index(task, |entry| {
-            ValueRef::encode_mem(&entry.value, entry.metadata.as_ref())
+            IndexValue::new_mem(entry.metadata.clone(), entry.value.clone())
         })
     }
 
@@ -739,6 +704,33 @@ impl Core {
         self.writes_tx.send(req).await?;
         Ok(rx)
     }
+
+    /// Resolves the value from the given offset in the commit log.
+    /// If the offset exists in the value cache, it returns the cached value.
+    /// Otherwise, it reads the value from the commit log, caches it, and returns it.
+    pub(crate) fn resolve_from_offset(
+        &self,
+        segment_id: u64,
+        value_offset: u64,
+        value_len: usize,
+    ) -> Result<Vec<u8>> {
+        // Attempt to return the cached value if it exists
+        let cache_key = (segment_id, value_offset);
+
+        if let Some(value) = self.value_cache.get(&cache_key) {
+            return Ok(value.to_vec());
+        }
+
+        // If the value is not in the cache, read it from the commit log
+        let mut buf = vec![0; value_len];
+        let clog = self.clog.as_ref().unwrap().read();
+        clog.read_at(&mut buf, segment_id, value_offset)?;
+
+        // Cache the newly read value for future use
+        self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
+
+        Ok(buf)
+    }
 }
 
 #[cfg(test)]
@@ -751,12 +743,16 @@ mod tests {
     use crate::storage::kv::option::Options;
     use crate::storage::kv::store::{Store, Task, TaskRunner};
     use crate::storage::kv::transaction::Durability;
+    use crate::storage::log::Error as LogError;
+    use crate::Error;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
     use tempdir::TempDir;
+
+    use skv44;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
@@ -848,106 +844,6 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
         let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
         assert_eq!(store_opts, opts);
-    }
-
-    #[tokio::test]
-    async fn increasing_max_key_value_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        let mut opts = opts.clone();
-        opts.max_key_size += 1;
-        opts.max_value_size += 1;
-
-        // Try to create a new store instance with the updated options
-        let result = Store::new(opts.clone());
-        assert!(
-            result.is_ok(),
-            "should not throw an error when max_key_size or max_value_size is increased"
-        );
-    }
-
-    #[tokio::test]
-    async fn decreasing_max_key_value_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        {
-            let mut opts = opts.clone();
-            opts.max_key_size -= 1;
-
-            let result = Store::new(opts.clone());
-            assert!(
-                result.is_err(),
-                "should throw an error when max_key_size is decreased"
-            );
-            assert_eq!(
-                result.err().unwrap().to_string(),
-                "Max key size cannot be decreased".to_string()
-            );
-        }
-
-        {
-            let mut opts = opts.clone();
-            opts.max_value_size -= 1;
-            let result = Store::new(opts.clone());
-            assert!(
-                result.is_err(),
-                "should throw an error when max_value_size is decreased"
-            );
-
-            assert_eq!(
-                result.err().unwrap().to_string(),
-                "Max value size cannot be decreased".to_string()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn changing_max_segment_size() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance with VariableKey as the key type
-        let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
-
-        // Update the options and use them to update the new store instance
-        let mut opts = opts.clone();
-        opts.max_segment_size += 1;
-
-        // Try to create a new store instance with the updated options
-        let result = Store::new(opts.clone());
-        assert!(
-            result.is_err(),
-            "should throw an error when max_segment_size is changed"
-        );
-        assert_eq!(
-            result.err().unwrap().to_string(),
-            "Max segment size cannot be changed".to_string()
-        );
     }
 
     #[tokio::test]
@@ -1145,7 +1041,7 @@ mod tests {
         // Delete the keys from the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(key).unwrap();
+            txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -1474,7 +1370,7 @@ mod tests {
         // Delete the first 5 keys from the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
-            txn.hard_delete(key).unwrap();
+            txn.delete(key).unwrap();
             txn.commit().await.unwrap();
         }
 
@@ -1485,6 +1381,397 @@ mod tests {
         for key in keys.iter() {
             let mut txn = reopened_store.begin().unwrap();
             assert!(txn.get(key).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_with_varying_segment_sizes() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_segment_size = 84; // Initial max segment size
+
+        let k1 = Bytes::from("k1");
+        let k2 = Bytes::from("k2");
+        let k3 = Bytes::from("k3");
+        let k4 = Bytes::from("k4");
+        let val = Bytes::from("val");
+
+        // Step 1: Open store with initial max segment size and commit a record
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k1.clone(), &val.clone()).unwrap();
+            txn.commit().await.unwrap();
+        }
+        store.close().await.expect("should close store");
+
+        // Step 2: Reopen store with a smaller max segment size and append a record
+        opts.max_segment_size = 37; // Smaller max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k2.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 3: Reopen store with a larger max segment size and append a record
+        opts.max_segment_size = 121; // Larger max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k3.clone(), &val).unwrap();
+            txn.commit().await.unwrap();
+
+            // Verify the first record
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&k1).unwrap().unwrap();
+            assert_eq!(val, val);
+
+            // Verify the second record
+            let val2 = txn.get(&k2).unwrap().unwrap();
+            assert_eq!(val2, val);
+
+            // Verify the third record
+            let val3 = txn.get(&k3).unwrap().unwrap();
+            assert_eq!(val3, val);
+        }
+        store.close().await.expect("should close store");
+
+        // Step 4: Reopen store with a max segment size smaller than the record
+        opts.max_segment_size = 36; // Smallest max segment size
+        let store = Store::new(opts.clone()).expect("should create store");
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&k4.clone(), &val).unwrap();
+            let err = txn.commit().await.err().unwrap();
+            match err {
+                Error::LogError(LogError::RecordTooLarge) => (),
+                _ => panic!("expected RecordTooLarge error"),
+            };
+        }
+        store.close().await.expect("should close store");
+    }
+
+    #[tokio::test]
+    async fn load_index_with_disabled_versions() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+        store.close().await.unwrap();
+
+        let store = Store::new(opts.clone()).unwrap();
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_with_disabled_versions() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_with_disabled_versions_in_memory() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            disk_persistence: false,
+            ..Default::default()
+        };
+
+        let key = b"key";
+        let value1 = b"value1";
+        let value2 = b"value2";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set(key, value1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.set(key, value2).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        let history = txn.get_history(key).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    // Common setup logic for creating a store
+    fn create_store(dir: Option<TempDir>) -> (Store, TempDir) {
+        let temp_dir = dir.unwrap_or_else(create_temp_directory);
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        (
+            Store::new(opts.clone()).expect("should create store"),
+            temp_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_store_version_after_reopen() {
+        let (store, temp_dir) = create_store(None);
+
+        // Define the number of keys, key size, and value size
+        let num_keys = 10000u32;
+        let key_size = 32;
+        let value_size = 32;
+
+        // Generate keys and values
+        let keys: Vec<Bytes> = (0..num_keys)
+            .map(|i| {
+                let mut key = vec![0; key_size];
+                key[..4].copy_from_slice(&i.to_be_bytes());
+                Bytes::from(key)
+            })
+            .collect();
+
+        let value = Bytes::from(vec![0; value_size]);
+
+        // Insert keys into the store
+        {
+            for key in &keys {
+                let mut txn = store.begin().unwrap();
+                txn.set(key, &value).unwrap();
+                txn.commit().await.unwrap();
+            }
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Verify if the indexer version is set correctly
+        assert_eq!(
+            store.inner.as_ref().unwrap().core.indexer.read().version(),
+            num_keys as u64
+        );
+
+        // Verify that the keys are present in the store
+        let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
+        for key in &keys {
+            let history = txn.get_history(key).unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].0, value);
+        }
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_incremental_transaction_ids_post_store_open() {
+        let (store, temp_dir) = create_store(None);
+
+        let total_records = 1000;
+        let multiple_keys_records = total_records / 2;
+
+        // Define keys and values
+        let keys: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("key{}", i)))
+            .collect();
+        let values: Vec<Bytes> = (1..=total_records)
+            .map(|i| Bytes::from(format!("value{}", i)))
+            .collect();
+
+        // Insert multiple transactions with single keys
+        for (i, key) in keys.iter().enumerate().take(multiple_keys_records) {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &values[i]).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Insert multiple transactions with multiple keys
+        for (i, key) in keys
+            .iter()
+            .enumerate()
+            .skip(multiple_keys_records)
+            .take(multiple_keys_records)
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &values[i]).unwrap();
+            txn.set(&keys[(i + 1) % keys.len()], &values[(i + 1) % values.len()])
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Close the store
+        store.close().await.unwrap();
+
+        // Add delay to ensure that the store is closed
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Reopen the store
+        let (store, _) = create_store(Some(temp_dir));
+
+        // Commit a new transaction with a single key
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&keys[0], &values[0]).unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
+
+            assert_eq!(res.0, total_records as u64 + 1);
+        }
+
+        // Commit another new transaction with multiple keys
+        {
+            let mut txn = store.begin().unwrap();
+            txn.set(&keys[1], &values[1]).unwrap();
+            txn.set(&keys[2], &values[2]).unwrap();
+            txn.commit().await.unwrap();
+
+            let res = txn.get_versionstamp().unwrap();
+
+            assert_eq!(res.0, total_records as u64 + 2);
+        }
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tx_id_assignment_after_migration_from_skv44() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = skv44::Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        // Number of transactions
+        let num_transactions = 10;
+        // Number of keys per transaction
+        let keys_per_transaction = 5;
+
+        let default_value = Bytes::from("default_value".to_string());
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for txn_id in 0..num_transactions {
+            for key_id in 0..keys_per_transaction {
+                // Generate a unique key for each transaction and key_id
+                let key_bytes = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                keys.push(key_bytes);
+            }
+        }
+
+        // Insert multiple records in each transaction and close/reopen the store
+        for txn_id in 0..num_transactions {
+            // Create a new store instance with VariableKey as the key type
+            let store = skv44::Store::new(opts.clone()).expect("should create store");
+
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+            for key_id in 0..keys_per_transaction {
+                let key = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                txn.set(&key, &default_value).unwrap();
+            }
+            txn.commit().await.unwrap();
+
+            // Drop the store to simulate closing it
+            store.close().await.unwrap();
+        }
+
+        // Create a new store instance but with values read from disk
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+
+        let store = Store::new(opts).expect("should create store");
+
+        // Insert a new transaction into the reopened store
+        let new_key = Bytes::from("new_key");
+        let new_value = Bytes::from("new_value");
+
+        {
+            // Start a new write transaction
+            let mut txn = store.begin().unwrap();
+            txn.set(&new_key, &new_value).unwrap();
+            txn.commit().await.unwrap();
+            let (new_tx_id, _) = txn.get_versionstamp().unwrap();
+
+            let expected_tx_id = ((num_transactions - 1) * keys_per_transaction) + 2;
+            assert_eq!(expected_tx_id, new_tx_id);
+        }
+
+        // Verify the new transaction
+        {
+            // Start a new read transaction
+            let mut txn = store.begin().unwrap();
+            let val = txn.get(&new_key).unwrap().unwrap();
+            // Assert that the value retrieved in txn matches new_value
+            assert_eq!(val, new_value.as_ref());
+        }
+
+        // Read the keys from the store to verify after reopening
+        for txn_id in 0..num_transactions {
+            for key_id in 0..keys_per_transaction {
+                let key = Bytes::from(format!("txn{}_key{}", txn_id, key_id));
+                // Start a new read transaction
+                let mut txn = store.begin().unwrap();
+                let val = txn.get(&key).unwrap().unwrap();
+                // Assert that the value retrieved in txn matches default_value
+                assert_eq!(val, default_value.as_ref());
+            }
         }
     }
 }
