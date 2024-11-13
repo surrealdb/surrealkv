@@ -368,9 +368,9 @@ The following benchmarks measure single-operation latency across different key a
 | 1,000         | 4 (u32)          | 100               | 71.92        |
 | 10,000        | 4 (u32)          | 100               | 823.29       |
 
-### Concurrent Operations
+#### Concurrent Operations
 
-#### Multi-threaded Insert Performance
+##### Multi-threaded Insert Performance
 Configuration:
 - Key size: 16 bytes
 - Value size: 32 bytes
@@ -383,7 +383,7 @@ Configuration:
 | 4            | 589.8       | 169.6               |
 
 
-All benchmarks were performed on [system specifications] with:
+All benchmarks were performed with:
 - Durability: Eventual
 - Disk persistence: Enabled
 
@@ -437,7 +437,7 @@ This benchmark shows how different key-value size combinations affect load time 
 
 Key observations:
 - Load time scales roughly linearly with store size
-- Key and value size impact load time because each record's checksum is calculated based on their bytes, so an increase in size leads to an increase in time. However, the insertion into the index only stores the value offset against the key, which does not significantly affect load time.
+- Key and value size impact load time because each record's checksum is calculated based on their bytes, so an increase in size leads to an increase in time to calculate the checksum. However, the insertion into the index only stores the value offset against the key, which does not significantly affect load time.
 
 
 #### Impact of Version Count
