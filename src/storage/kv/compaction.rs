@@ -112,8 +112,6 @@ impl StoreInner {
                                ts: u64,
                                metadata: Option<Metadata>|
          -> Result<()> {
-            let mut key = key;
-            key.truncate(key.len() - 1);
             let mut entry = Entry::new(&key, &value);
             entry.set_ts(ts);
 

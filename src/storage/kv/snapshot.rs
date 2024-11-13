@@ -43,10 +43,6 @@ impl Snapshot {
 
     /// Set a key-value pair into the snapshot.
     pub(crate) fn set(&mut self, key: &VariableSizeKey, value: IndexValue) {
-        // TODO: need to fix this to avoid cloning the key
-        // This happens because the VariableSizeKey transfrom from
-        // a &[u8] does not terminate the key with a null byte.
-        let key = &key.terminate();
         self.snap
             .insert(key, value, self.version, now())
             .expect("incorrect snapshot version");
@@ -54,10 +50,6 @@ impl Snapshot {
 
     #[allow(unused)]
     pub(crate) fn delete(&mut self, key: &VariableSizeKey) -> bool {
-        // TODO: need to fix this to avoid cloning the key
-        // This happens because the VariableSizeKey transfrom from
-        // a &[u8] does not terminate the key with a null byte.
-        let key = &key.terminate();
         self.snap.remove(key)
     }
 
@@ -71,10 +63,6 @@ impl Snapshot {
 
     /// Retrieves the latest value associated with the given key from the snapshot.
     pub(crate) fn get(&self, key: &VariableSizeKey) -> Result<(IndexValue, u64)> {
-        // TODO: need to fix this to avoid cloning the key
-        // This happens because the VariableSizeKey transfrom from
-        // a &[u8] does not terminate the key with a null byte.
-        let key = &key.terminate();
         let (snap_val, version, _) = self.snap.get(key, self.version).ok_or(Error::KeyNotFound)?;
         let val = self.apply_filters(snap_val, &FILTERS)?;
         Ok((val, version))
@@ -82,7 +70,6 @@ impl Snapshot {
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
     pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<IndexValue> {
-        let key = &key.terminate();
         let (val, _, _) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
         self.apply_filters(val, &FILTERS)
     }
@@ -92,8 +79,6 @@ impl Snapshot {
         &self,
         key: &VariableSizeKey,
     ) -> Result<Vec<(IndexValue, u64)>> {
-        let key = &key.terminate();
-
         let mut results = Vec::new();
 
         let items = self

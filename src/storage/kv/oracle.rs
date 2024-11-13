@@ -270,7 +270,7 @@ fn key_in_range(
     range_start: &Bound<VariableSizeKey>,
     range_end: &Bound<VariableSizeKey>,
 ) -> bool {
-    let key = VariableSizeKey::from_slice_with_termination(key);
+    let key = VariableSizeKey::from_slice(key);
 
     let start_inclusive = match &range_start {
         Bound::Included(start) => key >= *start,
