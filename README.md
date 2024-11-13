@@ -167,7 +167,7 @@ let all_versions = tx.scan_all_versions(range, Some(10))?;
 
 The `Durability` enum provides two levels of durability for transactions:
 
-- `Eventual`: Commits with this durability level are guaranteed to be persistent eventually. The data is written to the disk, but it is not fsynced before returning from `Transaction::commit`. This is the default durability level.
+- `Eventual`: Commits with this durability level are guaranteed to be persistent eventually. The data is written to the kernel buffer, but it is not fsynced before returning from `Transaction::commit`. This is the default durability level.
 - `Immediate`: Commits with this durability level are guaranteed to be persistent as soon as `Transaction::commit` returns. Data is fsynced to disk before returning from `Transaction::commit`. This is the slowest durability level, but it is the safest.
 
 ```rust
