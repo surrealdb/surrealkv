@@ -343,6 +343,57 @@ The Multi-Version Concurrency Control system allows:
 
 ### Key-Value Operations Performance
 
+The following benchmarks measure single-operation latency across different key and value sizes.
+
+#### Sequential Insert Performance (μs)
+
+| Value Size | Key Size (bytes) ||||
+|------------|-----------|-----------|-----------|-----------|
+| (bytes)    | 8         | 32        | 128       | 256       |
+|------------|-----------|-----------|-----------|-----------|
+| 8          | 16.57     | 15.60     | 16.19     | 16.61     |
+| 256        | 16.44     | 16.21     | 16.82     | 16.60     |
+| 1024       | 17.71     | 18.12     | 18.01     | 18.17     |
+| 4096       | 25.47     | 26.67     | 26.92     | 26.55     |
+
+#### Random Insert Performance (μs)
+
+| Value Size | Key Size (bytes) ||||
+|------------|-----------|-----------|-----------|-----------|
+| (bytes)    | 8         | 32        | 128       | 256       |
+|------------|-----------|-----------|-----------|-----------|
+| 8          | 19.55     | 19.01     | 20.84     | 19.99     |
+| 256        | 20.07     | 19.33     | 21.58     | 21.16     |
+| 1024       | 20.18     | 20.60     | 22.65     | 20.45     |
+| 4096       | 24.08     | 22.73     | 24.39     | 23.24     |
+
+#### Range Scan Performance
+
+| Number of Keys | Key Size (bytes) | Value Size (bytes) | Latency (μs)
+|---------------|------------------|-------------------|--------------|
+| 100           | 4 (u32)          | 100               | 7.01         |
+| 1,000         | 4 (u32)          | 100               | 71.92        |
+| 10,000        | 4 (u32)          | 100               | 823.29       |
+
+### Concurrent Operations
+
+#### Multi-threaded Insert Performance
+Configuration:
+- Key size: 16 bytes
+- Value size: 32 bytes
+- Dataset size: 5MB
+
+| Thread Count | Latency (ms) | Throughput (K ops/sec) |
+|--------------|-------------|----------------------|
+| 1            | 1,055.6     | 94.7                |
+| 2            | 739.3       | 135.3               |
+| 4            | 589.8       | 169.6               |
+
+
+All benchmarks were performed on [system specifications] with:
+- Durability: Eventual
+- Disk persistence: Enabled
+
 
 ### Startup Performance
 
