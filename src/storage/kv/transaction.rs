@@ -2598,7 +2598,8 @@ mod tests {
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
         let reader = MultiSegmentReader::new(sr).unwrap();
         let reader = Reader::new_from(reader);
-        let mut tx_reader = RecordReader::new(reader);
+        let mut tx_reader =
+            RecordReader::new(reader, store.inner.as_ref().unwrap().core.opts.clone());
 
         // Expect ("k2", "v2")
         let mut log_rec = Record::new();

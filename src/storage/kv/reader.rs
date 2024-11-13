@@ -2,13 +2,20 @@ use std::io::Read;
 
 use bytes::BytesMut;
 
-use crate::storage::{
-    kv::{
-        entry::{Record, MAX_KV_METADATA_SIZE},
-        error::{Error, Result},
-        meta::Metadata,
+use crate::{
+    storage::{
+        kv::{
+            entry::{Record, MAX_KV_METADATA_SIZE},
+            error::{Error, Result},
+            meta::Metadata,
+        },
+        log::{
+            CorruptionError,
+            Error::{self as LogError, Corruption},
+            MultiSegmentReader,
+        },
     },
-    log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
+    Options,
 };
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
@@ -116,6 +123,7 @@ pub(crate) struct RecordReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
+    opts: Options,
 }
 
 impl RecordReader {
@@ -124,11 +132,12 @@ impl RecordReader {
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
-    pub(crate) fn new(r: Reader) -> Self {
+    pub(crate) fn new(r: Reader, opts: Options) -> Self {
         RecordReader {
             r,
             err: None,
             rec: Vec::new(),
+            opts,
         }
     }
 
@@ -234,12 +243,15 @@ impl RecordReader {
         rec.value_len = v_len as u32;
         rec.key_len = k_len as u32;
 
-        let actual_crc = rec.calculate_crc32();
-        if entry_crc != actual_crc {
-            return Err(corrupt_error(
-                "CRC mismatch",
-                Error::ChecksumMismatch(entry_crc, actual_crc),
-            ));
+        // Verify checksum if not skipped
+        if !self.opts.skip_checksum_verification {
+            let actual_crc = rec.calculate_crc32();
+            if entry_crc != actual_crc {
+                return Err(corrupt_error(
+                    "CRC mismatch",
+                    Error::ChecksumMismatch(entry_crc, actual_crc),
+                ));
+            }
         }
 
         rec.crc32 = entry_crc;

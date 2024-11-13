@@ -19,7 +19,7 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 3)]
+#[revisioned(revision = 4)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Options {
     // Required options.
@@ -47,6 +47,9 @@ pub struct Options {
     // Used to enable or disable versioned values.
     #[revision(start = 3)]
     pub enable_versions: bool,
+
+    #[revision(start = 4)]
+    pub skip_checksum_verification: bool, // Skip checksum verification for read operations.
 }
 
 impl Default for Options {
@@ -61,6 +64,7 @@ impl Default for Options {
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
             enable_versions: true,
+            skip_checksum_verification: false,
         }
     }
 }

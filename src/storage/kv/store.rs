@@ -381,7 +381,7 @@ impl Core {
         let reader = Reader::new_from(reader);
 
         // A RecordReader is created from the Reader to read transactions.
-        let mut tx_reader = RecordReader::new(reader);
+        let mut tx_reader = RecordReader::new(reader, opts.clone());
 
         // A Record is created to hold the transactions. The maximum number of entries per transaction is specified.
         let mut tx = Record::new();
@@ -427,7 +427,12 @@ impl Core {
                 "Repairing corrupted segment with id: {} and offset: {}",
                 corrupted_segment_id, corrupted_offset
             );
-            repair_last_corrupted_segment(clog, corrupted_segment_id, corrupted_offset)?;
+            repair_last_corrupted_segment(
+                clog,
+                opts.clone(),
+                corrupted_segment_id,
+                corrupted_offset,
+            )?;
         }
 
         Ok(num_entries)

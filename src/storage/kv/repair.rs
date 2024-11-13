@@ -10,12 +10,14 @@ use crate::storage::{
     },
     log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef},
 };
+use crate::Options;
 
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
 /// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
 /// and also due to the asynchronous nature of calling close on the store.
 pub(crate) fn repair_last_corrupted_segment(
     aol: &mut Aol,
+    opts: Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -44,6 +46,7 @@ pub(crate) fn repair_last_corrupted_segment(
     // Repair the last segment
     repair_segment(
         aol,
+        opts,
         last_segment_id,
         corrupted_offset_marker,
         last_segment_path,
@@ -56,6 +59,7 @@ pub(crate) fn repair_last_corrupted_segment(
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment(
     aol: &mut Aol,
+    opts: Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -85,6 +89,7 @@ pub(crate) fn repair_corrupted_segment(
 
     repair_segment(
         aol,
+        opts,
         corrupted_segment_id,
         corrupted_offset_marker,
         file_path,
@@ -122,6 +127,7 @@ pub(crate) fn repair_corrupted_segment(
 /// If any of these operations fail, the function returns an error.
 fn repair_segment(
     aol: &mut Aol,
+    opts: Options,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
@@ -151,7 +157,7 @@ fn repair_segment(
 
     // Initialize a reader for the segment
     let reader = Reader::new_from(segment_reader);
-    let mut reader = RecordReader::new(reader);
+    let mut reader = RecordReader::new(reader, opts);
 
     let mut count = 0;
     // Read records until the offset marker is reached
@@ -329,7 +335,13 @@ mod tests {
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
-        repair_corrupted_segment(&mut clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
+        repair_corrupted_segment(
+            &mut clog,
+            opts,
+            corrupted_segment_id,
+            corrupted_offset_marker,
+        )
+        .unwrap();
 
         // drop lock over commit log
         drop(clog);
@@ -338,7 +350,7 @@ mod tests {
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
         let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"));
-        let mut tx_reader = RecordReader::new(reader);
+        let mut tx_reader = RecordReader::new(reader, opts);
         let mut tx = Record::new();
 
         loop {
