@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
-SurrealKV is a versioned, low-level, persistent, embedded key-value database implemented in Rust. It provides ACID compliance, rich transaction support, and efficient concurrent operations through Multi-Version Concurrency Control (MVCC).
+surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust. This ACID-compliant database offers the following features:
 
 ## Features
 
