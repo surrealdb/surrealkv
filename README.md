@@ -227,6 +227,14 @@ SurrealKV implements a two-component architecture:
    - Update index references
    - Remove old log file
 
+4. **Recovery Process**
+   - Sequential scan of all log segments during startup
+   - Reconstruction of in-memory index from log entries
+   - Startup time directly proportional to:
+     * Total size of all segments
+     * Number of unique keys and versions
+   - Memory usage during recovery proportional to key count
+
 
 ### Storage Format
 
@@ -275,7 +283,9 @@ The Multi-Version Concurrency Control system allows:
    - Range queries benefit from trie's prefix-based organization
 
 3. **Recovery Semantics**
-   - Recovery time proportional to size of last active segment
+   - Initial startup requires full segment scan to rebuild index
+   - Recovery time proportional to total size of all segments
+   - Repair time proportional to size of last active segment
    - CRC verification ensures data integrity during recovery
    - Partial write detection:
      * Uses CRC32 and record fields to detect truncated writes
@@ -328,6 +338,88 @@ The Multi-Version Concurrency Control system allows:
    - Very large key spaces
    - Scan-heavy workloads
    - Random updates to large datasets
+
+## Benchmarks
+
+### Key-Value Operations Performance
+
+
+### Startup Performance
+
+SurrealKV rebuilds its index from log segments during startup. The following benchmarks demonstrate how different factors affect startup performance.
+
+#### Impact of Key-Value Sizes on Load Time
+
+This benchmark shows how different key-value size combinations affect load time and storage size (1M entries each):
+
+| Key Size | Value Size | Distribution | Load Time (s) | Store Size (GB) |
+|----------|------------|--------------|---------------|-----------------|
+| 32       | 64        | Sequential   | 0.61         | 0.12           |
+| 32       | 64        | Random       | 0.70         | 0.12           |
+| 32       | 256       | Sequential   | 0.74         | 0.30           |
+| 32       | 256       | Random       | 0.83         | 0.30           |
+| 32       | 1024      | Sequential   | 1.13         | 1.01           |
+| 32       | 1024      | Random       | 1.43         | 1.01           |
+| 32       | 4096      | Sequential   | 2.85         | 3.87           |
+| 32       | 4096      | Random       | 2.82         | 3.87           |
+| 32       | 16384     | Sequential   | 8.63         | 15.32          |
+| 32       | 16384     | Random       | 8.99         | 15.32          |
+| 32       | 65536     | Sequential   | 31.04        | 61.09          |
+| 32       | 65536     | Random       | 31.79        | 61.09          |
+| 128      | 64        | Sequential   | 0.63         | 0.21           |
+| 128      | 64        | Random       | 0.64         | 0.21           |
+| 128      | 256       | Sequential   | 0.68         | 0.39           |
+| 128      | 256       | Random       | 0.81         | 0.39           |
+| 128      | 1024      | Sequential   | 1.10         | 1.10           |
+| 128      | 1024      | Random       | 1.31         | 1.10           |
+| 128      | 4096      | Sequential   | 2.95         | 3.96           |
+| 128      | 4096      | Random       | 3.01         | 3.96           |
+| 128      | 16384     | Sequential   | 8.67         | 15.41          |
+| 128      | 16384     | Random       | 8.91         | 15.41          |
+| 128      | 65536     | Sequential   | 31.36        | 61.18          |
+| 128      | 65536     | Random       | 31.47        | 61.18          |
+| 256      | 64        | Sequential   | 0.73         | 0.33           |
+| 256      | 64        | Random       | 0.71         | 0.33           |
+| 256      | 256       | Sequential   | 0.77         | 0.51           |
+| 256      | 256       | Random       | 0.91         | 0.51           |
+| 256      | 1024      | Sequential   | 1.22         | 1.22           |
+| 256      | 1024      | Random       | 1.29         | 1.22           |
+| 256      | 4096      | Sequential   | 3.11         | 4.08           |
+| 256      | 4096      | Random       | 3.03         | 4.08           |
+| 256      | 16384     | Sequential   | 8.81         | 15.53          |
+| 256      | 16384     | Random       | 9.12         | 15.53          |
+| 256      | 65536     | Sequential   | 31.42        | 61.30          |
+| 256      | 65536     | Random       | 32.66        | 61.30          |
+
+
+Key observations:
+- Load time scales roughly linearly with store size
+- Random vs Sequential key distribution has minimal impact on load times (~10% difference)
+- Load performance is primarily bound by I/O throughput
+
+Key observations:
+- Load time scales roughly linearly with store size
+- Key and value size impact load time because each record's checksum is calculated based on their bytes, so an increase in size leads to an increase in time. However, the insertion into the index only stores the value offset against the key, which does not significantly affect load time.
+- Load performance is primarily bound by I/O throughput
+- Random vs Sequential key distribution has minimal impact on load times (typically <15% difference)
+- At larger store sizes (>15GB), load times remain predictable and proportional
+
+
+#### Impact of Version Count
+
+This benchmark demonstrates how the number of versions affects load time while maintaining a constant total entry count:
+
+| Versions | Keys    | Load Time (s) | Store Size (MB) |
+|----------|---------|---------------|-----------------|
+| 10       | 100,000 | 1.01         | 1,251.22       |
+| 100      | 10,000  | 0.97         | 1,251.22       |
+| 1,000    | 1,000   | 1.10         | 1,251.22       |
+
+Key observations:
+- Version count has minimal impact on load time when total data size remains constant
+- Memory usage scales with number of unique keys rather than total versions
+
+
 
 
 ## License
