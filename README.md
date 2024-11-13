@@ -195,10 +195,6 @@ SurrealKV implements a two-component architecture:
 1. **Index Component**
    - In-memory versioned adaptive radix trie using [vart](https://github.com/surrealdb/vart)
    - Stores key-to-offset mappings for each version of the key
-   - Time complexity for operations:
-     * Insert: O(L) where L is key length in bytes
-     * Search: O(L) where L is key length in bytes
-     * Delete: O(L) where L is key length in bytes
 
 2. **Log Component**
    - Sequential append-only storage divided into segments
@@ -233,7 +229,6 @@ SurrealKV implements a two-component architecture:
    - Startup time directly proportional to:
      * Total size of all segments
      * Number of unique keys and versions
-   - Memory usage during recovery proportional to key count
 
 
 ### Storage Format
@@ -288,14 +283,12 @@ The Multi-Version Concurrency Control system allows:
    - Repair time proportional to size of last active segment
    - CRC verification ensures data integrity during recovery
    - Partial write detection:
-     * Uses CRC32 and record fields to detect truncated writes
-     * Records are self-validating through header checksum metadata
-     * System identifies and truncates incomplete records during recovery
+     * Uses CRC32 calculated from the record fields to detect truncated writes
+     * Identifies and truncates incomplete records during recovery
      * Transaction logs are recovered to the last valid record boundary
 
 
 4. **Operational Advantages**
-   - Backup operations can occur during live operation
    - Compaction process runs concurrently with normal operations
    - Append-only format simplifies replication procedures
 
@@ -322,7 +315,7 @@ The Multi-Version Concurrency Control system allows:
 
 4. **Operational Considerations**
    - Compaction necessary for space reclamation
-   - Recovery time increases with log size
+   - Restart time increases with log size
    - Memory pressure in high-cardinality keyspaces
 
 ### Performance Implications
@@ -442,18 +435,9 @@ This benchmark shows how different key-value size combinations affect load time 
 | 256      | 65536     | Sequential   | 31.42        | 61.30          |
 | 256      | 65536     | Random       | 32.66        | 61.30          |
 
-
-Key observations:
-- Load time scales roughly linearly with store size
-- Random vs Sequential key distribution has minimal impact on load times (~10% difference)
-- Load performance is primarily bound by I/O throughput
-
 Key observations:
 - Load time scales roughly linearly with store size
 - Key and value size impact load time because each record's checksum is calculated based on their bytes, so an increase in size leads to an increase in time. However, the insertion into the index only stores the value offset against the key, which does not significantly affect load time.
-- Load performance is primarily bound by I/O throughput
-- Random vs Sequential key distribution has minimal impact on load times (typically <15% difference)
-- At larger store sizes (>15GB), load times remain predictable and proportional
 
 
 #### Impact of Version Count
@@ -468,9 +452,6 @@ This benchmark demonstrates how the number of versions affects load time while m
 
 Key observations:
 - Version count has minimal impact on load time when total data size remains constant
-- Memory usage scales with number of unique keys rather than total versions
-
-
 
 
 ## License
