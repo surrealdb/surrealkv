@@ -11,7 +11,7 @@ surrealkv is a versioned, low-level, persistent, embedded key-value database imp
 - 🔒 **Isolation Levels**: Choose between Snapshot Isolation and Serializable Snapshot Isolation
 - 💾 **Durability Guaranteed**: Persistent storage with protection against system failures
 - 📦 **Embedded Database**: Easily integrate into your Rust applications
-- 🔄 **MVCC Support**: Non-blocking concurrent reads and writes using [immutable versioned adaptive radix trie](https://github.com/surrealdb/vart)
+- 🔄 **MVCC Support**: Non-blocking concurrent reads and writes using [versioned adaptive radix trie](https://github.com/surrealdb/vart)
 - 📚 **Built-in Versioning**: Track and access historical versions of your data
 - 🗜️ **Compaction**: Efficient storage management through compaction
 
@@ -49,8 +49,8 @@ opts.dir = "path/to/db".into();                    // Database directory path
 
 // Storage configuration
 opts.disk_persistence = true;                       // false for in-memory only operation
-opts.max_value_threshold = 4096;                    // Values larger than this stored in separate files
-opts.max_segment_size = 268_435_456;               // 256MB default segment size
+opts.max_value_threshold = 4096;                    // Values smaller than this stored in memory
+opts.max_segment_size = 268_435_456;               // 256MB segment size
 opts.max_compaction_segment_size = 1_073_741_824;  // 1GB max compaction segment
 
 // Transaction and versioning
@@ -66,9 +66,8 @@ let store = Store::new(opts).expect("failed to create store");
 ### Storage Options
 
 - `disk_persistence`: Controls whether data is persisted to disk or kept only in memory
-- `max_value_threshold`: Values exceeding this size are stored in separate files for better memory management
+- `max_value_threshold`: Values within this size are stored and served directly from memory
 - `max_segment_size`: Controls when new log segments are created, affects compaction frequency
-- `max_compaction_segment_size`: Maximum size of segments after compaction
 
 ### Transaction Options
 
