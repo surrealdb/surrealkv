@@ -18,7 +18,8 @@ surrealkv is a versioned, low-level, persistent, embedded key-value database imp
 ## Quick Start
 
 ```rust
-use surrealkv::{Store, Options, Bytes};
+use surrealkv::{Store, Options};
+use bytes::Bytes;
 
 // Create a new store
 let mut opts = Options::new();
@@ -83,7 +84,8 @@ let store = Store::new(opts).expect("failed to create store");
 ### Basic Operations
 
 ```rust
-use surrealkv::{Store, Options, Bytes};
+use surrealkv::{Store, Options};
+use bytes::Bytes;
 
 // Initialize the store
 let mut opts = Options::new();
