@@ -7,6 +7,7 @@ use crate::storage::kv::store::Core;
 
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
 /// It uses a `vart` index, which is a type of persistent, lock-free B+ tree.
+#[derive(Clone)]
 pub(crate) struct Indexer {
     pub(crate) index: VartIndex<VariableSizeKey, IndexValue>,
 }
