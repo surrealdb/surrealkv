@@ -24,7 +24,7 @@ lru = "0.12.0"
 async-channel = "2.3.1"
 futures = "0.3.30"
 bytes = "1.5.0"
-tokio = { version = "1.36", features = ["rt", "sync"] }
+tokio = { version = "1.36", features = ["rt", "sync", "rt-multi-thread"] }
 quick_cache = "0.6.0"
 vart = "0.7.0"
 revision = "0.10.0"
