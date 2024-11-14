@@ -199,7 +199,7 @@ impl Drop for Store {
                             // TODO: use log/tracing instead of eprintln
                             eprintln!("Error closing store: {}", err);
                         }
-                    });    
+                    });
                 } else {
                     // TODO: use log/tracing instead of eprintln
                     eprintln!("Failed to create runtime for store cleanup");
