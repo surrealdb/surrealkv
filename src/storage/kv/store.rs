@@ -181,13 +181,17 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
+            // Create a new async executor
+            let exe = async_executor::Executor::new();
             // Close the store asynchronously
-            tokio::spawn(async move {
+            let task = exe.spawn(async move {
                 if let Err(err) = inner.close().await {
                     // TODO: use log/tracing instead of eprintln
                     eprintln!("Error occurred while closing the kv store: {}", err);
                 }
             });
+            // Block until the future completes
+            futures::executor::block_on(exe.run(task));
         }
     }
 }
