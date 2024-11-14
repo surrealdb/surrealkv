@@ -181,13 +181,18 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            // Close the store asynchronously
-            tokio::spawn(async move {
-                if let Err(err) = inner.close().await {
-                    // TODO: use log/tracing instead of eprintln
-                    eprintln!("Error occurred while closing the kv store: {}", err);
-                }
-            });
+            // Try to get existing runtime handle first
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                // We're in a runtime, spawn normally
+                handle.spawn(async move {
+                    if let Err(err) = inner.close().await {
+                        // TODO: use log/tracing instead of eprintln
+                        eprintln!("Error closing store: {}", err);
+                    }
+                });
+            } else {
+                eprintln!("No runtime available for closing the store correctly");
+            }
         }
     }
 }
