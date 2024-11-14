@@ -191,19 +191,7 @@ impl Drop for Store {
                     }
                 });
             } else {
-                // No runtime, create a temporary one
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    // Block until close completes
-                    rt.spawn(async move {
-                        if let Err(err) = inner.close().await {
-                            // TODO: use log/tracing instead of eprintln
-                            eprintln!("Error closing store: {}", err);
-                        }
-                    });
-                } else {
-                    // TODO: use log/tracing instead of eprintln
-                    eprintln!("Failed to create runtime for store cleanup");
-                }
+                eprintln!("No runtime available for closing the store correctly");
             }
         }
     }
