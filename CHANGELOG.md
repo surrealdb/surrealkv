@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2024-11-15
+
+### ⚡ Performance
+
+- Do not hold write lock while updating the index (#129)
+
 ## [0.5.1] - 2024-11-14
 
 ### 🚀 Features
