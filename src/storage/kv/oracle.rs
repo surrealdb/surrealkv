@@ -178,6 +178,24 @@ impl SnapshotIsolation {
             }
         }
 
+        // Check write conflicts
+        for key in txn.write_set.keys() {
+            if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
+                match current_snapshot.get(&key[..].into()) {
+                    Ok((_, version)) => {
+                        // Detect if another transaction has written to this key
+                        if version > last_entry.version {
+                            return Err(Error::TransactionReadConflict);
+                        }
+                    }
+                    Err(Error::KeyNotFound) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
         let ts = self.next_tx_id.load(Ordering::SeqCst);
         self.increment_ts();
         Ok(ts)

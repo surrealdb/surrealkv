@@ -85,14 +85,16 @@ pub(crate) struct WriteSetEntry {
     pub(crate) e: Entry,
     savepoint_no: u32,
     seqno: u32,
+    pub(crate) version: u64,
 }
 
 impl WriteSetEntry {
-    pub(crate) fn new(e: Entry, savepoint_no: u32, seqno: u32) -> Self {
+    pub(crate) fn new(e: Entry, savepoint_no: u32, seqno: u32, version: u64) -> Self {
         Self {
             e,
             savepoint_no,
             seqno,
+            version,
         }
     }
 }
@@ -346,7 +348,7 @@ impl Transaction {
         // Set the transaction's latest savepoint number and add it to the write set.
         let key = e.key.clone();
         let write_seqno = self.next_write_seqno();
-        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno);
+        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno, self.read_ts);
         match self.write_set.entry(key) {
             HashEntry::Occupied(mut oe) => {
                 let entries = oe.get_mut();
@@ -1039,7 +1041,7 @@ mod tests {
             });
         }
 
-        // blind writes should succeed if key wasn't read first
+        // blind writes should not succeed
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1048,11 +1050,12 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
 
             txn1.commit().await.unwrap();
-            txn2.commit().await.unwrap();
-
-            let mut txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap().unwrap();
-            assert_eq!(val, value2.as_ref());
+            assert!(match txn2.commit().await {
+                Err(err) => {
+                    matches!(err, Error::TransactionReadConflict)
+                }
+                _ => false,
+            });
         }
 
         // read conflict when the read key was updated by another transaction
