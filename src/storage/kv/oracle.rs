@@ -254,32 +254,44 @@ impl CommitTracker {
     /// Checks if a transaction has conflicts with committed transactions.
     /// It acquires a lock on the read set and checks if there are any conflict keys in the read set.
     fn has_conflict(&self, txn: &Transaction) -> bool {
-        if txn.read_set.is_empty() {
-            false
-        } else {
-            // For each object in the changeset of the already committed transactions, check if it lies
-            // within the predicates of the current transaction.
-            for committed_tx in self.committed_transactions.iter() {
-                if committed_tx.ts > txn.read_ts {
-                    for conflict_key in committed_tx.conflict_keys.iter() {
-                        for rs_entry in txn.read_key_ranges.iter() {
-                            if key_in_range(conflict_key, &rs_entry.start, &rs_entry.end) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-
+        // For each object in the changeset of the already committed transactions, check if it lies
+        // within the predicates of the current transaction.
+        let predicate_conflict = if !txn.read_key_ranges.is_empty() {
             self.committed_transactions
                 .iter()
-                .filter(|committed_txn| committed_txn.ts > txn.read_ts)
-                .any(|committed_txn| {
-                    txn.read_set
-                        .iter()
-                        .any(|read| committed_txn.conflict_keys.contains(&read.key))
+                .filter(|committed_tx| committed_tx.ts > txn.read_ts)
+                .any(|committed_tx| {
+                    committed_tx.conflict_keys.iter().any(|conflict_key| {
+                        txn.read_key_ranges.iter().any(|rs_entry| {
+                            key_in_range(conflict_key, &rs_entry.start, &rs_entry.end)
+                        })
+                    })
                 })
-        }
+        } else {
+            false
+        };
+
+        let read_set_conflict = self
+            .committed_transactions
+            .iter()
+            .filter(|committed_tx| committed_tx.ts > txn.read_ts)
+            .any(|committed_tx| {
+                txn.read_set
+                    .iter()
+                    .any(|read| committed_tx.conflict_keys.contains(&read.key))
+            });
+
+        let write_set_conflict = self
+            .committed_transactions
+            .iter()
+            .filter(|committed_tx| committed_tx.ts > txn.read_ts)
+            .any(|committed_tx| {
+                txn.write_set
+                    .keys()
+                    .any(|write_key| committed_tx.conflict_keys.contains(write_key))
+            });
+
+        predicate_conflict || read_set_conflict || write_set_conflict
     }
 }
 

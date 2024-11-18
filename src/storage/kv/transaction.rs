@@ -1054,7 +1054,9 @@ mod tests {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
-                _ => false,
+                _ => {
+                    false
+                }
             });
         }
 
@@ -1257,7 +1259,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn mvcc_serialized_snapshot_isolation_scan() {
         mvcc_with_scan_tests(true).await;
     }
