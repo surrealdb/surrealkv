@@ -15,6 +15,7 @@ pub(crate) struct Entry {
     pub(crate) metadata: Option<Metadata>,
     pub(crate) value: Bytes,
     pub(crate) ts: u64,
+    pub(crate) replace: bool,
 }
 
 impl Entry {
@@ -24,6 +25,7 @@ impl Entry {
             metadata: None,
             value: Bytes::copy_from_slice(value),
             ts: 0,
+            replace: false,
         }
     }
 
@@ -33,6 +35,10 @@ impl Entry {
 
     pub(crate) fn set_ts(&mut self, ts: u64) {
         self.ts = ts;
+    }
+
+    pub(crate) fn set_replace(&mut self, replace: bool) {
+        self.replace = replace;
     }
 
     pub(crate) fn mark_delete(&mut self) {

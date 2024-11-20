@@ -224,7 +224,17 @@ impl Transaction {
 
     /// Adds a key-value pair to the store.
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        let entry = Entry::new(key, value);
+        let mut entry = Entry::new(key, value);
+        // Replace when versions are disabled.
+        entry.set_replace(!self.core.opts.enable_versions);
+        self.write(entry)?;
+        Ok(())
+    }
+
+    /// Inserts if not present or replaces an existing key-value pair.
+    pub fn insert_or_replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut entry = Entry::new(key, value);
+        entry.set_replace(true);
         self.write(entry)?;
         Ok(())
     }
@@ -233,6 +243,8 @@ impl Transaction {
     pub fn set_at_ts(&mut self, key: &[u8], value: &[u8], ts: u64) -> Result<()> {
         let mut entry = Entry::new(key, value);
         entry.set_ts(ts);
+        // Replace when versions are disabled.
+        entry.set_replace(!self.core.opts.enable_versions);
         self.write(entry)?;
         Ok(())
     }
@@ -254,6 +266,8 @@ impl Transaction {
         let value = Bytes::new();
         let mut entry = Entry::new(key, &value);
         entry.mark_tombstone();
+        // Replace when versions are disabled.
+        entry.set_replace(!self.core.opts.enable_versions);
         self.write(entry)?;
         Ok(())
     }
