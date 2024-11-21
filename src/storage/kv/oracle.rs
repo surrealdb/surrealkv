@@ -165,11 +165,13 @@ impl SnapshotIsolation {
             match current_snapshot.get(&entry.key[..].into()) {
                 Ok((_, version)) => {
                     if entry.ts != version {
+                        println!("fail1-------> key: {:?}, entry.ts: {}, version: {}", String::from_utf8_lossy(&entry.key),entry.ts, version);
                         return Err(Error::TransactionReadConflict);
                     }
                 }
                 Err(Error::KeyNotFound) => {
                     if entry.ts > 0 {
+                        println!("fail2-------> key: {:?}, entry.ts: {}", String::from_utf8_lossy(&entry.key),entry.ts);
                         return Err(Error::TransactionReadConflict);
                     }
                     continue;
