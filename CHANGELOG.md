@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.4] - 2024-11-21
+
+- Add Transaction::insert_or_replace() (#134)
+
+## [0.5.3] - 2024-11-19
+
+- Revert: Do not hold write lock while updating the index (#133)
+
 ## [0.5.2] - 2024-11-15
 
 ### ⚡ Performance
