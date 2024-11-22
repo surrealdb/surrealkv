@@ -1,14 +1,24 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Instant;
+
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use bytes::BytesMut;
 use humansize::{format_size, BINARY};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Instant;
+
 use surrealkv::{
-    storage::kv::error::Error, storage::log::Error as LogError, storage::log::MultiSegmentReader,
-    storage::log::SegmentRef, Reader, Record, RecordReader,
+    storage::kv::error::Error,
+    storage::log::Error as LogError,
+    storage::log::SegmentRef,
+    storage::log::{Aol, MultiSegmentReader, Options as LogOptions},
+    Reader, Record, RecordReader,
 };
 
 pub struct DbStats {
@@ -153,38 +163,8 @@ impl Analyzer {
         &self,
         keys_file: Option<&PathBuf>,
         keys: Option<&Vec<String>>,
+        destination: &PathBuf,
     ) -> Result<()> {
-        let keys: Vec<String> = if let Some(file) = keys_file {
-            // Read from file
-            std::fs::read_to_string(file)
-                .context("Failed to read keys file")?
-                .lines()
-                .map(String::from)
-                .collect()
-        } else if let Some(key_list) = keys {
-            // Use provided key list
-            key_list.clone()
-        } else {
-            return Err(anyhow::anyhow!("Either keys_file or keys must be provided"));
-        };
-
-        let pb = ProgressBar::new(keys.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})")
-                .unwrap(),
-        );
-
-        for key in keys {
-            // TODO: Implement pruning logic
-            pb.inc(1);
-        }
-
-        pb.finish_with_message("Pruning complete!");
-        Ok(())
-    }
-
-    pub fn prune_all_keys(&self) -> Result<()> {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -192,9 +172,242 @@ impl Analyzer {
                 .unwrap(),
         );
 
-        // TODO: Implement pruning logic using store APIs
+        // Get the target keys
+        let target_keys: Vec<String> = if let Some(file) = keys_file {
+            std::fs::read_to_string(file)
+                .context("Failed to read keys file")?
+                .lines()
+                .map(String::from)
+                .collect()
+        } else if let Some(key_list) = keys {
+            key_list.clone()
+        } else {
+            return Err(anyhow::anyhow!("Either keys_file or keys must be provided"));
+        };
 
-        pb.finish_with_message("All keys pruned successfully!");
+        pb.set_message(format!(
+            "Analyzing records for {} specific keys...",
+            target_keys.len()
+        ));
+
+        // Convert target keys to Bytes for efficient comparison
+        let target_keys_set: BTreeSet<Bytes> = target_keys
+            .iter()
+            .map(|k| Bytes::copy_from_slice(k.as_bytes()))
+            .collect();
+
+        // Map to store the latest version of each target key
+        let mut latest_records: BTreeMap<Bytes, Record> = BTreeMap::new();
+
+        // Read all records and keep track of the latest versions for target keys
+        let corruption_info = self.read_records(|tx| {
+            let record_key = tx.key.clone();
+
+            // Only process if this key is in our target set
+            if target_keys_set.contains(&record_key) {
+                let existing_record = latest_records
+                    .entry(record_key)
+                    .or_insert_with(|| tx.clone());
+
+                if tx.ts > existing_record.ts {
+                    *existing_record = tx.clone();
+                }
+            }
+            Ok(())
+        })?;
+
+        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
+            eprintln!(
+                "Found corruption in segment {} at offset {}",
+                corrupted_segment_id, corrupted_offset
+            );
+            return Err(anyhow::anyhow!(
+                "Corruption found in segment {} at offset {}",
+                corrupted_segment_id,
+                corrupted_offset
+            ));
+        }
+
+        let found_keys = latest_records.len();
+        pb.set_message(format!(
+            "Found {} out of {} requested keys",
+            found_keys,
+            target_keys.len()
+        ));
+
+        // Print keys that were not found
+        let found_keys_set: BTreeSet<_> = latest_records.keys().collect();
+        let missing_keys: Vec<_> = target_keys_set
+            .iter()
+            .filter(|k| !found_keys_set.contains(k))
+            .collect();
+
+        if !missing_keys.is_empty() {
+            println!("\nWarning: The following keys were not found:");
+            for key in missing_keys {
+                println!("  - {}", String::from_utf8_lossy(key));
+            }
+        }
+
+        // Create destination directory if it doesn't exist
+        std::fs::create_dir_all(destination)?;
+
+        // Copy manifest folder
+        let source_manifest = self.db_path.join("manifest");
+        let destination_manifest = destination.join("manifest");
+
+        pb.set_message("Copying manifest folder...");
+        if source_manifest.exists() {
+            // Remove destination manifest if it exists
+            if destination_manifest.exists() {
+                fs::remove_dir_all(&destination_manifest)?;
+            }
+            // Copy the manifest directory recursively
+            fs::create_dir_all(&destination_manifest)?;
+            copy_dir_all(&source_manifest, &destination_manifest)?;
+        }
+
+        pb.set_message("Writing latest versions to new location...");
+
+        // Initialize new commit log
+        let destination_clog_subdir = destination.join("clog");
+
+        // Setup log options
+        let copts = LogOptions::default()
+            .with_max_file_size(512 * 1024 * 1024) // 512MB default
+            .with_file_extension("clog".to_string());
+
+        // Open the commit log
+        let mut destination_commit_log =
+            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
+
+        // Write latest versions to new location
+        let mut total_written = 0;
+        for record in latest_records.values() {
+            let mut buffer = BytesMut::new();
+            record.encode(&mut buffer)?;
+            destination_commit_log.append(&buffer)?;
+            total_written += 1;
+
+            if total_written % 1000 == 0 {
+                pb.set_message(format!(
+                    "Written {}/{} records",
+                    total_written,
+                    latest_records.len()
+                ));
+            }
+        }
+
+        // Ensure all writes are persisted
+        destination_commit_log.sync()?;
+
+        pb.finish_with_message(format!(
+            "Successfully migrated {} records and manifest to {}",
+            total_written,
+            destination.display()
+        ));
+
+        Ok(())
+    }
+
+    pub fn prune_all_keys(&self, destination: &PathBuf) -> Result<()> {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {wide_msg}")
+                .unwrap(),
+        );
+        pb.set_message("Analyzing records...");
+
+        // Map to store the latest version of each unique key
+        let mut latest_records: BTreeMap<Bytes, Record> = BTreeMap::new();
+
+        // Read all records and keep track of the latest versions
+        let corruption_info = self.read_records(|tx| {
+            let record_key = tx.key.clone();
+
+            let existing_record = latest_records
+                .entry(record_key)
+                .or_insert_with(|| tx.clone());
+
+            if tx.ts > existing_record.ts {
+                *existing_record = tx.clone();
+            }
+            Ok(())
+        })?;
+
+        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
+            eprintln!(
+                "Found corruption in segment {} at offset {}",
+                corrupted_segment_id, corrupted_offset
+            );
+            return Err(anyhow::anyhow!(
+                "Corruption found in segment {} at offset {}",
+                corrupted_segment_id,
+                corrupted_offset
+            ));
+        }
+
+        pb.set_message(format!("Found {} unique keys", latest_records.len()));
+
+        // Create destination directory if it doesn't exist
+        std::fs::create_dir_all(destination)?;
+
+        // Copy manifest folder
+        let source_manifest = self.db_path.join("manifest");
+        let destination_manifest = destination.join("manifest");
+
+        pb.set_message("Copying manifest folder...");
+        if source_manifest.exists() {
+            // Remove destination manifest if it exists
+            if destination_manifest.exists() {
+                fs::remove_dir_all(&destination_manifest)?;
+            }
+            // Copy the manifest directory recursively
+            fs::create_dir_all(&destination_manifest)?;
+            copy_dir_all(&source_manifest, &destination_manifest)?;
+        }
+
+        pb.set_message("Writing latest versions to new location...");
+
+        // Initialize new commit log
+        let destination_clog_subdir = destination.join("clog");
+
+        // Setup log options
+        let copts = LogOptions::default()
+            .with_max_file_size(512 * 1024 * 1024) // 512MB default
+            .with_file_extension("clog".to_string());
+
+        // Open the commit log
+        let mut destination_commit_log =
+            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
+
+        // Write latest versions to new location
+        let mut total_written = 0;
+        for record in latest_records.values() {
+            let mut buffer = BytesMut::new();
+            record.encode(&mut buffer)?;
+            destination_commit_log.append(&buffer)?;
+            total_written += 1;
+
+            if total_written % 1000 == 0 {
+                pb.set_message(format!(
+                    "Written {}/{} records",
+                    total_written,
+                    latest_records.len()
+                ));
+            }
+        }
+
+        // Ensure all writes are persisted
+        destination_commit_log.sync()?;
+
+        pb.finish_with_message(format!(
+            "Successfully migrated {} records and manifest to {}",
+            total_written,
+            destination.display()
+        ));
+
         Ok(())
     }
 
@@ -263,4 +476,21 @@ impl Analyzer {
         pb.finish_with_message("Statistics collection complete!");
         Ok(stats)
     }
+}
+
+// Helper function to recursively copy directories
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.as_ref().join(entry.file_name());
+
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst_path)?;
+        } else {
+            fs::copy(entry.path(), dst_path)?;
+        }
+    }
+    Ok(())
 }

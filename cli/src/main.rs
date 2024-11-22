@@ -23,11 +23,15 @@ fn run() -> Result<()> {
         Commands::TopVersions { format, count } => {
             analyzer.analyze_top_versions(format, *count)?;
         }
-        Commands::PruneKeys { keys_file, keys } => {
-            analyzer.prune_specific_keys(keys_file.as_ref(), keys.as_ref())?;
+        Commands::PruneKeys {
+            keys_file,
+            keys,
+            destination,
+        } => {
+            analyzer.prune_specific_keys(keys_file.as_ref(), keys.as_ref(), destination)?;
         }
-        Commands::PruneAll {} => {
-            analyzer.prune_all_keys()?;
+        Commands::PruneAll { destination } => {
+            analyzer.prune_all_keys(destination)?;
         }
         Commands::Stats => {
             let stats = analyzer.collect_stats()?;

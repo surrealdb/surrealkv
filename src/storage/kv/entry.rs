@@ -101,7 +101,7 @@ pub(crate) fn encode_entries(
 //   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Record {
     pub id: u64,
     pub ts: u64,
@@ -198,7 +198,7 @@ impl Record {
         Record { crc32, ..rec }
     }
 
-    pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // This function encodes an Record into a buffer. The encoding format is as follows:
         // - CRC32 Checksum (4 bytes)
         // - Version (2 bytes)

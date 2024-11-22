@@ -36,9 +36,16 @@ pub enum Commands {
         /// Comma-separated list of keys to prune
         #[arg(short = 'k', long, value_delimiter = ',', group = "keys_input")]
         keys: Option<Vec<String>>,
+        /// Destination directory for pruned database
+        #[arg(short, long)]
+        destination: PathBuf,
     },
     /// Delete all versions except latest for all keys
-    PruneAll {},
+    PruneAll {
+        /// Destination directory for pruned database
+        #[arg(short, long)]
+        destination: PathBuf,
+    },
     /// Show database statistics
     Stats,
 }
