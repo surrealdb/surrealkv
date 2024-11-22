@@ -14,7 +14,7 @@ use crate::storage::{
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
 /// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
 /// and also due to the asynchronous nature of calling close on the store.
-pub(crate) fn repair_last_corrupted_segment(
+pub fn repair_last_corrupted_segment(
     aol: &mut Aol,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,

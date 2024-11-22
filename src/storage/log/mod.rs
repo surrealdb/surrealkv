@@ -561,7 +561,7 @@ fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 }
 
 #[derive(Debug)]
-pub(crate) struct SegmentRef {
+pub struct SegmentRef {
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
     /// The base offset of the file.
@@ -930,8 +930,8 @@ impl fmt::Display for IOError {
 pub struct CorruptionError {
     kind: io::ErrorKind,
     message: String,
-    pub(crate) segment_id: u64,
-    pub(crate) offset: u64,
+    pub segment_id: u64,
+    pub offset: u64,
 }
 
 impl CorruptionError {
@@ -971,7 +971,7 @@ pub struct MultiSegmentReader {
 }
 
 impl MultiSegmentReader {
-    pub(crate) fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader> {
+    pub fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader> {
         if segments.is_empty() {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::InvalidInput,
