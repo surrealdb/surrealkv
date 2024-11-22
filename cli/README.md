@@ -11,7 +11,7 @@ cargo install skv-cli
 ## Usage
 
 ```bash
-skv -d <database_path> <command> [options]
+skv-cli -d <database_path> <command> [options]
 ```
 
 ## Commands
@@ -22,10 +22,10 @@ Lists the top N keys with the most versions.
 
 ```bash
 # Show top 10 keys in table format
-skv -d /path/to/db top-versions
+skv-cli -d /path/to/db top-versions
 
 # Show top 20 keys in JSON format
-skv -d /path/to/db top-versions -n 20 --format json
+skv-cli -d /path/to/db top-versions -n 20 --format json
 ```
 
 Options:
@@ -38,13 +38,13 @@ Delete all versions except the latest for specified keys and migrate to a new lo
 
 ```bash
 # Prune using comma-separated keys
-skv -d /path/to/db prune-keys -k key1,key2,key3 --destination /path/to/dest
+skv-cli -d /path/to/db prune-keys -k key1,key2,key3 --destination /path/to/dest
 
 # Prune using a file containing keys
-skv -d /path/to/db prune-keys --keys-file keys.txt --destination /path/to/dest
+skv-cli -d /path/to/db prune-keys --keys-file keys.txt --destination /path/to/dest
 
 # Dry run to see what would be pruned
-skv -d /path/to/db prune-keys -k key1,key2 --destination /path/to/dest
+skv-cli -d /path/to/db prune-keys -k key1,key2 --destination /path/to/dest
 ```
 
 Options:
@@ -58,10 +58,10 @@ Delete all versions except the latest for all keys and migrate to a new location
 
 ```bash
 # Prune all keys
-skv -d /path/to/db prune-all --destination /path/to/dest
+skv-cli -d /path/to/db prune-all --destination /path/to/dest
 
 # Dry run
-skv -d /path/to/db prune-all --destination /path/to/dest
+skv-cli -d /path/to/db prune-all --destination /path/to/dest
 ```
 
 Options:
@@ -72,7 +72,7 @@ Options:
 Show comprehensive statistics about the database.
 
 ```bash
-skv -d /path/to/db stats
+skv-cli -d /path/to/db stats
 ```
 
 Statistics include:
@@ -88,7 +88,7 @@ Repair corrupted commit log segments.
 
 ```bash
 # Repair in-place (creates backup automatically)
-skv -d /path/to/db repair
+skv-cli -d /path/to/db repair
 ```
 
 ## Examples
@@ -101,22 +101,22 @@ key2
 key3" > keys.txt
 
 # Prune using the file
-skv -d /path/to/db prune-keys --keys-file keys.txt --destination /path/to/dest
+skv-cli -d /path/to/db prune-keys --keys-file keys.txt --destination /path/to/dest
 ```
 
 2. Prune all keys retaining only latest versions:
 ```bash
-skv -d /path/to/db prune-all --destination /path/to/pruned_db
+skv-cli -d /path/to/db prune-all --destination /path/to/pruned_db
 ```
 
 3. Get database statistics:
 ```bash
-skv -d /path/to/db stats
+skv-cli -d /path/to/db stats
 ```
 
 4. Repair corrupted database:
 ```bash
-skv -d /path/to/db repair
+skv-cli -d /path/to/db repair
 ```
 
 ## Understanding Version Management

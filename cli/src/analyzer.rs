@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -129,17 +128,16 @@ impl Analyzer {
         match format {
             "json" => {
                 let json_output = json!({
-                    "top_keys": top_keys.map(|(key, count)| {
-                        json!({
-                            "key": String::from_utf8_lossy(&key),
-                            "versions": count
-                        })
-                    }).collect::<Vec<_>>()
-                });
+                                "top_keys": top_keys.map(|(key, count)| {
+                json!({
+                                        "key": String::from_utf8_lossy(&key),
+                                        "versions": count
+                                    })
+                                }).collect::<Vec<_>>()
+                            });
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
             }
             "table" => {
-                println!("\nTop 10 Keys by Version Count:");
                 println!("----------------------------");
                 for (key, count) in top_keys {
                     println!("{}: {} versions", String::from_utf8_lossy(&key), count);
