@@ -37,6 +37,9 @@ fn run() -> Result<()> {
             let stats = analyzer.collect_stats()?;
             stats.display();
         }
+        Commands::Repair => {
+            analyzer.repair()?;
+        }
     }
 
     Ok(())

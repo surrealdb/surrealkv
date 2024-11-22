@@ -14,6 +14,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
 use surrealkv::{
+    restore_repair_files,
     storage::kv::error::Error,
     storage::log::Error as LogError,
     storage::log::SegmentRef,
@@ -29,7 +30,6 @@ pub struct DbStats {
     pub avg_key_size: f64,
     pub avg_value_size: f64,
     pub total_size: u64,
-    pub version_distribution: HashMap<usize, usize>,
 }
 
 impl DbStats {
@@ -49,13 +49,6 @@ impl DbStats {
             "Total Database Size: {}",
             format_size(self.total_size, BINARY)
         );
-
-        println!("\nVersion Distribution:");
-        let mut version_counts: Vec<_> = self.version_distribution.iter().collect();
-        version_counts.sort_by_key(|&(k, _)| k);
-        for (versions, count) in version_counts {
-            println!("{} versions: {} keys", versions, count);
-        }
     }
 }
 
@@ -159,6 +152,90 @@ impl Analyzer {
         Ok(())
     }
 
+    // Common function to write records and manifest
+    fn write_records_and_manifest(
+        &self,
+        latest_records: BTreeMap<Bytes, Record>,
+        destination: &PathBuf,
+        pb: &ProgressBar,
+    ) -> Result<()> {
+        // Create destination directory if it doesn't exist
+        std::fs::create_dir_all(destination)?;
+
+        // Copy manifest folder
+        let source_manifest = self.db_path.join("manifest");
+        let destination_manifest = destination.join("manifest");
+
+        pb.set_message("Copying manifest folder...");
+        if source_manifest.exists() {
+            // Remove destination manifest if it exists
+            if destination_manifest.exists() {
+                fs::remove_dir_all(&destination_manifest)?;
+            }
+            // Copy the manifest directory recursively
+            fs::create_dir_all(&destination_manifest)?;
+            copy_dir_all(&source_manifest, &destination_manifest)?;
+        }
+
+        pb.set_message("Writing latest versions to new location...");
+
+        // Initialize new commit log
+        let destination_clog_subdir = destination.join("clog");
+
+        // Setup log options
+        let copts = LogOptions::default()
+            .with_max_file_size(512 * 1024 * 1024) // 512MB default
+            .with_file_extension("clog".to_string());
+
+        // Open the commit log
+        let mut destination_commit_log =
+            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
+
+        // Write latest versions to new location
+        let mut total_written = 0;
+        for record in latest_records.values() {
+            let mut buffer = BytesMut::new();
+            record.encode(&mut buffer)?;
+            destination_commit_log.append(&buffer)?;
+            total_written += 1;
+
+            if total_written % 1000 == 0 {
+                pb.set_message(format!(
+                    "Written {}/{} records",
+                    total_written,
+                    latest_records.len()
+                ));
+            }
+        }
+
+        // Ensure all writes are persisted
+        destination_commit_log.sync()?;
+
+        pb.finish_with_message(format!(
+            "Successfully migrated {} records and manifest to {}",
+            total_written,
+            destination.display()
+        ));
+
+        Ok(())
+    }
+
+    // Helper to handle corruption info
+    fn handle_corruption(&self, corruption_info: Option<(u64, u64)>) -> Result<()> {
+        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
+            eprintln!(
+                "Found corruption in segment {} at offset {}",
+                corrupted_segment_id, corrupted_offset
+            );
+            return Err(anyhow::anyhow!(
+                "Corruption found in segment {} at offset {}",
+                corrupted_segment_id,
+                corrupted_offset
+            ));
+        }
+        Ok(())
+    }
+
     pub fn prune_specific_keys(
         &self,
         keys_file: Option<&PathBuf>,
@@ -196,37 +273,31 @@ impl Analyzer {
             .map(|k| Bytes::copy_from_slice(k.as_bytes()))
             .collect();
 
-        // Map to store the latest version of each target key
-        let mut latest_records: BTreeMap<Bytes, Record> = BTreeMap::new();
+        // Map to store all versions of each target key
+        let mut key_versions: BTreeMap<Bytes, Vec<Record>> = BTreeMap::new();
 
-        // Read all records and keep track of the latest versions for target keys
+        // Read all records and collect all versions for target keys
         let corruption_info = self.read_records(|tx| {
             let record_key = tx.key.clone();
 
-            // Only process if this key is in our target set
             if target_keys_set.contains(&record_key) {
-                let existing_record = latest_records
-                    .entry(record_key)
-                    .or_insert_with(|| tx.clone());
-
-                if tx.ts > existing_record.ts {
-                    *existing_record = tx.clone();
-                }
+                key_versions.entry(record_key).or_default().push(tx.clone());
             }
             Ok(())
         })?;
 
-        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
-            eprintln!(
-                "Found corruption in segment {} at offset {}",
-                corrupted_segment_id, corrupted_offset
-            );
-            return Err(anyhow::anyhow!(
-                "Corruption found in segment {} at offset {}",
-                corrupted_segment_id,
-                corrupted_offset
-            ));
-        }
+        self.handle_corruption(corruption_info)?;
+
+        // Process versions to keep only the latest one based on tx.id
+        let latest_records: BTreeMap<Bytes, Record> = key_versions
+            .into_iter()
+            .map(|(key, mut versions)| {
+                // Sort by id (which is sequential) in descending order
+                versions.sort_by(|a, b| b.id.cmp(&a.id));
+                // Take the first one (highest id)
+                (key, versions.into_iter().next().unwrap())
+            })
+            .collect();
 
         let found_keys = latest_records.len();
         pb.set_message(format!(
@@ -249,65 +320,7 @@ impl Analyzer {
             }
         }
 
-        // Create destination directory if it doesn't exist
-        std::fs::create_dir_all(destination)?;
-
-        // Copy manifest folder
-        let source_manifest = self.db_path.join("manifest");
-        let destination_manifest = destination.join("manifest");
-
-        pb.set_message("Copying manifest folder...");
-        if source_manifest.exists() {
-            // Remove destination manifest if it exists
-            if destination_manifest.exists() {
-                fs::remove_dir_all(&destination_manifest)?;
-            }
-            // Copy the manifest directory recursively
-            fs::create_dir_all(&destination_manifest)?;
-            copy_dir_all(&source_manifest, &destination_manifest)?;
-        }
-
-        pb.set_message("Writing latest versions to new location...");
-
-        // Initialize new commit log
-        let destination_clog_subdir = destination.join("clog");
-
-        // Setup log options
-        let copts = LogOptions::default()
-            .with_max_file_size(512 * 1024 * 1024) // 512MB default
-            .with_file_extension("clog".to_string());
-
-        // Open the commit log
-        let mut destination_commit_log =
-            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
-
-        // Write latest versions to new location
-        let mut total_written = 0;
-        for record in latest_records.values() {
-            let mut buffer = BytesMut::new();
-            record.encode(&mut buffer)?;
-            destination_commit_log.append(&buffer)?;
-            total_written += 1;
-
-            if total_written % 1000 == 0 {
-                pb.set_message(format!(
-                    "Written {}/{} records",
-                    total_written,
-                    latest_records.len()
-                ));
-            }
-        }
-
-        // Ensure all writes are persisted
-        destination_commit_log.sync()?;
-
-        pb.finish_with_message(format!(
-            "Successfully migrated {} records and manifest to {}",
-            total_written,
-            destination.display()
-        ));
-
-        Ok(())
+        self.write_records_and_manifest(latest_records, destination, &pb)
     }
 
     pub fn prune_all_keys(&self, destination: &PathBuf) -> Result<()> {
@@ -319,96 +332,32 @@ impl Analyzer {
         );
         pb.set_message("Analyzing records...");
 
-        // Map to store the latest version of each unique key
-        let mut latest_records: BTreeMap<Bytes, Record> = BTreeMap::new();
+        // Map to store all versions of each key
+        let mut key_versions: BTreeMap<Bytes, Vec<Record>> = BTreeMap::new();
 
-        // Read all records and keep track of the latest versions
+        // Read all records and collect all versions
         let corruption_info = self.read_records(|tx| {
             let record_key = tx.key.clone();
-
-            let existing_record = latest_records
-                .entry(record_key)
-                .or_insert_with(|| tx.clone());
-
-            if tx.ts > existing_record.ts {
-                *existing_record = tx.clone();
-            }
+            key_versions.entry(record_key).or_default().push(tx.clone());
             Ok(())
         })?;
 
-        if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
-            eprintln!(
-                "Found corruption in segment {} at offset {}",
-                corrupted_segment_id, corrupted_offset
-            );
-            return Err(anyhow::anyhow!(
-                "Corruption found in segment {} at offset {}",
-                corrupted_segment_id,
-                corrupted_offset
-            ));
-        }
+        self.handle_corruption(corruption_info)?;
+
+        // Process versions to keep only the latest one based on tx.id
+        let latest_records: BTreeMap<Bytes, Record> = key_versions
+            .into_iter()
+            .map(|(key, mut versions)| {
+                // Sort by id (which is sequential) in descending order
+                versions.sort_by(|a, b| b.id.cmp(&a.id));
+                // Take the first one (highest id)
+                (key, versions.into_iter().next().unwrap())
+            })
+            .collect();
 
         pb.set_message(format!("Found {} unique keys", latest_records.len()));
 
-        // Create destination directory if it doesn't exist
-        std::fs::create_dir_all(destination)?;
-
-        // Copy manifest folder
-        let source_manifest = self.db_path.join("manifest");
-        let destination_manifest = destination.join("manifest");
-
-        pb.set_message("Copying manifest folder...");
-        if source_manifest.exists() {
-            // Remove destination manifest if it exists
-            if destination_manifest.exists() {
-                fs::remove_dir_all(&destination_manifest)?;
-            }
-            // Copy the manifest directory recursively
-            fs::create_dir_all(&destination_manifest)?;
-            copy_dir_all(&source_manifest, &destination_manifest)?;
-        }
-
-        pb.set_message("Writing latest versions to new location...");
-
-        // Initialize new commit log
-        let destination_clog_subdir = destination.join("clog");
-
-        // Setup log options
-        let copts = LogOptions::default()
-            .with_max_file_size(512 * 1024 * 1024) // 512MB default
-            .with_file_extension("clog".to_string());
-
-        // Open the commit log
-        let mut destination_commit_log =
-            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
-
-        // Write latest versions to new location
-        let mut total_written = 0;
-        for record in latest_records.values() {
-            let mut buffer = BytesMut::new();
-            record.encode(&mut buffer)?;
-            destination_commit_log.append(&buffer)?;
-            total_written += 1;
-
-            if total_written % 1000 == 0 {
-                pb.set_message(format!(
-                    "Written {}/{} records",
-                    total_written,
-                    latest_records.len()
-                ));
-            }
-        }
-
-        // Ensure all writes are persisted
-        destination_commit_log.sync()?;
-
-        pb.finish_with_message(format!(
-            "Successfully migrated {} records and manifest to {}",
-            total_written,
-            destination.display()
-        ));
-
-        Ok(())
+        self.write_records_and_manifest(latest_records, destination, &pb)
     }
 
     pub fn collect_stats(&self) -> Result<DbStats> {
@@ -423,7 +372,6 @@ impl Analyzer {
             avg_key_size: 0.0,
             avg_value_size: 0.0,
             total_size: 0,
-            version_distribution: HashMap::new(),
         };
 
         let mut key_sizes = Vec::new();
@@ -463,11 +411,6 @@ impl Analyzer {
                 value_sizes.iter().sum::<usize>() as f64 / value_sizes.len() as f64;
         }
 
-        // Calculate version distribution
-        for (_, version_count) in unique_keys {
-            *stats.version_distribution.entry(version_count).or_insert(0) += 1;
-        }
-
         // Get file sizes
         if let Ok(metadata) = std::fs::metadata(&self.db_path) {
             stats.total_size = metadata.len();
@@ -475,6 +418,30 @@ impl Analyzer {
 
         pb.finish_with_message("Statistics collection complete!");
         Ok(stats)
+    }
+
+    pub fn repair(&self) -> Result<()> {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {wide_msg}")
+                .unwrap(),
+        );
+        pb.set_message("Analyzing commit log for corruption...");
+
+        // Get the commit log directory
+        let clog_subdir = self.db_path.join("clog");
+
+        pb.set_message("Repairing commit log...");
+
+        restore_repair_files(clog_subdir.as_path().to_str().unwrap())?;
+
+        pb.finish_with_message(format!(
+            "Successfully repaired commit log at {}",
+            clog_subdir.display()
+        ));
+
+        Ok(())
     }
 }
 

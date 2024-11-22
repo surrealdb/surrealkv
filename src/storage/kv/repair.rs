@@ -189,7 +189,7 @@ fn repair_segment(
 //
 // Parameters:
 // directory: A string slice that holds the path to the directory.
-pub(crate) fn restore_repair_files(directory: &str) -> std::io::Result<()> {
+pub fn restore_repair_files(directory: &str) -> std::io::Result<()> {
     // Check if the directory exists
     if !Path::new(directory).exists() {
         return Ok(());

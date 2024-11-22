@@ -127,6 +127,12 @@ impl Hash for Record {
     }
 }
 
+impl Default for Record {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Record {
     pub fn new() -> Self {
         Record {

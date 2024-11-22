@@ -48,4 +48,6 @@ pub enum Commands {
     },
     /// Show database statistics
     Stats,
+    /// Repair corrupted segments in the commit log
+    Repair,
 }

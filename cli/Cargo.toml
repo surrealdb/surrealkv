@@ -2,8 +2,7 @@
 name = "skv-cli"
 version = "0.1.0"
 edition = "2021"
-description = "CLI tools for SurrealKV"
-# Use the same license, authors etc. as your main package
+description = "CLI tool for SurrealKV"
 
 [[bin]]
 name = "skv-cli"
