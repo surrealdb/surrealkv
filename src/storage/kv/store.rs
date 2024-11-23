@@ -217,12 +217,7 @@ impl TaskRunner {
 
     fn spawn(self) {
         let done_tx = self.done_tx.clone();
-
-        #[cfg(not(target_arch = "wasm32"))]
         tokio::spawn(self.run(done_tx));
-
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(self.run(done_tx));
     }
 
     async fn run(self, done_tx: Arc<Sender<()>>) {
