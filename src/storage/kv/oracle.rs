@@ -96,8 +96,8 @@ impl Oracle {
         }
     }
 
-    // Takes lock asynchronously
-    pub async fn lock(&self) -> CommitGuard {
+    // Takes guard asynchronously
+    pub async fn acquire_commit_guard(&self) -> CommitGuard {
         if let Some(rx) = &self.receiver {
             rx.recv().await.unwrap();
         }
