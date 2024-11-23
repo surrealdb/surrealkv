@@ -173,17 +173,28 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            // Try to get existing runtime handle first
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // We're in a runtime, spawn normally
-                handle.spawn(async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Native environment - use tokio
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        if let Err(err) = inner.close().await {
+                            eprintln!("Error closing store: {}", err);
+                        }
+                    });
+                } else {
+                    eprintln!("No runtime available for closing the store correctly");
+                }
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                // WASM environment - use wasm_bindgen_futures
+                wasm_bindgen_futures::spawn_local(async move {
                     if let Err(err) = inner.close().await {
-                        // TODO: use log/tracing instead of eprintln
                         eprintln!("Error closing store: {}", err);
                     }
                 });
-            } else {
-                eprintln!("No runtime available for closing the store correctly");
             }
         }
     }
