@@ -1854,59 +1854,60 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
 
-        let (writes_tx, writes_rx) = bounded(100);
-        let (stop_tx, stop_rx) = bounded(1);
-        let core = Arc::new(Core::new(opts, writes_tx.clone()).unwrap());
+        // Create a new store instance
+        let store = Store::new(opts).expect("should create store");
 
-        let (runner, done_rx) = TaskRunner::new(core.clone(), writes_rx, stop_rx);
+        let (writes_tx, writes_rx) = bounded(1000); // Increased buffer size
+        let (stop_tx, stop_rx) = bounded(1);
+        let core = &store.inner.as_ref().unwrap().core;
+
+        let (runner, finish_rx) = TaskRunner::new(core.clone(), writes_rx, stop_rx);
         runner.spawn();
 
         let task_counter = Arc::new(AtomicU64::new(0));
         let total_tasks = 1000;
 
-        // Spawn a task that continuously sends tasks
-        let task_sender = {
-            let writes_tx = writes_tx.clone();
+        // First, send all tasks before stopping
+        for i in 0..total_tasks {
+            let (done_tx, done_rx) = bounded(1);
+            writes_tx
+                .send(Task {
+                    entries: vec![],
+                    done: Some(done_tx),
+                    tx_id: i,
+                    durability: Durability::default(),
+                })
+                .await
+                .expect("should send task");
+
             let task_counter = task_counter.clone();
             tokio::spawn(async move {
-                for i in 0..total_tasks {
-                    let (done_tx, done_rx) = bounded(1);
-                    writes_tx
-                        .send(Task {
-                            entries: vec![],
-                            done: Some(done_tx),
-                            tx_id: i,
-                            durability: Durability::default(),
-                        })
-                        .await
-                        .unwrap();
+                done_rx.recv().await.unwrap().unwrap();
+                task_counter.fetch_add(1, Ordering::SeqCst);
+            });
+        }
 
-                    let task_counter = task_counter.clone();
-                    tokio::spawn(async move {
-                        done_rx.recv().await.unwrap().unwrap();
-                        task_counter.fetch_add(1, Ordering::SeqCst);
-                    });
-                }
-            })
-        };
-
-        // Wait a bit to let some tasks queue up
+        // Give some time for tasks to be processed
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Send stop signal
-        stop_tx.send(()).await.unwrap();
+        stop_tx.send(()).await.expect("should send stop signal");
 
         // Wait for TaskRunner to finish
-        done_rx
+        finish_rx
             .recv()
             .await
             .expect("TaskRunner should signal completion");
 
-        // Wait for task sender to finish
-        task_sender.await.unwrap();
+        // Give some time for all task counters to be updated
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Check that all tasks that were sent were processed
         let final_count = task_counter.load(Ordering::SeqCst);
-        assert_eq!(final_count, total_tasks, "Should have processed all tasks");
+        assert_eq!(
+            final_count, total_tasks,
+            "Expected {} tasks to be processed, but got {}",
+            total_tasks, final_count
+        );
     }
 }

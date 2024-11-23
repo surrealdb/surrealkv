@@ -243,9 +243,9 @@ fn concurrent_insert(c: &mut Criterion) {
     // Configuration
     let item_count = 100_000;
 
-    let key_sizes = vec![16]; // in bytes
-    let value_sizes = vec![32]; // in bytes
-    let thread_counts = vec![4];
+    let key_sizes = vec![16, 64, 256, 1024]; // in bytes
+    let value_sizes = vec![32, 128, 512, 2048]; // in bytes
+    let thread_counts = vec![1, 2, 4, num_cpus::get()];
 
     let mut group = c.benchmark_group("concurrent_inserts");
     group.throughput(criterion::Throughput::Elements(item_count as u64));
@@ -396,7 +396,7 @@ fn concurrent_workload(c: &mut Criterion) {
 
     let operations_per_thread = 1000;
     let value_size = 1000;
-    let thread_counts = [4];
+    let thread_counts = [2, 4, num_cpus::get() as u64];
     let read_ratios = [0.0, 0.5, 0.95, 1.0]; // 0%, 50%, 95%, 100% reads
 
     for &thread_count in &thread_counts {
@@ -481,4 +481,4 @@ criterion_group!(
 );
 criterion_group!(benches_range, range_scan);
 criterion_group!(benches_concurrent, concurrent_insert, concurrent_workload);
-criterion_main!(benches_concurrent);
+criterion_main!(benches_insert, benches_range);
