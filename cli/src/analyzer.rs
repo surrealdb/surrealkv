@@ -128,19 +128,22 @@ impl Analyzer {
         match format {
             "json" => {
                 let json_output = json!({
-                                "top_keys": top_keys.map(|(key, count)| {
-                json!({
-                                        "key": String::from_utf8_lossy(&key),
-                                        "versions": count
-                                    })
-                                }).collect::<Vec<_>>()
-                            });
+                    "top_keys": top_keys.map(|(key, count)| {
+                        let formatted_key = format_key(&key);
+
+                        json!({
+                            "key": &formatted_key,
+                            "versions": count
+                        })
+                    }).collect::<Vec<_>>()
+                });
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
             }
             "table" => {
                 println!("----------------------------");
                 for (key, count) in top_keys {
-                    println!("{}: {} versions", String::from_utf8_lossy(&key), count);
+                    let formatted_key = format_key(&key);
+                    println!("{}: {} versions", formatted_key, count);
                 }
             }
             _ => return Err(anyhow::anyhow!("Unsupported format: {}", format)),
@@ -410,9 +413,7 @@ impl Analyzer {
         }
 
         // Get file sizes
-        if let Ok(metadata) = std::fs::metadata(&self.db_path) {
-            stats.total_size = metadata.len();
-        }
+        stats.total_size = get_dir_size(&self.db_path)?;
 
         pb.finish_with_message("Statistics collection complete!");
         Ok(stats)
@@ -458,4 +459,30 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn get_dir_size(path: impl AsRef<Path>) -> Result<u64> {
+    let mut total_size = 0;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            total_size += entry.metadata()?.len();
+        } else if path.is_dir() {
+            total_size += get_dir_size(path)?;
+        }
+    }
+    Ok(total_size)
+}
+
+fn format_key(key: &[u8]) -> String {
+    key.iter()
+        .map(|&byte| {
+            if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+                format!("{}", byte as char)
+            } else {
+                format!("\\x{:02x}", byte)
+            }
+        })
+        .collect()
 }
