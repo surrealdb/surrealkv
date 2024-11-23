@@ -6,6 +6,14 @@ on:
   workflow_dispatch:
 
 jobs:
+  semver:
+    name: semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
   release:
     name: Process Release
     runs-on: ubuntu-latest
