@@ -12,7 +12,6 @@ use ahash::{HashMap, HashMapExt, HashSet};
 use async_channel::{bounded, Receiver, Sender};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
 
 use crate::storage::kv::{
@@ -27,7 +26,8 @@ use crate::storage::kv::{
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
     /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: AsyncMutex<()>,
+    writer: Sender<()>,
+    receiver: Option<Receiver<()>>,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -45,8 +45,12 @@ impl Oracle {
             }
         };
 
+        let (tx, rx) = bounded(1);
+        tx.try_send(()).unwrap();
+
         Self {
-            write_lock: AsyncMutex::new(()),
+            writer: tx,
+            receiver: Some(rx),
             isolation,
         }
     }
@@ -90,6 +94,29 @@ impl Oracle {
                 oracle.txn_mark.wait_for(ts);
             }
         }
+    }
+
+    // Takes lock asynchronously
+    pub async fn lock(&self) -> CommitGuard {
+        if let Some(rx) = &self.receiver {
+            rx.recv().await.unwrap();
+        }
+        CommitGuard {
+            tx: self.writer.clone(),
+        }
+    }
+}
+
+pub(crate) struct CommitGuard {
+    tx: Sender<()>,
+}
+
+impl Drop for CommitGuard {
+    fn drop(&mut self) {
+        // Decided to use send instead of try_send because:
+        // 1. drop is called in async context already
+        // 2. we must ensure tx is returned for next transaction
+        let _ = futures::executor::block_on(self.tx.send(()));
     }
 }
 

@@ -68,7 +68,7 @@ impl StoreInner {
 
         // Lock the oracle to prevent operations during compaction
         let oracle = self.core.oracle.clone();
-        let oracle_lock = oracle.write_lock.lock().await;
+        let oracle_lock = oracle.lock().await; // Async wait for lock
 
         // Rotate the commit log and get the new segment ID
         let mut clog = self.core.clog.as_ref().unwrap().write();
