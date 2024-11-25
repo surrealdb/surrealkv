@@ -460,11 +460,9 @@ impl Core {
         value_offset: u64,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        if entry
-            .metadata
-            .as_ref()
-            .map_or(false, |metadata| metadata.is_deleted())
-        {
+        if entry.metadata.as_ref().map_or(false, |metadata| {
+            metadata.is_deleted() || metadata.is_tombstone() && !opts.enable_versions
+        }) {
             indexer.delete(&mut entry.key[..].into());
         } else {
             let index_value = IndexValue::new_disk(
@@ -670,9 +668,10 @@ impl Core {
         let mut index = self.indexer.write();
 
         for entry in &task.entries {
-            // If the entry is marked as deleted, delete it.
+            // If the entry is marked as deleted or a tombstone
+            // with the replace flag set, delete it.
             if let Some(metadata) = entry.metadata.as_ref() {
-                if metadata.is_deleted() {
+                if metadata.is_deleted() || metadata.is_tombstone() && entry.replace {
                     index.delete(&mut entry.key[..].into());
                     continue;
                 }
@@ -1579,6 +1578,67 @@ mod tests {
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_with_versions_disabled() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            ..Default::default()
+        };
+
+        let key = Bytes::from("key");
+        let value1 = b"value1";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set_at_ts(&key, value1, 1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.soft_delete(&key).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn3 = store.begin().unwrap();
+        let versions = txn3
+            .scan_all_versions(key.as_ref()..=key.as_ref(), None)
+            .unwrap();
+        assert!(versions.is_empty());
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_with_versions_disabled_in_memory() {
+        let opts = Options {
+            dir: create_temp_directory().path().to_path_buf(),
+            enable_versions: false,
+            disk_persistence: false,
+            ..Default::default()
+        };
+
+        let key = Bytes::from("key");
+        let value1 = b"value1";
+
+        let store = Store::new(opts.clone()).unwrap();
+
+        let mut txn1 = store.begin().unwrap();
+        txn1.set_at_ts(&key, value1, 1).unwrap();
+        txn1.commit().await.unwrap();
+
+        let mut txn2 = store.begin().unwrap();
+        txn2.soft_delete(&key).unwrap();
+        txn2.commit().await.unwrap();
+
+        let txn3 = store.begin().unwrap();
+        let versions = txn3
+            .scan_all_versions(key.as_ref()..=key.as_ref(), None)
+            .unwrap();
+        assert!(versions.is_empty());
 
         store.close().await.unwrap();
     }
