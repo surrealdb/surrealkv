@@ -456,6 +456,29 @@ impl Transaction {
         Ok(results)
     }
 
+    /// Returns all existing keys within the specified range, including soft-deleted
+    /// and thus hidden by tombstones.
+    /// The returned keys are not added to the read set and will not cause read-write conflicts.
+    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(range);
+        let keys = self.snapshot.as_ref().unwrap().range(range);
+
+        // Remove the trailing `\0`.
+        let result = keys
+            .into_iter()
+            .map(|(mut key, _, _, _)| {
+                key.truncate(key.len() - 1);
+                key
+            })
+            .collect();
+
+        Ok(result)
+    }
+
     /// Commits the transaction, by writing all pending entries to the store.
     pub async fn commit(&mut self) -> Result<()> {
         // If the transaction is closed, return an error.
@@ -1011,6 +1034,33 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let results = txn.scan(range, None).unwrap();
             assert_eq!(results.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_with_tombstones() {
+        for is_ssi in [false, true] {
+            let (store, _) = create_store(is_ssi);
+
+            let key = Bytes::from("k");
+            let value = Bytes::from("v");
+
+            // First, insert the key.
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key, &value).unwrap();
+            txn1.commit().await.unwrap();
+
+            // Then, soft-delete it.
+            let mut txn2 = store.begin().unwrap();
+            txn2.soft_delete(&key).unwrap();
+            txn2.commit().await.unwrap();
+
+            // keys_with_tombstones() should still return `k`
+            // despite it being soft-deleted.
+            let range = "k".as_bytes()..="k".as_bytes();
+            let txn3 = store.begin().unwrap();
+            let results = txn3.keys_with_tombstones(range).unwrap();
+            assert_eq!(results, vec![b"k"]);
         }
     }
 
