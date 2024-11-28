@@ -25,7 +25,7 @@ pub fn repair_last_corrupted_segment(
     // Get the last segment
     let last_segment = segs
         .last()
-        .ok_or_else(|| Error::LogError(LogError::SegmentNotFound))?;
+        .ok_or(Error::LogError(LogError::SegmentNotFound))?;
 
     // Check if the last segment's ID is equal to the corrupted_segment_id
     if last_segment.id != corrupted_segment_id {

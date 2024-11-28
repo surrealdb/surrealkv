@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 use ahash::{HashMap, HashMapExt};
+use ahash::{HashSet, HashSetExt};
 use bytes::Bytes;
 use std::collections::hash_map::Entry as HashEntry;
 use vart::{art::QueryType, VariableSizeKey};
@@ -875,9 +875,8 @@ impl Transaction {
         }
 
         // Process the last key's versions.
-        if let Some(key) = current_key {
+        if current_key.is_some() {
             results.append(&mut current_key_versions);
-            unique_keys.insert(key);
         }
 
         // Return the results.
