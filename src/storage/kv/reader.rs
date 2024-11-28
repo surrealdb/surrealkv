@@ -13,14 +13,14 @@ use crate::storage::{
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `RecordReader` to read data from the Aol source.
-pub(crate) struct Reader {
+pub struct Reader {
     rdr: MultiSegmentReader,
     err: Option<Error>,
 }
 
 impl Reader {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    pub(crate) fn new_from(rdr: MultiSegmentReader) -> Self {
+    pub fn new_from(rdr: MultiSegmentReader) -> Self {
         Reader { rdr, err: None }
     }
 
@@ -112,7 +112,7 @@ impl Reader {
 ///
 /// # Fields
 /// * `r: Reader` - The `Reader` instance used to read data.
-pub(crate) struct RecordReader {
+pub struct RecordReader {
     r: Reader,
     err: Option<Error>,
     rec: Vec<u8>,
@@ -124,7 +124,7 @@ impl RecordReader {
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
-    pub(crate) fn new(r: Reader) -> Self {
+    pub fn new(r: Reader) -> Self {
         RecordReader {
             r,
             err: None,
@@ -248,7 +248,7 @@ impl RecordReader {
     }
 
     /// Reads a transaction record into the provided `Record`.
-    pub(crate) fn read_into(&mut self, entry: &mut Record) -> Result<(u64, u64)> {
+    pub fn read_into(&mut self, entry: &mut Record) -> Result<(u64, u64)> {
         self.read_entry_into(entry)
     }
 

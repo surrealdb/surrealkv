@@ -1,3 +1,9 @@
+[workspace]
+members = [
+    ".",   # Main surrealkv library
+    "cli", # CLI tool
+]
+
 [package]
 name = "surrealkv"
 publish = true

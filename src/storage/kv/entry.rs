@@ -101,17 +101,17 @@ pub(crate) fn encode_entries(
 //   |----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
 //
 
-#[derive(Debug)]
-pub(crate) struct Record {
-    pub(crate) id: u64,
-    pub(crate) ts: u64,
-    pub(crate) version: u16,
-    pub(crate) metadata: Option<Metadata>,
-    pub(crate) key: Bytes,
-    pub(crate) key_len: u32,
-    pub(crate) value_len: u32,
-    pub(crate) value: Bytes,
-    pub(crate) crc32: u32,
+#[derive(Debug, Clone)]
+pub struct Record {
+    pub id: u64,
+    pub ts: u64,
+    pub version: u16,
+    pub metadata: Option<Metadata>,
+    pub key: Bytes,
+    pub key_len: u32,
+    pub value_len: u32,
+    pub value: Bytes,
+    pub crc32: u32,
 }
 
 impl Hash for Record {
@@ -127,8 +127,14 @@ impl Hash for Record {
     }
 }
 
+impl Default for Record {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Record {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Record {
             id: 0,
             ts: 0,
@@ -167,7 +173,7 @@ impl Record {
         Record { crc32, ..rec }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.id = 0;
         self.ts = 0;
         self.version = 0;
@@ -198,7 +204,7 @@ impl Record {
         Record { crc32, ..rec }
     }
 
-    pub(crate) fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // This function encodes an Record into a buffer. The encoding format is as follows:
         // - CRC32 Checksum (4 bytes)
         // - Version (2 bytes)
