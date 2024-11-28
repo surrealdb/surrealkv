@@ -28,7 +28,7 @@ impl<'a> CompactionGuard<'a> {
     }
 }
 
-impl<'a> Drop for CompactionGuard<'a> {
+impl Drop for CompactionGuard<'_> {
     fn drop(&mut self) {
         self.is_compacting.store(false, Ordering::Relaxed);
     }
