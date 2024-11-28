@@ -437,8 +437,7 @@ impl Transaction {
             // Only add the key to the read set if the version is less than or equal to the
             // read timestamp. This is to prevent adding keys that are added during the transaction.
             if *version <= self.read_ts {
-                // the keys in the vart leaf are terminated with a null byte
-                let key = Bytes::copy_from_slice(&key[..&key.len() - 1]);
+                let key = Bytes::copy_from_slice(&key);
                 let entry = ReadSetEntry::new(key, *version, self.savepoints);
                 self.read_set.push(entry);
             }
@@ -447,8 +446,6 @@ impl Transaction {
             let v = value.resolve(&self.core)?;
 
             // Add the value, version, and timestamp to the results vector.
-            let mut key = key;
-            key.truncate(key.len() - 1);
             results.push((key, v, *version, *ts));
         }
 
@@ -466,15 +463,7 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
         let keys = self.snapshot.as_ref().unwrap().range(range);
-
-        // Remove the trailing `\0`.
-        let result = keys
-            .into_iter()
-            .map(|(mut key, _, _, _)| {
-                key.truncate(key.len() - 1);
-                key
-            })
-            .collect();
+        let result = keys.into_iter().map(|(key, _, _, _)| key).collect();
 
         Ok(result)
     }
@@ -761,7 +750,7 @@ impl Transaction {
         let items = self.snapshot.as_ref().unwrap().scan_at_ts(range, ts);
 
         let mut results = Vec::new();
-        'outer: for (mut key, value) in items {
+        'outer: for (key, value) in items {
             // If a limit is set and we've already got enough results, break the loop.
             if let Some(limit) = limit {
                 if results.len() >= limit {
@@ -779,8 +768,6 @@ impl Transaction {
             // Resolve the value reference to get the actual value.
             let v = value.resolve(&self.core)?;
 
-            // Remove the trailing `\0`.
-            key.truncate(key.len() - 1);
             results.push((key, v));
         }
 
@@ -798,16 +785,7 @@ impl Transaction {
         let range = convert_range_bounds(range);
         let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
 
-        // Remove the trailing `\0`.
-        let result = keys
-            .into_iter()
-            .map(|mut key| {
-                key.truncate(key.len() - 1);
-                key
-            })
-            .collect();
-
-        Ok(result)
+        Ok(keys)
     }
 
     /// Returns the value associated with the key at the given timestamp.
@@ -866,10 +844,7 @@ impl Transaction {
         let mut current_key_versions = Vec::new();
 
         // Iterate over the keys in the range.
-        for (mut key, value, _, ts) in ranger {
-            // Remove the trailing `\0`.
-            key.truncate(key.len() - 1);
-
+        for (key, value, _, ts) in ranger {
             // If the key changes, process the previous key's versions.
             if current_key.as_ref().map_or(false, |k| k != &key) {
                 // Add the previous key's versions to the results.

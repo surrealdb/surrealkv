@@ -31,7 +31,6 @@ impl Indexer {
         ts: u64,
         check_version: bool,
     ) -> Result<()> {
-        *key = key.terminate();
         if check_version {
             self.index.insert(key, value, version, ts)?;
         } else {
@@ -48,7 +47,6 @@ impl Indexer {
         ts: u64,
         check_version: bool,
     ) -> Result<()> {
-        *key = key.terminate();
         if check_version {
             self.index.insert_or_replace(key, value, version, ts)?;
         } else {
@@ -59,7 +57,6 @@ impl Indexer {
     }
 
     pub fn delete(&mut self, key: &mut VariableSizeKey) {
-        *key = key.terminate();
         self.index.remove(key);
     }
 

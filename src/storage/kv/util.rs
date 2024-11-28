@@ -74,17 +74,13 @@ where
 {
     // Step 2: Apply the conversion logic for both start and end bounds
     let start_bound = match range.start_bound() {
-        Bound::Included(start) => {
-            Bound::Included(VariableSizeKey::from_slice_with_termination(start))
-        }
-        Bound::Excluded(start) => {
-            Bound::Excluded(VariableSizeKey::from_slice_with_termination(start))
-        }
+        Bound::Included(start) => Bound::Included(VariableSizeKey::from_slice(start)),
+        Bound::Excluded(start) => Bound::Excluded(VariableSizeKey::from_slice(start)),
         Bound::Unbounded => Bound::Unbounded,
     };
     let end_bound = match range.end_bound() {
-        Bound::Included(end) => Bound::Included(VariableSizeKey::from_slice_with_termination(end)),
-        Bound::Excluded(end) => Bound::Excluded(VariableSizeKey::from_slice_with_termination(end)),
+        Bound::Included(end) => Bound::Included(VariableSizeKey::from_slice(end)),
+        Bound::Excluded(end) => Bound::Excluded(VariableSizeKey::from_slice(end)),
         Bound::Unbounded => Bound::Unbounded,
     };
     (start_bound, end_bound)

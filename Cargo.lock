@@ -1299,7 +1299,7 @@ dependencies = [
  "humansize",
  "indicatif",
  "serde_json",
- "surrealkv 0.5.4",
+ "surrealkv 0.6.1",
 ]
 
 [[package]]
@@ -1403,7 +1403,7 @@ dependencies = [
  "surrealkv 0.4.4",
  "tempdir",
  "tokio",
- "vart 0.7.0",
+ "vart 0.8.0",
  "walkdir",
  "wasm-bindgen-futures",
 ]
@@ -1500,9 +1500,9 @@ checksum = "52d02665a2dd16898d28bd1d314b067a97365facca5c39c370d55822bcbbfb48"
 
 [[package]]
 name = "vart"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c92195d375eb94995afddeedfd7f246796eb60b85f727c538e42222c4c9b2d3"
+checksum = "c9a2ea22a0e064164cecaf12fe060ba3806598ba3f1cfad6b7a9ba4167d5bbab"
 
 [[package]]
 name = "version_check"
