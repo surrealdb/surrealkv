@@ -4,7 +4,6 @@ use crate::storage::{
     kv::error::{Error, Result},
     kv::indexer::IndexValue,
     kv::store::Core,
-    kv::util::now,
 };
 
 use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
@@ -39,13 +38,6 @@ impl Snapshot {
             snap,
             version: read_version,
         })
-    }
-
-    /// Set a key-value pair into the snapshot.
-    pub(crate) fn set(&mut self, key: &VariableSizeKey, value: IndexValue) {
-        self.snap
-            .insert(key, value, self.version, now())
-            .expect("incorrect snapshot version");
     }
 
     #[allow(unused)]
