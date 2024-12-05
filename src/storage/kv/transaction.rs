@@ -85,14 +85,16 @@ pub(crate) struct WriteSetEntry {
     pub(crate) e: Entry,
     savepoint_no: u32,
     seqno: u32,
+    pub(crate) version: u64,
 }
 
 impl WriteSetEntry {
-    pub(crate) fn new(e: Entry, savepoint_no: u32, seqno: u32) -> Self {
+    pub(crate) fn new(e: Entry, savepoint_no: u32, seqno: u32, version: u64) -> Self {
         Self {
             e,
             savepoint_no,
             seqno,
+            version,
         }
     }
 }
@@ -114,20 +116,17 @@ impl ReadSetEntry {
 }
 
 pub(crate) struct ReadScanEntry {
-    pub(crate) start: Bound<VariableSizeKey>,
-    pub(crate) end: Bound<VariableSizeKey>,
+    pub(crate) range: (Bound<VariableSizeKey>, Bound<VariableSizeKey>),
     pub(crate) savepoint_no: u32,
 }
 
 impl ReadScanEntry {
     pub(crate) fn new(
-        start: Bound<VariableSizeKey>,
-        end: Bound<VariableSizeKey>,
+        range: (Bound<VariableSizeKey>, Bound<VariableSizeKey>),
         savepoint_no: u32,
     ) -> Self {
         Self {
-            start,
-            end,
+            range,
             savepoint_no,
         }
     }
@@ -360,7 +359,7 @@ impl Transaction {
         // Set the transaction's latest savepoint number and add it to the write set.
         let key = e.key.clone();
         let write_seqno = self.next_write_seqno();
-        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno);
+        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno, self.read_ts);
         match self.write_set.entry(key) {
             HashEntry::Occupied(mut oe) => {
                 let entries = oe.get_mut();
@@ -391,25 +390,11 @@ impl Transaction {
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(range);
+        let range: (Bound<VariableSizeKey>, Bound<VariableSizeKey>) = convert_range_bounds(range);
 
         // Keep track of the range bound predicates for conflict detection in case of SSI.
-        {
-            let range_start = match range.start_bound() {
-                Bound::Included(start) => Bound::Included((*start).clone()),
-                Bound::Excluded(start) => Bound::Included((*start).clone()),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-
-            let range_end = match range.end_bound() {
-                Bound::Included(end) => Bound::Included((*end).clone()),
-                Bound::Excluded(end) => Bound::Included((*end).clone()),
-                Bound::Unbounded => Bound::Unbounded,
-            };
-
-            let rs_entry = ReadScanEntry::new(range_start, range_end, self.savepoints);
-            self.read_key_ranges.push(rs_entry);
-        }
+        let rs_entry = ReadScanEntry::new(range.clone(), self.savepoints);
+        self.read_key_ranges.push(rs_entry);
 
         // Initialize an empty vector to store the results.
         let mut results = Vec::new();
@@ -508,25 +493,15 @@ impl Transaction {
         let done = self
             .core
             .send_to_write_channel(entries, tx_id, self.durability)
-            .await;
-
-        if let Err(err) = done {
-            oracle.committed_upto(tx_id);
-            return Err(err);
-        }
+            .await?;
 
         drop(write_ch_lock);
 
         // Check if the transaction is written to the transaction log.
-        let done = done.unwrap();
         let ret = done.recv().await;
         if let Err(err) = ret {
-            oracle.committed_upto(tx_id);
             return Err(err.into());
         }
-
-        // Update the oracle to indicate that the transaction has been committed up to the given transaction ID.
-        oracle.committed_upto(tx_id);
 
         // Mark the transaction as closed.
         self.closed = true;
@@ -1046,7 +1021,7 @@ mod tests {
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
 
-        // no read conflict
+        // no conflict
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1059,7 +1034,7 @@ mod tests {
             txn2.commit().await.unwrap();
         }
 
-        // read conflict when the read key was updated by another transaction
+        // conflict when the read key was updated by another transaction
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1071,13 +1046,17 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
         }
 
-        // blind writes should succeed if key wasn't read first
+        // blind writes should not succeed
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1086,14 +1065,17 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
 
             txn1.commit().await.unwrap();
-            txn2.commit().await.unwrap();
-
-            let mut txn3 = store.begin().unwrap();
-            let val = txn3.get(&key1).unwrap().unwrap();
-            assert_eq!(val, value2.as_ref());
+            assert!(match txn2.commit().await {
+                Err(err) => {
+                    matches!(err, Error::TransactionWriteConflict)
+                }
+                _ => {
+                    false
+                }
+            });
         }
 
-        // read conflict when the read key was updated by another transaction
+        // conflict when the read key was updated by another transaction
         {
             let key = Bytes::from("key3");
 
@@ -1107,13 +1089,17 @@ mod tests {
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
         }
 
-        // read conflict when the read key was deleted by another transaction
+        // write-skew: read conflict when the read key was deleted by another transaction
         {
             let key = Bytes::from("key4");
 
@@ -1129,12 +1115,12 @@ mod tests {
 
             assert!(txn3.get(&key).is_ok());
             txn3.set(&key, &value2).unwrap();
-            assert!(match txn3.commit().await {
-                Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
-                }
-                _ => false,
-            });
+            let result = txn3.commit().await;
+            if is_ssi {
+                assert!(matches!(result, Err(Error::TransactionReadConflict)));
+            } else {
+                assert!(result.is_ok());
+            }
         }
     }
 
@@ -1237,7 +1223,7 @@ mod tests {
         let value5 = Bytes::from("value5");
         let value6 = Bytes::from("value6");
 
-        // read conflict when scan keys have been updated in another transaction
+        // conflict when scan keys have been updated in another transaction
         {
             let mut txn1 = store.begin().unwrap();
 
@@ -1260,13 +1246,17 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
         }
 
-        // read conflict when read keys are deleted by other transaction
+        // write-skew: read conflict when read keys are deleted by other transaction
         {
             let mut txn1 = store.begin().unwrap();
 
@@ -1282,13 +1272,12 @@ mod tests {
             let range = "key1".as_bytes()..="key5".as_bytes();
             txn3.scan(range, None).unwrap();
             txn3.set(&key4, &value2).unwrap();
-
-            assert!(match txn3.commit().await {
-                Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
-                }
-                _ => false,
-            });
+            let result = txn3.commit().await;
+            if is_ssi {
+                assert!(matches!(result, Err(Error::TransactionReadConflict)));
+            } else {
+                assert!(result.is_ok());
+            }
         }
     }
 
@@ -1393,7 +1382,11 @@ mod tests {
             txn2.set(&key2, &value6).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1537,7 +1530,6 @@ mod tests {
 
     #[tokio::test]
     async fn g1c() {
-        g1c_tests(false).await; // snapshot isolation
         g1c_tests(true).await;
     }
 
@@ -1622,7 +1614,6 @@ mod tests {
 
     #[tokio::test]
     async fn pmp_write() {
-        pmp_write_tests(false).await;
         pmp_write_tests(true).await;
     }
 
@@ -1647,7 +1638,11 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1726,7 +1721,11 @@ mod tests {
             assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1820,7 +1819,6 @@ mod tests {
 
     #[tokio::test]
     async fn g2_item() {
-        g2_item_tests(false).await;
         g2_item_tests(true).await;
     }
 
