@@ -493,16 +493,11 @@ impl Transaction {
         let done = self
             .core
             .send_to_write_channel(entries, tx_id, self.durability)
-            .await;
-
-        if let Err(err) = done {
-            return Err(err);
-        }
+            .await?;
 
         drop(write_ch_lock);
 
         // Check if the transaction is written to the transaction log.
-        let done = done.unwrap();
         let ret = done.recv().await;
         if let Err(err) = ret {
             return Err(err.into());
