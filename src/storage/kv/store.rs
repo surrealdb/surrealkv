@@ -570,6 +570,11 @@ impl Core {
             return Ok(());
         }
 
+        // Wait for the oracle to catch up to the latest commit transaction.
+        let oracle = self.oracle.clone();
+        let last_commit_ts = oracle.read_ts();
+        oracle.wait_for(last_commit_ts);
+
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
             clog.write().close()?;
@@ -759,7 +764,7 @@ mod tests {
     use crate::storage::kv::store::{Store, Task, TaskRunner};
     use crate::storage::kv::transaction::Durability;
     use crate::storage::log::Error as LogError;
-    use crate::{Error, IsolationLevel};
+    use crate::Error;
 
     use async_channel::bounded;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1639,13 +1644,10 @@ mod tests {
     }
 
     // Common setup logic for creating a store
-    fn create_store(dir: Option<TempDir>, is_ssi: bool) -> (Store, TempDir) {
+    fn create_store(dir: Option<TempDir>) -> (Store, TempDir) {
         let temp_dir = dir.unwrap_or_else(create_temp_directory);
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
-        if is_ssi {
-            opts.isolation_level = IsolationLevel::SerializableSnapshotIsolation;
-        }
         (
             Store::new(opts.clone()).expect("should create store"),
             temp_dir,
@@ -1654,7 +1656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_version_after_reopen() {
-        let (store, temp_dir) = create_store(None, false);
+        let (store, temp_dir) = create_store(None);
 
         // Define the number of keys, key size, and value size
         let num_keys = 10000u32;
@@ -1685,7 +1687,7 @@ mod tests {
         store.close().await.unwrap();
 
         // Reopen the store
-        let (store, _) = create_store(Some(temp_dir), false);
+        let (store, _) = create_store(Some(temp_dir));
 
         // Verify if the indexer version is set correctly
         assert_eq!(
@@ -1706,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_incremental_transaction_ids_post_store_open() {
-        let (store, temp_dir) = create_store(None, false);
+        let (store, temp_dir) = create_store(None);
 
         let total_records = 1000;
         let multiple_keys_records = total_records / 2;
@@ -1747,7 +1749,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Reopen the store
-        let (store, _) = create_store(Some(temp_dir), false);
+        let (store, _) = create_store(Some(temp_dir));
 
         // Commit a new transaction with a single key
         {
@@ -1903,7 +1905,7 @@ mod tests {
         assert!(slow_done_rx.recv().await.is_ok());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn stop_task_runner_concurrent_tasks() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();

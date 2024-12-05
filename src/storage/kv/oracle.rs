@@ -1,9 +1,17 @@
 use std::{
-    ops::{Bound, RangeBounds},
-    sync::atomic::{AtomicU64, Ordering},
+    cmp::Reverse,
+    collections::BinaryHeap,
+    ops::Bound,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
+use ahash::{HashMap, HashMapExt, HashSet};
+use async_channel::{bounded, Receiver, Sender};
 use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
 
@@ -60,6 +68,28 @@ impl Oracle {
     pub(crate) fn set_ts(&self, ts: u64) {
         self.isolation.set_ts(ts);
         self.isolation.increment_ts();
+    }
+
+    /// Marks the transactions as committed up to the given timestamp.
+    /// If the isolation level is SerializableSnapshotIsolation, it delegates to the isolation level to mark the transactions.
+    pub(crate) fn committed_upto(&self, ts: u64) {
+        match &self.isolation {
+            IsolationLevel::SnapshotIsolation(_) => {}
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => {
+                oracle.txn_mark.done_upto(ts);
+            }
+        }
+    }
+
+    /// Waits for the transactions to commit up to the given timestamp.
+    /// If the isolation level is SerializableSnapshotIsolation, it delegates to the isolation level to wait for the transactions.
+    pub(crate) fn wait_for(&self, ts: u64) {
+        match &self.isolation {
+            IsolationLevel::SnapshotIsolation(_) => {}
+            IsolationLevel::SerializableSnapshotIsolation(oracle) => {
+                oracle.txn_mark.wait_for(ts);
+            }
+        }
     }
 }
 
@@ -131,96 +161,6 @@ impl SnapshotIsolation {
     pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
         let current_snapshot = Snapshot::take(&txn.core)?;
 
-        // Check write conflicts
-        for key in txn.write_set.keys() {
-            if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                match current_snapshot.get(&key[..].into()) {
-                    Ok((_, version)) => {
-                        // Detect if another transaction has written to this key
-                        if version > last_entry.version {
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                    Err(Error::KeyNotFound) => {
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        let ts = self.next_tx_id.load(Ordering::SeqCst);
-        self.increment_ts();
-        Ok(ts)
-    }
-
-    /// Returns the read timestamp, which is the next transaction ID minus 1.
-    pub(crate) fn read_ts(&self) -> u64 {
-        self.next_tx_id.load(Ordering::SeqCst) - 1
-    }
-
-    /// Increments the next transaction ID by 1.
-    pub(crate) fn increment_ts(&self) {
-        self.next_tx_id.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-fn key_in_range(
-    key: &Bytes,
-    range_start: &Bound<&VariableSizeKey>,
-    range_end: &Bound<&VariableSizeKey>,
-) -> bool {
-    let key = VariableSizeKey::from_slice(key);
-
-    let start_inclusive = match &range_start {
-        Bound::Included(start) => key >= **start,
-        Bound::Excluded(start) => key > **start,
-        Bound::Unbounded => true,
-    };
-
-    let end_exclusive = match &range_end {
-        Bound::Included(end) => key <= **end,
-        Bound::Excluded(end) => key < **end,
-        Bound::Unbounded => true,
-    };
-
-    start_inclusive && end_exclusive
-}
-
-/// Serializable Snapshot Isolation (SSI):
-/// https://www.cse.iitb.ac.in/infolab/Data/Courses/CS632/2009/Papers/p492-fekete.pdf
-///
-/// Serializable Snapshot Isolation (SSI) is a specific isolation level that falls under the
-/// category of "serializable" isolation levels. It provides serializability while allowing for
-/// a higher degree of concurrency compared to traditional serializability mechanisms.
-///
-/// This implementation adopts Write Snapshot Isolation as defined in the paper:
-/// https://arxiv.org/abs/2405.18393
-pub(crate) struct SerializableSnapshotIsolation {
-    next_tx_id: AtomicU64,
-}
-
-impl SerializableSnapshotIsolation {
-    /// Creates a new SerializableSnapshotIsolation instance with the next transaction ID set to 0.
-    pub(crate) fn new() -> Self {
-        Self {
-            next_tx_id: AtomicU64::new(0),
-        }
-    }
-
-    /// Sets the next transaction ID to the given timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.next_tx_id.store(ts, Ordering::SeqCst);
-    }
-
-    /// Generates a new commit timestamp for the given transaction.
-    /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
-    /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
-    /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(&txn.core)?;
-
-        // Check read conflicts
         for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
                 Ok((_, version)) => {
@@ -238,61 +178,6 @@ impl SerializableSnapshotIsolation {
             }
         }
 
-        // Check write conflicts
-        for key in txn.write_set.keys() {
-            if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                match current_snapshot.get(&key[..].into()) {
-                    Ok((_, version)) => {
-                        // Detect if another transaction has written to this key
-                        if version > last_entry.version {
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                    Err(Error::KeyNotFound) => {
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
-        // For each range, check if any write skew (including deletes) conflicts
-        for range in &txn.read_key_ranges {
-            // Get all writes in the range from the snapshot
-            let range_writes = current_snapshot.range(range.range.clone());
-
-            for (key, _, version, _) in range_writes {
-                if *version > txn.read_ts {
-                    // Check if this key was deleted in current transaction
-                    match txn.write_set.get(&key[..]) {
-                        Some(entries)
-                            if entries
-                                .last()
-                                .map_or(false, |e| e.e.is_deleted_or_tombstone()) =>
-                        {
-                            // Key is being deleted in current txn, don't count as conflict
-                            continue;
-                        }
-                        _ => return Err(Error::TransactionReadConflict),
-                    }
-                }
-            }
-
-            // Check for deletes in current transaction that affect this range
-            for (key, entries) in &txn.write_set {
-                if key_in_range(key, &range.range.start_bound(), &range.range.end_bound()) {
-                    if let Some(entry) = entries.last() {
-                        let key = VariableSizeKey::from_slice(key);
-                        let res = current_snapshot.get(&key);
-                        if entry.e.is_deleted_or_tombstone() && res.is_err() {
-                            // This is a delete of a key that didn't exist at snapshot time
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                }
-            }
-        }
-
         let ts = self.next_tx_id.load(Ordering::SeqCst);
         self.increment_ts();
         Ok(ts)
@@ -306,5 +191,357 @@ impl SerializableSnapshotIsolation {
     /// Increments the next transaction ID by 1.
     pub(crate) fn increment_ts(&self) {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Struct representing a commit marker in a transaction.
+/// It contains a timestamp and a set of conflict keys.
+struct CommitMarker {
+    ts: u64,
+    conflict_keys: HashSet<Bytes>,
+}
+
+/// Struct for tracking committed transactions.
+/// It maintains the next timestamp, a list of committed transactions, and the last cleanup timestamp.
+#[derive(Default)]
+struct CommitTracker {
+    next_ts: u64,
+    committed_transactions: Vec<CommitMarker>,
+    last_cleanup_ts: u64,
+}
+
+impl CommitTracker {
+    /// Creates a new CommitTracker instance with the next timestamp, committed transactions, and last cleanup timestamp set to 0.
+    fn new() -> Self {
+        Self {
+            next_ts: 0,
+            committed_transactions: Vec::new(),
+            last_cleanup_ts: 0,
+        }
+    }
+
+    /// Cleans up committed transactions with timestamps greater than the given maximum read timestamp.
+    /// It updates the last cleanup timestamp and removes committed transactions with timestamps greater than the maximum read timestamp.
+    fn cleanup_committed_transactions(&mut self, max_read_ts: u64) {
+        if max_read_ts <= self.last_cleanup_ts {
+            return;
+        }
+
+        self.last_cleanup_ts = max_read_ts;
+
+        self.committed_transactions
+            .retain(|txn| txn.ts > max_read_ts);
+    }
+
+    /// Checks if a transaction has conflicts with committed transactions.
+    /// It acquires a lock on the read set and checks if there are any conflict keys in the read set.
+    fn has_conflict(&self, txn: &Transaction) -> bool {
+        if txn.read_set.is_empty() {
+            false
+        } else {
+            // For each object in the changeset of the already committed transactions, check if it lies
+            // within the predicates of the current transaction.
+            for committed_tx in self.committed_transactions.iter() {
+                if committed_tx.ts > txn.read_ts {
+                    for conflict_key in committed_tx.conflict_keys.iter() {
+                        for rs_entry in txn.read_key_ranges.iter() {
+                            if key_in_range(conflict_key, &rs_entry.start, &rs_entry.end) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.committed_transactions
+                .iter()
+                .filter(|committed_txn| committed_txn.ts > txn.read_ts)
+                .any(|committed_txn| {
+                    txn.read_set
+                        .iter()
+                        .any(|read| committed_txn.conflict_keys.contains(&read.key))
+                })
+        }
+    }
+}
+
+fn key_in_range(
+    key: &Bytes,
+    range_start: &Bound<VariableSizeKey>,
+    range_end: &Bound<VariableSizeKey>,
+) -> bool {
+    let key = VariableSizeKey::from_slice(key);
+
+    let start_inclusive = match &range_start {
+        Bound::Included(start) => key >= *start,
+        Bound::Excluded(start) => key > *start,
+        Bound::Unbounded => true,
+    };
+
+    let end_exclusive = match &range_end {
+        Bound::Included(end) => key <= *end,
+        Bound::Excluded(end) => key < *end,
+        Bound::Unbounded => true,
+    };
+
+    start_inclusive && end_exclusive
+}
+
+/// Serializable Snapshot Isolation (SSI):
+/// https://www.cse.iitb.ac.in/infolab/Data/Courses/CS632/2009/Papers/p492-fekete.pdf
+///
+/// Serializable Snapshot Isolation (SSI) is a specific isolation level that falls under the
+/// category of "serializable" isolation levels. It provides serializability while allowing for
+/// a higher degree of concurrency compared to traditional serializability mechanisms.
+///
+/// SSI allows for "snapshot isolation" semantics, where a transaction sees a consistent snapshot of
+/// the database as of its start time. It uses timestamps to control the order in which transactions
+/// read and write data, preventing anomalies like write skew and lost updates.
+///
+/// This struct manages the coordination of read and write operations by maintaining timestamps
+/// for transactions and tracking committed transactions.
+///
+/// - `commit_tracker` maintains information about committed transactions and their timestamps.
+/// - `txn_mark` is a watermark used to block new transactions until previous commits are visible.
+/// - `read_mark` is another watermark that marks the visibility of read operations to other transactions.
+///
+/// The serializable snapshot isolation (SSI) algorithm implemented here is inspired from BadgerDB.
+pub(crate) struct SerializableSnapshotIsolation {
+    // The `commit_tracker` keeps track of committed transactions and their timestamps.
+    commit_tracker: Mutex<CommitTracker>,
+
+    // The `txn_mark` and `read_mark` are used to manage visibility of transactions.
+    // `txn_mark` blocks `new_transaction` to ensure previous commits are visible to new reads.
+    txn_mark: Arc<WaterMark>,
+    // `read_mark` marks the visibility of read operations to other transactions.
+    read_mark: Arc<RwLock<BinaryHeap<Reverse<u64>>>>,
+}
+
+impl SerializableSnapshotIsolation {
+    // Create a new instance of `SerializableSnapshotIsolation`.
+    pub(crate) fn new() -> Self {
+        Self {
+            commit_tracker: Mutex::new(CommitTracker::new()),
+            // Create a watermark for transactions.
+            txn_mark: Arc::new(WaterMark::new()),
+            // Create a watermark for read operations.
+            read_mark: Arc::new(RwLock::new(BinaryHeap::new())),
+        }
+    }
+
+    // Retrieve the read timestamp for a new read operation.
+    pub(crate) fn read_ts(&self) -> u64 {
+        let commit_tracker = self.commit_tracker.lock();
+        let read_ts = commit_tracker.next_ts - 1;
+
+        // Keep track of the read timestamp for active transactions.
+        self.read_mark.write().push(Reverse(read_ts));
+
+        // Wait for the current read timestamp to be visible to new transactions.
+        self.txn_mark.wait_for(read_ts);
+        read_ts
+    }
+
+    // Generate a new commit timestamp for a transaction.
+    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+        let mut commit_tracker = self.commit_tracker.lock();
+
+        // Check for conflicts between the transaction and committed transactions.
+        if commit_tracker.has_conflict(txn) {
+            return Err(Error::TransactionReadConflict);
+        }
+
+        // Mark that read operations are done up to the transaction's read timestamp.
+        self.mark_read_operations_done(txn.read_ts);
+
+        // Clean up committed transactions up to the current read mark.
+        let max_read_ts = self.read_mark.read().peek().map_or(0, |peek| peek.0);
+        commit_tracker.cleanup_committed_transactions(max_read_ts);
+
+        let ts = commit_tracker.next_ts;
+        commit_tracker.next_ts += 1;
+
+        assert!(ts >= commit_tracker.last_cleanup_ts);
+
+        // Add the transaction to the list of committed transactions with conflict keys.
+        let conflict_keys: HashSet<Bytes> = txn
+            .write_set
+            .values()
+            .filter_map(|entries| entries.last().map(|entry| entry.e.key.clone()))
+            .collect();
+
+        commit_tracker
+            .committed_transactions
+            .push(CommitMarker { ts, conflict_keys });
+
+        Ok(ts)
+    }
+
+    // Helper method to mark read operations as done up to a given timestamp.
+    fn mark_read_operations_done(&self, read_ts: u64) {
+        self.read_mark
+            .write()
+            .retain(|&read_timestamp| read_timestamp.0 > read_ts);
+    }
+
+    // Set the global timestamp for the system.
+    pub(crate) fn set_ts(&self, ts: u64) {
+        self.commit_tracker.lock().next_ts = ts;
+
+        // Mark that read operations are done up to the given timestamp.
+        self.txn_mark.done_upto(ts);
+
+        // Mark that reads are done up to the given timestamp.
+        self.read_mark.write().retain(|&read_ts| read_ts.0 > ts);
+    }
+
+    // Increment the global timestamp for the system.
+    pub(crate) fn increment_ts(&self) {
+        let mut commit_info = self.commit_tracker.lock();
+        commit_info.next_ts += 1;
+    }
+}
+
+/// `WaterMark` is a synchronization mechanism for managing transaction timestamps.
+struct WaterMark {
+    mark: RwLock<WaterMarkState>, // Keeps track of waiters for specific timestamps.
+}
+
+struct WaterMarkState {
+    done_upto: u64,
+    waiters: HashMap<u64, Arc<Mark>>,
+}
+
+impl WaterMarkState {
+    fn new() -> Self {
+        Self {
+            done_upto: 0,
+            waiters: HashMap::new(),
+        }
+    }
+}
+
+/// Represents a waiter for a specific timestamp.
+struct Mark {
+    ch: Mutex<Option<Sender<()>>>, // Sender for notifying the waiter.
+    closer: Receiver<()>,          // Receiver for detecting closure.
+}
+
+impl Mark {
+    fn new() -> Arc<Self> {
+        let (tx, rx) = bounded(1);
+        Arc::new(Self {
+            ch: Mutex::new(Some(tx)),
+            closer: rx,
+        })
+    }
+
+    fn take(&self) -> Sender<()> {
+        self.ch.lock().take().unwrap()
+    }
+}
+
+impl WaterMark {
+    /// Creates a new `WaterMark` with the given initial done timestamp.
+    fn new() -> Self {
+        WaterMark {
+            mark: RwLock::new(WaterMarkState::new()),
+        }
+    }
+
+    /// Marks transactions as done up to the specified timestamp.
+    fn done_upto(&self, t: u64) {
+        let mut mark = self.mark.write();
+
+        let done_upto = mark.done_upto;
+        if done_upto >= t {
+            return;
+        }
+
+        for i in (done_upto + 1)..=t {
+            if let Some(wp) = mark.waiters.get(&i) {
+                wp.take();
+                mark.waiters.remove(&i);
+            }
+        }
+
+        mark.done_upto = t;
+    }
+
+    /// Waits for transactions to be done up to the specified timestamp.
+    fn wait_for(&self, t: u64) {
+        let mark = self.mark.read();
+        if mark.done_upto >= t {
+            return;
+        }
+        let should_insert = !mark.waiters.contains_key(&t);
+        drop(mark);
+
+        if should_insert {
+            let mut mark = self.mark.write();
+            mark.waiters.entry(t).or_insert_with(Mark::new);
+            drop(mark);
+        }
+
+        let mark = self.mark.read(); // Re-acquire the read lock.
+        let wp = mark.waiters.get(&t).cloned();
+        drop(mark);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures::executor::block_on;
+            if let Some(wp) = wp {
+                matches!(block_on(wp.closer.recv()), Err(async_channel::RecvError));
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(wp) = wp {
+                matches!(wp.closer.recv_blocking(), Err(async_channel::RecvError));
+            }
+        }
+    }
+
+    /// Gets the highest completed timestamp.
+    fn _done_until(&self) -> u64 {
+        let mark = self.mark.read();
+        mark.done_upto
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn waiters_new() {
+        let hub = WaterMark::new();
+
+        hub.done_upto(10);
+        let t2 = hub._done_until();
+        assert_eq!(t2, 10);
+
+        for i in 1..=10 {
+            hub.wait_for(i);
+        }
+    }
+
+    #[test]
+    fn waiters_async() {
+        let hub = Arc::new(WaterMark::new());
+        let hub_clone = Arc::clone(&hub);
+
+        // Spawn a thread to complete timestamp 1.
+        thread::spawn(move || {
+            // Wait for a while and then complete timestamp 1.
+            thread::sleep(std::time::Duration::from_millis(10));
+            hub_clone.done_upto(10);
+        });
+
+        // Now, wait for timestamp 1 in the main thread.
+        hub.wait_for(10);
     }
 }
