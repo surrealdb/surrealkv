@@ -1021,7 +1021,7 @@ mod tests {
         let value1 = Bytes::from("baz");
         let value2 = Bytes::from("bar");
 
-        // no read conflict
+        // no conflict
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1034,7 +1034,7 @@ mod tests {
             txn2.commit().await.unwrap();
         }
 
-        // read conflict when the read key was updated by another transaction
+        // conflict when the read key was updated by another transaction
         {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
@@ -1046,7 +1046,11 @@ mod tests {
             txn2.set(&key1, &value2).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1063,7 +1067,7 @@ mod tests {
             txn1.commit().await.unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    matches!(err, Error::TransactionWriteConflict)
                 }
                 _ => {
                     false
@@ -1071,7 +1075,7 @@ mod tests {
             });
         }
 
-        // read conflict when the read key was updated by another transaction
+        // conflict when the read key was updated by another transaction
         {
             let key = Bytes::from("key3");
 
@@ -1085,35 +1089,37 @@ mod tests {
             txn2.set(&key, &value1).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
         }
 
-        if is_ssi {
-            // write-skew: read conflict when the read key was deleted by another transaction
-            {
-                let key = Bytes::from("key4");
+        // write-skew: read conflict when the read key was deleted by another transaction
+        {
+            let key = Bytes::from("key4");
 
-                let mut txn1 = store.begin().unwrap();
-                txn1.set(&key, &value1).unwrap();
-                txn1.commit().await.unwrap();
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key, &value1).unwrap();
+            txn1.commit().await.unwrap();
 
-                let mut txn2 = store.begin().unwrap();
-                let mut txn3 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
-                txn2.delete(&key).unwrap();
-                assert!(txn2.commit().await.is_ok());
+            txn2.delete(&key).unwrap();
+            assert!(txn2.commit().await.is_ok());
 
-                assert!(txn3.get(&key).is_ok());
-                txn3.set(&key, &value2).unwrap();
-                assert!(match txn3.commit().await {
-                    Err(err) => {
-                        matches!(err, Error::TransactionReadConflict)
-                    }
-                    _ => false,
-                });
+            assert!(txn3.get(&key).is_ok());
+            txn3.set(&key, &value2).unwrap();
+            let result = txn3.commit().await;
+            if is_ssi {
+                assert!(matches!(result, Err(Error::TransactionReadConflict)));
+            } else {
+                assert!(result.is_ok());
             }
         }
     }
@@ -1217,7 +1223,7 @@ mod tests {
         let value5 = Bytes::from("value5");
         let value6 = Bytes::from("value6");
 
-        // read conflict when scan keys have been updated in another transaction
+        // conflict when scan keys have been updated in another transaction
         {
             let mut txn1 = store.begin().unwrap();
 
@@ -1240,36 +1246,37 @@ mod tests {
 
             assert!(match txn3.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
         }
 
-        if is_ssi {
-            // write-skew: read conflict when read keys are deleted by other transaction
-            {
-                let mut txn1 = store.begin().unwrap();
+        // write-skew: read conflict when read keys are deleted by other transaction
+        {
+            let mut txn1 = store.begin().unwrap();
 
-                txn1.set(&key4, &value1).unwrap();
-                txn1.commit().await.unwrap();
+            txn1.set(&key4, &value1).unwrap();
+            txn1.commit().await.unwrap();
 
-                let mut txn2 = store.begin().unwrap();
-                let mut txn3 = store.begin().unwrap();
+            let mut txn2 = store.begin().unwrap();
+            let mut txn3 = store.begin().unwrap();
 
-                txn2.delete(&key4).unwrap();
-                txn2.commit().await.unwrap();
+            txn2.delete(&key4).unwrap();
+            txn2.commit().await.unwrap();
 
-                let range = "key1".as_bytes()..="key5".as_bytes();
-                txn3.scan(range, None).unwrap();
-                txn3.set(&key4, &value2).unwrap();
-
-                assert!(match txn3.commit().await {
-                    Err(err) => {
-                        matches!(err, Error::TransactionReadConflict)
-                    }
-                    _ => false,
-                });
+            let range = "key1".as_bytes()..="key5".as_bytes();
+            txn3.scan(range, None).unwrap();
+            txn3.set(&key4, &value2).unwrap();
+            let result = txn3.commit().await;
+            if is_ssi {
+                assert!(matches!(result, Err(Error::TransactionReadConflict)));
+            } else {
+                assert!(result.is_ok());
             }
         }
     }
@@ -1375,7 +1382,11 @@ mod tests {
             txn2.set(&key2, &value6).unwrap();
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1627,7 +1638,11 @@ mod tests {
 
             assert!(match txn2.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
@@ -1706,7 +1721,11 @@ mod tests {
             assert!(txn1.get(&key2).unwrap().is_none());
             assert!(match txn1.commit().await {
                 Err(err) => {
-                    matches!(err, Error::TransactionReadConflict)
+                    if !is_ssi {
+                        matches!(err, Error::TransactionWriteConflict)
+                    } else {
+                        matches!(err, Error::TransactionReadConflict)
+                    }
                 }
                 _ => false,
             });
