@@ -23,7 +23,6 @@ pub enum Error {
     KeyNotFound,                        // The key was not found
     CorruptedIndex,                     // The index is corrupted
     TransactionReadConflict,            // A read conflict occurred in the transaction
-    TransactionWriteConflict,           // A write conflict occurred in the transaction
     StoreClosed,                        // The store was closed
     InvalidAttributeData,               // The attribute data is invalid
     UnknownAttributeType,               // The attribute type is unknown
@@ -67,7 +66,6 @@ impl fmt::Display for Error {
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::CorruptedIndex => write!(f, "Corrupted index"),
             Error::TransactionReadConflict => write!(f, "Transaction read conflict"),
-            Error::TransactionWriteConflict => write!(f, "Transaction write conflict"),
             Error::StoreClosed => write!(f, "Store closed"),
             Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
             Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
