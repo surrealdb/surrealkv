@@ -194,16 +194,8 @@ fn key_in_range(
 /// category of "serializable" isolation levels. It provides serializability while allowing for
 /// a higher degree of concurrency compared to traditional serializability mechanisms.
 ///
-/// SSI allows for "snapshot isolation" semantics, where a transaction sees a consistent snapshot of
-/// the database as of its start time. It uses timestamps to control the order in which transactions
-/// read and write data, preventing anomalies like write skew and lost updates.
-///
-/// This struct manages the coordination of read and write operations by maintaining timestamps
-/// for transactions and tracking committed transactions.
-///
-/// - `commit_tracker` maintains information about committed transactions and their timestamps.
-/// - `txn_mark` is a watermark used to block new transactions until previous commits are visible.
-/// - `read_mark` is another watermark that marks the visibility of read operations to other transactions.
+/// This implementation adopts Write Snapshot Isolation as defined in the paper:
+/// https://arxiv.org/abs/2405.18393
 pub(crate) struct SerializableSnapshotIsolation {
     next_tx_id: AtomicU64,
 }
