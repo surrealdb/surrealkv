@@ -138,7 +138,7 @@ impl SnapshotIsolation {
                     Ok((_, version)) => {
                         // Detect if another transaction has written to this key
                         if version > last_entry.version {
-                            return Err(Error::TransactionReadConflict);
+                            return Err(Error::TransactionWriteConflict);
                         }
                     }
                     Err(Error::KeyNotFound) => {
@@ -253,7 +253,7 @@ impl SerializableSnapshotIsolation {
                     Ok((_, version)) => {
                         // Detect if another transaction has written to this key
                         if version > last_entry.version {
-                            return Err(Error::TransactionReadConflict);
+                            return Err(Error::TransactionWriteConflict);
                         }
                     }
                     Err(Error::KeyNotFound) => {
@@ -294,7 +294,7 @@ impl SerializableSnapshotIsolation {
                         let res = current_snapshot.get(&key);
                         if entry.e.is_deleted_or_tombstone() && res.is_err() {
                             // This is a delete of a key that didn't exist at snapshot time
-                            return Err(Error::TransactionReadConflict);
+                            return Err(Error::TransactionWriteConflict);
                         }
                     }
                 }
