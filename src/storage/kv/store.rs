@@ -945,9 +945,9 @@ mod tests {
         }
     }
 
-    async fn concurrent_task(store: Arc<Store>) {
+    async fn concurrent_task(store: Arc<Store>, key: &[u8], value: &[u8]) {
         let mut txn = store.begin().unwrap();
-        txn.set(b"dummy key", b"dummy value").unwrap();
+        txn.set(key, value).unwrap();
         txn.commit().await.unwrap();
     }
 
@@ -956,8 +956,15 @@ mod tests {
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
         let db = Arc::new(Store::new(opts).expect("should create store"));
-        let task1 = tokio::spawn(concurrent_task(db.clone()));
-        let task2 = tokio::spawn(concurrent_task(db.clone()));
+
+        let key1 = b"key1";
+        let value1 = b"value1";
+        let key2 = b"key2";
+        let value2 = b"value2";
+
+        let task1 = tokio::spawn(concurrent_task(db.clone(), key1, value1));
+        let task2 = tokio::spawn(concurrent_task(db.clone(), key2, value2));
+
         let _ = tokio::try_join!(task1, task2).expect("Tasks failed");
     }
 
