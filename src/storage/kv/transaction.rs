@@ -60,8 +60,8 @@ impl Mode {
     }
 }
 
-/// ScanResult is a tuple containing the key, value, timestamp, and commit timestamp of a key-value pair.
-pub type ScanResult = (Vec<u8>, Vec<u8>, u64, u64);
+/// ScanResult is a tuple containing the key, value, and commit timestamp of a key-value pair.
+pub type ScanResult = (Vec<u8>, Vec<u8>, u64);
 
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
 pub type ScanVersionResult = (Vec<u8>, Vec<u8>, u64, bool);
@@ -430,8 +430,8 @@ impl Transaction {
             // Resolve the value reference to get the actual value.
             let v = value.resolve(&self.core)?;
 
-            // Add the value, version, and timestamp to the results vector.
-            results.push((key, v, *version, *ts));
+            // Add the key, value, and timestamp to the results vector.
+            results.push((key, v, *ts));
         }
 
         // Return the results.
