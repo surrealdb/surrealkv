@@ -11,7 +11,7 @@ use crate::storage::kv::{
     entry::Entry,
     error::{Error, Result},
     indexer::IndexValue,
-    snapshot::{FilterFn, Snapshot, FILTERS},
+    snapshot::Snapshot,
     store::Core,
     util::{convert_range_bounds, now},
 };
@@ -299,7 +299,7 @@ impl Transaction {
 
         // The value is not in the write set, so attempt to get it from the snapshot.
         match self.snapshot.as_ref().unwrap().get(&key[..].into()) {
-            Ok((val, version)) => {
+            Some((val, version)) => {
                 // If the transaction is not read-only and the value reference has a version greater than 0,
                 // add the key and its version to the read set for conflict detection.
                 if !self.mode.is_read_only() && version > 0 {
@@ -311,21 +311,15 @@ impl Transaction {
                 // Resolve the value reference to get the actual value.
                 val.resolve(&self.core).map(Some)
             }
-            Err(e) => {
-                match &e {
-                    // If the key is not found in the index, and the transaction is not read-only,
-                    // add the key to the read set with a timestamp of 0.
-                    Error::KeyNotFound => {
-                        if !self.mode.is_read_only() {
-                            let key = Bytes::copy_from_slice(key);
-                            let entry = ReadSetEntry::new(key, 0, self.savepoints);
-                            self.read_set.push(entry);
-                        }
-                        Ok(None)
-                    }
-                    // For other errors, just propagate them.
-                    _ => Err(e),
+            None => {
+                // If the key is not found in the index, and the transaction is not read-only,
+                // add the key to the read set with a timestamp of 0.
+                if !self.mode.is_read_only() {
+                    let key = Bytes::copy_from_slice(key);
+                    let entry = ReadSetEntry::new(key, 0, self.savepoints);
+                    self.read_set.push(entry);
                 }
+                Ok(None)
             }
         }
     }
@@ -404,18 +398,11 @@ impl Transaction {
         let ranger = snap.range(range);
 
         // Iterate over the keys in the range.
-        'outer: for (key, value, version, ts) in ranger {
+        for (key, value, version, ts) in ranger {
             // If a limit is set and we've already got enough results, break the loop.
             if let Some(limit) = limit {
                 if results.len() >= limit {
                     break;
-                }
-            }
-
-            // Apply all filters. If any filter fails, skip this key and continue with the next one.
-            for filter in &FILTERS {
-                if filter.apply(value).is_err() {
-                    continue 'outer;
                 }
             }
 
@@ -447,7 +434,7 @@ impl Transaction {
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(range);
-        let keys = self.snapshot.as_ref().unwrap().range(range);
+        let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
         let result = keys.into_iter().map(|(key, _, _, _)| key).collect();
 
         Ok(result)
@@ -670,12 +657,11 @@ impl Transaction {
             .unwrap()
             .get_at_ts(&key[..].into(), ts)
         {
-            Ok(value) => {
+            Some(value) => {
                 // Resolve the value reference to get the actual value.
                 value.resolve(&self.core).map(Some)
             }
-            Err(Error::KeyNotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 
@@ -697,14 +683,16 @@ impl Transaction {
             .unwrap()
             .get_version_history(&key[..].into())
         {
-            Ok(values) => {
+            Some(values) => {
                 // Resolve the value reference to get the actual value.
                 for (value, ts) in values {
                     let resolved_value = value.resolve(&self.core)?;
                     results.push((resolved_value, ts));
                 }
             }
-            Err(e) => return Err(e),
+            None => {
+                // Return the empty vec.
+            }
         }
 
         Ok(results)
@@ -725,18 +713,11 @@ impl Transaction {
         let items = self.snapshot.as_ref().unwrap().scan_at_ts(range, ts);
 
         let mut results = Vec::new();
-        'outer: for (key, value) in items {
+        for (key, value) in items {
             // If a limit is set and we've already got enough results, break the loop.
             if let Some(limit) = limit {
                 if results.len() >= limit {
                     break;
-                }
-            }
-
-            // Apply all filters. If any filter fails, skip this key and continue with the next one.
-            for filter in &FILTERS {
-                if filter.apply(&value).is_err() {
-                    continue 'outer;
                 }
             }
 
@@ -780,13 +761,12 @@ impl Transaction {
             .unwrap()
             .get_value_by_query(key, query_type)
         {
-            Ok((idx_val, version, ts)) => {
+            Some((idx_val, version, ts)) => {
                 // Resolve the value reference to get the actual value.
                 let value = idx_val.resolve(&self.core)?;
                 Ok(Some((value, version, ts)))
             }
-            Err(Error::KeyNotFound) => Ok(None),
-            Err(e) => Err(e),
+            None => Ok(None),
         }
     }
 

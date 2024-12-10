@@ -123,6 +123,11 @@ impl IndexValue {
         }
     }
 
+    pub(crate) fn deleted(&self) -> bool {
+        self.metadata()
+            .is_some_and(|md| md.is_deleted_or_tombstone())
+    }
+
     pub(crate) fn segment_id(&self) -> u64 {
         match self {
             Self::Disk(e) => e.segment_id,

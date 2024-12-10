@@ -134,17 +134,12 @@ impl SnapshotIsolation {
         // Check write conflicts
         for key in txn.write_set.keys() {
             if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                match current_snapshot.get(&key[..].into()) {
-                    Ok((_, version)) => {
-                        // Detect if another transaction has written to this key
-                        if version > last_entry.version {
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                    Err(Error::KeyNotFound) => {
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                // Detect if another transaction has written to this key.
+                if current_snapshot
+                    .get(&key[..].into())
+                    .is_some_and(|(_, version)| version > last_entry.version)
+                {
+                    return Err(Error::TransactionWriteConflict);
                 }
             }
         }
@@ -223,35 +218,28 @@ impl SerializableSnapshotIsolation {
         // Check read conflicts
         for entry in txn.read_set.iter() {
             match current_snapshot.get(&entry.key[..].into()) {
-                Ok((_, version)) => {
+                Some((_, version)) => {
                     if entry.ts != version {
                         return Err(Error::TransactionReadConflict);
                     }
                 }
-                Err(Error::KeyNotFound) => {
+                None => {
                     if entry.ts > 0 {
                         return Err(Error::TransactionReadConflict);
                     }
-                    continue;
                 }
-                Err(e) => return Err(e),
             }
         }
 
         // Check write conflicts
         for key in txn.write_set.keys() {
             if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                match current_snapshot.get(&key[..].into()) {
-                    Ok((_, version)) => {
-                        // Detect if another transaction has written to this key
-                        if version > last_entry.version {
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                    Err(Error::KeyNotFound) => {
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                // Detect if another transaction has written to this key.
+                if current_snapshot
+                    .get(&key[..].into())
+                    .is_some_and(|(_, version)| version > last_entry.version)
+                {
+                    return Err(Error::TransactionWriteConflict);
                 }
             }
         }
@@ -284,7 +272,7 @@ impl SerializableSnapshotIsolation {
                     if let Some(entry) = entries.last() {
                         let key = VariableSizeKey::from_slice(key);
                         let res = current_snapshot.get(&key);
-                        if entry.e.is_deleted_or_tombstone() && res.is_err() {
+                        if entry.e.is_deleted_or_tombstone() && res.is_none() {
                             // This is a delete of a key that didn't exist at snapshot time
                             return Err(Error::TransactionWriteConflict);
                         }
