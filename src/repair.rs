@@ -135,7 +135,7 @@ fn repair_segment(
     std::fs::rename(&corrupted_segment_file_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
-    let mut new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
+    let mut new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
 
     // Create a segment reader for the repaired segment
     let segments: Vec<SegmentRef> = vec![SegmentRef {
@@ -171,7 +171,7 @@ fn repair_segment(
         println!("deleting empty file {:?}", corrupted_segment_file_path);
         std::fs::remove_file(&corrupted_segment_file_path)?;
     }
-    let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts)?;
+    let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts, false)?;
     aol.active_segment = new_segment;
 
     Ok(())

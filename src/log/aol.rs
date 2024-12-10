@@ -1,16 +1,19 @@
 use std::fs;
 use std::io;
 use std::mem;
-use std::num::NonZeroUsize;
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use lru::LruCache;
-use parking_lot::Mutex;
+use quick_cache::sync::Cache;
 
 use crate::log::{get_segment_range, Error, IOError, Options, Result, Segment};
+
+use super::fd::SegmentReaderPool;
+
+const DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT: usize = 8;
 
 /// Append-Only Log (Aol) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
@@ -32,8 +35,9 @@ pub struct Aol {
     /// A flag indicating whether the AOL instance is closed or not.
     closed: bool,
 
-    /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: Mutex<LruCache<u64, Segment>>,
+    /// A lock-free cache used to store recently used segments.
+    /// Cache stores pools of segment readers
+    segment_cache: Cache<u64, Arc<SegmentReaderPool>>,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
@@ -55,11 +59,10 @@ impl Aol {
         let active_segment_id = Self::calculate_current_write_segment_id(dir)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts)?;
+        let active_segment = Segment::open(dir, active_segment_id, opts, false)?;
 
-        // Create the segment cache
-        // TODO: fix unwrap and return error
-        let cache = LruCache::new(NonZeroUsize::new(opts.max_open_files).unwrap());
+        // Create the lock-free cache with specified capacity
+        let segment_cache = Cache::new(opts.max_open_files as usize);
 
         Ok(Self {
             active_segment,
@@ -67,7 +70,7 @@ impl Aol {
             dir: dir.to_path_buf(),
             opts: opts.clone(),
             closed: false,
-            segment_cache: Mutex::new(cache),
+            segment_cache,
             fsync_failed: Default::default(),
         })
     }
@@ -119,16 +122,16 @@ impl Aol {
             return Err(Error::RecordTooLarge);
         }
 
-        // Get options and initialize variables
-        let opts = &self.opts;
-
         // Calculate available space in the active segment
-        let available = opts.max_file_size as i64 - self.active_segment.offset() as i64;
+        let current_offset = self.active_segment.offset();
+        let available = self.opts.max_file_size as i64 - current_offset as i64;
 
         // If the entire record can't fit into the remaining space of the current segment,
         // close the current segment and create a new one
         if available < rec.len() as i64 {
             // Rotate to a new segment
+            let current_id = self.active_segment_id;
+            let new_id = current_id + 1;
 
             // Sync and close the active segment
             // Note that closing the segment will
@@ -137,10 +140,10 @@ impl Aol {
             self.active_segment.close()?;
 
             // Increment the active segment id
-            self.active_segment_id += 1;
+            self.active_segment_id = new_id;
 
             // Open a new segment for writing
-            let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+            let new_segment = Segment::open(&self.dir, new_id, &self.opts, false)?;
 
             // Retrieve the previous active segment and replace it with the new one
             let _ = mem::replace(&mut self.active_segment, new_segment);
@@ -208,21 +211,49 @@ impl Aol {
         segment_id: u64,
         read_offset: u64,
     ) -> Result<usize> {
-        // During read, we acquire a lock to not allow concurrent writes and reads
-        // to the active segment file to avoid seek errors.
         if segment_id == self.active_segment.id {
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let mut cache = self.segment_cache.lock();
-            match cache.get(&segment_id) {
-                Some(segment) => segment.read_at(buf, read_offset),
-                None => {
-                    let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
-                    let read_bytes = segment.read_at(buf, read_offset)?;
-                    cache.push(segment_id, segment);
-                    Ok(read_bytes)
-                }
-            }
+            // Get or create the segment reader pool
+            let pool = self
+                .segment_cache
+                .get_or_insert_with(&segment_id, || {
+                    Ok::<_, std::io::Error>(Arc::new(
+                        SegmentReaderPool::new(
+                            self.dir.clone(),
+                            segment_id,
+                            self.opts.clone(),
+                            DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT, // Pool size - could be configurable
+                        )
+                        .unwrap(),
+                    ))
+                })
+                .unwrap();
+
+            // Acquire reader from pool
+            let reader = pool.acquire_reader()?;
+
+            // Use reader and return it to pool on drop
+            reader.segment.as_ref().unwrap().read_at(buf, read_offset)
+
+            // // Try to get segment from cache first
+            //     match self.segment_cache.get(&segment_id) {
+            //         Some(segment) => segment.read_at(buf, read_offset),
+            //         None => {
+            //             // If not in cache, open the segment and cache it
+            //             // Use get_or_insert_with to ensure atomic insertion
+            //             let segment = self
+            //                 .segment_cache
+            //                 .get_or_insert_with(&segment_id, || {
+            //                     Segment::open(&self.dir, segment_id, &self.opts, true).map(Arc::new)
+            //                 })
+            //                 .unwrap();
+
+            //             let read_bytes = segment.read_at(buf, read_offset)?;
+
+            //             Ok(read_bytes)
+            //         }
+            //     }
         }
     }
 
@@ -235,12 +266,12 @@ impl Aol {
     pub fn rotate(&mut self) -> Result<u64> {
         self.active_segment.close()?;
         self.active_segment_id += 1;
-        self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
+        self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts, false)?;
         Ok(self.active_segment_id)
     }
 
     pub fn size(&self) -> Result<u64> {
-        let cur_segment_size = self.active_segment.file_offset;
+        let cur_segment_size = self.active_segment.file_offset();
         let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
     }
