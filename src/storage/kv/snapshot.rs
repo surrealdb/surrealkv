@@ -9,8 +9,6 @@ use crate::storage::{
 
 use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
 
-pub(crate) const FILTERS: [fn(&IndexValue) -> Result<()>; 1] = [ignore_deleted];
-
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
     snap: Tree<VariableSizeKey, IndexValue>,
@@ -48,50 +46,40 @@ impl Snapshot {
             .expect("incorrect snapshot version");
     }
 
-    #[allow(unused)]
     pub(crate) fn delete(&mut self, key: &VariableSizeKey) -> bool {
         self.snap.remove(key)
     }
 
-    fn apply_filters(&self, val: IndexValue, filters: &[impl FilterFn]) -> Result<IndexValue> {
-        for filter in filters {
-            filter.apply(&val)?;
-        }
-
-        Ok(val)
-    }
-
     /// Retrieves the latest value associated with the given key from the snapshot.
-    pub(crate) fn get(&self, key: &VariableSizeKey) -> Result<(IndexValue, u64)> {
-        let (snap_val, version, _) = self.snap.get(key, self.version).ok_or(Error::KeyNotFound)?;
-        let val = self.apply_filters(snap_val, &FILTERS)?;
-        Ok((val, version))
+    pub(crate) fn get(&self, key: &VariableSizeKey) -> Option<(IndexValue, u64)> {
+        self.snap
+            .get(key, self.version)
+            .filter(|(val, _, _)| !val.deleted())
+            .map(|(val, version, _)| (val, version))
     }
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
-    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Result<IndexValue> {
-        let (val, _, _) = self.snap.get_at_ts(key, ts).ok_or(Error::KeyNotFound)?;
-        self.apply_filters(val, &FILTERS)
+    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Option<IndexValue> {
+        self.snap
+            .get_at_ts(key, ts)
+            .filter(|(val, _, _)| !val.deleted())
+            .map(|(val, _, _)| val)
     }
 
     /// Retrieves the version history of the value associated with the given key from the snapshot.
     pub(crate) fn get_version_history(
         &self,
         key: &VariableSizeKey,
-    ) -> Result<Vec<(IndexValue, u64)>> {
-        let mut results = Vec::new();
+    ) -> Option<Vec<(IndexValue, u64)>> {
+        let items = self.snap.get_version_history(key)?;
 
-        let items = self
-            .snap
-            .get_version_history(key)
-            .ok_or(Error::KeyNotFound)?;
+        let result = items
+            .into_iter()
+            .filter(|(val, _, _)| !val.deleted())
+            .map(|(value, _, ts)| (value, ts))
+            .collect();
 
-        for (value, _, ts) in items {
-            let result = self.apply_filters(value, &FILTERS)?;
-            results.push((result, ts));
-        }
-
-        Ok(results)
+        Some(result)
     }
 
     /// Retrieves an iterator over the key-value pairs in the snapshot.
@@ -100,8 +88,21 @@ impl Snapshot {
         self.snap.iter()
     }
 
-    /// Returns a range query iterator over the Trie.
+    /// Returns a range query iterator over the Trie without deleted keys.
     pub(crate) fn range<'a, R>(
+        &'a self,
+        range: R,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    where
+        R: RangeBounds<VariableSizeKey> + 'a,
+    {
+        self.snap
+            .range(range)
+            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
+    }
+
+    /// Returns a range query iterator over the Trie including deleted keys.
+    pub(crate) fn range_with_deleted<'a, R>(
         &'a self,
         range: R,
     ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
@@ -112,7 +113,6 @@ impl Snapshot {
     }
 
     /// Returns a versioned range query iterator over the Trie.
-    #[allow(unused)]
     pub(crate) fn range_with_versions<'a, R>(
         &'a self,
         range: R,
@@ -127,20 +127,21 @@ impl Snapshot {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<(IndexValue, u64, u64)> {
-        let (idx_val, version, ts) = self
-            .snap
+    ) -> Option<(IndexValue, u64, u64)> {
+        self.snap
             .get_value_by_query(key, query_type)
-            .ok_or(Error::KeyNotFound)?;
-        let filtered_val = self.apply_filters(idx_val, &FILTERS)?;
-        Ok((filtered_val, version, ts))
+            .filter(|(val, _, _)| !val.deleted())
     }
 
     pub(crate) fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, IndexValue)>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.scan_at_ts(range, ts)
+        self.snap
+            .scan_at_ts(range, ts)
+            .into_iter()
+            .filter(|(_, snap_val)| !snap_val.deleted())
+            .collect()
     }
 
     pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
@@ -148,29 +149,6 @@ impl Snapshot {
         R: RangeBounds<VariableSizeKey>,
     {
         self.snap.keys_at_ts(range, ts)
-    }
-}
-
-pub(crate) trait FilterFn {
-    fn apply(&self, val: &IndexValue) -> Result<()>;
-}
-
-fn ignore_deleted(val: &IndexValue) -> Result<()> {
-    let md = val.metadata();
-    if let Some(md) = md {
-        if md.is_deleted_or_tombstone() {
-            return Err(Error::KeyNotFound);
-        }
-    }
-    Ok(())
-}
-
-impl<F> FilterFn for F
-where
-    F: Fn(&IndexValue) -> Result<()>,
-{
-    fn apply(&self, val: &IndexValue) -> Result<()> {
-        self(val)
     }
 }
 
