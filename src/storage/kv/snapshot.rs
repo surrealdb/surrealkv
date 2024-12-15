@@ -1,13 +1,11 @@
 use std::ops::RangeBounds;
+use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
 
 use crate::storage::{
     kv::error::{Error, Result},
     kv::indexer::IndexValue,
     kv::store::Core,
-    kv::util::now,
 };
-
-use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
@@ -39,17 +37,6 @@ impl Snapshot {
         })
     }
 
-    /// Set a key-value pair into the snapshot.
-    pub(crate) fn set(&mut self, key: &VariableSizeKey, value: IndexValue) {
-        self.snap
-            .insert(key, value, self.version, now())
-            .expect("incorrect snapshot version");
-    }
-
-    pub(crate) fn delete(&mut self, key: &VariableSizeKey) -> bool {
-        self.snap.remove(key)
-    }
-
     /// Retrieves the latest value associated with the given key from the snapshot.
     pub(crate) fn get(&self, key: &VariableSizeKey) -> Option<(IndexValue, u64)> {
         self.snap
@@ -59,11 +46,11 @@ impl Snapshot {
     }
 
     /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
-    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Option<IndexValue> {
+    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Option<(IndexValue, u64)> {
         self.snap
             .get_at_ts(key, ts)
             .filter(|(val, _, _)| !val.deleted())
-            .map(|(val, _, _)| val)
+            .map(|(val, _, ts)| (val, ts))
     }
 
     /// Retrieves the version history of the value associated with the given key from the snapshot.
@@ -201,7 +188,7 @@ mod tests {
 
         // Test keys_at_ts
         let ts = now();
-        let txn = store
+        let mut txn = store
             .begin_with_mode(Mode::ReadOnly)
             .expect("Failed to begin transaction");
 
