@@ -1,11 +1,9 @@
-use std::{
-    fs,
-    ops::{Bound, RangeBounds},
-    path::{Path, PathBuf},
-};
-
+use bytes::Bytes;
 use chrono::Utc;
-use vart::VariableSizeKey;
+use std::fs;
+use std::ops::{Bound, RangeBounds};
+use std::path::{Path, PathBuf};
+use vart::{Key, VariableSizeKey};
 
 use crate::Result;
 
@@ -67,7 +65,7 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 pub(crate) fn convert_range_bounds<'a, R>(
-    range: R,
+    range: &R,
 ) -> (Bound<VariableSizeKey>, Bound<VariableSizeKey>)
 where
     R: RangeBounds<&'a [u8]>,
@@ -81,6 +79,23 @@ where
     let end_bound = match range.end_bound() {
         Bound::Included(end) => Bound::Included(VariableSizeKey::from_slice(end)),
         Bound::Excluded(end) => Bound::Excluded(VariableSizeKey::from_slice(end)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (start_bound, end_bound)
+}
+
+pub(crate) fn convert_range_bounds_bytes<R>(range: &R) -> (Bound<Bytes>, Bound<Bytes>)
+where
+    R: RangeBounds<VariableSizeKey>,
+{
+    let start_bound = match range.start_bound() {
+        Bound::Included(start) => Bound::Included(Bytes::copy_from_slice(start.as_slice())),
+        Bound::Excluded(start) => Bound::Excluded(Bytes::copy_from_slice(start.as_slice())),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end_bound = match range.end_bound() {
+        Bound::Included(end) => Bound::Included(Bytes::copy_from_slice(end.as_slice())),
+        Bound::Excluded(end) => Bound::Excluded(Bytes::copy_from_slice(end.as_slice())),
         Bound::Unbounded => Bound::Unbounded,
     };
     (start_bound, end_bound)
