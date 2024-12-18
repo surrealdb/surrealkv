@@ -1299,7 +1299,7 @@ dependencies = [
  "humansize",
  "indicatif",
  "serde_json",
- "surrealkv 0.6.1",
+ "surrealkv 0.7.0",
 ]
 
 [[package]]
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "surrealkv"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "async-channel",
