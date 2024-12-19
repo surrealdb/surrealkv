@@ -1,15 +1,10 @@
+use bytes::BytesMut;
 use std::io::Read;
 
-use bytes::BytesMut;
-
-use crate::storage::{
-    kv::{
-        entry::{Record, MAX_KV_METADATA_SIZE},
-        error::{Error, Result},
-        meta::Metadata,
-    },
-    log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader},
-};
+use crate::entry::{Record, MAX_KV_METADATA_SIZE};
+use crate::error::{Error, Result};
+use crate::log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader};
+use crate::meta::Metadata;
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `RecordReader` to read data from the Aol source.
@@ -278,7 +273,7 @@ impl RecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::log::{Aol, Options, SegmentRef};
+    use crate::log::{Aol, Options, SegmentRef};
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {

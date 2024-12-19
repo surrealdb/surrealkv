@@ -2,7 +2,7 @@ use revision::{revisioned, Revisioned};
 use std::path::Path;
 
 use super::reader::Reader;
-use crate::storage::log::{write_field, Error as LogError, MultiSegmentReader, SegmentRef};
+use crate::log::{write_field, Error as LogError, MultiSegmentReader, SegmentRef};
 use crate::{Error, Options, Result};
 
 #[revisioned(revision = 1)]
@@ -118,9 +118,9 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::kv::store::Core;
-    use crate::storage::log::Aol;
-    use crate::storage::log::Options as LogOptions;
+    use crate::log::Aol;
+    use crate::log::Options as LogOptions;
+    use crate::store::Core;
 
     use super::*;
     use tempdir::TempDir;
