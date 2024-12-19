@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use bytes::{BufMut, Bytes, BytesMut};
 use crc32fast::Hasher as crc32Hasher;
 
-use crate::storage::{kv::error::Result, kv::meta::Metadata};
+use crate::{error::Result, meta::Metadata};
 
 pub(crate) const MAX_KV_METADATA_SIZE: usize = 2; // Maximum size of key-value metadata in bytes
 pub(crate) const RECORD_VERSION: u16 = 1; // Version of the transaction header
@@ -245,8 +245,8 @@ impl Record {
 mod tests {
     use super::*;
 
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
+    use crate::option::Options;
+    use crate::store::Store;
 
     use tempdir::TempDir;
 

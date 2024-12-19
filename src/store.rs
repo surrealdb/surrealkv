@@ -1,34 +1,28 @@
+use ahash::{HashMap, HashMapExt};
+use async_channel::{bounded, Receiver, Sender};
+use bytes::{Bytes, BytesMut};
+use futures::{select, FutureExt};
+use parking_lot::RwLock;
+use quick_cache::sync::Cache;
+use revision::Revisioned;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
-use async_channel::{bounded, Receiver, Sender};
-use futures::{select, FutureExt};
-
-use ahash::{HashMap, HashMapExt};
-use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
-use quick_cache::sync::Cache;
-use revision::Revisioned;
-
-use crate::storage::{
-    kv::{
-        compaction::restore_from_compaction,
-        entry::{encode_entries, Entry, Record},
-        error::{Error, Result},
-        indexer::{IndexValue, Indexer},
-        manifest::Manifest,
-        option::Options,
-        oracle::Oracle,
-        reader::{Reader, RecordReader},
-        repair::{repair_last_corrupted_segment, restore_repair_files},
-        stats::StorageStats,
-        transaction::{Durability, Mode, Transaction},
-    },
-    log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef},
-};
+use crate::compaction::restore_from_compaction;
+use crate::entry::{encode_entries, Entry, Record};
+use crate::error::{Error, Result};
+use crate::indexer::{IndexValue, Indexer};
+use crate::log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef};
+use crate::manifest::Manifest;
+use crate::option::Options;
+use crate::oracle::Oracle;
+use crate::reader::{Reader, RecordReader};
+use crate::repair::{repair_last_corrupted_segment, restore_repair_files};
+use crate::stats::StorageStats;
+use crate::transaction::{Durability, Mode, Transaction};
 
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
@@ -754,11 +748,11 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Core;
-    use crate::storage::kv::store::{Store, Task, TaskRunner};
-    use crate::storage::kv::transaction::Durability;
-    use crate::storage::log::Error as LogError;
+    use crate::log::Error as LogError;
+    use crate::option::Options;
+    use crate::store::Core;
+    use crate::store::{Store, Task, TaskRunner};
+    use crate::transaction::Durability;
     use crate::{Error, IsolationLevel};
 
     use async_channel::bounded;
@@ -766,8 +760,6 @@ mod tests {
 
     use bytes::Bytes;
     use tempdir::TempDir;
-
-    use skv44;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()

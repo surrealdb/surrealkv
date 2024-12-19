@@ -1,8 +1,8 @@
 use std::{fmt, io, sync::Arc};
-
-use crate::storage::kv::store::Task;
-use crate::storage::log::Error as LogError;
 use vart::TrieError;
+
+use crate::log::Error as LogError;
+use crate::store::Task;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;

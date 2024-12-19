@@ -1,21 +1,16 @@
+use bytes::BytesMut;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::BytesMut;
-
-use crate::storage::{
-    kv::{
-        entry::{Entry, Record},
-        error::{Error, Result},
-        manifest::Manifest,
-        meta::Metadata,
-        option::Options,
-        store::{Core, StoreInner},
-    },
-    log::{Aol, Options as LogOptions, SegmentRef},
-};
+use crate::entry::{Entry, Record};
+use crate::error::{Error, Result};
+use crate::log::{Aol, Options as LogOptions, SegmentRef};
+use crate::manifest::Manifest;
+use crate::meta::Metadata;
+use crate::option::Options;
+use crate::store::{Core, StoreInner};
 
 struct CompactionGuard<'a> {
     is_compacting: &'a AtomicBool,
@@ -408,8 +403,8 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::read_to_string;
 
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
+    use crate::option::Options;
+    use crate::store::Store;
 
     use bytes::Bytes;
     use tempdir::TempDir;

@@ -1,11 +1,9 @@
 use std::ops::RangeBounds;
 use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
 
-use crate::storage::{
-    kv::error::{Error, Result},
-    kv::indexer::IndexValue,
-    kv::store::Core,
-};
+use crate::error::{Error, Result};
+use crate::indexer::IndexValue;
+use crate::store::Core;
 
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
@@ -141,9 +139,9 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
-    use crate::storage::kv::util::now;
+    use crate::option::Options;
+    use crate::store::Store;
+    use crate::util::now;
     use crate::Mode;
 
     use bytes::Bytes;

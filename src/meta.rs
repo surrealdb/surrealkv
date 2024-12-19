@@ -1,9 +1,8 @@
-use std::hash::{Hash, Hasher};
-
 use ahash::{HashSet, HashSetExt};
 use bytes::{BufMut, Bytes, BytesMut};
+use std::hash::{Hash, Hasher};
 
-use crate::storage::kv::error::{Error, Result};
+use crate::error::{Error, Result};
 
 /// An enumeration of possible attributes for a key-value pair.
 /// Currently, only the `Deleted` attribute is defined.

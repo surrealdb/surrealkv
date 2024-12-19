@@ -13,12 +13,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 
 use surrealkv::{
-    restore_repair_files,
-    storage::kv::error::Error,
-    storage::log::Error as LogError,
-    storage::log::SegmentRef,
-    storage::log::{Aol, MultiSegmentReader, Options as LogOptions},
-    Reader, Record, RecordReader,
+    log::Error as LogError,
+    log::SegmentRef,
+    log::{Aol, MultiSegmentReader, Options as LogOptions},
+    restore_repair_files, Error, Reader, Record, RecordReader,
 };
 
 pub struct DbStats {
