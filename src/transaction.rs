@@ -7,15 +7,13 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use vart::{art::QueryType, VariableSizeKey};
 
-use crate::storage::kv::{
-    entry::Entry,
-    error::{Error, Result},
-    indexer::IndexValue,
-    option::IsolationLevel,
-    snapshot::Snapshot,
-    store::Core,
-    util::{convert_range_bounds, convert_range_bounds_bytes, now},
-};
+use crate::entry::Entry;
+use crate::error::{Error, Result};
+use crate::indexer::IndexValue;
+use crate::option::IsolationLevel;
+use crate::snapshot::Snapshot;
+use crate::store::Core;
+use crate::util::{convert_range_bounds, convert_range_bounds_bytes, now};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -931,8 +929,8 @@ mod tests {
     use tokio::task;
 
     use super::*;
-    use crate::storage::kv::option::{IsolationLevel, Options};
-    use crate::storage::kv::store::Store;
+    use crate::option::{IsolationLevel, Options};
+    use crate::store::Store;
 
     use tempdir::TempDir;
 
@@ -2665,10 +2663,10 @@ mod tests {
     async fn ordered_writes() {
         // This test ensures that the real time order of writes
         // is preserved within a transaction.
-        use crate::storage::kv::entry::Record;
-        use crate::storage::kv::reader::{Reader, RecordReader};
-        use crate::storage::log::Error as LogError;
-        use crate::storage::log::{MultiSegmentReader, SegmentRef};
+        use crate::entry::Record;
+        use crate::log::Error as LogError;
+        use crate::log::{MultiSegmentReader, SegmentRef};
+        use crate::reader::{Reader, RecordReader};
 
         let k1 = Bytes::from("k1");
         let v1 = Bytes::from("v1");

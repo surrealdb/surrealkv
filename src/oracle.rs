@@ -1,18 +1,13 @@
-use std::{
-    ops::{Bound, RangeBounds},
-    sync::atomic::{AtomicU64, Ordering},
-};
-
 use bytes::Bytes;
+use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
 
-use crate::storage::kv::{
-    error::{Error, Result},
-    option::Options,
-    snapshot::Snapshot,
-    transaction::Transaction,
-};
+use crate::error::{Error, Result};
+use crate::option::Options;
+use crate::snapshot::Snapshot;
+use crate::transaction::Transaction;
 
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
 /// It uses a write lock to ensure that only one transaction can commit at a time.
@@ -29,10 +24,10 @@ impl Oracle {
     /// It sets the isolation level based on the options.
     pub(crate) fn new(opts: &Options) -> Self {
         let isolation = match opts.isolation_level {
-            crate::storage::kv::option::IsolationLevel::SnapshotIsolation => {
+            crate::option::IsolationLevel::SnapshotIsolation => {
                 IsolationLevel::SnapshotIsolation(SnapshotIsolation::new())
             }
-            crate::storage::kv::option::IsolationLevel::SerializableSnapshotIsolation => {
+            crate::option::IsolationLevel::SerializableSnapshotIsolation => {
                 IsolationLevel::SerializableSnapshotIsolation(SerializableSnapshotIsolation::new())
             }
         };

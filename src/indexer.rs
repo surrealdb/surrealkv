@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use vart::{art::Tree as VartIndex, VariableSizeKey};
 
-use crate::storage::kv::error::Result;
-use crate::storage::kv::meta::Metadata;
-use crate::storage::kv::store::Core;
+use crate::error::Result;
+use crate::meta::Metadata;
+use crate::store::Core;
 
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
 /// It uses a `vart` index, which is a type of persistent, lock-free B+ tree.

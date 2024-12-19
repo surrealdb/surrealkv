@@ -1,6 +1,21 @@
-pub mod storage;
+mod compaction;
+mod entry;
+mod error;
+mod indexer;
+pub mod log;
+mod manifest;
+mod meta;
+mod option;
+mod oracle;
+mod reader;
+mod repair;
+mod snapshot;
+mod stats;
+mod store;
+mod transaction;
+mod util;
 
-pub use storage::kv::{
+pub use {
     entry::Record,
     error::{Error, Result},
     option::{IsolationLevel, Options},

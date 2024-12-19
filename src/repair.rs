@@ -2,14 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::storage::{
-    kv::{
-        error::{Error, Result},
-        reader::{Reader, RecordReader},
-        util::sanitize_directory,
-    },
-    log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef},
-};
+use crate::error::{Error, Result};
+use crate::log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef};
+use crate::reader::{Reader, RecordReader};
+use crate::util::sanitize_directory;
 
 /// The last active segment being written to in the append-only log (AOL) is usually the WAL in database terminology.
 /// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
@@ -240,11 +236,11 @@ mod tests {
 
     use super::*;
 
-    use crate::storage::kv::entry::Record;
-    use crate::storage::kv::option::Options;
-    use crate::storage::kv::store::Store;
-    use crate::storage::kv::transaction::Durability;
-    use crate::storage::log::{read_file_header, SegmentRef};
+    use crate::entry::Record;
+    use crate::log::{read_file_header, SegmentRef};
+    use crate::option::Options;
+    use crate::store::Store;
+    use crate::transaction::Durability;
 
     use bytes::Bytes;
     use tempdir::TempDir;
