@@ -268,11 +268,6 @@ pub struct Core {
     pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Arc<Oracle>,
-    /// Value cache for store.
-    /// The assumption for this cache is that it should be useful for
-    /// storing offsets that are frequently accessed (especially in
-    /// the case of range scans)
-    pub(crate) value_cache: Cache<(u64, u64), Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Channel to send write requests to the writer
@@ -365,9 +360,6 @@ impl Core {
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
 
-        // Create and initialize value cache.
-        let value_cache = Cache::new(opts.max_value_cache_size as usize);
-
         // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
@@ -375,7 +367,6 @@ impl Core {
             manifest: manifest.map(RwLock::new),
             clog: clog.map(|c| Arc::new(RwLock::new(c))),
             oracle: Arc::new(oracle),
-            value_cache,
             is_closed: AtomicBool::new(false),
             writes_tx,
         })
@@ -728,20 +719,10 @@ impl Core {
         value_offset: u64,
         value_len: usize,
     ) -> Result<Vec<u8>> {
-        // Attempt to return the cached value if it exists
-        let cache_key = (segment_id, value_offset);
-
-        if let Some(value) = self.value_cache.get(&cache_key) {
-            return Ok(value.to_vec());
-        }
-
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
         let clog = self.clog.as_ref().unwrap().read();
         clog.read_at(&mut buf, segment_id, value_offset)?;
-
-        // Cache the newly read value for future use
-        self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
 
         Ok(buf)
     }
