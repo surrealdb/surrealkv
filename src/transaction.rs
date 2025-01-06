@@ -65,6 +65,12 @@ pub type ScanResult = (Box<[u8]>, Box<[u8]>, u64);
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
 pub type ScanVersionResult = (Box<[u8]>, Box<[u8]>, u64, bool);
 
+// For scan_at_ts return type
+type ScanTsResult = Vec<(Box<[u8]>, Box<[u8]>)>;
+
+// For get_value_by_query return type
+type QueryResult = Option<(Box<[u8]>, u64, u64)>;
+
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
     /// Commits with this durability level are guaranteed to be persistent eventually. The data
@@ -780,7 +786,7 @@ impl Transaction {
         range: R,
         ts: u64,
         limit: Option<usize>,
-    ) -> Result<Vec<(Box<[u8]>, Box<[u8]>)>>
+    ) -> Result<ScanTsResult>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -828,7 +834,7 @@ impl Transaction {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<Option<(Box<[u8]>, u64, u64)>> {
+    ) -> Result<QueryResult> {
         self.ensure_read_only_transaction()?;
 
         match self
