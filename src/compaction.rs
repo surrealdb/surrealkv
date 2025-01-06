@@ -101,8 +101,8 @@ impl StoreInner {
         // Do compaction and write
 
         // Define a closure for writing entries to the temporary commit log
-        let mut write_entry = |key: Vec<u8>,
-                               value: Vec<u8>,
+        let mut write_entry = |key: Box<[u8]>,
+                               value: Box<[u8]>,
                                version: u64,
                                ts: u64,
                                metadata: Option<Metadata>|
@@ -133,7 +133,7 @@ impl StoreInner {
             Ok(())
         };
 
-        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_key: Option<Box<[u8]>> = None;
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
 
@@ -509,7 +509,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -578,14 +578,14 @@ mod tests {
         {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, updated_value.as_ref());
+            assert_eq!(val.as_ref(), updated_value);
         }
 
         // Verify that the second half of the keys still have the default value
         for key in keys.iter().skip(num_keys_to_write / 2) {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         reopened_store.close().await.unwrap();
@@ -629,7 +629,7 @@ mod tests {
         for key in keys.iter() {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         reopened_store.close().await.unwrap();
@@ -691,14 +691,14 @@ mod tests {
         for key in initial_keys.iter() {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         // Verify post-compaction keys are present
         for key in post_compaction_keys.iter() {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         reopened_store.close().await.unwrap();
@@ -787,7 +787,7 @@ mod tests {
             if !keys_to_delete.contains(key) {
                 let mut txn = reopened_store.begin().unwrap();
                 let val = txn.get(key).unwrap().unwrap();
-                assert_eq!(val, default_value.as_ref());
+                assert_eq!(val.as_ref(), default_value);
             }
         }
 
@@ -801,7 +801,7 @@ mod tests {
         for key in &post_compaction_keys {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         reopened_store.close().await.unwrap();
@@ -865,9 +865,9 @@ mod tests {
             let mut txn = reopened_store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             if overlapping_keys.contains(key) {
-                assert_eq!(val, overlapping_value.as_ref());
+                assert_eq!(val.as_ref(), overlapping_value);
             } else {
-                assert_eq!(val, default_value.as_ref());
+                assert_eq!(val.as_ref(), default_value);
             }
         }
 
@@ -1077,7 +1077,12 @@ mod tests {
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             if let Some(value) = txn.get(key).expect("Failed to get key") {
-                assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
+                assert_eq!(
+                    value.as_ref(),
+                    expected_value,
+                    "Value mismatch for key {:?}",
+                    key
+                )
             }
         }
 
@@ -1120,7 +1125,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
 
-                assert_eq!(val, value);
+                assert_eq!(val.as_ref(), value);
             }
 
             // Close the store again
@@ -1187,7 +1192,8 @@ mod tests {
             .unwrap()
             .expect("key2 should exist after compaction");
         assert_eq!(
-            val, b"value2",
+            val.as_ref(),
+            b"value2",
             "key2's value should remain unchanged after compaction"
         );
 
@@ -1239,7 +1245,8 @@ mod tests {
             .unwrap()
             .expect("key1 should exist after compaction");
         assert_eq!(
-            val, b"value2",
+            val.as_ref(),
+            b"value2",
             "key1's value should be the last version after compaction"
         );
 
@@ -1305,7 +1312,7 @@ mod tests {
                 .unwrap()
                 .expect("key should exist after compaction");
             assert_eq!(
-                val,
+                val.as_ref(),
                 expected_value.as_bytes(),
                 "key's value should be the expected version after compaction"
             );
@@ -1386,7 +1393,7 @@ mod tests {
                     .unwrap()
                     .expect("key should exist after compaction");
                 assert_eq!(
-                    val,
+                    val.as_ref(),
                     expected_value.as_bytes(),
                     "key{}'s value should be the last version after compaction",
                     key_index
@@ -1399,7 +1406,7 @@ mod tests {
                     .unwrap()
                     .expect("key should exist after compaction");
                 assert_eq!(
-                    val,
+                    val.as_ref(),
                     expected_value.as_bytes(),
                     "key{}'s value should remain unchanged after compaction",
                     key_index
@@ -1496,7 +1503,7 @@ mod tests {
                     .unwrap()
                     .expect("key should exist after compaction");
                 assert_eq!(
-                    val,
+                    val.as_ref(),
                     expected_value.as_bytes(),
                     "key{}'s value should be the last version after compaction",
                     key_index
@@ -1509,7 +1516,7 @@ mod tests {
                     .unwrap()
                     .expect("key should exist after compaction");
                 assert_eq!(
-                    val,
+                    val.as_ref(),
                     expected_value.as_bytes(),
                     "key{}'s value should remain unchanged after compaction",
                     key_index

@@ -394,7 +394,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -429,7 +429,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -480,7 +480,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -527,7 +527,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -574,7 +574,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -631,7 +631,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -674,7 +674,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -716,7 +716,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -768,7 +768,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             let val = txn.get(&key).unwrap().unwrap();
-            assert_eq!(val, default_value);
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 

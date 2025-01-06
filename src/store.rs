@@ -721,12 +721,12 @@ impl Core {
         segment_id: u64,
         value_offset: u64,
         value_len: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Box<[u8]>> {
         // Attempt to return the cached value if it exists
         let cache_key = (segment_id, value_offset);
 
         if let Some(value) = self.value_cache.get(&cache_key) {
-            return Ok(value.to_vec());
+            return Ok(Box::from(value.as_ref()));
         }
 
         // If the value is not in the cache, read it from the commit log
@@ -737,7 +737,7 @@ impl Core {
         // Cache the newly read value for future use
         self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
 
-        Ok(buf)
+        Ok(buf.into_boxed_slice())
     }
 }
 
@@ -807,7 +807,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         // Drop the store to simulate closing it
@@ -827,7 +827,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -886,7 +886,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
 
-                assert_eq!(val, value);
+                assert_eq!(val.as_ref(), value);
             }
 
             // Close the store again
@@ -996,7 +996,7 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         // Delete the keys from the store
@@ -1017,7 +1017,7 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap();
 
-            assert_eq!(val.unwrap(), value);
+            assert_eq!(val.unwrap().as_ref(), value);
         }
     }
 
@@ -1100,7 +1100,7 @@ mod tests {
             let val = txn.get(key).unwrap();
 
             if should_exist {
-                assert_eq!(val.unwrap(), value);
+                assert_eq!(val.unwrap().as_ref(), value);
             } else {
                 assert!(val.is_none());
             }
@@ -1205,7 +1205,7 @@ mod tests {
             for i in &key_order {
                 let (key, value) = &pairs[*i % pairs.len()];
                 let val = txn.get(key.as_slice()).unwrap().unwrap();
-                assert_eq!(&val, value);
+                assert_eq!(val.as_ref(), value);
             }
         }
     }
@@ -1263,7 +1263,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let val = txn.get(key).unwrap().unwrap();
             // Assert that the value retrieved in txn matches default_value
-            assert_eq!(val, default_value.as_ref());
+            assert_eq!(val.as_ref(), default_value);
         }
 
         // Drop the store to simulate closing it
@@ -1450,7 +1450,7 @@ mod tests {
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, value2);
+        assert_eq!(history[0].0.as_ref(), value2);
         store.close().await.unwrap();
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, value2);
+        assert_eq!(history[0].0.as_ref(), value2);
 
         store.close().await.unwrap();
     }
@@ -1510,7 +1510,7 @@ mod tests {
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, value2);
+        assert_eq!(history[0].0.as_ref(), value2);
 
         store.close().await.unwrap();
     }
@@ -1540,7 +1540,7 @@ mod tests {
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, value2);
+        assert_eq!(history[0].0.as_ref(), value2);
 
         store.close().await.unwrap();
     }
@@ -1571,7 +1571,7 @@ mod tests {
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_history(key).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, value2);
+        assert_eq!(history[0].0.as_ref(), value2);
 
         store.close().await.unwrap();
     }
@@ -1697,7 +1697,7 @@ mod tests {
         for key in &keys {
             let history = txn.get_history(key).unwrap();
             assert_eq!(history.len(), 1);
-            assert_eq!(history[0].0, value);
+            assert_eq!(history[0].0.as_ref(), value);
         }
 
         store.close().await.unwrap();

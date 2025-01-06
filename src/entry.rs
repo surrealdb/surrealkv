@@ -304,7 +304,7 @@ mod tests {
             let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
+            assert_eq!(val.as_ref(), value);
         }
 
         {
@@ -326,7 +326,7 @@ mod tests {
             let val = txn.get(&key3).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
+            assert_eq!(val.as_ref(), value);
         }
     }
 
@@ -379,7 +379,7 @@ mod tests {
             let val = txn.get(&key2).unwrap().unwrap();
 
             // Assert that the value retrieved in txn matches the expected value
-            assert_eq!(val, value);
+            assert_eq!(val.as_ref(), value);
         }
     }
 }

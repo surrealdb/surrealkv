@@ -32,7 +32,7 @@ futures = "0.3.30"
 bytes = "1.5.0"
 tokio = { version = "1.36", features = ["rt", "sync"] }
 quick_cache = "0.6.0"
-vart = "0.8.1"
+vart = {git = "https://github.com/surrealdb/vart", branch = "refactor-scan-iters"}
 revision = "0.10.0"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
