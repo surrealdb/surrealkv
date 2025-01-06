@@ -124,7 +124,6 @@ impl Snapshot {
     {
         self.snap
             .scan_at_ts(range, ts)
-            .into_iter()
             .filter(|(_, snap_val)| !snap_val.deleted())
             .collect()
     }
@@ -206,7 +205,7 @@ mod tests {
             keys_values.len(),
             "Should match the number of keys"
         );
-        let expected = vec![
+        let expected = [
             (Box::from(&b"k1"[..]), Box::from(&b"value1Updated"[..])),
             (Box::from(&b"k2"[..]), Box::from(&b"value2Updated"[..])),
         ];
