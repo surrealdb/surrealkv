@@ -60,10 +60,10 @@ impl Mode {
 }
 
 /// ScanResult is a tuple containing the key, value, and commit timestamp of a key-value pair.
-pub type ScanResult = (Vec<u8>, Vec<u8>, u64);
+pub type ScanResult = (Box<[u8]>, Box<[u8]>, u64);
 
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
-pub type ScanVersionResult = (Vec<u8>, Vec<u8>, u64, bool);
+pub type ScanVersionResult = (Box<[u8]>, Box<[u8]>, u64, bool);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
@@ -286,7 +286,7 @@ impl Transaction {
     }
 
     /// Gets a value for a key if it exists.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Box<[u8]>>> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -303,7 +303,7 @@ impl Transaction {
 
         // RYOW semantics: Read your own writes. If the value is in the write set, return it.
         match self.get_in_write_set(key) {
-            Some((Some(val), _)) => return Ok(Some(val.to_vec())),
+            Some((Some(val), _)) => return Ok(Some(Box::from(val.as_ref()))),
             Some((None, _)) => return Ok(None), // Delete in the write set
             None => {}
         }
@@ -405,7 +405,7 @@ impl Transaction {
     ) -> Result<Vec<ScanResult>>
     where
         R: RangeBounds<VariableSizeKey>,
-        I: Iterator<Item = (Vec<u8>, &'b IndexValue, u64, u64)>,
+        I: Iterator<Item = (Box<[u8]>, &'b IndexValue, u64, u64)>,
     {
         let mut snap_iter = snap_iter.peekable();
         let range_bytes = convert_range_bounds_bytes(range);
@@ -445,7 +445,7 @@ impl Transaction {
                     (Some(_), None) => true,
                     (None, Some(_)) => false,
                     (Some((snap_key, _, _, _)), Some((ws_key, _))) => {
-                        match snap_key.as_slice().cmp(ws_key.as_ref()) {
+                        match snap_key.as_ref().cmp(ws_key.as_ref()) {
                             Ordering::Less => true,
                             Ordering::Greater => false,
                             Ordering::Equal => {
@@ -467,7 +467,11 @@ impl Transaction {
                     let (ws_key, ws_entries) = write_set_iter.next().unwrap();
                     let ws_entry = ws_entries.last().unwrap();
                     if !ws_entry.e.is_deleted_or_tombstone() {
-                        results.push((ws_key.to_vec(), ws_entry.e.value.to_vec(), ws_entry.e.ts));
+                        results.push((
+                            Box::from(ws_key.as_ref()),
+                            Box::from(ws_entry.e.value.as_ref()),
+                            ws_entry.e.ts,
+                        ));
                     }
                 }
             }
@@ -513,7 +517,7 @@ impl Transaction {
     /// Returns all existing keys within the specified range, including soft-deleted
     /// and thus hidden by tombstones.
     /// The returned keys are not added to the read set and will not cause read-write conflicts.
-    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
+    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> Result<Vec<Box<[u8]>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -702,7 +706,7 @@ impl Transaction {
     }
 
     /// Returns the value associated with the key at the given timestamp.
-    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Option<Box<[u8]>>> {
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
@@ -723,11 +727,11 @@ impl Transaction {
         let result = match (snap_val, ws_val) {
             (None, None) => None,
             (Some(snap_val), None) => Some(snap_val.0.resolve(&self.core)?),
-            (None, Some((ws_val, _))) => ws_val.map(|v| v.to_vec()),
+            (None, Some((ws_val, _))) => ws_val.map(|v| Box::from(v.as_ref())),
             (Some(snap_val), Some((ws_val, ws_ts))) => {
                 assert!(snap_val.1 != ws_ts, "cannot overwrite historical values");
                 if ws_ts > snap_val.1 {
-                    ws_val.map(|v| v.to_vec())
+                    ws_val.map(|v| Box::from(v.as_ref()))
                 } else {
                     Some(snap_val.0.resolve(&self.core)?)
                 }
@@ -738,7 +742,7 @@ impl Transaction {
     }
 
     /// Returns all the versioned values and timestamps associated with the key.
-    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Box<[u8]>, u64)>> {
         self.ensure_read_only_transaction()?;
 
         // If the key is empty, return an error.
@@ -776,7 +780,7 @@ impl Transaction {
         range: R,
         ts: u64,
         limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    ) -> Result<Vec<(Box<[u8]>, Box<[u8]>)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -803,7 +807,7 @@ impl Transaction {
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Box<[u8]>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -824,7 +828,7 @@ impl Transaction {
         &self,
         key: &VariableSizeKey,
         query_type: QueryType,
-    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+    ) -> Result<Option<(Box<[u8]>, u64, u64)>> {
         self.ensure_read_only_transaction()?;
 
         match self
@@ -873,7 +877,10 @@ impl Transaction {
         // Iterate over the keys in the range.
         for (key, value, _, ts) in ranger {
             // If the key changes, process the previous key's versions.
-            if current_key.as_ref().map_or(false, |k| k != &key) {
+            if current_key
+                .as_ref()
+                .map_or(false, |k| k.as_ref() != key.as_ref())
+            {
                 // Add the previous key's versions to the results.
                 results.append(&mut current_key_versions);
 
@@ -974,7 +981,7 @@ mod tests {
             // Start a read-only transaction (txn3)
             let mut txn3 = store.begin().unwrap();
             let val = txn3.get(&key1).unwrap().unwrap();
-            assert_eq!(val, value1.as_ref());
+            assert_eq!(val.as_ref(), value1);
         }
 
         {
@@ -998,7 +1005,7 @@ mod tests {
         let val = txn4.get(&key1).unwrap().unwrap();
 
         // Assert that the value retrieved in txn4 matches value2
-        assert_eq!(val, value2.as_ref());
+        assert_eq!(val.as_ref(), value2);
     }
 
     #[tokio::test]
@@ -1061,7 +1068,7 @@ mod tests {
             let range = "k".as_bytes()..="k".as_bytes();
             let txn3 = store.begin().unwrap();
             let results = txn3.keys_with_tombstones(range).unwrap();
-            assert_eq!(results, vec![b"k"]);
+            assert_eq!(results, vec![Box::from(&b"k"[..])]);
         }
     }
 
@@ -1227,9 +1234,9 @@ mod tests {
         let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].1, keys_to_insert[0]);
-        assert_eq!(results[1].1, keys_to_insert[1]);
-        assert_eq!(results[2].1, keys_to_insert[2]);
+        assert_eq!(results[0].1, Box::from(keys_to_insert[0].as_ref()));
+        assert_eq!(results[1].1, Box::from(keys_to_insert[1].as_ref()));
+        assert_eq!(results[2].1, Box::from(keys_to_insert[2].as_ref()));
     }
 
     #[tokio::test]
@@ -1253,12 +1260,12 @@ mod tests {
         let mut txn = store.begin().unwrap();
         let results = txn.scan(range, None).unwrap();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, keys_to_insert[0]);
-        assert_eq!(results[1].0, keys_to_insert[1]);
-        assert_eq!(results[2].0, keys_to_insert[2]);
-        assert_eq!(results[0].1, keys_to_insert[0]);
-        assert_eq!(results[1].1, keys_to_insert[1]);
-        assert_eq!(results[2].1, keys_to_insert[2]);
+        assert_eq!(results[0].0, Box::from(keys_to_insert[0].as_ref()));
+        assert_eq!(results[1].0, Box::from(keys_to_insert[1].as_ref()));
+        assert_eq!(results[2].0, Box::from(keys_to_insert[2].as_ref()));
+        assert_eq!(results[0].1, Box::from(keys_to_insert[0].as_ref()));
+        assert_eq!(results[1].1, Box::from(keys_to_insert[1].as_ref()));
+        assert_eq!(results[2].1, Box::from(keys_to_insert[2].as_ref()));
     }
 
     async fn mvcc_with_scan_tests(is_ssi: bool) {
@@ -1377,10 +1384,10 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value2).unwrap();
-            assert_eq!(txn.get(&key1).unwrap().unwrap(), value2.as_ref());
+            assert_eq!(txn.get(&key1).unwrap().unwrap(), value2.as_ref().into());
             assert!(txn.get(&key3).unwrap().is_none());
             txn.set(&key2, &value1).unwrap();
-            assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref().into());
             txn.commit().await.unwrap();
         }
     }
@@ -1447,9 +1454,9 @@ mod tests {
         {
             let mut txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap().unwrap();
-            assert_eq!(val1, value3.as_ref());
+            assert_eq!(val1.as_ref(), value3);
             let val2 = txn3.get(&key2).unwrap().unwrap();
-            assert_eq!(val2, value5.as_ref());
+            assert_eq!(val2.as_ref(), value5);
         }
     }
 
@@ -1479,13 +1486,13 @@ mod tests {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
+            assert_eq!(res[0].1.as_ref(), value1);
 
             drop(txn1);
 
             let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
+            assert_eq!(res[0].1.as_ref(), value1);
 
             txn2.commit().await.unwrap();
         }
@@ -1493,9 +1500,9 @@ mod tests {
         {
             let mut txn3 = store.begin().unwrap();
             let val1 = txn3.get(&key1).unwrap().unwrap();
-            assert_eq!(val1, value1.as_ref());
+            assert_eq!(val1.as_ref(), value1);
             let val2 = txn3.get(&key2).unwrap().unwrap();
-            assert_eq!(val2, value2.as_ref());
+            assert_eq!(val2.as_ref(), value2);
         }
     }
 
@@ -1527,14 +1534,14 @@ mod tests {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
+            assert_eq!(res[0].1.as_ref(), value1);
 
             txn1.set(&key1, &value4).unwrap();
             txn1.commit().await.unwrap();
 
             let res = txn2.scan(range, None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
+            assert_eq!(res[0].1.as_ref(), value1);
 
             txn2.commit().await.unwrap();
         }
@@ -1567,8 +1574,8 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
+            assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1);
 
             txn1.commit().await.unwrap();
             assert!(match txn2.commit().await {
@@ -1602,8 +1609,8 @@ mod tests {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             // k3 is committed by txn2
             txn2.set(&key3, &value3).unwrap();
@@ -1613,8 +1620,8 @@ mod tests {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
         }
     }
 
@@ -1644,8 +1651,8 @@ mod tests {
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             txn2.delete(&key2).unwrap();
             txn1.commit().await.unwrap();
@@ -1653,7 +1660,7 @@ mod tests {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 1);
-            assert_eq!(res[0].1, value1);
+            assert_eq!(res[0].1.as_ref(), value1);
 
             assert!(match txn2.commit().await {
                 Err(err) => {
@@ -1722,15 +1729,15 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
-            assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
+            assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1);
+            assert_eq!(txn2.get(&key2).unwrap().unwrap().as_ref(), value2);
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
             txn2.commit().await.unwrap();
 
-            assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
+            assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
             txn1.commit().await.unwrap();
         }
     }
@@ -1756,13 +1763,13 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
 
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
@@ -1805,12 +1812,12 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             let mut txn2 = store.begin().unwrap();
 
-            assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
+            assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             txn2.set(&key1, &value3).unwrap();
 
@@ -1847,13 +1854,13 @@ mod tests {
             let range = "k1".as_bytes()..="k2".as_bytes();
             let res = txn1.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             let res = txn2.scan(range.clone(), None).unwrap();
             assert_eq!(res.len(), 2);
-            assert_eq!(res[0].1, value1);
-            assert_eq!(res[1].1, value2);
+            assert_eq!(res[0].1.as_ref(), value1);
+            assert_eq!(res[1].1.as_ref(), value2);
 
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
@@ -2286,7 +2293,7 @@ mod tests {
             let val = txn3.get(&key1).unwrap();
             assert!(val.is_none());
             let val = txn3.get(&key2).unwrap().unwrap();
-            assert_eq!(val, value.as_ref());
+            assert_eq!(val.as_ref(), value);
         }
 
         // Drop the store to simulate closing it
@@ -2305,7 +2312,7 @@ mod tests {
         let val = txn4.get(&key1).unwrap();
         assert!(val.is_none());
         let val = txn4.get(&key2).unwrap().unwrap();
-        assert_eq!(val, value.as_ref());
+        assert_eq!(val.as_ref(), value);
     }
 
     #[tokio::test]
@@ -2372,21 +2379,21 @@ mod tests {
         txn1.set(&key3, &value3).unwrap();
 
         // Just a sanity check that all three keys are present.
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
-        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
-        assert_eq!(txn1.get(&key3).unwrap().unwrap(), value3);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
+        assert_eq!(txn1.get(&key3).unwrap().unwrap().as_ref(), value3);
 
         // Rollback to the latest (second) savepoint. This should make key3
         // go away while keeping key1 and key2.
         txn1.rollback_to_savepoint().unwrap();
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
-        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
         assert!(txn1.get(&key3).unwrap().is_none());
 
         // Now roll back to the first savepoint. This should only
         // keep key1 around.
         txn1.rollback_to_savepoint().unwrap();
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
         assert!(txn1.get(&key2).unwrap().is_none());
         assert!(txn1.get(&key3).unwrap().is_none());
 
@@ -2402,7 +2409,7 @@ mod tests {
 
         // Start another transaction and check again for the keys.
         let mut txn2 = store.begin().unwrap();
-        assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1);
         assert!(txn2.get(&key2).unwrap().is_none());
         assert!(txn2.get(&key3).unwrap().is_none());
         txn2.commit().await.unwrap();
@@ -2436,21 +2443,21 @@ mod tests {
         txn1.set(&key3, &value3).unwrap();
 
         // Just a sanity check that all three keys are present.
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
-        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
-        assert_eq!(txn1.get(&key3).unwrap().unwrap(), value3);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
+        assert_eq!(txn1.get(&key3).unwrap().unwrap().as_ref(), value3);
 
         // Rollback to the latest (second) savepoint. This should make key3
         // go away while keeping key1 and key2.
         txn1.rollback_to_savepoint().unwrap();
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
-        assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
+        assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2);
         assert!(txn1.get(&key3).unwrap().is_none());
 
         // Now roll back to the first savepoint. This should only
         // keep key1 around.
         txn1.rollback_to_savepoint().unwrap();
-        assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1);
         assert!(txn1.get(&key2).unwrap().is_none());
         assert!(txn1.get(&key3).unwrap().is_none());
 
@@ -2466,7 +2473,7 @@ mod tests {
 
         // Start another transaction and check again for the keys.
         let mut txn2 = store.begin().unwrap();
-        assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+        assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1);
         assert!(txn2.get(&key2).unwrap().is_none());
         assert!(txn2.get(&key3).unwrap().is_none());
         txn2.commit().await.unwrap();
@@ -2630,7 +2637,7 @@ mod tests {
         txn1.rollback_to_savepoint().unwrap();
 
         // The read value should be the one before the savepoint.
-        assert_eq!(txn1.get(&k1).unwrap().unwrap(), value2);
+        assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value2);
     }
 
     #[tokio::test]
@@ -2650,10 +2657,10 @@ mod tests {
         // The scanned value should be the one before the savepoint.
         let range = "k1".as_bytes()..="k3".as_bytes();
         let sr = txn1.scan(range, None).unwrap();
-        assert_eq!(sr[0].0, k1.to_vec());
+        assert_eq!(sr[0].0.as_ref(), k1);
         assert_eq!(
-            sr[0].1,
-            value.to_vec(),
+            sr[0].1.as_ref(),
+            value,
             "{}",
             String::from_utf8_lossy(&sr[0].1)
         );
@@ -2724,8 +2731,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k, &key);
-        assert_eq!(v, &value);
+        assert_eq!(k.as_ref(), &key);
+        assert_eq!(v.as_ref(), &value);
         assert_eq!(*version, 1);
         assert!(!(*is_deleted));
     }
@@ -2756,8 +2763,8 @@ mod tests {
         // Verify that the output contains all the versions of the key
         assert_eq!(results.len(), values.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k, &key);
-            assert_eq!(v, &values[i]);
+            assert_eq!(k.as_ref(), &key);
+            assert_eq!(v.as_ref(), &values[i]);
             assert_eq!(*version, (i + 1) as u64);
             assert!(!(*is_deleted));
         }
@@ -2785,8 +2792,8 @@ mod tests {
 
         assert_eq!(results.len(), keys.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k, &keys[i]);
-            assert_eq!(v, &value);
+            assert_eq!(k.as_ref(), keys[i].as_ref());
+            assert_eq!(v.as_ref(), value.as_ref());
             assert_eq!(*version, 1);
             assert!(!(*is_deleted));
         }
@@ -2834,8 +2841,8 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k, expected_key);
-            assert_eq!(v, expected_value);
+            assert_eq!(k.as_ref(), expected_key);
+            assert_eq!(v.as_ref(), expected_value);
             assert_eq!(*version, *expected_version);
             assert_eq!(*is_deleted, *expected_is_deleted);
         }
@@ -2861,14 +2868,14 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k, &key);
-        assert_eq!(v, &value);
+        assert_eq!(k.as_ref(), &key);
+        assert_eq!(v.as_ref(), &value);
         assert_eq!(*version, 1);
         assert!(!(*is_deleted));
 
         let (k, v, _, is_deleted) = &results[1];
-        assert_eq!(k, &key);
-        assert_eq!(v, &Bytes::new());
+        assert_eq!(k.as_ref(), &key);
+        assert_eq!(v.as_ref(), &Bytes::new());
         assert!(*is_deleted);
     }
 
@@ -2902,12 +2909,12 @@ mod tests {
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
             let key_index = i / 2;
             let is_deleted_version = i % 2 == 1;
-            assert_eq!(k, &keys[key_index]);
+            assert_eq!(k.as_ref(), &keys[key_index]);
             if is_deleted_version {
-                assert_eq!(v, &Bytes::new());
+                assert_eq!(v.as_ref(), &Bytes::new());
                 assert!(*is_deleted);
             } else {
-                assert_eq!(v, &value);
+                assert_eq!(v.as_ref(), &value);
                 assert_eq!(*version, 1);
                 assert!(!(*is_deleted));
             }
@@ -2959,8 +2966,8 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k, expected_key);
-            assert_eq!(v, expected_value);
+            assert_eq!(k.as_ref(), expected_key);
+            assert_eq!(v.as_ref(), expected_value);
             // Check version only if the record is not deleted
             // This is because a soft-deleted record has version which is
             // the commit timestamp of the transaction, and do not want to
@@ -3165,7 +3172,7 @@ mod tests {
                 .iter()
                 .find(|(k, _, version, _)| k == &key && *version == latest_version)
                 .unwrap();
-            assert_eq!(result.1, *latest_value);
+            assert_eq!(result.1.as_ref(), *latest_value);
         }
     }
 
@@ -3298,12 +3305,12 @@ mod tests {
 
         // Verify the results
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, key1);
-        assert_eq!(results[0].1, value1);
-        assert_eq!(results[1].0, key2);
-        assert_eq!(results[1].1, value2);
-        assert_eq!(results[2].0, key3);
-        assert_eq!(results[2].1, value3);
+        assert_eq!(results[0].0.as_ref(), key1);
+        assert_eq!(results[0].1.as_ref(), value1);
+        assert_eq!(results[1].0.as_ref(), key2);
+        assert_eq!(results[1].1.as_ref(), value2);
+        assert_eq!(results[2].0.as_ref(), key3);
+        assert_eq!(results[2].1.as_ref(), value3);
     }
 
     #[tokio::test]
@@ -3357,9 +3364,9 @@ mod tests {
                     let version = (i + 1) as u64;
                     let result = results
                         .iter()
-                        .find(|(k, v, ver, _)| k == &key && v == value && *ver == version)
+                        .find(|(k, v, ver, _)| k == &key && v.as_ref() == value && *ver == version)
                         .unwrap();
-                    assert_eq!(result.1, *value);
+                    assert_eq!(result.1.as_ref(), *value);
                     assert_eq!(result.2, version);
                 }
             }

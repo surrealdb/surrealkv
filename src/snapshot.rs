@@ -77,7 +77,7 @@ impl Snapshot {
     pub(crate) fn range<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Box<[u8]>, &'a IndexValue, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -90,7 +90,7 @@ impl Snapshot {
     pub(crate) fn range_with_deleted<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Box<[u8]>, &'a IndexValue, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -101,7 +101,7 @@ impl Snapshot {
     pub(crate) fn range_with_versions<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = (Box<[u8]>, &'a IndexValue, &'a u64, &'a u64)>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -118,7 +118,7 @@ impl Snapshot {
             .filter(|(val, _, _)| !val.deleted())
     }
 
-    pub(crate) fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, IndexValue)>
+    pub(crate) fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Box<[u8]>, IndexValue)>
     where
         R: RangeBounds<VariableSizeKey>,
     {
@@ -129,11 +129,11 @@ impl Snapshot {
             .collect()
     }
 
-    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
+    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Box<[u8]>>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.keys_at_ts(range, ts)
+        self.snap.keys_at_ts(range, ts).collect()
     }
 }
 
@@ -194,8 +194,8 @@ mod tests {
         let keys = txn
             .keys_at_ts(range.clone(), ts)
             .expect("Failed to get keys at timestamp");
-        assert_eq!(keys[0], b"k1");
-        assert_eq!(keys[1], b"k2");
+        assert_eq!(keys[0].as_ref(), b"k1");
+        assert_eq!(keys[1].as_ref(), b"k2");
 
         // Test scan_at_ts
         let entries = txn
@@ -206,8 +206,12 @@ mod tests {
             keys_values.len(),
             "Should match the number of keys"
         );
-        assert_eq!(entries[0], (b"k1".to_vec(), b"value1Updated".to_vec()));
-        assert_eq!(entries[1], (b"k2".to_vec(), b"value2Updated".to_vec()));
+        let expected = vec![
+            (Box::from(&b"k1"[..]), Box::from(&b"value1Updated"[..])),
+            (Box::from(&b"k2"[..]), Box::from(&b"value2Updated"[..])),
+        ];
+        assert_eq!(entries[0], expected[0]);
+        assert_eq!(entries[1], expected[1]);
 
         // Enhance get_history testing
         for (key, initial_value, updated_value) in keys_values.iter() {
@@ -218,11 +222,13 @@ mod tests {
                 "History should contain two entries for each key"
             );
             assert_eq!(
-                history[0].0, *initial_value,
+                history[0].0.as_ref(),
+                initial_value,
                 "First entry should match initial value"
             );
             assert_eq!(
-                history[1].0, *updated_value,
+                history[1].0.as_ref(),
+                updated_value,
                 "Second entry should match updated value"
             );
 
@@ -231,12 +237,12 @@ mod tests {
             assert_eq!(
                 txn.get_at_ts(key, initial_ts)
                     .expect("Failed to get value at initial timestamp"),
-                Some(initial_value.to_vec())
+                Some(Box::from(initial_value.as_ref()))
             );
             assert_eq!(
                 txn.get_at_ts(key, updated_ts)
                     .expect("Failed to get value at updated timestamp"),
-                Some(updated_value.to_vec())
+                Some(Box::from(updated_value.as_ref()))
             );
         }
     }

@@ -1501,8 +1501,7 @@ checksum = "52d02665a2dd16898d28bd1d314b067a97365facca5c39c370d55822bcbbfb48"
 [[package]]
 name = "vart"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87782b74f898179396e93c0efabb38de0d58d50bbd47eae00c71b3a1144dbbae"
+source = "git+https://github.com/surrealdb/vart?branch=refactor-scan-iters#e7890e09d1945befa6a0b3d5a0b133cf25660031"
 
 [[package]]
 name = "version_check"
