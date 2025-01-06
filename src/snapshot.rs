@@ -128,11 +128,32 @@ impl Snapshot {
             .collect()
     }
 
-    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Box<[u8]>>
+    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64, limit: Option<usize>) -> Vec<Box<[u8]>>
     where
         R: RangeBounds<VariableSizeKey>,
     {
-        self.snap.keys_at_ts(range, ts).collect()
+        let iter = self.snap.keys_at_ts(range, ts);
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
+        }
+    }
+
+    /// Returns just the keys in the given range.
+    pub(crate) fn range_keys<'a, R>(&'a self, range: R, limit: Option<usize>) -> Vec<Box<[u8]>>
+    where
+        R: RangeBounds<VariableSizeKey> + 'a,
+    {
+        let base_iter = self
+            .snap
+            .range(range)
+            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
+            .map(|(key, _, _, _)| key);
+
+        match limit {
+            Some(n) => base_iter.take(n).collect(),
+            None => base_iter.collect(),
+        }
     }
 }
 
@@ -191,7 +212,7 @@ mod tests {
 
         let range = "k1".as_bytes()..="k2".as_bytes();
         let keys = txn
-            .keys_at_ts(range.clone(), ts)
+            .keys_at_ts(range.clone(), ts, None)
             .expect("Failed to get keys at timestamp");
         assert_eq!(keys[0].as_ref(), b"k1");
         assert_eq!(keys[1].as_ref(), b"k2");

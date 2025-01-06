@@ -523,14 +523,23 @@ impl Transaction {
     /// Returns all existing keys within the specified range, including soft-deleted
     /// and thus hidden by tombstones.
     /// The returned keys are not added to the read set and will not cause read-write conflicts.
-    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> Result<Vec<Box<[u8]>>>
+    pub fn keys_with_tombstones<'b, R>(
+        &'b self,
+        range: R,
+        limit: Option<usize>,
+    ) -> Result<Vec<Box<[u8]>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
         let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
-        let result = keys.into_iter().map(|(key, _, _, _)| key).collect();
+        let iter = keys.into_iter().map(|(key, _, _, _)| key);
+
+        let result = match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
+        };
 
         Ok(result)
     }
@@ -813,7 +822,12 @@ impl Transaction {
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Box<[u8]>>>
+    pub fn keys_at_ts<'b, R>(
+        &'b self,
+        range: R,
+        ts: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<Box<[u8]>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -821,7 +835,21 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
+        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts, limit);
+
+        Ok(keys)
+    }
+
+    /// Returns only keys within the specified range.
+    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<Box<[u8]>>>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        self.ensure_read_only_transaction()?;
+
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(&range);
+        let keys = self.snapshot.as_ref().unwrap().range_keys(range, limit);
 
         Ok(keys)
     }
@@ -1073,7 +1101,7 @@ mod tests {
             // despite it being soft-deleted.
             let range = "k".as_bytes()..="k".as_bytes();
             let txn3 = store.begin().unwrap();
-            let results = txn3.keys_with_tombstones(range).unwrap();
+            let results = txn3.keys_with_tombstones(range, None).unwrap();
             assert_eq!(results, vec![Box::from(&b"k"[..])]);
         }
     }
