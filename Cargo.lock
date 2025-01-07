@@ -1299,7 +1299,7 @@ dependencies = [
  "humansize",
  "indicatif",
  "serde_json",
- "surrealkv 0.7.0",
+ "surrealkv",
 ]
 
 [[package]]
@@ -1358,26 +1358,6 @@ dependencies = [
 
 [[package]]
 name = "surrealkv"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c651de39c5af29f5e4ba89a255b2247f470d8f3f059a5462ee4287f6c34588b1"
-dependencies = [
- "ahash",
- "async-channel",
- "bytes",
- "chrono",
- "crc32fast",
- "futures",
- "lru",
- "parking_lot",
- "quick_cache",
- "revision",
- "tokio",
- "vart 0.6.3",
-]
-
-[[package]]
-name = "surrealkv"
 version = "0.7.0"
 dependencies = [
  "ahash",
@@ -1400,10 +1380,9 @@ dependencies = [
  "quick_cache",
  "rand 0.8.5",
  "revision",
- "surrealkv 0.4.4",
  "tempdir",
  "tokio",
- "vart 0.8.1",
+ "vart",
  "walkdir",
  "wasm-bindgen-futures",
 ]
@@ -1491,12 +1470,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "vart"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52d02665a2dd16898d28bd1d314b067a97365facca5c39c370d55822bcbbfb48"
 
 [[package]]
 name = "vart"
