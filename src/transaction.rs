@@ -925,6 +925,8 @@ impl Drop for Transaction {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use std::mem::size_of;
     use tokio::task;
 
@@ -1893,34 +1895,34 @@ mod tests {
     const VALUE_SIZE: usize = 150;
     const RNG_SEED: u64 = 3;
 
-    fn fill_slice(slice: &mut [u8], rng: &mut fastrand::Rng) {
+    fn fill_slice(slice: &mut [u8], rng: &mut StdRng) {
         let mut i = 0;
         while i + size_of::<u128>() < slice.len() {
-            let tmp = rng.u128(..);
+            let tmp = rng.gen::<u128>();
             slice[i..(i + size_of::<u128>())].copy_from_slice(&tmp.to_le_bytes());
             i += size_of::<u128>()
         }
         if i + size_of::<u64>() < slice.len() {
-            let tmp = rng.u64(..);
+            let tmp = rng.gen::<u64>();
             slice[i..(i + size_of::<u64>())].copy_from_slice(&tmp.to_le_bytes());
             i += size_of::<u64>()
         }
         if i + size_of::<u32>() < slice.len() {
-            let tmp = rng.u32(..);
+            let tmp = rng.gen::<u32>();
             slice[i..(i + size_of::<u32>())].copy_from_slice(&tmp.to_le_bytes());
             i += size_of::<u32>()
         }
         if i + size_of::<u16>() < slice.len() {
-            let tmp = rng.u16(..);
+            let tmp = rng.gen::<u16>();
             slice[i..(i + size_of::<u16>())].copy_from_slice(&tmp.to_le_bytes());
             i += size_of::<u16>()
         }
         if i + size_of::<u8>() < slice.len() {
-            slice[i] = rng.u8(..);
+            slice[i] = rng.gen::<u8>();
         }
     }
 
-    fn gen_pair(rng: &mut fastrand::Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
+    fn gen_pair(rng: &mut StdRng) -> ([u8; KEY_SIZE], Vec<u8>) {
         let mut key = [0u8; KEY_SIZE];
         fill_slice(&mut key, rng);
         let mut value = vec![0u8; VALUE_SIZE];
@@ -1929,8 +1931,8 @@ mod tests {
         (key, value)
     }
 
-    fn make_rng() -> fastrand::Rng {
-        fastrand::Rng::with_seed(RNG_SEED)
+    fn make_rng() -> StdRng {
+        StdRng::seed_from_u64(RNG_SEED)
     }
 
     #[tokio::test]
