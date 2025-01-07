@@ -140,7 +140,11 @@ impl Snapshot {
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
-        let iter = self.snap.keys_at_ts(range, ts);
+        let iter = self
+            .snap
+            .scan_at_ts(range, ts)
+            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
+            .map(|(key, _, _, _)| (key));
         match limit {
             Some(n) => iter.take(n).collect(),
             None => iter.collect(),
