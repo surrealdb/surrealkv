@@ -11,7 +11,7 @@ use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::indexer::IndexValue;
 use crate::option::IsolationLevel;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, VersionedEntry};
 use crate::store::Core;
 use crate::util::{convert_range_bounds, convert_range_bounds_bytes, now};
 
@@ -411,7 +411,7 @@ impl Transaction {
     ) -> Result<Vec<ScanResult>>
     where
         R: RangeBounds<VariableSizeKey>,
-        I: Iterator<Item = (Box<[u8]>, &'b IndexValue, u64, u64)>,
+        I: Iterator<Item = VersionedEntry<'b, IndexValue>>,
     {
         let mut snap_iter = snap_iter.peekable();
         let range_bytes = convert_range_bounds_bytes(range);
@@ -431,7 +431,7 @@ impl Transaction {
                     Self::add_to_read_set(read_set, &key, version, savepoints);
                 }
                 let v = value.resolve(core)?;
-                results.push((key, v, ts));
+                results.push((Box::from(key.as_ref()), v, ts));
             }
         } else {
             // If both the write set and the snapshot contain values from the requested
@@ -468,7 +468,7 @@ impl Transaction {
                         Self::add_to_read_set(read_set, &key, version, savepoints);
                     }
                     let v = value.resolve(core)?;
-                    results.push((key, v, ts));
+                    results.push((Box::from(key.as_ref()), v, ts));
                 } else {
                     let (ws_key, ws_entries) = write_set_iter.next().unwrap();
                     let ws_entry = ws_entries.last().unwrap();
@@ -507,7 +507,7 @@ impl Transaction {
         let snap = self.snapshot.as_ref().unwrap();
         let snap_iter = snap
             .range(bound_range.clone())
-            .map(|(k, v, ver, ts)| (k, v, *ver, *ts));
+            .map(|(k, v, ver, ts)| (k, v, ver, ts));
 
         Self::merging_scan(
             &self.core,
@@ -534,7 +534,9 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
         let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
-        let iter = keys.into_iter().map(|(key, _, _, _)| key);
+        let iter = keys
+            .into_iter()
+            .map(|(key, _, _, _)| Box::from(key.as_ref()));
 
         let result = match limit {
             Some(n) => iter.take(n).collect(),
@@ -827,7 +829,7 @@ impl Transaction {
         range: R,
         ts: u64,
         limit: Option<usize>,
-    ) -> Result<Vec<Box<[u8]>>>
+    ) -> Result<Vec<&'b [u8]>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -841,7 +843,7 @@ impl Transaction {
     }
 
     /// Returns only keys within the specified range.
-    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<Box<[u8]>>>
+    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<&'b [u8]>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -881,13 +883,13 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
-    pub fn scan_all_versions<'b, R>(
-        &self,
+    pub fn scan_all_versions<'a, R>(
+        &'a self,
         range: R,
         limit: Option<usize>,
     ) -> Result<Vec<ScanVersionResult>>
     where
-        R: RangeBounds<&'b [u8]>,
+        R: RangeBounds<&'a [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
@@ -910,10 +912,11 @@ impl Transaction {
 
         // Iterate over the keys in the range.
         for (key, value, _, ts) in ranger {
+            let owned_key = key.to_vec();
             // If the key changes, process the previous key's versions.
             if current_key
                 .as_ref()
-                .map_or(false, |k| k.as_ref() != key.as_ref())
+                .map_or(false, |k| k.as_ref() != owned_key.as_slice())
             {
                 // Add the previous key's versions to the results.
                 results.append(&mut current_key_versions);
@@ -936,10 +939,10 @@ impl Transaction {
             let v = value.resolve(&self.core)?;
 
             // Add the key, value, version, and deletion status to the current key's versions.
-            current_key_versions.push((key.clone(), v, *ts, is_deleted));
+            current_key_versions.push((Box::from(owned_key.as_slice()), v, ts, is_deleted));
 
             // Update the current key being processed.
-            current_key = Some(key.into());
+            current_key = Some(Bytes::from(owned_key));
         }
 
         // Process the last key's versions.

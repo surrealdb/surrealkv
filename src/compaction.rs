@@ -101,7 +101,7 @@ impl StoreInner {
         // Do compaction and write
 
         // Define a closure for writing entries to the temporary commit log
-        let mut write_entry = |key: Box<[u8]>,
+        let mut write_entry = |key: &[u8],
                                value: Box<[u8]>,
                                version: u64,
                                ts: u64,
@@ -133,7 +133,7 @@ impl StoreInner {
             Ok(())
         };
 
-        let mut current_key: Option<Box<[u8]>> = None;
+        let mut current_key: Option<&[u8]> = None;
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
 
@@ -146,7 +146,7 @@ impl StoreInner {
             let metadata = value.metadata();
 
             // If we've moved to a new key, decide whether to write the previous key's entries
-            if Some(&key) != current_key.as_ref() {
+            if Some(&key.as_ref()) != current_key.as_ref() {
                 if !skip_current_key {
                     // Write buffered entries of the previous key to disk
                     for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
@@ -158,7 +158,7 @@ impl StoreInner {
                 }
 
                 // Reset flags for the new key
-                current_key = Some(key.clone());
+                current_key = Some(key.as_ref());
                 skip_current_key = false;
             }
 
@@ -180,10 +180,10 @@ impl StoreInner {
             // Buffer the current entry if not skipping
             if !skip_current_key {
                 entries_buffer.push((
-                    key,
+                    key.as_ref(),
                     value.resolve(&self.core)?,
-                    *version,
-                    *ts,
+                    version,
+                    ts,
                     metadata.cloned(),
                 ));
             }
