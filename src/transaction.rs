@@ -505,8 +505,7 @@ impl Transaction {
 
         // Get a snapshot iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
-        let snap_iter = snap
-            .range(bound_range.clone());
+        let snap_iter = snap.range(bound_range.clone());
 
         Self::merging_scan(
             &self.core,
@@ -533,9 +532,7 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
         let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
-        let iter = keys
-            .into_iter()
-            .map(|(key, _, _, _)| Box::from(key));
+        let iter = keys.into_iter().map(|(key, _, _, _)| Box::from(key));
 
         let result = match limit {
             Some(n) => iter.take(n).collect(),
@@ -837,20 +834,6 @@ impl Transaction {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
         let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts, limit);
-
-        Ok(keys)
-    }
-
-    /// Returns only keys within the specified range.
-    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> Result<Vec<&'b [u8]>>
-    where
-        R: RangeBounds<&'b [u8]>,
-    {
-        self.ensure_read_only_transaction()?;
-
-        // Convert the range to a tuple of bounds of variable keys.
-        let range = convert_range_bounds(&range);
-        let keys = self.snapshot.as_ref().unwrap().range_keys(range, limit);
 
         Ok(keys)
     }

@@ -146,23 +146,6 @@ impl Snapshot {
             None => iter.collect(),
         }
     }
-
-    /// Returns just the keys in the given range.
-    pub(crate) fn range_keys<'a, R>(&'a self, range: R, limit: Option<usize>) -> Vec<&'a [u8]>
-    where
-        R: RangeBounds<VariableSizeKey> + 'a,
-    {
-        let base_iter = self
-            .snap
-            .range(range)
-            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
-            .map(|(key, _, _, _)| key);
-
-        match limit {
-            Some(n) => base_iter.take(n).collect(),
-            None => base_iter.collect(),
-        }
-    }
 }
 
 #[cfg(test)]
