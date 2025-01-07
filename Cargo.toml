@@ -44,11 +44,6 @@ tempdir = "0.3"
 rand = "0.8.5"
 criterion = { version = "0.5.1", features = ["async_tokio", "html_reports"] }
 mimalloc = { version = "0.1.39", default-features = false }
-nanoid = "0.4.0"
-fastrand = "2.0.1"
-libc = "0.2.155"
-fmmap = "0.3.3"
-memmap2 = "0.9.4"
 num_cpus = "1.16.0"
 walkdir = "2.5.0"
 
