@@ -131,20 +131,11 @@ impl Snapshot {
             .collect()
     }
 
-    pub(crate) fn keys_at_ts<'a, R>(
-        &'a self,
-        range: R,
-        ts: u64,
-        limit: Option<usize>,
-    ) -> Vec<&'a [u8]>
+    pub(crate) fn keys_at_ts<'a, R>(&'a self, range: R, ts: u64) -> Vec<&'a [u8]>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
-        let iter = self.snap.keys_at_ts(range, ts);
-        match limit {
-            Some(n) => iter.take(n).collect(),
-            None => iter.collect(),
-        }
+        self.snap.keys_at_ts(range, ts).collect()
     }
 }
 
@@ -203,7 +194,7 @@ mod tests {
 
         let range = "k1".as_bytes()..="k2".as_bytes();
         let keys = txn
-            .keys_at_ts(range.clone(), ts, None)
+            .keys_at_ts(range.clone(), ts)
             .expect("Failed to get keys at timestamp");
         assert_eq!(keys[0], b"k1");
         assert_eq!(keys[1], b"k2");

@@ -820,12 +820,7 @@ impl Transaction {
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(
-        &'b self,
-        range: R,
-        ts: u64,
-        limit: Option<usize>,
-    ) -> Result<Vec<&'b [u8]>>
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<&'b [u8]>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -833,7 +828,7 @@ impl Transaction {
 
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts, limit);
+        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
 
         Ok(keys)
     }
