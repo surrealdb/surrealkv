@@ -126,7 +126,6 @@ impl Snapshot {
     {
         self.snap
             .scan_at_ts(range, ts)
-            .into_iter()
             .filter(|(_, snap_val, _, _)| !snap_val.deleted())
             .map(|(key, snap_val, _, _)| (key, snap_val.clone()))
             .collect()

@@ -428,10 +428,10 @@ impl Transaction {
                     break;
                 }
                 if let Some(read_set) = read_set.as_mut() {
-                    Self::add_to_read_set(read_set, &key, version, savepoints);
+                    Self::add_to_read_set(read_set, key, version, savepoints);
                 }
                 let v = value.resolve(core)?;
-                results.push((Box::from(key.as_ref()), v, ts));
+                results.push((Box::from(key), v, ts));
             }
         } else {
             // If both the write set and the snapshot contain values from the requested
@@ -465,10 +465,10 @@ impl Transaction {
                 if from_snap {
                     let (key, value, version, ts) = snap_iter.next().unwrap();
                     if let Some(read_set) = read_set.as_mut() {
-                        Self::add_to_read_set(read_set, &key, version, savepoints);
+                        Self::add_to_read_set(read_set, key, version, savepoints);
                     }
                     let v = value.resolve(core)?;
-                    results.push((Box::from(key.as_ref()), v, ts));
+                    results.push((Box::from(key), v, ts));
                 } else {
                     let (ws_key, ws_entries) = write_set_iter.next().unwrap();
                     let ws_entry = ws_entries.last().unwrap();
@@ -506,8 +506,7 @@ impl Transaction {
         // Get a snapshot iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
         let snap_iter = snap
-            .range(bound_range.clone())
-            .map(|(k, v, ver, ts)| (k, v, ver, ts));
+            .range(bound_range.clone());
 
         Self::merging_scan(
             &self.core,
@@ -536,7 +535,7 @@ impl Transaction {
         let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
         let iter = keys
             .into_iter()
-            .map(|(key, _, _, _)| Box::from(key.as_ref()));
+            .map(|(key, _, _, _)| Box::from(key));
 
         let result = match limit {
             Some(n) => iter.take(n).collect(),
@@ -808,7 +807,7 @@ impl Transaction {
             .as_ref()
             .unwrap()
             .scan_at_ts(range.clone(), ts);
-        let snap_iter = snap_values.iter().map(|(k, v)| (k.clone(), v, 0, 0));
+        let snap_iter = snap_values.iter().map(|(k, v)| (*k, v, 0, 0));
 
         let results = Self::merging_scan(
             &self.core,

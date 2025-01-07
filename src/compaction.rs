@@ -107,7 +107,7 @@ impl StoreInner {
                                ts: u64,
                                metadata: Option<Metadata>|
          -> Result<()> {
-            let mut entry = Entry::new(&key, &value);
+            let mut entry = Entry::new(key, &value);
             entry.set_ts(ts);
 
             if let Some(md) = metadata {
@@ -146,7 +146,7 @@ impl StoreInner {
             let metadata = value.metadata();
 
             // If we've moved to a new key, decide whether to write the previous key's entries
-            if Some(&key.as_ref()) != current_key.as_ref() {
+            if Some(&key) != current_key.as_ref() {
                 if !skip_current_key {
                     // Write buffered entries of the previous key to disk
                     for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
@@ -158,7 +158,7 @@ impl StoreInner {
                 }
 
                 // Reset flags for the new key
-                current_key = Some(key.as_ref());
+                current_key = Some(key);
                 skip_current_key = false;
             }
 
@@ -180,7 +180,7 @@ impl StoreInner {
             // Buffer the current entry if not skipping
             if !skip_current_key {
                 entries_buffer.push((
-                    key.as_ref(),
+                    key,
                     value.resolve(&self.core)?,
                     version,
                     ts,
