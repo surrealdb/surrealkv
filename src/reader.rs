@@ -255,10 +255,7 @@ impl RecordReader {
         self.rec.clear();
 
         let mut tx = Record::new();
-        match self.read_into(&mut tx) {
-            Ok(value_offsets) => value_offsets,
-            Err(e) => return Err(e),
-        };
+        self.read_into(&mut tx)?;
 
         let mut rec = BytesMut::new();
         tx.encode(&mut rec)?;
