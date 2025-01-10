@@ -873,7 +873,7 @@ impl Transaction {
         // Iterate over the keys in the range.
         for (key, value, _, ts) in ranger {
             // If the key changes, process the previous key's versions.
-            if current_key.as_ref().map_or(false, |k| k != &key) {
+            if current_key.as_ref().is_some_and(|k| k != &key) {
                 // Add the previous key's versions to the results.
                 results.append(&mut current_key_versions);
 

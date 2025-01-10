@@ -454,7 +454,7 @@ impl Core {
         value_offset: u64,
         indexer: &mut Indexer,
     ) -> Result<()> {
-        if entry.metadata.as_ref().map_or(false, |metadata| {
+        if entry.metadata.as_ref().is_some_and(|metadata| {
             metadata.is_deleted() || metadata.is_tombstone() && !opts.enable_versions
         }) {
             indexer.delete(&mut entry.key[..].into());

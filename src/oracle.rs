@@ -251,7 +251,7 @@ impl SerializableSnapshotIsolation {
                         Some(entries)
                             if entries
                                 .last()
-                                .map_or(false, |e| e.e.is_deleted_or_tombstone()) =>
+                                .is_some_and(|e| e.e.is_deleted_or_tombstone()) =>
                         {
                             // Key is being deleted in current txn, don't count as conflict
                             continue;
