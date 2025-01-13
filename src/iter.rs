@@ -1,4 +1,6 @@
-use std::{cmp::Ordering, marker::PhantomData, ops::RangeBounds};
+use std::{
+    cmp::Ordering, collections::btree_map, iter::Peekable, marker::PhantomData, ops::RangeBounds,
+};
 
 use bytes::Bytes;
 use vart::VariableSizeKey;
@@ -26,9 +28,8 @@ pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
     core: &'a Core,
     read_set: Option<&'a mut ReadSet>,
     savepoints: u32,
-    snap_iter: std::iter::Peekable<I>,
-    write_set_iter:
-        std::iter::Peekable<std::collections::btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
+    snap_iter: Peekable<I>,
+    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     limit: usize,
     count: usize,
     _phantom: PhantomData<R>,
@@ -167,9 +168,8 @@ where
 /// An iterator over the keys in the snapshot and write set.
 /// It does not add anything to the read set.
 pub(crate) struct KeyScanIterator<'a, R, I: Iterator> {
-    snap_iter: std::iter::Peekable<I>,
-    write_set_iter:
-        std::iter::Peekable<std::collections::btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
+    snap_iter: Peekable<I>,
+    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     limit: Option<usize>,
     count: usize,
     _phantom: PhantomData<R>,
