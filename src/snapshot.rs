@@ -1,5 +1,5 @@
 use std::ops::RangeBounds;
-use vart::{art::QueryType, art::Tree, iter::Iter, VariableSizeKey};
+use vart::{art::Tree, iter::Iter, VariableSizeKey};
 
 use crate::error::{Error, Result};
 use crate::indexer::IndexValue;

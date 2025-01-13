@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ahash::{HashSet, HashSetExt};
 use bytes::Bytes;
-use vart::{art::QueryType, VariableSizeKey};
+use vart::VariableSizeKey;
 
 use crate::entry::Entry;
 use crate::error::{Error, Result};
