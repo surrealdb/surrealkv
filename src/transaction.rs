@@ -607,18 +607,6 @@ impl Transaction {
 /// Implement Versioned APIs for read-only transactions.
 /// These APIs do not take part in conflict detection.
 impl Transaction {
-    fn ensure_read_only_transaction(&self) -> Result<()> {
-        // If the transaction is closed, return an error.
-        if self.closed {
-            return Err(Error::TransactionClosed);
-        }
-        // Do not allow versioned reads if it is not a read-only transaction
-        if !self.mode.is_read_only() {
-            return Err(Error::TransactionMustBeReadOnly);
-        }
-        Ok(())
-    }
-
     /// Returns the value associated with the key at the given timestamp.
     pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
         // If the key is empty, return an error.
@@ -657,14 +645,19 @@ impl Transaction {
 
     /// Returns all the versioned values and timestamps associated with the key.
     pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
-        self.ensure_read_only_transaction()?;
-
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
         }
 
         let mut results = Vec::new();
+
+        // Check write set first
+        if let Some(write_val) = self.get_in_write_set(key) {
+            if let Some(val) = write_val.0 {
+                results.push((val.to_vec(), write_val.1));
+            }
+        }
 
         // Attempt to get the value for the key from the snapshot.
         match self
@@ -739,7 +732,7 @@ impl Transaction {
         &'b self,
         range: R,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = Result<ScanVersionResult<'b>>> + 'b
+    ) -> impl Iterator<Item = Result<ScanVersionResult<'b>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
