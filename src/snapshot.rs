@@ -132,16 +132,6 @@ impl Snapshot {
             .scan_at_ts(range, ts)
             .filter(|(_, snap_val, _, _)| !snap_val.deleted())
     }
-
-    pub(crate) fn keys_at_ts<'a, R>(&'a self, range: R, ts: u64) -> impl Iterator<Item = &'a [u8]>
-    where
-        R: RangeBounds<VariableSizeKey> + 'a,
-    {
-        self.snap
-            .scan_at_ts(range, ts)
-            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
-            .map(|(key, _, _, _)| (key))
-    }
 }
 
 #[cfg(test)]

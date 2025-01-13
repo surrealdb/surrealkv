@@ -1,7 +1,5 @@
-use std::cmp::Ordering;
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -11,11 +9,11 @@ use vart::{art::QueryType, VariableSizeKey};
 
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::indexer::IndexValue;
+use crate::iter::{KeyScanIterator, MergingScanIterator};
 use crate::option::IsolationLevel;
 use crate::snapshot::Snapshot;
 use crate::store::Core;
-use crate::util::{convert_range_bounds, convert_range_bounds_bytes, now};
+use crate::util::{convert_range_bounds, now};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -65,7 +63,7 @@ impl Mode {
 pub type ScanResult<'a> = (&'a [u8], Vec<u8>, u64);
 
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
-pub type ScanVersionResult<'a> = (Box<[u8]>, Vec<u8>, u64, bool);
+pub type ScanVersionResult = (Box<[u8]>, Vec<u8>, u64, bool);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
@@ -134,8 +132,8 @@ impl ReadScanEntry {
     }
 }
 
-type ReadSet = Vec<ReadSetEntry>;
-type WriteSet = BTreeMap<Bytes, Vec<WriteSetEntry>>;
+pub(crate) type ReadSet = Vec<ReadSetEntry>;
+pub(crate) type WriteSet = BTreeMap<Bytes, Vec<WriteSetEntry>>;
 
 /// `Transaction` is a struct representing a transaction in a database.
 pub struct Transaction {
@@ -419,7 +417,7 @@ impl Transaction {
         let snap = self.snapshot.as_ref().unwrap();
         let snap_iter = snap.range(bound_range.clone());
 
-        merging_scan(
+        MergingScanIterator::new(
             &self.core,
             &self.write_set,
             read_set_for_scan,
@@ -709,7 +707,7 @@ impl Transaction {
             .unwrap()
             .scan_at_ts(range.clone(), ts);
 
-        merging_scan(
+        MergingScanIterator::new(
             &self.core,
             &self.write_set,
             None,
@@ -728,7 +726,13 @@ impl Transaction {
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        self.snapshot.as_ref().unwrap().keys_at_ts(range, ts)
+        let snap_iter = self
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .scan_at_ts(range.clone(), ts);
+
+        KeyScanIterator::new(&self.write_set, snap_iter, &range, None)
     }
 
     /// Returns the value associated with the key at the given timestamp.
@@ -789,7 +793,7 @@ impl Transaction {
         for (key, value, _, ts) in ranger {
             let owned_key = key.to_vec();
             // If the key changes, process the previous key's versions.
-            if current_key.as_ref().is_some_and(|k| k != &key) {
+            if current_key.as_ref().is_some_and(|k| k != key) {
                 // Add the previous key's versions to the results.
                 results.append(&mut current_key_versions);
 
@@ -838,161 +842,6 @@ impl Drop for Transaction {
     }
 }
 
-pub struct MergingScanIterator<'a, R, I: Iterator> {
-    core: &'a Core,
-    read_set: Option<&'a mut ReadSet>,
-    savepoints: u32,
-    snap_iter: std::iter::Peekable<I>,
-    write_set_iter:
-        std::iter::Peekable<std::collections::btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
-    limit: usize,
-    count: usize,
-    _phantom: PhantomData<R>,
-}
-
-impl<'a, R, I: Iterator> MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
-{
-    pub fn new(
-        core: &'a Core,
-        write_set: &'a WriteSet,
-        read_set: Option<&'a mut ReadSet>,
-        savepoints: u32,
-        snap_iter: I,
-        range: &R,
-        limit: Option<usize>,
-    ) -> Self {
-        let range_bytes = convert_range_bounds_bytes(range);
-        MergingScanIterator::<R, I> {
-            core,
-            read_set,
-            savepoints,
-            snap_iter: snap_iter.peekable(),
-            write_set_iter: write_set.range(range_bytes).peekable(),
-            limit: limit.unwrap_or(usize::MAX),
-            count: 0,
-            _phantom: PhantomData,
-        }
-    }
-
-    fn add_to_read_set(read_set: &mut ReadSet, key: &[u8], version: u64, savepoints: u32) {
-        let entry = ReadSetEntry::new(key, version, savepoints);
-        read_set.push(entry);
-    }
-}
-
-impl<'a, R, I> Iterator for MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
-{
-    type Item = Result<ScanResult<'a>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count >= self.limit {
-            return None;
-        }
-
-        // Fast path when write set is empty
-        if self.write_set_iter.peek().is_none() {
-            // If the write set does not contain values in the scan range,
-            // do the scan only in the snapshot. This optimisation is quite
-            // important according to the benches.
-            let result = self.read_from_snapshot();
-            if result.is_some() {
-                self.count += 1;
-            }
-            return result;
-        }
-
-        // Merging path
-        // If both the write set and the snapshot contain values from the requested
-        // range, perform a somewhat slower merging scan.
-
-        // Determine which iterator has the next value
-        let has_snap = self.snap_iter.peek().is_some();
-        let has_ws = self.write_set_iter.peek().is_some();
-
-        let result = match (has_snap, has_ws) {
-            (false, false) => None,
-            (true, false) => self.read_from_snapshot(),
-            (false, true) => self.read_from_write_set(),
-            (true, true) => {
-                // Now we can safely do the comparison
-                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
-                    (self.snap_iter.peek(), self.write_set_iter.peek())
-                {
-                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
-                        Ordering::Less => self.read_from_snapshot(),
-                        Ordering::Greater => self.read_from_write_set(),
-                        Ordering::Equal => {
-                            self.snap_iter.next(); // Skip snapshot entry
-                            self.read_from_write_set()
-                        }
-                    }
-                } else {
-                    // This should never happen since we checked above
-                    None
-                }
-            }
-        };
-
-        if result.is_some() {
-            self.count += 1;
-        }
-        result
-    }
-}
-
-impl<'a, R, I> MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
-{
-    fn read_from_snapshot(&mut self) -> Option<<Self as Iterator>::Item> {
-        let (key, value, version, ts) = self.snap_iter.next().unwrap();
-        if let Some(read_set) = self.read_set.as_mut() {
-            Self::add_to_read_set(read_set, key, version, self.savepoints);
-        }
-        Some(match value.resolve(self.core) {
-            Ok(v) => Ok((key, v, ts)),
-            Err(e) => Err(e),
-        })
-    }
-
-    fn read_from_write_set(&mut self) -> Option<<Self as Iterator>::Item> {
-        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
-        let ws_entry = ws_entries.last().unwrap();
-        if ws_entry.e.is_deleted_or_tombstone() {
-            return self.next();
-        }
-        Some(Ok((
-            ws_key.as_ref(),
-            ws_entry.e.value.to_vec(),
-            ws_entry.e.ts,
-        )))
-    }
-}
-
-// Modified merging_scan function to return the iterator
-fn merging_scan<'a, R: RangeBounds<VariableSizeKey>, I>(
-    core: &'a Core,
-    write_set: &'a WriteSet,
-    read_set: Option<&'a mut ReadSet>,
-    savepoints: u32,
-    snap_iter: I,
-    range: &R,
-    limit: Option<usize>,
-) -> MergingScanIterator<'a, R, I>
-where
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
-{
-    MergingScanIterator::new(
-        core, write_set, read_set, savepoints, snap_iter, range, limit,
-    )
-}
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
