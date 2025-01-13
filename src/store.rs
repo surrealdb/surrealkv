@@ -1598,9 +1598,9 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn3 = store.begin().unwrap();
-        let versions = txn3
+        let versions: Vec<_> = txn3
             .scan_all_versions(key.as_ref()..=key.as_ref(), None)
-            .unwrap();
+            .collect();
         assert!(versions.is_empty());
 
         store.close().await.unwrap();
@@ -1629,9 +1629,9 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn3 = store.begin().unwrap();
-        let versions = txn3
+        let versions: Vec<_> = txn3
             .scan_all_versions(key.as_ref()..=key.as_ref(), None)
-            .unwrap();
+            .collect();
         assert!(versions.is_empty());
 
         store.close().await.unwrap();

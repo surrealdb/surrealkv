@@ -3,13 +3,12 @@ use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use ahash::{HashSet, HashSetExt};
 use bytes::Bytes;
 use vart::VariableSizeKey;
 
 use crate::entry::Entry;
 use crate::error::{Error, Result};
-use crate::iter::{KeyScanIterator, MergingScanIterator};
+use crate::iter::{KeyScanIterator, MergingScanIterator, VersionScanIterator};
 use crate::option::IsolationLevel;
 use crate::snapshot::Snapshot;
 use crate::store::Core;
@@ -63,7 +62,7 @@ impl Mode {
 pub type ScanResult<'a> = (&'a [u8], Vec<u8>, u64);
 
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
-pub type ScanVersionResult = (Box<[u8]>, Vec<u8>, u64, bool);
+pub type ScanVersionResult<'a> = (&'a [u8], Vec<u8>, u64, bool);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
@@ -736,72 +735,21 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
-    pub fn scan_all_versions<'a, R>(
-        &'a self,
+    pub fn scan_all_versions<'b, R>(
+        &'b self,
         range: R,
         limit: Option<usize>,
-    ) -> Result<Vec<ScanVersionResult>>
+    ) -> impl Iterator<Item = Result<ScanVersionResult<'b>>> + 'b
     where
-        R: RangeBounds<&'a [u8]>,
+        R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
 
-        // Initialize an empty vector to store the results.
-        let mut results = Vec::new();
-
-        // Initialize a HashSet to keep track of unique keys.
-        let mut unique_keys = HashSet::new();
-
-        // Get a range iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
-        let ranger = snap.range_with_versions(range);
+        let snap_iter = snap.range_with_versions(range);
 
-        // Initialize a variable to keep track of the current key being processed.
-        let mut current_key: Option<Bytes> = None;
-
-        // Initialize a vector to store versions for the current key.
-        let mut current_key_versions = Vec::new();
-
-        // Iterate over the keys in the range.
-        for (key, value, _, ts) in ranger {
-            let owned_key = key.to_vec();
-            // If the key changes, process the previous key's versions.
-            if current_key.as_ref().is_some_and(|k| k != key) {
-                // Add the previous key's versions to the results.
-                results.append(&mut current_key_versions);
-
-                // Add the previous key to the set of unique keys.
-                unique_keys.insert(current_key.take().unwrap());
-
-                // If a limit is set and we've already got enough unique keys, break the loop.
-                if let Some(limit) = limit {
-                    if unique_keys.len() >= limit {
-                        break;
-                    }
-                }
-            }
-
-            // Determine if the record is soft deleted based on the metadata.
-            let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
-
-            // Resolve the value reference to get the actual value.
-            let v = value.resolve(&self.core)?;
-
-            // Add the key, value, version, and deletion status to the current key's versions.
-            current_key_versions.push((Box::from(owned_key.as_slice()), v, ts, is_deleted));
-
-            // Update the current key being processed.
-            current_key = Some(Bytes::from(owned_key));
-        }
-
-        // Process the last key's versions.
-        if current_key.is_some() {
-            results.append(&mut current_key_versions);
-        }
-
-        // Return the results.
-        Ok(results)
+        VersionScanIterator::new(&self.core, snap_iter, limit)
     }
 
     #[allow(unused)]
@@ -821,6 +769,7 @@ mod tests {
     use bytes::Bytes;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::HashSet;
     use std::mem::size_of;
     use tokio::task;
 
@@ -2671,28 +2620,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_all_versions_single_key_single_version() {
-        let (store, _) = create_store(false);
-        let key = Bytes::from("key1");
-        let value = Bytes::from("value1");
-
-        let mut txn = store.begin().unwrap();
-        txn.set_at_ts(&key, &value, 1).unwrap();
-        txn.commit().await.unwrap();
-
-        let range = key.as_ref()..=key.as_ref();
-        let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
-
-        assert_eq!(results.len(), 1);
-        let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k.as_ref(), &key);
-        assert_eq!(v, &value);
-        assert_eq!(*version, 1);
-        assert!(!(*is_deleted));
-    }
-
-    #[tokio::test]
     async fn test_scan_all_versions_single_key_multiple_versions() {
         let (store, _) = create_store(false);
         let key = Bytes::from("key1");
@@ -2713,12 +2640,15 @@ mod tests {
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         // Verify that the output contains all the versions of the key
         assert_eq!(results.len(), values.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k.as_ref(), &key);
+            assert_eq!(k, &key);
             assert_eq!(v, &values[i]);
             assert_eq!(*version, (i + 1) as u64);
             assert!(!(*is_deleted));
@@ -2743,11 +2673,14 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(results.len(), keys.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k.as_ref(), &keys[i]);
+            assert_eq!(k, &keys[i]);
             assert_eq!(v, &value);
             assert_eq!(*version, 1);
             assert!(!(*is_deleted));
@@ -2757,15 +2690,11 @@ mod tests {
     #[tokio::test]
     async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
         let (store, _) = create_store(false);
-
-        // Define a range of keys
         let keys = vec![
             Bytes::from("key1"),
             Bytes::from("key2"),
             Bytes::from("key3"),
         ];
-
-        // Insert multiple versions for each key
         let values = [
             Bytes::from("value1"),
             Bytes::from("value2"),
@@ -2775,7 +2704,7 @@ mod tests {
         for key in &keys {
             for (i, value) in values.iter().enumerate() {
                 let mut txn = store.begin().unwrap();
-                let version = (i + 1) as u64; // Incremental version
+                let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
                 txn.commit().await.unwrap();
             }
@@ -2783,7 +2712,10 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         let mut expected_results = Vec::new();
         for key in &keys {
@@ -2796,7 +2728,7 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k.as_ref(), expected_key);
+            assert_eq!(k, expected_key);
             assert_eq!(v, expected_value);
             assert_eq!(*version, *expected_version);
             assert_eq!(*is_deleted, *expected_is_deleted);
@@ -2819,17 +2751,20 @@ mod tests {
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(results.len(), 2);
         let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k.as_ref(), &key);
+        assert_eq!(k, &key);
         assert_eq!(v, &value);
         assert_eq!(*version, 1);
         assert!(!(*is_deleted));
 
         let (k, v, _, is_deleted) = &results[1];
-        assert_eq!(k.as_ref(), &key);
+        assert_eq!(k, &key);
         assert_eq!(v, &Bytes::new());
         assert!(*is_deleted);
     }
@@ -2858,13 +2793,16 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(results.len(), keys.len() * 2);
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
             let key_index = i / 2;
             let is_deleted_version = i % 2 == 1;
-            assert_eq!(k.as_ref(), &keys[key_index]);
+            assert_eq!(k, &keys[key_index]);
             if is_deleted_version {
                 assert_eq!(v, &Bytes::new());
                 assert!(*is_deleted);
@@ -2907,7 +2845,10 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         let mut expected_results = Vec::new();
         for key in &keys {
@@ -2921,12 +2862,8 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k.as_ref(), expected_key);
+            assert_eq!(k, expected_key);
             assert_eq!(v, expected_value);
-            // Check version only if the record is not deleted
-            // This is because a soft-deleted record has version which is
-            // the commit timestamp of the transaction, and do not want to
-            // make the test complex by predicting the exact value.
             if !expected_is_deleted {
                 assert_eq!(*version, *expected_version);
             }
@@ -2954,7 +2891,10 @@ mod tests {
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(results.len(), 0);
     }
@@ -2978,19 +2918,28 @@ mod tests {
         // Inclusive range
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(results.len(), keys.len());
 
         // Exclusive range
         let range = keys.first().unwrap().as_ref()..keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(results.len(), keys.len() - 1);
 
         // Unbounded range
         let range = ..;
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, None).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(results.len(), keys.len());
     }
 
@@ -3012,9 +2961,37 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, Some(2)).unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, Some(2))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_versions_single_key_single_version() {
+        let (store, _) = create_store(false);
+        let key = Bytes::from("key1");
+        let value = Bytes::from("value1");
+
+        let mut txn = store.begin().unwrap();
+        txn.set_at_ts(&key, &value, 1).unwrap();
+        txn.commit().await.unwrap();
+
+        let range = key.as_ref()..=key.as_ref();
+        let txn = store.begin().unwrap();
+        let results: Vec<_> = txn
+            .scan_all_versions(range, None)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let (k, v, version, is_deleted) = &results[0];
+        assert_eq!(k, &key);
+        assert_eq!(v, &value);
+        assert_eq!(*version, 1);
+        assert!(!(*is_deleted));
     }
 
     #[tokio::test]
@@ -3112,24 +3089,31 @@ mod tests {
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
         let txn = store.begin().unwrap();
-        let results = txn.scan_all_versions(range, Some(2)).unwrap();
-        assert_eq!(results.len(), 6);
+        let results: Vec<_> = txn
+            .scan_all_versions(range, Some(2))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(results.len(), 6); // 3 versions for each of 2 keys
 
         // Collect unique keys from the results
-        let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+        let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
 
         // Verify that the number of unique keys is equal to the limit
         assert_eq!(unique_keys.len(), 2);
 
-        // Verify that the results contain the latest version for each key
+        // Verify that the results contain all versions for each key
         for key in unique_keys {
-            let latest_value = values.last().unwrap();
-            let latest_version = values.len() as u64;
-            let result = results
+            let key_versions: Vec<_> = results.iter().filter(|(k, _, _, _)| k == &key).collect();
+
+            assert_eq!(key_versions.len(), 3); // Should have all 3 versions
+
+            // Check the latest version
+            let latest = key_versions
                 .iter()
-                .find(|(k, _, version, _)| k == &key && *version == latest_version)
+                .max_by_key(|(_, _, version, _)| version)
                 .unwrap();
-            assert_eq!(result.1, *latest_value);
+            assert_eq!(latest.1, *values.last().unwrap());
+            assert_eq!(latest.2, values.len() as u64);
         }
     }
 
@@ -3322,10 +3306,13 @@ mod tests {
         // Scan each subset and collect versions
         for subset in subsets {
             let txn = store.begin().unwrap();
-            let results = txn.scan_all_versions(subset, None).unwrap();
+            let results: Vec<_> = txn
+                .scan_all_versions(subset, None)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
 
             // Collect unique keys from the results
-            let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
+            let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
 
             // Verify that the results contain all versions for each key in the subset
             for key in unique_keys {
@@ -3389,31 +3376,38 @@ mod tests {
             batch_size: usize,
         ) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
             let mut all_results = Vec::new();
-            let mut start_key: Option<Bytes> = None;
+            let mut last_key = Vec::new();
+            let mut first_iteration = true;
 
             loop {
-                let range = match &start_key {
-                    Some(key) => (Bound::Excluded(key.as_ref()), Bound::Unbounded),
-                    None => (Bound::Unbounded, Bound::Unbounded),
+                let txn = store.begin().unwrap();
+
+                // Create range using a clone of last_key
+                let key_clone = last_key.clone();
+                let range = if first_iteration {
+                    (Bound::Unbounded, Bound::Unbounded)
+                } else {
+                    (Bound::Excluded(&key_clone[..]), Bound::Unbounded)
                 };
 
-                let txn = store.begin().unwrap();
-                let results = txn.scan_all_versions(range, Some(batch_size)).unwrap();
+                let mut batch_results = Vec::new();
+                for result in txn.scan_all_versions(range, Some(batch_size)) {
+                    let (k, v, ts, is_deleted) = result.unwrap();
+                    // Convert borrowed key to owned immediately
+                    let key_bytes = Bytes::copy_from_slice(k);
+                    let val_bytes = Bytes::from(v);
+                    batch_results.push((key_bytes, val_bytes, ts, is_deleted));
 
-                if results.is_empty() {
+                    // Update last_key with a new vector
+                    last_key = k.to_vec();
+                }
+
+                if batch_results.is_empty() {
                     break;
                 }
 
-                // Convert Vec<u8> to Bytes
-                let converted_results: Vec<(Bytes, Bytes, u64, bool)> = results
-                    .into_iter()
-                    .map(|(k, v, ts, is_deleted)| (Bytes::from(k), Bytes::from(v), ts, is_deleted))
-                    .collect();
-
-                all_results.push(converted_results.clone());
-
-                // Update the start_key for the next batch
-                start_key = Some(converted_results.last().unwrap().0.clone());
+                first_iteration = false;
+                all_results.push(batch_results);
             }
 
             all_results
