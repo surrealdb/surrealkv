@@ -137,7 +137,10 @@ impl Snapshot {
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
-        self.snap.keys_at_ts(range, ts)
+        self.snap
+            .scan_at_ts(range, ts)
+            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
+            .map(|(key, _, _, _)| (key))
     }
 }
 

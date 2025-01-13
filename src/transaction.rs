@@ -900,80 +900,41 @@ where
             // If the write set does not contain values in the scan range,
             // do the scan only in the snapshot. This optimisation is quite
             // important according to the benches.
-            if let Some((key, value, version, ts)) = self.snap_iter.next() {
-                if let Some(read_set) = self.read_set.as_mut() {
-                    Self::add_to_read_set(read_set, key, version, self.savepoints);
-                }
+            let result = self.read_from_snapshot();
+            if result.is_some() {
                 self.count += 1;
-                return Some(value.resolve(self.core).map(|v| (key, v, ts)));
             }
-            return None;
+            return result;
         }
 
         // Merging path
         // If both the write set and the snapshot contain values from the requested
         // range, perform a somewhat slower merging scan.
 
-        let snap_entry = self.snap_iter.peek();
-        let ws_entry = self.write_set_iter.peek();
+        // Determine which iterator has the next value
+        let has_snap = self.snap_iter.peek().is_some();
+        let has_ws = self.write_set_iter.peek().is_some();
 
-        // Determine where to pick the next value from,
-        // the write set or the snaphot.
-        let result = match (snap_entry, ws_entry) {
-            (None, None) => None,
-            (Some(_), None) => {
-                let (key, value, version, ts) = self.snap_iter.next().unwrap();
-                if let Some(read_set) = self.read_set.as_mut() {
-                    Self::add_to_read_set(read_set, key, version, self.savepoints);
-                }
-                Some(value.resolve(self.core).map(|v| (key, v, ts)))
-            }
-            (None, Some(_)) => {
-                let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
-                let ws_entry = ws_entries.last().unwrap();
-                if ws_entry.e.is_deleted_or_tombstone() {
-                    return self.next();
-                }
-                Some(Ok((
-                    ws_key.as_ref(),
-                    ws_entry.e.value.to_vec(),
-                    ws_entry.e.ts,
-                )))
-            }
-            (Some((snap_key, _, _, _)), Some((ws_key, _))) => {
-                match snap_key.as_ref().cmp(ws_key.as_ref()) {
-                    Ordering::Less => {
-                        let (key, value, version, ts) = self.snap_iter.next().unwrap();
-                        if let Some(read_set) = self.read_set.as_mut() {
-                            Self::add_to_read_set(read_set, key, version, self.savepoints);
+        let result = match (has_snap, has_ws) {
+            (false, false) => None,
+            (true, false) => self.read_from_snapshot(),
+            (false, true) => self.read_from_write_set(),
+            (true, true) => {
+                // Now we can safely do the comparison
+                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
+                    (self.snap_iter.peek(), self.write_set_iter.peek())
+                {
+                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
+                        Ordering::Less => self.read_from_snapshot(),
+                        Ordering::Greater => self.read_from_write_set(),
+                        Ordering::Equal => {
+                            self.snap_iter.next(); // Skip snapshot entry
+                            self.read_from_write_set()
                         }
-                        Some(value.resolve(self.core).map(|v| (key, v, ts)))
                     }
-                    Ordering::Greater => {
-                        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
-                        let ws_entry = ws_entries.last().unwrap();
-                        if ws_entry.e.is_deleted_or_tombstone() {
-                            return self.next();
-                        }
-                        Some(Ok((
-                            ws_key.as_ref(),
-                            ws_entry.e.value.to_vec(),
-                            ws_entry.e.ts,
-                        )))
-                    }
-                    Ordering::Equal => {
-                        self.snap_iter.next();
-                        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
-                        let ws_entry = ws_entries.last().unwrap();
-                        if ws_entry.e.is_deleted_or_tombstone() {
-                            return self.next();
-                        }
-                        Some(Ok((
-                            ws_key.as_ref(),
-                            ws_entry.e.value.to_vec(),
-                            ws_entry.e.ts,
-                        )))
-                    }
+                } else {
+                    // This should never happen since we checked above
+                    None
                 }
             }
         };
@@ -982,6 +943,36 @@ where
             self.count += 1;
         }
         result
+    }
+}
+
+impl<'a, R, I> MergingScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+{
+    fn read_from_snapshot(&mut self) -> Option<<Self as Iterator>::Item> {
+        let (key, value, version, ts) = self.snap_iter.next().unwrap();
+        if let Some(read_set) = self.read_set.as_mut() {
+            Self::add_to_read_set(read_set, key, version, self.savepoints);
+        }
+        Some(match value.resolve(self.core) {
+            Ok(v) => Ok((key, v, ts)),
+            Err(e) => Err(e),
+        })
+    }
+
+    fn read_from_write_set(&mut self) -> Option<<Self as Iterator>::Item> {
+        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
+        let ws_entry = ws_entries.last().unwrap();
+        if ws_entry.e.is_deleted_or_tombstone() {
+            return self.next();
+        }
+        Some(Ok((
+            ws_key.as_ref(),
+            ws_entry.e.value.to_vec(),
+            ws_entry.e.ts,
+        )))
     }
 }
 
