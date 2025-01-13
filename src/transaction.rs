@@ -735,32 +735,6 @@ impl Transaction {
         KeyScanIterator::new(&self.write_set, snap_iter, &range, None)
     }
 
-    /// Returns the value associated with the key at the given timestamp.
-    /// The query type specifies the type of query to perform.
-    /// The query type can be `LatestByVersion`, `LatestByTs`, `LastLessThanTs`,
-    /// `LastLessOrEqualTs`, `FirstGreaterOrEqualTs` or `FirstGreaterThanTs`.
-    pub fn get_value_by_query(
-        &self,
-        key: &VariableSizeKey,
-        query_type: QueryType,
-    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
-        self.ensure_read_only_transaction()?;
-
-        match self
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .get_value_by_query(key, query_type)
-        {
-            Some((idx_val, version, ts)) => {
-                // Resolve the value reference to get the actual value.
-                let value = idx_val.resolve(&self.core)?;
-                Ok(Some((value, version, ts)))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
     pub fn scan_all_versions<'a, R>(
         &'a self,

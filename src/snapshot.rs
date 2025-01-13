@@ -110,16 +110,6 @@ impl Snapshot {
         self.snap.range_with_versions(range)
     }
 
-    pub(crate) fn get_value_by_query(
-        &self,
-        key: &VariableSizeKey,
-        query_type: QueryType,
-    ) -> Option<(IndexValue, u64, u64)> {
-        self.snap
-            .get_value_by_query(key, query_type)
-            .filter(|(val, _, _)| !val.deleted())
-    }
-
     pub(crate) fn scan_at_ts<'a, R>(
         &'a self,
         range: R,
