@@ -5,6 +5,8 @@ use crate::error::{Error, Result};
 use crate::indexer::IndexValue;
 use crate::store::Core;
 
+pub(crate) type VersionedEntry<'a, V> = (&'a [u8], &'a V, u64, u64);
+
 /// A versioned snapshot for snapshot isolation.
 pub(crate) struct Snapshot {
     snap: Tree<VariableSizeKey, IndexValue>,
@@ -77,7 +79,7 @@ impl Snapshot {
     pub(crate) fn range<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -90,7 +92,7 @@ impl Snapshot {
     pub(crate) fn range_with_deleted<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -101,7 +103,7 @@ impl Snapshot {
     pub(crate) fn range_with_versions<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = (Vec<u8>, &'a IndexValue, &'a u64, &'a u64)>
+    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -118,20 +120,22 @@ impl Snapshot {
             .filter(|(val, _, _)| !val.deleted())
     }
 
-    pub(crate) fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, IndexValue)>
+    pub(crate) fn scan_at_ts<'a, R>(
+        &'a self,
+        range: R,
+        ts: u64,
+    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
     where
-        R: RangeBounds<VariableSizeKey>,
+        R: RangeBounds<VariableSizeKey> + 'a,
     {
         self.snap
             .scan_at_ts(range, ts)
-            .into_iter()
-            .filter(|(_, snap_val)| !snap_val.deleted())
-            .collect()
+            .filter(|(_, snap_val, _, _)| !snap_val.deleted())
     }
 
-    pub(crate) fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
+    pub(crate) fn keys_at_ts<'a, R>(&'a self, range: R, ts: u64) -> impl Iterator<Item = &'a [u8]>
     where
-        R: RangeBounds<VariableSizeKey>,
+        R: RangeBounds<VariableSizeKey> + 'a,
     {
         self.snap.keys_at_ts(range, ts)
     }
@@ -191,23 +195,23 @@ mod tests {
             .expect("Failed to begin transaction");
 
         let range = "k1".as_bytes()..="k2".as_bytes();
-        let keys = txn
-            .keys_at_ts(range.clone(), ts)
-            .expect("Failed to get keys at timestamp");
+        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts).collect();
         assert_eq!(keys[0], b"k1");
         assert_eq!(keys[1], b"k2");
 
         // Test scan_at_ts
-        let entries = txn
+        let entries: Vec<_> = txn
             .scan_at_ts(range, ts, Some(10))
-            .expect("Failed to scan at timestamp");
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Scan should succeed");
+
         assert_eq!(
             entries.len(),
             keys_values.len(),
             "Should match the number of keys"
         );
-        assert_eq!(entries[0], (b"k1".to_vec(), b"value1Updated".to_vec()));
-        assert_eq!(entries[1], (b"k2".to_vec(), b"value2Updated".to_vec()));
+        assert_eq!(entries[0], (b"k1".as_ref(), b"value1Updated".to_vec()));
+        assert_eq!(entries[1], (b"k2".as_ref(), b"value2Updated".to_vec()));
 
         // Enhance get_history testing
         for (key, initial_value, updated_value) in keys_values.iter() {

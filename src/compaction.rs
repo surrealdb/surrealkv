@@ -101,13 +101,13 @@ impl StoreInner {
         // Do compaction and write
 
         // Define a closure for writing entries to the temporary commit log
-        let mut write_entry = |key: Vec<u8>,
+        let mut write_entry = |key: &[u8],
                                value: Vec<u8>,
                                version: u64,
                                ts: u64,
                                metadata: Option<Metadata>|
          -> Result<()> {
-            let mut entry = Entry::new(&key, &value);
+            let mut entry = Entry::new(key, &value);
             entry.set_ts(ts);
 
             if let Some(md) = metadata {
@@ -133,7 +133,7 @@ impl StoreInner {
             Ok(())
         };
 
-        let mut current_key: Option<Vec<u8>> = None;
+        let mut current_key: Option<&[u8]> = None;
         let mut entries_buffer = Vec::new();
         let mut skip_current_key = false;
 
@@ -158,7 +158,7 @@ impl StoreInner {
                 }
 
                 // Reset flags for the new key
-                current_key = Some(key.clone());
+                current_key = Some(key);
                 skip_current_key = false;
             }
 
@@ -182,8 +182,8 @@ impl StoreInner {
                 entries_buffer.push((
                     key,
                     value.resolve(&self.core)?,
-                    *version,
-                    *ts,
+                    version,
+                    ts,
                     metadata.cloned(),
                 ));
             }

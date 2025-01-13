@@ -1,10 +1,12 @@
-use ahash::{HashSet, HashSetExt};
-use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
+
+use ahash::{HashSet, HashSetExt};
+use bytes::Bytes;
 use vart::{art::QueryType, VariableSizeKey};
 
 use crate::entry::Entry;
@@ -60,10 +62,10 @@ impl Mode {
 }
 
 /// ScanResult is a tuple containing the key, value, and commit timestamp of a key-value pair.
-pub type ScanResult = (Vec<u8>, Vec<u8>, u64);
+pub type ScanResult<'a> = (&'a [u8], Vec<u8>, u64);
 
 /// ScanResult is a tuple containing the key, value, timestamp, and info about whether the key is deleted.
-pub type ScanVersionResult = (Vec<u8>, Vec<u8>, u64, bool);
+pub type ScanVersionResult<'a> = (Box<[u8]>, Vec<u8>, u64, bool);
 
 #[derive(Default, Debug, Copy, Clone)]
 pub enum Durability {
@@ -392,92 +394,12 @@ impl Transaction {
         }
     }
 
-    // This is a helper method to perform merging scan in both the write set and the snapshot,
-    // since the writes are not duplicated in the transaction's snaphot anymore.
-    fn merging_scan<'b, R, I>(
-        core: &Core,
-        write_set: &WriteSet,
-        mut read_set: Option<&mut ReadSet>,
-        savepoints: u32,
-        snap_iter: I,
-        range: &R,
-        limit: Option<usize>,
-    ) -> Result<Vec<ScanResult>>
-    where
-        R: RangeBounds<VariableSizeKey>,
-        I: Iterator<Item = (Vec<u8>, &'b IndexValue, u64, u64)>,
-    {
-        let mut snap_iter = snap_iter.peekable();
-        let range_bytes = convert_range_bounds_bytes(range);
-        let mut write_set_iter = write_set.range(range_bytes).peekable();
-        let limit = limit.unwrap_or(usize::MAX);
-        let mut results = Vec::new();
-
-        if write_set_iter.peek().is_none() {
-            // If the write set does not contain values in the scan range,
-            // do the scan only in the snapshot. This optimisation is quite
-            // important according to the benches.
-            for (key, value, version, ts) in snap_iter.by_ref() {
-                if results.len() >= limit {
-                    break;
-                }
-                if let Some(read_set) = read_set.as_mut() {
-                    Self::add_to_read_set(read_set, &key, version, savepoints);
-                }
-                let v = value.resolve(core)?;
-                results.push((key, v, ts));
-            }
-        } else {
-            // If both the write set and the snapshot contain values from the requested
-            // range, perform a somewhat slower merging scan.
-            loop {
-                if results.len() >= limit {
-                    break;
-                }
-
-                let snap_entry = snap_iter.peek();
-                let ws_entry = write_set_iter.peek();
-
-                // Determine where to pick the next value from,
-                // the write set or the snaphot.
-                let from_snap = match (snap_entry, ws_entry) {
-                    (None, None) => break,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (Some((snap_key, _, _, _)), Some((ws_key, _))) => {
-                        match snap_key.as_slice().cmp(ws_key.as_ref()) {
-                            Ordering::Less => true,
-                            Ordering::Greater => false,
-                            Ordering::Equal => {
-                                snap_iter.next();
-                                false
-                            }
-                        }
-                    }
-                };
-
-                if from_snap {
-                    let (key, value, version, ts) = snap_iter.next().unwrap();
-                    if let Some(read_set) = read_set.as_mut() {
-                        Self::add_to_read_set(read_set, &key, version, savepoints);
-                    }
-                    let v = value.resolve(core)?;
-                    results.push((key, v, ts));
-                } else {
-                    let (ws_key, ws_entries) = write_set_iter.next().unwrap();
-                    let ws_entry = ws_entries.last().unwrap();
-                    if !ws_entry.e.is_deleted_or_tombstone() {
-                        results.push((ws_key.to_vec(), ws_entry.e.value.to_vec(), ws_entry.e.ts));
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
-
     /// Scans a range of keys and returns a vector of tuples containing the value, version, and timestamp for each key.
-    pub fn scan<'b, R>(&'b mut self, range: R, limit: Option<usize>) -> Result<Vec<ScanResult>>
+    pub fn scan<'b, R>(
+        &'b mut self,
+        range: R,
+        limit: Option<usize>,
+    ) -> impl Iterator<Item = Result<ScanResult<'b>>> + 'b
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -495,11 +417,9 @@ impl Transaction {
 
         // Get a snapshot iterator for the specified range.
         let snap = self.snapshot.as_ref().unwrap();
-        let snap_iter = snap
-            .range(bound_range.clone())
-            .map(|(k, v, ver, ts)| (k, v, *ver, *ts));
+        let snap_iter = snap.range(bound_range.clone());
 
-        Self::merging_scan(
+        merging_scan(
             &self.core,
             &self.write_set,
             read_set_for_scan,
@@ -513,16 +433,17 @@ impl Transaction {
     /// Returns all existing keys within the specified range, including soft-deleted
     /// and thus hidden by tombstones.
     /// The returned keys are not added to the read set and will not cause read-write conflicts.
-    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> Result<Vec<Vec<u8>>>
+    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> impl Iterator<Item = &'b [u8]> + 'b
     where
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        let keys = self.snapshot.as_ref().unwrap().range_with_deleted(range);
-        let result = keys.into_iter().map(|(key, _, _, _)| key).collect();
-
-        Ok(result)
+        self.snapshot
+            .as_ref()
+            .unwrap()
+            .range_with_deleted(range)
+            .map(|(k, _, _, _)| k)
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
@@ -776,20 +697,19 @@ impl Transaction {
         range: R,
         ts: u64,
         limit: Option<usize>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+    ) -> impl Iterator<Item = Result<(&'b [u8], Vec<u8>)>> + 'b
     where
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        let snap_values = self
+        let snap_iter = self
             .snapshot
             .as_ref()
             .unwrap()
             .scan_at_ts(range.clone(), ts);
-        let snap_iter = snap_values.iter().map(|(k, v)| (k.clone(), v, 0, 0));
 
-        let results = Self::merging_scan(
+        merging_scan(
             &self.core,
             &self.write_set,
             None,
@@ -797,23 +717,18 @@ impl Transaction {
             snap_iter,
             &range,
             limit,
-        )?;
-        let results_without_ts = results.into_iter().map(|(k, v, _)| (k, v)).collect();
-        Ok(results_without_ts)
+        )
+        .map(|result| result.map(|(k, v, _)| (k, v)))
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> Result<Vec<Vec<u8>>>
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> impl Iterator<Item = &'b [u8]> + 'b
     where
         R: RangeBounds<&'b [u8]>,
     {
-        self.ensure_read_only_transaction()?;
-
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        let keys = self.snapshot.as_ref().unwrap().keys_at_ts(range, ts);
-
-        Ok(keys)
+        self.snapshot.as_ref().unwrap().keys_at_ts(range, ts)
     }
 
     /// Returns the value associated with the key at the given timestamp.
@@ -843,13 +758,13 @@ impl Transaction {
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
-    pub fn scan_all_versions<'b, R>(
-        &self,
+    pub fn scan_all_versions<'a, R>(
+        &'a self,
         range: R,
         limit: Option<usize>,
     ) -> Result<Vec<ScanVersionResult>>
     where
-        R: RangeBounds<&'b [u8]>,
+        R: RangeBounds<&'a [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
@@ -872,6 +787,7 @@ impl Transaction {
 
         // Iterate over the keys in the range.
         for (key, value, _, ts) in ranger {
+            let owned_key = key.to_vec();
             // If the key changes, process the previous key's versions.
             if current_key.as_ref().is_some_and(|k| k != &key) {
                 // Add the previous key's versions to the results.
@@ -895,10 +811,10 @@ impl Transaction {
             let v = value.resolve(&self.core)?;
 
             // Add the key, value, version, and deletion status to the current key's versions.
-            current_key_versions.push((key.clone(), v, *ts, is_deleted));
+            current_key_versions.push((Box::from(owned_key.as_slice()), v, ts, is_deleted));
 
             // Update the current key being processed.
-            current_key = Some(key.into());
+            current_key = Some(Bytes::from(owned_key));
         }
 
         // Process the last key's versions.
@@ -922,6 +838,170 @@ impl Drop for Transaction {
     }
 }
 
+pub struct MergingScanIterator<'a, R, I: Iterator> {
+    core: &'a Core,
+    read_set: Option<&'a mut ReadSet>,
+    savepoints: u32,
+    snap_iter: std::iter::Peekable<I>,
+    write_set_iter:
+        std::iter::Peekable<std::collections::btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
+    limit: usize,
+    count: usize,
+    _phantom: PhantomData<R>,
+}
+
+impl<'a, R, I: Iterator> MergingScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+{
+    pub fn new(
+        core: &'a Core,
+        write_set: &'a WriteSet,
+        read_set: Option<&'a mut ReadSet>,
+        savepoints: u32,
+        snap_iter: I,
+        range: &R,
+        limit: Option<usize>,
+    ) -> Self {
+        let range_bytes = convert_range_bounds_bytes(range);
+        MergingScanIterator::<R, I> {
+            core,
+            read_set,
+            savepoints,
+            snap_iter: snap_iter.peekable(),
+            write_set_iter: write_set.range(range_bytes).peekable(),
+            limit: limit.unwrap_or(usize::MAX),
+            count: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn add_to_read_set(read_set: &mut ReadSet, key: &[u8], version: u64, savepoints: u32) {
+        let entry = ReadSetEntry::new(key, version, savepoints);
+        read_set.push(entry);
+    }
+}
+
+impl<'a, R, I> Iterator for MergingScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+{
+    type Item = Result<ScanResult<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count >= self.limit {
+            return None;
+        }
+
+        // Fast path when write set is empty
+        if self.write_set_iter.peek().is_none() {
+            // If the write set does not contain values in the scan range,
+            // do the scan only in the snapshot. This optimisation is quite
+            // important according to the benches.
+            if let Some((key, value, version, ts)) = self.snap_iter.next() {
+                if let Some(read_set) = self.read_set.as_mut() {
+                    Self::add_to_read_set(read_set, key, version, self.savepoints);
+                }
+                self.count += 1;
+                return Some(value.resolve(self.core).map(|v| (key, v, ts)));
+            }
+            return None;
+        }
+
+        // Merging path
+        // If both the write set and the snapshot contain values from the requested
+        // range, perform a somewhat slower merging scan.
+
+        let snap_entry = self.snap_iter.peek();
+        let ws_entry = self.write_set_iter.peek();
+
+        // Determine where to pick the next value from,
+        // the write set or the snaphot.
+        let result = match (snap_entry, ws_entry) {
+            (None, None) => None,
+            (Some(_), None) => {
+                let (key, value, version, ts) = self.snap_iter.next().unwrap();
+                if let Some(read_set) = self.read_set.as_mut() {
+                    Self::add_to_read_set(read_set, key, version, self.savepoints);
+                }
+                Some(value.resolve(self.core).map(|v| (key, v, ts)))
+            }
+            (None, Some(_)) => {
+                let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
+                let ws_entry = ws_entries.last().unwrap();
+                if ws_entry.e.is_deleted_or_tombstone() {
+                    return self.next();
+                }
+                Some(Ok((
+                    ws_key.as_ref(),
+                    ws_entry.e.value.to_vec(),
+                    ws_entry.e.ts,
+                )))
+            }
+            (Some((snap_key, _, _, _)), Some((ws_key, _))) => {
+                match snap_key.as_ref().cmp(ws_key.as_ref()) {
+                    Ordering::Less => {
+                        let (key, value, version, ts) = self.snap_iter.next().unwrap();
+                        if let Some(read_set) = self.read_set.as_mut() {
+                            Self::add_to_read_set(read_set, key, version, self.savepoints);
+                        }
+                        Some(value.resolve(self.core).map(|v| (key, v, ts)))
+                    }
+                    Ordering::Greater => {
+                        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
+                        let ws_entry = ws_entries.last().unwrap();
+                        if ws_entry.e.is_deleted_or_tombstone() {
+                            return self.next();
+                        }
+                        Some(Ok((
+                            ws_key.as_ref(),
+                            ws_entry.e.value.to_vec(),
+                            ws_entry.e.ts,
+                        )))
+                    }
+                    Ordering::Equal => {
+                        self.snap_iter.next();
+                        let (ws_key, ws_entries) = self.write_set_iter.next().unwrap();
+                        let ws_entry = ws_entries.last().unwrap();
+                        if ws_entry.e.is_deleted_or_tombstone() {
+                            return self.next();
+                        }
+                        Some(Ok((
+                            ws_key.as_ref(),
+                            ws_entry.e.value.to_vec(),
+                            ws_entry.e.ts,
+                        )))
+                    }
+                }
+            }
+        };
+
+        if result.is_some() {
+            self.count += 1;
+        }
+        result
+    }
+}
+
+// Modified merging_scan function to return the iterator
+fn merging_scan<'a, R: RangeBounds<VariableSizeKey>, I>(
+    core: &'a Core,
+    write_set: &'a WriteSet,
+    read_set: Option<&'a mut ReadSet>,
+    savepoints: u32,
+    snap_iter: I,
+    range: &R,
+    limit: Option<usize>,
+) -> MergingScanIterator<'a, R, I>
+where
+    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+{
+    MergingScanIterator::new(
+        core, write_set, read_set, savepoints, snap_iter, range, limit,
+    )
+}
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -1035,7 +1115,7 @@ mod tests {
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let mut txn = store.begin().unwrap();
-            let results = txn.scan(range, None).unwrap();
+            let results: Vec<_> = txn.scan(range, None).collect();
             assert_eq!(results.len(), 0);
         }
     }
@@ -1062,7 +1142,7 @@ mod tests {
             // despite it being soft-deleted.
             let range = "k".as_bytes()..="k".as_bytes();
             let txn3 = store.begin().unwrap();
-            let results = txn3.keys_with_tombstones(range).unwrap();
+            let results: Vec<_> = txn3.keys_with_tombstones(range).collect();
             assert_eq!(results, vec![b"k"]);
         }
     }
@@ -1203,7 +1283,7 @@ mod tests {
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let mut txn = store.begin().unwrap();
-        let results = txn.scan(range, None).unwrap();
+        let results: Vec<_> = txn.scan(range, None).collect();
         assert_eq!(results.len(), keys_to_insert.len());
     }
 
@@ -1227,11 +1307,11 @@ mod tests {
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let mut txn = store.begin().unwrap();
-        let results = txn.scan(range, None).unwrap();
+        let results: Vec<_> = txn.scan(range, None).collect();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].1, keys_to_insert[0]);
-        assert_eq!(results[1].1, keys_to_insert[1]);
-        assert_eq!(results[2].1, keys_to_insert[2]);
+        assert_eq!(results[0].as_ref().unwrap().1, keys_to_insert[0]);
+        assert_eq!(results[1].as_ref().unwrap().1, keys_to_insert[1]);
+        assert_eq!(results[2].as_ref().unwrap().1, keys_to_insert[2]);
     }
 
     #[tokio::test]
@@ -1253,7 +1333,10 @@ mod tests {
         let range = "test1".as_bytes()..="test7".as_bytes();
 
         let mut txn = store.begin().unwrap();
-        let results = txn.scan(range, None).unwrap();
+        let results = txn
+            .scan(range, None)
+            .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+            .expect("Scan should succeed");
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, keys_to_insert[0]);
         assert_eq!(results[1].0, keys_to_insert[1]);
@@ -1293,7 +1376,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key4".as_bytes();
-            let results = txn3.scan(range, None).unwrap();
+            let results: Vec<_> = txn3.scan(range, None).collect();
             assert_eq!(results.len(), 1);
             txn3.set(&key2, &value5).unwrap();
             txn3.set(&key3, &value6).unwrap();
@@ -1324,7 +1407,7 @@ mod tests {
             txn2.commit().await.unwrap();
 
             let range = "key1".as_bytes()..="key5".as_bytes();
-            txn3.scan(range, None).unwrap();
+            let _: Vec<_> = txn3.scan(range, None).collect();
             txn3.set(&key4, &value2).unwrap();
             let result = txn3.commit().await;
             if is_ssi {
@@ -1479,13 +1562,19 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
             drop(txn1);
 
-            let res = txn2.scan(range, None).unwrap();
+            let res = txn2
+                .scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
@@ -1527,14 +1616,20 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
             txn1.set(&key1, &value4).unwrap();
             txn1.commit().await.unwrap();
 
-            let res = txn2.scan(range, None).unwrap();
+            let res = txn2
+                .scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
@@ -1602,7 +1697,10 @@ mod tests {
 
             // k3 should not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
+            let res = txn1
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1613,7 +1711,10 @@ mod tests {
 
             // k3 should still not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
+            let res = txn1
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1644,7 +1745,10 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1653,7 +1757,10 @@ mod tests {
             txn1.commit().await.unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].1, value1);
 
@@ -1761,7 +1868,10 @@ mod tests {
             assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1809,7 +1919,10 @@ mod tests {
 
             assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1.as_ref());
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1847,12 +1960,18 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k2".as_bytes();
-            let res = txn1.scan(range.clone(), None).unwrap();
+            let res = txn1
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
 
-            let res = txn2.scan(range.clone(), None).unwrap();
+            let res = txn2
+                .scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
             assert_eq!(res[1].1, value2);
@@ -1969,7 +2088,7 @@ mod tests {
         let range = "key1".as_bytes()..="key3".as_bytes();
 
         let mut txn = store.begin().unwrap();
-        let results = txn.scan(range, None).unwrap();
+        let results: Vec<_> = txn.scan(range, None).collect();
         assert_eq!(results.len(), 0);
     }
 
@@ -1994,14 +2113,20 @@ mod tests {
             txn.get(&key1).unwrap();
             txn.delete(&key1).unwrap();
             let range = "k1".as_bytes()..="k3".as_bytes();
-            let results = txn.scan(range, None).unwrap();
+            let results = txn
+                .scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(results.len(), 0);
             txn.commit().await.unwrap();
         }
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
             let mut txn = store.begin().unwrap();
-            let results = txn.scan(range, None).unwrap();
+            let results = txn
+                .scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             assert_eq!(results.len(), 0);
         }
     }
@@ -2196,8 +2321,12 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k4".as_bytes();
-            txn1.scan(range.clone(), None).unwrap();
-            txn2.scan(range.clone(), None).unwrap();
+            txn1.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
+            txn2.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
 
             txn1.set(&key3, &value3).unwrap();
             txn2.set(&key4, &value4).unwrap();
@@ -2219,8 +2348,12 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
-            txn1.scan(range.clone(), None).unwrap();
-            txn2.scan(range.clone(), None).unwrap();
+            txn1.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
+            txn2.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
 
             txn1.set(&key4, &value3).unwrap();
             txn2.set(&key5, &value4).unwrap();
@@ -2236,9 +2369,13 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             let range = "k1".as_bytes()..="k7".as_bytes();
-            txn1.scan(range.clone(), None).unwrap();
+            txn1.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
             let range = "k3".as_bytes()..="k7".as_bytes();
-            txn2.scan(range.clone(), None).unwrap();
+            txn2.scan(range.clone(), None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
 
             txn1.set(&key6, &value3).unwrap();
             txn2.set(&key7, &value4).unwrap();
@@ -2571,7 +2708,10 @@ mod tests {
         read_txn.set_savepoint().unwrap();
 
         let range = "k0".as_bytes()..="k10".as_bytes();
-        read_txn.scan(range, None).unwrap();
+        read_txn
+            .scan(range, None)
+            .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+            .expect("Scan should succeed");
         update_txn.set(&k1, &updated_value).unwrap();
 
         update_txn.commit().await.unwrap();
@@ -2607,7 +2747,10 @@ mod tests {
         read_txn.set_savepoint().unwrap();
 
         let range = "k1".as_bytes()..="k3".as_bytes();
-        read_txn.scan(range, None).unwrap();
+        read_txn
+            .scan(range, None)
+            .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+            .expect("Scan should succeed");
         update_txn.set(&k3, &value3).unwrap();
 
         update_txn.commit().await.unwrap();
@@ -2651,8 +2794,11 @@ mod tests {
 
         // The scanned value should be the one before the savepoint.
         let range = "k1".as_bytes()..="k3".as_bytes();
-        let sr = txn1.scan(range, None).unwrap();
-        assert_eq!(sr[0].0, k1.to_vec());
+        let sr = txn1
+            .scan(range, None)
+            .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+            .expect("Scan should succeed");
+        assert_eq!(sr[0].0, k1);
         assert_eq!(
             sr[0].1,
             value.to_vec(),
@@ -2726,7 +2872,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k, &key);
+        assert_eq!(k.as_ref(), &key);
         assert_eq!(v, &value);
         assert_eq!(*version, 1);
         assert!(!(*is_deleted));
@@ -2758,7 +2904,7 @@ mod tests {
         // Verify that the output contains all the versions of the key
         assert_eq!(results.len(), values.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k, &key);
+            assert_eq!(k.as_ref(), &key);
             assert_eq!(v, &values[i]);
             assert_eq!(*version, (i + 1) as u64);
             assert!(!(*is_deleted));
@@ -2787,7 +2933,7 @@ mod tests {
 
         assert_eq!(results.len(), keys.len());
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
-            assert_eq!(k, &keys[i]);
+            assert_eq!(k.as_ref(), &keys[i]);
             assert_eq!(v, &value);
             assert_eq!(*version, 1);
             assert!(!(*is_deleted));
@@ -2836,7 +2982,7 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k, expected_key);
+            assert_eq!(k.as_ref(), expected_key);
             assert_eq!(v, expected_value);
             assert_eq!(*version, *expected_version);
             assert_eq!(*is_deleted, *expected_is_deleted);
@@ -2863,13 +3009,13 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         let (k, v, version, is_deleted) = &results[0];
-        assert_eq!(k, &key);
+        assert_eq!(k.as_ref(), &key);
         assert_eq!(v, &value);
         assert_eq!(*version, 1);
         assert!(!(*is_deleted));
 
         let (k, v, _, is_deleted) = &results[1];
-        assert_eq!(k, &key);
+        assert_eq!(k.as_ref(), &key);
         assert_eq!(v, &Bytes::new());
         assert!(*is_deleted);
     }
@@ -2904,7 +3050,7 @@ mod tests {
         for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
             let key_index = i / 2;
             let is_deleted_version = i % 2 == 1;
-            assert_eq!(k, &keys[key_index]);
+            assert_eq!(k.as_ref(), &keys[key_index]);
             if is_deleted_version {
                 assert_eq!(v, &Bytes::new());
                 assert!(*is_deleted);
@@ -2961,7 +3107,7 @@ mod tests {
         for (result, expected) in results.iter().zip(expected_results.iter()) {
             let (k, v, version, is_deleted) = result;
             let (expected_key, expected_value, expected_version, expected_is_deleted) = expected;
-            assert_eq!(k, expected_key);
+            assert_eq!(k.as_ref(), expected_key);
             assert_eq!(v, expected_value);
             // Check version only if the record is not deleted
             // This is because a soft-deleted record has version which is
@@ -3058,7 +3204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdb_bug() {
+    async fn sdb_bug_complex_key_handling_with_null_bytes_and_range_scan() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3118,7 +3264,9 @@ mod tests {
             let end_key = "/*test\0*test\0*user\0!fd�";
 
             let range = start_key.as_bytes()..end_key.as_bytes();
-            txn.scan(range, None).unwrap();
+            txn.scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
 
             txn.commit().await.unwrap();
         }
@@ -3200,7 +3348,10 @@ mod tests {
             txn.set(&key1, &value1).unwrap();
             let range = "k1".as_bytes()..="k3".as_bytes();
 
-            txn.scan(range, None).unwrap();
+            txn.scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
+
             txn.commit().await.unwrap();
         }
     }
@@ -3234,7 +3385,10 @@ mod tests {
             txn.set(&key1, &value1).unwrap();
             let range = "k1".as_bytes()..="k3".as_bytes();
 
-            txn.scan(range, None).unwrap();
+            txn.scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
+
             txn.commit().await.unwrap();
         }
     }
@@ -3271,7 +3425,10 @@ mod tests {
             txn.set(&key1, &value1).unwrap();
             let range = "k1".as_bytes()..="k3".as_bytes();
 
-            txn.scan(range, None).unwrap();
+            txn.scan(range, None)
+                .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                .expect("Scan should succeed");
+
             txn.commit().await.unwrap();
         }
     }
@@ -3296,7 +3453,10 @@ mod tests {
 
         // Define the range for the scan
         let range = "key1".as_bytes()..="key3".as_bytes();
-        let results = txn.scan(range, None).unwrap();
+        let results = txn
+            .scan(range, None)
+            .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+            .expect("Scan should succeed");
 
         // Verify the results
         assert_eq!(results.len(), 3);
