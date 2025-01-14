@@ -397,7 +397,7 @@ impl Transaction {
         &'b mut self,
         range: R,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = Result<ScanResult<'b>>> + 'b
+    ) -> impl Iterator<Item = Result<ScanResult<'b>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -431,7 +431,7 @@ impl Transaction {
     /// Returns all existing keys within the specified range, including soft-deleted
     /// and thus hidden by tombstones.
     /// The returned keys are not added to the read set and will not cause read-write conflicts.
-    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> impl Iterator<Item = &'b [u8]> + 'b
+    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> impl Iterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -695,7 +695,7 @@ impl Transaction {
         range: R,
         ts: u64,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = Result<(&'b [u8], Vec<u8>)>> + 'b
+    ) -> impl Iterator<Item = Result<(&'b [u8], Vec<u8>)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -720,7 +720,7 @@ impl Transaction {
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> impl Iterator<Item = &'b [u8]> + 'b
+    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> impl Iterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
