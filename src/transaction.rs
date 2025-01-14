@@ -613,22 +613,24 @@ impl Transaction {
 /// Implement Versioned APIs for read-only transactions.
 /// These APIs do not take part in conflict detection.
 impl Transaction {
-    /// Returns the value associated with the key at the given timestamp.
-    pub fn get_at_ts(&self, key: &[u8], ts: u64) -> Result<Option<Vec<u8>>> {
+    /// Returns the value associated with the key at the given version.
+    pub fn get_at_version(&self, key: &[u8], version: u64) -> Result<Option<Vec<u8>>> {
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
         }
 
         // Consider the value from the write set only if it's lower than of equal
-        // to the requested timestamp `ts`.
-        let ws_val = self.get_in_write_set(key).filter(|(_, ws_ts)| *ws_ts <= ts);
+        // to the requested `version``.
+        let ws_val = self
+            .get_in_write_set(key)
+            .filter(|(_, ws_ts)| *ws_ts <= version);
 
         let snap_val = self
             .snapshot
             .as_ref()
             .unwrap()
-            .get_at_ts(&key[..].into(), ts);
+            .get_at_version(&key[..].into(), version);
 
         // Similar to `Transaction::merging_scan`, we have to pick where
         // the value should come from, the write set or the snapshot.
@@ -649,8 +651,8 @@ impl Transaction {
         Ok(result)
     }
 
-    /// Returns all the versioned values and timestamps associated with the key.
-    pub fn get_history(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
+    /// Returns all the versioned values and versions associated with the key.
+    pub fn get_all_versions(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, u64)>> {
         // If the key is empty, return an error.
         if key.is_empty() {
             return Err(Error::EmptyKey);
@@ -687,11 +689,11 @@ impl Transaction {
         Ok(results)
     }
 
-    /// Returns key-value pairs within the specified range, at the given timestamp.
-    pub fn scan_at_ts<'b, R>(
+    /// Returns key-value pairs within the specified range, at the given version.
+    pub fn scan_at_version<'b, R>(
         &'b mut self,
         range: R,
-        ts: u64,
+        version: u64,
         limit: Option<usize>,
     ) -> impl Iterator<Item = Result<(&'b [u8], Vec<u8>)>>
     where
@@ -703,7 +705,7 @@ impl Transaction {
             .snapshot
             .as_ref()
             .unwrap()
-            .scan_at_ts(range.clone(), ts);
+            .scan_at_version(range.clone(), version);
 
         MergingScanIterator::new(
             &self.core,
@@ -717,11 +719,11 @@ impl Transaction {
         .map(|result| result.map(|(k, v, _)| (k, v)))
     }
 
-    /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(
+    /// Returns keys within the specified range, at the given version.
+    pub fn keys_at_version<'b, R>(
         &'b self,
         range: R,
-        ts: u64,
+        version: u64,
         limit: Option<usize>,
     ) -> impl Iterator<Item = &'b [u8]>
     where
@@ -733,7 +735,7 @@ impl Transaction {
             .snapshot
             .as_ref()
             .unwrap()
-            .scan_at_ts(range.clone(), ts);
+            .scan_at_version(range.clone(), version);
 
         KeyScanIterator::new(&self.write_set, snap_iter, &range, limit)
     }
