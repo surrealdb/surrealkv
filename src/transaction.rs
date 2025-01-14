@@ -430,17 +430,23 @@ impl Transaction {
     /// Returns all existing keys within the specified range, including soft-deleted
     /// and thus hidden by tombstones.
     /// The returned keys are not added to the read set and will not cause read-write conflicts.
-    pub fn keys_with_tombstones<'b, R>(&'b self, range: R) -> impl Iterator<Item = &'b [u8]>
+    pub fn keys_with_tombstones<'b, R>(
+        &'b self,
+        range: R,
+        limit: Option<usize>,
+    ) -> impl Iterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
         // Convert the range to a tuple of bounds of variable keys.
         let range = convert_range_bounds(&range);
-        self.snapshot
+        let snap_iter = self
+            .snapshot
             .as_ref()
             .unwrap()
-            .range_with_deleted(range)
-            .map(|(k, _, _, _)| k)
+            .range_with_deleted(range.clone());
+
+        KeyScanIterator::new(&self.write_set, snap_iter, &range, limit)
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
@@ -719,7 +725,12 @@ impl Transaction {
     }
 
     /// Returns keys within the specified range, at the given timestamp.
-    pub fn keys_at_ts<'b, R>(&'b self, range: R, ts: u64) -> impl Iterator<Item = &'b [u8]>
+    pub fn keys_at_ts<'b, R>(
+        &'b self,
+        range: R,
+        ts: u64,
+        limit: Option<usize>,
+    ) -> impl Iterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -731,7 +742,7 @@ impl Transaction {
             .unwrap()
             .scan_at_ts(range.clone(), ts);
 
-        KeyScanIterator::new(&self.write_set, snap_iter, &range, None)
+        KeyScanIterator::new(&self.write_set, snap_iter, &range, limit)
     }
 
     /// Scans a range of keys and returns a vector of tuples containing the key, value, timestamp, and deletion status for each key.
@@ -755,6 +766,20 @@ impl Transaction {
     #[allow(unused)]
     pub(crate) fn get_versionstamp(&self) -> Option<(u64, u64)> {
         self.versionstamp
+    }
+
+    /// Returns only keys within the specified range.
+    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> impl Iterator<Item = &'b [u8]>
+    where
+        R: RangeBounds<&'b [u8]>,
+    {
+        // Convert the range to a tuple of bounds of variable keys.
+        let range = convert_range_bounds(&range);
+        // Get a snapshot iterator for the specified range.
+        let snap = self.snapshot.as_ref().unwrap();
+        let snap_iter = snap.range(range.clone());
+
+        KeyScanIterator::new(&self.write_set, snap_iter, &range, limit)
     }
 }
 
@@ -905,7 +930,7 @@ mod tests {
             // despite it being soft-deleted.
             let range = "k".as_bytes()..="k".as_bytes();
             let txn3 = store.begin().unwrap();
-            let results: Vec<_> = txn3.keys_with_tombstones(range).collect();
+            let results: Vec<_> = txn3.keys_with_tombstones(range, None).collect();
             assert_eq!(results, vec![b"k"]);
         }
     }
@@ -3517,5 +3542,81 @@ mod tests {
 
         // Drop the store to simulate closing it
         store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keys_with_tombstones_with_limit() {
+        for is_ssi in [false, true] {
+            let (store, _) = create_store(is_ssi);
+
+            let key1 = Bytes::from("k1");
+            let key2 = Bytes::from("k2");
+            let value = Bytes::from("v");
+
+            // First, insert the keys.
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value).unwrap();
+            txn1.set(&key2, &value).unwrap();
+            txn1.commit().await.unwrap();
+
+            // Then, soft-delete them.
+            let mut txn2 = store.begin().unwrap();
+            txn2.soft_delete(&key1).unwrap();
+            txn2.soft_delete(&key2).unwrap();
+            txn2.commit().await.unwrap();
+
+            // keys_with_tombstones() should still return `k1` and `k2`
+            // despite them being soft-deleted.
+            let range = "k1".as_bytes()..="k2".as_bytes();
+            let txn3 = store.begin().unwrap();
+            let results: Vec<_> = txn3.keys_with_tombstones(range.clone(), None).collect();
+            assert_eq!(results, vec![&b"k1"[..], &b"k2"[..]]);
+
+            // Check if the limit works correctly.
+            let txn4 = store.begin().unwrap();
+            let limited_results: Vec<_> = txn4.keys_with_tombstones(range, Some(1)).collect();
+            assert_eq!(limited_results.len(), 1);
+            assert_eq!(limited_results, vec![&b"k1"[..]]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keys_api() {
+        for is_ssi in [false, true] {
+            let (store, _) = create_store(is_ssi);
+
+            let key1 = Bytes::from("k1");
+            let key2 = Bytes::from("k2");
+            let key3 = Bytes::from("k3");
+            let value = Bytes::from("v");
+
+            // Insert the keys.
+            let mut txn1 = store.begin().unwrap();
+            txn1.set(&key1, &value).unwrap();
+            txn1.set(&key2, &value).unwrap();
+            txn1.set(&key3, &value).unwrap();
+            txn1.commit().await.unwrap();
+
+            // Soft-delete key2.
+            let mut txn2 = store.begin().unwrap();
+            txn2.soft_delete(&key2).unwrap();
+            txn2.commit().await.unwrap();
+
+            // Test the keys function without a limit.
+            let range = "k1".as_bytes()..="k3".as_bytes();
+            let txn3 = store.begin_with_mode(Mode::ReadOnly).unwrap();
+            let results: Vec<_> = txn3.keys(range.clone(), None).collect();
+            assert_eq!(results, vec![&b"k1"[..], &b"k3"[..]]);
+
+            // Test the keys function with a limit of 2.
+            let txn4 = store.begin_with_mode(Mode::ReadOnly).unwrap();
+            let limited_results: Vec<_> = txn4.keys(range.clone(), Some(2)).collect();
+            assert_eq!(limited_results, vec![&b"k1"[..], &b"k3"[..]]);
+
+            // Test the keys function with a limit of 1.
+            let txn5 = store.begin_with_mode(Mode::ReadOnly).unwrap();
+            let limited_results: Vec<_> = txn5.keys(range, Some(1)).collect();
+            assert_eq!(limited_results, vec![&b"k1"[..]]);
+        }
     }
 }

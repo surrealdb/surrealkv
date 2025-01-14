@@ -178,9 +178,14 @@ mod tests {
             .expect("Failed to begin transaction");
 
         let range = "k1".as_bytes()..="k2".as_bytes();
-        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts).collect();
+        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts, None).collect();
         assert_eq!(keys[0], b"k1");
         assert_eq!(keys[1], b"k2");
+
+        // Check if limit works correctly
+        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts, Some(1)).collect();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], b"k1");
 
         // Test scan_at_ts
         let entries: Vec<_> = txn
