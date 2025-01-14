@@ -232,4 +232,115 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_get_history_with_write_set() {
+        let temp_dir = create_temp_directory();
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        let store = Store::new(opts).expect("Failed to create store");
+        let key = b"test_key";
+
+        // Test 1: Only write set value
+        {
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"write_set_value")
+                .expect("Failed to set value");
+
+            let history = txn.get_history(key).expect("Failed to get history");
+            assert_eq!(history.len(), 1, "Should have one entry from write set");
+            assert_eq!(history[0].0, b"write_set_value");
+
+            // Verify timestamp is recent (the latest entry version is 0)
+            assert_eq!(history[0].1, 0);
+        }
+
+        // Test 2: Value in both write set and snapshot
+        {
+            // First commit a value to create snapshot
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"snapshot_value")
+                .expect("Failed to set value");
+            txn.commit().await.expect("Failed to commit");
+
+            // Now create new transaction and set write set value
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"write_set_value")
+                .expect("Failed to set value");
+
+            let history = txn.get_history(key).expect("Failed to get history");
+            assert_eq!(
+                history.len(),
+                2,
+                "Should have entries from both write set and snapshot"
+            );
+
+            // Write set value should be more recent (first in history)
+            assert_eq!(history[0].0, b"write_set_value");
+            assert_eq!(history[1].0, b"snapshot_value");
+        }
+
+        // Test 3: Multiple snapshot versions plus write set
+        {
+            // Commit multiple versions
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"snapshot_value1")
+                .expect("Failed to set value");
+            txn.commit().await.expect("Failed to commit");
+
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"snapshot_value2")
+                .expect("Failed to set value");
+            txn.commit().await.expect("Failed to commit");
+
+            // Now add write set value
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"write_set_value")
+                .expect("Failed to set value");
+
+            let history = txn.get_history(key).expect("Failed to get history");
+            assert_eq!(
+                history.len(),
+                4,
+                "Should have write set + 3 snapshot entries"
+            );
+
+            assert_eq!(
+                history[0].0, b"write_set_value",
+                "Most recent should be write set value"
+            );
+            assert_eq!(
+                history[1].0, b"snapshot_value",
+                "First should be oldest snapshot"
+            );
+            assert_eq!(
+                history[2].0, b"snapshot_value1",
+                "Second should be latest snapshot"
+            );
+            assert_eq!(
+                history[3].0, b"snapshot_value2",
+                "Third should be latest snapshot"
+            );
+        }
+
+        // Test 4: Deleted value in write set
+        {
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.set(key, b"initial_value").expect("Failed to set value");
+            txn.commit().await.expect("Failed to commit");
+
+            let mut txn = store.begin().expect("Failed to begin transaction");
+            txn.delete(key).expect("Failed to delete key");
+
+            let history = txn.get_history(key).expect("Failed to get history");
+            assert_eq!(history.len(), 4, "Should only have snapshot values");
+            assert_eq!(history[3].0, b"initial_value");
+        }
+
+        // Test 5: Empty key
+        {
+            let txn = store.begin().expect("Failed to begin transaction");
+            assert!(txn.get_history(b"").is_err());
+        }
+    }
 }
