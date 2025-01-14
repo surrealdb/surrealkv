@@ -45,8 +45,12 @@ impl Snapshot {
             .map(|(val, version, _)| (val, version))
     }
 
-    /// Retrieves the value associated with the given key at the given timestamp from the snapshot.
-    pub(crate) fn get_at_ts(&self, key: &VariableSizeKey, ts: u64) -> Option<(IndexValue, u64)> {
+    /// Retrieves the value associated with the given key at the given version from the snapshot.
+    pub(crate) fn get_at_version(
+        &self,
+        key: &VariableSizeKey,
+        ts: u64,
+    ) -> Option<(IndexValue, u64)> {
         self.snap
             .get_at_ts(key, ts)
             .filter(|(val, _, _)| !val.deleted())
@@ -110,16 +114,16 @@ impl Snapshot {
         self.snap.range_with_versions(range)
     }
 
-    pub(crate) fn scan_at_ts<'a, R>(
+    pub(crate) fn scan_at_version<'a, R>(
         &'a self,
         range: R,
-        ts: u64,
+        version: u64,
     ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
         self.snap
-            .scan_at_ts(range, ts)
+            .scan_at_ts(range, version)
             .filter(|(_, snap_val, _, _)| !snap_val.deleted())
     }
 }
@@ -171,25 +175,25 @@ mod tests {
             set_value(&store, key, updated_value).await;
         }
 
-        // Test keys_at_ts
+        // Test keys_at_version
         let ts = now();
         let mut txn = store
             .begin_with_mode(Mode::ReadOnly)
             .expect("Failed to begin transaction");
 
         let range = "k1".as_bytes()..="k2".as_bytes();
-        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts, None).collect();
+        let keys: Vec<_> = txn.keys_at_version(range.clone(), ts, None).collect();
         assert_eq!(keys[0], b"k1");
         assert_eq!(keys[1], b"k2");
 
         // Check if limit works correctly
-        let keys: Vec<_> = txn.keys_at_ts(range.clone(), ts, Some(1)).collect();
+        let keys: Vec<_> = txn.keys_at_version(range.clone(), ts, Some(1)).collect();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], b"k1");
 
-        // Test scan_at_ts
+        // Test scan_at_version
         let entries: Vec<_> = txn
-            .scan_at_ts(range, ts, Some(10))
+            .scan_at_version(range, ts, Some(10))
             .collect::<Result<Vec<_>, _>>()
             .expect("Scan should succeed");
 
@@ -201,9 +205,9 @@ mod tests {
         assert_eq!(entries[0], (b"k1".as_ref(), b"value1Updated".to_vec()));
         assert_eq!(entries[1], (b"k2".as_ref(), b"value2Updated".to_vec()));
 
-        // Enhance get_history testing
+        // Enhance get_all_versions testing
         for (key, initial_value, updated_value) in keys_values.iter() {
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_all_versions(key).expect("Failed to get history");
             assert_eq!(
                 history.len(),
                 2,
@@ -221,12 +225,12 @@ mod tests {
             let initial_ts = history[0].1;
             let updated_ts = history[1].1;
             assert_eq!(
-                txn.get_at_ts(key, initial_ts)
+                txn.get_at_version(key, initial_ts)
                     .expect("Failed to get value at initial timestamp"),
                 Some(initial_value.to_vec())
             );
             assert_eq!(
-                txn.get_at_ts(key, updated_ts)
+                txn.get_at_version(key, updated_ts)
                     .expect("Failed to get value at updated timestamp"),
                 Some(updated_value.to_vec())
             );
@@ -234,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_history_with_write_set() {
+    async fn test_get_all_versions_with_write_set() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -247,7 +251,7 @@ mod tests {
             txn.set(key, b"write_set_value")
                 .expect("Failed to set value");
 
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_all_versions(key).expect("Failed to get history");
             assert_eq!(history.len(), 1, "Should have one entry from write set");
             assert_eq!(history[0].0, b"write_set_value");
 
@@ -268,7 +272,7 @@ mod tests {
             txn.set(key, b"write_set_value")
                 .expect("Failed to set value");
 
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_all_versions(key).expect("Failed to get history");
             assert_eq!(
                 history.len(),
                 2,
@@ -298,7 +302,7 @@ mod tests {
             txn.set(key, b"write_set_value")
                 .expect("Failed to set value");
 
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_all_versions(key).expect("Failed to get history");
             assert_eq!(
                 history.len(),
                 4,
@@ -332,7 +336,7 @@ mod tests {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.delete(key).expect("Failed to delete key");
 
-            let history = txn.get_history(key).expect("Failed to get history");
+            let history = txn.get_all_versions(key).expect("Failed to get history");
             assert_eq!(history.len(), 4, "Should only have snapshot values");
             assert_eq!(history[3].0, b"initial_value");
         }
@@ -340,7 +344,7 @@ mod tests {
         // Test 5: Empty key
         {
             let txn = store.begin().expect("Failed to begin transaction");
-            assert!(txn.get_history(b"").is_err());
+            assert!(txn.get_all_versions(b"").is_err());
         }
     }
 }
