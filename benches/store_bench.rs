@@ -8,6 +8,7 @@ use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 
 use surrealkv::Options;
+use surrealkv::Result;
 use surrealkv::Store;
 use tempdir::TempDir;
 
@@ -377,7 +378,9 @@ fn range_scan(c: &mut Criterion) {
                 let start = 0_u64.to_be_bytes().to_vec();
                 let end = scan_size.to_be_bytes().to_vec();
                 let range = &start[..]..&end[..];
-                txn.scan(range, None).unwrap();
+                txn.scan(range, None)
+                    .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
+                    .expect("Scan should succeed");
             })
         });
 

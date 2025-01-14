@@ -1448,7 +1448,7 @@ mod tests {
 
         let store = Store::new(opts.clone()).unwrap();
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
         store.close().await.unwrap();
@@ -1477,7 +1477,7 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
@@ -1508,7 +1508,7 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
@@ -1538,7 +1538,7 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
@@ -1569,7 +1569,7 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
-        let history = txn.get_history(key).unwrap();
+        let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
@@ -1598,9 +1598,9 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn3 = store.begin().unwrap();
-        let versions = txn3
+        let versions: Vec<_> = txn3
             .scan_all_versions(key.as_ref()..=key.as_ref(), None)
-            .unwrap();
+            .collect();
         assert!(versions.is_empty());
 
         store.close().await.unwrap();
@@ -1629,9 +1629,9 @@ mod tests {
         txn2.commit().await.unwrap();
 
         let txn3 = store.begin().unwrap();
-        let versions = txn3
+        let versions: Vec<_> = txn3
             .scan_all_versions(key.as_ref()..=key.as_ref(), None)
-            .unwrap();
+            .collect();
         assert!(versions.is_empty());
 
         store.close().await.unwrap();
@@ -1695,7 +1695,7 @@ mod tests {
         // Verify that the keys are present in the store
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         for key in &keys {
-            let history = txn.get_history(key).unwrap();
+            let history = txn.get_all_versions(key).unwrap();
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].0, value);
         }

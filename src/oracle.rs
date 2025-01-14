@@ -245,9 +245,9 @@ impl SerializableSnapshotIsolation {
             let range_writes = current_snapshot.range(range.range.clone());
 
             for (key, _, version, _) in range_writes {
-                if *version > txn.read_ts {
+                if version > txn.read_ts {
                     // Check if this key was deleted in current transaction
-                    match txn.write_set.get(&key[..]) {
+                    match txn.write_set.get(key) {
                         Some(entries)
                             if entries
                                 .last()
