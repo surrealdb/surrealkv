@@ -254,8 +254,8 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    #[tokio::test]
-    async fn txn_with_value_read_from_clog() {
+    #[test]
+    fn txn_with_value_read_from_clog() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -282,7 +282,7 @@ mod tests {
             txn.set(&key2, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -315,7 +315,7 @@ mod tests {
             txn.set(&key3, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -330,8 +330,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn txn_with_value_read_from_memory() {
+    #[test]
+    fn txn_with_value_read_from_memory() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -357,7 +357,7 @@ mod tests {
             txn.set(&key2, &value).unwrap();
 
             // Commit the transaction
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {

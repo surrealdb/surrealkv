@@ -236,6 +236,7 @@ impl Aol {
     pub fn close(&mut self) -> Result<()> {
         let _lock = self.mutex.lock();
         self.active_segment.close()?;
+        self.closed = true;
         Ok(())
     }
 

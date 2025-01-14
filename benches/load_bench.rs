@@ -23,7 +23,7 @@ fn remove_local_directory(local_dir: &PathBuf) {
     }
 }
 
-async fn benchmark_load_times_kv_size() {
+fn benchmark_load_times_kv_size() {
     println!("\n=== Benchmarking Load Times - KV Size Combinations with Key Distribution ===");
     println!("Key Size | Value Size | Distribution | Load Time (s) | Store Size (GB)");
     println!("------------------------------------------------------------");
@@ -51,10 +51,10 @@ async fn benchmark_load_times_kv_size() {
                 for key in &keys {
                     let mut txn = store.begin().unwrap();
                     txn.set(key, &default_value).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
 
-                store.close().await.unwrap();
+                store.close().unwrap();
 
                 // Calculate store size
                 let store_size = calculate_store_size(&local_dir);
@@ -72,7 +72,7 @@ async fn benchmark_load_times_kv_size() {
                     duration.as_secs_f64(),
                     store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
-                store.close().await.unwrap();
+                store.close().unwrap();
 
                 // Remove the local directory
                 remove_local_directory(&local_dir);
@@ -99,10 +99,10 @@ async fn benchmark_load_times_kv_size() {
                 for key in &keys {
                     let mut txn = store.begin().unwrap();
                     txn.set(key, &default_value).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
 
-                store.close().await.unwrap();
+                store.close().unwrap();
 
                 // Calculate store size
                 let store_size = calculate_store_size(&local_dir);
@@ -120,7 +120,7 @@ async fn benchmark_load_times_kv_size() {
                     duration.as_secs_f64(),
                     store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
                 );
-                store.close().await.unwrap();
+                store.close().unwrap();
 
                 // Remove the local directory
                 remove_local_directory(&local_dir);
@@ -129,7 +129,7 @@ async fn benchmark_load_times_kv_size() {
     }
 }
 
-async fn benchmark_load_times_versions() {
+fn benchmark_load_times_versions() {
     println!("\n=== Benchmarking Load Times - Version Count ===");
     println!("Versions | Keys    | Load Time (s) | Store Size (GB)");
     println!("------------------------------------------------");
@@ -162,11 +162,11 @@ async fn benchmark_load_times_versions() {
             for _ in 0..version_count {
                 let mut txn = store.begin().unwrap();
                 txn.set(key, &default_value).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Calculate store size
         let store_size = calculate_store_size(&local_dir);
@@ -183,7 +183,7 @@ async fn benchmark_load_times_versions() {
             store_size as f64 / (1024.0 * 1024.0 * 1024.0) // Convert to GB
         );
 
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Remove the local directory
         remove_local_directory(&local_dir);
@@ -203,12 +203,11 @@ fn calculate_store_size(local_dir: &PathBuf) -> u64 {
     total_size
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     println!("Starting Load Time Benchmarks...\n");
 
-    benchmark_load_times_kv_size().await;
-    benchmark_load_times_versions().await;
+    benchmark_load_times_kv_size();
+    benchmark_load_times_versions();
 
     println!("\nBenchmarks complete!");
 }

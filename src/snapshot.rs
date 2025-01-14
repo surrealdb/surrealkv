@@ -142,14 +142,14 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    async fn set_value(store: &Store, key: &Bytes, value: &Bytes) {
+    fn set_value(store: &Store, key: &Bytes, value: &Bytes) {
         let mut txn = store.begin().expect("Failed to begin transaction");
         txn.set(key, value).expect("Failed to set value");
-        txn.commit().await.expect("Failed to commit transaction");
+        txn.commit().expect("Failed to commit transaction");
     }
 
-    #[tokio::test]
-    async fn test_versioned_apis() {
+    #[test]
+    fn test_versioned_apis() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -171,8 +171,8 @@ mod tests {
 
         // Set and update values for all keys
         for (key, initial_value, updated_value) in keys_values.iter() {
-            set_value(&store, key, initial_value).await;
-            set_value(&store, key, updated_value).await;
+            set_value(&store, key, initial_value);
+            set_value(&store, key, updated_value);
         }
 
         // Test keys_at_version
@@ -237,8 +237,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_get_all_versions_with_write_set() {
+    #[test]
+    fn test_get_all_versions_with_write_set() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -265,7 +265,7 @@ mod tests {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, b"snapshot_value")
                 .expect("Failed to set value");
-            txn.commit().await.expect("Failed to commit");
+            txn.commit().expect("Failed to commit");
 
             // Now create new transaction and set write set value
             let mut txn = store.begin().expect("Failed to begin transaction");
@@ -290,12 +290,12 @@ mod tests {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, b"snapshot_value1")
                 .expect("Failed to set value");
-            txn.commit().await.expect("Failed to commit");
+            txn.commit().expect("Failed to commit");
 
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, b"snapshot_value2")
                 .expect("Failed to set value");
-            txn.commit().await.expect("Failed to commit");
+            txn.commit().expect("Failed to commit");
 
             // Now add write set value
             let mut txn = store.begin().expect("Failed to begin transaction");
@@ -331,7 +331,7 @@ mod tests {
         {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, b"initial_value").expect("Failed to set value");
-            txn.commit().await.expect("Failed to commit");
+            txn.commit().expect("Failed to commit");
 
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.delete(key).expect("Failed to delete key");

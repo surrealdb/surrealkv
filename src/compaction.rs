@@ -10,7 +10,7 @@ use crate::log::{Aol, Options as LogOptions, SegmentRef};
 use crate::manifest::Manifest;
 use crate::meta::Metadata;
 use crate::option::Options;
-use crate::store::{Core, StoreInner};
+use crate::store::{Core, Store};
 
 struct CompactionGuard<'a> {
     is_compacting: &'a AtomicBool,
@@ -18,19 +18,19 @@ struct CompactionGuard<'a> {
 
 impl<'a> CompactionGuard<'a> {
     fn new(is_compacting: &'a AtomicBool) -> Self {
-        is_compacting.store(true, Ordering::Relaxed);
+        is_compacting.store(true, Ordering::SeqCst);
         CompactionGuard { is_compacting }
     }
 }
 
 impl Drop for CompactionGuard<'_> {
     fn drop(&mut self) {
-        self.is_compacting.store(false, Ordering::Relaxed);
+        self.is_compacting.store(false, Ordering::SeqCst);
     }
 }
 
-impl StoreInner {
-    pub async fn compact(&self) -> Result<()> {
+impl Store {
+    pub fn compact(&self) -> Result<()> {
         // Early return if the store is closed or compaction is already in progress
         if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
             return Err(Error::InvalidOperation);
@@ -63,7 +63,7 @@ impl StoreInner {
 
         // Lock the oracle to prevent operations during compaction
         let oracle = self.core.oracle.clone();
-        let oracle_lock = oracle.write_lock.lock().await;
+        let oracle_lock = oracle.write_lock.lock();
 
         // Rotate the commit log and get the new segment ID
         let mut clog = self.core.clog.as_ref().unwrap().write();
@@ -449,8 +449,8 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[tokio::test]
-    async fn basic_compaction() {
+    #[test]
+    fn basic_compaction() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -483,7 +483,7 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Number of keys to delete
@@ -493,11 +493,11 @@ mod tests {
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
+        store.compact().unwrap();
+        store.close().unwrap();
 
         opts.max_value_threshold = 20;
         opts.max_value_cache_size = 20;
@@ -513,8 +513,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn compaction_with_mixed_operations() {
+    #[test]
+    fn compaction_with_mixed_operations() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -540,14 +540,14 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Update half of the keys
         for key in keys.iter().take(num_keys_to_write / 2) {
             let mut txn = store.begin().unwrap();
             txn.set(key, &updated_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Delete a quarter of the keys
@@ -555,11 +555,11 @@ mod tests {
         for key in keys.iter().take(num_keys_to_delete) {
             let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
+        store.compact().unwrap();
+        store.close().unwrap();
 
         // Reopen the store to verify persistence
         let reopened_store = Store::new(opts).expect("should reopen store");
@@ -588,11 +588,11 @@ mod tests {
             assert_eq!(val, default_value.as_ref());
         }
 
-        reopened_store.close().await.unwrap();
+        reopened_store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compaction_persistence_across_restarts() {
+    #[test]
+    fn compaction_persistence_across_restarts() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -616,11 +616,11 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
+        store.compact().unwrap();
+        store.close().unwrap();
 
         // Reopen the store to verify persistence
         let reopened_store = Store::new(opts).expect("should reopen store");
@@ -632,11 +632,11 @@ mod tests {
             assert_eq!(val, default_value.as_ref());
         }
 
-        reopened_store.close().await.unwrap();
+        reopened_store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compaction_and_post_compaction_writes() {
+    #[test]
+    fn compaction_and_post_compaction_writes() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -669,20 +669,20 @@ mod tests {
         for key in initial_keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
+        store.compact().unwrap();
 
         // Write post-compaction values
         for key in post_compaction_keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Reopen the store to verify persistence of all keys
         let reopened_store = Store::new(opts).expect("should reopen store");
@@ -701,11 +701,11 @@ mod tests {
             assert_eq!(val, default_value.as_ref());
         }
 
-        reopened_store.close().await.unwrap();
+        reopened_store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compaction_with_random_keys_and_deletes() {
+    #[test]
+    fn compaction_with_random_keys_and_deletes() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -757,27 +757,27 @@ mod tests {
         for key in &initial_keys {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
+        store.compact().unwrap();
 
         // Delete selected keys
         for key in &keys_to_delete {
             let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Write post-compaction values
         for key in &post_compaction_keys {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Reopen the store to verify persistence of all keys
         let reopened_store = Store::new(opts).expect("should reopen store");
@@ -804,11 +804,11 @@ mod tests {
             assert_eq!(val, default_value.as_ref());
         }
 
-        reopened_store.close().await.unwrap();
+        reopened_store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compaction_with_overlapping_keys() {
+    #[test]
+    fn compaction_with_overlapping_keys() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -842,20 +842,20 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Write overlapping values
         for key in &overlapping_keys {
             let mut txn = store.begin().unwrap();
             txn.set(key, &overlapping_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Trigger compaction
-        store.inner.as_ref().unwrap().compact().await.unwrap();
+        store.compact().unwrap();
 
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Reopen the store to verify persistence of all keys
         let reopened_store = Store::new(opts).expect("should reopen store");
@@ -871,11 +871,11 @@ mod tests {
             }
         }
 
-        reopened_store.close().await.unwrap();
+        reopened_store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compaction_with_all_keys_deleted() {
+    #[test]
+    fn compaction_with_all_keys_deleted() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -903,7 +903,7 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, &value).expect("Failed to set key");
-            txn.commit().await.expect("Failed to commit transaction");
+            txn.commit().expect("Failed to commit transaction");
         }
 
         // Delete all keys
@@ -912,19 +912,13 @@ mod tests {
                 .begin()
                 .expect("Failed to begin transaction for deletion");
             txn.delete(key).expect("Failed to delete key");
-            txn.commit().await.expect("Failed to commit deletion");
+            txn.commit().expect("Failed to commit deletion");
         }
 
         // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
+        store.compact().expect("Failed to compact");
 
-        store.close().await.expect("Failed to close store");
+        store.close().expect("Failed to close store");
 
         // Reopen the store to verify all keys are deleted
         let reopened_store = Store::new(opts).expect("Failed to reopen store");
@@ -942,12 +936,11 @@ mod tests {
 
         reopened_store
             .close()
-            .await
             .expect("Failed to close reopened store");
     }
 
-    #[tokio::test]
-    async fn compaction_with_sequential_writes_and_deletes() {
+    #[test]
+    fn compaction_with_sequential_writes_and_deletes() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -969,7 +962,7 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().expect("Failed to begin transaction");
             txn.set(key, &value).expect("Failed to set key");
-            txn.commit().await.expect("Failed to commit transaction");
+            txn.commit().expect("Failed to commit transaction");
         }
 
         // Sequentially delete half of the keys
@@ -978,19 +971,13 @@ mod tests {
                 .begin()
                 .expect("Failed to begin transaction for deletion");
             txn.delete(key).expect("Failed to delete key");
-            txn.commit().await.expect("Failed to commit deletion");
+            txn.commit().expect("Failed to commit deletion");
         }
 
         // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
+        store.compact().expect("Failed to compact");
 
-        store.close().await.expect("Failed to close store");
+        store.close().expect("Failed to close store");
 
         // Reopen the store to verify the state of keys
         let reopened_store = Store::new(opts).expect("Failed to reopen store");
@@ -1010,12 +997,11 @@ mod tests {
 
         reopened_store
             .close()
-            .await
             .expect("Failed to close reopened store");
     }
 
-    #[tokio::test]
-    async fn compaction_with_random_reads_and_writes() {
+    #[test]
+    fn compaction_with_random_reads_and_writes() {
         let temp_dir = create_temp_directory();
 
         let mut opts = Options::new();
@@ -1047,26 +1033,20 @@ mod tests {
                 // 50% chance
                 let mut txn = store.begin().expect("Failed to begin transaction");
                 txn.set(key, value).expect("Failed to set key");
-                txn.commit().await.expect("Failed to commit transaction");
+                txn.commit().expect("Failed to commit transaction");
             } else {
                 let mut txn = store
                     .begin()
                     .expect("Failed to begin transaction for deletion");
                 txn.delete(key).expect("Failed to delete key");
-                txn.commit().await.expect("Failed to commit deletion");
+                txn.commit().expect("Failed to commit deletion");
             }
         }
 
         // Trigger compaction
-        store
-            .inner
-            .as_ref()
-            .expect("Store inner is None")
-            .compact()
-            .await
-            .expect("Failed to compact");
+        store.compact().expect("Failed to compact");
 
-        store.close().await.expect("Failed to close store");
+        store.close().expect("Failed to close store");
 
         // Reopen the store to verify the state of keys
         let reopened_store = Store::new(opts).expect("Failed to reopen store");
@@ -1083,12 +1063,11 @@ mod tests {
 
         reopened_store
             .close()
-            .await
             .expect("Failed to close reopened store");
     }
 
-    #[tokio::test]
-    async fn insert_close_reopen_single_bulk_transaction() {
+    #[test]
+    fn insert_close_reopen_single_bulk_transaction() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1110,7 +1089,7 @@ mod tests {
                 let value = format!("value{}", id);
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             // Test that the items are still in the store
             for j in 0..(num_ops * i) {
@@ -1124,12 +1103,12 @@ mod tests {
             }
 
             // Close the store again
-            store.close().await.unwrap();
+            store.close().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn compact_skips_all_versions_if_last_is_deleted() {
+    #[test]
+    fn compact_skips_all_versions_if_last_is_deleted() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1145,26 +1124,26 @@ mod tests {
             let mut txn = store.begin().unwrap();
             // Insert a key with two versions, where the last one is marked as deleted
             txn.set(b"key1", b"value1").unwrap(); // First version
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
             // Insert a key with two versions, where the last one is marked as deleted
             txn.delete(b"key1").unwrap(); // Second version marked as deleted
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
             // Insert another key with a single version not marked as deleted
             txn.set(b"key2", b"value2").unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Perform compaction
-        store.compact().await.expect("compaction should succeed");
-        let stats = &store.inner.as_ref().unwrap().stats;
+        store.compact().expect("compaction should succeed");
+        let stats = &store.stats;
         assert_eq!(stats.compaction_stats.get_records_deleted(), 0);
         assert_eq!(stats.compaction_stats.get_records_added(), 1);
 
@@ -1192,11 +1171,11 @@ mod tests {
         );
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn multiple_versions_stored_post_compaction() {
+    #[test]
+    fn multiple_versions_stored_post_compaction() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1212,18 +1191,18 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(b"key1", b"value1").unwrap(); // First version
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
             txn.set(b"key1", b"value2").unwrap(); // Second version
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Perform compaction
-        store.compact().await.expect("compaction should succeed");
-        let stats = &store.inner.as_ref().unwrap().stats;
+        store.compact().expect("compaction should succeed");
+        let stats = &store.stats;
         assert_eq!(stats.compaction_stats.get_records_added(), 2);
 
         // Reopen the store to ensure compaction changes are applied
@@ -1244,11 +1223,11 @@ mod tests {
         );
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn multiple_versions_and_single_version_keys_post_compaction() {
+    #[test]
+    fn multiple_versions_and_single_version_keys_post_compaction() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1267,7 +1246,7 @@ mod tests {
 
                 // Insert first version for all keys
                 txn.set(&key, &value1).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
 
             if key_index > multiple_versions_threshold {
@@ -1276,14 +1255,14 @@ mod tests {
                     let mut txn = store.begin().unwrap();
                     // Insert a second version for keys above the multiple_versions_threshold
                     txn.set(&key, &value2).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
             }
         }
 
         // Perform compaction
-        store.compact().await.expect("compaction should succeed");
-        let stats = &store.inner.as_ref().unwrap().stats;
+        store.compact().expect("compaction should succeed");
+        let stats = &store.stats;
         assert_eq!(stats.compaction_stats.get_records_added(), 150);
 
         // Reopen the store
@@ -1312,11 +1291,11 @@ mod tests {
         }
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compact_handles_various_key_versions_correctly() {
+    #[test]
+    fn compact_handles_various_key_versions_correctly() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1336,7 +1315,7 @@ mod tests {
             {
                 let mut txn = store.begin().unwrap();
                 txn.set(&key, &value1).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
@@ -1345,21 +1324,21 @@ mod tests {
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
 
                 // Mark the last version as deleted for keys above the delete_threshold in its own transaction
                 if key_index > delete_threshold {
                     let mut txn = store.begin().unwrap();
                     txn.delete(&key).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
             }
         }
 
         // Perform compaction
-        store.compact().await.expect("compaction should succeed");
-        let stats = &store.inner.as_ref().unwrap().stats;
+        store.compact().expect("compaction should succeed");
+        let stats = &store.stats;
         assert_eq!(stats.compaction_stats.get_records_added(), 100);
 
         // Reopen the store
@@ -1408,11 +1387,11 @@ mod tests {
         }
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn compact_handles_various_key_versions_correctly_with_clear() {
+    #[test]
+    fn compact_handles_various_key_versions_correctly_with_clear() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1432,7 +1411,7 @@ mod tests {
             {
                 let mut txn = store.begin().unwrap();
                 txn.set(&key, &value1).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
@@ -1441,21 +1420,21 @@ mod tests {
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
 
                 // Mark the last version as deleted for keys above the clear_threshold in its own transaction
                 if key_index > clear_threshold {
                     let mut txn = store.begin().unwrap();
                     txn.soft_delete(&key).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }
             }
         }
 
         // Perform compaction
-        store.compact().await.expect("compaction should succeed");
-        let stats = &store.inner.as_ref().unwrap().stats;
+        store.compact().expect("compaction should succeed");
+        let stats = &store.stats;
         assert_eq!(stats.compaction_stats.get_records_added(), 175);
 
         // Reopen the store
@@ -1518,6 +1497,6 @@ mod tests {
         }
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 }

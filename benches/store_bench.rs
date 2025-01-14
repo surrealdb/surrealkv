@@ -33,17 +33,9 @@ fn sequential_insert(c: &mut Criterion) {
     };
 
     let mut bench = |key_len, val_len| {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(num_cpus::get())
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let db = rt.block_on(async {
-            let mut opts = Options::new();
-            opts.dir = create_temp_directory().path().to_path_buf();
-            Store::new(opts).expect("should create store")
-        });
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        let db = Store::new(opts).expect("should create store");
 
         c.bench_function(
             &format!(
@@ -51,18 +43,14 @@ fn sequential_insert(c: &mut Criterion) {
                 key_len, val_len
             ),
             |b| {
-                b.to_async(&rt).iter(|| async {
+                b.iter(|| {
                     let mut txn = db.begin().unwrap();
                     txn.set(bytes(key_len)[..].into(), bytes(val_len)[..].into())
                         .unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 })
             },
         );
-        rt.block_on(async {
-            drop(db);
-        });
-        rt.shutdown_background();
     };
 
     for key_len in &[8_usize, 32, 128, 256] {
@@ -78,17 +66,9 @@ fn random_insert(c: &mut Criterion) {
             let key_len = *key_len;
             let val_len = *val_len;
 
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get())
-                .enable_all()
-                .build()
-                .unwrap();
-
-            let db = rt.block_on(async {
-                let mut opts = Options::new();
-                opts.dir = create_temp_directory().path().to_path_buf();
-                Store::new(opts).expect("should create store")
-            });
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            let db = Store::new(opts).expect("should create store");
 
             // Pre-generate a pool of random keys and values
             let mut rng = rand::thread_rng();
@@ -108,25 +88,17 @@ fn random_insert(c: &mut Criterion) {
                     let values = &values;
                     let mut idx = 0;
 
-                    b.to_async(&rt).iter(|| {
+                    b.iter(|| {
                         let key = &keys[idx % num_samples];
                         let value = &values[idx % num_samples];
                         idx += 1;
 
-                        async move {
-                            let mut txn = db.begin().unwrap();
-                            txn.set(key[..].into(), value[..].into()).unwrap();
-                            txn.commit().await.unwrap();
-                        }
+                        let mut txn = db.begin().unwrap();
+                        txn.set(key[..].into(), value[..].into()).unwrap();
+                        txn.commit().unwrap();
                     })
                 },
             );
-
-            // Cleanup
-            rt.block_on(async {
-                drop(db);
-            });
-            rt.shutdown_background();
         }
     }
 }
@@ -149,17 +121,9 @@ fn bulk_insert(c: &mut Criterion) {
         for &value_size in &value_sizes {
             group.throughput(criterion::Throughput::Elements(batch_size));
 
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(num_cpus::get())
-                .enable_all()
-                .build()
-                .unwrap();
-
-            let db = rt.block_on(async {
-                let mut opts = Options::new();
-                opts.dir = create_temp_directory().path().to_path_buf();
-                Store::new(opts).expect("should create store")
-            });
+            let mut opts = Options::new();
+            opts.dir = create_temp_directory().path().to_path_buf();
+            let db = Store::new(opts).expect("should create store");
 
             // Pre-generate data to avoid generation overhead during benchmarking
             let data: Vec<(Vec<u8>, Vec<u8>)> = (0u64..batch_size)
@@ -172,72 +136,57 @@ fn bulk_insert(c: &mut Criterion) {
                     format!("batch_{}_val_{}", batch_size, value_size),
                 ),
                 |b| {
-                    b.to_async(&rt).iter(|| {
+                    b.iter(|| {
                         let data = data.clone();
-                        async {
-                            let mut txn = db.begin().unwrap();
-                            for (key, value) in data {
-                                txn.set(key.as_slice(), value.as_slice()).unwrap();
-                            }
-                            txn.commit().await.unwrap()
+                        let mut txn = db.begin().unwrap();
+                        for (key, value) in data {
+                            txn.set(key.as_slice(), value.as_slice()).unwrap();
                         }
+                        txn.commit().unwrap()
                     })
                 },
             );
-            rt.block_on(async {
-                drop(db);
-            });
-            rt.shutdown_background();
         }
     }
     group.finish();
 }
 
 fn sequential_insert_read(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_cpus::get())
-        .enable_all()
-        .build()
-        .unwrap();
+    let max_count = AtomicU32::new(0_u32);
+    let mut opts = Options::new();
+    opts.dir = create_temp_directory().path().to_path_buf();
+    let db = Store::new(opts).expect("should create store");
 
-    rt.block_on(async {
-        let max_count = AtomicU32::new(0_u32);
-        let mut opts = Options::new();
-        opts.dir = create_temp_directory().path().to_path_buf();
-        let db = Store::new(opts).expect("should create store");
+    c.bench_function("sequential inserts", |b| {
+        let count = AtomicU32::new(0_u32);
+        b.iter(|| {
+            let mut txn = db.begin().unwrap();
+            txn.set(
+                count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
+                vec![][..].into(),
+            )
+            .unwrap();
+            txn.commit().unwrap();
 
-        c.bench_function("sequential inserts", |b| {
-            let count = AtomicU32::new(0_u32);
-            b.iter(|| async {
-                let mut txn = db.begin().unwrap();
-                txn.set(
-                    count.fetch_add(1, Relaxed).to_be_bytes()[..].into(),
-                    vec![][..].into(),
-                )
-                .unwrap();
-                txn.commit().await.unwrap();
-
-                let current_count = count.load(Relaxed);
-                if current_count > max_count.load(Relaxed) {
-                    max_count.store(current_count, Relaxed);
-                }
-            })
-        });
-
-        c.bench_function("sequential gets", |b| {
-            let count = AtomicU32::new(0_u32);
-            b.iter(|| async {
-                count.fetch_add(1, Relaxed);
-
-                let current_count = count.load(Relaxed);
-                if current_count <= max_count.load(Relaxed) {
-                    let mut txn = db.begin().unwrap();
-                    txn.get(&current_count.to_be_bytes()[..]).unwrap();
-                }
-            })
-        });
+            let current_count = count.load(Relaxed);
+            if current_count > max_count.load(Relaxed) {
+                max_count.store(current_count, Relaxed);
+            }
+        })
     });
-    rt.shutdown_background();
+
+    c.bench_function("sequential gets", |b| {
+        let count = AtomicU32::new(0_u32);
+        b.iter(|| {
+            count.fetch_add(1, Relaxed);
+
+            let current_count = count.load(Relaxed);
+            if current_count <= max_count.load(Relaxed) {
+                let mut txn = db.begin().unwrap();
+                txn.get(&current_count.to_be_bytes()[..]).unwrap();
+            }
+        })
+    });
 }
 
 fn concurrent_insert(c: &mut Criterion) {
@@ -250,12 +199,6 @@ fn concurrent_insert(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("concurrent_inserts");
     group.throughput(criterion::Throughput::Elements(item_count as u64));
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_cpus::get())
-        .enable_all()
-        .build()
-        .unwrap();
 
     for &key_size in &key_sizes {
         for &value_size in &value_sizes {
@@ -274,11 +217,9 @@ fn concurrent_insert(c: &mut Criterion) {
             for &thread_count in &thread_counts {
                 let items_per_thread = item_count / thread_count;
 
-                let db = rt.block_on(async {
-                    let mut opts = Options::new();
-                    opts.dir = create_temp_directory().path().to_path_buf();
-                    Arc::new(Store::new(opts).expect("should create store"))
-                });
+                let mut opts = Options::new();
+                opts.dir = create_temp_directory().path().to_path_buf();
+                let db = Arc::new(Store::new(opts).expect("should create store"));
 
                 // Calculate total data size for this configuration
                 let total_data_size = item_count * (key_size + value_size);
@@ -305,7 +246,7 @@ fn concurrent_insert(c: &mut Criterion) {
                                 let start_idx = thread_idx * items_per_thread;
                                 let end_idx = start_idx + items_per_thread;
 
-                                let handle = rt.spawn(async move {
+                                let handle = std::thread::spawn(move || {
                                     let mut txn = db.begin().unwrap();
 
                                     for idx in start_idx..end_idx {
@@ -313,48 +254,34 @@ fn concurrent_insert(c: &mut Criterion) {
                                         txn.set(key.as_slice(), value.as_slice()).unwrap();
                                     }
 
-                                    txn.commit().await.unwrap()
+                                    txn.commit().unwrap()
                                 });
 
                                 handles.push(handle);
                             }
 
-                            rt.block_on(async {
-                                for handle in handles {
-                                    handle.await.unwrap();
-                                }
-                            });
+                            for handle in handles {
+                                handle.join().unwrap();
+                            }
                         })
                     },
                 );
-
-                // Cleanup database after each configuration
-                rt.block_on(async {
-                    drop(db);
-                });
             }
         }
     }
 
     group.finish();
-    rt.shutdown_background();
 }
 
 // Range scan performance
 fn range_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("range_scans");
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .enable_all()
-        .build()
-        .unwrap();
-
     let scan_sizes = [100u32, 1000, 10000];
     let value_size = 100;
 
     for &scan_size in &scan_sizes {
-        let db = rt.block_on(async {
+        let db = {
             let mut opts = Options::new();
             opts.dir = create_temp_directory().path().to_path_buf();
             let db = Store::new(opts).expect("should create store");
@@ -368,12 +295,12 @@ fn range_scan(c: &mut Criterion) {
                 )
                 .unwrap();
             }
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
             db
-        });
+        };
 
         group.bench_function(BenchmarkId::new("range_scan", scan_size), |b| {
-            b.to_async(&rt).iter(|| async {
+            b.iter(|| {
                 let mut txn = db.begin().unwrap();
                 let start = 0_u64.to_be_bytes().to_vec();
                 let end = scan_size.to_be_bytes().to_vec();
@@ -382,11 +309,6 @@ fn range_scan(c: &mut Criterion) {
                     .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                     .expect("Scan should succeed");
             })
-        });
-
-        // Cleanup database after each configuration
-        rt.block_on(async {
-            drop(db);
         });
     }
 
@@ -399,18 +321,16 @@ fn concurrent_workload(c: &mut Criterion) {
 
     let operations_per_thread = 1000;
     let value_size = 1000;
-    let thread_counts = [2, 4, num_cpus::get() as u64];
+    let thread_counts = [num_cpus::get() as u64];
     let read_ratios = [0.0, 0.5, 0.95, 1.0]; // 0%, 50%, 95%, 100% reads
 
     for &thread_count in &thread_counts {
         for &read_ratio in &read_ratios {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-
-            let db = rt.block_on(async {
+            let db = {
                 let mut opts = Options::new();
                 opts.dir = create_temp_directory().path().to_path_buf();
                 Arc::new(Store::new(opts).expect("should create store"))
-            });
+            };
 
             let counter = Arc::new(AtomicU64::new(0));
 
@@ -431,7 +351,7 @@ fn concurrent_workload(c: &mut Criterion) {
                             let db = db.clone();
                             let counter = counter.clone();
 
-                            let handle = rt.spawn(async move {
+                            let handle = std::thread::spawn(move || {
                                 let mut rng = StdRng::from_entropy();
                                 for _ in 0..operations_per_thread {
                                     let mut txn = db.begin().unwrap();
@@ -452,23 +372,18 @@ fn concurrent_workload(c: &mut Criterion) {
                                         )
                                         .unwrap();
                                     }
-                                    txn.commit().await.unwrap();
+                                    txn.commit().unwrap();
                                 }
                             });
                             handles.push(handle);
                         }
 
                         for handle in handles {
-                            rt.block_on(handle).unwrap();
+                            handle.join().unwrap();
                         }
                     })
                 },
             );
-
-            // Cleanup database after each configuration
-            rt.block_on(async {
-                drop(db);
-            });
         }
     }
 
