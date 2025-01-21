@@ -140,11 +140,19 @@ impl IndexValue {
             Self::Mem(mem_entry) => Ok(mem_entry.value.to_vec()),
             Self::Disk(disk_entry) => match &disk_entry.inlined_value {
                 Some(value) => Ok(value.to_vec()),
-                None => store.resolve_from_offset(
-                    disk_entry.segment_id,
-                    disk_entry.value_offset,
-                    disk_entry.value_len,
-                ),
+                None => {
+                    if disk_entry.value_len > 0 {
+                        store.resolve_from_offset(
+                            disk_entry.segment_id,
+                            disk_entry.value_offset,
+                            disk_entry.value_len,
+                        )
+                    } else {
+                        // As an optimisation, for values of zero length
+                        // we can return an empty vec immediately.
+                        Ok(Vec::new())
+                    }
+                }
             },
         }
     }
