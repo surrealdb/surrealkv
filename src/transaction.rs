@@ -450,7 +450,7 @@ impl Transaction {
     }
 
     /// Commits the transaction, by writing all pending entries to the store.
-    pub async fn commit(&mut self) -> Result<()> {
+    pub fn commit(&mut self) -> Result<()> {
         // If the transaction is closed, return an error.
         if self.closed {
             return Err(Error::TransactionClosed);
@@ -468,7 +468,7 @@ impl Transaction {
 
         // Lock the oracle to serialize commits to the transaction log.
         let oracle = self.core.oracle.clone();
-        let write_ch_lock = oracle.write_lock.lock().await;
+        let write_ch_lock = oracle.write_lock.lock();
 
         // Prepare for the commit by getting a transaction ID.
         let (tx_id, commit_ts) = self.prepare_commit()?;
@@ -486,18 +486,9 @@ impl Transaction {
             .collect();
 
         // Commit the changes to the store index.
-        let done = self
-            .core
-            .send_to_write_channel(entries, tx_id, self.durability)
-            .await?;
+        self.core.write_entries(entries, tx_id, self.durability)?;
 
         drop(write_ch_lock);
-
-        // Check if the transaction is written to the transaction log.
-        let ret = done.recv().await;
-        if let Err(err) = ret {
-            return Err(err.into());
-        }
 
         // Mark the transaction as closed.
         self.closed = true;
@@ -506,7 +497,7 @@ impl Transaction {
         self.versionstamp = Some((tx_id, commit_ts));
 
         // Return the transaction ID and commit timestamp.
-        ret.unwrap()
+        Ok(())
     }
 
     /// Prepares for the commit by assigning commit timestamps and preparing records.
@@ -791,13 +782,11 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use std::collections::HashSet;
     use std::mem::size_of;
-    use tokio::task;
+    use tempdir::TempDir;
 
     use super::*;
     use crate::option::{IsolationLevel, Options};
     use crate::store::Store;
-
-    use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
@@ -817,8 +806,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn basic_transaction() {
+    #[test]
+    fn basic_transaction() {
         let (store, temp_dir) = create_store(false);
 
         // Define key-value pairs for the test
@@ -832,7 +821,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key2, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
 
         {
@@ -847,11 +836,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
             txn2.set(&key1, &value2).unwrap();
             txn2.set(&key2, &value2).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
 
         // Drop the store to simulate closing it
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Create a new Core instance with VariableSizeKey after dropping the previous one
         let mut opts = Options::new();
@@ -866,8 +855,8 @@ mod tests {
         assert_eq!(val, value2.as_ref());
     }
 
-    #[tokio::test]
-    async fn transaction_delete_scan() {
+    #[test]
+    fn transaction_delete_scan() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -879,14 +868,14 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
 
         {
             // Start a read-only transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.delete(&key1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -903,8 +892,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn keys_with_tombstones() {
+    #[test]
+    fn keys_with_tombstones() {
         for is_ssi in [false, true] {
             let (store, _) = create_store(is_ssi);
 
@@ -914,12 +903,12 @@ mod tests {
             // First, insert the key.
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key, &value).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             // Then, soft-delete it.
             let mut txn2 = store.begin().unwrap();
             txn2.soft_delete(&key).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             // keys_with_tombstones() should still return `k`
             // despite it being soft-deleted.
@@ -930,7 +919,7 @@ mod tests {
         }
     }
 
-    async fn mvcc_tests(is_ssi: bool) {
+    fn mvcc_tests(is_ssi: bool) {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
@@ -944,11 +933,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             assert!(txn2.get(&key2).unwrap().is_none());
             txn2.set(&key2, &value2).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
 
         // conflict when the read key was updated by another transaction
@@ -957,11 +946,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             assert!(txn2.get(&key1).is_ok());
             txn2.set(&key1, &value2).unwrap();
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -981,8 +970,8 @@ mod tests {
             txn1.set(&key1, &value1).unwrap();
             txn2.set(&key1, &value2).unwrap();
 
-            txn1.commit().await.unwrap();
-            assert!(match txn2.commit().await {
+            txn1.commit().unwrap();
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionWriteConflict)
                 }
@@ -1000,11 +989,11 @@ mod tests {
             let mut txn2 = store.begin().unwrap();
 
             txn1.set(&key, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             assert!(txn2.get(&key).unwrap().is_none());
             txn2.set(&key, &value1).unwrap();
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -1022,17 +1011,17 @@ mod tests {
 
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key).unwrap();
-            assert!(txn2.commit().await.is_ok());
+            assert!(txn2.commit().is_ok());
 
             assert!(txn3.get(&key).is_ok());
             txn3.set(&key, &value2).unwrap();
-            let result = txn3.commit().await;
+            let result = txn3.commit();
             if is_ssi {
                 assert!(matches!(result, Err(Error::TransactionReadConflict)));
             } else {
@@ -1041,18 +1030,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mvcc_serialized_snapshot_isolation() {
-        mvcc_tests(true).await;
+    #[test]
+    fn mvcc_serialized_snapshot_isolation() {
+        mvcc_tests(true);
     }
 
-    #[tokio::test]
-    async fn mvcc_snapshot_isolation() {
-        mvcc_tests(false).await;
+    #[test]
+    fn mvcc_snapshot_isolation() {
+        mvcc_tests(false);
     }
 
-    #[tokio::test]
-    async fn basic_scan_single_key() {
+    #[test]
+    fn basic_scan_single_key() {
         let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![Bytes::from("key1")];
@@ -1060,7 +1049,7 @@ mod tests {
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
@@ -1070,8 +1059,8 @@ mod tests {
         assert_eq!(results.len(), keys_to_insert.len());
     }
 
-    #[tokio::test]
-    async fn basic_scan_multiple_keys() {
+    #[test]
+    fn basic_scan_multiple_keys() {
         let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![
@@ -1084,7 +1073,7 @@ mod tests {
         for key in &keys_to_insert {
             let mut txn = store.begin().unwrap();
             txn.set(key, key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = "key1".as_bytes()..="key3".as_bytes();
@@ -1097,8 +1086,8 @@ mod tests {
         assert_eq!(results[2].as_ref().unwrap().1, keys_to_insert[2]);
     }
 
-    #[tokio::test]
-    async fn scan_multiple_keys_within_single_transaction() {
+    #[test]
+    fn scan_multiple_keys_within_single_transaction() {
         let (store, _) = create_store(false);
         // Define key-value pairs for the test
         let keys_to_insert = vec![
@@ -1111,7 +1100,7 @@ mod tests {
         for key in &keys_to_insert {
             txn.set(key, key).unwrap();
         }
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let range = "test1".as_bytes()..="test7".as_bytes();
 
@@ -1129,7 +1118,7 @@ mod tests {
         assert_eq!(results[2].1, keys_to_insert[2]);
     }
 
-    async fn mvcc_with_scan_tests(is_ssi: bool) {
+    fn mvcc_with_scan_tests(is_ssi: bool) {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("key1");
@@ -1148,7 +1137,7 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
@@ -1156,7 +1145,7 @@ mod tests {
             txn2.set(&key1, &value4).unwrap();
             txn2.set(&key2, &value2).unwrap();
             txn2.set(&key3, &value3).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             let range = "key1".as_bytes()..="key4".as_bytes();
             let results: Vec<_> = txn3.scan(range, None).collect();
@@ -1164,7 +1153,7 @@ mod tests {
             txn3.set(&key2, &value5).unwrap();
             txn3.set(&key3, &value6).unwrap();
 
-            assert!(match txn3.commit().await {
+            assert!(match txn3.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -1181,18 +1170,18 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
 
             txn1.set(&key4, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             let mut txn2 = store.begin().unwrap();
             let mut txn3 = store.begin().unwrap();
 
             txn2.delete(&key4).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             let range = "key1".as_bytes()..="key5".as_bytes();
             let _: Vec<_> = txn3.scan(range, None).collect();
             txn3.set(&key4, &value2).unwrap();
-            let result = txn3.commit().await;
+            let result = txn3.commit();
             if is_ssi {
                 assert!(matches!(result, Err(Error::TransactionReadConflict)));
             } else {
@@ -1201,18 +1190,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mvcc_serialized_snapshot_isolation_scan() {
-        mvcc_with_scan_tests(true).await;
+    #[test]
+    fn mvcc_serialized_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(true);
     }
 
-    #[tokio::test]
-    async fn mvcc_snapshot_isolation_scan() {
-        mvcc_with_scan_tests(false).await;
+    #[test]
+    fn mvcc_snapshot_isolation_scan() {
+        mvcc_with_scan_tests(false);
     }
 
-    #[tokio::test]
-    async fn ryow() {
+    #[test]
+    fn ryow() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1232,13 +1221,13 @@ mod tests {
             txn1.delete(&key1).unwrap();
             let res = txn1.get(&key1).unwrap();
             assert!(res.is_none());
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -1249,12 +1238,12 @@ mod tests {
             assert!(txn.get(&key3).unwrap().is_none());
             txn.set(&key2, &value1).unwrap();
             assert_eq!(txn.get(&key2).unwrap().unwrap(), value1.as_ref());
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
     // Common setup logic for creating a store
-    async fn create_hermitage_store(is_ssi: bool) -> Store {
+    fn create_hermitage_store(is_ssi: bool) -> Store {
         let (store, _) = create_store(is_ssi);
 
         let key1 = Bytes::from("k1");
@@ -1265,7 +1254,7 @@ mod tests {
         let mut txn = store.begin().unwrap();
         txn.set(&key1, &value1).unwrap();
         txn.set(&key2, &value2).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         store
     }
@@ -1274,8 +1263,8 @@ mod tests {
     // Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
 
     // G0: Write Cycles (dirty writes)
-    async fn g0_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g0_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value3 = Bytes::from("v3");
@@ -1297,10 +1286,10 @@ mod tests {
 
             txn1.set(&key2, &value5).unwrap();
 
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             txn2.set(&key2, &value6).unwrap();
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -1321,15 +1310,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g0() {
-        g0_tests(false).await; // snapshot isolation
-        g0_tests(true).await; // serializable snapshot isolation
+    #[test]
+    fn g0() {
+        g0_tests(false); // snapshot isolation
+        g0_tests(true); // serializable snapshot isolation
     }
 
     // G1a: Aborted Reads (dirty reads, cascaded aborts)
-    async fn g1a_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g1a_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
         let value1 = Bytes::from("v1");
@@ -1361,7 +1350,7 @@ mod tests {
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
 
         {
@@ -1373,15 +1362,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g1a() {
-        g1a_tests(false).await; // snapshot isolation
-        g1a_tests(true).await; // serializable snapshot isolation
+    #[test]
+    fn g1a() {
+        g1a_tests(false); // snapshot isolation
+        g1a_tests(true); // serializable snapshot isolation
     }
 
     // G1b: Intermediate Reads (dirty reads)
-    async fn g1b_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g1b_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1407,7 +1396,7 @@ mod tests {
             assert_eq!(res[0].1, value1);
 
             txn1.set(&key1, &value4).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             let res = txn2
                 .scan(range, None)
@@ -1416,19 +1405,19 @@ mod tests {
             assert_eq!(res.len(), 2);
             assert_eq!(res[0].1, value1);
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn g1b() {
-        g1b_tests(false).await; // snapshot isolation
-        g1b_tests(true).await; // serializable snapshot isolation
+    #[test]
+    fn g1b() {
+        g1b_tests(false); // snapshot isolation
+        g1b_tests(true); // serializable snapshot isolation
     }
 
     // G1c: Circular Information Flow (dirty reads)
-    async fn g1c_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g1c_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1450,8 +1439,8 @@ mod tests {
             assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
             assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1.as_ref());
 
-            txn1.commit().await.unwrap();
-            assert!(match txn2.commit().await {
+            txn1.commit().unwrap();
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
@@ -1460,14 +1449,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g1c() {
-        g1c_tests(true).await;
+    #[test]
+    fn g1c() {
+        g1c_tests(true);
     }
 
     // PMP: Predicate-Many-Preceders
-    async fn pmp_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn pmp_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key3 = Bytes::from("k3");
         let value1 = Bytes::from("v1");
@@ -1490,7 +1479,7 @@ mod tests {
 
             // k3 is committed by txn2
             txn2.set(&key3, &value3).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             // k3 should still not be visible to txn1
             let range = "k1".as_bytes()..="k3".as_bytes();
@@ -1504,15 +1493,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pmp() {
-        pmp_tests(false).await;
-        pmp_tests(true).await;
+    #[test]
+    fn pmp() {
+        pmp_tests(false);
+        pmp_tests(true);
     }
 
     // PMP-Write: Circular Information Flow (dirty reads)
-    async fn pmp_write_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn pmp_write_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1537,7 +1526,7 @@ mod tests {
             assert_eq!(res[1].1, value2);
 
             txn2.delete(&key2).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             let range = "k1".as_bytes()..="k3".as_bytes();
             let res = txn2
@@ -1547,7 +1536,7 @@ mod tests {
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].1, value1);
 
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
@@ -1556,14 +1545,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn pmp_write() {
-        pmp_write_tests(true).await;
+    #[test]
+    fn pmp_write() {
+        pmp_write_tests(true);
     }
 
     // P4: Lost Update
-    async fn p4_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn p4_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let value3 = Bytes::from("v3");
@@ -1578,9 +1567,9 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key1, &value3).unwrap();
 
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -1593,15 +1582,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn p4() {
-        p4_tests(false).await;
-        p4_tests(true).await;
+    #[test]
+    fn p4() {
+        p4_tests(false);
+        p4_tests(true);
     }
 
     // G-single: Single Anti-dependency Cycles (read skew)
-    async fn g_single_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g_single_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1620,22 +1609,22 @@ mod tests {
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2.as_ref());
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn g_single() {
-        g_single_tests(false).await;
-        g_single_tests(true).await;
+    #[test]
+    fn g_single() {
+        g_single_tests(false);
+        g_single_tests(true);
     }
 
     // G-single-write-1: Single Anti-dependency Cycles (read skew)
-    async fn g_single_write_1_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g_single_write_1_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1662,11 +1651,11 @@ mod tests {
             txn2.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             txn1.delete(&key2).unwrap();
             assert!(txn1.get(&key2).unwrap().is_none());
-            assert!(match txn1.commit().await {
+            assert!(match txn1.commit() {
                 Err(err) => {
                     if !is_ssi {
                         matches!(err, Error::TransactionWriteConflict)
@@ -1679,15 +1668,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g_single_write_1() {
-        g_single_write_1_tests(false).await;
-        g_single_write_1_tests(true).await;
+    #[test]
+    fn g_single_write_1() {
+        g_single_write_1_tests(false);
+        g_single_write_1_tests(true);
     }
 
     // G-single-write-2: Single Anti-dependency Cycles (read skew)
-    async fn g_single_write_2_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g_single_write_2_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1718,18 +1707,18 @@ mod tests {
 
             drop(txn1);
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn g_single_write_2() {
-        g_single_write_2_tests(false).await;
-        g_single_write_2_tests(true).await;
+    #[test]
+    fn g_single_write_2() {
+        g_single_write_2_tests(false);
+        g_single_write_2_tests(true);
     }
 
-    async fn g2_item_tests(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g2_item_tests(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key1 = Bytes::from("k1");
         let key2 = Bytes::from("k2");
@@ -1762,9 +1751,9 @@ mod tests {
             txn1.set(&key1, &value3).unwrap();
             txn2.set(&key2, &value4).unwrap();
 
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
@@ -1773,16 +1762,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g2_item() {
-        g2_item_tests(true).await;
+    #[test]
+    fn g2_item() {
+        g2_item_tests(true);
     }
 
     fn require_send<T: Send>(_: T) {}
     fn require_sync<T: Sync + Send>(_: T) {}
 
-    #[tokio::test]
-    async fn is_send_sync() {
+    #[test]
+    fn is_send_sync() {
         let (db, _) = create_store(false);
 
         let txn = db.begin().unwrap();
@@ -1837,9 +1826,9 @@ mod tests {
         StdRng::seed_from_u64(RNG_SEED)
     }
 
-    #[tokio::test]
     #[ignore]
-    async fn insert_large_txn_and_get() {
+    #[test]
+    fn insert_large_txn_and_get() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1852,7 +1841,7 @@ mod tests {
             let (key, value) = gen_pair(&mut rng);
             txn.set(&key, &value).unwrap();
         }
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
         drop(txn);
 
         // Read the keys from the store
@@ -1864,8 +1853,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn empty_scan_should_not_return_an_error() {
+    #[test]
+    fn empty_scan_should_not_return_an_error() {
         let (store, _) = create_store(false);
 
         let range = "key1".as_bytes()..="key3".as_bytes();
@@ -1875,8 +1864,8 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    #[tokio::test]
-    async fn transaction_delete_and_scan_test() {
+    #[test]
+    fn transaction_delete_and_scan_test() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -1887,7 +1876,7 @@ mod tests {
             // Start a new read-write transaction (txn1)
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value1).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
 
         {
@@ -1901,7 +1890,7 @@ mod tests {
                 .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                 .expect("Scan should succeed");
             assert_eq!(results.len(), 0);
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
         {
             let range = "k1".as_bytes()..="k3".as_bytes();
@@ -1914,8 +1903,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn sdb_delete_record_id_bug() {
+    #[test]
+    fn sdb_delete_record_id_bug() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -1934,7 +1923,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
             txn.set(&key2, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let key3 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -1942,7 +1931,7 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key3, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -2041,7 +2030,7 @@ mod tests {
             ]))
             .unwrap();
 
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
 
         {
@@ -2083,12 +2072,12 @@ mod tests {
                 &value1,
             )
             .unwrap();
-            txn3.commit().await.unwrap();
+            txn3.commit().unwrap();
         }
     }
 
-    async fn g2_item_predicate(is_ssi: bool) {
-        let store = create_hermitage_store(is_ssi).await;
+    fn g2_item_predicate(is_ssi: bool) {
+        let store = create_hermitage_store(is_ssi);
 
         let key3 = Bytes::from("k3");
         let key4 = Bytes::from("k4");
@@ -2114,9 +2103,9 @@ mod tests {
             txn1.set(&key3, &value3).unwrap();
             txn2.set(&key4, &value4).unwrap();
 
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
-            assert!(match txn2.commit().await {
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
@@ -2141,8 +2130,8 @@ mod tests {
             txn1.set(&key4, &value3).unwrap();
             txn2.set(&key5, &value4).unwrap();
 
-            txn1.commit().await.unwrap();
-            txn2.commit().await.unwrap();
+            txn1.commit().unwrap();
+            txn2.commit().unwrap();
         }
 
         // k1, k2, k3, k4, k5 already committed
@@ -2163,8 +2152,8 @@ mod tests {
             txn1.set(&key6, &value3).unwrap();
             txn2.set(&key7, &value4).unwrap();
 
-            txn1.commit().await.unwrap();
-            assert!(match txn2.commit().await {
+            txn1.commit().unwrap();
+            assert!(match txn2.commit() {
                 Err(err) => {
                     matches!(err, Error::TransactionReadConflict)
                 }
@@ -2173,13 +2162,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn g2_predicate() {
-        g2_item_predicate(true).await;
+    #[test]
+    fn g2_predicate() {
+        g2_item_predicate(true);
     }
 
-    #[tokio::test]
-    async fn transaction_delete_from_index() {
+    #[test]
+    fn transaction_delete_from_index() {
         let (store, temp_dir) = create_store(false);
 
         // Define key-value pairs for the test
@@ -2192,14 +2181,14 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value).unwrap();
             txn1.set(&key2, &value).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
         }
 
         {
             // Start another read-write transaction (txn2)
             let mut txn2 = store.begin().unwrap();
             txn2.delete(&key1).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
         }
 
         {
@@ -2212,10 +2201,10 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // sleep for a while to ensure the store is closed
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Create a new Core instance with VariableSizeKey after dropping the previous one
         let mut opts = Options::new();
@@ -2230,8 +2219,8 @@ mod tests {
         assert_eq!(val, value.as_ref());
     }
 
-    #[tokio::test]
-    async fn test_insert_clear_read_key() {
+    #[test]
+    fn test_insert_clear_read_key() {
         let (store, _) = create_store(false);
 
         // Key-value pair for the test
@@ -2243,20 +2232,20 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&key, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
             txn.set(&key, &value2).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Clear the key in a separate transaction
         {
             let mut txn = store.begin().unwrap();
             txn.soft_delete(&key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Read the key in a new transaction to verify it does not exist
@@ -2266,8 +2255,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn multiple_savepoints_without_ssi() {
+    #[test]
+    fn multiple_savepoints_without_ssi() {
         let (store, _) = create_store(false);
 
         // Key-value pair for the test
@@ -2319,7 +2308,7 @@ mod tests {
         ),);
 
         // Commit the transaction.
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         // Start another transaction and check again for the keys.
@@ -2327,11 +2316,11 @@ mod tests {
         assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
         assert!(txn2.get(&key2).unwrap().is_none());
         assert!(txn2.get(&key3).unwrap().is_none());
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn multiple_savepoints_with_ssi() {
+    #[test]
+    fn multiple_savepoints_with_ssi() {
         let (store, _) = create_store(true);
 
         // Key-value pair for the test
@@ -2383,7 +2372,7 @@ mod tests {
         ),);
 
         // Commit the transaction.
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         // Start another transaction and check again for the keys.
@@ -2391,11 +2380,11 @@ mod tests {
         assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
         assert!(txn2.get(&key2).unwrap().is_none());
         assert!(txn2.get(&key3).unwrap().is_none());
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn savepont_with_concurrent_read_txn_without_ssi() {
+    #[test]
+    fn savepont_with_concurrent_read_txn_without_ssi() {
         let (store, _) = create_store(false);
 
         // Key-value pair for the test
@@ -2408,7 +2397,7 @@ mod tests {
         // Store the entry.
         let mut txn1 = store.begin().unwrap();
         txn1.set(&key, &value).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         // Now open two concurrent transaction, where one
@@ -2430,15 +2419,15 @@ mod tests {
         update_txn.set(&key, &updated_value).unwrap();
 
         // Commit the transaction.
-        update_txn.commit().await.unwrap();
+        update_txn.commit().unwrap();
         // Read transaction should commit without conflict after
         // rolling back to the savepoint before reading `key`.
         read_txn.rollback_to_savepoint().unwrap();
-        read_txn.commit().await.unwrap();
+        read_txn.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn savepont_with_concurrent_read_txn_with_ssi() {
+    #[test]
+    fn savepont_with_concurrent_read_txn_with_ssi() {
         let (store, _) = create_store(true);
 
         let key = Bytes::from("test_key1");
@@ -2449,7 +2438,7 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(&key, &value).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         let mut read_txn = store.begin().unwrap();
@@ -2462,13 +2451,13 @@ mod tests {
         read_txn.get(&key).unwrap().unwrap();
         update_txn.set(&key, &updated_value).unwrap();
 
-        update_txn.commit().await.unwrap();
+        update_txn.commit().unwrap();
         read_txn.rollback_to_savepoint().unwrap();
-        read_txn.commit().await.unwrap();
+        read_txn.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn savepont_with_concurrent_scan_txn() {
+    #[test]
+    fn savepont_with_concurrent_scan_txn() {
         // Scan set is only considered for SSI.
         let (store, _) = create_store(true);
 
@@ -2480,7 +2469,7 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(&k1, &value).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         let mut read_txn = store.begin().unwrap();
@@ -2497,13 +2486,13 @@ mod tests {
             .expect("Scan should succeed");
         update_txn.set(&k1, &updated_value).unwrap();
 
-        update_txn.commit().await.unwrap();
+        update_txn.commit().unwrap();
         read_txn.rollback_to_savepoint().unwrap();
-        read_txn.commit().await.unwrap();
+        read_txn.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn savepont_with_concurrent_scan_txn_with_new_write() {
+    #[test]
+    fn savepont_with_concurrent_scan_txn_with_new_write() {
         // Scan set is only considered for SSI.
         let (store, _) = create_store(true);
 
@@ -2516,7 +2505,7 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(&k1, &value).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
         drop(txn1);
 
         let mut read_txn = store.begin().unwrap();
@@ -2536,13 +2525,13 @@ mod tests {
             .expect("Scan should succeed");
         update_txn.set(&k3, &value3).unwrap();
 
-        update_txn.commit().await.unwrap();
+        update_txn.commit().unwrap();
         read_txn.rollback_to_savepoint().unwrap();
-        read_txn.commit().await.unwrap();
+        read_txn.commit().unwrap();
     }
 
-    #[tokio::test]
-    async fn savepoint_rollback_on_updated_key() {
+    #[test]
+    fn savepoint_rollback_on_updated_key() {
         let (store, _) = create_store(false);
 
         let k1 = Bytes::from("k1");
@@ -2561,8 +2550,8 @@ mod tests {
         assert_eq!(txn1.get(&k1).unwrap().unwrap(), value2);
     }
 
-    #[tokio::test]
-    async fn savepoint_rollback_on_updated_key_with_scan() {
+    #[test]
+    fn savepoint_rollback_on_updated_key_with_scan() {
         let (store, _) = create_store(false);
 
         let k1 = Bytes::from("k1");
@@ -2590,8 +2579,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ordered_writes() {
+    #[test]
+    fn ordered_writes() {
         // This test ensures that the real time order of writes
         // is preserved within a transaction.
         use crate::entry::Record;
@@ -2610,8 +2599,8 @@ mod tests {
         txn.set(&k1, &v1).unwrap();
         txn.set(&k2, &v2).unwrap();
         txn.set(&k1, &v3).unwrap();
-        txn.commit().await.unwrap();
-        store.close().await.unwrap();
+        txn.commit().unwrap();
+        store.close().unwrap();
 
         let clog_subdir = tmp_dir.path().join("clog");
         let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
@@ -2639,8 +2628,8 @@ mod tests {
         ),);
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_single_key_multiple_versions() {
+    #[test]
+    fn test_scan_all_versions_single_key_multiple_versions() {
         let (store, _) = create_store(false);
         let key = Bytes::from("key1");
 
@@ -2655,7 +2644,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             let version = (i + 1) as u64; // Incremental version
             txn.set_at_ts(&key, value, version).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = key.as_ref()..=key.as_ref();
@@ -2675,8 +2664,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_multiple_keys_single_version_each() {
+    #[test]
+    fn test_scan_all_versions_multiple_keys_single_version_each() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2688,7 +2677,7 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.set_at_ts(key, &value, 1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
@@ -2707,8 +2696,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
+    #[test]
+    fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2726,7 +2715,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
@@ -2755,19 +2744,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_deleted_records() {
+    #[test]
+    fn test_scan_all_versions_deleted_records() {
         let (store, _) = create_store(false);
         let key = Bytes::from("key1");
         let value = Bytes::from("value1");
 
         let mut txn = store.begin().unwrap();
         txn.set_at_ts(&key, &value, 1).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let mut txn = store.begin().unwrap();
         txn.soft_delete(&key).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
@@ -2789,8 +2778,8 @@ mod tests {
         assert!(*is_deleted);
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
+    #[test]
+    fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2802,13 +2791,13 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.set_at_ts(key, &value, 1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.soft_delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
@@ -2834,8 +2823,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
+    #[test]
+    fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2853,14 +2842,14 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.soft_delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
@@ -2891,23 +2880,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_soft_and_hard_delete() {
+    #[test]
+    fn test_scan_all_versions_soft_and_hard_delete() {
         let (store, _) = create_store(false);
         let key = Bytes::from("key1");
         let value = Bytes::from("value1");
 
         let mut txn = store.begin().unwrap();
         txn.set_at_ts(&key, &value, 1).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let mut txn = store.begin().unwrap();
         txn.soft_delete(&key).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let mut txn = store.begin().unwrap();
         txn.delete(&key).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
@@ -2919,8 +2908,8 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_range_boundaries() {
+    #[test]
+    fn test_scan_all_versions_range_boundaries() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2932,7 +2921,7 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.set_at_ts(key, &value, 1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Inclusive range
@@ -2963,8 +2952,8 @@ mod tests {
         assert_eq!(results.len(), keys.len());
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_with_limit() {
+    #[test]
+    fn test_scan_all_versions_with_limit() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -2976,7 +2965,7 @@ mod tests {
         for key in &keys {
             let mut txn = store.begin().unwrap();
             txn.set_at_ts(key, &value, 1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let range = keys.first().unwrap().as_ref()..=keys.last().unwrap().as_ref();
@@ -2989,15 +2978,15 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_single_key_single_version() {
+    #[test]
+    fn test_scan_all_versions_single_key_single_version() {
         let (store, _) = create_store(false);
         let key = Bytes::from("key1");
         let value = Bytes::from("value1");
 
         let mut txn = store.begin().unwrap();
         txn.set_at_ts(&key, &value, 1).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         let range = key.as_ref()..=key.as_ref();
         let txn = store.begin().unwrap();
@@ -3014,8 +3003,8 @@ mod tests {
         assert!(!(*is_deleted));
     }
 
-    #[tokio::test]
-    async fn sdb_bug_complex_key_handling_with_null_bytes_and_range_scan() {
+    #[test]
+    fn sdb_bug_complex_key_handling_with_null_bytes_and_range_scan() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3050,7 +3039,7 @@ mod tests {
 
             txn.set(&k5, &v4).unwrap();
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -3059,7 +3048,7 @@ mod tests {
             txn.get(&k5).unwrap();
             txn.delete(&k5).unwrap();
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -3079,12 +3068,12 @@ mod tests {
                 .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                 .expect("Scan should succeed");
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
+    #[test]
+    fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -3103,7 +3092,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
@@ -3137,8 +3126,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_soft_delete_and_reinsert() {
+    #[test]
+    fn test_soft_delete_and_reinsert() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3149,14 +3138,14 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.soft_delete(&key1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -3170,12 +3159,12 @@ mod tests {
                 .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                 .expect("Scan should succeed");
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn test_hard_delete_and_reinsert() {
+    #[test]
+    fn test_hard_delete_and_reinsert() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3186,14 +3175,14 @@ mod tests {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.delete(&key1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -3207,12 +3196,12 @@ mod tests {
                 .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                 .expect("Scan should succeed");
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn test_hard_delete_and_reinsert_with_multiple_keys() {
+    #[test]
+    fn test_hard_delete_and_reinsert_with_multiple_keys() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3225,14 +3214,14 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set(&key1, &value1).unwrap();
             txn.set(&key2, &value1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
             // Start a new read-write transaction (txn)
             let mut txn = store.begin().unwrap();
             txn.delete(&key1).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         {
@@ -3247,12 +3236,12 @@ mod tests {
                 .collect::<Result<Vec<(&[u8], Vec<u8>, u64)>>>()
                 .expect("Scan should succeed");
 
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_includes_entries_before_commit() {
+    #[test]
+    fn test_scan_includes_entries_before_commit() {
         let (store, _) = create_store(false);
 
         // Define key-value pairs for the test
@@ -3286,8 +3275,8 @@ mod tests {
         assert_eq!(results[2].1, value3);
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_with_subsets() {
+    #[test]
+    fn test_scan_all_versions_with_subsets() {
         let (store, _) = create_store(false);
         let keys = vec![
             Bytes::from("key1"),
@@ -3310,7 +3299,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
@@ -3349,8 +3338,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_scan_all_versions_with_batches() {
+    #[test]
+    fn test_scan_all_versions_with_batches() {
         let (store, _) = create_store(false);
         let keys = [
             Bytes::from("key1"),
@@ -3383,7 +3372,7 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 let version = (i + 1) as u64;
                 txn.set_at_ts(key, value, version).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
@@ -3466,8 +3455,8 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_concurrent_transactions() {
+    #[test]
+    fn test_concurrent_transactions() {
         let (store, _) = create_store(false);
         let store = Arc::new(store);
 
@@ -3497,11 +3486,11 @@ mod tests {
             let key = key.clone();
             let value = value.clone();
 
-            let handle = task::spawn(async move {
+            let handle = std::thread::spawn(move || {
                 // Start a new read-write transaction
                 let mut txn = store.begin().unwrap();
                 txn.set(&key, &value).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
                 txn.versionstamp
             });
 
@@ -3510,7 +3499,7 @@ mod tests {
 
         // Wait for all tasks to complete and collect the results
         for handle in handles {
-            let result = handle.await.unwrap();
+            let result = handle.join().unwrap();
             if let Some((transaction_id, commit_ts)) = result {
                 transaction_ids.push(transaction_id);
                 commit_timestamps.push(commit_ts);
@@ -3536,11 +3525,11 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn keys_with_tombstones_with_limit() {
+    #[test]
+    fn keys_with_tombstones_with_limit() {
         for is_ssi in [false, true] {
             let (store, _) = create_store(is_ssi);
 
@@ -3552,13 +3541,13 @@ mod tests {
             let mut txn1 = store.begin().unwrap();
             txn1.set(&key1, &value).unwrap();
             txn1.set(&key2, &value).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             // Then, soft-delete them.
             let mut txn2 = store.begin().unwrap();
             txn2.soft_delete(&key1).unwrap();
             txn2.soft_delete(&key2).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             // keys_with_tombstones() should still return `k1` and `k2`
             // despite them being soft-deleted.
@@ -3575,8 +3564,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_keys_api() {
+    #[test]
+    fn test_keys_api() {
         for is_ssi in [false, true] {
             let (store, _) = create_store(is_ssi);
 
@@ -3590,12 +3579,12 @@ mod tests {
             txn1.set(&key1, &value).unwrap();
             txn1.set(&key2, &value).unwrap();
             txn1.set(&key3, &value).unwrap();
-            txn1.commit().await.unwrap();
+            txn1.commit().unwrap();
 
             // Soft-delete key2.
             let mut txn2 = store.begin().unwrap();
             txn2.soft_delete(&key2).unwrap();
-            txn2.commit().await.unwrap();
+            txn2.commit().unwrap();
 
             // Test the keys function without a limit.
             let range = "k1".as_bytes()..="k3".as_bytes();

@@ -1,7 +1,5 @@
 use ahash::{HashMap, HashMapExt};
-use async_channel::{bounded, Receiver, Sender};
 use bytes::{Bytes, BytesMut};
-use futures::{select, FutureExt};
 use parking_lot::RwLock;
 use quick_cache::sync::Cache;
 use revision::Revisioned;
@@ -24,84 +22,27 @@ use crate::repair::{repair_last_corrupted_segment, restore_repair_files};
 use crate::stats::StorageStats;
 use crate::transaction::{Durability, Mode, Transaction};
 
-pub(crate) struct StoreInner {
+/// An MVCC-based transactional key-value store.
+///
+/// The store is closed synchronously when it is dropped.
+/// If you need to guarantee that the store is closed before the program continues, use the `close` method.
+pub struct Store {
     pub(crate) core: Arc<Core>,
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
-    stop_tx: Sender<()>,
-    done_rx: Receiver<()>,
     pub(crate) stats: Arc<StorageStats>,
-}
-
-// Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
-impl StoreInner {
-    /// Creates a new MVCC key-value store with the given options.
-    /// It creates a new core with the options and wraps it in an atomic reference counter.
-    /// It returns the store.
-    pub fn new(opts: Options) -> Result<Self> {
-        // TODO: make this channel size configurable
-        let (writes_tx, writes_rx) = bounded(10000);
-        let (stop_tx, stop_rx) = bounded(1);
-
-        let core = Arc::new(Core::new(opts, writes_tx)?);
-        let (task_runner, done_rx) = TaskRunner::new(core.clone(), writes_rx, stop_rx);
-        task_runner.spawn();
-
-        Ok(Self {
-            core,
-            stop_tx,
-            done_rx,
-            is_closed: AtomicBool::new(false),
-            is_compacting: AtomicBool::new(false),
-            stats: Arc::new(StorageStats::new()),
-        })
-    }
-
-    /// Closes the store. It sends a stop signal to the writer and waits for the done signal.
-    pub async fn close(&self) -> Result<()> {
-        if self.is_closed.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        if self.is_compacting.load(Ordering::SeqCst) {
-            return Err(Error::CompactionAlreadyInProgress);
-        }
-
-        // Send stop signal
-        self.stop_tx
-            .send(())
-            .await
-            .map_err(|e| Error::SendError(format!("{}", e)))?;
-
-        // Wait for done signal
-        self.done_rx.recv().await.map_err(|e| {
-            Error::ReceiveError(format!("Error waiting for task runner to complete: {}", e))
-        })?;
-
-        self.core.close()?;
-
-        self.is_closed.store(true, Ordering::Relaxed);
-
-        Ok(())
-    }
-}
-
-/// An MVCC-based transactional key-value store.
-///
-/// The store is closed asynchronously when it is dropped.
-/// If you need to guarantee that the store is closed before the program continues, use the `close` method.
-
-// This is a wrapper around the inner store to allow for asynchronous closing of the store.
-#[derive(Default)]
-pub struct Store {
-    pub(crate) inner: Option<StoreInner>,
 }
 
 impl Store {
     /// Creates a new MVCC key-value store with the given options.
     pub fn new(opts: Options) -> Result<Self> {
+        let core = Arc::new(Core::new(opts)?);
+
         Ok(Self {
-            inner: Some(StoreInner::new(opts)?),
+            core,
+            is_closed: AtomicBool::new(false),
+            is_compacting: AtomicBool::new(false),
+            stats: Arc::new(StorageStats::new()),
         })
     }
 
@@ -109,7 +50,7 @@ impl Store {
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin(&self) -> Result<Transaction> {
-        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), Mode::ReadWrite)?;
+        let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
 
@@ -117,7 +58,7 @@ impl Store {
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
     pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-        let txn = Transaction::new(self.inner.as_ref().unwrap().core.clone(), mode)?;
+        let txn = Transaction::new(self.core.clone(), mode)?;
         Ok(txn)
     }
 
@@ -134,31 +75,27 @@ impl Store {
     /// Executes a function in a read-write transaction and commits the transaction.
     /// It begins a new read-write transaction, executes the function with the transaction, and commits the transaction.
     /// It returns the result of the function.
-    pub async fn write(
-        self: Arc<Self>,
-        f: impl FnOnce(&mut Transaction) -> Result<()>,
-    ) -> Result<()> {
+    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
-        txn.commit().await?;
+        txn.commit()?;
 
         Ok(())
     }
 
     /// Closes the inner store
-    pub async fn close(&self) -> Result<()> {
-        if let Some(inner) = self.inner.as_ref() {
-            inner.close().await?;
+    pub fn close(&self) -> Result<()> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Ok(());
         }
 
-        Ok(())
-    }
-
-    /// Compacts the store.
-    pub async fn compact(&self) -> Result<()> {
-        if let Some(inner) = self.inner.as_ref() {
-            inner.compact().await?;
+        if self.is_compacting.load(Ordering::SeqCst) {
+            return Err(Error::CompactionAlreadyInProgress);
         }
+
+        self.core.close()?;
+
+        self.is_closed.store(true, Ordering::SeqCst);
 
         Ok(())
     }
@@ -166,86 +103,9 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            // Try to get existing runtime handle first
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // We're in a runtime, spawn normally
-                handle.spawn(async move {
-                    if let Err(err) = inner.close().await {
-                        // TODO: use log/tracing instead of eprintln
-                        eprintln!("Error closing store: {}", err);
-                    }
-                });
-            } else {
-                eprintln!("No runtime available for closing the store correctly");
-            }
-        }
-    }
-}
-
-pub(crate) struct TaskRunner {
-    core: Arc<Core>,
-    writes_rx: Receiver<Task>,
-    stop_rx: Receiver<()>,
-    // Done channel to signal completion
-    done_tx: Arc<Sender<()>>,
-}
-
-impl TaskRunner {
-    fn new(
-        core: Arc<Core>,
-        writes_rx: Receiver<Task>,
-        stop_rx: Receiver<()>,
-    ) -> (Self, Receiver<()>) {
-        let (done_tx, done_rx) = bounded(1);
-        (
-            Self {
-                core,
-                writes_rx,
-                stop_rx,
-                done_tx: Arc::new(done_tx),
-            },
-            done_rx,
-        )
-    }
-
-    fn spawn(self) {
-        let done_tx = self.done_tx.clone();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(self.run(done_tx));
-
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(self.run(done_tx));
-    }
-
-    async fn run(self, done_tx: Arc<Sender<()>>) {
-        loop {
-            select! {
-                req = self.writes_rx.recv().fuse() => {
-                    match req {
-                        Ok(task) => self.handle_task(task).await,
-                        Err(_) => break,
-                    }
-                },
-                _ = self.stop_rx.recv().fuse() => {
-                    // Consume all remaining items in writes_rx
-                    while let Ok(task) = self.writes_rx.try_recv() {
-                        self.handle_task(task).await;
-                    }
-                    break;
-                },
-            }
-        }
-
-        // Signal completion
-        let _ = done_tx.send(()).await;
-    }
-
-    async fn handle_task(&self, task: Task) {
-        let core = self.core.clone();
-        if let Err(err) = core.write_request(task).await {
-            eprintln!("failed to write: {:?}", err);
+        if let Err(err) = self.close() {
+            // TODO: use log/tracing instead of eprintln
+            eprintln!("Error closing store: {}", err);
         }
     }
 }
@@ -269,20 +129,6 @@ pub struct Core {
     pub(crate) value_cache: Cache<(u64, u64), Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
-    /// Channel to send write requests to the writer
-    writes_tx: Sender<Task>,
-}
-/// A Task contains multiple entries to be written to the disk.
-#[derive(Clone)]
-pub struct Task {
-    /// Entries contained in this task
-    entries: Vec<Entry>,
-    /// Use channel to notify that the value has been persisted to disk
-    done: Option<Sender<Result<()>>>,
-    /// Transaction ID
-    tx_id: u64,
-    /// Durability
-    durability: Durability,
 }
 
 impl Core {
@@ -329,7 +175,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options, writes_tx: Sender<Task>) -> Result<Self> {
+    pub fn new(opts: Options) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
@@ -371,7 +217,6 @@ impl Core {
             oracle: Arc::new(oracle),
             value_cache,
             is_closed: AtomicBool::new(false),
-            writes_tx,
         })
     }
 
@@ -556,7 +401,7 @@ impl Core {
     }
 
     fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Relaxed)
+        self.is_closed.load(Ordering::SeqCst)
     }
 
     pub(crate) fn close(&self) -> Result<()> {
@@ -566,6 +411,13 @@ impl Core {
 
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
+            // For the moment we rely on the RwLock protecting `self.clog`
+            // in order to serialise `Core::close()` and `Core::append_log()`.
+            // Store can only be closed when there are no writes to the log
+            // file in progress.
+            //
+            // If we ever need more control over the closing process, we might
+            // need to extend this protocol with additional locks.
             clog.write().close()?;
         }
 
@@ -573,49 +425,47 @@ impl Core {
         if let Some(manifest) = &self.manifest {
             manifest.write().close()?;
         }
-        self.is_closed.store(true, Ordering::Relaxed);
+        self.is_closed.store(true, Ordering::SeqCst);
 
         Ok(())
     }
 
-    pub(crate) async fn write_request(&self, req: Task) -> Result<()> {
-        let done = req.done.clone();
-
-        let result = self.write_entries(req);
-
-        if let Some(done) = done {
-            done.send(result.clone()).await?;
-        }
-
-        result
-    }
-
-    fn write_entries(&self, req: Task) -> Result<()> {
-        if req.entries.is_empty() {
+    pub(crate) fn write_entries(
+        &self,
+        entries: Vec<Entry>,
+        tx_id: u64,
+        durability: Durability,
+    ) -> Result<()> {
+        if entries.is_empty() {
             return Ok(());
         }
 
         if self.opts.should_persist_data() {
-            self.write_entries_to_disk(req)
+            self.write_entries_to_disk(entries, tx_id, durability)
         } else {
-            self.write_index_in_memory(&req)
+            self.write_index_in_memory(entries, tx_id)
         }
     }
 
-    fn write_entries_to_disk(&self, req: Task) -> Result<()> {
+    fn write_entries_to_disk(
+        &self,
+        entries: Vec<Entry>,
+        tx_id: u64,
+        durability: Durability,
+    ) -> Result<()> {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
-        let mut values_offsets = HashMap::with_capacity(req.entries.len());
+        let mut values_offsets = HashMap::with_capacity(entries.len());
 
-        encode_entries(&req.entries, req.tx_id, &mut buf, &mut values_offsets);
+        encode_entries(&entries, tx_id, &mut buf, &mut values_offsets);
 
-        let (segment_id, current_offset) = self.append_log(&buf, req.durability)?;
+        let (segment_id, current_offset) = self.append_log(&buf, durability)?;
 
         values_offsets.iter_mut().for_each(|(_, val_off)| {
             *val_off += current_offset;
         });
 
-        self.write_entries_to_index(&req, |entry| {
+        self.write_entries_to_index(&entries, tx_id, |entry| {
             let offset = *values_offsets.get(&entry.key).unwrap();
             IndexValue::new_disk(
                 segment_id,
@@ -650,13 +500,18 @@ impl Core {
         Ok((segment_id, offset))
     }
 
-    fn write_entries_to_index<F>(&self, task: &Task, encode_entry: F) -> Result<()>
+    fn write_entries_to_index<F>(
+        &self,
+        entries: &[Entry],
+        tx_id: u64,
+        encode_entry: F,
+    ) -> Result<()>
     where
         F: Fn(&Entry) -> IndexValue,
     {
         let mut index = self.indexer.write();
 
-        for entry in &task.entries {
+        for entry in entries {
             // If the entry is marked as deleted or a tombstone
             // with the replace flag set, delete it.
             if let Some(metadata) = entry.metadata.as_ref() {
@@ -672,7 +527,7 @@ impl Core {
                 index.insert(
                     &mut entry.key[..].into(),
                     index_value,
-                    task.tx_id,
+                    tx_id,
                     entry.ts,
                     true,
                 )?;
@@ -680,7 +535,7 @@ impl Core {
                 index.insert_or_replace(
                     &mut entry.key[..].into(),
                     index_value,
-                    task.tx_id,
+                    tx_id,
                     entry.ts,
                     true,
                 )?;
@@ -690,27 +545,10 @@ impl Core {
         Ok(())
     }
 
-    fn write_index_in_memory(&self, task: &Task) -> Result<()> {
-        self.write_entries_to_index(task, |entry| {
+    fn write_index_in_memory(&self, entries: Vec<Entry>, tx_id: u64) -> Result<()> {
+        self.write_entries_to_index(&entries, tx_id, |entry| {
             IndexValue::new_mem(entry.metadata.clone(), entry.value.clone())
         })
-    }
-
-    pub(crate) async fn send_to_write_channel(
-        &self,
-        entries: Vec<Entry>,
-        tx_id: u64,
-        durability: Durability,
-    ) -> Result<Receiver<Result<()>>> {
-        let (tx, rx) = bounded(1);
-        let req = Task {
-            entries,
-            done: Some(tx),
-            tx_id,
-            durability,
-        };
-        self.writes_tx.send(req).await?;
-        Ok(rx)
     }
 
     /// Resolves the value from the given offset in the commit log.
@@ -743,30 +581,23 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use rand::prelude::SliceRandom;
-    use rand::Rng;
-
-    use std::sync::Arc;
-
     use crate::log::Error as LogError;
     use crate::option::Options;
-    use crate::store::Core;
-    use crate::store::{Store, Task, TaskRunner};
+    use crate::store::Store;
     use crate::transaction::Durability;
     use crate::{Error, IsolationLevel};
-
-    use async_channel::bounded;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use bytes::Bytes;
+    use rand::prelude::SliceRandom;
+    use rand::Rng;
+    use std::sync::Arc;
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
     }
 
-    #[tokio::test]
-    async fn bulk_insert_and_reload() {
+    #[test]
+    fn bulk_insert_and_reload() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -798,7 +629,7 @@ mod tests {
             // Start a new write transaction
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Read the keys to the store
@@ -811,7 +642,7 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Create a new store instance but with values read from disk
         let mut opts = Options::new();
@@ -831,8 +662,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn store_open_and_update_options() {
+    #[test]
+    fn store_open_and_update_options() {
         // // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -842,19 +673,19 @@ mod tests {
 
         // Create a new store instance with VariableKey as the key type
         let store = Store::new(opts.clone()).expect("should create store");
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Update the options and use them to update the new store instance
         let mut opts = opts.clone();
         opts.max_value_cache_size = 5;
 
         let store = Store::new(opts.clone()).expect("should create store");
-        let store_opts = store.inner.as_ref().unwrap().core.opts.clone();
+        let store_opts = store.core.opts.clone();
         assert_eq!(store_opts, opts);
     }
 
-    #[tokio::test]
-    async fn insert_close_reopen() {
+    #[test]
+    fn insert_close_reopen() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -875,7 +706,7 @@ mod tests {
                 let value = format!("value{}", id);
                 let mut txn = store.begin().unwrap();
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
 
             // Test that the items are still in the store
@@ -890,12 +721,12 @@ mod tests {
             }
 
             // Close the store again
-            store.close().await.unwrap();
+            store.close().unwrap();
         }
     }
 
-    #[tokio::test]
-    async fn clone_store() {
+    #[test]
+    fn clone_store() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -928,35 +759,37 @@ mod tests {
             // Start a new write transaction
             let mut txn = store1.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
     }
 
-    async fn concurrent_task(store: Arc<Store>, key: &[u8], value: &[u8]) {
+    fn concurrent_task(store: Arc<Store>, key: &[u8], value: &[u8]) {
         let mut txn = store.begin().unwrap();
         txn.set(key, value).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_test() {
+    #[test]
+    fn concurrent_test() {
         let mut opts = Options::new();
         opts.dir = create_temp_directory().path().to_path_buf();
         let db = Arc::new(Store::new(opts).expect("should create store"));
+        let db_clone = db.clone();
 
         let key1 = b"key1";
         let value1 = b"value1";
         let key2 = b"key2";
         let value2 = b"value2";
 
-        let task1 = tokio::spawn(concurrent_task(db.clone(), key1, value1));
-        let task2 = tokio::spawn(concurrent_task(db.clone(), key2, value2));
+        let task1 = std::thread::spawn(move || concurrent_task(db, key1, value1));
+        let task2 = std::thread::spawn(move || concurrent_task(db_clone, key2, value2));
 
-        let _ = tokio::try_join!(task1, task2).expect("Tasks failed");
+        task1.join().unwrap();
+        task2.join().unwrap();
     }
 
-    #[tokio::test]
-    async fn insert_then_read_then_delete_then_read() {
+    #[test]
+    fn insert_then_read_then_delete_then_read() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -989,7 +822,7 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Read the keys from the store
@@ -1003,14 +836,14 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // ReWrite the keys to the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Read the keys from the store
@@ -1021,8 +854,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn records_not_lost_when_store_is_closed() {
+    #[test]
+    fn records_not_lost_when_store_is_closed() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1040,10 +873,10 @@ mod tests {
             // Insert an item into the store
             let mut txn = store.begin().unwrap();
             txn.set(key, value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             drop(txn);
-            store.close().await.unwrap();
+            store.close().unwrap();
         }
         {
             // Reopen the store
@@ -1057,11 +890,7 @@ mod tests {
         }
     }
 
-    async fn test_records_when_store_is_dropped(
-        durability: Durability,
-        wait: bool,
-        should_exist: bool,
-    ) {
+    fn test_records_when_store_is_dropped(durability: Durability, wait: bool, should_exist: bool) {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1080,7 +909,7 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set_durability(durability);
             txn.set(key, value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             drop(txn);
             drop(store);
@@ -1088,7 +917,7 @@ mod tests {
 
         if wait {
             // Give some room for the store to close asynchronously
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         {
@@ -1107,24 +936,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn eventual_durability_records_persist_after_drop() {
-        test_records_when_store_is_dropped(Durability::Eventual, true, true).await;
+    #[test]
+    fn eventual_durability_records_persist_after_drop() {
+        test_records_when_store_is_dropped(Durability::Eventual, true, true);
     }
 
-    #[tokio::test]
-    async fn eventual_durability_records_persist_without_wait() {
-        test_records_when_store_is_dropped(Durability::Eventual, false, true).await;
+    #[test]
+    fn eventual_durability_records_persist_without_wait() {
+        test_records_when_store_is_dropped(Durability::Eventual, false, true);
     }
 
-    #[tokio::test]
-    async fn strong_durability_records_persist() {
-        test_records_when_store_is_dropped(Durability::Immediate, true, true).await;
-        test_records_when_store_is_dropped(Durability::Immediate, false, true).await;
+    #[test]
+    fn strong_durability_records_persist() {
+        test_records_when_store_is_dropped(Durability::Immediate, true, true);
+        test_records_when_store_is_dropped(Durability::Immediate, false, true);
     }
 
-    #[tokio::test]
-    async fn store_closed_twice_without_error() {
+    #[test]
+    fn store_closed_twice_without_error() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1136,16 +965,10 @@ mod tests {
         let store = Store::new(opts.clone()).expect("should create store");
 
         // Close the store once
-        assert!(
-            store.close().await.is_ok(),
-            "should close store without error"
-        );
+        assert!(store.close().is_ok(), "should close store without error");
 
         // Close the store a second time
-        assert!(
-            store.close().await.is_ok(),
-            "should close store without error"
-        );
+        assert!(store.close().is_ok(), "should close store without error");
     }
 
     /// Returns pairs of key, value
@@ -1161,7 +984,7 @@ mod tests {
         pairs
     }
 
-    async fn test_durability(durability: Durability, wait_enabled: bool) {
+    fn test_durability(durability: Durability, wait_enabled: bool) {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1185,14 +1008,14 @@ mod tests {
                     txn.set(key.as_slice(), value.as_slice()).unwrap();
                 }
             }
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             drop(store);
         }
 
         // Wait for a while to let close be called on drop as it is executed asynchronously
         if wait_enabled {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let store = Store::new(opts.clone()).expect("should create store");
@@ -1210,18 +1033,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn eventual_durability() {
-        test_durability(Durability::Eventual, false).await;
+    #[test]
+    fn eventual_durability() {
+        test_durability(Durability::Eventual, false);
     }
 
-    #[tokio::test]
-    async fn immediate_durability() {
-        test_durability(Durability::Immediate, false).await;
+    #[test]
+    fn immediate_durability() {
+        test_durability(Durability::Immediate, false);
     }
 
-    #[tokio::test]
-    async fn store_without_persistance() {
+    #[test]
+    fn store_without_persistance() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1254,7 +1077,7 @@ mod tests {
             // Start a new write transaction
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Read the keys to the store
@@ -1267,7 +1090,7 @@ mod tests {
         }
 
         // Drop the store to simulate closing it
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         let store = Store::new(opts).expect("should create store");
 
@@ -1279,8 +1102,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn basic_compaction1() {
+    #[test]
+    fn basic_compaction1() {
         // Create a temporary directory for testing
         let temp_dir = create_temp_directory();
 
@@ -1314,29 +1137,29 @@ mod tests {
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.set(key, &default_value2).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         let key_bytes = Bytes::from(2usize.to_le_bytes().to_vec());
         let mut txn = store.begin().unwrap();
         txn.set(&key_bytes, &default_value2).unwrap();
-        txn.commit().await.unwrap();
+        txn.commit().unwrap();
 
         // Delete the first 5 keys from the store
         for key in keys.iter() {
             let mut txn = store.begin().unwrap();
             txn.delete(key).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
-        store.inner.as_ref().unwrap().compact().await.unwrap();
-        store.close().await.unwrap();
+        store.compact().unwrap();
+        store.close().unwrap();
 
         let reopened_store = Store::new(opts).expect("should reopen store");
         for key in keys.iter() {
@@ -1345,8 +1168,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_store_with_varying_segment_sizes() {
+    #[test]
+    fn test_store_with_varying_segment_sizes() {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
@@ -1363,9 +1186,9 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&k1.clone(), &val.clone()).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
-        store.close().await.expect("should close store");
+        store.close().expect("should close store");
 
         // Step 2: Reopen store with a smaller max segment size and append a record
         opts.max_segment_size = 37; // Smaller max segment size
@@ -1373,7 +1196,7 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&k2.clone(), &val).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             // Verify the first record
             let mut txn = store.begin().unwrap();
@@ -1384,7 +1207,7 @@ mod tests {
             let val2 = txn.get(&k2).unwrap().unwrap();
             assert_eq!(val2, val);
         }
-        store.close().await.expect("should close store");
+        store.close().expect("should close store");
 
         // Step 3: Reopen store with a larger max segment size and append a record
         opts.max_segment_size = 121; // Larger max segment size
@@ -1392,7 +1215,7 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&k3.clone(), &val).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             // Verify the first record
             let mut txn = store.begin().unwrap();
@@ -1407,7 +1230,7 @@ mod tests {
             let val3 = txn.get(&k3).unwrap().unwrap();
             assert_eq!(val3, val);
         }
-        store.close().await.expect("should close store");
+        store.close().expect("should close store");
 
         // Step 4: Reopen store with a max segment size smaller than the record
         opts.max_segment_size = 36; // Smallest max segment size
@@ -1415,17 +1238,17 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&k4.clone(), &val).unwrap();
-            let err = txn.commit().await.err().unwrap();
+            let err = txn.commit().err().unwrap();
             match err {
                 Error::LogError(LogError::RecordTooLarge) => (),
                 _ => panic!("expected RecordTooLarge error"),
             };
         }
-        store.close().await.expect("should close store");
+        store.close().expect("should close store");
     }
 
-    #[tokio::test]
-    async fn load_index_with_disabled_versions() {
+    #[test]
+    fn load_index_with_disabled_versions() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: false,
@@ -1439,23 +1262,23 @@ mod tests {
         let store = Store::new(opts.clone()).unwrap();
         let mut txn1 = store.begin().unwrap();
         txn1.set(key, value1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.set(key, value2).unwrap();
-        txn2.commit().await.unwrap();
-        store.close().await.unwrap();
+        txn2.commit().unwrap();
+        store.close().unwrap();
 
         let store = Store::new(opts.clone()).unwrap();
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn insert_with_disabled_versions() {
+    #[test]
+    fn insert_with_disabled_versions() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: false,
@@ -1470,22 +1293,22 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(key, value1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.set(key, value2).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn insert_with_disabled_versions_in_memory() {
+    #[test]
+    fn insert_with_disabled_versions_in_memory() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: false,
@@ -1501,22 +1324,22 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(key, value1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.set(key, value2).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn insert_with_replace() {
+    #[test]
+    fn insert_with_replace() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: true,
@@ -1531,22 +1354,22 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(key, value1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.insert_or_replace(key, value2).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn insert_with_replace_in_memory() {
+    #[test]
+    fn insert_with_replace_in_memory() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: true,
@@ -1562,22 +1385,22 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set(key, value1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.insert_or_replace(key, value2).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
         let history = txn.get_all_versions(key).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0, value2);
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn delete_with_versions_disabled() {
+    #[test]
+    fn delete_with_versions_disabled() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: false,
@@ -1591,11 +1414,11 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set_at_ts(&key, value1, 1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.soft_delete(&key).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn3 = store.begin().unwrap();
         let versions: Vec<_> = txn3
@@ -1603,11 +1426,11 @@ mod tests {
             .collect();
         assert!(versions.is_empty());
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn delete_with_versions_disabled_in_memory() {
+    #[test]
+    fn delete_with_versions_disabled_in_memory() {
         let opts = Options {
             dir: create_temp_directory().path().to_path_buf(),
             enable_versions: false,
@@ -1622,11 +1445,11 @@ mod tests {
 
         let mut txn1 = store.begin().unwrap();
         txn1.set_at_ts(&key, value1, 1).unwrap();
-        txn1.commit().await.unwrap();
+        txn1.commit().unwrap();
 
         let mut txn2 = store.begin().unwrap();
         txn2.soft_delete(&key).unwrap();
-        txn2.commit().await.unwrap();
+        txn2.commit().unwrap();
 
         let txn3 = store.begin().unwrap();
         let versions: Vec<_> = txn3
@@ -1634,7 +1457,7 @@ mod tests {
             .collect();
         assert!(versions.is_empty());
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
     // Common setup logic for creating a store
@@ -1651,8 +1474,8 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_store_version_after_reopen() {
+    #[test]
+    fn test_store_version_after_reopen() {
         let (store, temp_dir) = create_store(None, false);
 
         // Define the number of keys, key size, and value size
@@ -1676,21 +1499,18 @@ mod tests {
             for key in &keys {
                 let mut txn = store.begin().unwrap();
                 txn.set(key, &value).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
             }
         }
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Reopen the store
         let (store, _) = create_store(Some(temp_dir), false);
 
         // Verify if the indexer version is set correctly
-        assert_eq!(
-            store.inner.as_ref().unwrap().core.indexer.read().version(),
-            num_keys as u64
-        );
+        assert_eq!(store.core.indexer.read().version(), num_keys as u64);
 
         // Verify that the keys are present in the store
         let txn = store.begin_with_mode(crate::Mode::ReadOnly).unwrap();
@@ -1700,11 +1520,11 @@ mod tests {
             assert_eq!(history[0].0, value);
         }
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_incremental_transaction_ids_post_store_open() {
+    #[test]
+    fn test_incremental_transaction_ids_post_store_open() {
         let (store, temp_dir) = create_store(None, false);
 
         let total_records = 1000;
@@ -1722,7 +1542,7 @@ mod tests {
         for (i, key) in keys.iter().enumerate().take(multiple_keys_records) {
             let mut txn = store.begin().unwrap();
             txn.set(key, &values[i]).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Insert multiple transactions with multiple keys
@@ -1736,14 +1556,14 @@ mod tests {
             txn.set(key, &values[i]).unwrap();
             txn.set(&keys[(i + 1) % keys.len()], &values[(i + 1) % values.len()])
                 .unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
         }
 
         // Close the store
-        store.close().await.unwrap();
+        store.close().unwrap();
 
         // Add delay to ensure that the store is closed
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Reopen the store
         let (store, _) = create_store(Some(temp_dir), false);
@@ -1752,7 +1572,7 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(&keys[0], &values[0]).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             let res = txn.get_versionstamp().unwrap();
 
@@ -1764,125 +1584,18 @@ mod tests {
             let mut txn = store.begin().unwrap();
             txn.set(&keys[1], &values[1]).unwrap();
             txn.set(&keys[2], &values[2]).unwrap();
-            txn.commit().await.unwrap();
+            txn.commit().unwrap();
 
             let res = txn.get_versionstamp().unwrap();
 
             assert_eq!(res.0, total_records as u64 + 2);
         }
 
-        store.close().await.unwrap();
+        store.close().unwrap();
     }
 
-    #[tokio::test]
-    async fn stop_task_runner_with_pending_tasks() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        let (writes_tx, writes_rx) = bounded(100);
-        let (stop_tx, stop_rx) = bounded(1);
-        let core = Arc::new(Core::new(opts, writes_tx.clone()).unwrap());
-
-        let (runner, done_rx) = TaskRunner::new(core.clone(), writes_rx, stop_rx);
-        runner.spawn();
-
-        // Create a task that will take some time to process
-        let (slow_done_tx, slow_done_rx) = bounded(1);
-        let slow_task = Task {
-            entries: vec![],
-            done: Some(slow_done_tx),
-            tx_id: 1,
-            durability: Durability::default(),
-        };
-
-        // Send the slow task
-        writes_tx.send(slow_task).await.unwrap();
-
-        // Send stop signal immediately
-        stop_tx.send(()).await.unwrap();
-
-        // Wait for TaskRunner to finish
-        done_rx
-            .recv()
-            .await
-            .expect("TaskRunner should signal completion");
-
-        // Verify the slow task was completed
-        assert!(slow_done_rx.recv().await.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stop_task_runner_concurrent_tasks() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-
-        // Create a new store instance
-        let store = Store::new(opts).expect("should create store");
-
-        let (writes_tx, writes_rx) = bounded(1000); // Increased buffer size
-        let (stop_tx, stop_rx) = bounded(1);
-        let core = &store.inner.as_ref().unwrap().core;
-
-        let (runner, finish_rx) = TaskRunner::new(core.clone(), writes_rx, stop_rx);
-        runner.spawn();
-
-        let task_counter = Arc::new(AtomicU64::new(0));
-        let total_tasks = 1000;
-
-        // First, send all tasks before stopping
-        for i in 0..total_tasks {
-            let (done_tx, done_rx) = bounded(1);
-            writes_tx
-                .send(Task {
-                    entries: vec![],
-                    done: Some(done_tx),
-                    tx_id: i,
-                    durability: Durability::default(),
-                })
-                .await
-                .expect("should send task");
-
-            let task_counter = task_counter.clone();
-            tokio::spawn(async move {
-                done_rx.recv().await.unwrap().unwrap();
-                task_counter.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-
-        // Give some time for tasks to be processed
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Send stop signal
-        stop_tx.send(()).await.expect("should send stop signal");
-
-        // Wait for TaskRunner to finish
-        finish_rx
-            .recv()
-            .await
-            .expect("TaskRunner should signal completion");
-
-        // Give some time for all task counters to be updated
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Check that all tasks that were sent were processed
-        let final_count = task_counter.load(Ordering::SeqCst);
-        assert_eq!(
-            final_count, total_tasks,
-            "Expected {} tasks to be processed, but got {}",
-            total_tasks, final_count
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_incremental_transaction_ids_concurrent() {
+    #[test]
+    fn test_incremental_transaction_ids_concurrent() {
         for is_ssi in [false, true] {
             let (store, temp_dir) = create_store(None, is_ssi);
             let store = Arc::new(store);
@@ -1904,16 +1617,16 @@ mod tests {
                 let store = store.clone();
                 let key = key.clone();
                 let value = values[i].clone();
-                tasks.push(tokio::spawn(async move {
+                tasks.push(std::thread::spawn(move || {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }));
             }
 
             // Wait for all tasks to complete
             for task in tasks {
-                task.await.unwrap();
+                task.join().unwrap();
             }
 
             // Insert multiple transactions with multiple keys concurrently
@@ -1929,23 +1642,23 @@ mod tests {
                 let value = values[i].clone();
                 let next_key = keys[(i + multiple_keys_records) % keys.len()].clone();
                 let next_value = values[(i + multiple_keys_records) % values.len()].clone();
-                tasks.push(tokio::spawn(async move {
+                tasks.push(std::thread::spawn(move || {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value).unwrap();
                     txn.set(&next_key, &next_value).unwrap();
-                    txn.commit().await.unwrap();
+                    txn.commit().unwrap();
                 }));
             }
 
             // Wait for all tasks to complete
             for task in tasks {
-                task.await.unwrap();
+                task.join().unwrap();
             }
             // Close the store
-            store.close().await.unwrap();
+            store.close().unwrap();
 
             // Add delay to ensure that the store is closed
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            std::thread::sleep(std::time::Duration::from_millis(50));
 
             // Reopen the store
             let (store, _) = create_store(Some(temp_dir), is_ssi);
@@ -1954,7 +1667,7 @@ mod tests {
             {
                 let mut txn = store.begin().unwrap();
                 txn.set(&keys[0], &values[0]).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
 
                 let res = txn.get_versionstamp().unwrap();
 
@@ -1966,14 +1679,46 @@ mod tests {
                 let mut txn = store.begin().unwrap();
                 txn.set(&keys[1], &values[1]).unwrap();
                 txn.set(&keys[2], &values[2]).unwrap();
-                txn.commit().await.unwrap();
+                txn.commit().unwrap();
 
                 let res = txn.get_versionstamp().unwrap();
 
                 assert_eq!(res.0, total_records as u64 + 2);
             }
 
-            store.close().await.unwrap();
+            store.close().unwrap();
         }
+    }
+
+    #[test]
+    fn test_append_log_consistency_during_close() {
+        let (store, _) = create_store(None, false);
+
+        let store = Arc::new(store);
+        // Start a transaction with a large value to ensure significant append time
+        let store_clone = store.clone();
+        let tx_handle = std::thread::spawn(move || {
+            store_clone.write(|txn| {
+                // Create a large value that will take time to append
+                let large_value = vec![1u8; 10 * 1024 * 1024]; // 10MB value
+                txn.set(b"large_key", &large_value)?;
+                Ok(())
+            })
+        });
+
+        // Attempt to close the store during append
+        let store_clone = store.clone();
+        let close_handle = std::thread::spawn(move || {
+            // Try to close while append is in progress
+            store_clone.close()
+        });
+
+        // Wait for both operations to complete
+        let tx_res = tx_handle.join().unwrap();
+        assert!(matches!(
+            tx_res,
+            Err(Error::LogError(LogError::SegmentClosed))
+        ));
+        close_handle.join().unwrap().unwrap();
     }
 }

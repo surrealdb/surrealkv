@@ -2,7 +2,6 @@ use std::{fmt, io, sync::Arc};
 use vart::TrieError;
 
 use crate::log::Error as LogError;
-use crate::store::Task;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
@@ -149,24 +148,6 @@ impl From<TrieError> for Error {
 impl From<LogError> for Error {
     fn from(log_error: LogError) -> Self {
         Error::LogError(log_error)
-    }
-}
-
-impl From<async_channel::SendError<Task>> for Error {
-    fn from(error: async_channel::SendError<Task>) -> Self {
-        Error::SendError(format!("Async channel send error: {}", error))
-    }
-}
-
-impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
-    fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
-        Error::SendError(format!("Async channel send error: {}", error))
-    }
-}
-
-impl From<async_channel::RecvError> for Error {
-    fn from(error: async_channel::RecvError) -> Self {
-        Error::ReceiveError(format!("Async channel receive error: {}", error))
     }
 }
 

@@ -35,7 +35,7 @@ let value = Bytes::from("world");
 txn.set(&key, &value).unwrap();
 
 // Commit the transaction
-txn.commit().await.unwrap();
+txn.commit().unwrap();
 ```
 
 ## Configuration
@@ -105,7 +105,7 @@ let store = Store::new(opts).expect("failed to create store");
     txn.set(&key2, &value).unwrap();
     
     // Commit changes
-    txn.commit().await.unwrap();
+    txn.commit().unwrap();
 }
 
 // Read Transaction
@@ -119,7 +119,7 @@ let store = Store::new(opts).expect("failed to create store");
 }
 
 // Close the store when done
-store.close().await.unwrap();
+store.close().unwrap();
 ```
 
 ### Versioned Operations

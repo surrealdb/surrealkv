@@ -1,7 +1,7 @@
 use bytes::Bytes;
+use parking_lot::Mutex;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex as AsyncMutex;
 use vart::VariableSizeKey;
 
 use crate::error::{Error, Result};
@@ -14,7 +14,7 @@ use crate::transaction::Transaction;
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
     /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: AsyncMutex<()>,
+    pub(crate) write_lock: Mutex<()>,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -33,7 +33,7 @@ impl Oracle {
         };
 
         Self {
-            write_lock: AsyncMutex::new(()),
+            write_lock: Mutex::new(()),
             isolation,
         }
     }
