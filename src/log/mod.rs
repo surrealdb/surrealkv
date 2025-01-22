@@ -2,6 +2,9 @@ mod aol;
 pub use aol::Aol;
 
 use ahash::{HashMap, HashMapExt};
+
+#[cfg(not(unix))]
+use parking_lot::Mutex;
 use std::fmt;
 use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
@@ -656,6 +659,11 @@ pub(crate) struct Segment {
     /// The maximum size of the segment file.
     pub(crate) file_size: u64,
 
+    /// A lock used to synchronize concurrent read access to the segment
+    /// for the platforms that don't have FileExt::read_at().
+    #[cfg(not(unix))]
+    mutex: Mutex<()>,
+
     /// A flag indicating whether the segment is closed or not.
     closed: bool,
 }
@@ -709,6 +717,8 @@ impl Segment {
             file_path,
             id,
             closed: false,
+            #[cfg(not(unix))]
+            mutex: Mutex::new(()),
             file_size: opts.max_file_size,
         })
     }
@@ -835,6 +845,7 @@ impl Segment {
         #[cfg(not(unix))]
         {
             let mut file = &self.file;
+            let _lock = self.mutex.lock();
             file.seek(SeekFrom::Start(self.file_header_offset + off))?;
             bytes_read = file.read(bs)?;
         }
