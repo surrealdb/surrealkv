@@ -1499,4 +1499,70 @@ mod tests {
         // Close the store
         store.close().unwrap();
     }
+
+    #[test]
+    fn compaction_preserves_key_deletion() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.max_value_threshold = 0;
+        opts.max_value_cache_size = 0;
+
+        // Create a new store instance with VariableKey as the key type
+        let store = Store::new(opts.clone()).expect("should create store");
+
+        // Number of keys to generate and write
+        let num_keys_to_write = 1;
+
+        // Create a vector to store the generated keys
+        let mut keys: Vec<Bytes> = Vec::new();
+
+        for counter in 1usize..=num_keys_to_write {
+            // Convert the counter to Bytes
+            let key_bytes = Bytes::from(counter.to_le_bytes().to_vec());
+
+            // Add the key to the vector
+            keys.push(key_bytes);
+        }
+
+        let default_value = Bytes::from("default_value".to_string());
+        let default_value2 = Bytes::from("default_value2".to_string());
+
+        // Write the keys to the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value).unwrap();
+            txn.commit().unwrap();
+        }
+
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.set(key, &default_value2).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let key_bytes = Bytes::from(2usize.to_le_bytes().to_vec());
+        let mut txn = store.begin().unwrap();
+        txn.set(&key_bytes, &default_value2).unwrap();
+        txn.commit().unwrap();
+
+        // Delete the first 5 keys from the store
+        for key in keys.iter() {
+            let mut txn = store.begin().unwrap();
+            txn.delete(key).unwrap();
+            txn.commit().unwrap();
+        }
+
+        store.compact().unwrap();
+        store.close().unwrap();
+
+        let reopened_store = Store::new(opts).expect("should reopen store");
+        for key in keys.iter() {
+            let mut txn = reopened_store.begin().unwrap();
+            assert!(txn.get(key).unwrap().is_none());
+        }
+    }
 }
