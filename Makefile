@@ -10,7 +10,7 @@ check:
 	cargo clippy --all --all-targets
 
 # This command runs the tests with backtrace enabled.
-test: check
+test:
 	RUST_BACKTRACE=1 cargo test
 
 .PHONY: build-cli
