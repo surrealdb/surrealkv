@@ -35,18 +35,13 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v2
-      - name: Cache
-        id: rust-cache
-        uses: actions/cache@v3
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
         with:
-            path: |
-                ~/.cargo/bin/
-                ~/.cargo/registry/index/
-                ~/.cargo/registry/cache/
-                ~/.cargo/git/db/
-                target/
-            key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: actions-rs/toolchain@v1
         with:
@@ -59,8 +54,8 @@ jobs:
         run: cargo build --target=${{ matrix.target }}
 
       - name: Run tests
-        # Skip tests on Windows as compaction tests fail due to file permissions issue. Need to fix the tests.
         if: ${{ !contains(matrix.os, 'windows') }}
+        # Skip tests on Windows as compaction tests are not supported
         run: make test
 
   ci:
@@ -69,18 +64,13 @@ jobs:
       RUSTFLAGS: --deny warnings
 
     steps:
-      - uses: actions/checkout@v2
-      - name: Cache
-        id: rust-cache
-        uses: actions/cache@v3
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
         with:
-            path: |
-                ~/.cargo/bin/
-                ~/.cargo/registry/index/
-                ~/.cargo/registry/cache/
-                ~/.cargo/git/db/
-                target/
-            key: ubuntu-ci-cargo-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: actions-rs/toolchain@v1
         with:
