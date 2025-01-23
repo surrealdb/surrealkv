@@ -7,7 +7,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use surrealkv::storage::log::{Error, Options, Result, Segment};
+use surrealkv::log::{Error, Options, Result, Segment};
 
 pub struct SysFile {
     file: Mutex<Segment>,

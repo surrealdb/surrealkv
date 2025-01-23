@@ -42,6 +42,7 @@ mimalloc = { version = "0.1.39", default-features = false }
 num_cpus = "1.16.0"
 walkdir = "2.5.0"
 dashmap = "6.1.0"
+tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "store_bench"
