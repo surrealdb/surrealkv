@@ -59,7 +59,7 @@ opts.isolation_level = IsolationLevel::Snapshot;    // Controls transaction isol
 opts.enable_versions = true;                        // Enable/disable versioning
 
 // Cache settings
-opts.max_value_cache_size = 67_108_864;            // 64MB value cache size
+opts.max_value_cache_size = 10000;            // Number of values that can be cached to avoid disk lookups
 
 let store = Store::new(opts).expect("failed to create store");
 ```
@@ -126,14 +126,14 @@ store.close().unwrap();
 
 ```rust
 // Get value at specific timestamp
-let value = tx.get_at_ts(b"key1", timestamp)?;
+let value = tx.get_at_version(b"key1", timestamp)?;
 
 // Get complete history of a key
-let history = tx.get_history(b"key1")?;
+let history = tx.get_all_versions(b"key1")?;
 
 // Scan range at specific timestamp
 let range = b"start"..b"end";
-let results = tx.scan_at_ts(range, timestamp, Some(10))?;
+let results = tx.scan_at_version(range, timestamp, Some(10));
 ```
 
 ### Transaction Control
@@ -157,10 +157,10 @@ tx.rollback();
 ```rust
 // Scan a range of keys
 let range = b"start"..b"end";
-let results = tx.scan(range, Some(10))?;
+let results = tx.scan(range, Some(10));
 
 // Scan all versions in a range
-let all_versions = tx.scan_all_versions(range, Some(10))?;
+let all_versions = tx.scan_all_versions(range, Some(10));
 ```
 
 ## Advanced Features
