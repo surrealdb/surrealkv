@@ -1,3 +1,4 @@
+#![allow(clippy::single_element_loop)]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -15,6 +16,9 @@ use tempdir::TempDir;
 // Should be kept in sync with https://github.com/surrealdb/surrealdb/blob/main/src/mem/mod.rs
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), global_allocator)]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const DEFAULT_KEY_SIZE: usize = 30;
+const DEFAULT_VALUE_SIZE: usize = 200;
 
 fn create_temp_directory() -> TempDir {
     TempDir::new("test").unwrap()
@@ -53,16 +57,16 @@ fn sequential_insert(c: &mut Criterion) {
         );
     };
 
-    for key_len in &[8_usize, 32, 128, 256] {
-        for val_len in &[8, 256, 1024, 4096] {
+    for key_len in &[DEFAULT_KEY_SIZE] {
+        for val_len in &[DEFAULT_VALUE_SIZE] {
             bench(*key_len, *val_len);
         }
     }
 }
 
 fn random_insert(c: &mut Criterion) {
-    for key_len in &[8_usize, 32, 128, 256] {
-        for val_len in &[8, 256, 1024, 4096] {
+    for key_len in &[DEFAULT_KEY_SIZE] {
+        for val_len in &[DEFAULT_VALUE_SIZE] {
             let key_len = *key_len;
             let val_len = *val_len;
 
@@ -114,8 +118,8 @@ fn bulk_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("bulk_operations");
 
     // Test different batch sizes
-    let batch_sizes = [10, 100, 1000];
-    let value_sizes = [10, 100, 1000];
+    let batch_sizes = [1000];
+    let value_sizes = [DEFAULT_VALUE_SIZE];
 
     for &batch_size in &batch_sizes {
         for &value_size in &value_sizes {
@@ -193,12 +197,14 @@ fn concurrent_insert(c: &mut Criterion) {
     // Configuration
     let item_count = 100_000;
 
-    let key_sizes = vec![30]; // in bytes
-    let value_sizes = vec![200]; // in bytes
+    let key_sizes = vec![DEFAULT_KEY_SIZE]; // in bytes
+    let value_sizes = vec![DEFAULT_VALUE_SIZE]; // in bytes
     let thread_counts = vec![num_cpus::get()];
 
     let mut group = c.benchmark_group("concurrent_inserts");
-    group.throughput(criterion::Throughput::Elements(item_count as u64));
+    group
+        .throughput(criterion::Throughput::Elements(item_count as u64))
+        .sample_size(10);
 
     for &key_size in &key_sizes {
         for &value_size in &value_sizes {
@@ -277,8 +283,8 @@ fn concurrent_insert(c: &mut Criterion) {
 fn range_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("range_scans");
 
-    let scan_sizes = [100u32, 1000, 10000];
-    let value_size = 100;
+    let scan_sizes = [10000_u32];
+    let value_size = DEFAULT_VALUE_SIZE;
 
     for &scan_size in &scan_sizes {
         let db = {
@@ -320,7 +326,7 @@ fn concurrent_workload(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_workload");
 
     let operations_per_thread = 1000;
-    let value_size = 1000;
+    let value_size = DEFAULT_VALUE_SIZE;
     let thread_counts = [num_cpus::get() as u64];
     let read_ratios = [0.0, 0.5, 0.95, 1.0]; // 0%, 50%, 95%, 100% reads
 
