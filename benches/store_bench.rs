@@ -193,9 +193,9 @@ fn concurrent_insert(c: &mut Criterion) {
     // Configuration
     let item_count = 100_000;
 
-    let key_sizes = vec![16, 64, 256, 1024]; // in bytes
-    let value_sizes = vec![32, 128, 512, 2048]; // in bytes
-    let thread_counts = vec![1, 2, 4, num_cpus::get()];
+    let key_sizes = vec![30]; // in bytes
+    let value_sizes = vec![200]; // in bytes
+    let thread_counts = vec![num_cpus::get()];
 
     let mut group = c.benchmark_group("concurrent_inserts");
     group.throughput(criterion::Throughput::Elements(item_count as u64));
@@ -399,4 +399,4 @@ criterion_group!(
 );
 criterion_group!(benches_range, range_scan);
 criterion_group!(benches_concurrent, concurrent_insert, concurrent_workload);
-criterion_main!(benches_insert, benches_range);
+criterion_main!(benches_insert, benches_range, benches_concurrent);
