@@ -688,7 +688,7 @@ impl Segment {
             None
         };
 
-        // Now open read handle - file must exist at this point if in write mode
+        // Open read handle
         let mut read_file = Self::open_file(&file_path, opts, false)?;
 
         // Initialize the file header offset

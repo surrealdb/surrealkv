@@ -235,25 +235,6 @@ impl Aol {
 
             // Use reader and return it to pool on drop
             reader.segment.as_ref().unwrap().read_at(buf, read_offset)
-
-            // // Try to get segment from cache first
-            //     match self.segment_cache.get(&segment_id) {
-            //         Some(segment) => segment.read_at(buf, read_offset),
-            //         None => {
-            //             // If not in cache, open the segment and cache it
-            //             // Use get_or_insert_with to ensure atomic insertion
-            //             let segment = self
-            //                 .segment_cache
-            //                 .get_or_insert_with(&segment_id, || {
-            //                     Segment::open(&self.dir, segment_id, &self.opts, true).map(Arc::new)
-            //                 })
-            //                 .unwrap();
-
-            //             let read_bytes = segment.read_at(buf, read_offset)?;
-
-            //             Ok(read_bytes)
-            //         }
-            //     }
         }
     }
 
