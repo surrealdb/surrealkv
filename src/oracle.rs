@@ -244,20 +244,11 @@ impl SerializableSnapshotIsolation {
             // Get all writes in the range from the snapshot
             let range_writes = current_snapshot.range(range.range.clone());
 
-            for (key, _, version, _) in range_writes {
+            for (_, _, version, _) in range_writes {
                 if version > txn.read_ts {
-                    // Check if this key was deleted in current transaction
-                    match txn.write_set.get(key) {
-                        Some(entries)
-                            if entries
-                                .last()
-                                .is_some_and(|e| e.e.is_deleted_or_tombstone()) =>
-                        {
-                            // Key is being deleted in current txn, don't count as conflict
-                            continue;
-                        }
-                        _ => return Err(Error::TransactionReadConflict),
-                    }
+                    // Any modification after our read timestamp should cause a conflict
+                    // regardless of whether we're deleting the key or not
+                    return Err(Error::TransactionReadConflict);
                 }
             }
 
