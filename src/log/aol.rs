@@ -62,7 +62,7 @@ impl Aol {
         let active_segment = Segment::open(dir, active_segment_id, opts, false)?;
 
         // Create the lock-free cache with specified capacity
-        let segment_cache = Cache::new(opts.max_open_files as usize);
+        let segment_cache = Cache::new(opts.max_open_files);
 
         Ok(Self {
             active_segment,

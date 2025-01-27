@@ -711,7 +711,7 @@ impl Segment {
             // Only write header if we're in write mode
             if let Some(ref write_handle) = write_file {
                 let mut file = write_handle.lock();
-                let header_len = write_file_header(&mut *file, id, opts)?;
+                let header_len = write_file_header(&mut file, id, opts)?;
                 file_header_offset += header_len;
             }
         }

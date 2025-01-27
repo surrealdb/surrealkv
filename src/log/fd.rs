@@ -64,7 +64,7 @@ pub struct PooledReader<'a> {
     pool: &'a SegmentReaderPool,
 }
 
-impl<'a> Drop for PooledReader<'a> {
+impl Drop for PooledReader<'_> {
     fn drop(&mut self) {
         if let Some(reader) = self.segment.take() {
             self.pool.return_reader(reader);
