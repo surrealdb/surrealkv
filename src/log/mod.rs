@@ -878,10 +878,11 @@ impl Segment {
         }
         #[cfg(not(unix))]
         {
-            let mut file = &self.file;
+            let mut file = &self.read_file;
             let _lock = self.mutex.lock();
             file.seek(SeekFrom::Start(actual_read_offset))?;
-            bytes_read = file.read(bs)?;
+            let bytes_read = file.read(bs)?;
+            Ok(bytes_read)
         }
     }
 
