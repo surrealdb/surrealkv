@@ -101,15 +101,6 @@ impl Store {
     }
 }
 
-impl Drop for Store {
-    fn drop(&mut self) {
-        if let Err(err) = self.close() {
-            // TODO: use log/tracing instead of eprintln
-            eprintln!("Error closing store: {}", err);
-        }
-    }
-}
-
 /// Core of the key-value store.
 pub struct Core {
     /// Index for store.
@@ -576,6 +567,18 @@ impl Core {
         self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
 
         Ok(buf)
+    }
+}
+
+// Implement Drop for Core instead of Store. All open transactions
+// hold references to Core, therefore it will never be dropped if
+// Store is dropped until all the transactions are done.
+// Store::close() can always be called directly if more control is needed.
+impl Drop for Core {
+    fn drop(&mut self) {
+        if let Err(err) = self.close() {
+            eprintln!("Error closing store core: {}", err);
+        }
     }
 }
 
