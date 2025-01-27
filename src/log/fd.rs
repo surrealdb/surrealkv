@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
 use parking_lot::Mutex;
 
@@ -12,6 +13,7 @@ pub struct SegmentReaderPool {
     id: u64,
     opts: Options,
     pool_size: usize,
+    active_readers: AtomicUsize,
 }
 
 impl SegmentReaderPool {
@@ -24,6 +26,7 @@ impl SegmentReaderPool {
             id,
             opts,
             pool_size,
+            active_readers: AtomicUsize::new(0),
         })
     }
 
@@ -31,10 +34,12 @@ impl SegmentReaderPool {
         let mut readers = self.readers.lock();
         let segment = match readers.pop_front() {
             Some(reader) => reader,
-            None => {
-                // Pool exhausted, create new reader
+            None if self.active_readers.load(Ordering::Acquire) < self.pool_size => {
+                // Create new reader if under pool size limit
+                self.active_readers.fetch_add(1, Ordering::AcqRel);
                 Segment::open(&self.dir, self.id, &self.opts, true)?
             }
+            None => return Err(super::Error::NoAvailableReaders),
         };
 
         Ok(PooledReader {
@@ -47,8 +52,10 @@ impl SegmentReaderPool {
         let mut readers = self.readers.lock();
         if readers.len() < self.pool_size {
             readers.push_back(reader);
+        } else {
+            // Reader will be dropped and active_readers decremented
+            self.active_readers.fetch_sub(1, Ordering::AcqRel);
         }
-        // If pool is full, reader will be dropped
     }
 }
 

@@ -3,7 +3,7 @@ pub mod fd;
 pub use aol::Aol;
 
 use ahash::{HashMap, HashMapExt};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::fmt;
 use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
@@ -651,8 +651,15 @@ pub struct Segment {
     /// File handle for reading
     read_file: File,
 
-    /// Shared state protected by RwLock
-    state: RwLock<SegmentState>,
+    /// The base offset of the file.
+    pub(crate) file_header_offset: u64,
+
+    /// The current offset within the file.
+    pub(crate) file_offset: u64,
+
+    #[allow(dead_code)]
+    /// The maximum size of the segment file.
+    pub(crate) file_size: u64,
 
     /// A lock used to synchronize concurrent read access to the segment
     /// for the platforms that don't have FileExt::read_at().
@@ -661,16 +668,6 @@ pub struct Segment {
 
     /// A flag indicating whether the segment is closed or not.
     closed: bool,
-}
-
-pub(crate) struct SegmentState {
-    /// The base offset of the file.
-    pub(crate) file_header_offset: u64,
-    /// The current offset within the file.
-    pub(crate) file_offset: u64,
-    #[allow(dead_code)]
-    /// The maximum size of the segment file.
-    pub(crate) file_size: u64,
 }
 
 impl Segment {
@@ -723,12 +720,6 @@ impl Segment {
         // Seek to the end of the file to get the file offset
         let file_offset = read_file.seek(io::SeekFrom::End(0))?;
 
-        let state = SegmentState {
-            file_header_offset: file_header_offset as u64,
-            file_offset: file_offset - file_header_offset as u64,
-            file_size: opts.max_file_size,
-        };
-
         // Initialize and return the Segment
         Ok(Segment {
             write_file,
@@ -738,7 +729,9 @@ impl Segment {
             closed: false,
             #[cfg(not(unix))]
             mutex: Mutex::new(()),
-            state: RwLock::new(state),
+            file_header_offset: file_header_offset as u64,
+            file_offset: file_offset - file_header_offset as u64,
+            file_size: opts.max_file_size,
         })
     }
 
@@ -792,7 +785,7 @@ impl Segment {
 
     // Returns the current offset within the segment.
     pub(crate) fn offset(&self) -> u64 {
-        self.state.read().file_offset
+        self.file_offset
     }
 
     /// Appends data to the segment.
@@ -825,17 +818,22 @@ impl Segment {
             )));
         };
 
-        let mut state = self.state.write();
-        let mut file = write_file.lock();
+        let current_offset = self.file_offset;
+        let new_offset = current_offset + rec.len() as u64;
 
-        // Get the starting offset for the record
-        let offset = state.file_offset;
+        // Check against max file size
+        if new_offset > self.file_size {
+            return Err(Error::RecordTooLarge);
+        }
 
         // write_all does atomic writes to the file (in this case the os buffer)
+        // append mode ensures it's written at the end
+        let mut file = write_file.lock();
         file.write_all(rec)?;
-        state.file_offset += rec.len() as u64;
 
-        Ok(offset)
+        self.file_offset += rec.len() as u64;
+
+        Ok(current_offset)
     }
 
     /// Reads data from the segment at the specified offset from the underlying file.
@@ -862,8 +860,8 @@ impl Segment {
             )));
         }
 
-        let state = self.state.read();
-        if off > state.file_offset {
+        let current_offset = self.file_offset;
+        if off > current_offset {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Offset beyond current position",
@@ -871,7 +869,7 @@ impl Segment {
         }
 
         // Read from the file
-        let actual_read_offset = state.file_header_offset + off;
+        let actual_read_offset = self.file_header_offset + off;
 
         #[cfg(unix)]
         {
@@ -888,7 +886,7 @@ impl Segment {
     }
 
     pub(crate) fn file_offset(&self) -> u64 {
-        self.state.read().file_offset
+        self.file_offset
     }
 }
 
@@ -913,6 +911,7 @@ pub enum Error {
     Poison(String),
     RecordTooLarge,
     SegmentNotFound,
+    NoAvailableReaders,
 }
 
 // Implementation of Display trait for Error
@@ -930,6 +929,7 @@ impl fmt::Display for Error {
                 "Record is too large to fit in a segment. Increase max segment size"
             ),
             Error::SegmentNotFound => write!(f, "Segment not found"),
+            Error::NoAvailableReaders => write!(f, "No available readers"),
         }
     }
 }
