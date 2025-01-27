@@ -11,8 +11,6 @@ use crate::log::{
     fd::SegmentReaderPool, get_segment_range, Error, IOError, Options, Result, Segment,
 };
 
-const DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT: usize = 8;
-
 /// Append-Only Log (Aol) is a data structure used to sequentially store records
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
@@ -60,7 +58,7 @@ impl Aol {
         let active_segment = Segment::open(dir, active_segment_id, opts, false)?;
 
         // Create the lock-free cache with specified capacity
-        let segment_cache = Cache::new(opts.max_open_files);
+        let segment_cache = Cache::new(opts.max_cached_segments);
 
         Ok(Self {
             active_segment,
@@ -221,7 +219,7 @@ impl Aol {
                             self.dir.clone(),
                             segment_id,
                             self.opts.clone(),
-                            DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT, // Pool size - could be configurable
+                            self.opts.max_file_descriptor_per_segment,
                         )
                         .unwrap(),
                     ))

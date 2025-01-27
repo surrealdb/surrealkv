@@ -51,8 +51,11 @@ const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
 /// Default maximum size of the segment file.
 const DEFAULT_FILE_SIZE: u64 = 4096 * 256 * 20; // 20mb
 
-/// Default maximum number of open files allowed.
-const DEFAULT_MAX_OPEN_FILES: usize = 16;
+/// Default maximum number of open file readers allowed per segment.
+const DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT: usize = 4;
+
+/// Default maximum number of segments that can be cached in memory.
+const DEFAULT_MAX_CACHED_SEGMENTS: usize = 8;
 
 /// Constants for key names used in the file header.
 const KEY_MAGIC: &str = "magic";
@@ -147,12 +150,11 @@ pub struct Options {
     /// This is used by aol to cycle segments when the max file size is reached.
     pub(crate) max_file_size: u64,
 
-    /// The maximum number of open files allowed.
-    ///
-    /// If specified, this option sets the maximum number of open files allowed.
-    ///
-    /// This is used by aol to initialize the segment cache.
-    pub(crate) max_open_files: usize,
+    /// The maximum number of segments that can be cached in memory.
+    pub(crate) max_cached_segments: usize,
+
+    /// The maximum number of file descriptors per segment.
+    pub(crate) max_file_descriptor_per_segment: usize,
 }
 
 impl Default for Options {
@@ -165,7 +167,8 @@ impl Default for Options {
             metadata: None,                                       // default metadata
             file_extension: None,                                 // default extension
             max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
-            max_open_files: DEFAULT_MAX_OPEN_FILES,
+            max_file_descriptor_per_segment: DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT,
+            max_cached_segments: DEFAULT_MAX_CACHED_SEGMENTS,
         }
     }
 }
