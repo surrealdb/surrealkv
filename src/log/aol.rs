@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
@@ -32,11 +32,8 @@ pub struct Aol {
     /// A flag indicating whether the AOL instance is closed or not.
     closed: bool,
 
-    /// A read-write lock used to synchronize concurrent access to the AOL instance.
-    mutex: Mutex<()>,
-
     /// A cache used to store recently used segments to avoid opening and closing the files.
-    segment_cache: RwLock<LruCache<u64, Segment>>,
+    segment_cache: Mutex<LruCache<u64, Segment>>,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
@@ -70,8 +67,7 @@ impl Aol {
             dir: dir.to_path_buf(),
             opts: opts.clone(),
             closed: false,
-            mutex: Mutex::new(()),
-            segment_cache: RwLock::new(cache),
+            segment_cache: Mutex::new(cache),
             fsync_failed: Default::default(),
         })
     }
@@ -122,8 +118,6 @@ impl Aol {
         if rec.len() > self.opts.max_file_size as usize {
             return Err(Error::RecordTooLarge);
         }
-
-        let _lock = self.mutex.lock();
 
         // Get options and initialize variables
         let opts = &self.opts;
@@ -217,10 +211,9 @@ impl Aol {
         // During read, we acquire a lock to not allow concurrent writes and reads
         // to the active segment file to avoid seek errors.
         if segment_id == self.active_segment.id {
-            let _lock = self.mutex.lock();
             self.active_segment.read_at(buf, read_offset)
         } else {
-            let mut cache = self.segment_cache.write();
+            let mut cache = self.segment_cache.lock();
             match cache.get(&segment_id) {
                 Some(segment) => segment.read_at(buf, read_offset),
                 None => {
@@ -234,14 +227,12 @@ impl Aol {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        let _lock = self.mutex.lock();
         self.active_segment.close()?;
         self.closed = true;
         Ok(())
     }
 
     pub fn rotate(&mut self) -> Result<u64> {
-        let _lock = self.mutex.lock();
         self.active_segment.close()?;
         self.active_segment_id += 1;
         self.active_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
@@ -249,7 +240,6 @@ impl Aol {
     }
 
     pub fn size(&self) -> Result<u64> {
-        let _lock = self.mutex.lock();
         let cur_segment_size = self.active_segment.file_offset;
         let total_size = (self.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
