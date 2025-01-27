@@ -238,6 +238,8 @@ impl Aol {
 
     pub fn close(&mut self) -> Result<()> {
         self.active_segment.close()?;
+        // Clear segment cache to ensure all pools are dropped
+        self.segment_cache.clear();
         self.closed = true;
         Ok(())
     }

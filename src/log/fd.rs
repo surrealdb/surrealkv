@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
 use parking_lot::Mutex;
 
-use crate::log::{Options, Result, Segment};
+use crate::log::{Error, Options, Result, Segment};
 
 /// Pool of segment readers for a specific segment
 pub struct SegmentReaderPool {
@@ -30,41 +31,64 @@ impl SegmentReaderPool {
         })
     }
 
-    pub fn acquire_reader(&self) -> Result<PooledReader> {
+    pub fn acquire_reader(self: &Arc<Self>) -> Result<PooledReader> {
         let mut readers = self.readers.lock();
         let segment = match readers.pop_front() {
             Some(reader) => reader,
-            None if self.active_readers.load(Ordering::Acquire) < self.pool_size => {
-                // Create new reader if under pool size limit
-                self.active_readers.fetch_add(1, Ordering::AcqRel);
-                Segment::open(&self.dir, self.id, &self.opts, true)?
+            None => {
+                let mut current = self.active_readers.load(Ordering::Acquire);
+                loop {
+                    if current >= self.pool_size {
+                        return Err(Error::NoAvailableReaders);
+                    }
+
+                    // Try to update the value atomically
+                    match self.active_readers.compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            match Segment::open(&self.dir, self.id, &self.opts, true) {
+                                Ok(segment) => break segment,
+                                Err(e) => {
+                                    // Decrement counter on failure
+                                    self.active_readers.fetch_sub(1, Ordering::AcqRel);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(actual) => current = actual,
+                    }
+                }
             }
-            None => return Err(super::Error::NoAvailableReaders),
         };
 
         Ok(PooledReader {
             segment: Some(segment),
-            pool: self,
+            pool: Arc::clone(self),
         })
     }
 
-    pub fn return_reader(&self, reader: Segment) {
+    fn return_reader(&self, reader: Segment) {
         let mut readers = self.readers.lock();
         if readers.len() < self.pool_size {
             readers.push_back(reader);
         } else {
-            // Reader will be dropped and active_readers decremented
+            // If we can't reuse this reader, we need to decrement active_readers
+            // The reader will be dropped automatically when it goes out of scope
             self.active_readers.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
-pub struct PooledReader<'a> {
+pub struct PooledReader {
     pub segment: Option<Segment>,
-    pool: &'a SegmentReaderPool,
+    pool: Arc<SegmentReaderPool>,
 }
 
-impl Drop for PooledReader<'_> {
+impl Drop for PooledReader {
     fn drop(&mut self) {
         if let Some(reader) = self.segment.take() {
             self.pool.return_reader(reader);
