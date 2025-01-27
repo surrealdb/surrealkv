@@ -846,7 +846,7 @@ impl Segment {
         {
             let mut file = &self.file;
             let _lock = self.mutex.lock();
-            file.seek(SeekFrom::Start(self.file_header_offset + off))?;
+            file.seek(SeekFrom::Start(actual_read_offset))?;
             bytes_read = file.read(bs)?;
         }
 
@@ -1063,11 +1063,13 @@ impl Read for MultiSegmentReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
     use std::fs::File;
     use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::io::Seek;
     use std::io::Write;
+    use std::sync::Arc;
     use tempdir::TempDir;
 
     #[test]
@@ -1654,5 +1656,120 @@ mod tests {
 
         // Verify the output
         assert_eq!(segment_ids, vec![1, 2, 10]);
+    }
+
+    fn setup_locked_segment(opts: Options) -> (Arc<RwLock<Segment>>, PathBuf) {
+        let dir = TempDir::new("test").expect("should create temp dir");
+        let seg = Segment::open(dir.path(), 1, &opts).unwrap();
+        (Arc::new(RwLock::new(seg)), dir.into_path())
+    }
+
+    #[test]
+    fn test_concurrent_reads() {
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+        let (seg, _dir) = setup_locked_segment(opts);
+
+        // Write test data
+        let data = vec![1u8; 256];
+        seg.write().append(&data).unwrap();
+
+        // Spawn multiple readers
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let seg = seg.clone();
+                std::thread::spawn(move || {
+                    let s = seg.read();
+                    let mut buf = [0u8; 128];
+                    s.read_at(&mut buf, 0).unwrap();
+                    buf
+                })
+            })
+            .collect();
+
+        // Verify all readers got correct data
+        for h in handles {
+            assert_eq!(h.join().unwrap(), [1u8; 128]);
+        }
+    }
+
+    #[test]
+    fn test_append_doesnt_interfere_with_reads() {
+        let opts = Options {
+            max_file_size: 1024,
+            ..Default::default()
+        };
+        let (seg, _dir) = setup_locked_segment(opts);
+        let initial_data = vec![1u8; 128];
+
+        // Initial write
+        seg.write().append(&initial_data).unwrap();
+
+        // Spawn reader
+        let reader = {
+            let seg = seg.clone();
+            std::thread::spawn(move || {
+                let s = seg.read();
+                let mut buf = [0u8; 128];
+                s.read_at(&mut buf, 0).unwrap();
+                buf
+            })
+        };
+
+        // Spawn writer
+        let writer = {
+            let seg = seg.clone();
+            std::thread::spawn(move || {
+                let mut s = seg.write();
+                s.append(&[2u8; 64]).unwrap();
+            })
+        };
+
+        // Verify reader sees original data
+        assert_eq!(reader.join().unwrap(), [1u8; 128]);
+        writer.join().unwrap();
+
+        // Verify new data was appended correctly
+        let mut buf = [0u8; 64];
+        seg.read().read_at(&mut buf, 128).unwrap();
+        assert_eq!(buf, [2u8; 64]);
+    }
+
+    #[test]
+    fn test_concurrent_appends() {
+        let opts = Options {
+            max_file_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let (seg, _dir) = setup_locked_segment(opts);
+
+        // Spawn multiple appenders
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let seg = seg.clone();
+                std::thread::spawn(move || {
+                    let data = vec![i as u8; 256];
+                    let mut s = seg.write();
+                    let offset = s.offset();
+                    s.append(&data).unwrap();
+                    offset
+                })
+            })
+            .collect();
+
+        // Wait for all appends and collect their offsets
+        let offsets: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Verify all writes are present at their respective offsets
+        let s = seg.write();
+        let mut buf = [0u8; 256];
+        for offset in offsets {
+            s.read_at(&mut buf, offset).unwrap();
+            // Find which thread wrote at this offset based on the data
+            let thread_id = buf[0] as usize;
+            assert_eq!(buf.to_vec(), vec![thread_id as u8; 256]);
+        }
     }
 }
