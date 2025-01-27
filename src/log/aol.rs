@@ -1,17 +1,15 @@
-use std::fs;
-use std::io;
-use std::mem;
-
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::{
+    fs, io, mem,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
+};
 
 use quick_cache::sync::Cache;
 
-use crate::log::{get_segment_range, Error, IOError, Options, Result, Segment};
-
-use super::fd::SegmentReaderPool;
+use crate::log::{
+    fd::SegmentReaderPool, get_segment_range, Error, IOError, Options, Result, Segment,
+};
 
 const DEFAULT_MAX_FILE_DESCRIPTORS_PER_SEGMENT: usize = 8;
 
