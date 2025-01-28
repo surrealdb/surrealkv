@@ -647,10 +647,11 @@ impl SegmentRef {
      +------+------+------+------+------+------+------+------+
 */
 pub struct Segment {
+    #[allow(unused)]
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
 
@@ -843,14 +844,6 @@ impl Segment {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Segment is closed",
-            )));
-        }
-
-        let current_offset = self.file_offset.load(Ordering::Acquire);
-        if off > current_offset {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Offset beyond current position",
             )));
         }
 
@@ -1367,7 +1360,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 11 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
@@ -1475,7 +1469,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, READ_BUF_SIZE as u64 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
