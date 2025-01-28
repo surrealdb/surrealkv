@@ -269,8 +269,6 @@ impl RecordReader {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use super::*;
     use crate::log::{Aol, Options, SegmentRef};
     use tempdir::TempDir;
@@ -281,10 +279,7 @@ mod tests {
 
     fn get_writer_state(aol: &Aol) -> (u64, u64) {
         let writer = aol.writer_state.lock();
-        (
-            writer.active_segment_id.load(Ordering::Acquire),
-            writer.active_segment.offset(),
-        )
+        (writer.active_segment_id, writer.active_segment.offset())
     }
 
     #[test]

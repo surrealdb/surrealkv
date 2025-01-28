@@ -2,7 +2,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
@@ -17,7 +17,7 @@ pub(crate) struct WriterState {
     /// The currently active segment where data is being written.
     pub(crate) active_segment: Segment,
     /// The ID of the currently active segment.
-    pub(crate) active_segment_id: AtomicU64,
+    pub(crate) active_segment_id: u64,
 }
 
 /// Append-Only Log (Aol) is a data structure used to sequentially store records
@@ -64,7 +64,7 @@ impl Aol {
 
         let writer_state = WriterState {
             active_segment,
-            active_segment_id: AtomicU64::new(active_segment_id),
+            active_segment_id,
         };
 
         Ok(Self {
@@ -143,19 +143,18 @@ impl Aol {
             writer.active_segment.close()?;
 
             // Increment active segment id and get the new id
-            let new_id = writer.active_segment_id.fetch_add(1, Ordering::AcqRel);
+            writer.active_segment_id += 1;
 
             // Open new segment with the incremented id
-            let new_segment = Segment::open(&self.dir, new_id + 1, &self.opts, false)?;
+            let new_segment =
+                Segment::open(&self.dir, writer.active_segment_id, &self.opts, false)?;
+
             writer.active_segment = new_segment;
         }
 
         // Write the record to the segment
         match writer.active_segment.append(rec) {
-            Ok(offset) => {
-                let segment_id = writer.active_segment_id.load(Ordering::Acquire);
-                Ok((segment_id, offset, rec.len()))
-            }
+            Ok(offset) => Ok((writer.active_segment_id, offset, rec.len())),
             Err(e) => {
                 if let Error::IO(_) = e {
                     self.set_fsync_failed(true);
@@ -189,14 +188,11 @@ impl Aol {
         }
 
         // Get segment from cache (works for both active and inactive segments)
-        let segment = self
-            .segment_cache
-            .get_or_insert_with(&segment_id, || {
-                Ok::<_, std::io::Error>(Arc::new(
-                    Segment::open(&self.dir, segment_id, &self.opts, true).unwrap(),
-                ))
-            })
-            .unwrap();
+        let segment = self.segment_cache.get_or_insert_with(&segment_id, || {
+            Segment::open(&self.dir, segment_id, &self.opts, true)
+                .map(Arc::new)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        })?;
 
         match segment.read_at(buf, read_offset) {
             Ok(bytes_read) => Ok((segment_id, bytes_read)),
@@ -208,7 +204,7 @@ impl Aol {
     pub fn close(&self) -> Result<()> {
         let writer = self.writer_state.lock();
         writer.active_segment.close()?;
-        // Clear segment cache to ensure all pools are dropped
+        // Clear segment cache to ensure all file descriptors are dropped
         self.segment_cache.clear();
         self.closed.store(true, Ordering::Release);
         Ok(())
@@ -221,20 +217,19 @@ impl Aol {
         writer.active_segment.close()?;
 
         // Increment active segment id and get the new id
-        let new_id = writer.active_segment_id.fetch_add(1, Ordering::AcqRel) + 1;
+        writer.active_segment_id += 1;
 
         // Open new segment with the incremented id
-        writer.active_segment = Segment::open(&self.dir, new_id, &self.opts, false)?;
+        writer.active_segment =
+            Segment::open(&self.dir, writer.active_segment_id, &self.opts, false)?;
 
-        Ok(new_id)
+        Ok(writer.active_segment_id)
     }
 
     pub fn size(&self) -> Result<u64> {
         let writer = self.writer_state.lock();
         let cur_segment_size = writer.active_segment.file_offset();
-        let total_size = (writer.active_segment_id.load(Ordering::Acquire)
-            * self.opts.max_file_size)
-            + cur_segment_size;
+        let total_size = (writer.active_segment_id * self.opts.max_file_size) + cur_segment_size;
         Ok(total_size)
     }
 
@@ -278,10 +273,7 @@ mod tests {
 
     fn get_writer_state(aol: &Aol) -> (u64, u64) {
         let writer = aol.writer_state.lock();
-        (
-            writer.active_segment_id.load(Ordering::Acquire),
-            writer.active_segment.offset(),
-        )
+        (writer.active_segment_id, writer.active_segment.offset())
     }
 
     #[test]

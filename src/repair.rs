@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 
 use crate::error::{Error, Result};
 use crate::log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef};
@@ -126,7 +125,7 @@ fn repair_segment(
 ) -> Result<()> {
     // Get writer lock to check and manipulate active segment
     let mut writer = aol.writer_state.lock();
-    let current_active_id = writer.active_segment_id.load(Ordering::Acquire);
+    let current_active_id = writer.active_segment_id;
 
     // Close the active segment if its ID matches
     if current_active_id == corrupted_segment_id {
