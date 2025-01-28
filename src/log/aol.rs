@@ -10,9 +10,7 @@ use std::{
 use parking_lot::Mutex;
 use quick_cache::sync::Cache;
 
-use crate::log::{
-    fd::SegmentReaderPool, get_segment_range, Error, IOError, Options, Result, Segment,
-};
+use crate::log::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Writer state that needs exclusive access
 pub(crate) struct WriterState {
@@ -39,9 +37,8 @@ pub struct Aol {
     /// A flag indicating whether the AOL instance is closed or not.
     closed: AtomicBool,
 
-    /// A lock-free cache used to store recently used segments.
-    /// Cache stores pools of segment readers
-    segment_cache: Cache<u64, Arc<SegmentReaderPool>>,
+    /// Lock-free cache for all read segments (including active)
+    segment_cache: Cache<u64, Arc<Segment>>,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
@@ -191,24 +188,17 @@ impl Aol {
             )));
         }
 
-        // Use segment cache for all reads, including active segment
-        let pool = self
+        // Get segment from cache (works for both active and inactive segments)
+        let segment = self
             .segment_cache
             .get_or_insert_with(&segment_id, || {
                 Ok::<_, std::io::Error>(Arc::new(
-                    SegmentReaderPool::new(
-                        self.dir.clone(),
-                        segment_id,
-                        self.opts.clone(),
-                        self.opts.max_file_descriptor_per_segment,
-                    )
-                    .unwrap(),
+                    Segment::open(&self.dir, segment_id, &self.opts, true).unwrap(),
                 ))
             })
             .unwrap();
 
-        let reader = pool.acquire_reader()?;
-        match reader.segment.as_ref().unwrap().read_at(buf, read_offset) {
+        match segment.read_at(buf, read_offset) {
             Ok(bytes_read) => Ok((segment_id, bytes_read)),
             Err(Error::Eof) => Err(Error::Eof),
             Err(e) => Err(e),
@@ -231,12 +221,12 @@ impl Aol {
         writer.active_segment.close()?;
 
         // Increment active segment id and get the new id
-        let new_id = writer.active_segment_id.fetch_add(1, Ordering::AcqRel);
+        let new_id = writer.active_segment_id.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Open new segment with the incremented id
-        writer.active_segment = Segment::open(&self.dir, new_id + 1, &self.opts, false)?;
+        writer.active_segment = Segment::open(&self.dir, new_id, &self.opts, false)?;
 
-        Ok(new_id + 1)
+        Ok(new_id)
     }
 
     pub fn size(&self) -> Result<u64> {
