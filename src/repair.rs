@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use crate::error::{Error, Result};
 use crate::log::{Aol, Error as LogError, MultiSegmentReader, Segment, SegmentRef};
@@ -123,9 +124,13 @@ fn repair_segment(
     corrupted_segment_file_path: PathBuf,
     corrupted_segment_file_header_offset: u64,
 ) -> Result<()> {
+    // Get writer lock to check and manipulate active segment
+    let mut writer = aol.writer_state.lock();
+    let current_active_id = writer.active_segment_id.load(Ordering::Acquire);
+
     // Close the active segment if its ID matches
-    if aol.active_segment_id == corrupted_segment_id {
-        aol.active_segment.close()?;
+    if current_active_id == corrupted_segment_id {
+        writer.active_segment.close()?;
     }
 
     // Prepare the repaired segment path
@@ -171,8 +176,12 @@ fn repair_segment(
         println!("deleting empty file {:?}", corrupted_segment_file_path);
         std::fs::remove_file(&corrupted_segment_file_path)?;
     }
-    let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts, false)?;
-    aol.active_segment = new_segment;
+
+    // If we were repairing the active segment, update it
+    if current_active_id == corrupted_segment_id {
+        let new_active_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
+        writer.active_segment = new_active_segment;
+    }
 
     Ok(())
 }

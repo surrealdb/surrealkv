@@ -134,7 +134,7 @@ mod tests {
         // Create a temporary directory
         let temp_dir = create_temp_directory();
         let opts = LogOptions::default();
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         let manifest = Manifest {
             changes: vec![ManifestChangeType::Options(Options::default())],
@@ -157,7 +157,7 @@ mod tests {
         // Step 1: Create a temporary directory
         let temp_dir = create_temp_directory();
         let log_opts = LogOptions::default();
-        let mut a = Aol::open(temp_dir.path(), &log_opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &log_opts).expect("should create aol");
 
         // Step 2: Create the first Manifest instance and append it to the file
         let first_manifest = Manifest {

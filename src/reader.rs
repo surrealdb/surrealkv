@@ -269,12 +269,22 @@ impl RecordReader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::log::{Aol, Options, SegmentRef};
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
+    }
+
+    fn get_writer_state(aol: &Aol) -> (u64, u64) {
+        let writer = aol.writer_state.lock();
+        (
+            writer.active_segment_id.load(Ordering::Acquire),
+            writer.active_segment.offset(),
+        )
     }
 
     #[test]
@@ -287,10 +297,10 @@ mod tests {
             max_file_size: 4,
             ..Options::default()
         };
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Test initial offset
-        let sz = (a.active_segment_id, a.active_segment.offset());
+        let sz = get_writer_state(&a);
         assert_eq!(0, sz.0);
         assert_eq!(0, sz.1);
 
@@ -344,7 +354,7 @@ mod tests {
             ..Options::default()
         };
 
-        let mut a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
 
         // Append 10 records
         for i in 0..num_items {

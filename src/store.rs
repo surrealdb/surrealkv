@@ -478,7 +478,7 @@ impl Core {
     }
 
     fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
-        let mut clog = self.clog.as_ref().unwrap().write();
+        let clog = self.clog.as_ref().unwrap().write();
 
         let (segment_id, offset) = match durability {
             Durability::Immediate => {

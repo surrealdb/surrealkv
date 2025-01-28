@@ -19,8 +19,17 @@ pub struct SegmentReaderPool {
 
 impl SegmentReaderPool {
     pub fn new(dir: PathBuf, id: u64, opts: Options, pool_size: usize) -> Result<Self> {
+        let initial_size = pool_size / 2;
+        let queue = ArrayQueue::new(pool_size);
+
+        // Pre-create initial readers
+        for _ in 0..initial_size {
+            if let Ok(segment) = Segment::open(&dir, id, &opts, true) {
+                let _ = queue.push(segment);
+            }
+        }
         Ok(Self {
-            readers: ArrayQueue::new(pool_size),
+            readers: queue,
             dir,
             id,
             opts,

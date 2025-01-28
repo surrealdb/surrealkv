@@ -16,7 +16,6 @@ use std::{
 };
 
 use ahash::{HashMap, HashMapExt};
-use parking_lot::Mutex;
 
 /// The `READ_BUF_SIZE` constant represents the size of a buffer for disk reads from
 /// the append-only log.
@@ -647,15 +646,16 @@ impl SegmentRef {
      +------+------+------+------+------+------+------+------+
 */
 pub struct Segment {
+    #[allow(unused)]
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
 
     /// The underlying file for storing the segment's data (None if opened in read-only mode)
-    write_file: Option<Mutex<File>>,
+    write_file: Option<File>,
 
     /// File handle for reading
     read_file: File,
@@ -673,7 +673,7 @@ pub struct Segment {
     /// A lock used to synchronize concurrent read access to the segment
     /// for the platforms that don't have FileExt::read_at().
     #[cfg(not(unix))]
-    mutex: Mutex<()>,
+    mutex: parking_lot::Mutex<()>,
 
     /// A flag indicating whether the segment is closed or not.
     closed: AtomicBool,
@@ -691,8 +691,8 @@ impl Segment {
         let file_exists = file_path.exists() && file_path.is_file();
 
         // Only open write handle if not read_only
-        let write_file = if !read_only {
-            Some(Mutex::new(Self::open_file(&file_path, opts, true)?))
+        let mut write_file = if !read_only {
+            Some(Self::open_file(&file_path, opts, true)?)
         } else {
             None
         };
@@ -718,9 +718,8 @@ impl Segment {
             }
         } else if !read_only {
             // Only write header if we're in write mode
-            if let Some(ref write_handle) = write_file {
-                let mut file = write_handle.lock();
-                let header_len = write_file_header(&mut file, id, opts)?;
+            if let Some(ref mut write_handle) = write_file {
+                let header_len = write_file_header(write_handle, id, opts)?;
                 file_header_offset += header_len;
             }
         }
@@ -737,7 +736,7 @@ impl Segment {
             id,
             closed: AtomicBool::new(false),
             #[cfg(not(unix))]
-            mutex: Mutex::new(()),
+            mutex: parking_lot::Mutex::new(()),
             file_header_offset: file_header_offset as u64,
             file_offset: AtomicU64::new(file_offset - file_header_offset as u64),
             file_size: opts.max_file_size,
@@ -779,8 +778,7 @@ impl Segment {
         }
 
         if let Some(ref write_file) = self.write_file {
-            let file = write_file.lock();
-            file.sync_all()?;
+            write_file.sync_all()?;
         }
 
         Ok(())
@@ -815,9 +813,6 @@ impl Segment {
             )));
         };
 
-        // Lock first to ensure exclusive access during the entire operation
-        let mut file = write_file.lock();
-
         // After acquiring lock, get current offset
         let current_offset = self.file_offset.load(Ordering::Acquire);
         let new_offset = current_offset + rec.len() as u64;
@@ -828,6 +823,7 @@ impl Segment {
         }
 
         // Write the data
+        let mut file = write_file;
         file.write_all(rec)?;
 
         // Update offset - still holding the lock
@@ -843,14 +839,6 @@ impl Segment {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Segment is closed",
-            )));
-        }
-
-        let current_offset = self.file_offset.load(Ordering::Acquire);
-        if off > current_offset {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Offset beyond current position",
             )));
         }
 
@@ -1367,7 +1355,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 11 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
@@ -1475,7 +1464,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, READ_BUF_SIZE as u64 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
