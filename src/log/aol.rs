@@ -811,4 +811,255 @@ mod tests {
             "Data read from the new segment should match the data appended"
         );
     }
+
+    #[cfg(test)]
+    mod fd {
+        use super::*;
+
+        #[cfg(target_os = "linux")]
+        fn count_open_fds() -> std::io::Result<usize> {
+            let fd_dir = format!("/proc/{}/fd", std::process::id());
+            let count = std::fs::read_dir(fd_dir)?.count();
+            // Subtracting 1 to account for the FD used to read the directory
+            Ok(count.saturating_sub(1))
+        }
+
+        #[cfg(target_os = "macos")]
+        mod macos_fd {
+            use std::os::raw::{c_int, c_void};
+            use std::ptr::null_mut;
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            pub struct ProcFdInfo {
+                pub proc_fd: i32,
+                pub proc_fd_type: u32,
+            }
+
+            impl ProcFdInfo {
+                pub fn new() -> ProcFdInfo {
+                    Self {
+                        proc_fd: 0,
+                        proc_fd_type: 0,
+                    }
+                }
+            }
+
+            extern "C" {
+                pub fn proc_pidinfo(
+                    pid: c_int,
+                    flavor: c_int,
+                    arg: u64,
+                    buffer: *mut c_void,
+                    size: c_int,
+                ) -> c_int;
+            }
+
+            pub fn count_open_fds() -> std::io::Result<usize> {
+                let pid = std::process::id() as c_int;
+                let fds_flavor = 1 as c_int;
+
+                let buffer_size_bytes = unsafe { proc_pidinfo(pid, fds_flavor, 0, null_mut(), 0) };
+
+                let fds_buffer_length: usize =
+                    buffer_size_bytes as usize / std::mem::size_of::<ProcFdInfo>();
+                let mut buf: Vec<ProcFdInfo> = vec![ProcFdInfo::new(); fds_buffer_length];
+                buf.shrink_to_fit();
+
+                let actual_buffer_size_bytes = unsafe {
+                    proc_pidinfo(
+                        pid,
+                        fds_flavor,
+                        0,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buffer_size_bytes,
+                    )
+                };
+
+                buf.truncate(actual_buffer_size_bytes as usize / std::mem::size_of::<ProcFdInfo>());
+
+                Ok(buf.len())
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        use macos_fd::count_open_fds;
+
+        // Test to check for file descriptor leaks
+        //
+        // This test runs successfully when run individually, but
+        // fails when run with other tests. This is because the
+        // other tests open file descriptors and it is not possible
+        // to detect how many file descriptors are active as tests
+        // are running concurrently.
+        #[ignore]
+        #[test]
+        fn test_no_fd_leaks() {
+            let initial_fds = count_open_fds().unwrap();
+
+            // Test 1: Basic operations
+            {
+                let dir = create_temp_directory();
+                let opts = Options::default();
+
+                let mut aol = Aol::open(dir.path(), &opts).unwrap();
+                let data = b"test data";
+                aol.append(data).unwrap();
+
+                let mut buf = vec![0u8; data.len()];
+                aol.read_at(&mut buf, 0, 0).unwrap();
+                aol.sync().unwrap();
+            }
+
+            #[cfg(unix)]
+            {
+                let fds_after_basic = count_open_fds().unwrap();
+                assert_eq!(
+                    initial_fds, fds_after_basic,
+                    "FD leak after basic operations!"
+                );
+            }
+
+            // Test 2: Multiple segments
+            {
+                let dir = create_temp_directory();
+                let opts = Options {
+                    max_file_size: 50,
+                    ..Default::default()
+                };
+
+                let mut aol = Aol::open(dir.path(), &opts).unwrap();
+
+                for i in 0..10 {
+                    let data = vec![i as u8; 50];
+                    aol.append(&data).unwrap();
+                }
+
+                let mut buf = vec![0u8; 50];
+                aol.read_at(&mut buf, 0, 0).unwrap();
+                aol.read_at(&mut buf, 1, 0).unwrap();
+                aol.sync().unwrap();
+            }
+
+            #[cfg(unix)]
+            {
+                let fds_after_segments = count_open_fds().unwrap();
+                assert_eq!(
+                    initial_fds, fds_after_segments,
+                    "FD leak after multiple segments!"
+                );
+            }
+
+            // Test 3: Concurrent reads
+            {
+                let dir = create_temp_directory();
+                let opts = Options {
+                    max_file_size: 100,
+                    ..Default::default()
+                };
+
+                let mut aol = Aol::open(dir.path(), &opts).unwrap();
+                let data = vec![1u8; 100];
+                let (segment_id, offset, _) = aol.append(&data).unwrap();
+
+                let aol = Arc::new(aol);
+                let mut handles = vec![];
+
+                for _ in 0..5 {
+                    let aol_clone = Arc::clone(&aol);
+                    handles.push(std::thread::spawn(move || {
+                        let mut buf = vec![0u8; 100];
+                        for _ in 0..10 {
+                            aol_clone.read_at(&mut buf, segment_id, offset).unwrap();
+                        }
+                    }));
+                }
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                let fds_after_concurrent = count_open_fds().unwrap();
+                assert_eq!(
+                    initial_fds, fds_after_concurrent,
+                    "FD leak after concurrent reads!"
+                );
+            }
+
+            // Test 4: Reader pool stress
+            {
+                let dir = create_temp_directory();
+                let opts = Options {
+                    max_file_size: 50,
+                    ..Default::default()
+                };
+
+                let mut aol = Aol::open(dir.path(), &opts).unwrap();
+
+                for i in 0..5 {
+                    let data = vec![i as u8; 50];
+                    aol.append(&data).unwrap();
+                }
+
+                let aol = Arc::new(aol);
+                let mut handles = vec![];
+
+                for segment_id in 0..5 {
+                    let aol_clone = Arc::clone(&aol);
+                    handles.push(std::thread::spawn(move || {
+                        let mut buf = vec![0u8; 50];
+                        for _ in 0..100 {
+                            aol_clone.read_at(&mut buf, segment_id, 0).unwrap();
+                        }
+                    }));
+                }
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                let fds_after_stress = count_open_fds().unwrap();
+                assert_eq!(
+                    initial_fds, fds_after_stress,
+                    "FD leak after reader pool stress!"
+                );
+            }
+
+            // Test 5: Error handling
+            {
+                let dir = create_temp_directory();
+                let opts = Options {
+                    max_file_size: 100,
+                    ..Default::default()
+                };
+
+                let mut aol = Aol::open(dir.path(), &opts).unwrap();
+
+                let large_data = vec![0u8; 200];
+                let _ = aol.append(&large_data); // Expected to fail
+
+                let mut buf = vec![0u8; 10];
+                let _ = aol.read_at(&mut buf, 999, 0); // Expected to fail
+
+                for _ in 0..5 {
+                    let data = vec![0u8; 90];
+                    if aol.append(&data).is_err() {
+                        break;
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                let final_fds = count_open_fds().unwrap();
+                assert_eq!(initial_fds, final_fds, "FD leak detected in final check!");
+            }
+        }
+    }
 }
