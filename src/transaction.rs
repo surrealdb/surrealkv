@@ -466,9 +466,8 @@ impl Transaction {
             return Ok(()); // Return when there's nothing to commit
         }
 
-        // Lock the oracle to serialize commits to the transaction log.
-        let oracle = self.core.oracle.clone();
-        let write_ch_lock = oracle.write_lock.lock();
+        // Serialize commits to the transaction log.
+        let write_ch_lock = self.core.commit_write_lock.lock();
 
         // Prepare for the commit by getting a transaction ID.
         let (tx_id, commit_ts) = self.prepare_commit()?;
@@ -482,7 +481,14 @@ impl Transaction {
         latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
         let entries: Vec<Entry> = latest_writes
             .into_iter()
-            .map(|ws_entry| ws_entry.e)
+            .map(|ws_entry| {
+                let mut e = ws_entry.e;
+                // Assigns commit timestamps to transaction entries.
+                if e.ts == 0 {
+                    e.ts = commit_ts;
+                }
+                e
+            })
             .collect();
 
         // Commit the changes to the store index.
@@ -500,25 +506,12 @@ impl Transaction {
         Ok(())
     }
 
-    /// Prepares for the commit by assigning commit timestamps and preparing records.
-    fn prepare_commit(&mut self) -> Result<(u64, u64)> {
-        let oracle = self.core.oracle.clone();
-        let tx_id = oracle.new_commit_ts(self)?;
-        let commit_ts = self.assign_commit_ts();
-        Ok((tx_id, commit_ts))
-    }
-
-    /// Assigns commit timestamps to transaction entries.
-    fn assign_commit_ts(&mut self) -> u64 {
+    /// Prepares for the commit by checking for conflicts
+    /// and providing commit timestamp.
+    fn prepare_commit(&self) -> Result<(u64, u64)> {
+        let tx_id = self.core.oracle.new_commit_ts(self)?;
         let commit_ts = now();
-        for entries in self.write_set.values_mut() {
-            if let Some(entry) = entries.last_mut() {
-                if entry.e.ts == 0 {
-                    entry.e.ts = commit_ts;
-                }
-            }
-        }
-        commit_ts
+        Ok((tx_id, commit_ts))
     }
 
     /// Rolls back the transaction by removing all updated entries.

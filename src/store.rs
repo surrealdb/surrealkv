@@ -1,6 +1,6 @@
 use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use quick_cache::sync::Cache;
 use revision::Revisioned;
 use std::path::Path;
@@ -112,7 +112,7 @@ pub struct Core {
     /// Manifest for store to track Store state.
     pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
-    pub(crate) oracle: Arc<Oracle>,
+    pub(crate) oracle: Oracle,
     /// Value cache for store.
     /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
@@ -120,6 +120,8 @@ pub struct Core {
     pub(crate) value_cache: Cache<(u64, u64), Bytes>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
+    /// Write lock to ensure that only one transaction can commit at a time.
+    pub(crate) commit_write_lock: Mutex<()>,
 }
 
 impl Core {
@@ -205,9 +207,10 @@ impl Core {
             opts,
             manifest: manifest.map(RwLock::new),
             clog: clog.map(|c| Arc::new(RwLock::new(c))),
-            oracle: Arc::new(oracle),
+            oracle,
             value_cache,
             is_closed: AtomicBool::new(false),
+            commit_write_lock: Mutex::new(()),
         })
     }
 

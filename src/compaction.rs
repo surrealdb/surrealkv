@@ -61,9 +61,8 @@ impl Store {
         // Acquire compaction guard
         let _guard = CompactionGuard::new(&self.is_compacting);
 
-        // Lock the oracle to prevent operations during compaction
-        let oracle = self.core.oracle.clone();
-        let oracle_lock = oracle.write_lock.lock();
+        // Lock the commit lock to prevent operations during compaction
+        let commit_lock = self.core.commit_write_lock.lock();
 
         // Rotate the commit log and get the new segment ID
         let mut clog = self.core.clog.as_ref().unwrap().write();
@@ -96,7 +95,7 @@ impl Store {
         let snapshot = snapshot_lock.snapshot();
         let snapshot_versioned_iter = snapshot.iter_with_versions();
         drop(snapshot_lock); // Explicitly drop the lock
-        drop(oracle_lock); // Release the oracle lock
+        drop(commit_lock); // Release the commit lock
 
         // Do compaction and write
 
