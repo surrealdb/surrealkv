@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use parking_lot::Mutex;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, Ordering};
 use vart::VariableSizeKey;
@@ -10,11 +9,8 @@ use crate::snapshot::Snapshot;
 use crate::transaction::Transaction;
 
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
-/// It uses a write lock to ensure that only one transaction can commit at a time.
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
 pub(crate) struct Oracle {
-    /// Write lock to ensure that only one transaction can commit at a time.
-    pub(crate) write_lock: Mutex<()>,
     /// Isolation level of the transactions.
     isolation: IsolationLevel,
 }
@@ -32,15 +28,12 @@ impl Oracle {
             }
         };
 
-        Self {
-            write_lock: Mutex::new(()),
-            isolation,
-        }
+        Self { isolation }
     }
 
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
         self.isolation.new_commit_ts(txn)
     }
 
@@ -77,7 +70,7 @@ macro_rules! isolation_level_method {
 impl IsolationLevel {
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the specific isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
         isolation_level_method!(self, new_commit_ts, txn)
     }
 
@@ -123,7 +116,7 @@ impl SnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
         let current_snapshot = Snapshot::take(&txn.core)?;
 
         // Check write conflicts
@@ -207,7 +200,7 @@ impl SerializableSnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &mut Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
         let current_snapshot = Snapshot::take(&txn.core)?;
 
         // Check read conflicts
