@@ -65,10 +65,9 @@ impl Store {
         let commit_lock = self.core.commit_write_lock.lock();
 
         // Rotate the commit log and get the new segment ID
-        let clog = self.core.clog.as_ref().unwrap().write();
+        let clog = self.core.clog.as_ref().unwrap();
         let new_segment_id = clog.rotate()?;
         let last_updated_segment_id = new_segment_id - 1;
-        drop(clog); // Explicitly drop the lock
 
         // Create a temporary directory for compaction
         fs::create_dir_all(&tmp_merge_dir)?;
