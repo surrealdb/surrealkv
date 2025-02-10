@@ -108,7 +108,7 @@ pub struct Core {
     /// Options for store.
     pub(crate) opts: Options,
     /// Commit log for store.
-    pub(crate) clog: Option<Arc<RwLock<Aol>>>,
+    pub(crate) clog: Option<Arc<Aol>>,
     /// Manifest for store to track Store state.
     pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
@@ -206,7 +206,7 @@ impl Core {
             indexer: RwLock::new(indexer),
             opts,
             manifest: manifest.map(RwLock::new),
-            clog: clog.map(|c| Arc::new(RwLock::new(c))),
+            clog: clog.map(Arc::new),
             oracle,
             value_cache,
             is_closed: AtomicBool::new(false),
@@ -412,7 +412,7 @@ impl Core {
             //
             // If we ever need more control over the closing process, we might
             // need to extend this protocol with additional locks.
-            clog.write().close()?;
+            clog.close()?;
         }
 
         // Close the manifest if it exists
@@ -472,7 +472,7 @@ impl Core {
     }
 
     fn append_log(&self, tx_record: &BytesMut, durability: Durability) -> Result<(u64, u64)> {
-        let clog = self.clog.as_ref().unwrap().write();
+        let clog = self.clog.as_ref().unwrap();
 
         let (segment_id, offset) = match durability {
             Durability::Immediate => {
@@ -563,7 +563,7 @@ impl Core {
 
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
-        let clog = self.clog.as_ref().unwrap().read();
+        let clog = self.clog.as_ref().unwrap();
         clog.read_at(&mut buf, segment_id, value_offset)?;
 
         // Cache the newly read value for future use

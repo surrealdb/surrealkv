@@ -51,7 +51,7 @@ pub fn repair_last_corrupted_segment(
 /// Currently it is only being used for testing purposes.
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment(
-    aol: &mut Aol,
+    aol: &Aol,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -117,7 +117,7 @@ pub(crate) fn repair_corrupted_segment(
 ///
 /// If any of these operations fail, the function returns an error.
 fn repair_segment(
-    aol: &mut Aol,
+    aol: &Aol,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
@@ -314,7 +314,7 @@ mod tests {
         segment_num: usize,
         corruption_offset: u64,
     ) {
-        let mut clog = store.core.clog.as_ref().unwrap().write();
+        let clog = store.core.clog.as_ref().unwrap();
         let clog_subdir = opts.dir.join("clog");
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
@@ -325,10 +325,7 @@ mod tests {
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
-        repair_corrupted_segment(&mut clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
-
-        // drop lock over commit log
-        drop(clog);
+        repair_corrupted_segment(clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
     }
 
     #[allow(unused)]
