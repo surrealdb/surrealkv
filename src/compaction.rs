@@ -65,7 +65,7 @@ impl Store {
         let commit_lock = self.core.commit_write_lock.lock();
 
         // Rotate the commit log and get the new segment ID
-        let mut clog = self.core.clog.as_ref().unwrap().write();
+        let clog = self.core.clog.as_ref().unwrap().write();
         let new_segment_id = clog.rotate()?;
         let last_updated_segment_id = new_segment_id - 1;
         drop(clog); // Explicitly drop the lock
@@ -74,7 +74,7 @@ impl Store {
         fs::create_dir_all(&tmp_merge_dir)?;
 
         // Initialize a new manifest in the temporary directory
-        let mut manifest = Core::initialize_manifest(&tmp_merge_dir)?;
+        let manifest = Core::initialize_manifest(&tmp_merge_dir)?;
         // Add the last updated segment ID to the manifest
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
         manifest.append(&changeset.serialize()?)?;
@@ -85,7 +85,7 @@ impl Store {
         let tm_opts = LogOptions::default()
             .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
-        let mut temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
+        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
         // check in files for the keys that are not found in memory to handle deletion
@@ -100,11 +100,11 @@ impl Store {
         // Do compaction and write
 
         // Define a closure for writing entries to the temporary commit log
-        let mut write_entry = |key: &[u8],
-                               value: Vec<u8>,
-                               version: u64,
-                               ts: u64,
-                               metadata: Option<Metadata>|
+        let write_entry = |key: &[u8],
+                           value: Vec<u8>,
+                           version: u64,
+                           ts: u64,
+                           metadata: Option<Metadata>|
          -> Result<()> {
             let mut entry = Entry::new(key, &value);
             entry.set_ts(ts);

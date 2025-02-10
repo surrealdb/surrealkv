@@ -1,17 +1,20 @@
-mod aol;
+pub mod aol;
 pub use aol::Aol;
 
-use ahash::{HashMap, HashMapExt};
+use std::{
+    fmt,
+    fs::{
+        File, {read_dir, OpenOptions},
+    },
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        PoisonError,
+    },
+};
 
-#[cfg(not(unix))]
-use parking_lot::Mutex;
-use std::fmt;
-use std::fs::File;
-use std::fs::{read_dir, OpenOptions};
-use std::io::BufReader;
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use ahash::{HashMap, HashMapExt};
 
 /// The `READ_BUF_SIZE` constant represents the size of a buffer for disk reads from
 /// the append-only log.
@@ -47,7 +50,7 @@ const DEFAULT_COMPRESSION_LEVEL: CompressionLevel = CompressionLevel::BestSpeed;
 const DEFAULT_FILE_SIZE: u64 = 4096 * 256 * 20; // 20mb
 
 /// Default maximum number of open files allowed.
-const DEFAULT_MAX_OPEN_FILES: usize = 16;
+const DEFAULT_MAX_OPEN_FILES: usize = 8;
 
 /// Constants for key names used in the file header.
 const KEY_MAGIC: &str = "magic";
@@ -142,12 +145,8 @@ pub struct Options {
     /// This is used by aol to cycle segments when the max file size is reached.
     pub(crate) max_file_size: u64,
 
-    /// The maximum number of open files allowed.
-    ///
-    /// If specified, this option sets the maximum number of open files allowed.
-    ///
-    /// This is used by aol to initialize the segment cache.
-    pub(crate) max_open_files: usize,
+    /// The maximum number of segments that can be cached in memory.
+    pub(crate) max_cached_segments: usize,
 }
 
 impl Default for Options {
@@ -160,7 +159,7 @@ impl Default for Options {
             metadata: None,                                       // default metadata
             file_extension: None,                                 // default extension
             max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
-            max_open_files: DEFAULT_MAX_OPEN_FILES,
+            max_cached_segments: DEFAULT_MAX_OPEN_FILES,
         }
     }
 }
@@ -638,22 +637,26 @@ impl SegmentRef {
      .                                                       |
      +------+------+------+------+------+------+------+------+
 */
-pub(crate) struct Segment {
+pub struct Segment {
+    #[allow(unused)]
     /// The unique identifier of the segment.
     pub(crate) id: u64,
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     /// The path where the segment file is located.
     pub(crate) file_path: PathBuf,
 
-    /// The underlying file for storing the segment's data.
-    file: File,
+    /// The underlying file for storing the segment's data (None if opened in read-only mode)
+    write_file: Option<File>,
+
+    /// File handle for reading
+    read_file: File,
 
     /// The base offset of the file.
     pub(crate) file_header_offset: u64,
 
     /// The current offset within the file.
-    file_offset: u64,
+    pub(crate) file_offset: AtomicU64,
 
     #[allow(dead_code)]
     /// The maximum size of the segment file.
@@ -662,14 +665,14 @@ pub(crate) struct Segment {
     /// A lock used to synchronize concurrent read access to the segment
     /// for the platforms that don't have FileExt::read_at().
     #[cfg(not(unix))]
-    mutex: Mutex<()>,
+    mutex: parking_lot::Mutex<()>,
 
     /// A flag indicating whether the segment is closed or not.
-    closed: bool,
+    closed: AtomicBool,
 }
 
 impl Segment {
-    pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
+    pub fn open(dir: &Path, id: u64, opts: &Options, read_only: bool) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
@@ -677,22 +680,27 @@ impl Segment {
         let extension = opts.file_extension.as_deref().unwrap_or("");
         let file_name = segment_name(id, extension);
         let file_path = dir.join(&file_name);
-        let file_path_exists = file_path.exists();
-        let file_path_is_file = file_path.is_file();
+        let file_exists = file_path.exists() && file_path.is_file();
 
-        // Open the file with the specified options
-        let mut file = Self::open_file(&file_path, opts)?;
+        // Only open write handle if not read_only
+        let mut write_file = if !read_only {
+            Some(Self::open_file(&file_path, opts, true)?)
+        } else {
+            None
+        };
+
+        // Open read handle
+        let mut read_file = Self::open_file(&file_path, opts, false)?;
 
         // Initialize the file header offset
         let mut file_header_offset = 0;
 
-        // If the file already exists
-        if file_path_exists && file_path_is_file {
-            // Handle existing file
-            let header = read_file_header(&mut file)?;
+        // Handle file header
+        if file_exists {
+            let header = read_file_header(&mut read_file.try_clone()?)?;
             validate_file_header(&header, id, opts)?;
-
             file_header_offset += 4 + header.len();
+
             let (index, _) = parse_segment_name(&file_name)?;
             if index != id {
                 return Err(Error::IO(IOError::new(
@@ -700,32 +708,40 @@ impl Segment {
                     "Invalid segment id",
                 )));
             }
-        } else {
-            // Write new file header
-            let header_len = write_file_header(&mut file, id, opts)?;
-            file_header_offset += header_len;
+        } else if !read_only {
+            // Only write header if we're in write mode
+            if let Some(ref mut write_handle) = write_file {
+                let header_len = write_file_header(write_handle, id, opts)?;
+                file_header_offset += header_len;
+            }
         }
 
+        // Get initial file offset
         // Seek to the end of the file to get the file offset
-        let file_offset = file.seek(io::SeekFrom::End(0))?;
+        let file_offset = read_file.seek(io::SeekFrom::End(0))?;
 
         // Initialize and return the Segment
         Ok(Segment {
-            file,
-            file_header_offset: file_header_offset as u64,
-            file_offset: file_offset - file_header_offset as u64,
+            write_file,
+            read_file,
             file_path,
             id,
-            closed: false,
+            closed: AtomicBool::new(false),
             #[cfg(not(unix))]
-            mutex: Mutex::new(()),
+            mutex: parking_lot::Mutex::new(()),
+            file_header_offset: file_header_offset as u64,
+            file_offset: AtomicU64::new(file_offset - file_header_offset as u64),
             file_size: opts.max_file_size,
         })
     }
 
-    fn open_file(file_path: &Path, opts: &Options) -> Result<File> {
+    fn open_file(file_path: &Path, opts: &Options, for_writing: bool) -> Result<File> {
         let mut open_options = OpenOptions::new();
-        open_options.read(true).append(true);
+        open_options.read(true);
+
+        if for_writing {
+            open_options.append(true);
+        }
 
         #[cfg(unix)]
         {
@@ -735,57 +751,46 @@ impl Segment {
             }
         }
 
-        if !file_path.exists() {
+        if !file_path.exists() && for_writing {
             open_options.create(true); // Create the file if it doesn't exist
         }
 
-        let file = open_options.open(file_path)?;
-
-        Ok(file)
+        Ok(open_options.open(file_path)?)
     }
 
     // Flushes the current block to disk.
     // This method also synchronize file metadata to the filesystem
     // hence it is a bit slower than fdatasync (sync_data).
-    pub(crate) fn sync(&mut self) -> Result<()> {
-        if self.closed {
+    pub(crate) fn sync(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Segment is closed",
             )));
         }
 
-        self.file.sync_all()?;
+        if let Some(ref write_file) = self.write_file {
+            write_file.sync_all()?;
+        }
+
         Ok(())
     }
 
-    pub(crate) fn close(&mut self) -> Result<()> {
+    pub fn close(&self) -> Result<()> {
         self.sync()?;
-        self.closed = true;
+        self.closed.store(true, Ordering::Release);
         Ok(())
     }
 
     // Returns the current offset within the segment.
     pub(crate) fn offset(&self) -> u64 {
-        self.file_offset
+        self.file_offset.load(Ordering::Acquire)
     }
 
     /// Appends data to the segment.
-    ///
-    /// # Parameters
-    ///
-    /// - `rec`: The data to be appended.
-    ///
-    /// # Returns
-    ///
-    /// Returns the offset.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the segment is closed.
-    pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
+    pub fn append(&self, rec: &[u8]) -> Result<u64> {
         // If the segment is closed, return an error
-        if self.closed {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::SegmentClosed);
         }
 
@@ -793,64 +798,62 @@ impl Segment {
             return Err(Error::EmptyBuffer);
         }
 
-        let offset = self.offset();
+        let Some(ref write_file) = self.write_file else {
+            return Err(Error::IO(IOError::new(
+                io::ErrorKind::Other,
+                "Segment opened in read-only mode",
+            )));
+        };
 
-        // write_all does atomic writes to the file (in this case the os buffer)
-        self.file.write_all(rec)?;
-        self.file_offset += rec.len() as u64;
+        // After acquiring lock, get current offset
+        let current_offset = self.file_offset.load(Ordering::Acquire);
+        let new_offset = current_offset + rec.len() as u64;
 
-        Ok(offset)
+        // Check against max file size
+        if new_offset > self.file_size {
+            return Err(Error::RecordTooLarge);
+        }
+
+        // Write the data
+        let mut file = write_file;
+        file.write_all(rec)?;
+
+        // Update offset - still holding the lock
+        self.file_offset.store(new_offset, Ordering::Release);
+
+        Ok(current_offset)
     }
 
     /// Reads data from the segment at the specified offset from the underlying file.
     /// The read data is then copied into the provided byte slice `bs`.
-    ///
-    /// # Parameters
-    ///
-    /// - `bs`: A byte slice to store the read data.
-    /// - `off`: The offset from which to start reading.
-    ///
-    /// # Returns
-    ///
-    /// Returns the number of bytes read and any encountered error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the provided offset is negative or if there is an I/O error
-    /// during reading.
-    pub(crate) fn read_at(&self, bs: &mut [u8], off: u64) -> Result<usize> {
-        if self.closed {
+    pub fn read_at(&self, bs: &mut [u8], off: u64) -> Result<usize> {
+        if self.closed.load(Ordering::Acquire) {
             return Err(Error::IO(IOError::new(
                 io::ErrorKind::Other,
                 "Segment is closed",
             )));
         }
 
-        if off > self.offset() {
-            return Err(Error::IO(IOError::new(
-                io::ErrorKind::Other,
-                "Offset beyond current position",
-            )));
-        }
-
         // Read from the file
         let actual_read_offset = self.file_header_offset + off;
-        let bytes_read;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            bytes_read = self.file.read_at(bs, actual_read_offset)?;
+            Ok(self.read_file.read_at(bs, actual_read_offset)?)
         }
         #[cfg(not(unix))]
         {
-            let mut file = &self.file;
+            let mut file = &self.read_file;
             let _lock = self.mutex.lock();
             file.seek(SeekFrom::Start(actual_read_offset))?;
-            bytes_read = file.read(bs)?;
+            let bytes_read = file.read(bs)?;
+            Ok(bytes_read)
         }
+    }
 
-        Ok(bytes_read)
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.file_offset.load(Ordering::Acquire)
     }
 }
 
@@ -875,6 +878,7 @@ pub enum Error {
     Poison(String),
     RecordTooLarge,
     SegmentNotFound,
+    NoAvailableReaders,
 }
 
 // Implementation of Display trait for Error
@@ -892,6 +896,7 @@ impl fmt::Display for Error {
                 "Record is too large to fit in a segment. Increase max segment size"
             ),
             Error::SegmentNotFound => write!(f, "Segment not found"),
+            Error::NoAvailableReaders => write!(f, "No available readers"),
         }
     }
 }
@@ -1297,7 +1302,8 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1341,7 +1347,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, 11 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
@@ -1375,7 +1382,8 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1383,7 +1391,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1396,7 +1405,8 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1425,7 +1435,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(segment.offset(), 11);
@@ -1445,7 +1456,8 @@ mod tests {
         // Test reading beyond segment's current size
         let mut bs = vec![0; 14];
         let r = segment.read_at(&mut bs, READ_BUF_SIZE as u64 + 1);
-        assert!(r.is_err());
+        assert_eq!(r.unwrap(), 0);
+        assert_eq!(bs, vec![0; 14]);
 
         // Test appending another buffer after syncing
         let r = segment.append(&[11, 12, 13, 14]);
@@ -1465,7 +1477,8 @@ mod tests {
         assert!(segment.close().is_ok());
 
         // Reopen segment
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
         // Test initial offset
         assert_eq!(segment.offset(), 11 + 4);
 
@@ -1481,7 +1494,8 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1489,7 +1503,8 @@ mod tests {
         drop(segment);
 
         // Reopen segment should pass
-        let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         assert_eq!(0, segment.offset());
@@ -1503,7 +1518,8 @@ mod tests {
         // Create segment options
         let opts = Options::default();
 
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1524,7 +1540,7 @@ mod tests {
             .expect("should write corrupted data to file");
 
         // Attempt to reopen the segment with corrupted metadata
-        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts);
+        let reopened_segment = Segment::open(temp_dir.path(), 0, &opts, false);
         assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
     }
 
@@ -1537,7 +1553,8 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Close the segment
         segment.close().expect("should close segment");
@@ -1554,7 +1571,8 @@ mod tests {
         assert!(n.is_err()); // Reading should fail
 
         // Reopen the closed segment
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should reopen segment");
 
         // Try to perform operations on the reopened segment
         let r = segment.append(&[4, 5, 6, 7]);
@@ -1570,7 +1588,8 @@ mod tests {
         let opts = Options::default();
 
         // Create a new segment file and open it
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Append data to the segment
         let append_result = segment.append(&[0, 1, 2, 3]);
@@ -1604,7 +1623,8 @@ mod tests {
 
         // Create segment options and open a segment
         let opts = Options::default();
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1629,7 +1649,8 @@ mod tests {
         segment.close().expect("should close segment");
 
         // Reopen segment and validate offset
-        let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+        let segment =
+            Segment::open(temp_dir.path(), 0, &opts, false).expect("should create segment");
 
         // Test initial offset
         let sz = segment.offset();
@@ -1660,7 +1681,7 @@ mod tests {
 
     fn setup_locked_segment(opts: Options) -> (Arc<RwLock<Segment>>, PathBuf) {
         let dir = TempDir::new("test").expect("should create temp dir");
-        let seg = Segment::open(dir.path(), 1, &opts).unwrap();
+        let seg = Segment::open(dir.path(), 1, &opts, false).unwrap();
         (Arc::new(RwLock::new(seg)), dir.into_path())
     }
 
@@ -1722,7 +1743,7 @@ mod tests {
         let writer = {
             let seg = seg.clone();
             std::thread::spawn(move || {
-                let mut s = seg.write();
+                let s = seg.write();
                 s.append(&[2u8; 64]).unwrap();
             })
         };
@@ -1751,7 +1772,7 @@ mod tests {
                 let seg = seg.clone();
                 std::thread::spawn(move || {
                     let data = vec![i as u8; 256];
-                    let mut s = seg.write();
+                    let s = seg.write();
                     let offset = s.offset();
                     s.append(&data).unwrap();
                     offset
