@@ -1205,7 +1205,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "surrealkv"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ahash",
  "async-channel",
@@ -1315,9 +1315,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vart"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9486b23b6bec4be5205c9d696a8cc2bc82c51ee82a26e93ceabac56e535dfbcc"
+checksum = "907dbbd9267f93d6f023576d8c28710395dc6c417b70ab0c80b05500f7b44938"
 
 [[package]]
 name = "version_check"
