@@ -2821,13 +2821,14 @@ mod tests {
     #[cfg(not(debug_assertions))]
     mod performance_tests {
         use super::*;
+        use rand::thread_rng;
+        use rand::Rng;
 
         const ENTRIES: usize = 400_000;
         const KEY_SIZE: usize = 24;
         const VALUE_SIZE: usize = 150;
-        const RNG_SEED: u64 = 3;
 
-        fn fill_slice(slice: &mut [u8], rng: &mut StdRng) {
+        fn fill_slice(slice: &mut [u8], rng: &mut impl Rng) {
             let mut i = 0;
             while i + size_of::<u128>() < slice.len() {
                 let tmp = rng.gen::<u128>();
@@ -2854,17 +2855,13 @@ mod tests {
             }
         }
 
-        fn gen_pair(rng: &mut StdRng) -> ([u8; KEY_SIZE], Vec<u8>) {
+        fn gen_pair(rng: &mut impl Rng) -> ([u8; KEY_SIZE], Vec<u8>) {
             let mut key = [0u8; KEY_SIZE];
             fill_slice(&mut key, rng);
             let mut value = vec![0u8; VALUE_SIZE];
             fill_slice(&mut value, rng);
 
             (key, value)
-        }
-
-        fn make_rng() -> StdRng {
-            StdRng::seed_from_u64(RNG_SEED)
         }
 
         #[ignore]
@@ -2875,7 +2872,7 @@ mod tests {
             opts.dir = temp_dir.path().to_path_buf();
 
             let store = Store::new(opts.clone()).expect("should create store");
-            let mut rng = make_rng();
+            let mut rng = thread_rng();
 
             let mut txn = store.begin().unwrap();
             for _ in 0..ENTRIES {
@@ -2886,7 +2883,7 @@ mod tests {
             drop(txn);
 
             // Read the keys from the store
-            let mut rng = make_rng();
+            let mut rng = thread_rng();
             let mut txn = store.begin_with_mode(Mode::ReadOnly).unwrap();
             for _i in 0..ENTRIES {
                 let (key, _) = gen_pair(&mut rng);

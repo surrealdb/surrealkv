@@ -1,12 +1,10 @@
 #![allow(clippy::single_element_loop)]
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use rand::{prelude::SliceRandom, rngs::StdRng, thread_rng, Rng, SeedableRng};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use rand::rngs::StdRng;
-use rand::{thread_rng, Rng, SeedableRng};
 
 use surrealkv::Options;
 use surrealkv::Result;
@@ -396,13 +394,112 @@ fn concurrent_workload(c: &mut Criterion) {
     group.finish();
 }
 
+pub fn bench_cache_sequential_read(c: &mut Criterion) {
+    let group = c.benchmark_group("sequential_read");
+    let value_size = 1024;
+
+    for write_through in [true, false] {
+        let name = if write_through {
+            "write_through"
+        } else {
+            "read_through"
+        };
+
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        opts.cache_on_write = write_through;
+        opts.max_value_cache_size = 10 * 1024 * 1024;
+        let db = Store::new(opts).expect("should create store");
+
+        // Insert data
+        let mut txn = db.begin().unwrap();
+        for i in 0..1000u32 {
+            let key = i.to_be_bytes();
+            let value = vec![i as u8; value_size];
+            txn.set(&key[..], &value[..]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let mut txn = db.begin().unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..1000u32 {
+            let key = i.to_be_bytes();
+            black_box(txn.get(&key[..]).unwrap());
+        }
+        let elapsed = start.elapsed();
+        println!("{}_sequential_read total time: {:?}", name, elapsed);
+        println!(
+            "{}_sequential_read average per item: {:?}",
+            name,
+            elapsed / 1000
+        );
+    }
+    group.finish();
+}
+
+pub fn bench_cache_random_read(c: &mut Criterion) {
+    let group = c.benchmark_group("random_read");
+    let value_size = 1024;
+
+    for write_through in [true, false] {
+        let name = if write_through {
+            "write_through"
+        } else {
+            "read_through"
+        };
+
+        let mut opts = Options::new();
+        opts.dir = create_temp_directory().path().to_path_buf();
+        opts.cache_on_write = write_through;
+        opts.max_value_cache_size = 10 * 1024 * 1024;
+        let db = Store::new(opts).expect("should create store");
+
+        // Insert data
+        let mut txn = db.begin().unwrap();
+        for i in 0..1000u32 {
+            let key = i.to_be_bytes();
+            let value = vec![i as u8; value_size];
+            txn.set(&key[..], &value[..]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let mut keys: Vec<u32> = (0..1000).collect();
+        keys.shuffle(&mut thread_rng());
+
+        let mut txn = db.begin().unwrap();
+        let start = std::time::Instant::now();
+        for i in keys {
+            let key = i.to_be_bytes();
+            black_box(txn.get(&key[..]).unwrap());
+        }
+        let elapsed = start.elapsed();
+        println!("{}_random_read total time: {:?}", name, elapsed);
+        println!(
+            "{}_random_read average per item: {:?}",
+            name,
+            elapsed / 1000
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches_insert,
     sequential_insert,
     random_insert,
     bulk_insert,
-    sequential_insert_read
+    sequential_insert_read,
 );
 criterion_group!(benches_range, range_scan);
 criterion_group!(benches_concurrent, concurrent_insert, concurrent_workload);
-criterion_main!(benches_insert, benches_range, benches_concurrent);
+criterion_group!(
+    cache_benches,
+    bench_cache_sequential_read,
+    bench_cache_random_read,
+);
+criterion_main!(
+    benches_insert,
+    benches_range,
+    benches_concurrent,
+    cache_benches
+);

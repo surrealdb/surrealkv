@@ -1690,4 +1690,33 @@ mod tests {
         ));
         close_handle.join().unwrap().unwrap();
     }
+
+    #[test]
+    fn test_cache_on_write() {
+        // Create a temporary directory for testing
+        let temp_dir = create_temp_directory();
+
+        // Create store options with the test directory
+        let mut opts = Options::new();
+        opts.dir = temp_dir.path().to_path_buf();
+        opts.cache_on_write = true;
+        opts.max_value_cache_size = 10 * 1024 * 1024; // 10MB cache
+        let db = Store::new(opts).expect("should create store");
+
+        // Write 1000 items
+        let value = vec![1u8; 1024]; // 1KB value
+        for i in 0u64..1000 {
+            let mut txn = db.begin().unwrap();
+            let key = i.to_be_bytes();
+            txn.set(&key[..], &value[..]).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let mut txn = db.begin().unwrap();
+        for i in 0u64..1000 {
+            let key = i.to_be_bytes();
+            let result = txn.get(&key[..]).unwrap().unwrap();
+            assert_eq!(result, value, "Read value should match written value");
+        }
+    }
 }
