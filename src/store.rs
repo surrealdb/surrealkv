@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::compaction::restore_from_compaction;
-use crate::entry::{encode_entries, Entry, Record};
+use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::indexer::{IndexValue, Indexer};
 use crate::log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef};
@@ -456,14 +456,35 @@ impl Core {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(entries.len());
+        let mut cache_values = Vec::with_capacity(if self.opts.cache_on_write {
+            entries.len()
+        } else {
+            0
+        });
 
-        encode_entries(&entries, tx_id, &mut buf, &mut values_offsets);
+        // Encode entries and collect cache values if needed
+        for entry in &entries {
+            let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
+            let offset = tx_record_entry.encode(&mut buf).unwrap() as u64;
+            values_offsets.insert(entry.key.clone(), offset);
+
+            if self.opts.cache_on_write {
+                cache_values.push((offset, entry.value.clone()));
+            }
+        }
 
         let (segment_id, current_offset) = self.append_log(&buf, durability)?;
 
-        values_offsets.iter_mut().for_each(|(_, val_off)| {
-            *val_off += current_offset;
-        });
+        // Update offsets and cache in single pass
+        for (_, offset) in values_offsets.iter_mut() {
+            *offset += current_offset;
+        }
+
+        // Handle cache if enabled
+        for (offset, value) in cache_values {
+            self.value_cache
+                .insert((segment_id, offset + current_offset), value);
+        }
 
         self.write_entries_to_index(&entries, tx_id, |entry| {
             let offset = *values_offsets.get(&entry.key).unwrap();
@@ -572,8 +593,10 @@ impl Core {
         let clog = self.clog.as_ref().unwrap();
         clog.read_at(&mut buf, segment_id, value_offset)?;
 
-        // Cache the newly read value for future use
-        self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
+        // Cache the newly read value only if write-through is disabled
+        if !self.opts.cache_on_write {
+            self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
+        }
 
         Ok(buf)
     }
