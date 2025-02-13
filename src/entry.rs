@@ -1,4 +1,3 @@
-use ahash::HashMap;
 use std::hash::{Hash, Hasher};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -61,19 +60,6 @@ impl Entry {
         } else {
             false
         }
-    }
-}
-
-pub(crate) fn encode_entries(
-    entries: &[Entry],
-    tx_id: u64,
-    buf: &mut BytesMut,
-    offset_tracker: &mut HashMap<Bytes, u64>,
-) {
-    for entry in entries {
-        let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
-        let offset = tx_record_entry.encode(buf).unwrap();
-        offset_tracker.insert(entry.key.clone(), offset as u64);
     }
 }
 
