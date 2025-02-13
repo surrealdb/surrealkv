@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use chrono::Utc;
+use quick_cache::{sync::Cache, Weighter};
 use std::fs;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -99,4 +100,15 @@ where
         Bound::Unbounded => Bound::Unbounded,
     };
     (start_bound, end_bound)
+}
+
+pub(crate) type ValueCache = Cache<(u64, u64), Bytes, ByteWeighter>;
+
+#[derive(Clone)]
+pub(crate) struct ByteWeighter;
+
+impl Weighter<(u64, u64), Bytes> for ByteWeighter {
+    fn weight(&self, _key: &(u64, u64), value: &Bytes) -> u64 {
+        value.len() as u64
+    }
 }
