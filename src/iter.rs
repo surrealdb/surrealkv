@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use vart::VariableSizeKey;
 
 use crate::{
@@ -32,8 +33,8 @@ pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
     core: &'a Core,
     read_set: Option<&'a mut ReadSet>,
     savepoints: u32,
-    snap_iter: Peekable<I>,
-    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
+    snap_iter: DoubleEndedPeekable<I>,
+    write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     limit: usize,
     count: usize,
     _phantom: PhantomData<R>,
@@ -58,8 +59,8 @@ where
             core,
             read_set,
             savepoints,
-            snap_iter: snap_iter.peekable(),
-            write_set_iter: write_set.range(range_bytes).peekable(),
+            snap_iter: snap_iter.double_ended_peekable(),
+            write_set_iter: write_set.range(range_bytes).double_ended_peekable(),
             limit: limit.unwrap_or(usize::MAX),
             count: 0,
             _phantom: PhantomData,
@@ -69,6 +70,34 @@ where
     fn add_to_read_set(read_set: &mut ReadSet, key: &[u8], version: u64, savepoints: u32) {
         let entry = ReadSetEntry::new(key, version, savepoints);
         read_set.push(entry);
+    }
+
+    fn read_from_snapshot(&mut self) -> Option<<Self as Iterator>::Item> {
+        self.snap_iter.next().map(|(key, value, version, ts)| {
+            if let Some(read_set) = self.read_set.as_mut() {
+                Self::add_to_read_set(read_set, key, version, self.savepoints);
+            }
+            match value.resolve(self.core) {
+                Ok(v) => Ok((key, v, ts)),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn read_from_write_set(&mut self) -> Option<<Self as Iterator>::Item> {
+        if let Some((ws_key, ws_entries)) = self.write_set_iter.next() {
+            if let Some(ws_entry) = ws_entries.last() {
+                if ws_entry.e.is_deleted_or_tombstone() {
+                    return self.next();
+                }
+                return Some(Ok((
+                    ws_key.as_ref(),
+                    ws_entry.e.value.to_vec(),
+                    ws_entry.e.ts,
+                )));
+            }
+        }
+        None
     }
 }
 
@@ -135,13 +164,65 @@ where
     }
 }
 
+impl<'a, R, I> DoubleEndedIterator for MergingScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.count >= self.limit {
+            return None;
+        }
+
+        // Fast path when write set is empty
+        if self.write_set_iter.peek().is_none() {
+            let result = self.read_from_snapshot_back();
+            if result.is_some() {
+                self.count += 1;
+            }
+            return result;
+        }
+
+        // Merging path
+        let has_snap = self.snap_iter.peek_back().is_some();
+        let has_ws = self.write_set_iter.peek_back().is_some();
+
+        let result = match (has_snap, has_ws) {
+            (false, false) => None,
+            (true, false) => self.read_from_snapshot_back(),
+            (false, true) => self.read_from_write_set_back(),
+            (true, true) => {
+                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
+                    (self.snap_iter.peek_back(), self.write_set_iter.peek_back())
+                {
+                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
+                        Ordering::Greater => self.read_from_snapshot_back(),
+                        Ordering::Less => self.read_from_write_set_back(),
+                        Ordering::Equal => {
+                            self.snap_iter.next_back(); // Skip snapshot entry
+                            self.read_from_write_set_back()
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if result.is_some() {
+            self.count += 1;
+        }
+        result
+    }
+}
+
 impl<'a, R, I> MergingScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
 {
-    fn read_from_snapshot(&mut self) -> Option<<Self as Iterator>::Item> {
-        self.snap_iter.next().map(|(key, value, version, ts)| {
+    fn read_from_snapshot_back(&mut self) -> Option<<Self as Iterator>::Item> {
+        self.snap_iter.next_back().map(|(key, value, version, ts)| {
             if let Some(read_set) = self.read_set.as_mut() {
                 Self::add_to_read_set(read_set, key, version, self.savepoints);
             }
@@ -152,11 +233,11 @@ where
         })
     }
 
-    fn read_from_write_set(&mut self) -> Option<<Self as Iterator>::Item> {
-        if let Some((ws_key, ws_entries)) = self.write_set_iter.next() {
+    fn read_from_write_set_back(&mut self) -> Option<<Self as Iterator>::Item> {
+        if let Some((ws_key, ws_entries)) = self.write_set_iter.next_back() {
             if let Some(ws_entry) = ws_entries.last() {
                 if ws_entry.e.is_deleted_or_tombstone() {
-                    return self.next();
+                    return self.next_back();
                 }
                 return Some(Ok((
                     ws_key.as_ref(),
