@@ -187,7 +187,7 @@ impl Analyzer {
             .with_file_extension("clog".to_string());
 
         // Open the commit log
-        let mut destination_commit_log =
+        let destination_commit_log =
             Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
 
         // Write latest versions to new location
