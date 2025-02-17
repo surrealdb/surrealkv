@@ -3,7 +3,6 @@ use async_channel::{bounded, Receiver, Sender};
 use bytes::{Bytes, BytesMut};
 use futures::{select, FutureExt};
 use parking_lot::RwLock;
-use quick_cache::sync::Cache;
 use revision::Revisioned;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -23,6 +22,8 @@ use crate::reader::{Reader, RecordReader};
 use crate::repair::{repair_last_corrupted_segment, restore_repair_files};
 use crate::stats::StorageStats;
 use crate::transaction::{Durability, Mode, Transaction};
+use crate::util::ByteWeighter;
+use crate::util::ValueCache;
 
 pub(crate) struct StoreInner {
     pub(crate) core: Arc<Core>,
@@ -266,7 +267,7 @@ pub struct Core {
     /// The assumption for this cache is that it should be useful for
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
-    pub(crate) value_cache: Cache<(u64, u64), Bytes>,
+    pub(crate) value_cache: ValueCache,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Channel to send write requests to the writer
@@ -360,7 +361,11 @@ impl Core {
         oracle.set_ts(indexer.version());
 
         // Create and initialize value cache.
-        let value_cache = Cache::new(opts.max_value_cache_size as usize);
+        let value_cache = ValueCache::with_weighter(
+            opts.max_value_cache_size as usize,
+            opts.max_value_cache_size,
+            ByteWeighter,
+        );
 
         // Construct and return the Core instance.
         Ok(Self {
