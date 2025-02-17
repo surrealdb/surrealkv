@@ -466,7 +466,7 @@ impl Core {
         for (idx, entry) in entries.iter().enumerate() {
             let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
             let offset = tx_record_entry.encode(&mut buf).unwrap() as u64;
-            values_offsets.insert(entry.key.clone(), offset);
+            values_offsets.insert(&entry.key, offset);
 
             if self.opts.cache_on_write {
                 cache_indices.push((offset, idx));
