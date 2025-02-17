@@ -51,7 +51,7 @@ pub fn repair_last_corrupted_segment(
 /// Currently it is only being used for testing purposes.
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment(
-    aol: &mut Aol,
+    aol: &Aol,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
 ) -> Result<()> {
@@ -117,15 +117,19 @@ pub(crate) fn repair_corrupted_segment(
 ///
 /// If any of these operations fail, the function returns an error.
 fn repair_segment(
-    aol: &mut Aol,
+    aol: &Aol,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
     corrupted_segment_file_header_offset: u64,
 ) -> Result<()> {
+    // Get writer lock to check and manipulate active segment
+    let mut writer = aol.writer_state.lock();
+    let current_active_id = writer.active_segment_id;
+
     // Close the active segment if its ID matches
-    if aol.active_segment_id == corrupted_segment_id {
-        aol.active_segment.close()?;
+    if current_active_id == corrupted_segment_id {
+        writer.active_segment.close()?;
     }
 
     // Prepare the repaired segment path
@@ -135,7 +139,7 @@ fn repair_segment(
     std::fs::rename(&corrupted_segment_file_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
-    let mut new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts)?;
+    let new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
 
     // Create a segment reader for the repaired segment
     let segments: Vec<SegmentRef> = vec![SegmentRef {
@@ -171,8 +175,12 @@ fn repair_segment(
         println!("deleting empty file {:?}", corrupted_segment_file_path);
         std::fs::remove_file(&corrupted_segment_file_path)?;
     }
-    let new_segment = Segment::open(&aol.dir, aol.active_segment_id, &aol.opts)?;
-    aol.active_segment = new_segment;
+
+    // If we were repairing the active segment, update it
+    if current_active_id == corrupted_segment_id {
+        let new_active_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
+        writer.active_segment = new_active_segment;
+    }
 
     Ok(())
 }
@@ -306,15 +314,7 @@ mod tests {
         segment_num: usize,
         corruption_offset: u64,
     ) {
-        let mut clog = store
-            .inner
-            .as_ref()
-            .unwrap()
-            .core
-            .clog
-            .as_ref()
-            .unwrap()
-            .write();
+        let clog = store.inner.as_ref().unwrap().core.clog.as_ref().unwrap();
         let clog_subdir = opts.dir.join("clog");
         let sr =
             SegmentRef::read_segments_from_directory(&clog_subdir).expect("should read segments");
@@ -325,10 +325,7 @@ mod tests {
         let (corrupted_segment_id, corrupted_offset_marker) =
             find_corrupted_segment(sr, opts.clone());
 
-        repair_corrupted_segment(&mut clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
-
-        // drop lock over commit log
-        drop(clog);
+        repair_corrupted_segment(clog, corrupted_segment_id, corrupted_offset_marker).unwrap();
     }
 
     #[allow(unused)]
