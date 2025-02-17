@@ -1,5 +1,5 @@
 use ahash::{HashMap, HashMapExt};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use parking_lot::{Mutex, RwLock};
 use revision::Revisioned;
 use std::path::Path;
@@ -20,8 +20,6 @@ use crate::reader::{Reader, RecordReader};
 use crate::repair::{repair_last_corrupted_segment, restore_repair_files};
 use crate::stats::StorageStats;
 use crate::transaction::{Durability, Mode, Transaction};
-use crate::util::ByteWeighter;
-use crate::util::ValueCache;
 
 /// An MVCC-based transactional key-value store.
 ///
@@ -552,9 +550,6 @@ impl Core {
         value_offset: u64,
         value_len: usize,
     ) -> Result<Vec<u8>> {
-        // Attempt to return the cached value if it exists
-        let cache_key = (segment_id, value_offset);
-
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
         let clog = self.clog.as_ref().unwrap();
