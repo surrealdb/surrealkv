@@ -114,11 +114,6 @@ pub struct Core {
     pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Oracle,
-    /// Value cache for store.
-    /// The assumption for this cache is that it should be useful for
-    /// storing offsets that are frequently accessed (especially in
-    /// the case of range scans)
-    pub(crate) value_cache: ValueCache,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Write lock to ensure that only one transaction can commit at a time.
@@ -199,14 +194,6 @@ impl Core {
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
 
-        // Create and initialize value cache.
-        // Create and initialize value cache.
-        let value_cache = ValueCache::with_weighter(
-            opts.max_value_cache_size as usize,
-            opts.max_value_cache_size,
-            ByteWeighter,
-        );
-
         // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
@@ -214,7 +201,6 @@ impl Core {
             manifest: manifest.map(RwLock::new),
             clog: clog.map(Arc::new),
             oracle,
-            value_cache,
             is_closed: AtomicBool::new(false),
             commit_write_lock: Mutex::new(()),
         })
@@ -456,21 +442,12 @@ impl Core {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(entries.len());
-        let mut cache_values = Vec::with_capacity(if self.opts.cache_on_write {
-            entries.len()
-        } else {
-            0
-        });
 
         // Encode entries and collect cache values if needed
         for entry in &entries {
             let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
             let offset = tx_record_entry.encode(&mut buf).unwrap() as u64;
             values_offsets.insert(entry.key.clone(), offset);
-
-            if self.opts.cache_on_write {
-                cache_values.push((offset, entry.value.clone()));
-            }
         }
 
         let (segment_id, current_offset) = self.append_log(&buf, durability)?;
@@ -478,12 +455,6 @@ impl Core {
         // Update offsets and cache in single pass
         for (_, offset) in values_offsets.iter_mut() {
             *offset += current_offset;
-        }
-
-        // Handle cache if enabled
-        for (offset, value) in cache_values {
-            self.value_cache
-                .insert((segment_id, offset + current_offset), value);
         }
 
         self.write_entries_to_index(&entries, tx_id, |entry| {
@@ -584,19 +555,10 @@ impl Core {
         // Attempt to return the cached value if it exists
         let cache_key = (segment_id, value_offset);
 
-        if let Some(value) = self.value_cache.get(&cache_key) {
-            return Ok(value.to_vec());
-        }
-
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
         let clog = self.clog.as_ref().unwrap();
         clog.read_at(&mut buf, segment_id, value_offset)?;
-
-        // Cache the newly read value only if write-through is disabled
-        if !self.opts.cache_on_write {
-            self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
-        }
 
         Ok(buf)
     }
