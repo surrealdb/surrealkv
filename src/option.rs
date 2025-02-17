@@ -47,10 +47,6 @@ pub struct Options {
     // Used to enable or disable versioned values.
     #[revision(start = 3)]
     pub enable_versions: bool,
-
-    // Field to indicate whether the values should be cached during writes instead of reads.
-    #[revision(start = 4)]
-    pub cache_on_write: bool,
 }
 
 impl Default for Options {
@@ -65,7 +61,6 @@ impl Default for Options {
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
             enable_versions: true,
-            cache_on_write: false,
         }
     }
 }
@@ -109,6 +104,5 @@ mod tests {
         assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
         assert!(options.enable_versions);
-        assert!(!options.cache_on_write);
     }
 }
