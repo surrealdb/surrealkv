@@ -659,14 +659,14 @@ impl Core {
     where
         F: Fn(&Entry) -> IndexValue,
     {
-        let mut index = self.indexer.write();
+        let mut new_index = self.indexer.read().clone();
 
         for entry in &task.entries {
             // If the entry is marked as deleted or a tombstone
             // with the replace flag set, delete it.
             if let Some(metadata) = entry.metadata.as_ref() {
                 if metadata.is_deleted() || metadata.is_tombstone() && entry.replace {
-                    index.delete(&mut entry.key[..].into());
+                    new_index.delete(&mut entry.key[..].into());
                     continue;
                 }
             }
@@ -674,7 +674,7 @@ impl Core {
             let index_value = encode_entry(entry);
 
             if !entry.replace {
-                index.insert(
+                new_index.insert(
                     &mut entry.key[..].into(),
                     index_value,
                     task.tx_id,
@@ -682,7 +682,7 @@ impl Core {
                     true,
                 )?;
             } else {
-                index.insert_or_replace(
+                new_index.insert_or_replace(
                     &mut entry.key[..].into(),
                     index_value,
                     task.tx_id,
@@ -691,6 +691,8 @@ impl Core {
                 )?;
             }
         }
+
+        *self.indexer.write() = new_index;
 
         Ok(())
     }
