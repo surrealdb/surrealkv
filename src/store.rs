@@ -214,7 +214,18 @@ impl TaskRunner {
         let done_tx = self.done_tx.clone();
 
         #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(self.run(done_tx));
+        std::thread::spawn(move || {
+            // Create a new single-threaded Tokio runtime on the new thread
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build runtime");
+
+            // Run the TaskRunner's async code on this runtime
+            rt.block_on(async move {
+                self.run(done_tx).await;
+            });
+        });
 
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(self.run(done_tx));
