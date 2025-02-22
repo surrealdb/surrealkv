@@ -396,7 +396,7 @@ impl Transaction {
         &'b mut self,
         range: R,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = Result<ScanResult<'b>>>
+    ) -> impl DoubleEndedIterator<Item = Result<ScanResult<'b>>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -1479,6 +1479,329 @@ mod tests {
                 let limited_results: Vec<_> = txn5.keys(range, Some(1)).collect();
                 assert_eq!(limited_results, vec![&b"k1"[..]]);
             }
+        }
+
+        #[test]
+        fn test_double_ended_iterator() {
+            let (store, _) = create_store(false);
+
+            let keys_to_insert = vec![
+                Bytes::from("key1"),
+                Bytes::from("key2"),
+                Bytes::from("key3"),
+                Bytes::from("key4"),
+                Bytes::from("key5"),
+            ];
+
+            for key in &keys_to_insert {
+                let mut txn = store.begin().unwrap();
+                txn.set(key, key).unwrap();
+                txn.commit().unwrap();
+            }
+
+            let range = "key1".as_bytes()..="key5".as_bytes();
+            let mut txn = store.begin().unwrap();
+
+            // Test 1: Forward iteration
+            {
+                let results: Vec<_> = txn.scan(range.clone(), None).collect();
+                assert_eq!(results.len(), 5);
+                let keys: Vec<_> = results.iter().map(|r| r.as_ref().unwrap().0).collect();
+                assert_eq!(keys, vec![b"key1", b"key2", b"key3", b"key4", b"key5"]);
+            }
+
+            // Test 2: Reverse iteration
+            {
+                let results: Vec<_> = txn.scan(range.clone(), None).rev().collect();
+                assert_eq!(results.len(), 5);
+                let keys: Vec<_> = results.iter().map(|r| r.as_ref().unwrap().0).collect();
+                assert_eq!(keys, vec![b"key5", b"key4", b"key3", b"key2", b"key1"]);
+            }
+
+            // Test 3: Mixed iteration from both ends
+            {
+                let mut iter = txn.scan(range.clone(), None);
+
+                // Collect alternating from front and back
+                let mut results = Vec::new();
+
+                // First from front
+                if let Some(item) = iter.next() {
+                    results.push(item);
+                }
+
+                // Last from back
+                if let Some(item) = iter.next_back() {
+                    results.push(item);
+                }
+
+                // Second from front
+                if let Some(item) = iter.next() {
+                    results.push(item);
+                }
+
+                // Second-to-last from back
+                if let Some(item) = iter.next_back() {
+                    results.push(item);
+                }
+
+                // Middle element
+                if let Some(item) = iter.next() {
+                    results.push(item);
+                }
+
+                assert_eq!(results.len(), 5);
+
+                let keys: Vec<_> = results.iter().map(|r| r.as_ref().unwrap().0).collect();
+
+                assert_eq!(keys, vec![b"key1", b"key5", b"key2", b"key4", b"key3"]);
+            }
+
+            // Test 4: Iteration with limit
+            {
+                let results: Vec<_> = txn.scan(range.clone(), Some(3)).rev().collect();
+                assert_eq!(results.len(), 3);
+                let keys: Vec<_> = results.iter().map(|r| r.as_ref().unwrap().0).collect();
+                assert_eq!(keys, vec![b"key5", b"key4", b"key3"]);
+            }
+
+            // Test 5: Mixed iteration with limit
+            {
+                let mut iter = txn.scan(range.clone(), Some(3));
+                let mut results = Vec::new();
+
+                // First from front
+                if let Some(item) = iter.next() {
+                    results.push(item);
+                }
+
+                // One from back
+                if let Some(item) = iter.next_back() {
+                    results.push(item);
+                }
+
+                // One more from front
+                if let Some(item) = iter.next() {
+                    results.push(item);
+                }
+
+                // Should not get more items due to limit
+                assert!(iter.next().is_none());
+                assert!(iter.next_back().is_none());
+
+                assert_eq!(results.len(), 3);
+                let keys: Vec<_> = results.iter().map(|r| r.as_ref().unwrap().0).collect();
+                assert_eq!(keys, vec![b"key1", b"key5", b"key2"]);
+            }
+        }
+
+        #[test]
+        fn test_scan_mixed_pattern() {
+            let (store, _) = create_store(false);
+
+            for i in 1..=10u16 {
+                let key = format!("key{:02}", i);
+                let mut txn = store.begin().unwrap();
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let mut txn = store.begin().unwrap();
+            let range = "key03".as_bytes()..="key08".as_bytes();
+            let mut iter = txn.scan(range, None);
+
+            let mut results = Vec::new();
+
+            // Forward 2
+            for _ in 0..2 {
+                if let Some(Ok((key, _, _))) = iter.next() {
+                    results.push(String::from_utf8_lossy(key).to_string());
+                }
+            }
+            // Should have [key03, key04]
+            assert_eq!(results, vec!["key03", "key04"]);
+
+            // Backward 1
+            if let Some(Ok((key, _, _))) = iter.next_back() {
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+            // Should have [key03, key04, key08]
+            assert_eq!(results, vec!["key03", "key04", "key08"]);
+
+            // Forward 1
+            if let Some(Ok((key, _, _))) = iter.next() {
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+            // Should have [key03, key04, key08, key05]
+            assert_eq!(results, vec!["key03", "key04", "key08", "key05"]);
+
+            // Backward 2
+            for _ in 0..2 {
+                if let Some(Ok((key, _, _))) = iter.next_back() {
+                    results.push(String::from_utf8_lossy(key).to_string());
+                }
+            }
+            // Should have [key03, key04, key08, key05, key07, key06]
+            assert_eq!(
+                results,
+                vec!["key03", "key04", "key08", "key05", "key07", "key06"]
+            );
+
+            // Verify no remaining items
+            let mut remaining = Vec::new();
+            iter.for_each(|r| {
+                if let Ok((key, _, _)) = r {
+                    remaining.push(String::from_utf8_lossy(key).to_string());
+                }
+            });
+            assert!(
+                remaining.is_empty(),
+                "Expected no remaining items but got: {:?}",
+                remaining
+            );
+        }
+
+        #[test]
+        fn test_scan_exact_traversal_pattern() {
+            let (store, _) = create_store(false);
+
+            for i in 1..=6u16 {
+                let key = format!("key{:02}", i);
+                let mut txn = store.begin().unwrap();
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let mut txn = store.begin().unwrap();
+            let range = "key01".as_bytes()..="key06".as_bytes();
+            let mut iter = txn.scan(range, None);
+
+            // First forward
+            if let Some(Ok((key, _, _))) = iter.next() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key01",
+                    "First forward should be key01"
+                );
+            }
+
+            // First backward
+            if let Some(Ok((key, _, _))) = iter.next_back() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key06",
+                    "First backward should be key06"
+                );
+            }
+
+            // Second backward
+            if let Some(Ok((key, _, _))) = iter.next_back() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key05",
+                    "Second backward should be key05"
+                );
+            }
+
+            // Second forward
+            if let Some(Ok((key, _, _))) = iter.next() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key02",
+                    "Second forward should be key02"
+                );
+            }
+
+            // Third forward
+            if let Some(Ok((key, _, _))) = iter.next() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key03",
+                    "Third forward should be key03"
+                );
+            }
+
+            // Fourth forward
+            if let Some(Ok((key, _, _))) = iter.next() {
+                assert_eq!(
+                    String::from_utf8_lossy(key),
+                    "key04",
+                    "Fourth forward should be key04"
+                );
+            }
+
+            // Verify iterator is exhausted
+            assert!(
+                iter.next().is_none(),
+                "Iterator should be exhausted going forward"
+            );
+            assert!(
+                iter.next_back().is_none(),
+                "Iterator should be exhausted going backward"
+            );
+        }
+
+        #[test]
+        fn test_scan_mixed_pattern_with_deletions() {
+            let (store, _) = create_store(false);
+
+            for i in 1..=10u16 {
+                let key = format!("key{:02}", i);
+                let mut txn = store.begin().unwrap();
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Delete keys 4 and 7
+            {
+                let mut txn = store.begin().unwrap();
+                txn.delete(&Bytes::from("key04")).unwrap();
+                txn.delete(&Bytes::from("key07")).unwrap();
+                txn.commit().unwrap();
+            }
+
+            let mut txn = store.begin().unwrap();
+            let range = "key03".as_bytes()..="key08".as_bytes();
+            let mut iter = txn.scan(range, None);
+
+            let mut results = Vec::new();
+
+            // Collect with mixed pattern
+            if let Some(Ok((key, _, _))) = iter.next() {
+                // Forward
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+
+            if let Some(Ok((key, _, _))) = iter.next_back() {
+                // Backward
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+
+            if let Some(Ok((key, _, _))) = iter.next() {
+                // Forward
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+
+            if let Some(Ok((key, _, _))) = iter.next_back() {
+                // Backward
+                results.push(String::from_utf8_lossy(key).to_string());
+            }
+
+            // Expected: [key03, key08, key05, key06]
+            assert_eq!(results, vec!["key03", "key08", "key05", "key06"]);
+
+            // Verify iterator is exhausted
+            assert!(
+                iter.next().is_none(),
+                "Iterator should be exhausted going forward"
+            );
+            assert!(
+                iter.next_back().is_none(),
+                "Iterator should be exhausted going backward"
+            );
         }
     }
 

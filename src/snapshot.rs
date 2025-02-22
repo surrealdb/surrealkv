@@ -83,7 +83,7 @@ impl Snapshot {
     pub(crate) fn range<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
+    ) -> impl DoubleEndedIterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
@@ -96,7 +96,7 @@ impl Snapshot {
     pub(crate) fn range_with_deleted<'a, R>(
         &'a self,
         range: R,
-    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
+    ) -> impl DoubleEndedIterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
