@@ -456,20 +456,20 @@ impl Core {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(entries.len());
-        let mut cache_values = Vec::with_capacity(if self.opts.cache_on_write {
-            entries.len()
+        let mut cache_indices = if self.opts.cache_on_write {
+            Vec::with_capacity(entries.len())
         } else {
-            0
-        });
+            Vec::new()
+        };
 
         // Encode entries and collect cache values if needed
-        for entry in &entries {
+        for (idx, entry) in entries.iter().enumerate() {
             let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
             let offset = tx_record_entry.encode(&mut buf).unwrap() as u64;
-            values_offsets.insert(entry.key.clone(), offset);
+            values_offsets.insert(&entry.key, offset);
 
             if self.opts.cache_on_write {
-                cache_values.push((offset, entry.value.clone()));
+                cache_indices.push((offset, idx));
             }
         }
 
@@ -481,9 +481,11 @@ impl Core {
         }
 
         // Handle cache if enabled
-        for (offset, value) in cache_values {
-            self.value_cache
-                .insert((segment_id, offset + current_offset), value);
+        for (offset, idx) in cache_indices {
+            self.value_cache.insert(
+                (segment_id, offset + current_offset),
+                entries[idx].value.clone(), // Clone only when actually inserting into cache
+            );
         }
 
         self.write_entries_to_index(&entries, tx_id, |entry| {
