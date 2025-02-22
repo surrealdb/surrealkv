@@ -456,21 +456,12 @@ impl Core {
         // TODO: This buf can be reused by defining on core level
         let mut buf = BytesMut::new();
         let mut values_offsets = HashMap::with_capacity(entries.len());
-        let mut cache_indices = if self.opts.cache_on_write {
-            Vec::with_capacity(entries.len())
-        } else {
-            Vec::new()
-        };
 
         // Encode entries and collect cache values if needed
-        for (idx, entry) in entries.iter().enumerate() {
+        for entry in entries.iter() {
             let tx_record_entry = Record::new_from_entry(entry.clone(), tx_id);
             let offset = tx_record_entry.encode(&mut buf).unwrap() as u64;
             values_offsets.insert(&entry.key, offset);
-
-            if self.opts.cache_on_write {
-                cache_indices.push((offset, idx));
-            }
         }
 
         let (segment_id, current_offset) = self.append_log(&buf, durability)?;
@@ -478,14 +469,6 @@ impl Core {
         // Update offsets and cache in single pass
         for (_, offset) in values_offsets.iter_mut() {
             *offset += current_offset;
-        }
-
-        // Handle cache if enabled
-        for (offset, idx) in cache_indices {
-            self.value_cache.insert(
-                (segment_id, offset + current_offset),
-                entries[idx].value.clone(), // Clone only when actually inserting into cache
-            );
         }
 
         self.write_entries_to_index(&entries, tx_id, |entry| {
@@ -595,10 +578,8 @@ impl Core {
         let clog = self.clog.as_ref().unwrap();
         clog.read_at(&mut buf, segment_id, value_offset)?;
 
-        // Cache the newly read value only if write-through is disabled
-        if !self.opts.cache_on_write {
-            self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
-        }
+        // Cache the newly read value
+        self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
 
         Ok(buf)
     }
@@ -1691,34 +1672,5 @@ mod tests {
             Err(Error::LogError(LogError::SegmentClosed))
         ));
         close_handle.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn test_cache_on_write() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-
-        // Create store options with the test directory
-        let mut opts = Options::new();
-        opts.dir = temp_dir.path().to_path_buf();
-        opts.cache_on_write = true;
-        opts.max_value_cache_size = 10 * 1024 * 1024; // 10MB cache
-        let db = Store::new(opts).expect("should create store");
-
-        // Write 1000 items
-        let value = vec![1u8; 1024]; // 1KB value
-        for i in 0u64..1000 {
-            let mut txn = db.begin().unwrap();
-            let key = i.to_be_bytes();
-            txn.set(&key[..], &value[..]).unwrap();
-            txn.commit().unwrap();
-        }
-
-        let mut txn = db.begin().unwrap();
-        for i in 0u64..1000 {
-            let key = i.to_be_bytes();
-            let result = txn.get(&key[..]).unwrap().unwrap();
-            assert_eq!(result, value, "Read value should match written value");
-        }
     }
 }
