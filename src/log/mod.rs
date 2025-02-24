@@ -684,7 +684,12 @@ impl Segment {
 
         // Only open write handle if not read_only
         let mut write_file = if !read_only {
-            Some(Self::open_file(&file_path, opts, true)?)
+            let file = Self::open_file(&file_path, opts, true)?;
+
+            // Should fsync here to ensure any previous unflushed
+            // page cache in the kernel (because of previous crash) is flushed to disk
+            file.sync_all()?;
+            Some(file)
         } else {
             None
         };
