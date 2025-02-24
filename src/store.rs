@@ -515,7 +515,7 @@ impl Core {
     where
         F: Fn(&Entry) -> IndexValue,
     {
-        let mut index = self.indexer.write();
+        let mut index = self.indexer.read().clone();
 
         for entry in entries {
             // If the entry is marked as deleted or a tombstone
@@ -547,6 +547,8 @@ impl Core {
                 )?;
             }
         }
+
+        *self.indexer.write() = index;
 
         Ok(())
     }
