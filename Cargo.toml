@@ -46,7 +46,3 @@ walkdir = "2.5.0"
 [[bench]]
 name = "store_bench"
 harness = false
-
-[[bench]]
-name = "load_bench"
-harness = false

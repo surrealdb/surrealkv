@@ -466,6 +466,9 @@ impl Transaction {
             return Ok(()); // Return when there's nothing to commit
         }
 
+        // Drop the snapshot to avoid holding references in the index.
+        self.snapshot.take();
+
         // Serialize commits to the transaction log.
         let write_ch_lock = self.core.commit_write_lock.lock();
 
