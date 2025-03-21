@@ -196,6 +196,10 @@ impl Store {
 
         temp_writer.close()?;
 
+        // Explicitly drop temp_writer and manifest to release file handles before renaming
+        drop(temp_writer);
+        drop(manifest);
+
         // Finalize compaction by renaming the temporary directory
         fs::rename(tmp_merge_dir, merge_dir)?;
 
