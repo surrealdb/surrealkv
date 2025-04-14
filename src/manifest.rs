@@ -55,7 +55,7 @@ impl Manifest {
                 ManifestChangeType::Options(options) => Some(options),
                 _ => None,
             })
-            .last()
+            .next_back()
             .cloned()
     }
 
