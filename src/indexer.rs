@@ -4,6 +4,7 @@ use vart::{art::Tree as VartIndex, VariableSizeKey};
 use crate::error::Result;
 use crate::meta::Metadata;
 use crate::store::Core;
+use crate::vfs::FileSystem;
 
 /// The `Indexer` struct is responsible for managing the index of key-value pairs.
 /// It uses a `vart` index, which is a type of persistent, lock-free B+ tree.
@@ -136,7 +137,7 @@ impl IndexValue {
         }
     }
 
-    pub(crate) fn resolve(&self, store: &Core) -> Result<Vec<u8>> {
+    pub(crate) fn resolve<V: FileSystem>(&self, store: &Core<V>) -> Result<Vec<u8>> {
         match self {
             Self::Mem(mem_entry) => Ok(mem_entry.value.to_vec()),
             Self::Disk(disk_entry) => match &disk_entry.inlined_value {

@@ -24,35 +24,33 @@ use crate::util::ByteWeighter;
 use crate::util::ValueCache;
 use crate::vfs::FileSystem;
 
-pub struct StoreInner<V: FileSystem> {
-    pub(crate) core: Arc<Core>,
+pub struct StoreInner<'a, V: FileSystem> {
+    pub(crate) core: Arc<Core<'a, V>>,
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
     pub(crate) stats: Arc<StorageStats>,
-    pub(crate) vfs: V,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
-impl<V: FileSystem> StoreInner<V> {
+impl<'a, V: FileSystem> StoreInner<'a, V> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn with_vfs(opts: Options, vfs: V) -> Result<Self> {
-        let core = Arc::new(Core::new(opts, &vfs)?);
+    pub fn with_vfs(opts: Options, vfs: &'a V) -> Result<Self> {
+        let core = Arc::new(Core::new(opts, vfs)?);
 
         Ok(Self {
             core,
             is_closed: AtomicBool::new(false),
             is_compacting: AtomicBool::new(false),
             stats: Arc::new(StorageStats::new()),
-            vfs,
         })
     }
 
     /// Begins a new read-write transaction.
     /// It creates a new transaction with the core and read-write mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin(&self) -> Result<Transaction> {
+    pub fn begin(&self) -> Result<Transaction<V>> {
         let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
         Ok(txn)
     }
@@ -60,7 +58,7 @@ impl<V: FileSystem> StoreInner<V> {
     /// Begins a new transaction with the given mode.
     /// It creates a new transaction with the core and the given mode, and sets the read timestamp from the oracle.
     /// It returns the transaction.
-    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+    pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction<V>> {
         let txn = Transaction::new(self.core.clone(), mode)?;
         Ok(txn)
     }
@@ -68,7 +66,7 @@ impl<V: FileSystem> StoreInner<V> {
     /// Executes a function in a read-only transaction.
     /// It begins a new read-only transaction and executes the function with the transaction.
     /// It returns the result of the function.
-    pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+    pub fn view(&self, f: impl FnOnce(&mut Transaction<V>) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
         f(&mut txn)?;
 
@@ -78,7 +76,7 @@ impl<V: FileSystem> StoreInner<V> {
     /// Executes a function in a read-write transaction and commits the transaction.
     /// It begins a new read-write transaction, executes the function with the transaction, and commits the transaction.
     /// It returns the result of the function.
-    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+    pub fn write(self: Arc<Self>, f: impl FnOnce(&mut Transaction<V>) -> Result<()>) -> Result<()> {
         let mut txn = self.begin_with_mode(Mode::ReadWrite)?;
         f(&mut txn)?;
         txn.commit()?;
@@ -104,27 +102,27 @@ impl<V: FileSystem> StoreInner<V> {
     }
 }
 
-pub type Store = StoreInner<crate::vfs::Dummy>;
+pub type Store = StoreInner<'static, crate::vfs::Dummy>;
 
 impl Store {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
     pub fn new(opts: Options) -> Result<Self> {
-        Self::with_vfs(opts, crate::vfs::Dummy)
+        Self::with_vfs(opts, &crate::vfs::Dummy)
     }
 }
 
 /// Core of the key-value store.
-pub struct Core {
+pub struct Core<'a, V: FileSystem> {
     /// Index for store.
     pub(crate) indexer: RwLock<Indexer>,
     /// Options for store.
     pub(crate) opts: Options,
     /// Commit log for store.
-    pub(crate) clog: Option<Arc<Aol>>,
+    pub(crate) clog: Option<Arc<Aol<V>>>,
     /// Manifest for store to track Store state.
-    pub(crate) manifest: Option<RwLock<Aol>>,
+    pub(crate) manifest: Option<RwLock<Aol<V>>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Oracle,
     /// Value cache for store.
@@ -136,22 +134,24 @@ pub struct Core {
     is_closed: AtomicBool,
     /// Write lock to ensure that only one transaction can commit at a time.
     pub(crate) commit_write_lock: Mutex<()>,
+
+    pub(crate) vfs: &'a V,
 }
 
-impl Core {
+impl<'a, V: FileSystem> Core<'a, V> {
     fn initialize_indexer() -> Indexer {
         Indexer::new()
     }
 
     // This function initializes the manifest log for the database to store all settings.
-    pub(crate) fn initialize_manifest<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Aol> {
+    pub(crate) fn initialize_manifest(dir: &Path, vfs: &V) -> Result<Aol<V>> {
         let manifest_subdir = dir.join("manifest");
         let mopts = LogOptions::default().with_file_extension("manifest".to_string());
         Aol::open(&manifest_subdir, &mopts, vfs).map_err(Error::from)
     }
 
     // This function initializes the commit log (clog) for the database.
-    fn initialize_clog<V: FileSystem>(opts: &Options, vfs: &V) -> Result<Aol> {
+    fn initialize_clog(opts: &Options, vfs: &V) -> Result<Aol<V>> {
         // It first constructs the path to the clog subdirectory within the database directory.
         let clog_subdir = opts.dir.join("clog");
 
@@ -182,7 +182,7 @@ impl Core {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new<V: FileSystem>(opts: Options, vfs: &V) -> Result<Self> {
+    pub fn new(opts: Options, vfs: &'a V) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
@@ -230,6 +230,7 @@ impl Core {
             value_cache,
             is_closed: AtomicBool::new(false),
             commit_write_lock: Mutex::new(()),
+            vfs,
         })
     }
 
@@ -238,9 +239,9 @@ impl Core {
     }
 
     // The load_index function is responsible for loading the index from the log.
-    fn load_index<V: FileSystem>(
+    fn load_index(
         opts: &Options,
-        clog: &mut Aol,
+        clog: &mut Aol<V>,
         indexer: &mut Indexer,
         vfs: &V,
     ) -> Result<u64> {
@@ -252,7 +253,7 @@ impl Core {
             .expect("should read segments");
 
         // A MultiSegmentReader is created to read from multiple segments.
-        let reader = MultiSegmentReader::new(sr)?;
+        let reader = MultiSegmentReader::new(sr, vfs)?;
 
         // A Reader is created from the MultiSegmentReader with the maximum segment size and block size.
         let reader = Reader::new_from(reader);
@@ -276,7 +277,7 @@ impl Core {
             match tx_reader.read_into(&mut tx) {
                 // If the read is successful, the entries are processed.
                 Ok((segment_id, value_offset)) => {
-                    Core::process_entry(&tx, opts, segment_id, value_offset, indexer)?;
+                    Core::<V>::process_entry(&tx, opts, segment_id, value_offset, indexer)?;
                     num_entries += 1;
                 }
 
@@ -351,11 +352,7 @@ impl Core {
         Ok(())
     }
 
-    fn load_manifest<V: FileSystem>(
-        current_opts: &Options,
-        manifest: &mut Aol,
-        vfs: &V,
-    ) -> Result<Options> {
+    fn load_manifest(current_opts: &Options, manifest: &mut Aol<V>, vfs: &V) -> Result<Options> {
         // Load existing manifests if any, else create a new one
         let existing_manifest = if manifest.size()? > 0 {
             Core::read_manifest(&current_opts.dir, vfs)?
@@ -364,7 +361,7 @@ impl Core {
         };
 
         // Validate the current options against the existing manifest's options
-        Core::validate_options(current_opts)?;
+        Core::<V>::validate_options(current_opts)?;
 
         // Check if the current options are already the last option in the manifest
         if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
@@ -376,7 +373,7 @@ impl Core {
 
         // Serialize the changeset and append it to the manifest
         let buf = changeset.serialize()?;
-        manifest.append(&buf)?;
+        manifest.append(&buf, vfs)?;
 
         Ok(current_opts.clone())
     }
@@ -390,11 +387,11 @@ impl Core {
     }
 
     /// Loads the latest options from the manifest log.
-    pub(crate) fn read_manifest<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Manifest> {
+    pub(crate) fn read_manifest(dir: &Path, vfs: &V) -> Result<Manifest> {
         let manifest_subdir = dir.join("manifest");
         let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path(), vfs)
             .expect("should read segments");
-        let reader = MultiSegmentReader::new(sr)?;
+        let reader = MultiSegmentReader::new(sr, vfs)?;
         let mut reader = Reader::new_from(reader);
 
         let mut manifests = Manifest::new(); // Initialize with an empty Vec
@@ -511,7 +508,7 @@ impl Core {
             Durability::Immediate => {
                 // Immediate durability means that the transaction is made to
                 // fsync the data to disk before returning.
-                let (segment_id, offset, _) = clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record, &self.vfs)?;
                 clog.sync()?;
                 (segment_id, offset)
             }
@@ -519,7 +516,7 @@ impl Core {
                 // Eventual durability means that the transaction is made to
                 // write to disk using the write_all method. But it does not
                 // fsync the data to disk before returning.
-                let (segment_id, offset, _) = clog.append(tx_record)?;
+                let (segment_id, offset, _) = clog.append(tx_record, &self.vfs)?;
                 (segment_id, offset)
             }
         };
@@ -599,7 +596,7 @@ impl Core {
         // If the value is not in the cache, read it from the commit log
         let mut buf = vec![0; value_len];
         let clog = self.clog.as_ref().unwrap();
-        clog.read_at(&mut buf, segment_id, value_offset)?;
+        clog.read_at(&mut buf, segment_id, value_offset, &self.vfs)?;
 
         // Cache the newly read value
         self.value_cache.insert(cache_key, Bytes::from(buf.clone()));
@@ -612,7 +609,7 @@ impl Core {
 // hold references to Core, therefore it will never be dropped if
 // Store is dropped until all the transactions are done.
 // Store::close() can always be called directly if more control is needed.
-impl Drop for Core {
+impl<'a, V: FileSystem> Drop for Core<'a, V> {
     fn drop(&mut self) {
         if let Err(err) = self.close() {
             eprintln!("Error closing store core: {err}");
@@ -1050,6 +1047,7 @@ mod tests {
                 }
             }
             txn.commit().unwrap();
+            drop(txn);
 
             drop(store);
         }

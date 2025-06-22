@@ -12,7 +12,7 @@ use crate::util::sanitize_directory;
 /// Corruption in the last segment can happen due to various reasons such as a power failure or a bug in the system,
 /// and also due to the asynchronous nature of calling close on the store.
 pub fn repair_last_corrupted_segment<V: FileSystem>(
-    aol: &mut Aol,
+    aol: &mut Aol<V>,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     vfs: &V,
@@ -54,7 +54,7 @@ pub fn repair_last_corrupted_segment<V: FileSystem>(
 /// Currently it is only being used for testing purposes.
 #[allow(unused)]
 pub(crate) fn repair_corrupted_segment<V: FileSystem>(
-    aol: &Aol,
+    aol: &Aol<V>,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     vfs: &V,
@@ -122,7 +122,7 @@ pub(crate) fn repair_corrupted_segment<V: FileSystem>(
 ///
 /// If any of these operations fail, the function returns an error.
 fn repair_segment<V: FileSystem>(
-    aol: &Aol,
+    aol: &Aol<V>,
     corrupted_segment_id: u64,
     corrupted_offset_marker: u64,
     corrupted_segment_file_path: PathBuf,
@@ -145,7 +145,7 @@ fn repair_segment<V: FileSystem>(
     vfs.rename(&corrupted_segment_file_path, &repaired_segment_path)?;
 
     // Open a new segment as the active segment
-    let new_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
+    let new_segment = Segment::<V>::open(&aol.dir, corrupted_segment_id, &aol.opts, false, vfs)?;
 
     // Create a segment reader for the repaired segment
     let segments: Vec<SegmentRef> = vec![SegmentRef {
@@ -153,7 +153,7 @@ fn repair_segment<V: FileSystem>(
         file_header_offset: corrupted_segment_file_header_offset,
         id: corrupted_segment_id,
     }];
-    let segment_reader = MultiSegmentReader::new(segments)?;
+    let segment_reader = MultiSegmentReader::new(segments, vfs)?;
 
     // Initialize a reader for the segment
     let reader = Reader::new_from(segment_reader);
@@ -184,7 +184,8 @@ fn repair_segment<V: FileSystem>(
 
     // If we were repairing the active segment, update it
     if current_active_id == corrupted_segment_id {
-        let new_active_segment = Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false)?;
+        let new_active_segment =
+            Segment::open(&aol.dir, corrupted_segment_id, &aol.opts, false, vfs)?;
         writer.active_segment = new_active_segment;
     }
 
@@ -252,8 +253,8 @@ mod tests {
     use crate::log::{read_file_header, SegmentRef};
     use crate::option::Options;
     use crate::store::Store;
+    use crate::store::StoreInner;
     use crate::transaction::Durability;
-    use crate::vfs::File;
     use crate::vfs::OpenOptions;
 
     use bytes::Bytes;
@@ -312,7 +313,7 @@ mod tests {
     // the store, the repair process will only repair the corrupted segment
     // if it is the last segment in the directory.
     fn corrupt_and_repair<V: FileSystem>(
-        store: &Store,
+        store: &StoreInner<V>,
         opts: Options,
         segment_num: usize,
         corruption_offset: u64,
@@ -334,7 +335,9 @@ mod tests {
 
     #[allow(unused)]
     fn find_corrupted_segment(sr: Vec<SegmentRef>, opts: Options) -> (u64, u64) {
-        let reader = Reader::new_from(MultiSegmentReader::new(sr).expect("should create"));
+        let reader = Reader::new_from(
+            MultiSegmentReader::new(sr, &crate::vfs::Dummy).expect("should create"),
+        );
         let mut tx_reader = RecordReader::new(reader);
         let mut tx = Record::new();
 
@@ -355,7 +358,7 @@ mod tests {
     // Each transaction header is 24 in len
     fn corrupt_segment(segment_file_path: &Path, offset_to_edit: u64) {
         // Open the segment file for reading and writing
-        let mut file = OpenOptions::new()
+        let mut file = OpenOptions::new(&crate::vfs::Dummy)
             .read(true)
             .write(true)
             .open(segment_file_path)
@@ -809,8 +812,12 @@ mod tests {
     #[test]
     fn test_restore_files_multiple_clog_files() {
         let dir = create_temp_directory();
-        let mut file1 = File::create(dir.path().join("0001.clog")).unwrap();
-        let mut file2 = File::create(dir.path().join("0002.clog")).unwrap();
+        let mut file1 = crate::vfs::Dummy
+            .create(dir.path().join("0001.clog"))
+            .unwrap();
+        let mut file2 = crate::vfs::Dummy
+            .create(dir.path().join("0002.clog"))
+            .unwrap();
         file1.write_all(b"Data for 0001.clog").unwrap();
         file2.write_all(b"Data for 0002.clog").unwrap();
         assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
@@ -821,8 +828,12 @@ mod tests {
     #[test]
     fn test_restore_files_multiple_repair_files() {
         let dir = create_temp_directory();
-        File::create(dir.path().join("001.repair")).unwrap();
-        File::create(dir.path().join("002.repair")).unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("001.repair"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("002.repair"))
+            .unwrap();
         assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("001.clog").exists());
         assert!(dir.path().join("002.clog").exists());
@@ -833,10 +844,18 @@ mod tests {
     #[test]
     fn test_restore_files_multiple_clog_and_repair_files() {
         let dir = create_temp_directory();
-        File::create(dir.path().join("0001.clog")).unwrap();
-        File::create(dir.path().join("0002.clog")).unwrap();
-        File::create(dir.path().join("0001.repair")).unwrap();
-        File::create(dir.path().join("0002.repair")).unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0001.clog"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0002.clog"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0001.repair"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0002.repair"))
+            .unwrap();
         assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
@@ -847,9 +866,15 @@ mod tests {
     #[test]
     fn test_restore_files_single_clog_and_repair_files() {
         let dir = create_temp_directory();
-        File::create(dir.path().join("0001.clog")).unwrap();
-        File::create(dir.path().join("0002.clog")).unwrap();
-        File::create(dir.path().join("0001.repair")).unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0001.clog"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0002.clog"))
+            .unwrap();
+        crate::vfs::Dummy
+            .create(dir.path().join("0001.repair"))
+            .unwrap();
         assert!(restore_repair_files(dir.path().to_str().unwrap(), &crate::vfs::Dummy).is_ok());
         assert!(dir.path().join("0001.clog").exists());
         assert!(dir.path().join("0002.clog").exists());
@@ -859,10 +884,18 @@ mod tests {
     #[test]
     fn test_restore_files_multiple_repair_files_with_data() {
         let dir = create_temp_directory();
-        let mut file1 = File::create(dir.path().join("0001.clog")).unwrap();
-        let mut file2 = File::create(dir.path().join("0002.clog")).unwrap();
-        let mut repair_file1 = File::create(dir.path().join("0001.repair")).unwrap();
-        let mut repair_file2 = File::create(dir.path().join("0002.repair")).unwrap();
+        let mut file1 = crate::vfs::Dummy
+            .create(dir.path().join("0001.clog"))
+            .unwrap();
+        let mut file2 = crate::vfs::Dummy
+            .create(dir.path().join("0002.clog"))
+            .unwrap();
+        let mut repair_file1 = crate::vfs::Dummy
+            .create(dir.path().join("0001.repair"))
+            .unwrap();
+        let mut repair_file2 = crate::vfs::Dummy
+            .create(dir.path().join("0002.repair"))
+            .unwrap();
         file1.write_all(b"Data for 0001.clog").unwrap();
         file2.write_all(b"Data for 0002.clog").unwrap();
         repair_file1.write_all(b"Data for 0001.repair").unwrap();
@@ -873,8 +906,12 @@ mod tests {
         assert!(!dir.path().join("0001.repair").exists());
         assert!(!dir.path().join("0002.repair").exists());
 
-        let mut restored_file1 = File::open(dir.path().join("0001.clog")).unwrap();
-        let mut restored_file2 = File::open(dir.path().join("0002.clog")).unwrap();
+        let mut restored_file1 = crate::vfs::Dummy
+            .open(dir.path().join("0001.clog"))
+            .unwrap();
+        let mut restored_file2 = crate::vfs::Dummy
+            .open(dir.path().join("0002.clog"))
+            .unwrap();
         let mut contents1 = String::new();
         let mut contents2 = String::new();
         restored_file1.read_to_string(&mut contents1).unwrap();

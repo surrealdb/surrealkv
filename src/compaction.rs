@@ -30,7 +30,7 @@ impl Drop for CompactionGuard<'_> {
     }
 }
 
-impl<V: FileSystem> StoreInner<V> {
+impl<'a, V: FileSystem> StoreInner<'a, V> {
     pub fn compact(&self) -> Result<()> {
         // Early return if the store is closed or compaction is already in progress
         if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
@@ -45,16 +45,16 @@ impl<V: FileSystem> StoreInner<V> {
         // Clear files before starting compaction if a .merge or .tmp.merge directory exists
         let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
         if tmp_merge_dir.exists() {
-            self.vfs.remove_dir_all(&tmp_merge_dir)?;
+            self.core.vfs.remove_dir_all(&tmp_merge_dir)?;
         }
 
         let merge_dir = self.core.opts.dir.join(".merge");
         if merge_dir.exists() {
-            self.vfs.remove_dir_all(&merge_dir)?;
+            self.core.vfs.remove_dir_all(&merge_dir)?;
         }
 
         // Clean recovery state before starting compaction
-        RecoveryState::clear(&self.core.opts.dir, &self.vfs)?;
+        RecoveryState::clear(&self.core.opts.dir, self.core.vfs)?;
 
         // Clear compaction stats before starting compaction
         self.stats.compaction_stats.reset();
@@ -67,17 +67,17 @@ impl<V: FileSystem> StoreInner<V> {
 
         // Rotate the commit log and get the new segment ID
         let clog = self.core.clog.as_ref().unwrap();
-        let new_segment_id = clog.rotate()?;
+        let new_segment_id = clog.rotate(&self.core.vfs)?;
         let last_updated_segment_id = new_segment_id - 1;
 
         // Create a temporary directory for compaction
-        self.vfs.create_dir_all(&tmp_merge_dir)?;
+        self.core.vfs.create_dir_all(&tmp_merge_dir)?;
 
         // Initialize a new manifest in the temporary directory
-        let manifest = Core::initialize_manifest(&tmp_merge_dir, &self.vfs)?;
+        let manifest = Core::initialize_manifest(&tmp_merge_dir, self.core.vfs)?;
         // Add the last updated segment ID to the manifest
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
-        manifest.append(&changeset.serialize()?)?;
+        manifest.append(&changeset.serialize()?, &self.core.vfs)?;
         manifest.close()?;
 
         // Prepare a temporary commit log directory
@@ -85,7 +85,7 @@ impl<V: FileSystem> StoreInner<V> {
         let tm_opts = LogOptions::default()
             .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
-        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts, &self.vfs)?;
+        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts, self.core.vfs)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
         // check in files for the keys that are not found in memory to handle deletion
@@ -117,7 +117,7 @@ impl<V: FileSystem> StoreInner<V> {
             let mut buf = BytesMut::new();
             tx_record.encode(&mut buf)?;
 
-            let (segment_id, _, _) = temp_writer.append(&buf)?;
+            let (segment_id, _, _) = temp_writer.append(&buf, &self.core.vfs)?;
             if segment_id > last_updated_segment_id {
                 eprintln!(
                     "Segment ID: {segment_id} exceeds last updated segment ID: {last_updated_segment_id}"
@@ -201,7 +201,7 @@ impl<V: FileSystem> StoreInner<V> {
         drop(manifest);
 
         // Finalize compaction by renaming the temporary directory
-        self.vfs.rename(tmp_merge_dir, merge_dir)?;
+        self.core.vfs.rename(tmp_merge_dir, merge_dir)?;
 
         Ok(())
     }

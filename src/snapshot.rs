@@ -4,6 +4,7 @@ use vart::{art::Tree, iter::Iter, VariableSizeKey};
 use crate::error::{Error, Result};
 use crate::indexer::IndexValue;
 use crate::store::Core;
+use crate::vfs::FileSystem;
 
 pub(crate) type VersionedEntry<'a, V> = (&'a [u8], &'a V, u64, u64);
 
@@ -14,7 +15,7 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(crate) fn take(store: &Core) -> Result<Self> {
+    pub(crate) fn take<V: FileSystem>(store: &Core<V>) -> Result<Self> {
         // Acquire a read lock on the indexer to get the current index version.
         let index = store.indexer.read();
         let index_version = index.version();

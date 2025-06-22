@@ -5,17 +5,18 @@ use crate::entry::{Record, MAX_KV_METADATA_SIZE};
 use crate::error::{Error, Result};
 use crate::log::{CorruptionError, Error as LogError, Error::Corruption, MultiSegmentReader};
 use crate::meta::Metadata;
+use crate::vfs::FileSystem;
 
 /// `Reader` is a generic reader for reading data from an Aol. It is used
 /// by the `RecordReader` to read data from the Aol source.
-pub struct Reader {
-    rdr: MultiSegmentReader,
+pub struct Reader<'a, V: FileSystem> {
+    rdr: MultiSegmentReader<'a, V>,
     err: Option<Error>,
 }
 
-impl Reader {
+impl<'a, V: FileSystem> Reader<'a, V> {
     /// Creates a new `Reader` with the given `rdr`, `off`, and `size`.
-    pub fn new_from(rdr: MultiSegmentReader) -> Self {
+    pub fn new_from(rdr: MultiSegmentReader<'a, V>) -> Self {
         Reader { rdr, err: None }
     }
 
@@ -107,19 +108,19 @@ impl Reader {
 ///
 /// # Fields
 /// * `r: Reader` - The `Reader` instance used to read data.
-pub struct RecordReader {
-    r: Reader,
+pub struct RecordReader<'a, V: FileSystem> {
+    r: Reader<'a, V>,
     err: Option<Error>,
     rec: Vec<u8>,
 }
 
-impl RecordReader {
+impl<'a, V: FileSystem> RecordReader<'a, V> {
     /// Creates a new `RecordReader` with the given `Reader`.
     ///
     /// # Arguments
     ///
     /// * `r: Reader` - The `Reader` instance to use for reading data.
-    pub fn new(r: Reader) -> Self {
+    pub fn new(r: Reader<'a, V>) -> Self {
         RecordReader {
             r,
             err: None,
@@ -270,14 +271,17 @@ impl RecordReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::{Aol, Options, SegmentRef};
+    use crate::{
+        log::{Aol, Options, SegmentRef},
+        vfs::FileSystem,
+    };
     use tempdir::TempDir;
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
     }
 
-    fn get_writer_state(aol: &Aol) -> (u64, u64) {
+    fn get_writer_state<V: FileSystem>(aol: &Aol<V>) -> (u64, u64) {
         let writer = aol.writer_state.lock();
         (writer.active_segment_id, writer.active_segment.offset())
     }
@@ -300,12 +304,12 @@ mod tests {
         assert_eq!(0, sz.1);
 
         // Test appending a non-empty buffer
-        let r = a.append(&[0, 1, 2, 3]);
+        let r = a.append(&[0, 1, 2, 3], &crate::vfs::Dummy);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().2);
 
         // Test appending another buffer
-        let r = a.append(&[4, 5, 6, 7]);
+        let r = a.append(&[4, 5, 6, 7], &crate::vfs::Dummy);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().2);
 
@@ -313,7 +317,8 @@ mod tests {
 
         let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), &crate::vfs::Dummy)
             .expect("should read segments");
-        let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
+        let sr =
+            MultiSegmentReader::new(sr, &crate::vfs::Dummy).expect("should create segment reader");
 
         let mut r = Reader::new_from(sr);
 
@@ -353,7 +358,7 @@ mod tests {
 
         // Append 10 records
         for i in 0..num_items {
-            let r = a.append(&[i; REC_SIZE]); // Each record is a 4-byte array filled with `i`
+            let r = a.append(&[i; REC_SIZE], &crate::vfs::Dummy); // Each record is a 4-byte array filled with `i`
             assert!(r.is_ok());
             assert_eq!(REC_SIZE, r.unwrap().2);
         }
@@ -362,7 +367,8 @@ mod tests {
 
         let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), &crate::vfs::Dummy)
             .expect("should read segments");
-        let sr = MultiSegmentReader::new(sr).expect("should create segment reader");
+        let sr =
+            MultiSegmentReader::new(sr, &crate::vfs::Dummy).expect("should create segment reader");
 
         let mut r = Reader::new_from(sr);
 

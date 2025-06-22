@@ -90,7 +90,7 @@ impl Manifest {
         }
 
         let sr = SegmentRef::read_segments_from_directory(path, vfs)?;
-        let reader = MultiSegmentReader::new(sr)?;
+        let reader = MultiSegmentReader::<V>::new(sr, vfs)?;
         let mut reader = Reader::new_from(reader);
 
         loop {
@@ -143,7 +143,8 @@ mod tests {
 
         // Append the manifest to the file
         let buf = manifest.serialize().unwrap();
-        a.append(&buf).expect("should append record");
+        a.append(&buf, &crate::vfs::Dummy)
+            .expect("should append record");
         a.close().expect("should close aol");
 
         // Load the manifests from the file
@@ -168,7 +169,8 @@ mod tests {
 
         // Append the manifest to the file
         let buf = first_manifest.serialize().unwrap();
-        a.append(&buf).expect("should append record");
+        a.append(&buf, &crate::vfs::Dummy)
+            .expect("should append record");
 
         // Step 4: Create a new Manifest instance with changes and append it to the same file
         let mut opt = Options::new();
@@ -180,7 +182,8 @@ mod tests {
 
         let buf = second_manifest.serialize().unwrap();
 
-        a.append(&buf).expect("should append record");
+        a.append(&buf, &crate::vfs::Dummy)
+            .expect("should append record");
 
         a.close().expect("should close aol");
 

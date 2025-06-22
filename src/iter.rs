@@ -15,6 +15,7 @@ use crate::{
     store::Core,
     transaction::{ReadSet, ReadSetEntry, ScanResult, ScanVersionResult, WriteSet, WriteSetEntry},
     util::convert_range_bounds_bytes,
+    vfs::FileSystem,
     Result,
 };
 
@@ -29,8 +30,8 @@ use crate::{
 /// If a key is present in the write set but not in the snapshot, the value from the write set
 /// will be returned.
 /// The iterator will add the keys that are read from the snapshot to the read set.
-pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
-    core: &'a Core,
+pub(crate) struct MergingScanIterator<'a, R, I: Iterator, V: FileSystem> {
+    core: &'a Core<'a, V>,
     read_set: Option<&'a mut ReadSet>,
     savepoints: u32,
     snap_iter: DoubleEndedPeekable<I>,
@@ -40,13 +41,14 @@ pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
     _phantom: PhantomData<R>,
 }
 
-impl<'a, R, I: Iterator> MergingScanIterator<'a, R, I>
+impl<'a, R, I: Iterator, V> MergingScanIterator<'a, R, I, V>
 where
     R: RangeBounds<VariableSizeKey>,
     I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    V: FileSystem,
 {
     pub(crate) fn new(
-        core: &'a Core,
+        core: &'a Core<V>,
         write_set: &'a WriteSet,
         read_set: Option<&'a mut ReadSet>,
         savepoints: u32,
@@ -55,7 +57,7 @@ where
         limit: Option<usize>,
     ) -> Self {
         let range_bytes = convert_range_bounds_bytes(range);
-        MergingScanIterator::<R, I> {
+        MergingScanIterator::<R, I, V> {
             core,
             read_set,
             savepoints,
@@ -101,10 +103,11 @@ where
     }
 }
 
-impl<'a, R, I> Iterator for MergingScanIterator<'a, R, I>
+impl<'a, R, I, V> Iterator for MergingScanIterator<'a, R, I, V>
 where
     R: RangeBounds<VariableSizeKey>,
     I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    V: FileSystem,
 {
     type Item = Result<ScanResult<'a>>;
 
@@ -164,10 +167,11 @@ where
     }
 }
 
-impl<'a, R, I> DoubleEndedIterator for MergingScanIterator<'a, R, I>
+impl<'a, R, I, V> DoubleEndedIterator for MergingScanIterator<'a, R, I, V>
 where
     R: RangeBounds<VariableSizeKey>,
     I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    V: FileSystem,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.count >= self.limit {
@@ -216,10 +220,11 @@ where
     }
 }
 
-impl<'a, R, I> MergingScanIterator<'a, R, I>
+impl<'a, R, I, V> MergingScanIterator<'a, R, I, V>
 where
     R: RangeBounds<VariableSizeKey>,
     I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    V: FileSystem,
 {
     fn read_from_snapshot_back(&mut self) -> Option<<Self as Iterator>::Item> {
         self.snap_iter.next_back().map(|(key, value, version, ts)| {
@@ -357,20 +362,20 @@ where
 /// An iterator that returns all versions of keys within a given range.
 /// For each key, it returns all versions before moving to the next key.
 /// Optionally limits the number of unique keys returned.
-pub struct VersionScanIterator<'a, I: Iterator> {
+pub struct VersionScanIterator<'a, I: Iterator, V: FileSystem> {
     snap_iter: Peekable<I>,
     current_key_versions: VecDeque<(&'a [u8], Vec<u8>, u64, bool)>,
     unique_keys_count: usize,
     current_key: Option<&'a [u8]>, // Track current key to detect changes
     limit: Option<usize>,
-    core: &'a Core,
+    core: &'a Core<'a, V>,
 }
 
-impl<'a, I: Iterator> VersionScanIterator<'a, I>
+impl<'a, I: Iterator, V: FileSystem> VersionScanIterator<'a, I, V>
 where
     I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
 {
-    pub(crate) fn new(core: &'a Core, snap_iter: I, limit: Option<usize>) -> Self {
+    pub(crate) fn new(core: &'a Core<V>, snap_iter: I, limit: Option<usize>) -> Self {
         Self {
             snap_iter: snap_iter.peekable(),
             current_key_versions: VecDeque::new(),
@@ -382,7 +387,7 @@ where
     }
 }
 
-impl<'a, I> Iterator for VersionScanIterator<'a, I>
+impl<'a, I, V: FileSystem> Iterator for VersionScanIterator<'a, I, V>
 where
     I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
 {
