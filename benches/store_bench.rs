@@ -40,10 +40,7 @@ fn sequential_insert(c: &mut Criterion) {
         let db = Store::new(opts).expect("should create store");
 
         c.bench_function(
-            &format!(
-                "sequential insert key/value lengths {}/{}",
-                key_len, val_len
-            ),
+            &format!("sequential insert key/value lengths {key_len}/{val_len}"),
             |b| {
                 b.iter(|| {
                     let mut txn = db.begin().unwrap();
@@ -83,7 +80,7 @@ fn random_insert(c: &mut Criterion) {
                 .collect();
 
             c.bench_function(
-                &format!("random insert key/value lengths {}/{}", key_len, val_len),
+                &format!("random insert key/value lengths {key_len}/{val_len}"),
                 |b| {
                     let db = &db;
                     let keys = &keys;
@@ -135,7 +132,7 @@ fn bulk_insert(c: &mut Criterion) {
             group.bench_function(
                 BenchmarkId::new(
                     "bulk_insert",
-                    format!("batch_{}_val_{}", batch_size, value_size),
+                    format!("batch_{batch_size}_val_{value_size}"),
                 ),
                 |b| {
                     b.iter(|| {

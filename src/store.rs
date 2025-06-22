@@ -285,7 +285,7 @@ impl Core {
 
                 // If a corruption error is encountered, the segment ID and offset are stored and the loop is broken.
                 Err(Error::LogError(LogError::Corruption(err))) => {
-                    eprintln!("Corruption error: {:?}", err);
+                    eprintln!("Corruption error: {err:?}");
                     corruption_info = Some((err.segment_id, err.offset));
                     break;
                 }
@@ -301,8 +301,7 @@ impl Core {
         // corruption of the data and should be handled by the user.
         if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
             eprintln!(
-                "Repairing corrupted segment with id: {} and offset: {}",
-                corrupted_segment_id, corrupted_offset
+                "Repairing corrupted segment with id: {corrupted_segment_id} and offset: {corrupted_offset}"
             );
             repair_last_corrupted_segment(clog, corrupted_segment_id, corrupted_offset, vfs)?;
         }
@@ -616,7 +615,7 @@ impl Core {
 impl Drop for Core {
     fn drop(&mut self) {
         if let Err(err) = self.close() {
-            eprintln!("Error closing store core: {}", err);
+            eprintln!("Error closing store core: {err}");
         }
     }
 }
@@ -744,8 +743,8 @@ mod tests {
             // Append num_ops items to the store
             for j in 0..num_ops {
                 let id = (i - 1) * num_ops + j;
-                let key = format!("key{}", id);
-                let value = format!("value{}", id);
+                let key = format!("key{id}");
+                let value = format!("value{id}");
                 let mut txn = store.begin().unwrap();
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
                 txn.commit().unwrap();
@@ -753,8 +752,8 @@ mod tests {
 
             // Test that the items are still in the store
             for j in 0..(num_ops * i) {
-                let key = format!("key{}", j);
-                let value = format!("value{}", j);
+                let key = format!("key{j}");
+                let value = format!("value{j}");
                 let value = value.into_bytes();
                 let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
@@ -1508,10 +1507,10 @@ mod tests {
 
         // Define keys and values
         let keys: Vec<Bytes> = (1..=total_records)
-            .map(|i| Bytes::from(format!("key{}", i)))
+            .map(|i| Bytes::from(format!("key{i}")))
             .collect();
         let values: Vec<Bytes> = (1..=total_records)
-            .map(|i| Bytes::from(format!("value{}", i)))
+            .map(|i| Bytes::from(format!("value{i}")))
             .collect();
 
         // Insert multiple transactions with single keys
@@ -1581,10 +1580,10 @@ mod tests {
 
             // Define keys and values
             let keys: Vec<Bytes> = (1..=total_records)
-                .map(|i| Bytes::from(format!("key{}", i)))
+                .map(|i| Bytes::from(format!("key{i}")))
                 .collect();
             let values: Vec<Bytes> = (1..=total_records)
-                .map(|i| Bytes::from(format!("value{}", i)))
+                .map(|i| Bytes::from(format!("value{i}")))
                 .collect();
 
             // Insert multiple transactions with single keys concurrently

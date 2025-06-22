@@ -120,8 +120,7 @@ impl<V: FileSystem> StoreInner<V> {
             let (segment_id, _, _) = temp_writer.append(&buf)?;
             if segment_id > last_updated_segment_id {
                 eprintln!(
-                    "Segment ID: {} exceeds last updated segment ID: {}",
-                    segment_id, last_updated_segment_id
+                    "Segment ID: {segment_id} exceeds last updated segment ID: {last_updated_segment_id}"
                 );
                 return Err(Error::SegmentIdExceedsLastUpdated);
             }
@@ -236,7 +235,7 @@ impl RecoveryState {
         match self {
             RecoveryState::ClogDeleted => {
                 write!(file, "ClogDeleted")
-                    .map_err(|e| Error::CustomError(format!("recovery file write error: {}", e)))?;
+                    .map_err(|e| Error::CustomError(format!("recovery file write error: {e}")))?;
                 Ok(())
             }
             RecoveryState::None => Ok(()),
@@ -287,7 +286,7 @@ fn perform_recovery<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
                             match vfs.copy(&seg.file_path, &dest_path) {
                                 Ok(_) => println!("File copied successfully"),
                                 Err(e) => {
-                                    eprintln!("Error copying file: {:?}", e);
+                                    eprintln!("Error copying file: {e:?}");
                                     return Err(Error::from(e));
                                 }
                             }
@@ -296,7 +295,7 @@ fn perform_recovery<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error accessing file metadata: {:?}", e);
+                        eprintln!("Error accessing file metadata: {e:?}");
                         return Err(Error::from(e));
                     }
                 }
@@ -310,13 +309,13 @@ fn perform_recovery<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
 
         // Delete the `clog` directory
         if let Err(e) = vfs.remove_dir_all(&clog_dir) {
-            eprintln!("Error deleting clog directory: {:?}", e);
+            eprintln!("Error deleting clog directory: {e:?}");
             return Err(Error::from(e));
         }
 
         // Rename `merge_clog_subdir` to `clog`
         if let Err(e) = vfs.rename(&merge_clog_subdir, &clog_dir) {
-            eprintln!("Error renaming merge_clog_subdir to clog: {:?}", e);
+            eprintln!("Error renaming merge_clog_subdir to clog: {e:?}");
             return Err(Error::from(e));
         }
 
@@ -949,8 +948,7 @@ mod tests {
                 .expect("Failed to begin transaction on reopened store");
             assert!(
                 txn.get(key).expect("Failed to get key").is_none(),
-                "Key {:?} was not deleted",
-                key
+                "Key {key:?} was not deleted"
             );
         }
 
@@ -973,7 +971,7 @@ mod tests {
         let num_keys = 26;
         // Sequentially generate keys
         let keys: Vec<Bytes> = (0..num_keys)
-            .map(|i| Bytes::from(format!("key{:02}", i)))
+            .map(|i| Bytes::from(format!("key{i:02}")))
             .collect();
 
         let value = Bytes::from("value");
@@ -1009,9 +1007,9 @@ mod tests {
                 .expect("Failed to begin transaction on reopened store");
             let result = txn.get(key).expect("Failed to get key");
             if i < num_keys / 2 {
-                assert!(result.is_none(), "Key {:?} should have been deleted", key);
+                assert!(result.is_none(), "Key {key:?} should have been deleted");
             } else {
-                assert!(result.is_some(), "Key {:?} should exist", key);
+                assert!(result.is_some(), "Key {key:?} should exist");
             }
         }
 
@@ -1077,7 +1075,7 @@ mod tests {
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             if let Some(value) = txn.get(key).expect("Failed to get key") {
-                assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
+                assert_eq!(&value, expected_value, "Value mismatch for key {key:?}")
             }
         }
 
@@ -1105,16 +1103,16 @@ mod tests {
             let mut txn = store.begin().unwrap();
             for j in 0..num_ops {
                 let id = (i - 1) * num_ops + j;
-                let key = format!("key{}", id);
-                let value = format!("value{}", id);
+                let key = format!("key{id}");
+                let value = format!("value{id}");
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
             txn.commit().unwrap();
 
             // Test that the items are still in the store
             for j in 0..(num_ops * i) {
-                let key = format!("key{}", j);
-                let value = format!("value{}", j);
+                let key = format!("key{j}");
+                let value = format!("value{j}");
                 let value = value.into_bytes();
                 let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
@@ -1259,10 +1257,10 @@ mod tests {
 
         // Insert keys into the store
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
             {
                 let mut txn = store.begin().unwrap();
-                let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+                let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
                 // Insert first version for all keys
                 txn.set(&key, &value1).unwrap();
@@ -1270,7 +1268,7 @@ mod tests {
             }
 
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     // Insert a second version for keys above the multiple_versions_threshold
@@ -1292,11 +1290,11 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
             let expected_value = if key_index > multiple_versions_threshold {
-                format!("value{}_2", key_index)
+                format!("value{key_index}_2")
             } else {
-                format!("value{}_1", key_index)
+                format!("value{key_index}_1")
             };
 
             let val = txn
@@ -1328,8 +1326,8 @@ mod tests {
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
-            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
             // Insert first version for all keys in its own transaction
             {
@@ -1340,7 +1338,7 @@ mod tests {
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
@@ -1368,18 +1366,17 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > delete_threshold {
                 // Keys marked as deleted in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Deleted key{} should not be present after compaction",
-                    key_index
+                    "Deleted key{key_index} should not be present after compaction"
                 );
             } else if key_index > multiple_versions_threshold {
                 // Keys with multiple versions should have their last version
-                let expected_value = format!("value{}_2", key_index);
+                let expected_value = format!("value{key_index}_2");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1387,12 +1384,11 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should be the last version after compaction",
-                    key_index
+                    "key{key_index}'s value should be the last version after compaction"
                 );
             } else {
                 // Keys with a single version should remain unchanged
-                let expected_value = format!("value{}_1", key_index);
+                let expected_value = format!("value{key_index}_1");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1400,8 +1396,7 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should remain unchanged after compaction",
-                    key_index
+                    "key{key_index}'s value should remain unchanged after compaction"
                 );
             }
         }
@@ -1424,8 +1419,8 @@ mod tests {
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
-            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
             // Insert first version for all keys in its own transaction
             {
@@ -1436,7 +1431,7 @@ mod tests {
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
@@ -1463,14 +1458,13 @@ mod tests {
 
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > clear_threshold {
                 // Keys marked as deleted in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Deleted key{} should not be present after compaction",
-                    key_index
+                    "Deleted key{key_index} should not be present after compaction"
                 );
             }
         }
@@ -1478,18 +1472,17 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > clear_threshold {
                 // Keys marked as cleared in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Cleared key{} should not be present after compaction",
-                    key_index
+                    "Cleared key{key_index} should not be present after compaction"
                 );
             } else if key_index > multiple_versions_threshold {
                 // Keys with multiple versions should have their last version
-                let expected_value = format!("value{}_2", key_index);
+                let expected_value = format!("value{key_index}_2");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1497,12 +1490,11 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should be the last version after compaction",
-                    key_index
+                    "key{key_index}'s value should be the last version after compaction"
                 );
             } else {
                 // Keys with a single version should remain unchanged
-                let expected_value = format!("value{}_1", key_index);
+                let expected_value = format!("value{key_index}_1");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1510,8 +1502,7 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should remain unchanged after compaction",
-                    key_index
+                    "key{key_index}'s value should remain unchanged after compaction"
                 );
             }
         }

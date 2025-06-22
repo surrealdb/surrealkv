@@ -1605,9 +1605,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=10u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -1662,8 +1662,7 @@ mod tests {
             });
             assert!(
                 remaining.is_empty(),
-                "Expected no remaining items but got: {:?}",
-                remaining
+                "Expected no remaining items but got: {remaining:?}"
             );
         }
 
@@ -1672,9 +1671,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=6u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -1753,9 +1752,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=10u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -3062,10 +3061,10 @@ mod tests {
 
             // Define key-value pairs for the test
             let keys: Vec<Bytes> = (0..num_transactions)
-                .map(|i| Bytes::from(format!("key{}", i)))
+                .map(|i| Bytes::from(format!("key{i}")))
                 .collect();
             let values: Vec<Bytes> = (0..num_transactions)
-                .map(|i| Bytes::from(format!("value{}", i)))
+                .map(|i| Bytes::from(format!("value{i}")))
                 .collect();
 
             // Create a vector to store the handles of the spawned tasks
