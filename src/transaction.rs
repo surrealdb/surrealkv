@@ -136,7 +136,7 @@ pub(crate) type ReadSet = Vec<ReadSetEntry>;
 pub(crate) type WriteSet = BTreeMap<Bytes, Vec<WriteSetEntry>>;
 
 /// `Transaction` is a struct representing a transaction in a database.
-pub struct Transaction<'a, V: FileSystem> {
+pub struct Transaction<V: FileSystem> {
     /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
     pub(crate) read_ts: u64,
 
@@ -148,7 +148,7 @@ pub struct Transaction<'a, V: FileSystem> {
     pub(crate) snapshot: Option<Snapshot>,
 
     /// `core` is the underlying core for the transaction. This is shared between transactions.
-    pub(crate) core: Arc<Core<'a, V>>,
+    pub(crate) core: Arc<Core<V>>,
 
     /// `write_set` is a map of keys to entries.
     /// These are the changes that the transaction intends to make to the data.
@@ -182,14 +182,14 @@ pub struct Transaction<'a, V: FileSystem> {
     versionstamp: Option<(u64, u64)>,
 }
 
-impl<'a, V: FileSystem> Transaction<'a, V> {
+impl<V: FileSystem> Transaction<V> {
     /// Prepare a new transaction in the given mode.
-    pub fn new(core: Arc<Core<'a, V>>, mode: Mode) -> Result<Self> {
+    pub fn new(core: Arc<Core<V>>, mode: Mode) -> Result<Self> {
         let mut read_ts = core.read_ts();
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            let snap = Snapshot::take(&core)?;
+            let snap = Snapshot::take(&*core)?;
             // The version with which the snapshot was
             // taken supersedes the version taken above.
             read_ts = snap.version - 1;
@@ -600,7 +600,7 @@ impl<'a, V: FileSystem> Transaction<'a, V> {
 
 /// Implement Versioned APIs for read-only transactions.
 /// These APIs do not take part in conflict detection.
-impl<'a, V: FileSystem> Transaction<'a, V> {
+impl<V: FileSystem> Transaction<V> {
     /// Returns the value associated with the key at the given version.
     pub fn get_at_version(&self, key: &[u8], version: u64) -> Result<Option<Vec<u8>>> {
         // If the key is empty, return an error.
@@ -766,7 +766,7 @@ impl<'a, V: FileSystem> Transaction<'a, V> {
     }
 }
 
-impl<'a, V: FileSystem> Drop for Transaction<'a, V> {
+impl<V: FileSystem> Drop for Transaction<V> {
     fn drop(&mut self) {
         self.rollback();
     }

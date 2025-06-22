@@ -31,7 +31,7 @@ use crate::{
 /// will be returned.
 /// The iterator will add the keys that are read from the snapshot to the read set.
 pub(crate) struct MergingScanIterator<'a, R, I: Iterator, V: FileSystem> {
-    core: &'a Core<'a, V>,
+    core: &'a Core<V>,
     read_set: Option<&'a mut ReadSet>,
     savepoints: u32,
     snap_iter: DoubleEndedPeekable<I>,
@@ -368,7 +368,7 @@ pub struct VersionScanIterator<'a, I: Iterator, V: FileSystem> {
     unique_keys_count: usize,
     current_key: Option<&'a [u8]>, // Track current key to detect changes
     limit: Option<usize>,
-    core: &'a Core<'a, V>,
+    core: &'a Core<V>,
 }
 
 impl<'a, I: Iterator, V: FileSystem> VersionScanIterator<'a, I, V>

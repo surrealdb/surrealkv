@@ -30,7 +30,7 @@ impl Drop for CompactionGuard<'_> {
     }
 }
 
-impl<'a, V: FileSystem> StoreInner<'a, V> {
+impl<V: FileSystem> StoreInner<V> {
     pub fn compact(&self) -> Result<()> {
         // Early return if the store is closed or compaction is already in progress
         if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
@@ -54,7 +54,7 @@ impl<'a, V: FileSystem> StoreInner<'a, V> {
         }
 
         // Clean recovery state before starting compaction
-        RecoveryState::clear(&self.core.opts.dir, self.core.vfs)?;
+        RecoveryState::clear(&self.core.opts.dir, &self.core.vfs)?;
 
         // Clear compaction stats before starting compaction
         self.stats.compaction_stats.reset();
@@ -74,7 +74,7 @@ impl<'a, V: FileSystem> StoreInner<'a, V> {
         self.core.vfs.create_dir_all(&tmp_merge_dir)?;
 
         // Initialize a new manifest in the temporary directory
-        let manifest = Core::initialize_manifest(&tmp_merge_dir, self.core.vfs)?;
+        let manifest = Core::initialize_manifest(&tmp_merge_dir, &self.core.vfs)?;
         // Add the last updated segment ID to the manifest
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
         manifest.append(&changeset.serialize()?, &self.core.vfs)?;
@@ -85,7 +85,7 @@ impl<'a, V: FileSystem> StoreInner<'a, V> {
         let tm_opts = LogOptions::default()
             .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
-        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts, self.core.vfs)?;
+        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts, &self.core.vfs)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
         // check in files for the keys that are not found in memory to handle deletion

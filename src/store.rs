@@ -24,19 +24,19 @@ use crate::util::ByteWeighter;
 use crate::util::ValueCache;
 use crate::vfs::FileSystem;
 
-pub struct StoreInner<'a, V: FileSystem> {
-    pub(crate) core: Arc<Core<'a, V>>,
+pub struct StoreInner<V: FileSystem> {
+    pub(crate) core: Arc<Core<V>>,
     pub(crate) is_closed: AtomicBool,
     pub(crate) is_compacting: AtomicBool,
     pub(crate) stats: Arc<StorageStats>,
 }
 
 // Inner representation of the store. The wrapper will handle the asynchronous closing of the store.
-impl<'a, V: FileSystem> StoreInner<'a, V> {
+impl<V: FileSystem> StoreInner<V> {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
-    pub fn with_vfs(opts: Options, vfs: &'a V) -> Result<Self> {
+    pub fn with_vfs(opts: Options, vfs: V) -> Result<Self> {
         let core = Arc::new(Core::new(opts, vfs)?);
 
         Ok(Self {
@@ -102,19 +102,19 @@ impl<'a, V: FileSystem> StoreInner<'a, V> {
     }
 }
 
-pub type Store = StoreInner<'static, crate::vfs::Dummy>;
+pub type Store = StoreInner<crate::vfs::Dummy>;
 
 impl Store {
     /// Creates a new MVCC key-value store with the given options.
     /// It creates a new core with the options and wraps it in an atomic reference counter.
     /// It returns the store.
     pub fn new(opts: Options) -> Result<Self> {
-        Self::with_vfs(opts, &crate::vfs::Dummy)
+        Self::with_vfs(opts, crate::vfs::Dummy)
     }
 }
 
 /// Core of the key-value store.
-pub struct Core<'a, V: FileSystem> {
+pub struct Core<V: FileSystem> {
     /// Index for store.
     pub(crate) indexer: RwLock<Indexer>,
     /// Options for store.
@@ -135,10 +135,10 @@ pub struct Core<'a, V: FileSystem> {
     /// Write lock to ensure that only one transaction can commit at a time.
     pub(crate) commit_write_lock: Mutex<()>,
 
-    pub(crate) vfs: &'a V,
+    pub(crate) vfs: V,
 }
 
-impl<'a, V: FileSystem> Core<'a, V> {
+impl<V: FileSystem> Core<V> {
     fn initialize_indexer() -> Indexer {
         Indexer::new()
     }
@@ -182,7 +182,7 @@ impl<'a, V: FileSystem> Core<'a, V> {
     /// opens or creates the commit log file, loads the index from the commit log if it exists, creates
     /// and initializes an Oracle, creates and initializes a value cache, and constructs and returns
     /// the Core instance.
-    pub fn new(opts: Options, vfs: &'a V) -> Result<Self> {
+    pub fn new(opts: Options, vfs: V) -> Result<Self> {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
@@ -191,20 +191,20 @@ impl<'a, V: FileSystem> Core<'a, V> {
 
         if opts.should_persist_data() {
             // Determine options for the manifest file and open or create it.
-            manifest = Some(Self::initialize_manifest(&opts.dir, vfs)?);
+            manifest = Some(Self::initialize_manifest(&opts.dir, &vfs)?);
 
             // Load options from the manifest file.
-            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap(), vfs)?;
+            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap(), &vfs)?;
 
             // Determine options for the commit log file and open or create it.
-            clog = Some(Self::initialize_clog(&opts, vfs)?);
+            clog = Some(Self::initialize_clog(&opts, &vfs)?);
 
             // Restore the store from a compaction process if necessary.
-            restore_from_compaction(&opts, vfs)?;
+            restore_from_compaction(&opts, &vfs)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
-                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer, vfs)?;
+                Core::load_index(&opts, clog.as_mut().unwrap(), &mut indexer, &vfs)?;
             }
         }
 
@@ -609,7 +609,7 @@ impl<'a, V: FileSystem> Core<'a, V> {
 // hold references to Core, therefore it will never be dropped if
 // Store is dropped until all the transactions are done.
 // Store::close() can always be called directly if more control is needed.
-impl<'a, V: FileSystem> Drop for Core<'a, V> {
+impl<V: FileSystem> Drop for Core<V> {
     fn drop(&mut self) {
         if let Err(err) = self.close() {
             eprintln!("Error closing store core: {err}");
