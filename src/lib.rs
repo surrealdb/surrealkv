@@ -16,6 +16,7 @@ mod store;
 mod transaction;
 mod util;
 
+pub mod vfs;
 pub use {
     entry::Record,
     error::{Error, Result},

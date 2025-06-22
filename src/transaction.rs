@@ -13,6 +13,7 @@ use crate::option::IsolationLevel;
 use crate::snapshot::Snapshot;
 use crate::store::Core;
 use crate::util::{convert_range_bounds, now};
+use crate::vfs::FileSystem;
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -135,7 +136,7 @@ pub(crate) type ReadSet = Vec<ReadSetEntry>;
 pub(crate) type WriteSet = BTreeMap<Bytes, Vec<WriteSetEntry>>;
 
 /// `Transaction` is a struct representing a transaction in a database.
-pub struct Transaction {
+pub struct Transaction<V: FileSystem> {
     /// `read_ts` is the read timestamp of the transaction. This is the time at which the transaction started.
     pub(crate) read_ts: u64,
 
@@ -147,7 +148,7 @@ pub struct Transaction {
     pub(crate) snapshot: Option<Snapshot>,
 
     /// `core` is the underlying core for the transaction. This is shared between transactions.
-    pub(crate) core: Arc<Core>,
+    pub(crate) core: Arc<Core<V>>,
 
     /// `write_set` is a map of keys to entries.
     /// These are the changes that the transaction intends to make to the data.
@@ -181,14 +182,14 @@ pub struct Transaction {
     versionstamp: Option<(u64, u64)>,
 }
 
-impl Transaction {
+impl<V: FileSystem> Transaction<V> {
     /// Prepare a new transaction in the given mode.
-    pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+    pub fn new(core: Arc<Core<V>>, mode: Mode) -> Result<Self> {
         let mut read_ts = core.read_ts();
 
         let mut snapshot = None;
         if !mode.is_write_only() {
-            let snap = Snapshot::take(&core)?;
+            let snap = Snapshot::take(&*core)?;
             // The version with which the snapshot was
             // taken supersedes the version taken above.
             read_ts = snap.version - 1;
@@ -599,7 +600,7 @@ impl Transaction {
 
 /// Implement Versioned APIs for read-only transactions.
 /// These APIs do not take part in conflict detection.
-impl Transaction {
+impl<V: FileSystem> Transaction<V> {
     /// Returns the value associated with the key at the given version.
     pub fn get_at_version(&self, key: &[u8], version: u64) -> Result<Option<Vec<u8>>> {
         // If the key is empty, return an error.
@@ -765,7 +766,7 @@ impl Transaction {
     }
 }
 
-impl Drop for Transaction {
+impl<V: FileSystem> Drop for Transaction<V> {
     fn drop(&mut self) {
         self.rollback();
     }
@@ -1251,8 +1252,10 @@ mod tests {
             store.close().unwrap();
 
             let clog_subdir = tmp_dir.path().join("clog");
-            let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path()).unwrap();
-            let reader = MultiSegmentReader::new(sr).unwrap();
+            let sr =
+                SegmentRef::read_segments_from_directory(clog_subdir.as_path(), &crate::vfs::Dummy)
+                    .unwrap();
+            let reader = MultiSegmentReader::new(sr, &crate::vfs::Dummy).unwrap();
             let reader = Reader::new_from(reader);
             let mut tx_reader = RecordReader::new(reader);
 
@@ -1603,9 +1606,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=10u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -1660,8 +1663,7 @@ mod tests {
             });
             assert!(
                 remaining.is_empty(),
-                "Expected no remaining items but got: {:?}",
-                remaining
+                "Expected no remaining items but got: {remaining:?}"
             );
         }
 
@@ -1670,9 +1672,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=6u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -1751,9 +1753,9 @@ mod tests {
             let (store, _) = create_store(false);
 
             for i in 1..=10u16 {
-                let key = format!("key{:02}", i);
+                let key = format!("key{i:02}");
                 let mut txn = store.begin().unwrap();
-                txn.set(&Bytes::from(key), &Bytes::from(format!("val{:02}", i)))
+                txn.set(&Bytes::from(key), &Bytes::from(format!("val{i:02}")))
                     .unwrap();
                 txn.commit().unwrap();
             }
@@ -1822,11 +1824,14 @@ mod tests {
             let key2 = Bytes::from("k2");
             let value1 = Bytes::from("v1");
             let value2 = Bytes::from("v2");
-            // Start a new read-write transaction (txn)
-            let mut txn = store.begin().unwrap();
-            txn.set(&key1, &value1).unwrap();
-            txn.set(&key2, &value2).unwrap();
-            txn.commit().unwrap();
+
+            // Use a block to ensure the transaction is dropped before returning store
+            {
+                let mut txn = store.begin().unwrap();
+                txn.set(&key1, &value1).unwrap();
+                txn.set(&key2, &value2).unwrap();
+                txn.commit().unwrap();
+            } // txn is automatically dropped here
 
             store
         }
@@ -3060,10 +3065,10 @@ mod tests {
 
             // Define key-value pairs for the test
             let keys: Vec<Bytes> = (0..num_transactions)
-                .map(|i| Bytes::from(format!("key{}", i)))
+                .map(|i| Bytes::from(format!("key{i}")))
                 .collect();
             let values: Vec<Bytes> = (0..num_transactions)
-                .map(|i| Bytes::from(format!("value{}", i)))
+                .map(|i| Bytes::from(format!("value{i}")))
                 .collect();
 
             // Create a vector to store the handles of the spawned tasks

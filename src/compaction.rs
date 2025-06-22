@@ -1,8 +1,9 @@
 use bytes::BytesMut;
-use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::vfs::FileSystem;
 
 use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
@@ -10,7 +11,7 @@ use crate::log::{Aol, Options as LogOptions, SegmentRef};
 use crate::manifest::Manifest;
 use crate::meta::Metadata;
 use crate::option::Options;
-use crate::store::{Core, Store};
+use crate::store::{Core, StoreInner};
 
 struct CompactionGuard<'a> {
     is_compacting: &'a AtomicBool,
@@ -29,7 +30,7 @@ impl Drop for CompactionGuard<'_> {
     }
 }
 
-impl Store {
+impl<V: FileSystem> StoreInner<V> {
     pub fn compact(&self) -> Result<()> {
         // Early return if the store is closed or compaction is already in progress
         if self.is_closed.load(Ordering::SeqCst) || !self.core.opts.should_persist_data() {
@@ -44,16 +45,16 @@ impl Store {
         // Clear files before starting compaction if a .merge or .tmp.merge directory exists
         let tmp_merge_dir = self.core.opts.dir.join(".tmp.merge");
         if tmp_merge_dir.exists() {
-            fs::remove_dir_all(&tmp_merge_dir)?;
+            self.core.vfs.remove_dir_all(&tmp_merge_dir)?;
         }
 
         let merge_dir = self.core.opts.dir.join(".merge");
         if merge_dir.exists() {
-            fs::remove_dir_all(&merge_dir)?;
+            self.core.vfs.remove_dir_all(&merge_dir)?;
         }
 
         // Clean recovery state before starting compaction
-        RecoveryState::clear(&self.core.opts.dir)?;
+        RecoveryState::clear(&self.core.opts.dir, &self.core.vfs)?;
 
         // Clear compaction stats before starting compaction
         self.stats.compaction_stats.reset();
@@ -66,17 +67,17 @@ impl Store {
 
         // Rotate the commit log and get the new segment ID
         let clog = self.core.clog.as_ref().unwrap();
-        let new_segment_id = clog.rotate()?;
+        let new_segment_id = clog.rotate(&self.core.vfs)?;
         let last_updated_segment_id = new_segment_id - 1;
 
         // Create a temporary directory for compaction
-        fs::create_dir_all(&tmp_merge_dir)?;
+        self.core.vfs.create_dir_all(&tmp_merge_dir)?;
 
         // Initialize a new manifest in the temporary directory
-        let manifest = Core::initialize_manifest(&tmp_merge_dir)?;
+        let manifest = Core::initialize_manifest(&tmp_merge_dir, &self.core.vfs)?;
         // Add the last updated segment ID to the manifest
         let changeset = Manifest::with_compacted_up_to_segment(last_updated_segment_id);
-        manifest.append(&changeset.serialize()?)?;
+        manifest.append(&changeset.serialize()?, &self.core.vfs)?;
         manifest.close()?;
 
         // Prepare a temporary commit log directory
@@ -84,7 +85,7 @@ impl Store {
         let tm_opts = LogOptions::default()
             .with_max_file_size(self.core.opts.max_compaction_segment_size)
             .with_file_extension("clog".to_string());
-        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
+        let temp_writer = Aol::open(&temp_clog_dir, &tm_opts, &self.core.vfs)?;
 
         // TODO: Check later to add a new way for compaction by reading from the files first and then
         // check in files for the keys that are not found in memory to handle deletion
@@ -116,11 +117,10 @@ impl Store {
             let mut buf = BytesMut::new();
             tx_record.encode(&mut buf)?;
 
-            let (segment_id, _, _) = temp_writer.append(&buf)?;
+            let (segment_id, _, _) = temp_writer.append(&buf, &self.core.vfs)?;
             if segment_id > last_updated_segment_id {
                 eprintln!(
-                    "Segment ID: {} exceeds last updated segment ID: {}",
-                    segment_id, last_updated_segment_id
+                    "Segment ID: {segment_id} exceeds last updated segment ID: {last_updated_segment_id}"
                 );
                 return Err(Error::SegmentIdExceedsLastUpdated);
             }
@@ -201,7 +201,7 @@ impl Store {
         drop(manifest);
 
         // Finalize compaction by renaming the temporary directory
-        fs::rename(tmp_merge_dir, merge_dir)?;
+        self.core.vfs.rename(tmp_merge_dir, merge_dir)?;
 
         Ok(())
     }
@@ -214,10 +214,10 @@ pub(crate) enum RecoveryState {
 }
 
 impl RecoveryState {
-    pub(crate) fn load(dir: &Path) -> Result<Self> {
+    pub(crate) fn load<V: FileSystem>(dir: &Path, vfs: &V) -> Result<Self> {
         let path = dir.join(".recovery_state");
         if path.exists() {
-            let mut file = File::open(path)?;
+            let mut file = vfs.open(path)?;
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
             match contents.as_str() {
@@ -229,29 +229,29 @@ impl RecoveryState {
         }
     }
 
-    pub(crate) fn save(&self, dir: &Path) -> Result<()> {
+    pub(crate) fn save<V: FileSystem>(&self, dir: &Path, vfs: &V) -> Result<()> {
         let path = dir.join(".recovery_state");
-        let mut file = File::create(path)?;
+        let mut file = vfs.create(path)?;
         match self {
             RecoveryState::ClogDeleted => {
                 write!(file, "ClogDeleted")
-                    .map_err(|e| Error::CustomError(format!("recovery file write error: {}", e)))?;
+                    .map_err(|e| Error::CustomError(format!("recovery file write error: {e}")))?;
                 Ok(())
             }
             RecoveryState::None => Ok(()),
         }
     }
 
-    pub(crate) fn clear(dir: &Path) -> Result<()> {
+    pub(crate) fn clear<V: FileSystem>(dir: &Path, vfs: &V) -> Result<()> {
         let path = dir.join(".recovery_state");
         if path.exists() {
-            fs::remove_file(path)?;
+            vfs.remove_file(path)?;
         }
         Ok(())
     }
 }
 
-fn perform_recovery(opts: &Options) -> Result<()> {
+fn perform_recovery<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
     // Encapsulate operations in a closure for easier rollback
     let result = || -> Result<()> {
         let merge_dir = opts.dir.join(".merge");
@@ -259,9 +259,9 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         let merge_clog_subdir = merge_dir.join("clog");
 
         // If there is a .merge directory, try reading manifest from it
-        let manifest = Core::initialize_manifest(&merge_dir)?;
+        let manifest = Core::initialize_manifest(&merge_dir, vfs)?;
         let existing_manifest = if manifest.size()? > 0 {
-            Core::read_manifest(&merge_dir)?
+            Core::read_manifest(&merge_dir, vfs)?
         } else {
             return Err(Error::MergeManifestMissing);
         };
@@ -272,21 +272,21 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         }
 
         let compacted_upto_segment_id = compacted_upto_segments[0];
-        let segs = SegmentRef::read_segments_from_directory(&clog_dir)?;
+        let segs = SegmentRef::read_segments_from_directory(&clog_dir, vfs)?;
         // Step 4: Copy files from clog dir to merge clog dir
         for seg in segs.iter() {
             if seg.id > compacted_upto_segment_id {
                 // Check if the path points to a regular file
-                match fs::metadata(&seg.file_path) {
+                match vfs.metadata(&seg.file_path) {
                     Ok(metadata) => {
                         if metadata.is_file() {
                             // Proceed to copy the file
                             let dest_path =
                                 merge_clog_subdir.join(seg.file_path.file_name().unwrap());
-                            match fs::copy(&seg.file_path, &dest_path) {
+                            match vfs.copy(&seg.file_path, &dest_path) {
                                 Ok(_) => println!("File copied successfully"),
                                 Err(e) => {
-                                    eprintln!("Error copying file: {:?}", e);
+                                    eprintln!("Error copying file: {e:?}");
                                     return Err(Error::from(e));
                                 }
                             }
@@ -295,7 +295,7 @@ fn perform_recovery(opts: &Options) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error accessing file metadata: {:?}", e);
+                        eprintln!("Error accessing file metadata: {e:?}");
                         return Err(Error::from(e));
                     }
                 }
@@ -303,24 +303,24 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         }
 
         // Clear any previous recovery state before setting a new one
-        RecoveryState::clear(&opts.dir)?;
+        RecoveryState::clear(&opts.dir, vfs)?;
         // After successful operation, update recovery state to indicate clog can be deleted
-        RecoveryState::ClogDeleted.save(&opts.dir)?;
+        RecoveryState::ClogDeleted.save(&opts.dir, vfs)?;
 
         // Delete the `clog` directory
-        if let Err(e) = fs::remove_dir_all(&clog_dir) {
-            eprintln!("Error deleting clog directory: {:?}", e);
+        if let Err(e) = vfs.remove_dir_all(&clog_dir) {
+            eprintln!("Error deleting clog directory: {e:?}");
             return Err(Error::from(e));
         }
 
         // Rename `merge_clog_subdir` to `clog`
-        if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
-            eprintln!("Error renaming merge_clog_subdir to clog: {:?}", e);
+        if let Err(e) = vfs.rename(&merge_clog_subdir, &clog_dir) {
+            eprintln!("Error renaming merge_clog_subdir to clog: {e:?}");
             return Err(Error::from(e));
         }
 
         // Clear recovery state after successful completion
-        RecoveryState::clear(&opts.dir)?;
+        RecoveryState::clear(&opts.dir, vfs)?;
 
         Ok(())
     };
@@ -330,22 +330,32 @@ fn perform_recovery(opts: &Options) -> Result<()> {
         Err(e) => {
             let merge_dir = opts.dir.join(".merge");
             let clog_dir = opts.dir.join("clog");
-            rollback(&merge_dir, &clog_dir, RecoveryState::load(&opts.dir)?)?;
+            rollback(
+                &merge_dir,
+                &clog_dir,
+                RecoveryState::load(&opts.dir, vfs)?,
+                vfs,
+            )?;
             Err(e)
         }
     }
 }
 
-fn cleanup_after_recovery(opts: &Options) -> Result<()> {
+fn cleanup_after_recovery<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
     let merge_dir = opts.dir.join(".merge");
 
     if merge_dir.exists() {
-        fs::remove_dir_all(&merge_dir)?;
+        vfs.remove_dir_all(&merge_dir)?;
     }
     Ok(())
 }
 
-fn rollback(merge_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
+fn rollback<V: FileSystem>(
+    merge_dir: &Path,
+    clog_dir: &Path,
+    checkpoint: RecoveryState,
+    vfs: &V,
+) -> Result<()> {
     if checkpoint == RecoveryState::ClogDeleted {
         // Restore the clog directory from merge directory if it exists
         // At this point the merge directory should exist and the clog directory should not
@@ -353,7 +363,7 @@ fn rollback(merge_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Res
         if !clog_dir.exists() && merge_dir.exists() {
             let merge_clog_subdir = merge_dir.join("clog");
             if merge_clog_subdir.exists() {
-                fs::rename(&merge_clog_subdir, clog_dir)?;
+                vfs.rename(&merge_clog_subdir, clog_dir)?;
             }
         }
     }
@@ -365,21 +375,21 @@ fn needs_recovery(opts: &Options) -> Result<bool> {
     Ok(opts.dir.join(".merge").exists())
 }
 
-fn handle_clog_deleted_state(opts: &Options) -> Result<()> {
+fn handle_clog_deleted_state<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
     let merge_dir = opts.dir.join(".merge");
     let clog_dir = opts.dir.join("clog");
-    rollback(&merge_dir, &clog_dir, RecoveryState::ClogDeleted)
+    rollback(&merge_dir, &clog_dir, RecoveryState::ClogDeleted, vfs)
 }
 
 /// Restores the store from a compaction process by handling .tmp.merge and .merge directories.
 /// TODO: This should happen post repair
-pub fn restore_from_compaction(opts: &Options) -> Result<()> {
+pub fn restore_from_compaction<V: FileSystem>(opts: &Options, vfs: &V) -> Result<()> {
     let tmp_merge_dir = opts.dir.join(".tmp.merge");
     // 1) Check if there is a .tmp.merge directory, delete it
     if tmp_merge_dir.exists() {
         // This means there was a previous compaction process that failed
         // so we don't need to do anything here and just return
-        fs::remove_dir_all(&tmp_merge_dir)?;
+        vfs.remove_dir_all(&tmp_merge_dir)?;
         return Ok(());
     }
 
@@ -387,14 +397,14 @@ pub fn restore_from_compaction(opts: &Options) -> Result<()> {
         return Ok(());
     }
 
-    match RecoveryState::load(&opts.dir)? {
-        RecoveryState::ClogDeleted => handle_clog_deleted_state(opts)?,
+    match RecoveryState::load(&opts.dir, vfs)? {
+        RecoveryState::ClogDeleted => handle_clog_deleted_state(opts, vfs)?,
         RecoveryState::None => (),
     }
 
-    perform_recovery(opts)?;
+    perform_recovery(opts, vfs)?;
     // Clean up merge directory after successful operation
-    cleanup_after_recovery(opts)
+    cleanup_after_recovery(opts, vfs)
 }
 
 #[cfg(test)]
@@ -403,7 +413,6 @@ mod tests {
     use rand::prelude::SliceRandom;
     use rand::{distributions::Alphanumeric, Rng};
     use std::collections::HashSet;
-    use std::fs::read_to_string;
 
     use crate::option::Options;
     use crate::store::Store;
@@ -424,30 +433,37 @@ mod tests {
         let temp_dir = &temp_dir.to_path_buf();
 
         // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
 
         // Test saving and loading ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
+        RecoveryState::ClogDeleted
+            .save(temp_dir, &crate::vfs::Dummy)
+            .unwrap();
         assert_eq!(
-            RecoveryState::load(temp_dir).unwrap(),
+            RecoveryState::load(temp_dir, &crate::vfs::Dummy).unwrap(),
             RecoveryState::ClogDeleted
         );
 
         // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
 
         // Test loading None when no state is saved
-        assert_eq!(RecoveryState::load(temp_dir).unwrap(), RecoveryState::None);
+        assert_eq!(
+            RecoveryState::load(temp_dir, &crate::vfs::Dummy).unwrap(),
+            RecoveryState::None
+        );
 
         // Test save contents for ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
-        let contents = read_to_string(&path).unwrap();
+        RecoveryState::ClogDeleted
+            .save(temp_dir, &crate::vfs::Dummy)
+            .unwrap();
+        let contents = crate::vfs::Dummy.read_to_string(&path).unwrap();
         assert_eq!(contents, "ClogDeleted");
 
         // Final clear to clean up
-        RecoveryState::clear(temp_dir).unwrap();
+        RecoveryState::clear(temp_dir, &crate::vfs::Dummy).unwrap();
         assert!(!path.exists());
     }
 
@@ -931,8 +947,7 @@ mod tests {
                 .expect("Failed to begin transaction on reopened store");
             assert!(
                 txn.get(key).expect("Failed to get key").is_none(),
-                "Key {:?} was not deleted",
-                key
+                "Key {key:?} was not deleted"
             );
         }
 
@@ -955,7 +970,7 @@ mod tests {
         let num_keys = 26;
         // Sequentially generate keys
         let keys: Vec<Bytes> = (0..num_keys)
-            .map(|i| Bytes::from(format!("key{:02}", i)))
+            .map(|i| Bytes::from(format!("key{i:02}")))
             .collect();
 
         let value = Bytes::from("value");
@@ -991,9 +1006,9 @@ mod tests {
                 .expect("Failed to begin transaction on reopened store");
             let result = txn.get(key).expect("Failed to get key");
             if i < num_keys / 2 {
-                assert!(result.is_none(), "Key {:?} should have been deleted", key);
+                assert!(result.is_none(), "Key {key:?} should have been deleted");
             } else {
-                assert!(result.is_some(), "Key {:?} should exist", key);
+                assert!(result.is_some(), "Key {key:?} should exist");
             }
         }
 
@@ -1059,7 +1074,7 @@ mod tests {
                 .begin()
                 .expect("Failed to begin transaction on reopened store");
             if let Some(value) = txn.get(key).expect("Failed to get key") {
-                assert_eq!(&value, expected_value, "Value mismatch for key {:?}", key)
+                assert_eq!(&value, expected_value, "Value mismatch for key {key:?}")
             }
         }
 
@@ -1087,16 +1102,16 @@ mod tests {
             let mut txn = store.begin().unwrap();
             for j in 0..num_ops {
                 let id = (i - 1) * num_ops + j;
-                let key = format!("key{}", id);
-                let value = format!("value{}", id);
+                let key = format!("key{id}");
+                let value = format!("value{id}");
                 txn.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
             txn.commit().unwrap();
 
             // Test that the items are still in the store
             for j in 0..(num_ops * i) {
-                let key = format!("key{}", j);
-                let value = format!("value{}", j);
+                let key = format!("key{j}");
+                let value = format!("value{j}");
                 let value = value.into_bytes();
                 let mut txn = store.begin().unwrap();
                 let val = txn.get(key.as_bytes()).unwrap().unwrap();
@@ -1241,10 +1256,10 @@ mod tests {
 
         // Insert keys into the store
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
             {
                 let mut txn = store.begin().unwrap();
-                let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+                let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
                 // Insert first version for all keys
                 txn.set(&key, &value1).unwrap();
@@ -1252,7 +1267,7 @@ mod tests {
             }
 
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     // Insert a second version for keys above the multiple_versions_threshold
@@ -1274,11 +1289,11 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
             let expected_value = if key_index > multiple_versions_threshold {
-                format!("value{}_2", key_index)
+                format!("value{key_index}_2")
             } else {
-                format!("value{}_1", key_index)
+                format!("value{key_index}_1")
             };
 
             let val = txn
@@ -1310,8 +1325,8 @@ mod tests {
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
-            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
             // Insert first version for all keys in its own transaction
             {
@@ -1322,7 +1337,7 @@ mod tests {
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
@@ -1350,18 +1365,17 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > delete_threshold {
                 // Keys marked as deleted in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Deleted key{} should not be present after compaction",
-                    key_index
+                    "Deleted key{key_index} should not be present after compaction"
                 );
             } else if key_index > multiple_versions_threshold {
                 // Keys with multiple versions should have their last version
-                let expected_value = format!("value{}_2", key_index);
+                let expected_value = format!("value{key_index}_2");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1369,12 +1383,11 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should be the last version after compaction",
-                    key_index
+                    "key{key_index}'s value should be the last version after compaction"
                 );
             } else {
                 // Keys with a single version should remain unchanged
-                let expected_value = format!("value{}_1", key_index);
+                let expected_value = format!("value{key_index}_1");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1382,8 +1395,7 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should remain unchanged after compaction",
-                    key_index
+                    "key{key_index}'s value should remain unchanged after compaction"
                 );
             }
         }
@@ -1406,8 +1418,8 @@ mod tests {
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
-            let key = format!("key{}", key_index).as_bytes().to_vec();
-            let value1 = format!("value{}_1", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            let value1 = format!("value{key_index}_1").as_bytes().to_vec();
 
             // Insert first version for all keys in its own transaction
             {
@@ -1418,7 +1430,7 @@ mod tests {
 
             // Insert a second version for keys above the multiple_versions_threshold in its own transaction
             if key_index > multiple_versions_threshold {
-                let value2 = format!("value{}_2", key_index).as_bytes().to_vec();
+                let value2 = format!("value{key_index}_2").as_bytes().to_vec();
                 {
                     let mut txn = store.begin().unwrap();
                     txn.set(&key, &value2).unwrap();
@@ -1445,14 +1457,13 @@ mod tests {
 
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > clear_threshold {
                 // Keys marked as deleted in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Deleted key{} should not be present after compaction",
-                    key_index
+                    "Deleted key{key_index} should not be present after compaction"
                 );
             }
         }
@@ -1460,18 +1471,17 @@ mod tests {
         // Verify the results
         for key_index in 1..=num_keys {
             let mut txn = store.begin().unwrap();
-            let key = format!("key{}", key_index).as_bytes().to_vec();
+            let key = format!("key{key_index}").as_bytes().to_vec();
 
             if key_index > clear_threshold {
                 // Keys marked as cleared in their last version should not be present
                 assert!(
                     txn.get(&key).unwrap().is_none(),
-                    "Cleared key{} should not be present after compaction",
-                    key_index
+                    "Cleared key{key_index} should not be present after compaction"
                 );
             } else if key_index > multiple_versions_threshold {
                 // Keys with multiple versions should have their last version
-                let expected_value = format!("value{}_2", key_index);
+                let expected_value = format!("value{key_index}_2");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1479,12 +1489,11 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should be the last version after compaction",
-                    key_index
+                    "key{key_index}'s value should be the last version after compaction"
                 );
             } else {
                 // Keys with a single version should remain unchanged
-                let expected_value = format!("value{}_1", key_index);
+                let expected_value = format!("value{key_index}_1");
                 let val = txn
                     .get(&key)
                     .unwrap()
@@ -1492,8 +1501,7 @@ mod tests {
                 assert_eq!(
                     val,
                     expected_value.as_bytes(),
-                    "key{}'s value should remain unchanged after compaction",
-                    key_index
+                    "key{key_index}'s value should remain unchanged after compaction"
                 );
             }
         }

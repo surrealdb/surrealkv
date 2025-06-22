@@ -9,7 +9,7 @@ use surrealkv::{Options, Store};
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn create_local_directory(test_name: &str) -> PathBuf {
-    let local_dir = PathBuf::from(format!("./test_data/{}", test_name));
+    let local_dir = PathBuf::from(format!("./test_data/{test_name}"));
     fs::create_dir_all(&local_dir).unwrap();
     local_dir
 }
@@ -36,7 +36,7 @@ fn benchmark_load_times_kv_size() {
         for value_size in &value_sizes {
             // Test Sequential Keys
             {
-                let test_name = format!("sequential_keys_{}_{}", key_size, value_size);
+                let test_name = format!("sequential_keys_{key_size}_{value_size}");
                 let local_dir = create_local_directory(&test_name);
 
                 let mut opts = Options::new();
@@ -45,7 +45,7 @@ fn benchmark_load_times_kv_size() {
 
                 let default_value = Bytes::from(vec![0x42; *value_size]);
                 let keys: Vec<Bytes> = (0..num_keys)
-                    .map(|i| Bytes::from(format!("{:0width$}", i, width = key_size)))
+                    .map(|i| Bytes::from(format!("{i:0key_size$}")))
                     .collect();
 
                 for key in &keys {
@@ -80,7 +80,7 @@ fn benchmark_load_times_kv_size() {
 
             // Test Random Keys
             {
-                let test_name = format!("random_keys_{}_{}", key_size, value_size);
+                let test_name = format!("random_keys_{key_size}_{value_size}");
                 let local_dir = create_local_directory(&test_name);
 
                 let mut opts = Options::new();
@@ -142,7 +142,7 @@ fn benchmark_load_times_versions() {
     for version_count in versions {
         let num_keys = total_records / version_count;
 
-        let test_name = format!("versions_{}", version_count);
+        let test_name = format!("versions_{version_count}");
         let local_dir = create_local_directory(&test_name);
 
         let mut opts = Options::new();

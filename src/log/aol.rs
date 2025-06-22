@@ -1,5 +1,5 @@
+use std::io;
 use std::{
-    fs, io,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,11 +11,12 @@ use parking_lot::Mutex;
 use quick_cache::sync::Cache;
 
 use crate::log::{get_segment_range, Error, IOError, Options, Result, Segment};
+use crate::vfs::FileSystem;
 
 /// Writer state that needs exclusive access
-pub(crate) struct WriterState {
+pub(crate) struct WriterState<V: FileSystem> {
     /// The currently active segment where data is being written.
-    pub(crate) active_segment: Segment,
+    pub(crate) active_segment: Segment<V>,
     /// The ID of the currently active segment.
     pub(crate) active_segment_id: u64,
 }
@@ -24,9 +25,9 @@ pub(crate) struct WriterState {
 /// in a series of segments. It provides efficient write operations,
 /// making it suitable for use cases like storing large amounts of data and
 /// writing data in a sequential manner.
-pub struct Aol {
+pub struct Aol<V: FileSystem> {
     /// The write state protected by a mutex
-    pub(crate) writer_state: Mutex<WriterState>,
+    pub(crate) writer_state: Mutex<WriterState<V>>,
 
     /// The directory where the segment files are located.
     pub(crate) dir: PathBuf,
@@ -38,29 +39,29 @@ pub struct Aol {
     closed: AtomicBool,
 
     /// Lock-free cache for all read segments (including active)
-    segment_cache: Cache<u64, Arc<Segment>>,
+    segment_cache: Cache<u64, Arc<Segment<V>>>,
 
     /// A flag indicating whether the AOL instance has encountered an IO error or not.
     fsync_failed: AtomicBool,
 }
 
-impl Aol {
+impl<V: FileSystem> Aol<V> {
     /// Opens or creates a new AOL instance associated with the specified directory and segment ID.
     ///
     /// This function prepares the AOL instance by creating the necessary directory,
     /// determining the active segment ID, and initializing the active segment.
-    pub fn open(dir: &Path, opts: &Options) -> Result<Self> {
+    pub fn open(dir: &Path, opts: &Options, vfs: &V) -> Result<Self> {
         // Ensure the options are valid
         opts.validate()?;
 
         // Ensure the directory exists with proper permissions
-        Self::prepare_directory(dir, opts)?;
+        Self::prepare_directory(dir, opts, vfs)?;
 
         // Determine the active segment ID
-        let active_segment_id = Self::calculate_current_write_segment_id(dir)?;
+        let active_segment_id = Self::calculate_current_write_segment_id(dir, vfs)?;
 
         // Open the active segment
-        let active_segment = Segment::open(dir, active_segment_id, opts, false)?;
+        let active_segment = Segment::open(dir, active_segment_id, opts, false, vfs)?;
 
         let writer_state = WriterState {
             active_segment,
@@ -78,10 +79,10 @@ impl Aol {
     }
 
     // Helper function to prepare the directory with proper permissions
-    fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
-        fs::create_dir_all(dir)?;
+    fn prepare_directory(dir: &Path, opts: &Options, vfs: &V) -> Result<()> {
+        vfs.create_dir_all(dir)?;
 
-        if let Ok(metadata) = fs::metadata(dir) {
+        if let Ok(metadata) = vfs.metadata(dir) {
             let mut permissions = metadata.permissions();
 
             #[cfg(unix)]
@@ -95,20 +96,20 @@ impl Aol {
                 permissions.set_readonly(false);
             }
 
-            fs::set_permissions(dir, permissions)?;
+            vfs.set_permissions(dir, permissions)?;
         }
 
         Ok(())
     }
 
     // Helper function to calculate the active segment ID
-    fn calculate_current_write_segment_id(dir: &Path) -> Result<u64> {
-        let (_, last) = get_segment_range(dir)?;
+    fn calculate_current_write_segment_id(dir: &Path, vfs: &V) -> Result<u64> {
+        let (_, last) = get_segment_range(dir, vfs)?;
         Ok(last)
     }
 
     /// Appends a record to the active segment.
-    pub fn append(&self, rec: &[u8]) -> Result<(u64, u64, usize)> {
+    pub fn append(&self, rec: &[u8], vfs: &V) -> Result<(u64, u64, usize)> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::SegmentClosed);
         }
@@ -147,7 +148,7 @@ impl Aol {
 
             // Open new segment with the incremented id
             let new_segment =
-                Segment::open(&self.dir, writer.active_segment_id, &self.opts, false)?;
+                Segment::open(&self.dir, writer.active_segment_id, &self.opts, false, vfs)?;
 
             writer.active_segment = new_segment;
         }
@@ -177,6 +178,7 @@ impl Aol {
         buf: &mut [u8],
         segment_id: u64,
         read_offset: u64,
+        vfs: &V,
     ) -> Result<(u64, usize)> {
         self.check_if_fsync_failed()?;
 
@@ -189,9 +191,9 @@ impl Aol {
 
         // Get segment from cache (works for both active and inactive segments)
         let segment = self.segment_cache.get_or_insert_with(&segment_id, || {
-            Segment::open(&self.dir, segment_id, &self.opts, true)
+            Segment::open(&self.dir, segment_id, &self.opts, true, vfs)
                 .map(Arc::new)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         })?;
 
         match segment.read_at(buf, read_offset) {
@@ -210,7 +212,7 @@ impl Aol {
         Ok(())
     }
 
-    pub fn rotate(&self) -> Result<u64> {
+    pub fn rotate(&self, vfs: &V) -> Result<u64> {
         let mut writer = self.writer_state.lock();
 
         // Close current segment
@@ -221,7 +223,7 @@ impl Aol {
 
         // Open new segment with the incremented id
         writer.active_segment =
-            Segment::open(&self.dir, writer.active_segment_id, &self.opts, false)?;
+            Segment::open(&self.dir, writer.active_segment_id, &self.opts, false, vfs)?;
 
         Ok(writer.active_segment_id)
     }
@@ -254,7 +256,7 @@ impl Aol {
     }
 }
 
-impl Drop for Aol {
+impl<V: FileSystem> Drop for Aol<V> {
     /// Attempt to fsync data on drop, in case we're running without sync.
     fn drop(&mut self) {
         self.close().ok();
@@ -271,7 +273,7 @@ mod tests {
         TempDir::new("test").unwrap()
     }
 
-    fn get_writer_state(aol: &Aol) -> (u64, u64) {
+    fn get_writer_state<V: FileSystem>(aol: &Aol<V>) -> (u64, u64) {
         let writer = aol.writer_state.lock();
         (writer.active_segment_id, writer.active_segment.offset())
     }
@@ -283,7 +285,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Test initial offset
         let sz = get_writer_state(&a);
@@ -291,16 +293,16 @@ mod tests {
         assert_eq!(0, sz.1);
 
         // Test appending an empty buffer
-        let r = a.append(&[]);
+        let r = a.append(&[], &crate::vfs::Dummy);
         assert!(r.is_err());
 
         // Test appending a non-empty buffer
-        let r = a.append(&[0, 1, 2, 3]);
+        let r = a.append(&[0, 1, 2, 3], &crate::vfs::Dummy);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().2);
 
         // Test appending another buffer
-        let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
+        let r = a.append(&[4, 5, 6, 7, 8, 9, 10], &crate::vfs::Dummy);
         assert!(r.is_ok());
         assert_eq!(7, r.unwrap().2);
 
@@ -312,24 +314,30 @@ mod tests {
 
         // Test reading from segment
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, segment_id, 0).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 0, &crate::vfs::Dummy)
+            .expect("should read");
         assert_eq!(4, n.1);
         assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[..]);
 
         // Test reading another portion of data from segment
         let mut bs = vec![0; 7];
-        let n = a.read_at(&mut bs, segment_id, 4).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 4, &crate::vfs::Dummy)
+            .expect("should read");
         assert_eq!(7, n.1);
         assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[..]);
 
         // Test reading beyond segment's current size
         let mut bs = vec![0; 15];
-        let r = a.read_at(&mut bs, segment_id, 4097).unwrap();
+        let r = a
+            .read_at(&mut bs, segment_id, 4097, &crate::vfs::Dummy)
+            .unwrap();
         assert_eq!(r, (0, 0));
         assert_eq!(bs, vec![0; 15]);
 
         // Test appending another buffer
-        let r = a.append(&[11, 12, 13, 14]);
+        let r = a.append(&[11, 12, 13, 14], &crate::vfs::Dummy);
         assert!(r.is_ok());
         assert_eq!(4, r.unwrap().2);
 
@@ -340,7 +348,9 @@ mod tests {
 
         // Test reading from segment after appending
         let mut bs = vec![0; 4];
-        let n = a.read_at(&mut bs, segment_id, 11).expect("should read");
+        let n = a
+            .read_at(&mut bs, segment_id, 11, &crate::vfs::Dummy)
+            .expect("should read");
         assert_eq!(4, n.1);
         assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[..]);
 
@@ -355,19 +365,19 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
         let data2 = vec![2; 2 * 1024];
 
         // Append the first data slice to the aol
-        let r1 = a.append(&data1);
+        let r1 = a.append(&data1, &crate::vfs::Dummy);
         assert!(r1.is_ok());
         assert_eq!(31 * 1024, r1.unwrap().2);
 
         // Append the second data slice to the aol
-        let r2 = a.append(&data2);
+        let r2 = a.append(&data2, &crate::vfs::Dummy);
         assert!(r2.is_ok());
         assert_eq!(2 * 1024, r2.unwrap().2);
 
@@ -376,7 +386,7 @@ mod tests {
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a
-            .read_at(&mut read_data1, segment_id, 0)
+            .read_at(&mut read_data1, segment_id, 0, &crate::vfs::Dummy)
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
@@ -384,7 +394,7 @@ mod tests {
         // Read the second data slice back from the aol
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a
-            .read_at(&mut read_data2, segment_id, 31 * 1024)
+            .read_at(&mut read_data2, segment_id, 31 * 1024, &crate::vfs::Dummy)
             .expect("should read");
         assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
@@ -400,7 +410,7 @@ mod tests {
 
         // Create aol options and open a aol file
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Create two slices of bytes of different sizes
         let data1 = vec![1; 31 * 1024];
@@ -409,12 +419,12 @@ mod tests {
         let data4 = vec![4; 1024];
 
         // Append the first data slice to the aol
-        let r1 = a.append(&data1);
+        let r1 = a.append(&data1, &crate::vfs::Dummy);
         assert!(r1.is_ok());
         assert_eq!(31 * 1024, r1.unwrap().2);
 
         // Append the second data slice to the aol
-        let r2 = a.append(&data2);
+        let r2 = a.append(&data2, &crate::vfs::Dummy);
         assert!(r2.is_ok());
         assert_eq!(2 * 1024, r2.unwrap().2);
 
@@ -422,18 +432,18 @@ mod tests {
         let mut read_data1 = vec![0; 31 * 1024];
         let (segment_id, _) = get_writer_state(&a);
         let n1 = a
-            .read_at(&mut read_data1, segment_id, 0)
+            .read_at(&mut read_data1, segment_id, 0, &crate::vfs::Dummy)
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
 
         // Append the third data slice to the aol
-        let r3 = a.append(&data4);
+        let r3 = a.append(&data4, &crate::vfs::Dummy);
         assert!(r3.is_ok());
         assert_eq!(1024, r3.unwrap().2);
 
         // Append the third data slice to the aol
-        let r4 = a.append(&data3);
+        let r4 = a.append(&data3, &crate::vfs::Dummy);
         assert!(r4.is_ok());
         assert_eq!(1024, r4.unwrap().2);
 
@@ -442,7 +452,7 @@ mod tests {
         // Read the first data slice back from the aol
         let mut read_data1 = vec![0; 31 * 1024];
         let n1 = a
-            .read_at(&mut read_data1, segment_id, 0)
+            .read_at(&mut read_data1, segment_id, 0, &crate::vfs::Dummy)
             .expect("should read");
         assert_eq!(31 * 1024, n1.1);
         assert_eq!(data1, read_data1);
@@ -450,7 +460,7 @@ mod tests {
         // Read the second data slice back from the aol
         let mut read_data2 = vec![0; 2 * 1024];
         let n2 = a
-            .read_at(&mut read_data2, segment_id, 31 * 1024)
+            .read_at(&mut read_data2, segment_id, 31 * 1024, &crate::vfs::Dummy)
             .expect("should read");
         assert_eq!(2 * 1024, n2.1);
         assert_eq!(data2, read_data2);
@@ -469,17 +479,17 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let large_record = vec![1; 1025];
         let small_record = vec![1; 1024];
-        let r = a.append(&small_record);
+        let r = a.append(&small_record, &crate::vfs::Dummy);
         assert!(r.is_ok());
         let (segment_id, offset) = get_writer_state(&a);
         assert_eq!(0, segment_id);
         assert_eq!(1024, offset);
 
-        let r = a.append(&large_record);
+        let r = a.append(&large_record, &crate::vfs::Dummy);
         assert!(r.is_err());
         let (segment_id, offset) = get_writer_state(&a);
         assert_eq!(0, segment_id);
@@ -496,10 +506,10 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let small_record = vec![1; 1024];
-        let r = a.append(&small_record);
+        let r = a.append(&small_record, &crate::vfs::Dummy);
         assert!(r.is_ok());
         let (segment_id, offset) = get_writer_state(&a);
         assert_eq!(1024, offset);
@@ -508,12 +518,12 @@ mod tests {
         a.set_fsync_failed(true);
 
         // Writes should fail aftet fsync failure
-        let r = a.append(&small_record);
+        let r = a.append(&small_record, &crate::vfs::Dummy);
         assert!(r.is_err());
 
         // Reads should fail after fsync failure
         let mut read_data = vec![0; 1024];
-        let r = a.read_at(&mut read_data, segment_id, 0);
+        let r = a.read_at(&mut read_data, segment_id, 0, &crate::vfs::Dummy);
         assert!(r.is_err());
     }
 
@@ -527,11 +537,11 @@ mod tests {
             max_file_size: 1024,
             ..Default::default()
         };
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         let large_record = vec![1; 1024];
         let small_record = vec![1; 512];
-        let r = a.append(&large_record);
+        let r = a.append(&large_record, &crate::vfs::Dummy);
         assert!(r.is_ok());
         let (segment_id, offset) = get_writer_state(&a);
         assert_eq!(0, segment_id);
@@ -541,10 +551,10 @@ mod tests {
 
         a.close().expect("should close");
 
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
         assert_eq!(0, get_writer_state(&a).0);
 
-        let r = a.append(&small_record);
+        let r = a.append(&small_record, &crate::vfs::Dummy);
         assert!(r.is_ok());
         let (segment_id, offset) = get_writer_state(&a);
         assert_eq!(1, segment_id);
@@ -562,11 +572,11 @@ mod tests {
             max_file_size: 1024, // Small enough to ensure the second append creates a new file
             ..Default::default()
         };
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append a record that fits within the first file
         let first_record = vec![1; 512];
-        a.append(&first_record)
+        a.append(&first_record, &crate::vfs::Dummy)
             .expect("first append should succeed");
         let (first_segment_id, first_offset) = get_writer_state(&a);
         assert_eq!(0, first_segment_id);
@@ -574,7 +584,7 @@ mod tests {
 
         // Append another record that causes a new file (segment) to be created
         let second_record = vec![2; 1024]; // This will exceed the max_file_size
-        a.append(&second_record)
+        a.append(&second_record, &crate::vfs::Dummy)
             .expect("second append should succeed");
         let (second_segment_id, second_offset) = get_writer_state(&a);
         assert_eq!(1, second_segment_id); // Expecting a new segment/file
@@ -582,13 +592,13 @@ mod tests {
 
         // Read back the first record using its segment ID and offset
         let mut read_buf = vec![0; 512];
-        a.read_at(&mut read_buf, first_segment_id, 0) // Start at offset 0 of the first segment
+        a.read_at(&mut read_buf, first_segment_id, 0, &crate::vfs::Dummy) // Start at offset 0 of the first segment
             .expect("failed to read first record");
         assert_eq!(first_record, read_buf, "First record data mismatch");
 
         // Read back the second record using its segment ID and offset
         let mut read_buf = vec![0; 1024];
-        a.read_at(&mut read_buf, second_segment_id, 0) // Start at offset 0 of the second segment
+        a.read_at(&mut read_buf, second_segment_id, 0, &crate::vfs::Dummy) // Start at offset 0 of the second segment
             .expect("failed to read second record");
         assert_eq!(second_record, read_buf, "Second record data mismatch");
     }
@@ -598,15 +608,16 @@ mod tests {
         // Setup: Create a temporary directory and initialize the log with default options
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append a single record to ensure there is some data in the log
         let record = vec![1; 512];
-        a.append(&record).expect("append should succeed");
+        a.append(&record, &crate::vfs::Dummy)
+            .expect("append should succeed");
 
         // Attempt to read beyond the current offset
         let mut read_buf = vec![0; 1024]; // Buffer size is larger than the appended record
-        let result = a.read_at(&mut read_buf, 0, 1024); // Attempt to read at an offset beyond the single appended record
+        let result = a.read_at(&mut read_buf, 0, 1024, &crate::vfs::Dummy); // Attempt to read at an offset beyond the single appended record
 
         // Verify: The read operation should fail or return an error indicating the offset is out of bounds
         assert_eq!(result.unwrap(), (0, 0));
@@ -622,23 +633,26 @@ mod tests {
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-            a.append(&record).expect("append should succeed");
+            let a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record
         {
-            let a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
-            a.append(&record)
+            let a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should reopen aol");
+            a.append(&record, &crate::vfs::Dummy)
                 .expect("append after reopen should succeed");
 
             // Verify: Ensure the log contains both records by reading them back
             let mut read_buf = vec![0; 512];
-            a.read_at(&mut read_buf, 0, 0)
+            a.read_at(&mut read_buf, 0, 0, &crate::vfs::Dummy)
                 .expect("failed to read first record after reopen");
             assert_eq!(record, read_buf, "First record data mismatch after reopen");
 
-            a.read_at(&mut read_buf, 0, 512)
+            a.read_at(&mut read_buf, 0, 512, &crate::vfs::Dummy)
                 .expect("failed to read second record after reopen");
             assert_eq!(record, read_buf, "Second record data mismatch after reopen");
         }
@@ -656,35 +670,40 @@ mod tests {
 
         // Step 1: Open the log, append a record, and then close it
         {
-            let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
-            a.append(&record).expect("first append should succeed");
-            a.append(&record).expect("first append should succeed");
+            let a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("first append should succeed");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("first append should succeed");
         } // Log is closed here as `a` goes out of scope
 
         // Step 2: Reopen the log and append another record, which should create a new file
         {
-            let a = Aol::open(temp_dir.path(), &opts).expect("should reopen aol");
+            let a =
+                Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should reopen aol");
 
             // Verify: Ensure the first record is in a new file by reading it back
             let mut read_buf = vec![0; 512];
             // The first record should be at the start of the first file (segment), hence segment_id = 1 and offset = 0.
-            a.read_at(&mut read_buf, 0, 0)
+            a.read_at(&mut read_buf, 0, 0, &crate::vfs::Dummy)
                 .expect("failed to read first record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in first file");
 
             // Verify: Ensure the second record is in a new file by reading it back
             let mut read_buf = vec![0; 512];
             // The second record should be at the start of the second file (segment), hence segment_id = 1 and offset = 0.
-            a.read_at(&mut read_buf, 1, 0)
+            a.read_at(&mut read_buf, 1, 0, &crate::vfs::Dummy)
                 .expect("failed to read second record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in second file");
 
-            a.append(&record).expect("first append should succeed");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("first append should succeed");
             // Verify: Ensure the third record is in a new file by reading it back
 
             let mut read_buf = vec![0; 512];
             // The third record should be at the start of the third file (segment), hence segment_id = 1 and offset = 0.
-            a.read_at(&mut read_buf, 2, 0)
+            a.read_at(&mut read_buf, 2, 0, &crate::vfs::Dummy)
                 .expect("failed to read third record from new file");
             assert_eq!(record, read_buf, "Record data mismatch in third file");
         }
@@ -695,12 +714,13 @@ mod tests {
     fn sequential_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
         for _ in 0..1000 {
-            a.append(&record).expect("append should succeed");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("append should succeed");
         }
 
         let start_time = std::time::Instant::now();
@@ -708,13 +728,13 @@ mod tests {
         // Sequentially read all records
         let mut read_buf = vec![0; 512];
         for offset in (0..512000).step_by(512) {
-            a.read_at(&mut read_buf, 0, offset as u64)
+            a.read_at(&mut read_buf, 0, offset as u64, &crate::vfs::Dummy)
                 .expect("failed to read record");
         }
 
         let duration = start_time.elapsed();
 
-        println!("Sequential read of 1000 records took: {:?}", duration);
+        println!("Sequential read of 1000 records took: {duration:?}");
     }
 
     // TODO: add to benchmarks
@@ -722,12 +742,13 @@ mod tests {
     fn random_access_read_performance() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let a = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 1000 records to ensure we have enough data
         let record = vec![1; 512]; // Each record is 512 bytes
         for _ in 0..1000 {
-            a.append(&record).expect("append should succeed");
+            a.append(&record, &crate::vfs::Dummy)
+                .expect("append should succeed");
         }
 
         // Generate a list of random offsets within the range of the data written
@@ -742,29 +763,29 @@ mod tests {
         // Randomly read records based on the generated offsets
         let mut read_buf = vec![0; 512];
         for offset in offsets {
-            a.read_at(&mut read_buf, 0, offset)
+            a.read_at(&mut read_buf, 0, offset, &crate::vfs::Dummy)
                 .expect("failed to read record");
         }
 
         let duration = start_time.elapsed();
 
-        println!("Random access read of 1000 records took: {:?}", duration);
+        println!("Random access read of 1000 records took: {duration:?}");
     }
 
     #[test]
     fn test_rotate_functionality() {
         let temp_dir = create_temp_directory();
         let opts = Options::default();
-        let aol = Aol::open(temp_dir.path(), &opts).expect("should create aol");
+        let aol = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Ensure there's data in the current segment to necessitate a rotation
-        aol.append(b"data 1").unwrap();
+        aol.append(b"data 1", &crate::vfs::Dummy).unwrap();
 
         // Capture the current active_segment_id before rotation
         let current_segment_id = get_writer_state(&aol).0;
 
         // Perform the rotation
-        aol.rotate().unwrap();
+        aol.rotate(&crate::vfs::Dummy).unwrap();
 
         // Verify the active_segment_id is incremented
         assert_eq!(
@@ -775,7 +796,7 @@ mod tests {
 
         // Append new data to the new segment
         let data_to_append = b"data 2";
-        let (_, record_offset_start, _) = aol.append(data_to_append).unwrap();
+        let (_, record_offset_start, _) = aol.append(data_to_append, &crate::vfs::Dummy).unwrap();
 
         // Use the offset method to verify the append operation is in the new segment
         let (segment_id, current_offset) = get_writer_state(&aol);
@@ -786,8 +807,13 @@ mod tests {
 
         // Use read_at to verify the data integrity
         let mut read_data = vec![0u8; data_to_append.len()];
-        aol.read_at(&mut read_data, segment_id, record_offset_start)
-            .unwrap();
+        aol.read_at(
+            &mut read_data,
+            segment_id,
+            record_offset_start,
+            &crate::vfs::Dummy,
+        )
+        .unwrap();
         assert_eq!(
             read_data, data_to_append,
             "Data read from the new segment should match the data appended"
@@ -876,6 +902,7 @@ mod tests {
         // are running concurrently.
         #[ignore]
         #[test]
+        #[cfg(target_family = "unix")]
         fn test_no_fd_leaks() {
             let initial_fds = count_open_fds().unwrap();
 
@@ -884,12 +911,12 @@ mod tests {
                 let dir = create_temp_directory();
                 let opts = Options::default();
 
-                let aol = Aol::open(dir.path(), &opts).unwrap();
+                let aol = Aol::open(dir.path(), &opts, &crate::vfs::Dummy).unwrap();
                 let data = b"test data";
-                aol.append(data).unwrap();
+                aol.append(data, &crate::vfs::Dummy).unwrap();
 
                 let mut buf = vec![0u8; data.len()];
-                aol.read_at(&mut buf, 0, 0).unwrap();
+                aol.read_at(&mut buf, 0, 0, &crate::vfs::Dummy).unwrap();
                 aol.sync().unwrap();
             }
 
@@ -910,16 +937,16 @@ mod tests {
                     ..Default::default()
                 };
 
-                let aol = Aol::open(dir.path(), &opts).unwrap();
+                let aol = Aol::open(dir.path(), &opts, &crate::vfs::Dummy).unwrap();
 
                 for i in 0..10 {
                     let data = vec![i as u8; 50];
-                    aol.append(&data).unwrap();
+                    aol.append(&data, &crate::vfs::Dummy).unwrap();
                 }
 
                 let mut buf = vec![0u8; 50];
-                aol.read_at(&mut buf, 0, 0).unwrap();
-                aol.read_at(&mut buf, 1, 0).unwrap();
+                aol.read_at(&mut buf, 0, 0, &crate::vfs::Dummy).unwrap();
+                aol.read_at(&mut buf, 1, 0, &crate::vfs::Dummy).unwrap();
                 aol.sync().unwrap();
             }
 
@@ -940,9 +967,9 @@ mod tests {
                     ..Default::default()
                 };
 
-                let aol = Aol::open(dir.path(), &opts).unwrap();
+                let aol = Aol::open(dir.path(), &opts, &crate::vfs::Dummy).unwrap();
                 let data = vec![1u8; 100];
-                let (segment_id, offset, _) = aol.append(&data).unwrap();
+                let (segment_id, offset, _) = aol.append(&data, &crate::vfs::Dummy).unwrap();
 
                 let aol = Arc::new(aol);
                 let mut handles = vec![];
@@ -952,7 +979,9 @@ mod tests {
                     handles.push(std::thread::spawn(move || {
                         let mut buf = vec![0u8; 100];
                         for _ in 0..10 {
-                            aol_clone.read_at(&mut buf, segment_id, offset).unwrap();
+                            aol_clone
+                                .read_at(&mut buf, segment_id, offset, &crate::vfs::Dummy)
+                                .unwrap();
                         }
                     }));
                 }
@@ -979,11 +1008,11 @@ mod tests {
                     ..Default::default()
                 };
 
-                let aol = Aol::open(dir.path(), &opts).unwrap();
+                let aol = Aol::open(dir.path(), &opts, &crate::vfs::Dummy).unwrap();
 
                 for i in 0..5 {
                     let data = vec![i as u8; 50];
-                    aol.append(&data).unwrap();
+                    aol.append(&data, &crate::vfs::Dummy).unwrap();
                 }
 
                 let aol = Arc::new(aol);
@@ -994,7 +1023,9 @@ mod tests {
                     handles.push(std::thread::spawn(move || {
                         let mut buf = vec![0u8; 50];
                         for _ in 0..100 {
-                            aol_clone.read_at(&mut buf, segment_id, 0).unwrap();
+                            aol_clone
+                                .read_at(&mut buf, segment_id, 0, &crate::vfs::Dummy)
+                                .unwrap();
                         }
                     }));
                 }
@@ -1021,17 +1052,17 @@ mod tests {
                     ..Default::default()
                 };
 
-                let aol = Aol::open(dir.path(), &opts).unwrap();
+                let aol = Aol::open(dir.path(), &opts, &crate::vfs::Dummy).unwrap();
 
                 let large_data = vec![0u8; 200];
-                let _ = aol.append(&large_data); // Expected to fail
+                let _ = aol.append(&large_data, &crate::vfs::Dummy); // Expected to fail
 
                 let mut buf = vec![0u8; 10];
-                let _ = aol.read_at(&mut buf, 999, 0); // Expected to fail
+                let _ = aol.read_at(&mut buf, 999, 0, &crate::vfs::Dummy); // Expected to fail
 
                 for _ in 0..5 {
                     let data = vec![0u8; 90];
-                    if aol.append(&data).is_err() {
+                    if aol.append(&data, &crate::vfs::Dummy).is_err() {
                         break;
                     }
                 }

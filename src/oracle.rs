@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::option::Options;
 use crate::snapshot::Snapshot;
 use crate::transaction::Transaction;
+use crate::vfs::FileSystem;
 
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
 /// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
@@ -33,7 +34,7 @@ impl Oracle {
 
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts<V: FileSystem>(&self, txn: &Transaction<V>) -> Result<u64> {
         self.isolation.new_commit_ts(txn)
     }
 
@@ -70,7 +71,7 @@ macro_rules! isolation_level_method {
 impl IsolationLevel {
     /// Generates a new commit timestamp for the given transaction.
     /// It delegates to the specific isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts<V: FileSystem>(&self, txn: &Transaction<V>) -> Result<u64> {
         isolation_level_method!(self, new_commit_ts, txn)
     }
 
@@ -116,7 +117,7 @@ impl SnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts<V: FileSystem>(&self, txn: &Transaction<V>) -> Result<u64> {
         let current_snapshot = Snapshot::take(&txn.core)?;
 
         // Check write conflicts
@@ -200,7 +201,7 @@ impl SerializableSnapshotIsolation {
     /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
     /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
     /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
+    pub(crate) fn new_commit_ts<V: FileSystem>(&self, txn: &Transaction<V>) -> Result<u64> {
         let current_snapshot = Snapshot::take(&txn.core)?;
 
         // Check read conflicts

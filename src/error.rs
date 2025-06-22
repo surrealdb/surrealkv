@@ -54,7 +54,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Abort => write!(f, "Operation aborted"),
-            Error::IoError(err) => write!(f, "IO error: {}", err),
+            Error::IoError(err) => write!(f, "IO error: {err}"),
             Error::EmptyKey => write!(f, "Empty key"),
             Error::TransactionClosed => {
                 write!(f, "This transaction has been closed")
@@ -62,7 +62,7 @@ impl fmt::Display for Error {
             Error::NonExpirable => write!(f, "This entry cannot be expired"),
             Error::CorruptedMetadata => write!(f, "Corrupted metadata"),
             Error::TransactionReadOnly => write!(f, "This transaction is read-only"),
-            Error::IndexError(trie_error) => write!(f, "Index error: {}", trie_error),
+            Error::IndexError(trie_error) => write!(f, "Index error: {trie_error}"),
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::CorruptedIndex => write!(f, "Corrupted index"),
             Error::TransactionReadConflict => write!(f, "Transaction read conflict"),
@@ -70,28 +70,27 @@ impl fmt::Display for Error {
             Error::StoreClosed => write!(f, "Store closed"),
             Error::InvalidAttributeData => write!(f, "Invalid attribute data"),
             Error::UnknownAttributeType => write!(f, "Unknown attribute type"),
-            Error::LogError(log_error) => write!(f, "Log error: {}", log_error),
+            Error::LogError(log_error) => write!(f, "Log error: {log_error}"),
             Error::CorruptedTransactionRecord(msg) => {
-                write!(f, "Corrupted transaction record: {}", msg)
+                write!(f, "Corrupted transaction record: {msg}")
             }
             Error::CorruptedTransactionHeader(msg) => {
-                write!(f, "Corrupted transaction header: {}", msg)
+                write!(f, "Corrupted transaction header: {msg}")
             }
             Error::InvalidTransactionRecordId => write!(f, "Invalid transaction record ID"),
             Error::EmptyValue => write!(f, "Empty value in the record"),
             Error::ManifestNotFound => write!(f, "Manifest not found"),
             Error::TransactionWriteOnly => write!(f, "Transaction is write-only"),
-            Error::SendError(err) => write!(f, "Send error: {}", err),
-            Error::ReceiveError(err) => write!(f, "Receive error: {}", err),
+            Error::SendError(err) => write!(f, "Send error: {err}"),
+            Error::ReceiveError(err) => write!(f, "Receive error: {err}"),
             Error::MismatchedSegmentID(expected, found) => write!(
                 f,
-                "Mismatched segment ID: expected={}, found={}",
-                expected, found
+                "Mismatched segment ID: expected={expected}, found={found}"
             ),
             Error::CompactionAlreadyInProgress => write!(f, "Compaction is in progress"),
-            Error::RevisionError(err) => write!(f, "Revision error: {}", err),
+            Error::RevisionError(err) => write!(f, "Revision error: {err}"),
             Error::MergeManifestMissing => write!(f, "Merge manifest is missing"),
-            Error::CustomError(err) => write!(f, "Error: {}", err),
+            Error::CustomError(err) => write!(f, "Error: {err}"),
             Error::InvalidOperation => write!(f, "Invalid operation"),
             Error::CompactionSegmentSizeTooSmall => {
                 write!(
@@ -112,17 +111,12 @@ impl fmt::Display for Error {
                 write!(f, "Maximum KV metadata length exceeded")
             }
             Error::ChecksumMismatch(expected, found) => {
-                write!(
-                    f,
-                    "Checksum mismatch: expected={}, found={}",
-                    expected, found
-                )
+                write!(f, "Checksum mismatch: expected={expected}, found={found}")
             }
             Error::SnapshotVersionIsOld(expected, found) => {
                 write!(
                     f,
-                    "Snapshot version is old: read_ts={}, index={}",
-                    expected, found
+                    "Snapshot version is old: read_ts={expected}, index={found}"
                 )
             }
         }
