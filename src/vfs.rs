@@ -16,6 +16,8 @@ pub trait FileSystem: Send + Sync + 'static {
     fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<u64>;
     fn set_permissions<P: AsRef<Path>>(&self, path: P, perm: Permissions) -> io::Result<()>;
     fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<File>;
+    fn read_to_string<P: AsRef<Path>>(&self, path: P) -> io::Result<String>;
+
     fn copy_dir_all(&self, src: &Path, dst: &Path) -> io::Result<()> {
         if !dst.exists() {
             self.create_dir_all(dst)?;
@@ -64,5 +66,8 @@ impl FileSystem for Dummy {
     }
     fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         std::fs::File::create(path)
+    }
+    fn read_to_string<P: AsRef<Path>>(&self, path: P) -> io::Result<String> {
+        std::fs::read_to_string(path)
     }
 }

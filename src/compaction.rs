@@ -413,7 +413,6 @@ mod tests {
     use rand::prelude::SliceRandom;
     use rand::{distributions::Alphanumeric, Rng};
     use std::collections::HashSet;
-    use std::fs::read_to_string;
 
     use crate::option::Options;
     use crate::store::Store;
@@ -460,7 +459,7 @@ mod tests {
         RecoveryState::ClogDeleted
             .save(temp_dir, &crate::vfs::Dummy)
             .unwrap();
-        let contents = read_to_string(&path).unwrap();
+        let contents = crate::vfs::Dummy.read_to_string(&path).unwrap();
         assert_eq!(contents, "ClogDeleted");
 
         // Final clear to clean up

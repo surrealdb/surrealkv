@@ -240,8 +240,6 @@ pub fn restore_repair_files<V: FileSystem>(directory: &str, vfs: &V) -> std::io:
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::fs::OpenOptions;
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
@@ -255,6 +253,8 @@ mod tests {
     use crate::option::Options;
     use crate::store::Store;
     use crate::transaction::Durability;
+    use crate::vfs::File;
+    use crate::vfs::OpenOptions;
 
     use bytes::Bytes;
     use tempdir::TempDir;

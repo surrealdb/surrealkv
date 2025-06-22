@@ -1072,13 +1072,14 @@ impl Read for MultiSegmentReader {
 mod tests {
     use super::*;
     use parking_lot::RwLock;
-    use std::fs::File;
-    use std::fs::OpenOptions;
     use std::io::Cursor;
     use std::io::Seek;
     use std::io::Write;
     use std::sync::Arc;
     use tempdir::TempDir;
+
+    use crate::vfs::File;
+    use crate::vfs::OpenOptions;
 
     #[test]
     fn new_empty() {
