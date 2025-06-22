@@ -64,8 +64,9 @@ impl Analyzer {
         F: FnMut(&Record) -> Result<()>,
     {
         let clog_subdir = self.db_path.join("clog");
-        let sr = SegmentRef::read_segments_from_directory(clog_subdir.as_path())
-            .expect("should read segments");
+        let sr =
+            SegmentRef::read_segments_from_directory(clog_subdir.as_path(), &surrealkv::vfs::Dummy)
+                .expect("should read segments");
 
         let reader = MultiSegmentReader::new(sr)?;
         let reader = Reader::new_from(reader);
@@ -188,7 +189,8 @@ impl Analyzer {
 
         // Open the commit log
         let destination_commit_log =
-            Aol::open(&destination_clog_subdir, &copts).map_err(Error::from)?;
+            Aol::open(&destination_clog_subdir, &copts, &surrealkv::vfs::Dummy)
+                .map_err(Error::from)?;
 
         // Write latest versions to new location
         let mut total_written = 0;
@@ -431,7 +433,10 @@ impl Analyzer {
 
         pb.set_message("Repairing commit log...");
 
-        restore_repair_files(clog_subdir.as_path().to_str().unwrap())?;
+        restore_repair_files(
+            clog_subdir.as_path().to_str().unwrap(),
+            &surrealkv::vfs::Dummy,
+        )?;
 
         pb.finish_with_message(format!(
             "Successfully repaired commit log at {}",

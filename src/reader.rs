@@ -292,8 +292,7 @@ mod tests {
             max_file_size: 4,
             ..Options::default()
         };
-        let mut a =
-            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Test initial offset
         let sz = get_writer_state(&a);
@@ -350,8 +349,7 @@ mod tests {
             ..Options::default()
         };
 
-        let mut a =
-            Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
+        let a = Aol::open(temp_dir.path(), &opts, &crate::vfs::Dummy).expect("should create aol");
 
         // Append 10 records
         for i in 0..num_items {
