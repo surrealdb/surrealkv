@@ -271,33 +271,44 @@ impl CommitPipeline {
         //         .unwrap()
         // });
 
-        let apply_handle = tokio::spawn(async move {
-            env.apply(&apply_batch.batch, starting_seq_num)
-            // // Run apply in blocking context since it might be CPU intensive
-            // tokio::task::spawn_blocking(move || env.apply(&batch_clone.batch))
-            //     .await
-            //     .unwrap()
-        });
-
-        // Wait for apply to complete
-        match apply_handle.await {
-            Ok(res) => match res {
-                Ok(_) => {
-                    commit_batch.mark_applied();
-                }
-                Err(e) => {
-                    let err = Error::CommitFail(e.to_string());
-                    commit_batch.complete(Err(err.clone())).await;
-                    return Err(err);
-                }
-            },
-            Err(_) => {
+        match env.apply(&apply_batch.batch, starting_seq_num) {
+            Ok(_) => {
                 commit_batch.mark_applied();
-                let err = Error::PipelineStall;
+            }
+            Err(e) => {
+                let err = Error::CommitFail(e.to_string());
                 commit_batch.complete(Err(err.clone())).await;
                 return Err(err);
             }
         }
+
+        // let apply_handle = tokio::spawn(async move {
+        //     env.apply(&apply_batch.batch, starting_seq_num)
+        //     // // Run apply in blocking context since it might be CPU intensive
+        //     // tokio::task::spawn_blocking(move || env.apply(&batch_clone.batch))
+        //     //     .await
+        //     //     .unwrap()
+        // });
+
+        // // Wait for apply to complete
+        // match apply_handle.await {
+        //     Ok(res) => match res {
+        //         Ok(_) => {
+        //             commit_batch.mark_applied();
+        //         }
+        //         Err(e) => {
+        //             let err = Error::CommitFail(e.to_string());
+        //             commit_batch.complete(Err(err.clone())).await;
+        //             return Err(err);
+        //         }
+        //     },
+        //     Err(_) => {
+        //         commit_batch.mark_applied();
+        //         let err = Error::PipelineStall;
+        //         commit_batch.complete(Err(err.clone())).await;
+        //         return Err(err);
+        //     }
+        // }
 
         // Phase 3: Publish
         self.publish_manager.add_batch(commit_batch).await;
