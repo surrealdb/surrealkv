@@ -13,6 +13,8 @@ use crate::{
     error::{Error, Result},
 };
 
+const MAX_CONCURRENT_COMMITS: usize = 7;
+
 // pub(super) static SKV_COMMIT_POOL: OnceLock<affinitypool::Threadpool> = OnceLock::new();
 
 // pub(super) fn commit_pool() -> &'static affinitypool::Threadpool {
@@ -163,7 +165,7 @@ impl PublishManager {
             // Wait for notification or timeout
             tokio::select! {
                 _ = self.notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
                     // Periodic check
                 }
             }
@@ -191,8 +193,6 @@ pub struct CommitPipeline {
     // Shutdown flag
     shutdown: AtomicBool,
 }
-
-const MAX_CONCURRENT_COMMITS: usize = 31;
 
 impl CommitPipeline {
     pub fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
