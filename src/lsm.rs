@@ -544,7 +544,7 @@ impl Core {
     /// 4. All directories are fsync'd to ensure durability
     pub async fn close(&self) -> Result<()> {
         // Step 1: Shutdown the commit pipeline to stop accepting new writes
-        self.commit_pipeline.shutdown().await;
+        self.commit_pipeline.shutdown();
 
         // Step 2: Wait for and stop all background tasks
         let task_manager = self.task_manager.lock().unwrap().take();

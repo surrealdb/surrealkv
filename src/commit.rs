@@ -1,32 +1,19 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
+// This commit pipeline is inspired by Pebble's commit pipeline.
+
+use std::sync::{
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
-use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 
 use crate::{
     batch::Batch,
     error::{Error, Result},
 };
 
-const MAX_CONCURRENT_COMMITS: usize = 7;
-
-// pub(super) static SKV_COMMIT_POOL: OnceLock<affinitypool::Threadpool> = OnceLock::new();
-
-// pub(super) fn commit_pool() -> &'static affinitypool::Threadpool {
-//     SKV_COMMIT_POOL.get_or_init(|| {
-//         affinitypool::Builder::new()
-//             .thread_name("surrealkv-commitpool")
-//             .thread_stack_size(5 * 1024 * 1024)
-//             .thread_per_core(true)
-//             .worker_threads(32)
-//             .build()
-//     })
-// }
+const MAX_CONCURRENT_COMMITS: usize = 16;
+const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
@@ -37,17 +24,12 @@ pub trait CommitEnv: Send + Sync + 'static {
     fn apply(&self, batch: &Batch, seq_num: u64) -> Result<()>;
 }
 
-// Represents a batch in the commit pipeline
+// Lock-free commit queue entry
 struct CommitBatch {
-    // The batch data
     batch: Batch,
-    // Assigned sequence number
     seq_num: AtomicU64,
-    // Whether batch has been applied
     applied: AtomicBool,
-    // Whether to sync WAL
     sync_wal: bool,
-    // Channel to notify completion - using Mutex for safe interior mutability
     complete_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
 }
 
@@ -80,140 +62,144 @@ impl CommitBatch {
         self.applied.load(Ordering::Acquire)
     }
 
-    async fn complete(&self, result: Result<()>) {
-        if let Some(tx) = self.complete_tx.lock().await.take() {
-            let _ = tx.send(result);
+    fn complete(&self, result: Result<()>) {
+        if let Ok(mut guard) = self.complete_tx.try_lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(result);
+            }
         }
     }
 }
 
-// Manages sequence number publishing with proper ordering
-struct PublishManager {
-    // Ordered queue of batches pending publication
-    pending: Mutex<std::collections::BTreeMap<u64, Arc<CommitBatch>>>,
-    // Notification for new work
-    notify: Notify,
-    // Current visible sequence number
-    visible_seq_num: Arc<AtomicU64>,
-    // Shutdown flag
-    shutdown: AtomicBool,
+// Lock-free single-producer, multi-consumer commit queue
+// Following Pebble's commitQueue design
+//
+// commitQueue is a lock-free fixed-size single-producer, multi-consumer
+// queue. The single producer can enqueue (push) to the head, and consumers can
+// dequeue (pop) from the tail.
+struct CommitQueue {
+    // Head and tail packed into single atomic
+    // head = index of next slot to fill (high 32 bits)
+    // tail = index of oldest data in queue (low 32 bits)
+    head_tail: AtomicU64,
+    slots: [AtomicPtr<CommitBatch>; MAX_CONCURRENT_COMMITS],
 }
 
-impl PublishManager {
-    fn new(visible_seq_num: Arc<AtomicU64>) -> Self {
+impl CommitQueue {
+    fn new() -> Self {
         Self {
-            pending: Mutex::new(std::collections::BTreeMap::new()),
-            notify: Notify::new(),
-            visible_seq_num,
-            shutdown: AtomicBool::new(false),
+            head_tail: AtomicU64::new(0),
+            slots: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
         }
     }
 
-    async fn add_batch(&self, batch: Arc<CommitBatch>) {
-        let seq_num = batch.get_seq_num();
-        self.pending.lock().await.insert(seq_num, batch);
-        self.notify.notify_one();
+    fn unpack(&self, ptrs: u64) -> (u32, u32) {
+        let head = (ptrs >> DEQUEUE_BITS) as u32;
+        let tail = ptrs as u32;
+        (head, tail)
     }
 
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.notify.notify_one();
+    fn pack(&self, head: u32, tail: u32) -> u64 {
+        ((head as u64) << DEQUEUE_BITS) | (tail as u64)
     }
 
-    async fn run(&self) {
+    // Single producer enqueue - following Pebble's approach exactly
+    fn enqueue(&self, batch: Arc<CommitBatch>) {
+        let ptrs = self.head_tail.load(Ordering::Acquire);
+        let (head, tail) = self.unpack(ptrs);
+
+        // Check if queue is full
+        if tail.wrapping_add(MAX_CONCURRENT_COMMITS as u32) == head {
+            // Queue is full. This should never be reached because the semaphore
+            // limits the number of concurrent operations.
+            panic!("commit queue overflow - should not be reached");
+        }
+
+        let slot_idx = (head & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
+        let slot = &self.slots[slot_idx];
+
+        // Check if the head slot has been released by dequeueApplied
+        while !slot.load(Ordering::Acquire).is_null() {
+            // Another thread is still cleaning up the tail, so the queue is
+            // actually still full.
+            std::hint::spin_loop();
+        }
+
+        // The head slot is free
+        let batch_ptr = Arc::into_raw(batch);
+        slot.store(batch_ptr as *mut CommitBatch, Ordering::Release);
+
+        // Increment head
+        self.head_tail
+            .fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
+    }
+
+    // Multi-consumer dequeue - removes the earliest enqueued Batch, if it is applied
+    fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
         loop {
-            // Try to publish as many sequential batches as possible
-            loop {
-                let next_batch = {
-                    let mut pending = self.pending.lock().await;
-                    let current_visible = self.visible_seq_num.load(Ordering::Acquire);
-                    let next_seq = if current_visible == 0 {
-                        1
-                    } else {
-                        current_visible + 1
-                    };
+            let ptrs = self.head_tail.load(Ordering::Acquire);
+            let (head, tail) = self.unpack(ptrs);
 
-                    // Check if we have the next batch and it's applied
-                    if let Some(batch) = pending.get(&next_seq) {
-                        if batch.is_applied() {
-                            pending.remove(&next_seq)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                if let Some(batch) = next_batch {
-                    let new_visible = batch.get_seq_num() + batch.batch.count() as u64 - 1;
-                    self.visible_seq_num.store(new_visible, Ordering::Release);
-
-                    batch.complete(Ok(())).await;
-                } else {
-                    break;
-                }
+            if tail == head {
+                // Queue is empty
+                return None;
             }
 
-            // Check for shutdown
-            if self.shutdown.load(Ordering::Acquire) {
-                let is_empty = self.pending.lock().await.is_empty();
-                if is_empty {
-                    break;
-                }
+            let slot_idx = (tail & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
+            let slot = &self.slots[slot_idx];
+            let batch_ptr = slot.load(Ordering::Acquire);
+
+            if batch_ptr.is_null() {
+                // The batch is not ready to be dequeued, or another thread has
+                // already dequeued it.
+                return None;
             }
 
-            // Wait for notification or timeout
-            tokio::select! {
-                _ = self.notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    // Periodic check
-                }
+            // Check if batch is applied (safely through raw pointer)
+            let is_applied = unsafe { (*batch_ptr).is_applied() };
+            if !is_applied {
+                return None;
             }
+
+            let new_ptrs = self.pack(head, tail.wrapping_add(1));
+            if self
+                .head_tail
+                .compare_exchange_weak(ptrs, new_ptrs, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                // We now own slot.
+                slot.store(std::ptr::null_mut(), Ordering::Release);
+
+                let batch = unsafe { Arc::from_raw(batch_ptr) };
+                return Some(batch);
+            }
+            // CAS failed, retry the whole loop
         }
     }
 }
 
-// The commit pipeline
 pub struct CommitPipeline {
-    // Environment for operations
     env: Arc<dyn CommitEnv>,
-    // Next sequence number
     log_seq_num: AtomicU64,
-    // Visible sequence number
     visible_seq_num: Arc<AtomicU64>,
-    // Write mutex for serializing WAL writes
-    write_mutex: Arc<Mutex<()>>,
-    // Publish manager
-    publish_manager: Arc<PublishManager>,
-    // Publish manager task handle
-    publish_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    // Semaphores for concurrency control
+    // Single producer - only one thread can write to WAL at a time
+    write_mutex: Mutex<()>,
+    // Lock-free single-producer, multi-consumer commit queue
+    pending: CommitQueue,
+    // Semaphore for flow control
     commit_sem: Arc<Semaphore>,
-    sync_sem: Arc<Semaphore>,
-    // Shutdown flag
     shutdown: AtomicBool,
 }
 
 impl CommitPipeline {
     pub fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
-        let visible_seq_num = Arc::new(AtomicU64::new(0));
-        let publish_manager = Arc::new(PublishManager::new(visible_seq_num.clone()));
-
-        // Start the publish manager task
-        let manager = publish_manager.clone();
-        let publish_task = tokio::spawn(async move {
-            manager.run().await;
-        });
-
         Arc::new(Self {
             env,
             log_seq_num: AtomicU64::new(1),
-            visible_seq_num,
-            write_mutex: Arc::new(Mutex::new(())),
-            publish_manager,
-            publish_task: Mutex::new(Some(publish_task)),
-            commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS)),
-            sync_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS)),
+            visible_seq_num: Arc::new(AtomicU64::new(0)),
+            write_mutex: Mutex::new(()),
+            pending: CommitQueue::new(),
+            commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -221,7 +207,7 @@ impl CommitPipeline {
     pub fn set_seq_num(&self, seq_num: u64) {
         if seq_num > 0 {
             self.visible_seq_num.store(seq_num, Ordering::Release);
-            self.log_seq_num.store(seq_num, Ordering::Release);
+            self.log_seq_num.store(seq_num + 1, Ordering::Release);
         }
     }
 
@@ -234,137 +220,121 @@ impl CommitPipeline {
             return Ok(());
         }
 
-        // Acquire permits
-        let _commit_permit = self
+        // Acquire permit for flow control
+        let _permit = self
             .commit_sem
             .acquire()
             .await
             .map_err(|_| Error::PipelineStall)?;
 
-        let _sync_permit = if sync_wal {
-            Some(
-                self.sync_sem
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::PipelineStall)?,
-            )
-        } else {
-            None
-        };
-
-        // Create commit batch
         let (commit_batch, complete_rx) = CommitBatch::new(batch, sync_wal);
 
-        // Phase 1: Prepare (assign sequence number and write to WAL)
-        let starting_seq_num = self.prepare(commit_batch.clone()).await?;
+        // Phase 1: Prepare (single producer)
+        let seq_num = self.prepare(commit_batch.clone())?;
 
-        // Phase 2: Apply to memtable (concurrent)
-        let env = self.env.clone();
-        let apply_batch = commit_batch.clone();
+        // Phase 2: Apply concurrently
+        let apply_result = {
+            let env = self.env.clone();
+            let batch_ref = &commit_batch.batch;
+            env.apply(batch_ref, seq_num)
+        };
 
-        // let apply_handle = commit_pool().spawn(move || env.apply(&batch_clone.batch));
-
-        // let apply_handle = tokio::spawn(async move {
-        //     // Run apply in blocking context since it might be CPU intensive
-        //     tokio::task::spawn_blocking(move || env.apply(&batch_clone.batch))
-        //         .await
-        //         .unwrap()
-        // });
-
-        let apply_handle = tokio::spawn(async move {
-            env.apply(&apply_batch.batch, starting_seq_num)
-            // // Run apply in blocking context since it might be CPU intensive
-            // tokio::task::spawn_blocking(move || env.apply(&batch_clone.batch))
-            //     .await
-            //     .unwrap()
-        });
-
-        // Wait for apply to complete
-        match apply_handle.await {
-            Ok(res) => match res {
-                Ok(_) => {
-                    commit_batch.mark_applied();
-                }
-                Err(e) => {
-                    let err = Error::CommitFail(e.to_string());
-                    commit_batch.complete(Err(err.clone())).await;
-                    return Err(err);
-                }
-            },
-            Err(_) => {
+        match apply_result {
+            Ok(_) => {
                 commit_batch.mark_applied();
-                let err = Error::PipelineStall;
-                commit_batch.complete(Err(err.clone())).await;
+                // Phase 3: Publish (multi-consumer)
+                self.publish();
+            }
+            Err(e) => {
+                let err = Error::CommitFail(e.to_string());
+                commit_batch.complete(Err(err.clone()));
                 return Err(err);
             }
         }
-
-        // Phase 3: Publish
-        self.publish_manager.add_batch(commit_batch).await;
 
         // Wait for completion
         complete_rx.await.map_err(|_| Error::PipelineStall)?
     }
 
-    async fn prepare(&self, commit_batch: Arc<CommitBatch>) -> Result<u64> {
-        // Serialize WAL writes
-        let _guard = self.write_mutex.lock().await;
+    fn prepare(&self, commit_batch: Arc<CommitBatch>) -> Result<u64> {
+        let _guard = self.write_mutex.lock().unwrap();
 
-        // Assign sequence number
+        // Assign sequence number atomically
         let count = commit_batch.batch.count() as u64;
-
         let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-
-        // println!("Assigned seq_num {} to batch (count={})", seq_num, count);
-
         commit_batch.set_seq_num(seq_num);
 
-        // Write to WAL in blocking context
-        let env = self.env.clone();
-        let sync_wal = commit_batch.sync_wal;
+        // Enqueue in pending queue (single producer operation)
+        self.pending.enqueue(commit_batch.clone());
 
-        // commit_pool().spawn(move || env.write(&batch_for_wal, sync_wal)).await
+        // Write to WAL (must be serialized)
+        self.env
+            .write(&commit_batch.batch, seq_num, commit_batch.sync_wal)?;
 
-        // tokio::task::spawn_blocking(move || env.write(&batch_for_wal, sync_wal))
-        //     .await
-        //     .map_err(|_| Error::PipelineStall)?
-
-        env.write(&commit_batch.batch, seq_num, sync_wal)?;
-        // let _ = tokio::spawn(async move { env.write(&commit_batch.batch, seq_num, sync_wal) })
-        //     .await
-        //     .map_err(|_| Error::PipelineStall)?;
-        // tokio::task::spawn(move || env.write(&batch_for_wal, sync_wal))
-        //     .await
-        //     .map_err(|_| Error::PipelineStall)?
         Ok(seq_num)
     }
 
-    pub async fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        // Shutdown publish manager
-        self.publish_manager.shutdown();
+    fn publish(&self) {
+        // Multi-consumer publish loop
+        loop {
+            let dequeued = self.pending.dequeue_applied();
 
-        // Wait for publish task to complete
-        if let Some(task) = self.publish_task.lock().await.take() {
-            let _ = task.await;
+            match dequeued {
+                Some(batch) => {
+                    // Publish this batch's sequence number
+                    let new_visible = batch.get_seq_num() + batch.batch.count() as u64 - 1;
+
+                    loop {
+                        let current = self.visible_seq_num.load(Ordering::Acquire);
+                        if new_visible <= current {
+                            // Already published by another thread
+                            break;
+                        }
+
+                        if self
+                            .visible_seq_num
+                            .compare_exchange_weak(
+                                current,
+                                new_visible,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
+                    }
+
+                    // Complete this batch
+                    batch.complete(Ok(()));
+                }
+                None => {
+                    // No more applied batches, done
+                    break;
+                }
+            }
         }
     }
 
     pub fn get_visible_seq_num(&self) -> u64 {
         self.visible_seq_num.load(Ordering::Acquire)
     }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for CommitPipeline {
     fn drop(&mut self) {
-        // Signal shutdown
-        self.shutdown.store(true, Ordering::Release);
-        self.publish_manager.shutdown();
+        self.shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::sstable::InternalKeyKind;
 
     use super::*;
@@ -392,19 +362,16 @@ mod tests {
         println!("Batch count: {}", batch.count());
 
         let result = pipeline.commit(batch, false).await;
-        assert!(result.is_ok(), "Single commit failed: {:?}", result);
-
-        // Wait a bit for publishing
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(result.is_ok(), "Single commit failed: {result:?}");
 
         let visible = pipeline.get_visible_seq_num();
-        println!("Visible seq num after single commit: {}", visible);
+        println!("Visible seq num after single commit: {visible}");
         assert_eq!(
             visible, 1,
             "Expected visible=1 after one commit with count=1 (highest seq num used)"
         );
 
-        pipeline.shutdown().await;
+        pipeline.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -421,18 +388,13 @@ mod tests {
             batch
                 .add_record(
                     InternalKeyKind::Set,
-                    &format!("key{}", i).into_bytes(),
+                    &format!("key{i}").into_bytes(),
                     Some(&[1, 2, 3]),
                 )
                 .unwrap();
             // println!("Batch {} count: {}", i, batch.count());
             let result = pipeline.commit(batch, false).await;
-            assert!(
-                result.is_ok(),
-                "Sequential commit {} failed: {:?}",
-                i,
-                result
-            );
+            assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
             println!(
                 "visible seq num after commit {}: {}",
                 i,
@@ -443,7 +405,7 @@ mod tests {
         println!("Final visible seq num: {}", pipeline.get_visible_seq_num());
         assert_eq!(pipeline.get_visible_seq_num(), 5);
 
-        pipeline.shutdown().await;
+        pipeline.shutdown();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -458,7 +420,7 @@ mod tests {
                 batch
                     .add_record(
                         InternalKeyKind::Set,
-                        &format!("key{}", i).into_bytes(),
+                        &format!("key{i}").into_bytes(),
                         Some(&[1, 2, 3]),
                     )
                     .unwrap();
@@ -469,7 +431,7 @@ mod tests {
 
         for (i, handle) in handles.into_iter().enumerate() {
             let result = handle.await.unwrap();
-            assert!(result.is_ok(), "Commit {} failed: {:?}", i, result);
+            assert!(result.is_ok(), "Commit {i} failed: {result:?}");
         }
 
         // Give time for all publishing to complete
@@ -486,7 +448,7 @@ mod tests {
         );
 
         // Shutdown the pipeline
-        pipeline.shutdown().await;
+        pipeline.shutdown();
     }
 
     struct DelayedMockEnv;
@@ -521,7 +483,7 @@ mod tests {
                 batch
                     .add_record(
                         InternalKeyKind::Set,
-                        &format!("key{}", i).into_bytes(),
+                        &format!("key{i}").into_bytes(),
                         Some(&[1, 2, 3]),
                     )
                     .unwrap();
@@ -538,6 +500,6 @@ mod tests {
         assert_eq!(pipeline.get_visible_seq_num(), 5);
 
         // Shutdown the pipeline
-        pipeline.shutdown().await;
+        pipeline.shutdown();
     }
 }
