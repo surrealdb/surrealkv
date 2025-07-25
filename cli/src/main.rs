@@ -10,7 +10,7 @@ use commands::{Cli, Commands};
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("Error: {}", err);
+        eprintln!("Error: {err}");
         process::exit(1);
     }
 }

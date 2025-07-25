@@ -138,7 +138,6 @@ where
             (true, false) => self.read_from_snapshot(),
             (false, true) => self.read_from_write_set(),
             (true, true) => {
-                // Now we can safely do the comparison
                 if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
                     (self.snap_iter.peek(), self.write_set_iter.peek())
                 {

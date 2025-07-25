@@ -1,13 +1,9 @@
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::log::SegmentRef;
-use crate::option::Options;
-use crate::store::{Core, Store};
+use crate::store::Store;
 
 struct CompactionGuard<'a> {
     is_compacting: &'a AtomicBool,
@@ -44,7 +40,7 @@ impl Store {
         // Acquire compaction guard
         let _guard = CompactionGuard::new(&self.is_compacting);
 
-        // Check which segments need compaction (>50% deleted keys)
+        // Check which segments need compaction
         let segments_to_compact = self.get_segments_for_compaction()?;
 
         // Early return if no segments need compaction
@@ -53,8 +49,9 @@ impl Store {
         }
 
         println!(
-            "Compacting {} segments with >50% deleted keys",
-            segments_to_compact.len()
+            "Compacting {} segments with >{}% deleted keys",
+            segments_to_compact.len(),
+            self.core.opts.compaction_discard_threshold
         );
 
         // Process the segments that need compaction
@@ -73,26 +70,22 @@ impl Store {
 
     /// Gets list of segments that need compaction using discard statistics
     fn get_segments_for_compaction(&self) -> Result<Vec<SegmentRef>> {
-        const DELETION_THRESHOLD: f64 = 50.0; // 50% deletion threshold
+        let deletion_threshold = self.core.opts.compaction_discard_threshold;
 
         let discard_stats = self.core.discard_stats.read();
-        let segment_ids_to_compact =
-            discard_stats.get_segments_exceeding_threshold(DELETION_THRESHOLD);
-
-        // Convert segment IDs to SegmentRef objects
         let clog_dir = self.core.opts.dir.join("clog");
-        let mut segments_to_compact = Vec::new();
 
-        for segment_id in segment_ids_to_compact {
-            let segment_path = clog_dir.join(format!("{segment_id:020}.clog"));
-            if segment_path.exists() {
-                segments_to_compact.push(SegmentRef {
-                    file_path: segment_path,
-                    file_header_offset: 0, // We'll read from the beginning of the file
-                    id: segment_id,
-                });
-            }
-        }
+        let segment_ids_to_compact =
+            discard_stats.get_segments_exceeding_threshold(deletion_threshold, &clog_dir);
+
+        // Read all segments from directory to get properly formatted SegmentRef objects
+        let all_segments = SegmentRef::read_segments_from_directory(&clog_dir)?;
+
+        // Filter to only include segments that need compaction
+        let segments_to_compact: Vec<SegmentRef> = all_segments
+            .into_iter()
+            .filter(|segment| segment_ids_to_compact.contains(&segment.id))
+            .collect();
 
         Ok(segments_to_compact)
     }
@@ -107,6 +100,7 @@ impl Store {
 
         // Read all live entries from segments that need compaction
         for segment in segments {
+            // Use the segment with its proper header offset (don't create a new one)
             let reader = MultiSegmentReader::new(vec![SegmentRef {
                 file_path: segment.file_path.clone(),
                 file_header_offset: segment.file_header_offset,
@@ -161,203 +155,11 @@ impl Store {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum RecoveryState {
-    None,
-    ClogDeleted,
-}
-
-impl RecoveryState {
-    pub(crate) fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join(".recovery_state");
-        if path.exists() {
-            let mut file = File::open(path)?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)?;
-            match contents.as_str() {
-                "ClogDeleted" => Ok(RecoveryState::ClogDeleted),
-                _ => Ok(RecoveryState::None),
-            }
-        } else {
-            Ok(RecoveryState::None)
-        }
-    }
-
-    pub(crate) fn save(&self, dir: &Path) -> Result<()> {
-        let path = dir.join(".recovery_state");
-        let mut file = File::create(path)?;
-        match self {
-            RecoveryState::ClogDeleted => {
-                write!(file, "ClogDeleted")
-                    .map_err(|e| Error::CustomError(format!("recovery file write error: {e}")))?;
-                Ok(())
-            }
-            RecoveryState::None => Ok(()),
-        }
-    }
-
-    pub(crate) fn clear(dir: &Path) -> Result<()> {
-        let path = dir.join(".recovery_state");
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-}
-
-fn perform_recovery(opts: &Options) -> Result<()> {
-    // Encapsulate operations in a closure for easier rollback
-    let result = || -> Result<()> {
-        let merge_dir = opts.dir.join(".merge");
-        let clog_dir = opts.dir.join("clog");
-        let merge_clog_subdir = merge_dir.join("clog");
-
-        // If there is a .merge directory, try reading manifest from it
-        let manifest = Core::initialize_manifest(&merge_dir)?;
-        let existing_manifest = if manifest.size()? > 0 {
-            Core::read_manifest(&merge_dir)?
-        } else {
-            return Err(Error::MergeManifestMissing);
-        };
-
-        let compacted_upto_segments = existing_manifest.extract_compacted_up_to_segments();
-        if compacted_upto_segments.is_empty() || compacted_upto_segments.len() > 1 {
-            return Err(Error::MergeManifestMissing);
-        }
-
-        let compacted_upto_segment_id = compacted_upto_segments[0];
-        let segs = SegmentRef::read_segments_from_directory(&clog_dir)?;
-        // Step 4: Copy files from clog dir to merge clog dir
-        for seg in segs.iter() {
-            if seg.id > compacted_upto_segment_id {
-                // Check if the path points to a regular file
-                match fs::metadata(&seg.file_path) {
-                    Ok(metadata) => {
-                        if metadata.is_file() {
-                            // Proceed to copy the file
-                            let dest_path =
-                                merge_clog_subdir.join(seg.file_path.file_name().unwrap());
-                            match fs::copy(&seg.file_path, &dest_path) {
-                                Ok(_) => println!("File copied successfully"),
-                                Err(e) => {
-                                    eprintln!("Error copying file: {e:?}");
-                                    return Err(Error::from(e));
-                                }
-                            }
-                        } else {
-                            println!("Path is not a regular file: {:?}", &seg.file_path);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Error accessing file metadata: {e:?}");
-                        return Err(Error::from(e));
-                    }
-                }
-            }
-        }
-
-        // Clear any previous recovery state before setting a new one
-        RecoveryState::clear(&opts.dir)?;
-        // After successful operation, update recovery state to indicate clog can be deleted
-        RecoveryState::ClogDeleted.save(&opts.dir)?;
-
-        // Delete the `clog` directory
-        if let Err(e) = fs::remove_dir_all(&clog_dir) {
-            eprintln!("Error deleting clog directory: {e:?}");
-            return Err(Error::from(e));
-        }
-
-        // Rename `merge_clog_subdir` to `clog`
-        if let Err(e) = fs::rename(&merge_clog_subdir, &clog_dir) {
-            eprintln!("Error renaming merge_clog_subdir to clog: {e:?}");
-            return Err(Error::from(e));
-        }
-
-        // Clear recovery state after successful completion
-        RecoveryState::clear(&opts.dir)?;
-
-        Ok(())
-    };
-
-    match result() {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let merge_dir = opts.dir.join(".merge");
-            let clog_dir = opts.dir.join("clog");
-            rollback(&merge_dir, &clog_dir, RecoveryState::load(&opts.dir)?)?;
-            Err(e)
-        }
-    }
-}
-
-fn cleanup_after_recovery(opts: &Options) -> Result<()> {
-    let merge_dir = opts.dir.join(".merge");
-
-    if merge_dir.exists() {
-        fs::remove_dir_all(&merge_dir)?;
-    }
-    Ok(())
-}
-
-fn rollback(merge_dir: &Path, clog_dir: &Path, checkpoint: RecoveryState) -> Result<()> {
-    if checkpoint == RecoveryState::ClogDeleted {
-        // Restore the clog directory from merge directory if it exists
-        // At this point the merge directory should exist and the clog directory should not
-        // So, we can safely rename the merge clog directory to clog directory
-        if !clog_dir.exists() && merge_dir.exists() {
-            let merge_clog_subdir = merge_dir.join("clog");
-            if merge_clog_subdir.exists() {
-                fs::rename(&merge_clog_subdir, clog_dir)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn needs_recovery(opts: &Options) -> Result<bool> {
-    Ok(opts.dir.join(".merge").exists())
-}
-
-fn handle_clog_deleted_state(opts: &Options) -> Result<()> {
-    let merge_dir = opts.dir.join(".merge");
-    let clog_dir = opts.dir.join("clog");
-    rollback(&merge_dir, &clog_dir, RecoveryState::ClogDeleted)
-}
-
-/// Restores the store from a compaction process by handling .tmp.merge and .merge directories.
-/// TODO: This should happen post repair
-pub fn restore_from_compaction(opts: &Options) -> Result<()> {
-    let tmp_merge_dir = opts.dir.join(".tmp.merge");
-    // 1) Check if there is a .tmp.merge directory, delete it
-    if tmp_merge_dir.exists() {
-        // This means there was a previous compaction process that failed
-        // so we don't need to do anything here and just return
-        fs::remove_dir_all(&tmp_merge_dir)?;
-        return Ok(());
-    }
-
-    if !needs_recovery(opts)? {
-        return Ok(());
-    }
-
-    match RecoveryState::load(&opts.dir)? {
-        RecoveryState::ClogDeleted => handle_clog_deleted_state(opts)?,
-        RecoveryState::None => (),
-    }
-
-    perform_recovery(opts)?;
-    // Clean up merge directory after successful operation
-    cleanup_after_recovery(opts)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::prelude::SliceRandom;
     use rand::{distributions::Alphanumeric, Rng};
     use std::collections::HashSet;
-    use std::fs::read_to_string;
 
     use crate::option::Options;
     use crate::store::Store;
@@ -367,42 +169,6 @@ mod tests {
 
     fn create_temp_directory() -> TempDir {
         TempDir::new("test").unwrap()
-    }
-
-    #[test]
-    fn test_recovery_state_sequentially() {
-        // Create a temporary directory for testing
-        let temp_dir = create_temp_directory();
-        let temp_dir = temp_dir.path();
-        let path = temp_dir.join(".recovery_state");
-        let temp_dir = &temp_dir.to_path_buf();
-
-        // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
-        assert!(!path.exists());
-
-        // Test saving and loading ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
-        assert_eq!(
-            RecoveryState::load(temp_dir).unwrap(),
-            RecoveryState::ClogDeleted
-        );
-
-        // Clear state and re-setup for next test
-        RecoveryState::clear(temp_dir).unwrap();
-        assert!(!path.exists());
-
-        // Test loading None when no state is saved
-        assert_eq!(RecoveryState::load(temp_dir).unwrap(), RecoveryState::None);
-
-        // Test save contents for ClogDeleted
-        RecoveryState::ClogDeleted.save(temp_dir).unwrap();
-        let contents = read_to_string(&path).unwrap();
-        assert_eq!(contents, "ClogDeleted");
-
-        // Final clear to clean up
-        RecoveryState::clear(temp_dir).unwrap();
-        assert!(!path.exists());
     }
 
     #[test]
@@ -1070,37 +836,43 @@ mod tests {
         // Create store options with the test directory
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.compaction_discard_threshold = 30.0; // Lower threshold for testing
 
         // Initialize the store
         let store = Store::new(opts.clone()).expect("should create store");
 
-        // Open a transaction to populate the store with versions of keys
+        // Create enough entries and deletions to exceed 30% discard threshold by bytes
+        // We'll create multiple entries and delete most of them
+
         {
             let mut txn = store.begin().unwrap();
-            // Insert a key with two versions, where the last one is marked as deleted
-            txn.set(b"key1", b"value1").unwrap(); // First version
+            // Insert multiple keys
+            for i in 1..=10 {
+                let key = format!("key{i}").as_bytes().to_vec();
+                let value = format!("value{i}").as_bytes().to_vec();
+                txn.set(&key, &value).unwrap();
+            }
             txn.commit().unwrap();
         }
 
         {
             let mut txn = store.begin().unwrap();
-            // Insert a key with two versions, where the last one is marked as deleted
-            txn.delete(b"key1").unwrap(); // Second version marked as deleted
+            // Delete most of the keys (8 out of 10) to exceed 30% threshold
+            for i in 1..=8 {
+                let key = format!("key{i}").as_bytes().to_vec();
+                txn.delete(&key).unwrap();
+            }
             txn.commit().unwrap();
         }
 
-        {
-            let mut txn = store.begin().unwrap();
-            // Insert another key with a single version not marked as deleted
-            txn.set(b"key2", b"value2").unwrap();
-            txn.commit().unwrap();
-        }
+        // Now we have: key1-key8 (deleted), key9-key10 (live)
+        // That should be > 30% deletion rate by bytes
 
         // Perform compaction
         store.compact().expect("compaction should succeed");
         let stats = &store.stats;
-        assert_eq!(stats.compaction_stats.get_records_deleted(), 0);
-        assert_eq!(stats.compaction_stats.get_records_added(), 1);
+        assert_eq!(stats.compaction_stats.get_records_deleted(), 16); // 8 original entries + 8 delete tombstones = 16 deleted records encountered
+        assert_eq!(stats.compaction_stats.get_records_added(), 2); // key9 and key10 should remain
 
         // Reopen the store to ensure compaction changes are applied
         drop(store);
@@ -1109,21 +881,28 @@ mod tests {
         // Begin a new transaction to verify compaction results
         let mut txn = store.begin().unwrap();
 
-        // Check that "key1" is not present because its last version was marked as deleted
-        assert!(
-            txn.get(b"key1").unwrap().is_none(),
-            "key1 should be skipped by compaction"
-        );
+        // Check that deleted keys are not present
+        for i in 1..=8 {
+            let key = format!("key{i}").as_bytes().to_vec();
+            assert!(
+                txn.get(&key).unwrap().is_none(),
+                "key{i} should be skipped by compaction"
+            );
+        }
 
-        // Check that "key2" is still present because it was not marked as deleted
-        let val = txn
-            .get(b"key2")
-            .unwrap()
-            .expect("key2 should exist after compaction");
-        assert_eq!(
-            val, b"value2",
-            "key2's value should remain unchanged after compaction"
-        );
+        // Check that remaining keys are still present
+        for i in 9..=10 {
+            let key = format!("key{i}").as_bytes().to_vec();
+            let expected_value = format!("value{i}").as_bytes().to_vec();
+            let val = txn
+                .get(&key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("key{i} should exist after compaction"));
+            assert_eq!(
+                val, expected_value,
+                "key{i}'s value should remain unchanged after compaction"
+            );
+        }
 
         // Close the store
         store.close().unwrap();
@@ -1137,6 +916,7 @@ mod tests {
         // Create store options with the test directory
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.compaction_discard_threshold = 1.0; // Set low threshold to ensure compaction triggers
 
         // Initialize the store
         let store = Store::new(opts.clone()).expect("should create store");
@@ -1152,6 +932,25 @@ mod tests {
         {
             let mut txn = store.begin().unwrap();
             txn.set(b"key1", b"value2").unwrap(); // Second version
+            txn.commit().unwrap();
+        }
+
+        // Add some keys that will be deleted to trigger compaction
+        for i in 2..=5 {
+            let key = format!("key{i}").as_bytes().to_vec();
+            let value = format!("value{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &value).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Delete the keys to trigger compaction
+        for i in 2..=5 {
+            let key = format!("key{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key).unwrap();
             txn.commit().unwrap();
         }
 
@@ -1186,13 +985,17 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.compaction_discard_threshold = 1.0;
 
         let store = Store::new(opts.clone()).expect("should create store");
 
         let num_keys = 100; // Total number of keys
         let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
+        let num_keys_to_delete = 10; // Number of keys to delete to trigger compaction
 
-        // Insert keys into the store
+        // Insert keys into the store:
+        // - First 50 keys (1-50) have a single version
+        // - Next 50 keys (51-100) have two versions each
         for key_index in 1..=num_keys {
             let key = format!("key{key_index}").as_bytes().to_vec();
             {
@@ -1215,17 +1018,30 @@ mod tests {
             }
         }
 
+        // Delete some keys to trigger compaction threshold
+        for key_index in 1..=num_keys_to_delete {
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key).unwrap();
+            txn.commit().unwrap();
+        }
+
         // Perform compaction
         store.compact().expect("compaction should succeed");
-        let stats = &store.stats;
-        assert_eq!(stats.compaction_stats.get_records_added(), 150);
 
-        // Reopen the store
+        // Verify compaction stats:
+        // - Original records: 150 (50 single-version + 50*2 double-version)
+        // - Deleted records: 10 keys
+        // - Expected remaining records: 140
+        let stats = &store.stats;
+        assert_eq!(stats.compaction_stats.get_records_added(), 140);
+
+        // Reopen the store to ensure changes persist
         drop(store);
         let store = Store::new(opts).expect("should reopen store");
 
-        // Verify the results
-        for key_index in 1..=num_keys {
+        // Verify non-deleted keys (11-100) still exist with correct values
+        for key_index in (num_keys_to_delete + 1)..=num_keys {
             let mut txn = store.begin().unwrap();
             let key = format!("key{key_index}").as_bytes().to_vec();
             let expected_value = if key_index > multiple_versions_threshold {
@@ -1245,6 +1061,16 @@ mod tests {
             );
         }
 
+        // Verify deleted keys (1-10) are gone
+        for key_index in 1..=num_keys_to_delete {
+            let mut txn = store.begin().unwrap();
+            let key = format!("key{key_index}").as_bytes().to_vec();
+            assert!(
+                txn.get(&key).unwrap().is_none(),
+                "deleted key should not exist after compaction"
+            );
+        }
+
         // Close the store
         store.close().unwrap();
     }
@@ -1254,12 +1080,23 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.compaction_discard_threshold = 1.0; // Set low threshold to ensure compaction triggers
 
         let store = Store::new(opts.clone()).expect("should create store");
 
         let num_keys = 100; // Total number of keys
         let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
         let delete_threshold = 75; // Keys above this index will be marked as deleted in their last version
+
+        // Add a few keys that will be deleted to ensure compaction threshold is met
+        for i in 101..=110 {
+            let key = format!("delete_me_key{i}").as_bytes().to_vec();
+            let value = format!("temp_value{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &value).unwrap();
+            txn.commit().unwrap();
+        }
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
@@ -1289,6 +1126,15 @@ mod tests {
                     txn.commit().unwrap();
                 }
             }
+        }
+
+        // Delete the temporary keys to trigger compaction threshold
+        for i in 101..=110 {
+            let key = format!("delete_me_key{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key).unwrap();
+            txn.commit().unwrap();
         }
 
         // Perform compaction
@@ -1347,12 +1193,23 @@ mod tests {
         let temp_dir = create_temp_directory();
         let mut opts = Options::new();
         opts.dir = temp_dir.path().to_path_buf();
+        opts.compaction_discard_threshold = 1.0;
 
         let store = Store::new(opts.clone()).expect("should create store");
 
         let num_keys = 100; // Total number of keys
         let multiple_versions_threshold = 50; // Keys above this index will have multiple versions
         let clear_threshold = 75; // Keys above this index will be marked as deleted in their last version
+
+        // Add a few keys that will be deleted to ensure compaction threshold is met
+        for i in 101..=110 {
+            let key = format!("delete_me_key{i}").as_bytes().to_vec();
+            let value = format!("temp_value{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.set(&key, &value).unwrap();
+            txn.commit().unwrap();
+        }
 
         // Insert keys into the store with each operation in its own transaction
         for key_index in 1..=num_keys {
@@ -1382,6 +1239,15 @@ mod tests {
                     txn.commit().unwrap();
                 }
             }
+        }
+
+        // Delete the temporary keys to trigger compaction threshold
+        for i in 101..=110 {
+            let key = format!("delete_me_key{i}").as_bytes().to_vec();
+
+            let mut txn = store.begin().unwrap();
+            txn.delete(&key).unwrap();
+            txn.commit().unwrap();
         }
 
         // Perform compaction

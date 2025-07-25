@@ -30,10 +30,6 @@ impl CompactionStats {
         self.tombstones.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub(crate) fn add_multiple_deleted_records(&self, n: u64) {
-        self.records_deleted.fetch_add(n, Ordering::SeqCst);
-    }
-
     #[allow(unused)]
     pub(crate) fn add_multiple_records(&self, n: u64) {
         self.records_added.fetch_add(n, Ordering::SeqCst);

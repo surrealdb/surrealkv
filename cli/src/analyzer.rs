@@ -82,7 +82,7 @@ impl Analyzer {
                 }
                 Err(Error::LogError(LogError::Eof)) => break,
                 Err(Error::LogError(LogError::Corruption(err))) => {
-                    eprintln!("Corruption error: {:?}", err);
+                    eprintln!("Corruption error: {err:?}");
                     corruption_info = Some((err.segment_id, err.offset));
                     break;
                 }
@@ -112,8 +112,7 @@ impl Analyzer {
 
         if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
             eprintln!(
-                "Data corrupted at segment with id: {} and offset: {}",
-                corrupted_segment_id, corrupted_offset
+                "Data corrupted at segment with id: {corrupted_segment_id} and offset: {corrupted_offset}"
             );
         }
 
@@ -141,7 +140,7 @@ impl Analyzer {
                 println!("----------------------------");
                 for (key, count) in top_keys {
                     let formatted_key = format_key(&key);
-                    println!("{}: {} versions", formatted_key, count);
+                    println!("{formatted_key}: {count} versions");
                 }
             }
             _ => return Err(anyhow::anyhow!("Unsupported format: {}", format)),
@@ -223,13 +222,10 @@ impl Analyzer {
     fn handle_corruption(&self, corruption_info: Option<(u64, u64)>) -> Result<()> {
         if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
             eprintln!(
-                "Found corruption in segment {} at offset {}",
-                corrupted_segment_id, corrupted_offset
+                "Found corruption in segment {corrupted_segment_id} at offset {corrupted_offset}"
             );
             return Err(anyhow::anyhow!(
-                "Corruption found in segment {} at offset {}",
-                corrupted_segment_id,
-                corrupted_offset
+                "Corruption found in segment {corrupted_segment_id} at offset {corrupted_offset}"
             ));
         }
         Ok(())
@@ -394,8 +390,7 @@ impl Analyzer {
 
         if let Some((corrupted_segment_id, corrupted_offset)) = corruption_info {
             eprintln!(
-                "Data corrupted at segment with id: {} and offset: {}",
-                corrupted_segment_id, corrupted_offset
+                "Data corrupted at segment with id: {corrupted_segment_id} and offset: {corrupted_offset}"
             );
         }
 
@@ -479,7 +474,7 @@ fn format_key(key: &[u8]) -> String {
             if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
                 format!("{}", byte as char)
             } else {
-                format!("\\x{:02x}", byte)
+                format!("\\x{byte:02x}")
             }
         })
         .collect()

@@ -171,25 +171,6 @@ impl Record {
         self.crc32 = 0;
     }
 
-    pub(crate) fn from_entry(entry: Entry, tx_id: u64) -> Record {
-        let rec = Record {
-            id: tx_id,
-            ts: entry.ts,
-            crc32: 0, // Temporarily set to 0, will be updated after initialization
-            version: RECORD_VERSION,
-            key_len: entry.key.len() as u32,
-            key: entry.key,
-            metadata: entry.metadata,
-            value_len: entry.value.len() as u32,
-            value: entry.value,
-        };
-
-        let crc32 = rec.calculate_crc32();
-
-        // Return a new Record instance with the correct crc32 value
-        Record { crc32, ..rec }
-    }
-
     pub fn encode(&self, buf: &mut BytesMut) -> Result<usize> {
         // This function encodes an Record into a buffer. The encoding format is as follows:
         // - CRC32 Checksum (4 bytes)

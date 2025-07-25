@@ -171,75 +171,61 @@ impl DiscardStats {
         }
     }
 
-    /// Updates the discard statistics for a file
+    /// Updates the discard count for a file. Returns the total discard bytes for this file.
     /// - If discard_bytes is 0, returns current discard bytes
     /// - If discard_bytes is negative, resets discard bytes to 0
     /// - If discard_bytes is positive, adds to current discard bytes
     pub fn update(&mut self, file_id: u64, discard_bytes: i64) -> u64 {
-        // Binary search for the file_id
         let next_empty_slot = *self.next_empty_slot.lock().unwrap();
-        let idx = self.binary_search(file_id, next_empty_slot);
 
-        if let Some(slot) = idx {
-            // Found existing entry - just update it, no sorting needed
+        // Binary search for existing entry
+        if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
+            // Update existing entry
             let current_discard = self.get_discard_bytes(slot);
 
+            // If discard_bytes is 0, just return current value
             if discard_bytes == 0 {
                 return current_discard;
             }
 
+            // If discard_bytes is negative, reset to 0
             if discard_bytes < 0 {
                 self.set_discard_bytes(slot, 0);
                 return 0;
             }
 
+            // If discard_bytes is positive, add to current value
             let new_discard = current_discard.saturating_add(discard_bytes as u64);
             self.set_discard_bytes(slot, new_discard);
-            return new_discard;
-        }
+            new_discard
+        } else {
+            // Expand if needed
+            if next_empty_slot >= self.max_slots() {
+                self.expand().expect("Failed to expand discard stats");
+            }
 
-        // File not found
-        if discard_bytes <= 0 {
-            return 0;
-        }
-
-        // Add new entry - need to check and update next_empty_slot atomically
-        let slot = {
-            let next_slot_guard = self.next_empty_slot.lock().unwrap();
-            let slot = *next_slot_guard;
-
-            // Check if we need to expand the mmap
-            if slot >= self.max_slots() {
-                drop(next_slot_guard); // Release lock before expand
-                if let Err(e) = self.expand() {
-                    eprintln!("Failed to expand discard stats file: {e}");
-                    return 0;
-                }
-                // After expansion, get the slot again
-                slot
+            // Add new entry
+            let insert_position = next_empty_slot;
+            let discard_count = if discard_bytes < 0 {
+                0
             } else {
-                slot
-            }
-        };
+                discard_bytes as u64
+            };
 
-        self.set_file_id(slot, file_id);
-        self.set_discard_bytes(slot, discard_bytes as u64);
+            self.set_file_id(insert_position, file_id);
+            self.set_discard_bytes(insert_position, discard_count);
 
-        // Update next_empty_slot and zero out the new next slot
-        {
-            let mut next_slot_guard = self.next_empty_slot.lock().unwrap();
-            *next_slot_guard += 1;
-            let next_slot = *next_slot_guard;
-            drop(next_slot_guard); // Release lock before zero_out_slot
-            if next_slot < self.max_slots() {
-                self.zero_out_slot(next_slot);
+            // Update next empty slot
+            {
+                let mut next_empty = self.next_empty_slot.lock().unwrap();
+                *next_empty += 1;
             }
+
+            // Sort entries to maintain order
+            self.sort_entries();
+
+            discard_count
         }
-
-        // Only sort when we add a new entry
-        self.sort_entries();
-
-        discard_bytes as u64
     }
 
     /// Binary search for a file_id, returns the slot index if found
@@ -297,6 +283,7 @@ impl DiscardStats {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Returns the file with maximum discard bytes
     pub fn max_discard(&self) -> Result<(u64, u64)> {
         let next_empty_slot = *self.next_empty_slot.lock().unwrap();
@@ -325,8 +312,9 @@ impl DiscardStats {
         Ok((max_file_id, max_discard))
     }
 
+    #[cfg(test)]
     /// Gets discard bytes for a specific file
-    pub fn get_file_stats(&self, file_id: u64) -> u64 {
+    fn get_file_stats(&self, file_id: u64) -> u64 {
         let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
         if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
@@ -369,14 +357,16 @@ impl DiscardStats {
 
     /// Syncs the memory-mapped file to disk
     pub fn sync(&mut self) -> Result<()> {
-        self.mmap
-            .flush()
-            .map_err(|e| Error::IoError(std::sync::Arc::new(e)))?;
+        self.mmap.flush()?;
         Ok(())
     }
 
     /// Gets all segments that exceed the deletion threshold
-    pub fn get_segments_exceeding_threshold(&self, threshold_percentage: f64) -> Vec<u64> {
+    pub fn get_segments_exceeding_threshold(
+        &self,
+        threshold_percentage: f64,
+        clog_dir: &std::path::Path,
+    ) -> Vec<u64> {
         let next_empty_slot = *self.next_empty_slot.lock().unwrap();
         let mut segments = Vec::new();
 
@@ -384,14 +374,10 @@ impl DiscardStats {
             let file_id = self.get_file_id(slot);
             let discard_bytes = self.get_discard_bytes(slot);
 
-            if file_id == 0 {
-                continue;
-            }
-
             // We need to get the total file size to calculate percentage
-            // For now, we'll use a simple heuristic - we can improve this later
-            // by also tracking total segment sizes in the discard stats
-            if let Ok(metadata) = std::fs::metadata(format!("{file_id:020}.clog")) {
+            let segment_path = clog_dir.join(format!("{file_id:020}.clog"));
+
+            if let Ok(metadata) = std::fs::metadata(&segment_path) {
                 let total_size = metadata.len();
                 if total_size > 0 {
                     let discard_percentage = (discard_bytes as f64 / total_size as f64) * 100.0;

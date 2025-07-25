@@ -266,9 +266,7 @@ mod tests {
             // Subtract 1 for the header line
             Ok(if count > 0 { count - 1 } else { 0 })
         } else {
-            Err(std::io::Error::other(
-                "Failed to execute lsof",
-            ))
+            Err(std::io::Error::other("Failed to execute lsof"))
         }
     }
 
@@ -341,9 +339,7 @@ mod tests {
                 Err(Error::LogError(LogError::Corruption(err))) => {
                     return (err.segment_id, err.offset);
                 }
-                Err(err) => panic!(
-                    "Expected a CorruptionError, but got a different error {err}"
-                ),
+                Err(err) => panic!("Expected a CorruptionError, but got a different error {err}"),
             }
         }
     }

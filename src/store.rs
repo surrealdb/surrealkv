@@ -1,21 +1,17 @@
 use ahash::{HashMap, HashMapExt};
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
-use revision::Revisioned;
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
 use crate::bptree::tree::{new_disk_tree, DiskBPlusTree};
-use crate::compaction::restore_from_compaction;
 use crate::discard::DiscardStats;
 use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::indexer::{IndexValue, Indexer};
 use crate::log::{Aol, Error as LogError, MultiSegmentReader, Options as LogOptions, SegmentRef};
-use crate::manifest::Manifest;
 use crate::option::Options;
 use crate::oracle::Oracle;
 use crate::reader::{Reader, RecordReader};
@@ -114,8 +110,6 @@ pub struct Core {
     pub(crate) opts: Options,
     /// Commit log for store.
     pub(crate) clog: Option<Arc<Aol>>,
-    /// Manifest for store to track Store state.
-    pub(crate) manifest: Option<RwLock<Aol>>,
     /// Transaction ID Oracle for store.
     pub(crate) oracle: Oracle,
     /// Value cache for store.
@@ -151,13 +145,6 @@ impl Core {
     // Initialize the discard statistics for tracking segment discard information
     fn initialize_discard_stats(opts: &Options) -> Result<DiscardStats> {
         DiscardStats::new(&opts.dir)
-    }
-
-    // This function initializes the manifest log for the database to store all settings.
-    pub(crate) fn initialize_manifest(dir: &Path) -> Result<Aol> {
-        let manifest_subdir = dir.join("manifest");
-        let mopts = LogOptions::default().with_file_extension("manifest".to_string());
-        Aol::open(&manifest_subdir, &mopts).map_err(Error::from)
     }
 
     // This function initializes the commit log (clog) for the database.
@@ -196,21 +183,11 @@ impl Core {
         // Initialize a new Indexer with the provided options.
         let mut indexer = Self::initialize_indexer();
 
-        let mut manifest = None;
         let mut clog = None;
 
         if opts.should_persist_data() {
-            // Determine options for the manifest file and open or create it.
-            manifest = Some(Self::initialize_manifest(&opts.dir)?);
-
-            // Load options from the manifest file.
-            let opts = Core::load_manifest(&opts, manifest.as_mut().unwrap())?;
-
             // Determine options for the commit log file and open or create it.
             clog = Some(Self::initialize_clog(&opts)?);
-
-            // Restore the store from a compaction process if necessary.
-            restore_from_compaction(&opts)?;
 
             // Load the index from the commit log if it exists.
             if clog.as_ref().unwrap().size()? > 0 {
@@ -222,7 +199,6 @@ impl Core {
         let oracle = Oracle::new(&opts);
         oracle.set_ts(indexer.version());
 
-        // Create and initialize value cache.
         // Create and initialize value cache.
         let value_cache = ValueCache::with_weighter(
             opts.max_value_cache_size as usize,
@@ -240,7 +216,6 @@ impl Core {
         Ok(Self {
             indexer: RwLock::new(indexer),
             opts,
-            manifest: manifest.map(RwLock::new),
             clog: clog.map(Arc::new),
             oracle,
             value_cache,
@@ -364,72 +339,6 @@ impl Core {
         Ok(())
     }
 
-    fn load_manifest(current_opts: &Options, manifest: &mut Aol) -> Result<Options> {
-        // Load existing manifests if any, else create a new one
-        let existing_manifest = if manifest.size()? > 0 {
-            Core::read_manifest(&current_opts.dir)?
-        } else {
-            Manifest::new()
-        };
-
-        // Validate the current options against the existing manifest's options
-        Core::validate_options(current_opts)?;
-
-        // Check if the current options are already the last option in the manifest
-        if existing_manifest.extract_last_option().as_ref() == Some(current_opts) {
-            return Ok(current_opts.clone());
-        }
-
-        // If not, create a changeset with an update operation for the current options
-        let changeset = Manifest::with_update_option_change(current_opts);
-
-        // Serialize the changeset and append it to the manifest
-        let buf = changeset.serialize()?;
-        manifest.append(&buf)?;
-
-        Ok(current_opts.clone())
-    }
-
-    fn validate_options(opts: &Options) -> Result<()> {
-        if opts.max_compaction_segment_size < opts.max_segment_size {
-            return Err(Error::CompactionSegmentSizeTooSmall);
-        }
-
-        Ok(())
-    }
-
-    /// Loads the latest options from the manifest log.
-    pub(crate) fn read_manifest(dir: &Path) -> Result<Manifest> {
-        let manifest_subdir = dir.join("manifest");
-        let sr = SegmentRef::read_segments_from_directory(manifest_subdir.as_path())
-            .expect("should read segments");
-        let reader = MultiSegmentReader::new(sr)?;
-        let mut reader = Reader::new_from(reader);
-
-        let mut manifests = Manifest::new(); // Initialize with an empty Vec
-
-        loop {
-            // Read the next transaction record from the log.
-            let mut len_buf = [0; 4];
-            let res = reader.read(&mut len_buf); // Read 4 bytes for the length
-            if let Err(e) = res {
-                if let Error::LogError(LogError::Eof) = e {
-                    break;
-                } else {
-                    return Err(e);
-                }
-            }
-
-            let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
-            let mut md_bytes = vec![0u8; len];
-            reader.read(&mut md_bytes)?; // Read the actual metadata
-            let manifest = Manifest::deserialize_revisioned(&mut md_bytes.as_slice())?;
-            manifests.changes.extend(manifest.changes);
-        }
-
-        Ok(manifests)
-    }
-
     fn is_closed(&self) -> bool {
         self.is_closed.load(Ordering::SeqCst)
     }
@@ -438,6 +347,10 @@ impl Core {
         if self.is_closed() {
             return Ok(());
         }
+
+        self.discard_stats.write().sync()?;
+
+        self.global_delete_list.write().close()?;
 
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
@@ -451,10 +364,6 @@ impl Core {
             clog.close()?;
         }
 
-        // Close the manifest if it exists
-        if let Some(manifest) = &self.manifest {
-            manifest.write().close()?;
-        }
         self.is_closed.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -552,29 +461,36 @@ impl Core {
             // with the replace flag set, delete it.
             if let Some(metadata) = entry.metadata.as_ref() {
                 if metadata.is_deleted() || metadata.is_tombstone() && entry.replace {
+                    // Get segment information BEFORE deleting from index
+                    let segment_info = {
+                        let key_lookup = VariableSizeKey::from(entry.key.to_vec());
+                        index.index.get(&key_lookup, self.read_ts()).and_then(
+                            |(index_value, _, _)| {
+                                if let IndexValue::Disk(_) = &index_value {
+                                    Some((
+                                        index_value.segment_id(),
+                                        entry.key.len() + entry.value.len() + 32,
+                                    ))
+                                } else {
+                                    None
+                                }
+                            },
+                        )
+                    };
+
                     index.delete(&mut entry.key[..].into());
 
                     // Add the deleted key to the global delete list for compaction
                     {
                         let mut delete_list = self.global_delete_list.write();
                         // Use empty value since we only care about tracking the key
-                        let _ = delete_list.insert(&entry.key, &[]);
+                        delete_list.insert(&entry.key, &[]).unwrap();
                     }
 
-                    // Update discard statistics for the segment containing this key
-                    {
-                        let key_lookup = VariableSizeKey::from(entry.key.to_vec());
-                        if let Some((index_value, _, _)) =
-                            index.index.get(&key_lookup, self.read_ts())
-                        {
-                            if let IndexValue::Disk(_) = &index_value {
-                                let segment_id = index_value.segment_id();
-                                let entry_size = entry.key.len() + entry.value.len() + 32; // Estimate entry overhead
-
-                                let mut discard_stats = self.discard_stats.write();
-                                discard_stats.update(segment_id, entry_size as i64);
-                            }
-                        }
+                    // Update discard statistics using the segment info we got before deletion
+                    if let Some((segment_id, entry_size)) = segment_info {
+                        let mut discard_stats = self.discard_stats.write();
+                        discard_stats.update(segment_id, entry_size as i64);
                     }
 
                     continue;

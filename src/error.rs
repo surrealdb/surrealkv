@@ -111,10 +111,7 @@ impl fmt::Display for Error {
                 write!(f, "Maximum KV metadata length exceeded")
             }
             Error::ChecksumMismatch(expected, found) => {
-                write!(
-                    f,
-                    "Checksum mismatch: expected={expected}, found={found}"
-                )
+                write!(f, "Checksum mismatch: expected={expected}, found={found}")
             }
             Error::SnapshotVersionIsOld(expected, found) => {
                 write!(
@@ -151,5 +148,11 @@ impl From<LogError> for Error {
 impl From<revision::Error> for Error {
     fn from(err: revision::Error) -> Self {
         Error::RevisionError(err.to_string())
+    }
+}
+
+impl From<crate::bptree::tree::BPlusTreeError> for Error {
+    fn from(err: crate::bptree::tree::BPlusTreeError) -> Self {
+        Error::CustomError(format!("BPlusTree error: {err}"))
     }
 }

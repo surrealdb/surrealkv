@@ -20,11 +20,6 @@ pub trait Storage: Send + Sync {
 
     /// Get the current length of the storage
     fn len(&self) -> Result<u64>;
-
-    /// Check if the storage is empty
-    fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
-    }
 }
 
 /// Disk-based storage implementation

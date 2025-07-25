@@ -19,8 +19,8 @@ impl IsolationLevel {
     }
 }
 
-#[revisioned(revision = 3)]
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[revisioned(revision = 4)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Options {
     // Required options.
     pub dir: PathBuf, // Directory path for storing the database files.
@@ -47,6 +47,10 @@ pub struct Options {
     // Used to enable or disable versioned values.
     #[revision(start = 3)]
     pub enable_versions: bool,
+
+    // Compaction options.
+    #[revision(start = 4)]
+    pub compaction_discard_threshold: f64, // Percentage threshold (0.0-100.0) for triggering compaction on segments
 }
 
 impl Default for Options {
@@ -61,6 +65,7 @@ impl Default for Options {
             disk_persistence: true,
             max_compaction_segment_size: 1 << 30, // 1 GB
             enable_versions: true,
+            compaction_discard_threshold: 50.0,
         }
     }
 }
@@ -73,6 +78,17 @@ impl Options {
     /// Returns true if the data should be persisted on disk.
     pub fn should_persist_data(&self) -> bool {
         self.disk_persistence
+    }
+
+    /// Validates that the compaction discard threshold is within a valid range (0.0-100.0)
+    pub fn validate_compaction_threshold(&self) -> Result<(), String> {
+        if self.compaction_discard_threshold < 0.0 || self.compaction_discard_threshold > 100.0 {
+            return Err(format!(
+                "compaction_discard_threshold must be between 0.0 and 100.0, got: {}",
+                self.compaction_discard_threshold
+            ));
+        }
+        Ok(())
     }
 
     fn convert_max_key_size(&self, _revision: u16, _value: u64) -> Result<(), revision::Error> {
@@ -104,5 +120,6 @@ mod tests {
         assert_eq!(options.max_compaction_segment_size, 1 << 30);
         assert!(options.disk_persistence);
         assert!(options.enable_versions);
+        assert_eq!(options.compaction_discard_threshold, 50.0);
     }
 }

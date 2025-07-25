@@ -6,7 +6,6 @@ mod error;
 mod indexer;
 mod iter;
 pub mod log;
-mod manifest;
 mod meta;
 mod option;
 mod oracle;
