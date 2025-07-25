@@ -86,113 +86,30 @@ impl Store {
             .with_file_extension("clog".to_string());
         let temp_writer = Aol::open(&temp_clog_dir, &tm_opts)?;
 
-        // TODO: Check later to add a new way for compaction by reading from the files first and then
-        // check in files for the keys that are not found in memory to handle deletion
+        // Check which segments need compaction (>50% deleted keys)
+        let segments_to_compact = self.get_segments_for_compaction()?;
 
-        // Start compaction process
-        let snapshot_lock = self.core.indexer.write();
-        let snapshot = snapshot_lock.snapshot();
-        let snapshot_versioned_iter = snapshot.iter_with_versions();
-        drop(snapshot_lock); // Explicitly drop the lock
-        drop(commit_lock); // Release the commit lock
-
-        // Do compaction and write
-
-        // Define a closure for writing entries to the temporary commit log
-        let write_entry = |key: &[u8],
-                           value: Vec<u8>,
-                           version: u64,
-                           ts: u64,
-                           metadata: Option<Metadata>|
-         -> Result<()> {
-            let mut entry = Entry::new(key, &value);
-            entry.set_ts(ts);
-
-            if let Some(md) = metadata {
-                entry.set_metadata(md);
-            }
-
-            let tx_record = Record::from_entry(entry, version);
-            let mut buf = BytesMut::new();
-            tx_record.encode(&mut buf)?;
-
-            let (segment_id, _, _) = temp_writer.append(&buf)?;
-            if segment_id > last_updated_segment_id {
-                eprintln!(
-                    "Segment ID: {} exceeds last updated segment ID: {}",
-                    segment_id, last_updated_segment_id
-                );
-                return Err(Error::SegmentIdExceedsLastUpdated);
-            }
-
-            // increment the compaction stats
-            self.stats.compaction_stats.add_record();
-
-            Ok(())
-        };
-
-        let mut current_key: Option<&[u8]> = None;
-        let mut entries_buffer = Vec::new();
-        let mut skip_current_key = false;
-
-        for (key, value, version, ts) in snapshot_versioned_iter {
-            // Skip keys from segments newer than the last updated segment
-            if value.segment_id() > last_updated_segment_id {
-                continue;
-            }
-
-            let metadata = value.metadata();
-
-            // If we've moved to a new key, decide whether to write the previous key's entries
-            if Some(&key) != current_key.as_ref() {
-                if !skip_current_key {
-                    // Write buffered entries of the previous key to disk
-                    for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
-                        write_entry(key, value, version, ts, metadata)?;
-                    }
-                } else {
-                    // Clear the buffer without writing if the last version was marked as deleted
-                    entries_buffer.clear();
-                }
-
-                // Reset flags for the new key
-                current_key = Some(key);
-                skip_current_key = false;
-            }
-
-            // Determine if the current key should be skipped based on deletion status
-            if let Some(md) = metadata {
-                if md.is_deleted() {
-                    skip_current_key = true;
-
-                    let num_records_deleted = 1 + entries_buffer.len() as u64;
-                    self.stats
-                        .compaction_stats
-                        .add_multiple_deleted_records(num_records_deleted);
-
-                    entries_buffer.clear(); // Clear any previously buffered entries for this key
-                    continue;
-                }
-            }
-
-            // Buffer the current entry if not skipping
-            if !skip_current_key {
-                entries_buffer.push((
-                    key,
-                    value.resolve(&self.core)?,
-                    version,
-                    ts,
-                    metadata.cloned(),
-                ));
-            }
+        // Early return if no segments need compaction
+        if segments_to_compact.is_empty() {
+            // Clean up and return success
+            fs::remove_dir_all(&tmp_merge_dir)?;
+            return Ok(());
         }
 
-        // Handle the last key
-        if !skip_current_key {
-            for (key, value, version, ts, metadata) in entries_buffer.drain(..) {
-                write_entry(key, value, version, ts, metadata)?;
-            }
-        }
+        println!(
+            "Compacting {} segments with >50% deleted keys",
+            segments_to_compact.len()
+        );
+
+        // Release the commit lock before processing segments
+        drop(commit_lock);
+
+        // Process only the segments that need compaction
+        self.compact_selected_segments(
+            &segments_to_compact,
+            &temp_writer,
+            &last_updated_segment_id,
+        )?;
 
         temp_writer.close()?;
 
@@ -202,6 +119,97 @@ impl Store {
 
         // Finalize compaction by renaming the temporary directory
         fs::rename(tmp_merge_dir, merge_dir)?;
+
+        // Clean up discard stats for compacted segments
+        {
+            let mut discard_stats = self.core.discard_stats.write();
+            for segment in &segments_to_compact {
+                discard_stats.remove_file(segment.id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Gets list of segments that need compaction using discard statistics
+    fn get_segments_for_compaction(&self) -> Result<Vec<SegmentRef>> {
+        const DELETION_THRESHOLD: f64 = 50.0; // 50% deletion threshold
+
+        let discard_stats = self.core.discard_stats.read();
+        let segment_ids_to_compact =
+            discard_stats.get_segments_exceeding_threshold(DELETION_THRESHOLD);
+
+        // Convert segment IDs to SegmentRef objects
+        let clog_dir = self.core.opts.dir.join("clog");
+        let mut segments_to_compact = Vec::new();
+
+        for segment_id in segment_ids_to_compact {
+            let segment_path = clog_dir.join(format!("{:020}.clog", segment_id));
+            if segment_path.exists() {
+                segments_to_compact.push(SegmentRef {
+                    file_path: segment_path,
+                    file_header_offset: 0, // We'll read from the beginning of the file
+                    id: segment_id,
+                });
+            }
+        }
+
+        Ok(segments_to_compact)
+    }
+
+    /// Compacts the selected segments by reading them directly and filtering out deleted keys
+    fn compact_selected_segments(
+        &self,
+        segments: &[SegmentRef],
+        temp_writer: &Aol,
+        last_updated_segment_id: &u64,
+    ) -> Result<()> {
+        use crate::log::MultiSegmentReader;
+        use crate::reader::{Reader, RecordReader};
+
+        let delete_list = self.core.global_delete_list.read();
+
+        for segment in segments {
+            // Skip segments newer than the last updated segment
+            if segment.id > *last_updated_segment_id {
+                continue;
+            }
+
+            let reader = MultiSegmentReader::new(vec![SegmentRef {
+                file_path: segment.file_path.clone(),
+                file_header_offset: segment.file_header_offset,
+                id: segment.id,
+            }])?;
+            let reader = Reader::new_from(reader);
+            let mut record_reader = RecordReader::new(reader);
+            let mut record = Record::new();
+
+            loop {
+                record.reset();
+                match record_reader.read_into(&mut record) {
+                    Ok(_) => {
+                        // Check if this key is NOT in the global delete list (i.e., it's still active)
+                        if delete_list.search(&record.key).unwrap_or(None).is_none() {
+                            // This key is still active, so include it in the compacted output
+                            let mut buf = BytesMut::new();
+                            record.encode(&mut buf)?;
+
+                            let (segment_id, _, _) = temp_writer.append(&buf)?;
+                            if segment_id > *last_updated_segment_id {
+                                return Err(Error::SegmentIdExceedsLastUpdated);
+                            }
+
+                            self.stats.compaction_stats.add_record();
+                        } else {
+                            // Key is deleted, increment deleted counter
+                            self.stats.compaction_stats.delete_record();
+                        }
+                    }
+                    Err(Error::LogError(crate::log::Error::Eof)) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
 
         Ok(())
     }

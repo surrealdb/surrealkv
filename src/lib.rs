@@ -1,4 +1,6 @@
+mod bptree;
 mod compaction;
+mod discard;
 mod entry;
 mod error;
 mod indexer;

@@ -8,7 +8,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
+use crate::bptree::tree::{new_disk_tree, DiskBPlusTree};
 use crate::compaction::restore_from_compaction;
+use crate::discard::DiscardStats;
 use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::indexer::{IndexValue, Indexer};
@@ -18,10 +20,12 @@ use crate::option::Options;
 use crate::oracle::Oracle;
 use crate::reader::{Reader, RecordReader};
 use crate::repair::{repair_last_corrupted_segment, restore_repair_files};
+
 use crate::stats::StorageStats;
 use crate::transaction::{Durability, Mode, Transaction};
 use crate::util::ByteWeighter;
 use crate::util::ValueCache;
+use vart::VariableSizeKey;
 
 /// An MVCC-based transactional key-value store.
 ///
@@ -119,6 +123,10 @@ pub struct Core {
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
     pub(crate) value_cache: ValueCache,
+    /// Global delete list using B+ tree to track all deleted keys for compaction
+    pub(crate) global_delete_list: RwLock<DiskBPlusTree>,
+    /// Discard statistics for efficient compaction decisions
+    pub(crate) discard_stats: RwLock<DiscardStats>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Write lock to ensure that only one transaction can commit at a time.
@@ -128,6 +136,21 @@ pub struct Core {
 impl Core {
     fn initialize_indexer() -> Indexer {
         Indexer::new()
+    }
+
+    // Initialize the global delete list B+ tree for tracking deleted keys during compaction
+    fn initialize_global_delete_list(opts: &Options) -> Result<DiskBPlusTree> {
+        let delete_list_dir = opts.dir.join("delete_list");
+        std::fs::create_dir_all(&delete_list_dir).map_err(|e| Error::IoError(Arc::new(e)))?;
+
+        let delete_list_path = delete_list_dir.join("global_deletes.db");
+        new_disk_tree(delete_list_path, Box::new(|a, b| a.cmp(b)))
+            .map_err(|_| Error::CustomError("Failed to initialize global delete list".to_string()))
+    }
+
+    // Initialize the discard statistics for tracking segment discard information
+    fn initialize_discard_stats(opts: &Options) -> Result<DiscardStats> {
+        DiscardStats::new(&opts.dir)
     }
 
     // This function initializes the manifest log for the database to store all settings.
@@ -207,6 +230,12 @@ impl Core {
             ByteWeighter,
         );
 
+        // Initialize global delete list for compaction (always disk-based for persistence)
+        let global_delete_list = Self::initialize_global_delete_list(&opts)?;
+
+        // Initialize discard statistics for compaction optimization
+        let discard_stats = Self::initialize_discard_stats(&opts)?;
+
         // Construct and return the Core instance.
         Ok(Self {
             indexer: RwLock::new(indexer),
@@ -215,6 +244,8 @@ impl Core {
             clog: clog.map(Arc::new),
             oracle,
             value_cache,
+            global_delete_list: RwLock::new(global_delete_list),
+            discard_stats: RwLock::new(discard_stats),
             is_closed: AtomicBool::new(false),
             commit_write_lock: Mutex::new(()),
         })
@@ -523,6 +554,30 @@ impl Core {
             if let Some(metadata) = entry.metadata.as_ref() {
                 if metadata.is_deleted() || metadata.is_tombstone() && entry.replace {
                     index.delete(&mut entry.key[..].into());
+
+                    // Add the deleted key to the global delete list for compaction
+                    {
+                        let mut delete_list = self.global_delete_list.write();
+                        // Use empty value since we only care about tracking the key
+                        let _ = delete_list.insert(&entry.key, &[]);
+                    }
+
+                    // Update discard statistics for the segment containing this key
+                    {
+                        let mut key_lookup = VariableSizeKey::from(entry.key.to_vec());
+                        if let Some((index_value, _, _)) =
+                            index.index.get(&key_lookup, self.read_ts())
+                        {
+                            if let IndexValue::Disk(_) = &index_value {
+                                let segment_id = index_value.segment_id();
+                                let entry_size = entry.key.len() + entry.value.len() + 32; // Estimate entry overhead
+
+                                let mut discard_stats = self.discard_stats.write();
+                                discard_stats.update(segment_id, entry_size as i64);
+                            }
+                        }
+                    }
+
                     continue;
                 }
             }
