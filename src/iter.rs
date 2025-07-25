@@ -18,6 +18,9 @@ use crate::{
     Result,
 };
 
+// Fields: key, value, version, ts
+type SnapItem<'a> = (&'a [u8], &'a IndexValue, u64, u64);
+
 /// An iterator over the snapshot and write set.
 /// This iterator is used to perform a merging scan over the snapshot and write set.
 /// The iterator will return the values in the snapshot and write set in the order of
@@ -43,7 +46,7 @@ pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
 impl<'a, R, I: Iterator> MergingScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     pub(crate) fn new(
         core: &'a Core,
@@ -104,7 +107,7 @@ where
 impl<'a, R, I> Iterator for MergingScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     type Item = Result<ScanResult<'a>>;
 
@@ -167,7 +170,7 @@ where
 impl<'a, R, I> DoubleEndedIterator for MergingScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: DoubleEndedIterator<Item = SnapItem<'a>>,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.count >= self.limit {
@@ -219,7 +222,7 @@ where
 impl<'a, R, I> MergingScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: DoubleEndedIterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: DoubleEndedIterator<Item = SnapItem<'a>>,
 {
     fn read_from_snapshot_back(&mut self) -> Option<<Self as Iterator>::Item> {
         self.snap_iter.next_back().map(|(key, value, version, ts)| {
@@ -263,7 +266,7 @@ pub(crate) struct KeyScanIterator<'a, R, I: Iterator> {
 impl<'a, R, I: Iterator> KeyScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     pub(crate) fn new(
         write_set: &'a WriteSet,
@@ -301,7 +304,7 @@ where
 impl<'a, R, I> Iterator for KeyScanIterator<'a, R, I>
 where
     R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     type Item = &'a [u8];
 
@@ -368,7 +371,7 @@ pub struct VersionScanIterator<'a, I: Iterator> {
 
 impl<'a, I: Iterator> VersionScanIterator<'a, I>
 where
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     pub(crate) fn new(core: &'a Core, snap_iter: I, limit: Option<usize>) -> Self {
         Self {
@@ -384,7 +387,7 @@ where
 
 impl<'a, I> Iterator for VersionScanIterator<'a, I>
 where
-    I: Iterator<Item = (&'a [u8], &'a IndexValue, u64, u64)>,
+    I: Iterator<Item = SnapItem<'a>>,
 {
     type Item = Result<ScanVersionResult<'a>>;
 
