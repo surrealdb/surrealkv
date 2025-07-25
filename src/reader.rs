@@ -145,7 +145,7 @@ impl RecordReader {
         let corrupt_error = |msg: &str, e: Error| {
             Error::LogError(Corruption(CorruptionError::new(
                 std::io::ErrorKind::Other,
-                Error::CorruptedTransactionRecord(format!("{}: {}", msg, e))
+                Error::CorruptedTransactionRecord(format!("{msg}: {e}"))
                     .to_string()
                     .as_str(),
                 initial_segment,

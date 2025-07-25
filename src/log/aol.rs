@@ -191,7 +191,7 @@ impl Aol {
         let segment = self.segment_cache.get_or_insert_with(&segment_id, || {
             Segment::open(&self.dir, segment_id, &self.opts, true)
                 .map(Arc::new)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         })?;
 
         match segment.read_at(buf, read_offset) {
@@ -714,7 +714,7 @@ mod tests {
 
         let duration = start_time.elapsed();
 
-        println!("Sequential read of 1000 records took: {:?}", duration);
+        println!("Sequential read of 1000 records took: {duration:?}");
     }
 
     // TODO: add to benchmarks
@@ -748,7 +748,7 @@ mod tests {
 
         let duration = start_time.elapsed();
 
-        println!("Random access read of 1000 records took: {:?}", duration);
+        println!("Random access read of 1000 records took: {duration:?}");
     }
 
     #[test]

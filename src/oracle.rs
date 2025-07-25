@@ -49,6 +49,12 @@ impl Oracle {
         self.isolation.set_ts(ts);
         self.isolation.increment_ts();
     }
+
+    /// Generates a new commit timestamp for internal operations like compaction.
+    /// This bypasses conflict detection since internal operations don't need it.
+    pub(crate) fn new_commit_ts_internal(&self) -> u64 {
+        self.isolation.new_commit_ts_internal()
+    }
 }
 
 /// Enum representing the isolation level of a transaction.
@@ -90,6 +96,12 @@ impl IsolationLevel {
     /// It delegates to the specific isolation level to increment the timestamp.
     pub(crate) fn increment_ts(&self) {
         isolation_level_method!(self, increment_ts)
+    }
+
+    /// Generates a new commit timestamp for internal operations.
+    /// It delegates to the specific isolation level to generate the timestamp.
+    pub(crate) fn new_commit_ts_internal(&self) -> u64 {
+        isolation_level_method!(self, new_commit_ts_internal)
     }
 }
 
@@ -145,6 +157,13 @@ impl SnapshotIsolation {
     /// Increments the next transaction ID by 1.
     pub(crate) fn increment_ts(&self) {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Generates a new commit timestamp for internal operations (no conflict detection).
+    pub(crate) fn new_commit_ts_internal(&self) -> u64 {
+        let ts = self.next_tx_id.load(Ordering::SeqCst);
+        self.increment_ts();
+        ts
     }
 }
 
@@ -273,5 +292,12 @@ impl SerializableSnapshotIsolation {
     /// Increments the next transaction ID by 1.
     pub(crate) fn increment_ts(&self) {
         self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Generates a new commit timestamp for internal operations (no conflict detection).
+    pub(crate) fn new_commit_ts_internal(&self) -> u64 {
+        let ts = self.next_tx_id.load(Ordering::SeqCst);
+        self.increment_ts();
+        ts
     }
 }

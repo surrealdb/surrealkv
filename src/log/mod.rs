@@ -519,9 +519,9 @@ fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
 
 pub(crate) fn segment_name(index: u64, ext: &str) -> String {
     if ext.is_empty() {
-        return format!("{:020}", index);
+        return format!("{index:020}");
     }
-    format!("{:020}.{}", index, ext)
+    format!("{index:020}.{ext}")
 }
 
 /// Gets the range of segment IDs present in the specified directory.
@@ -890,12 +890,12 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Corruption(err) => write!(f, "Corruption error: {}", err),
+            Error::Corruption(err) => write!(f, "Corruption error: {err}"),
             Error::SegmentClosed => write!(f, "Segment is closed"),
             Error::EmptyBuffer => write!(f, "Buffer is empty"),
-            Error::IO(err) => write!(f, "IO error: {}", err),
+            Error::IO(err) => write!(f, "IO error: {err}"),
             Error::Eof => write!(f, "EOF"),
-            Error::Poison(msg) => write!(f, "Lock Poison: {}", msg),
+            Error::Poison(msg) => write!(f, "Lock Poison: {msg}"),
             Error::RecordTooLarge => write!(
                 f,
                 "Record is too large to fit in a segment. Increase max segment size"
@@ -1235,14 +1235,14 @@ mod tests {
     fn segment_name_with_extension() {
         let index = 42;
         let ext = "log";
-        let expected = format!("{:020}.{}", index, ext);
+        let expected = format!("{index:020}.{ext}");
         assert_eq!(segment_name(index, ext), expected);
     }
 
     #[test]
     fn segment_name_without_extension() {
         let index = 42;
-        let expected = format!("{:020}", index);
+        let expected = format!("{index:020}");
         assert_eq!(segment_name(index, ""), expected);
     }
 

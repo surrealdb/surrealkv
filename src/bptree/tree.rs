@@ -41,20 +41,20 @@ pub enum BPlusTreeError {
 impl std::fmt::Display for BPlusTreeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BPlusTreeError::Io(e) => write!(f, "IO error: {}", e),
+            BPlusTreeError::Io(e) => write!(f, "IO error: {e}"),
             BPlusTreeError::DuplicateKey => write!(f, "Duplicate key"),
-            BPlusTreeError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
-            BPlusTreeError::Deserialization(msg) => write!(f, "Deserialization error: {}", msg),
+            BPlusTreeError::Serialization(msg) => write!(f, "Serialization error: {msg}"),
+            BPlusTreeError::Deserialization(msg) => write!(f, "Deserialization error: {msg}"),
             BPlusTreeError::InvalidOffset => write!(f, "Invalid offset"),
             BPlusTreeError::CorruptedFreeList(msg) => {
-                write!(f, "Corrupted free list: misaligned offset {}", msg)
+                write!(f, "Corrupted free list: misaligned offset {msg}")
             }
             BPlusTreeError::InvalidNodeType => write!(f, "Invalid node type"),
             BPlusTreeError::CorruptedTrunkPage(offset) => {
-                write!(f, "Corrupted trunk page at offset {}", offset)
+                write!(f, "Corrupted trunk page at offset {offset}")
             }
             BPlusTreeError::KeyValueTooLarge => write!(f, "Key-value pair too large"),
-            BPlusTreeError::Corruption(msg) => write!(f, "Corruption detected: {}", msg),
+            BPlusTreeError::Corruption(msg) => write!(f, "Corruption detected: {msg}"),
         }
     }
 }
@@ -138,8 +138,7 @@ impl Header {
         let version = u32::from_le_bytes(buffer[8..12].try_into().unwrap());
         if version != VERSION {
             return Err(BPlusTreeError::Deserialization(format!(
-                "Unsupported version: {}",
-                version
+                "Unsupported version: {version}"
             )));
         }
 
@@ -406,8 +405,7 @@ impl Node for InternalNode {
         // 7. Validate size before padding
         if total_used > available_space {
             return Err(BPlusTreeError::Serialization(format!(
-                "Internal node requires {} bytes (max {})",
-                total_used, available_space
+                "Internal node requires {total_used} bytes (max {available_space})"
             )));
         }
 
@@ -723,8 +721,7 @@ impl Node for LeafNode {
         // 7. Validate size before padding
         if total_used > available_space {
             return Err(BPlusTreeError::Serialization(format!(
-                "Leaf node requires {} bytes (max {})",
-                total_used, available_space
+                "Leaf node requires {total_used} bytes (max {available_space})"
             )));
         }
 
@@ -859,8 +856,7 @@ impl TrunkPage {
         // Check if num_free_pages is reasonable
         if num_free_pages > TRUNK_PAGE_MAX_ENTRIES {
             return Err(BPlusTreeError::Deserialization(format!(
-                "Invalid number of free pages in trunk: {} (max {})",
-                num_free_pages, TRUNK_PAGE_MAX_ENTRIES
+                "Invalid number of free pages in trunk: {num_free_pages} (max {TRUNK_PAGE_MAX_ENTRIES})"
             )));
         }
 
@@ -928,7 +924,7 @@ pub struct BPlusTree<S: Storage> {
 impl<S: Storage> Drop for BPlusTree<S> {
     fn drop(&mut self) {
         if let Err(e) = self.flush() {
-            eprintln!("Error during BPlusTree drop: {}", e);
+            eprintln!("Error during BPlusTree drop: {e}");
         }
     }
 }
@@ -1995,8 +1991,7 @@ impl<S: Storage> BPlusTree<S> {
         let len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
         if len > PAGE_SIZE - 4 {
             return Err(BPlusTreeError::Deserialization(format!(
-                "Invalid trunk page length {}",
-                len
+                "Invalid trunk page length {len}"
             )));
         }
 
@@ -2034,8 +2029,7 @@ impl<S: Storage> BPlusTree<S> {
         let len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
         if len > PAGE_SIZE - 4 {
             return Err(BPlusTreeError::Deserialization(format!(
-                "Invalid node length {}",
-                len
+                "Invalid node length {len}"
             )));
         }
 
@@ -2152,10 +2146,10 @@ impl<S: Storage> BPlusTree<S> {
 
         println!("B+ Tree Statistics:");
         println!("-------------------");
-        println!("Tree Height: {}", height);
-        println!("Total Nodes: {}", node_count);
-        println!("Total Keys: {}", total_keys);
-        println!("Leaf Nodes: {}", leaf_nodes);
+        println!("Tree Height: {height}");
+        println!("Total Nodes: {node_count}");
+        println!("Total Keys: {total_keys}");
+        println!("Leaf Nodes: {leaf_nodes}");
         println!("Internal Nodes: {}", node_count - leaf_nodes);
         println!("-------------------");
 
@@ -2403,14 +2397,14 @@ mod tests {
 
         // Insert 10 items
         for i in 0..10 {
-            let key = format!("key{:03}", i).into_bytes();
-            let value = format!("value{:03}", i).into_bytes();
+            let key = format!("key{i:03}").into_bytes();
+            let value = format!("value{i:03}").into_bytes();
             tree.insert(&key, &value).unwrap();
         }
 
         // Delete even numbered items
         for i in (0..10).step_by(2) {
-            let key = format!("key{:03}", i).into_bytes();
+            let key = format!("key{i:03}").into_bytes();
 
             // Verify key exists before deletion
             let _ = tree.search(&key).unwrap();
@@ -2429,8 +2423,8 @@ mod tests {
 
         // Verify all odd numbered items still exist
         for i in (1..10).step_by(2) {
-            let key = format!("key{:03}", i).into_bytes();
-            let value = format!("value{:03}", i).into_bytes();
+            let key = format!("key{i:03}").into_bytes();
+            let value = format!("value{i:03}").into_bytes();
 
             let result = tree.search(&key).unwrap();
 
@@ -2459,20 +2453,18 @@ mod tests {
 
         // Insert and immediately verify each key-value pair
         for i in 0..TEST_SIZE {
-            println!("Inserting key {}", i);
+            println!("Inserting key {i}");
             tree.insert(&keys[i], &values[i]).unwrap();
 
             let retrieved = tree.search(&keys[i]).unwrap();
             assert!(
                 retrieved.is_some(),
-                "Failed to retrieve just-inserted key at index {}",
-                i
+                "Failed to retrieve just-inserted key at index {i}"
             );
             assert_eq!(
                 retrieved.unwrap(),
                 values[i],
-                "Retrieved value doesn't match at index {}",
-                i
+                "Retrieved value doesn't match at index {i}"
             );
         }
 
@@ -2482,8 +2474,7 @@ mod tests {
             let exists = tree.search(&keys[i]).unwrap();
             assert!(
                 exists.is_some(),
-                "Key {} not found before deletion attempt",
-                i
+                "Key {i} not found before deletion attempt"
             );
 
             // Attempt deletion
@@ -2532,20 +2523,17 @@ mod tests {
             if i % 2 == 0 {
                 assert!(
                     retrieved.is_none(),
-                    "Value at index {} should have been deleted",
-                    i
+                    "Value at index {i} should have been deleted"
                 );
             } else {
                 assert!(
                     retrieved.is_some(),
-                    "Value at index {} should still exist",
-                    i
+                    "Value at index {i} should still exist"
                 );
                 assert_eq!(
                     retrieved.unwrap(),
                     values[i],
-                    "Retrieved value doesn't match at index {}",
-                    i
+                    "Retrieved value doesn't match at index {i}"
                 );
             }
         }
@@ -2553,7 +2541,7 @@ mod tests {
 
     fn generate_sequential_keys(n: usize) -> Vec<Vec<u8>> {
         (0..n)
-            .map(|i| format!("key{:010}", i).into_bytes())
+            .map(|i| format!("key{i:010}").into_bytes())
             .collect()
     }
 
@@ -2570,8 +2558,8 @@ mod tests {
 
         let mut data = Vec::new();
         for i in 0..TEST_SIZE {
-            let key = format!("key{:03}", i).into_bytes();
-            let value = format!("value{:03}", i).into_bytes();
+            let key = format!("key{i:03}").into_bytes();
+            let value = format!("value{i:03}").into_bytes();
             data.push((key, value));
         }
 
@@ -2751,8 +2739,7 @@ mod tests {
         let result = tree.insert(b"key", b"value2");
         assert!(
             matches!(result, Err(BPlusTreeError::DuplicateKey)),
-            "Expected DuplicateKey error, got {:?}",
-            result
+            "Expected DuplicateKey error, got {result:?}"
         );
     }
 
@@ -2762,27 +2749,27 @@ mod tests {
         let mut tree = create_test_tree();
         // Insert enough to cause multiple splits
         for i in 0..(max_keys * 3) {
-            let key = format!("key{}", i).into_bytes();
-            let value = format!("value{}", i).into_bytes();
+            let key = format!("key{i}").into_bytes();
+            let value = format!("value{i}").into_bytes();
             tree.insert(&key, &value).unwrap();
         }
 
         // Verify all exist
         for i in 0..(max_keys * 3) {
-            let key = format!("key{}", i).into_bytes();
+            let key = format!("key{i}").into_bytes();
             assert!(tree.search(&key).unwrap().is_some());
         }
 
         // Delete all in reverse order
         for i in (0..(max_keys * 3)).rev() {
-            let key = format!("key{}", i).into_bytes();
+            let key = format!("key{i}").into_bytes();
             println!("Deleting key: {:?}", String::from_utf8_lossy(&key));
             assert!(tree.delete(&key).unwrap().is_some());
         }
 
         // Verify all deleted
         for i in 0..(max_keys * 3) {
-            let key = format!("key{}", i).into_bytes();
+            let key = format!("key{i}").into_bytes();
             assert!(tree.search(&key).unwrap().is_none());
         }
     }
@@ -2874,7 +2861,7 @@ mod tests {
         // Test first and last positions in nodes
         let mut keys = Vec::new();
         for i in 0..max_keys * 2 {
-            keys.push(format!("key{:04}", i).into_bytes());
+            keys.push(format!("key{i:04}").into_bytes());
         }
 
         for key in &keys {
@@ -3241,8 +3228,8 @@ mod tests {
         // Generate test data
         let test_data: Vec<(Vec<u8>, Vec<u8>)> = (0..num_items)
             .map(|i| {
-                let key = format!("key_{}", i).into_bytes();
-                let value = format!("value_{}", i).into_bytes();
+                let key = format!("key_{i}").into_bytes();
+                let value = format!("value_{i}").into_bytes();
                 (key, value)
             })
             .collect();
@@ -3513,8 +3500,8 @@ mod tests {
         let mut tree = create_test_tree();
         // Insert 10000 keys
         for i in 0..10000 {
-            let key = format!("key_{:05}", i).into_bytes();
-            let value = format!("value_{:05}", i).into_bytes();
+            let key = format!("key_{i:05}").into_bytes();
+            let value = format!("value_{i:05}").into_bytes();
             tree.insert(&key, &value).unwrap();
         }
 
@@ -3523,8 +3510,8 @@ mod tests {
         let end = b"key_05500";
         let mut iter = tree.range(start, end).unwrap();
         for i in 5000..=5500 {
-            let expected_key = format!("key_{:05}", i).into_bytes();
-            let expected_value = format!("value_{:05}", i).into_bytes();
+            let expected_key = format!("key_{i:05}").into_bytes();
+            let expected_value = format!("value_{i:05}").into_bytes();
             assert_eq!(
                 iter.next().unwrap().unwrap(),
                 (expected_key, expected_value)
@@ -3538,8 +3525,8 @@ mod tests {
         let mut tree = create_test_tree();
         // Insert keys with prefix "pre_"
         for i in 0..1000 {
-            let key = format!("pre_{:04}", i).into_bytes();
-            let value = format!("val_{:04}", i).into_bytes();
+            let key = format!("pre_{i:04}").into_bytes();
+            let value = format!("val_{i:04}").into_bytes();
             tree.insert(&key, &value).unwrap();
         }
 
@@ -3549,8 +3536,8 @@ mod tests {
 
         let mut iter = tree.prefix(b"pre_").unwrap();
         for i in 0..1000 {
-            let expected_key = format!("pre_{:04}", i).into_bytes();
-            let expected_value = format!("val_{:04}", i).into_bytes();
+            let expected_key = format!("pre_{i:04}").into_bytes();
+            let expected_value = format!("val_{i:04}").into_bytes();
             assert_eq!(
                 iter.next().unwrap().unwrap(),
                 (expected_key, expected_value)
@@ -3564,11 +3551,11 @@ mod tests {
     }
 
     fn key(i: u32) -> Vec<u8> {
-        format!("key{:010}", i).into_bytes()
+        format!("key{i:010}").into_bytes()
     }
 
     fn value(i: u32) -> Vec<u8> {
-        format!("value{:010}", i).into_bytes()
+        format!("value{i:010}").into_bytes()
     }
 
     #[test]
@@ -3594,20 +3581,18 @@ mod tests {
             for i in (0..insert_count).step_by(2) {
                 assert!(
                     tree.search(&key(i)).unwrap().is_none(),
-                    "Deleted key {} should not exist",
-                    i
+                    "Deleted key {i} should not exist"
                 );
             }
 
             // Check items that weren't deleted
             for i in (1..insert_count).step_by(2) {
                 let result = tree.search(&key(i)).unwrap();
-                assert!(result.is_some(), "Non-deleted key {} should exist", i);
+                assert!(result.is_some(), "Non-deleted key {i} should exist");
                 assert_eq!(
                     result.unwrap(),
                     value(i),
-                    "Value for key {} is incorrect",
-                    i
+                    "Value for key {i} is incorrect"
                 );
             }
         }
@@ -3702,32 +3687,29 @@ mod tests {
             for i in (0..insert_count).step_by(2) {
                 assert!(
                     tree.search(&key(i)).unwrap().is_none(),
-                    "Deleted key {} should not exist",
-                    i
+                    "Deleted key {i} should not exist"
                 );
             }
 
             // Check items that weren't deleted
             for i in (1..insert_count).step_by(2) {
                 let result = tree.search(&key(i)).unwrap();
-                assert!(result.is_some(), "Non-deleted key {} should exist", i);
+                assert!(result.is_some(), "Non-deleted key {i} should exist");
                 assert_eq!(
                     result.unwrap(),
                     value(i),
-                    "Value for key {} is incorrect",
-                    i
+                    "Value for key {i} is incorrect"
                 );
             }
 
             // Check newly inserted items
             for i in insert_count..(insert_count + 100) {
                 let result = tree.search(&key(i)).unwrap();
-                assert!(result.is_some(), "Newly inserted key {} should exist", i);
+                assert!(result.is_some(), "Newly inserted key {i} should exist");
                 assert_eq!(
                     result.unwrap(),
                     value(i),
-                    "Value for key {} is incorrect",
-                    i
+                    "Value for key {i} is incorrect"
                 );
             }
 
@@ -3895,13 +3877,12 @@ mod tests {
                 let result = tree.search(&unique_key).unwrap();
                 assert!(
                     result.is_some(),
-                    "Failed to retrieve just-inserted key of size {}",
-                    key_size
+                    "Failed to retrieve just-inserted key of size {key_size}"
                 );
                 assert_eq!(result.unwrap(), fixed_value);
             }
 
-            println!("Testing deletion for key size {}", key_size);
+            println!("Testing deletion for key size {key_size}");
 
             // Delete every other key (evens)
             for (idx, key) in all_keys.iter().enumerate() {
@@ -3910,17 +3891,14 @@ mod tests {
                     let result = tree.delete(key).unwrap();
                     assert!(
                         result.is_some(),
-                        "Failed to delete key of size {} at index {}",
-                        key_size,
-                        idx
+                        "Failed to delete key of size {key_size} at index {idx}"
                     );
                     assert_eq!(result.unwrap(), fixed_value);
 
                     // Verify the key no longer exists
                     assert!(
                         tree.search(key).unwrap().is_none(),
-                        "Key of size {} still exists after deletion",
-                        key_size
+                        "Key of size {key_size} still exists after deletion"
                     );
                 }
             }
@@ -3931,8 +3909,7 @@ mod tests {
                     let result = tree.search(key).unwrap();
                     assert!(
                         result.is_some(),
-                        "Odd-indexed key of size {} missing after deletion of even keys",
-                        key_size
+                        "Odd-indexed key of size {key_size} missing after deletion of even keys"
                     );
                     assert_eq!(result.unwrap(), fixed_value);
                 }
@@ -3958,12 +3935,12 @@ mod tests {
 
         // Phase 1: Insert many keys of varying sizes
         let num_initial = 100;
-        println!("Phase 1: Inserting {} initial keys", num_initial);
+        println!("Phase 1: Inserting {num_initial} initial keys");
 
         for i in 0..num_initial {
             // Create key with sequence number and random size
             let key_size = rng.gen_range(10..400);
-            let mut key = format!("key_{:05}_", i).into_bytes();
+            let mut key = format!("key_{i:05}_").into_bytes();
             key.extend(vec![b'k'; key_size - key.len()]);
 
             let value_size = rng.gen_range(10..200);
@@ -3982,7 +3959,7 @@ mod tests {
 
         // Phase 2: Delete random keys
         let num_deletions = 40;
-        println!("Phase 2: Deleting {} random keys", num_deletions);
+        println!("Phase 2: Deleting {num_deletions} random keys");
 
         let mut keys_to_delete = active_keys.iter().cloned().collect::<Vec<_>>();
         for _ in 0..num_deletions {
@@ -4006,8 +3983,7 @@ mod tests {
         // Phase 3: Insert more keys, some very large
         let num_additional = 30;
         println!(
-            "Phase 3: Inserting {} additional keys, some very large",
-            num_additional
+            "Phase 3: Inserting {num_additional} additional keys, some very large"
         );
 
         for i in 0..num_additional {
@@ -4018,7 +3994,7 @@ mod tests {
                 rng.gen_range(10..200)
             };
 
-            let mut key = format!("additional_{:05}_", i).into_bytes();
+            let mut key = format!("additional_{i:05}_").into_bytes();
             key.extend(vec![b'k'; key_size - key.len()]);
 
             let value_size = rng.gen_range(10..100);
@@ -4304,7 +4280,7 @@ mod tests {
         // Verify the error is a corruption error
         match result {
             Err(BPlusTreeError::Corruption(_)) => (),
-            _ => panic!("Expected corruption error, got {:?}", result),
+            _ => panic!("Expected corruption error, got {result:?}"),
         }
     }
 

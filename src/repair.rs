@@ -172,7 +172,7 @@ fn repair_segment(
 
     // Open the next segment and make it active
     if count == 0 {
-        println!("deleting empty file {:?}", corrupted_segment_file_path);
+        println!("deleting empty file {corrupted_segment_file_path:?}");
         std::fs::remove_file(&corrupted_segment_file_path)?;
     }
 
@@ -215,7 +215,7 @@ pub fn restore_repair_files(directory: &str) -> std::io::Result<()> {
             // If the filename ends with '.repair'
             if let Some(stem) = filename.strip_suffix(".repair") {
                 // Construct the filename of the corresponding '.clog' file
-                let clog_filename = format!("{}.clog", stem);
+                let clog_filename = format!("{stem}.clog");
                 let clog_path = Path::new(&directory).join(clog_filename);
                 // If the '.clog' file exists
                 if clog_path.exists() {
@@ -266,8 +266,7 @@ mod tests {
             // Subtract 1 for the header line
             Ok(if count > 0 { count - 1 } else { 0 })
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "Failed to execute lsof",
             ))
         }
@@ -343,8 +342,7 @@ mod tests {
                     return (err.segment_id, err.offset);
                 }
                 Err(err) => panic!(
-                    "Expected a CorruptionError, but got a different error {}",
-                    err
+                    "Expected a CorruptionError, but got a different error {err}"
                 ),
             }
         }

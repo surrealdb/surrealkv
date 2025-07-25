@@ -391,7 +391,7 @@ impl DiscardStats {
             // We need to get the total file size to calculate percentage
             // For now, we'll use a simple heuristic - we can improve this later
             // by also tracking total segment sizes in the discard stats
-            if let Ok(metadata) = std::fs::metadata(format!("{:020}.clog", file_id)) {
+            if let Ok(metadata) = std::fs::metadata(format!("{file_id:020}.clog")) {
                 let total_size = metadata.len();
                 if total_size > 0 {
                     let discard_percentage = (discard_bytes as f64 / total_size as f64) * 100.0;
