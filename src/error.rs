@@ -150,9 +150,3 @@ impl From<revision::Error> for Error {
         Error::RevisionError(err.to_string())
     }
 }
-
-impl From<crate::bptree::tree::BPlusTreeError> for Error {
-    fn from(err: crate::bptree::tree::BPlusTreeError) -> Self {
-        Error::CustomError(format!("BPlusTree error: {err}"))
-    }
-}

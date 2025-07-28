@@ -19,6 +19,11 @@ impl Indexer {
         Self { index }
     }
 
+    /// Creates a snapshot of the current state of the index.
+    pub(crate) fn snapshot(&self) -> VartIndex<VariableSizeKey, IndexValue> {
+        self.index.clone()
+    }
+
     pub fn insert(
         &mut self,
         key: &mut VariableSizeKey,

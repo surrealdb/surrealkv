@@ -4,6 +4,7 @@ use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
 use crate::log::SegmentRef;
 use crate::store::Store;
+use vart::VariableSizeKey;
 
 struct CompactionGuard<'a> {
     is_compacting: &'a AtomicBool,
@@ -60,8 +61,10 @@ impl Store {
         // Clean up discard stats for compacted segments
         {
             let mut discard_stats = self.core.discard_stats.write();
-            for segment in &segments_to_compact {
-                discard_stats.remove_file(segment.id);
+            if let Some(discard_stats) = discard_stats.as_mut() {
+                for segment in &segments_to_compact {
+                    discard_stats.remove_file(segment.id);
+                }
             }
         }
 
@@ -75,8 +78,11 @@ impl Store {
         let discard_stats = self.core.discard_stats.read();
         let clog_dir = self.core.opts.dir.join("clog");
 
-        let segment_ids_to_compact =
-            discard_stats.get_segments_exceeding_threshold(deletion_threshold, &clog_dir);
+        let segment_ids_to_compact = if let Some(discard_stats) = discard_stats.as_ref() {
+            discard_stats.get_segments_exceeding_threshold(deletion_threshold, &clog_dir)
+        } else {
+            Vec::new()
+        };
 
         // Read all segments from directory to get properly formatted SegmentRef objects
         let all_segments = SegmentRef::read_segments_from_directory(&clog_dir)?;
@@ -95,10 +101,17 @@ impl Store {
         use crate::log::MultiSegmentReader;
         use crate::reader::{Reader, RecordReader};
 
-        let delete_list = self.core.global_delete_list.read();
         let mut live_entries = Vec::new();
 
-        // Read all live entries from segments that need compaction
+        // Take a snapshot of the index to check which keys are still alive
+        let index_snapshot = {
+            let snapshot_lock = self.core.indexer.read();
+            let snapshot = snapshot_lock.snapshot();
+            let snapshot_version = snapshot_lock.version();
+            (snapshot, snapshot_version)
+        };
+
+        // Read all entries from segments that need compaction
         for segment in segments {
             // Use the segment with its proper header offset (don't create a new one)
             let reader = MultiSegmentReader::new(vec![SegmentRef {
@@ -114,18 +127,27 @@ impl Store {
                 record.reset();
                 match record_reader.read_into(&mut record) {
                     Ok(_) => {
-                        // Check if this key is NOT in the global delete list (i.e., it's still active)
-                        if delete_list.search(&record.key).unwrap_or(None).is_none() {
-                            // This key is still active, convert to Entry and add to live entries
-                            let mut entry = Entry::new(&record.key, &record.value);
-                            if let Some(metadata) = record.metadata.clone() {
-                                entry.set_metadata(metadata);
+                        // Create a variable size key from the record's key
+                        let var_key = VariableSizeKey::from(record.key.to_vec());
+
+                        // Check if this key exists in the index (either normal or soft-deleted)
+                        if let Some((index_value, _, _)) =
+                            index_snapshot.0.get(&var_key, index_snapshot.1)
+                        {
+                            // Only keep entries that match this segment
+                            // IMPORTANT: For soft deletes, include them even if deleted() is true
+                            if index_value.segment_id() == segment.id {
+                                // This entry is in the index, convert to Entry and add to live entries
+                                let mut entry = Entry::new(&record.key, &record.value);
+                                if let Some(metadata) = record.metadata.clone() {
+                                    entry.set_metadata(metadata);
+                                }
+                                entry.set_ts(record.ts);
+                                live_entries.push(entry);
+                                self.stats.compaction_stats.add_record();
                             }
-                            entry.set_ts(record.ts);
-                            live_entries.push(entry);
-                            self.stats.compaction_stats.add_record();
                         } else {
-                            // Key is deleted, increment deleted counter
+                            // Key is no longer in the index (hard deleted), increment deleted counter
                             self.stats.compaction_stats.delete_record();
                         }
                     }

@@ -1,4 +1,3 @@
-mod bptree;
 mod compaction;
 mod discard;
 mod entry;

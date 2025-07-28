@@ -6,7 +6,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::vec;
 
-use crate::bptree::tree::{new_disk_tree, DiskBPlusTree};
 use crate::discard::DiscardStats;
 use crate::entry::{Entry, Record};
 use crate::error::{Error, Result};
@@ -117,10 +116,8 @@ pub struct Core {
     /// storing offsets that are frequently accessed (especially in
     /// the case of range scans)
     pub(crate) value_cache: ValueCache,
-    /// Global delete list using B+ tree to track all deleted keys for compaction
-    pub(crate) global_delete_list: RwLock<DiskBPlusTree>,
     /// Discard statistics for efficient compaction decisions
-    pub(crate) discard_stats: RwLock<DiscardStats>,
+    pub(crate) discard_stats: RwLock<Option<DiscardStats>>,
     /// Flag to indicate if the store is closed.
     is_closed: AtomicBool,
     /// Write lock to ensure that only one transaction can commit at a time.
@@ -130,16 +127,6 @@ pub struct Core {
 impl Core {
     fn initialize_indexer() -> Indexer {
         Indexer::new()
-    }
-
-    // Initialize the global delete list B+ tree for tracking deleted keys during compaction
-    fn initialize_global_delete_list(opts: &Options) -> Result<DiskBPlusTree> {
-        let delete_list_dir = opts.dir.join("delete_list");
-        std::fs::create_dir_all(&delete_list_dir).map_err(|e| Error::IoError(Arc::new(e)))?;
-
-        let delete_list_path = delete_list_dir.join("global_deletes.db");
-        new_disk_tree(delete_list_path, Box::new(|a, b| a.cmp(b)))
-            .map_err(|_| Error::CustomError("Failed to initialize global delete list".to_string()))
     }
 
     // Initialize the discard statistics for tracking segment discard information
@@ -206,11 +193,12 @@ impl Core {
             ByteWeighter,
         );
 
-        // Initialize global delete list for compaction (always disk-based for persistence)
-        let global_delete_list = Self::initialize_global_delete_list(&opts)?;
-
         // Initialize discard statistics for compaction optimization
-        let discard_stats = Self::initialize_discard_stats(&opts)?;
+        let discard_stats = if opts.should_persist_data() {
+            Some(Self::initialize_discard_stats(&opts)?)
+        } else {
+            None
+        };
 
         // Construct and return the Core instance.
         Ok(Self {
@@ -219,7 +207,6 @@ impl Core {
             clog: clog.map(Arc::new),
             oracle,
             value_cache,
-            global_delete_list: RwLock::new(global_delete_list),
             discard_stats: RwLock::new(discard_stats),
             is_closed: AtomicBool::new(false),
             commit_write_lock: Mutex::new(()),
@@ -348,9 +335,9 @@ impl Core {
             return Ok(());
         }
 
-        self.discard_stats.write().sync()?;
-
-        self.global_delete_list.write().close()?;
+        if let Some(discard_stats) = self.discard_stats.write().as_mut() {
+            discard_stats.sync()?;
+        }
 
         // Close the commit log if it exists
         if let Some(clog) = &self.clog {
@@ -480,17 +467,11 @@ impl Core {
 
                     index.delete(&mut entry.key[..].into());
 
-                    // Add the deleted key to the global delete list for compaction
-                    {
-                        let mut delete_list = self.global_delete_list.write();
-                        // Use empty value since we only care about tracking the key
-                        delete_list.insert(&entry.key, &[]).unwrap();
-                    }
-
                     // Update discard statistics using the segment info we got before deletion
                     if let Some((segment_id, entry_size)) = segment_info {
-                        let mut discard_stats = self.discard_stats.write();
-                        discard_stats.update(segment_id, entry_size as i64);
+                        if let Some(discard_stats) = self.discard_stats.write().as_mut() {
+                            discard_stats.update(segment_id, entry_size as i64);
+                        }
                     }
 
                     continue;
