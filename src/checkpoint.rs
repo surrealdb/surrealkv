@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
-use crate::lsm::{CoreInner, LEVELS_MANIFEST_FILE, TABLE_FOLDER};
+use crate::lsm::{CompactionOperations, CoreInner, LEVELS_MANIFEST_FILE, TABLE_FOLDER};
 
 /// Current checkpoint metadata format version
 const CHECKPOINT_VERSION: u32 = 1;
@@ -88,33 +88,32 @@ impl CheckpointMetadata {
         // Read version first
         let version = reader
             .read_u32::<BigEndian>()
-            .map_err(|e| Error::Other(format!("Failed to read version: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to read version: {e}")))?;
 
         // Check if we can handle this version
         if version > CHECKPOINT_VERSION {
             return Err(Error::Other(format!(
-                "Unsupported checkpoint version: {}. Current version: {}",
-                version, CHECKPOINT_VERSION
+                "Unsupported checkpoint version: {version}. Current version: {CHECKPOINT_VERSION}"
             )));
         }
 
         // Read remaining fields
         let timestamp = reader
             .read_u64::<BigEndian>()
-            .map_err(|e| Error::Other(format!("Failed to read timestamp: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to read timestamp: {e}")))?;
 
         let sequence_number = reader
             .read_u64::<BigEndian>()
-            .map_err(|e| Error::Other(format!("Failed to read sequence_number: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to read sequence_number: {e}")))?;
 
         let sstable_count = reader
             .read_u64::<BigEndian>()
-            .map_err(|e| Error::Other(format!("Failed to read sstable_count: {}", e)))?
+            .map_err(|e| Error::Other(format!("Failed to read sstable_count: {e}")))?
             as usize;
 
         let total_size = reader
             .read_u64::<BigEndian>()
-            .map_err(|e| Error::Other(format!("Failed to read total_size: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to read total_size: {e}")))?;
 
         Ok(CheckpointMetadata {
             version,
@@ -243,8 +242,6 @@ impl DatabaseCheckpoint {
 
     /// Flushes all memtables to ensure checkpoint consistency
     fn flush_all_memtables(&self) -> Result<()> {
-        use crate::lsm::CompactionOperations;
-
         // Keep calling compact_memtable until all memtables (active + immutable) are flushed
         // compact_memtable already handles the logic of checking if there's anything to flush
         loop {
@@ -448,7 +445,7 @@ mod tests {
 
         // Test future version rejection
         let mut future_data = Vec::new();
-        future_data.extend_from_slice(&999u32.to_le_bytes()); // version 999
+        future_data.extend_from_slice(&999u32.to_be_bytes()); // version 999
         future_data.extend_from_slice(&[0u8; 32]); // dummy data
 
         let result = CheckpointMetadata::from_bytes(&future_data);
@@ -468,7 +465,7 @@ mod tests {
         // 4 bytes version + 8 bytes timestamp + 8 bytes seq + 8 bytes count + 8 bytes size = 36 bytes
         assert_eq!(bytes.len(), 36);
 
-        // Check that version is at the beginning (little endian)
+        // Check that version is at the beginning (big endian)
         assert_eq!(&bytes[0..4], &1u32.to_be_bytes());
     }
 }

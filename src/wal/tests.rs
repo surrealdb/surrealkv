@@ -33,7 +33,7 @@ fn test_cleanup_old_segments() {
     for segment in 0..5 {
         // Write records to current segment
         for i in 0..10 {
-            let data = format!("seg{}_record_{:02}", segment, i).into_bytes();
+            let data = format!("seg{segment}_record_{i:02}").into_bytes();
             wal.append(&data).unwrap();
         }
 
@@ -57,8 +57,7 @@ fn test_cleanup_old_segments() {
     // Verify at least 4 segments were removed (keeping only the latest)
     assert!(
         removed_count >= 4,
-        "Expected at least 4 segments to be removed, got {}",
-        removed_count
+        "Expected at least 4 segments to be removed, got {removed_count}"
     );
 
     // Verify only the latest segment remains
@@ -91,7 +90,7 @@ fn test_wal_replay_latest_segment_only() {
 
     // Write 10 records to first segment
     for i in 0..10 {
-        let data = format!("test_record_{:02}", i).into_bytes();
+        let data = format!("test_record_{i:02}").into_bytes();
         wal.append(&data).unwrap();
     }
 
@@ -100,7 +99,7 @@ fn test_wal_replay_latest_segment_only() {
 
     // Write 10 records to second segment
     for i in 10..20 {
-        let data = format!("test_record_{:02}", i).into_bytes();
+        let data = format!("test_record_{i:02}").into_bytes();
         wal.append(&data).unwrap();
     }
 
@@ -110,8 +109,8 @@ fn test_wal_replay_latest_segment_only() {
     // Write batch records to third segment (latest)
     let mut batch = Batch::new();
     for i in 20..25 {
-        let key = format!("key_{:02}", i);
-        let value = format!("value_{:02}", i);
+        let key = format!("key_{i:02}");
+        let value = format!("value_{i:02}");
         batch.set(key.as_bytes(), value.as_bytes()).unwrap();
     }
 
@@ -142,8 +141,7 @@ fn test_wal_replay_latest_segment_only() {
     // Verify no corruption was detected
     assert!(
         corruption_info.is_none(),
-        "Expected no corruption, but got: {:?}",
-        corruption_info
+        "Expected no corruption, but got: {corruption_info:?}"
     );
 
     // Verify sequence number is from the latest segment (100)
@@ -184,7 +182,7 @@ fn test_wal_with_zero_padding_eof_handling() {
             assert_eq!(data, small_data);
         }
         Err(e) => {
-            panic!("Failed to read data: {}", e);
+            panic!("Failed to read data: {e}");
         }
     }
 
@@ -200,14 +198,14 @@ fn test_wal_with_zero_padding_eof_handling() {
                     if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
                         // Expected EOF error
                     } else {
-                        panic!("Got unexpected IO error: {}", io_err);
+                        panic!("Got unexpected IO error: {io_err}");
                     }
                 }
                 crate::wal::segment::Error::Corruption(_) => {
-                    panic!("Got corruption error when expecting EOF: {}", e);
+                    panic!("Got corruption error when expecting EOF: {e}");
                 }
                 _ => {
-                    panic!("Got unexpected error type: {}", e);
+                    panic!("Got unexpected error type: {e}");
                 }
             }
         }
@@ -246,17 +244,14 @@ fn test_empty_wal_segment() {
                     if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
                         // Expected EOF error from empty segment
                     } else {
-                        panic!("Got unexpected IO error from empty segment: {}", io_err);
+                        panic!("Got unexpected IO error from empty segment: {io_err}");
                     }
                 }
                 crate::wal::segment::Error::Corruption(_) => {
-                    panic!(
-                        "Got corruption error from empty segment when expecting EOF: {}",
-                        e
-                    );
+                    panic!("Got corruption error from empty segment when expecting EOF: {e}");
                 }
                 _ => {
-                    panic!("Got unexpected error type from empty segment: {}", e);
+                    panic!("Got unexpected error type from empty segment: {e}");
                 }
             }
         }

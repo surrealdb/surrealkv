@@ -263,7 +263,7 @@ mod tests {
         let mut keys = Vec::with_capacity(num_items);
         for i in 0..num_items {
             // Create internal key
-            let user_key = format!("key_{:05}", i);
+            let user_key = format!("key_{i:05}");
             let internal_key = InternalKey::new(
                 user_key.as_bytes().to_vec(),
                 (i + 1) as u64, // sequence numbers
@@ -311,14 +311,12 @@ mod tests {
         // Log false positive rate
         let false_positive_rate = (false_positives as f64 / num_samples as f64) * 100.0;
         println!(
-            "False positive rate: {:.2}% ({} out of {})",
-            false_positive_rate, false_positives, num_samples
+            "False positive rate: {false_positive_rate:.2}% ({false_positives} out of {num_samples})"
         );
 
         assert!(
             false_positive_rate < 2.0,
-            "False positive rate too high: {:.2}%",
-            false_positive_rate
+            "False positive rate too high: {false_positive_rate:.2}%"
         );
     }
 

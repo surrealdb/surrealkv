@@ -272,7 +272,7 @@ mod tests {
         let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
 
         for i in 0..10 {
-            let key = create_internal_key(format!("key{}", i).as_bytes().to_vec(), i as u64);
+            let key = create_internal_key(format!("key{i}").as_bytes().to_vec(), i as u64);
             let handle = vec![i as u8; 10]; // 10-byte handle
             writer.add(&key, &handle).unwrap();
         }
@@ -382,12 +382,11 @@ mod tests {
             match expected {
                 Some(expected_key) => {
                     let handle = result.expect("Expected a block handle but got None");
-                    assert_eq!(handle.user_key, *expected_key, "Mismatch for key {:?}", key);
+                    assert_eq!(handle.user_key, *expected_key, "Mismatch for key {key:?}");
                 }
                 None => assert!(
                     result.is_none(),
-                    "Expected None for key {:?}, but got Some",
-                    key
+                    "Expected None for key {key:?}, but got Some"
                 ),
             }
         }
@@ -432,11 +431,7 @@ mod tests {
         for (key, _) in &entries {
             // Pass user key directly instead of encoding as internal key
             let block = index.get(key.as_bytes()).unwrap();
-            assert!(
-                block.size() > 0,
-                "Block should not be empty for key {}",
-                key
-            );
+            assert!(block.size() > 0, "Block should not be empty for key {key}");
 
             // Verify the block contains the expected handle by checking if we can find it
             let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
@@ -444,8 +439,7 @@ mod tests {
             block_iter.seek(&internal_key);
             assert!(
                 block_iter.valid(),
-                "Block iterator should be valid for key {}",
-                key
+                "Block iterator should be valid for key {key}"
             );
         }
 
@@ -464,7 +458,7 @@ mod tests {
             Err(Error::BlockNotFound) => {
                 // This is also acceptable for keys completely out of range
             }
-            Err(e) => panic!("Unexpected error for key after range: {:?}", e),
+            Err(e) => panic!("Unexpected error for key after range: {e:?}"),
         }
     }
 }

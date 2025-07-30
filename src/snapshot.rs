@@ -9,7 +9,7 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
-use crate::{Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
 
 // ===== Snapshot Counter =====
@@ -154,7 +154,7 @@ impl Snapshot {
         &self,
         start: K,
         end: K,
-    ) -> Result<impl Iterator<Item = (Key, Value)>> {
+    ) -> Result<impl Iterator<Item = IterResult>> {
         // Create a range from start (inclusive) to end (inclusive)
         let range = start.as_ref().to_vec()..=end.as_ref().to_vec();
         SnapshotIterator::new_from(self.core.clone(), self.seq_num, range)
@@ -200,7 +200,9 @@ impl SnapshotIterator<'_> {
         let end = range.end_bound().map(|v| v.clone());
 
         // Increment VLog iterator count
-        core.vlog.incr_iterator_count();
+        if let Some(ref vlog) = core.vlog {
+            vlog.incr_iterator_count();
+        }
 
         Ok(Self {
             snapshot_merge_iter: SnapshotMergeIterator::new_from(iter_state, seq_num, (start, end)),
@@ -210,18 +212,28 @@ impl SnapshotIterator<'_> {
 }
 
 impl Iterator for SnapshotIterator<'_> {
-    type Item = (Key, Value);
+    type Item = IterResult;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.snapshot_merge_iter.next()
+        if let Some((key, value)) = self.snapshot_merge_iter.next() {
+            // Resolve value pointers to actual values
+            match self.core.resolve_value(&value) {
+                Ok(resolved_value) => Some(Ok((key, resolved_value.into()))),
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        }
     }
 }
 
 impl Drop for SnapshotIterator<'_> {
     fn drop(&mut self) {
         // Decrement VLog iterator count when iterator is dropped
-        if let Err(e) = self.core.vlog.decr_iterator_count() {
-            eprintln!("Warning: Failed to decrement VLog iterator count: {}", e);
+        if let Some(ref vlog) = self.core.vlog {
+            if let Err(e) = vlog.decr_iterator_count() {
+                eprintln!("Warning: Failed to decrement VLog iterator count: {e}");
+            }
         }
     }
 }
@@ -514,7 +526,11 @@ mod tests {
         let tx = store.begin().unwrap();
 
         // Range scan should return empty
-        let range: Vec<_> = tx.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
+        let range: Vec<_> = tx
+            .range(b"a", b"z", None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert!(range.is_empty());
     }
@@ -546,7 +562,8 @@ mod tests {
         let range: Vec<_> = read_tx
             .range(b"key0", b"key9", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].0.as_ref(), b"key1");
@@ -580,7 +597,8 @@ mod tests {
         let range: Vec<_> = read_tx
             .range(b"key0", b"key9", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].1.as_ref(), b"value1_v1");
@@ -591,7 +609,8 @@ mod tests {
         let range: Vec<_> = new_tx
             .range(b"key0", b"key9", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].1.as_ref(), b"value1_v2");
@@ -625,7 +644,8 @@ mod tests {
         let range: Vec<_> = read_tx1
             .range(b"key0", b"key9", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 3);
         assert_eq!(range[0].0.as_ref(), b"key1");
@@ -637,7 +657,8 @@ mod tests {
         let range: Vec<_> = read_tx2
             .range(b"key0", b"key9", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].0.as_ref(), b"key1");
@@ -692,8 +713,8 @@ mod tests {
         {
             let mut tx = store.begin().unwrap();
             for i in 1..=10 {
-                let key = format!("key{:02}", i);
-                let value = format!("value{}", i);
+                let key = format!("key{i:02}");
+                let value = format!("value{i}");
                 tx.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
             tx.commit().await.unwrap();
@@ -706,8 +727,8 @@ mod tests {
             let mut tx = store.begin().unwrap();
             // Update even keys
             for i in (2..=10).step_by(2) {
-                let key = format!("key{:02}", i);
-                let value = format!("value{}_updated", i);
+                let key = format!("key{i:02}");
+                let value = format!("value{i}_updated");
                 tx.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
             // Delete keys 3, 6, 9
@@ -723,10 +744,12 @@ mod tests {
         let range1: Vec<_> = snapshot1
             .range(b"key00", b"key99", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range1.len(), 10);
-        for (i, (key, value)) in range1.iter().enumerate() {
+        for (i, item) in range1.iter().enumerate() {
+            let (key, value) = item;
             let expected_key = format!("key{:02}", i + 1);
             let expected_value = format!("value{}", i + 1);
             assert_eq!(key.as_ref(), expected_key.as_bytes());
@@ -737,22 +760,24 @@ mod tests {
         let range2: Vec<_> = snapshot2
             .range(b"key00", b"key99", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
         // Check that deleted keys are not present
-        let keys: HashSet<_> = range2.iter().map(|(k, _)| k.as_ref()).collect();
+        let keys: HashSet<_> = range2.iter().map(|item| item.0.as_ref()).collect();
         assert!(!keys.contains(&b"key03".as_ref()));
         assert!(!keys.contains(&b"key06".as_ref()));
         assert!(!keys.contains(&b"key09".as_ref()));
 
         // Check that even keys are updated
-        for (key, value) in &range2 {
+        for item in &range2 {
+            let (key, value) = item;
             let key_str = String::from_utf8_lossy(key.as_ref());
             if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
                 if num % 2 == 0 {
-                    let expected_value = format!("value{}_updated", num);
+                    let expected_value = format!("value{num}_updated");
                     assert_eq!(value.as_ref(), expected_value.as_bytes());
                 }
             }
@@ -802,7 +827,7 @@ mod tests {
             let mut tx = store.begin().unwrap();
             // Numeric keys
             for i in 0..10 {
-                let key = format!("{:03}", i);
+                let key = format!("{i:03}");
                 tx.set(key.as_bytes(), b"numeric").unwrap();
             }
             // Alpha keys
@@ -811,7 +836,7 @@ mod tests {
             }
             // Mixed keys
             for i in 0..5 {
-                let key = format!("mix{}key", i);
+                let key = format!("mix{i}key");
                 tx.set(key.as_bytes(), b"mixed").unwrap();
             }
             tx.commit().await.unwrap();
@@ -861,7 +886,8 @@ mod tests {
         let range: Vec<_> = snapshot
             .range(b"key00", b"key99", None)
             .unwrap()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(range.len(), 9);
 
@@ -871,7 +897,7 @@ mod tests {
         }
 
         // Verify no duplicates
-        let keys: HashSet<_> = range.iter().map(|(k, _)| k.as_ref()).collect();
+        let keys: HashSet<_> = range.iter().map(|item| item.0.as_ref()).collect();
         assert_eq!(keys.len(), range.len());
     }
 

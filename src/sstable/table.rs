@@ -84,8 +84,7 @@ impl Footer {
     pub fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
         if file_size < TABLE_FULL_FOOTER_LENGTH {
             return Err(Error::CorruptedBlock(format!(
-                "invalid table (file size is too small: {} bytes)",
-                file_size
+                "invalid table (file size is too small: {file_size} bytes)"
             )));
         }
 
@@ -125,8 +124,7 @@ impl Footer {
             }
             _ => {
                 return Err(Error::CorruptedBlock(format!(
-                    "invalid table (bad magic number: {:x?})",
-                    magic
+                    "invalid table (bad magic number: {magic:x?})"
                 )))
             }
         }
@@ -869,8 +867,7 @@ impl TableIterator {
                 let (handle, _) = match BlockHandle::decode(&val) {
                     Err(e) => {
                         return Err(Error::CorruptedBlock(format!(
-                            "Couldn't decode corrupt blockhandle {:?}: error: {:?}",
-                            val, e
+                            "Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
                         )));
                     }
                     Ok(res) => res,
@@ -897,8 +894,7 @@ impl TableIterator {
             let (handle, _) = match BlockHandle::decode(&val) {
                 Err(e) => {
                     return Err(Error::CorruptedBlock(format!(
-                        "Couldn't decode corrupt blockhandle {:?}: error: {:?}",
-                        val, e
+                        "Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
                     )));
                 }
                 Ok(res) => res,
@@ -1538,8 +1534,8 @@ mod tests {
         // Generate and add num_items items
         let mut items = Vec::with_capacity(num_items as usize);
         for i in 0..num_items {
-            let key = format!("key_{:05}", i);
-            let value = format!("value_{:05}", i);
+            let key = format!("key_{i:05}");
+            let value = format!("value_{i:05}");
             items.push((key.clone(), value.clone()));
 
             let internal_key = InternalKey::new(
@@ -1571,23 +1567,21 @@ mod tests {
 
             let result = table.get(internal_key).unwrap();
 
-            assert!(result.is_some(), "Key '{}' not found in table", key);
+            assert!(result.is_some(), "Key '{key}' not found in table");
 
             if let Some((found_key, found_value)) = result {
                 // Verify key matches
                 assert_eq!(
                     std::str::from_utf8(&found_key.user_key).unwrap(),
                     key,
-                    "Key mismatch for '{}'",
-                    key
+                    "Key mismatch for '{key}'"
                 );
 
                 // Verify value matches
                 assert_eq!(
                     std::str::from_utf8(found_value.as_ref()).unwrap(),
                     value,
-                    "Value mismatch for key '{}'",
-                    key
+                    "Value mismatch for key '{key}'"
                 );
             }
         }
@@ -1611,8 +1605,8 @@ mod tests {
         // Generate and add num_items items
         let mut items = Vec::with_capacity(num_items as usize);
         for i in 0..num_items {
-            let key = format!("key_{:05}", i);
-            let value = format!("value_{:05}", i);
+            let key = format!("key_{i:05}");
+            let value = format!("value_{i:05}");
             items.push((key.clone(), value.clone()));
 
             let internal_key =
@@ -1636,8 +1630,8 @@ mod tests {
 
         let iter = table.iter();
         for (item, (key, value)) in iter.enumerate() {
-            let expected_key = format!("key_{:05}", item);
-            let expected_value = format!("value_{:05}", item);
+            let expected_key = format!("key_{item:05}");
+            let expected_value = format!("value_{item:05}");
             assert_eq!(
                 std::str::from_utf8(&key.user_key).unwrap(),
                 expected_key,
@@ -1765,7 +1759,7 @@ mod tests {
         for (i, prefix) in prefixes.iter().enumerate() {
             // For each prefix, add several close keys
             for j in 1..=5 {
-                let key = format!("{}{}", prefix, j);
+                let key = format!("{prefix}{j}");
                 add_key(&mut writer, key.as_bytes(), (i * 5 + j) as u64, b"value").unwrap();
             }
         }
@@ -2072,8 +2066,8 @@ mod tests {
 
         // Generate 50 keys that will span multiple blocks due to the small block size
         for i in 0..50 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{}", i);
+            let key = format!("key_{i:03}");
+            let value = format!("value_{i}");
             data.push((key, value));
         }
 
@@ -2099,7 +2093,7 @@ mod tests {
 
         // Test random access to various points in the range
         for idx in [0, 10, 25, 49] {
-            let key = format!("key_{:03}", idx);
+            let key = format!("key_{idx:03}");
             assert!(table.is_key_in_key_range(&InternalKey::new(
                 key.as_bytes().to_vec(),
                 1,
@@ -2200,22 +2194,17 @@ mod tests {
         for (i, (expected_key, expected_value)) in data.iter().enumerate() {
             assert!(
                 i < collected_items.len(),
-                "Missing item at index {}: expected ({}, {})",
-                i,
-                expected_key,
-                expected_value
+                "Missing item at index {i}: expected ({expected_key}, {expected_value})"
             );
 
             let (actual_key, actual_value) = &collected_items[i];
             assert_eq!(
                 actual_key, expected_key,
-                "Key mismatch at index {}: expected '{}', got '{}'",
-                i, expected_key, actual_key
+                "Key mismatch at index {i}: expected '{expected_key}', got '{actual_key}'"
             );
             assert_eq!(
                 actual_value, expected_value,
-                "Value mismatch at index {}: expected '{}', got '{}'",
-                i, expected_value, actual_value
+                "Value mismatch at index {i}: expected '{expected_value}', got '{actual_value}'"
             );
         }
 
@@ -2255,10 +2244,7 @@ mod tests {
 
                     let key_count = seen_keys.iter().filter(|(k, _)| k == key_str).count();
                     if key_count > 1 {
-                        panic!(
-                            "Iterator restarted! Saw key '{}' {} times",
-                            key_str, key_count
-                        );
+                        panic!("Iterator restarted! Saw key '{key_str}' {key_count} times");
                     }
                 }
                 None => break,
@@ -2307,8 +2293,7 @@ mod tests {
             );
             assert!(
                 iter.valid(),
-                "Iterator should be valid after advancing to item {}",
-                expected_index
+                "Iterator should be valid after advancing to item {expected_index}"
             );
 
             let current_key = iter.key();
@@ -2316,8 +2301,7 @@ mod tests {
             let expected_key = data[expected_index].0;
             assert_eq!(
                 key_str, expected_key,
-                "After advancing to position {}, expected key '{}', got '{}'",
-                expected_index, expected_key, key_str
+                "After advancing to position {expected_index}, expected key '{expected_key}', got '{key_str}'"
             );
         }
 
@@ -2395,7 +2379,7 @@ mod tests {
         // Large table
         {
             let large_data: Vec<_> = (0..100)
-                .map(|i| (format!("key_{:03}", i), format!("value_{:03}", i)))
+                .map(|i| (format!("key_{i:03}"), format!("value_{i:03}")))
                 .collect();
 
             let large_data_refs: Vec<(&str, &str)> = large_data
@@ -2419,8 +2403,7 @@ mod tests {
                 let key_str = std::str::from_utf8(&key.user_key).unwrap();
                 assert!(
                     seen_keys.insert(key_str),
-                    "Duplicate key found: '{}' - iterator may have restarted",
-                    key_str
+                    "Duplicate key found: '{key_str}' - iterator may have restarted"
                 );
             }
 
@@ -2456,8 +2439,7 @@ mod tests {
 
             assert!(
                 iter.valid(),
-                "Iterator should be valid after seeking to '{}'",
-                seek_key
+                "Iterator should be valid after seeking to '{seek_key}'"
             );
 
             let mut remaining_items = Vec::new();
@@ -2547,7 +2529,7 @@ mod tests {
                 "Should get remaining items after seek"
             );
             for (i, (actual, expected)) in remaining.iter().zip(expected.iter()).enumerate() {
-                assert_eq!(actual, expected, "Mismatch at position {} after seek", i);
+                assert_eq!(actual, expected, "Mismatch at position {i} after seek");
             }
         }
 
@@ -2586,7 +2568,7 @@ mod tests {
     fn test_table_iterator_performance_regression() {
         let mut large_data = Vec::new();
         for i in 0..1000 {
-            large_data.push((format!("key_{:06}", i), format!("value_{:06}", i)));
+            large_data.push((format!("key_{i:06}"), format!("value_{i:06}")));
         }
 
         let large_data_refs: Vec<(&str, &str)> = large_data
@@ -2608,27 +2590,25 @@ mod tests {
 
         assert!(
             duration.as_millis() < 1000,
-            "Iteration took too long: {:?}",
-            duration
+            "Iteration took too long: {duration:?}"
         );
 
         let start = Instant::now();
         for i in (0..1000).step_by(100) {
             let mut iter = table.iter();
             let seek_key = InternalKey::new(
-                format!("key_{:06}", i).as_bytes().to_vec(),
+                format!("key_{i:06}").as_bytes().to_vec(),
                 1,
                 InternalKeyKind::Set,
             );
             iter.seek(&seek_key.encode());
-            assert!(iter.valid(), "Seek to key_{:06} should succeed", i);
+            assert!(iter.valid(), "Seek to key_{i:06} should succeed");
         }
         let seek_duration = start.elapsed();
 
         assert!(
             seek_duration.as_millis() < 100,
-            "Seek operations took too long: {:?}",
-            seek_duration
+            "Seek operations took too long: {seek_duration:?}"
         );
     }
 
@@ -2696,13 +2676,11 @@ mod tests {
 
                 assert_eq!(
                     actual_key, *expected_key,
-                    "Iteration #{}, item {}: expected key '{}', got '{}'",
-                    iteration, i, expected_key, actual_key
+                    "Iteration #{iteration}, item {i}: expected key '{expected_key}', got '{actual_key}'"
                 );
                 assert_eq!(
                     actual_value, *expected_value,
-                    "Iteration #{}, item {}: expected value '{}', got '{}'",
-                    iteration, i, expected_value, actual_value
+                    "Iteration #{iteration}, item {i}: expected value '{expected_value}', got '{actual_value}'"
                 );
             }
         }
@@ -2821,14 +2799,12 @@ mod tests {
         {
             assert_eq!(
                 next_key.user_key, adv_key.user_key,
-                "Key mismatch at position {} between next() and advance()",
-                i
+                "Key mismatch at position {i} between next() and advance()"
             );
             assert_eq!(
                 next_val.as_ref(),
                 adv_val.as_ref(),
-                "Value mismatch at position {} between next() and advance()",
-                i
+                "Value mismatch at position {i} between next() and advance()"
             );
         }
     }
@@ -2837,7 +2813,7 @@ mod tests {
     fn test_table_iterator_basic_correctness() {
         let mut large_data = Vec::new();
         for i in 0..50 {
-            large_data.push((format!("key_{:03}", i), format!("value_{:03}", i)));
+            large_data.push((format!("key_{i:03}"), format!("value_{i:03}")));
         }
 
         let large_data_refs: Vec<(&str, &str)> = large_data
@@ -2858,15 +2834,11 @@ mod tests {
             let key_str = std::str::from_utf8(&actual_key.user_key).unwrap();
             let value_str = std::str::from_utf8(actual_value.as_ref()).unwrap();
 
-            let expected_key = format!("key_{:03}", i);
-            let expected_value = format!("value_{:03}", i);
+            let expected_key = format!("key_{i:03}");
+            let expected_value = format!("value_{i:03}");
 
-            assert_eq!(key_str, expected_key, "Key mismatch at position {}", i);
-            assert_eq!(
-                value_str, expected_value,
-                "Value mismatch at position {}",
-                i
-            );
+            assert_eq!(key_str, expected_key, "Key mismatch at position {i}");
+            assert_eq!(value_str, expected_value, "Value mismatch at position {i}");
         }
     }
 
@@ -2882,8 +2854,8 @@ mod tests {
 
         // Add enough entries to create multiple data blocks and index partitions
         for i in 0..100 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let value = format!("value_{i:03}");
             let internal_key =
                 InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
             writer
@@ -2906,8 +2878,8 @@ mod tests {
 
         // Test point lookups
         for i in 0..100 {
-            let key = format!("key_{:03}", i);
-            let expected_value = format!("value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let expected_value = format!("value_{i:03}");
             let internal_key = InternalKey::new(
                 key.as_bytes().to_vec(),
                 i + 2, // Higher seq number for lookup
@@ -2915,7 +2887,7 @@ mod tests {
             );
 
             let result = table.get(internal_key).unwrap();
-            assert!(result.is_some(), "Key '{}' not found in table", key);
+            assert!(result.is_some(), "Key '{key}' not found in table");
 
             if let Some((found_key, found_value)) = result {
                 assert_eq!(
@@ -2938,20 +2910,18 @@ mod tests {
 
         // Verify iteration order and content
         for (i, (key, value)) in collected.iter().enumerate() {
-            let expected_key = format!("key_{:03}", i);
-            let expected_value = format!("value_{:03}", i);
+            let expected_key = format!("key_{i:03}");
+            let expected_value = format!("value_{i:03}");
 
             assert_eq!(
                 std::str::from_utf8(&key.user_key).unwrap(),
                 expected_key,
-                "Iterator key mismatch at position {}",
-                i
+                "Iterator key mismatch at position {i}"
             );
             assert_eq!(
                 std::str::from_utf8(value.as_ref()).unwrap(),
                 expected_value,
-                "Iterator value mismatch at position {}",
-                i
+                "Iterator value mismatch at position {i}"
             );
         }
     }

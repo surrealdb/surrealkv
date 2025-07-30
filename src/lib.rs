@@ -18,17 +18,21 @@ mod vfs;
 pub mod vlog;
 mod wal;
 
-pub use lsm::Tree;
+pub use crate::error::{Error, Result};
+pub use crate::lsm::Tree;
+pub use crate::transaction::{Durability, Mode, Transaction};
 
+use sstable::{bloom::LevelDBBloomFilter, InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};
 
-use error::Result;
-use sstable::{bloom::LevelDBBloomFilter, InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
+/// Type alias for iterator results containing key-value pairs
+pub type IterResult = Result<(Key, Value)>;
 
-use crate::{error::Error, vlog::VALUE_POINTER_SIZE};
+/// The Key type used throughout the LSM tree
+pub type Key = Arc<[u8]>;
 
-pub(crate) type Key = Arc<[u8]>;
-pub(crate) type Value = Arc<[u8]>;
+/// The Value type used throughout the LSM tree  
+pub type Value = Arc<[u8]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VLogChecksumLevel {
@@ -54,9 +58,13 @@ pub struct Options {
     pub index_partition_size: usize,
 
     // VLog configuration
-    pub vlog_value_threshold: usize,
     pub vlog_max_file_size: u64,
     pub vlog_checksum_verification: VLogChecksumLevel,
+    /// If true, disables VLog creation entirely
+    pub disable_vlog: bool,
+    /// Discard ratio threshold for triggering VLog garbage collection (0.0 - 1.0)
+    /// Default: 0.5 (50% discardable data triggers GC)
+    pub vlog_gc_discard_ratio: f64,
 }
 
 impl Default for Options {
@@ -73,11 +81,12 @@ impl Default for Options {
             block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
             path: PathBuf::from(""),
             level_count: 1,
-            max_memtable_size: 100 * 1024 * 1024, // 100 MB
-            index_partition_size: 16384,          // 16KB
-            vlog_value_threshold: 256,
+            max_memtable_size: 100 * 1024 * 1024,  // 100 MB
+            index_partition_size: 16384,           // 16KB
             vlog_max_file_size: 128 * 1024 * 1024, // 128MB
             vlog_checksum_verification: VLogChecksumLevel::Disabled,
+            disable_vlog: false,
+            vlog_gc_discard_ratio: 0.5, // 50% default
         }
     }
 }
@@ -149,11 +158,6 @@ impl Options {
         self
     }
 
-    pub fn with_vlog_value_threshold(mut self, value: usize) -> Self {
-        self.vlog_value_threshold = value;
-        self
-    }
-
     pub fn with_vlog_max_file_size(mut self, value: u64) -> Self {
         self.vlog_max_file_size = value;
         self
@@ -164,14 +168,18 @@ impl Options {
         self
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.vlog_value_threshold <= VALUE_POINTER_SIZE {
-            return Err(Error::InvalidArgument(
-                "vlog_value_threshold must be greater than 28 bytes".to_string(),
-            ));
-        }
+    pub fn with_disable_vlog(mut self, value: bool) -> Self {
+        self.disable_vlog = value;
+        self
+    }
 
-        Ok(())
+    pub fn with_vlog_gc_discard_ratio(mut self, value: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&value),
+            "VLog GC discard ratio must be between 0.0 and 1.0"
+        );
+        self.vlog_gc_discard_ratio = value;
+        self
     }
 }
 

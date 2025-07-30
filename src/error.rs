@@ -74,19 +74,19 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Abort => write!(f, "Operation aborted"),
-            Error::Io(err) => write!(f, "IO error: {}", err),
-            Error::Send(err) => write!(f, "Send error: {}", err),
-            Error::Receive(err) => write!(f, "Receive error: {}", err),
-            Error::CorruptedBlock(err) => write!(f, "Corrupted block: {}", err),
-            Error::Compression(err) => write!(f, "Compression error: {}", err),
+            Error::Io(err) => write!(f, "IO error: {err}"),
+            Error::Send(err) => write!(f, "Send error: {err}"),
+            Error::Receive(err) => write!(f, "Receive error: {err}"),
+            Error::CorruptedBlock(err) => write!(f, "Corrupted block: {err}"),
+            Error::Compression(err) => write!(f, "Compression error: {err}"),
             Error::KeyNotInOrder => write!(f, "Keys are not in order"),
             Error::FilterBlockEmpty => write!(f, "Filter block is empty"),
-            Error::Decompression(err) => write!(f, "Decompression error: {}", err),
-            Error::InvalidFilename(err) => write!(f, "Invalid filename: {}", err),
-            Error::CorruptedTableMetadata(err) => write!(f, "Corrupted table metadata: {}", err),
+            Error::Decompression(err) => write!(f, "Decompression error: {err}"),
+            Error::InvalidFilename(err) => write!(f, "Invalid filename: {err}"),
+            Error::CorruptedTableMetadata(err) => write!(f, "Corrupted table metadata: {err}"),
             Error::InvalidTableFormat => write!(f, "Invalid table format"),
             Error::TableMetadataNotFound => write!(f, "Table metadata not found"),
-            Error::Wal(err) => write!(f, "WAL error: {}", err),
+            Error::Wal(err) => write!(f, "WAL error: {err}"),
             Error::BlockNotFound => write!(f, "Block not found"),
             Error::BatchTooLarge => write!(f, "Batch too large"),
             Error::InvalidBatchRecord => write!(f, "Invalid batch record"),
@@ -98,15 +98,15 @@ impl fmt::Display for Error {
             Error::KeyNotFound => write!(f, "Key not found"),
             Error::WriteStall => write!(f, "Write stall"),
             Error::FileDescriptorNotFound => write!(f, "File descriptor not found"),
-            Error::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {} conflicts with a table ID in the merge list.", id),
+            Error::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
             Error::PipelineStall => write!(f, "Pipeline stall"),
-            Error::Other(err) => write!(f, "Other error: {}", err),
+            Error::Other(err) => write!(f, "Other error: {err}"),
             Error::NoSnapshot => write!(f, "No snapshot available"),
-            Error::CommitFail(err) => write!(f, "Commit failed: {}", err),
-            Error::LoadManifestFail(err) => write!(f, "Failed to load manifest: {}", err),
-            Error::Corruption(err) => write!(f, "Data corruption detected: {}", err),
+            Error::CommitFail(err) => write!(f, "Commit failed: {err}"),
+            Error::LoadManifestFail(err) => write!(f, "Failed to load manifest: {err}"),
+            Error::Corruption(err) => write!(f, "Data corruption detected: {err}"),
             Error::VlogGCAlreadyInProgress => write!(f, "Vlog garbage collection already in progress"),
-            Error::InvalidArgument(err) => write!(f, "Invalid argument: {}", err),
+            Error::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
         }
     }
 }
@@ -129,12 +129,12 @@ impl From<crate::wal::Error> for Error {
 
 impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
     fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
-        Error::Send(format!("Async channel send error: {}", error))
+        Error::Send(format!("Async channel send error: {error}"))
     }
 }
 
 impl From<async_channel::RecvError> for Error {
     fn from(error: async_channel::RecvError) -> Self {
-        Error::Receive(format!("Async channel receive error: {}", error))
+        Error::Receive(format!("Async channel receive error: {error}"))
     }
 }

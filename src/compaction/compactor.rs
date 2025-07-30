@@ -1,7 +1,7 @@
 use crate::{
     compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
     error::Result,
-    iter::{BoxedIterator, CompactionIterator, MergeIterator},
+    iter::{BoxedIterator, CompactionIterator},
     levels::{write_levels_to_disk, LevelManifest},
     lsm::TABLE_FOLDER,
     memtable::ImmutableMemtables,
@@ -27,7 +27,7 @@ pub struct CompactionOptions {
     pub lopts: Arc<LSMOptions>,
     pub levels: Arc<RwLock<LevelManifest>>,
     pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-    pub vlog: Arc<VLog>,
+    pub vlog: Option<Arc<VLog>>,
 }
 
 impl CompactionOptions {
@@ -35,8 +35,8 @@ impl CompactionOptions {
         Self {
             table_id_counter: tree.table_id_counter.clone(),
             lopts: tree.opts.clone(),
-            immutable_memtables: tree.immutable_memtables.clone(),
             levels: tree.levels.clone(),
+            immutable_memtables: tree.immutable_memtables.clone(),
             vlog: tree.vlog.clone(),
         }
     }
@@ -69,7 +69,21 @@ impl Compactor {
         input: &CompactionInput,
     ) -> Result<()> {
         let merge_result = {
-            let merge_iter = self.create_merge_iterator(&levels, input)?;
+            let tables = levels.get_all_tables();
+
+            let to_merge: Vec<_> = input
+                .tables_to_merge
+                .iter()
+                .filter_map(|&id| {
+                    let table_opt = tables.get(&id);
+                    table_opt.cloned()
+                })
+                .collect();
+
+            let iterators: Vec<BoxedIterator<'_>> = to_merge
+                .into_iter()
+                .map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
+                .collect();
 
             // Hide tables that are being merged
             levels.hide_tables(&input.tables_to_merge);
@@ -81,7 +95,7 @@ impl Compactor {
 
             // Write merged data and collect discard statistics
             let discard_stats =
-                self.write_merged_table(&new_table_path, new_table_id, merge_iter, input)?;
+                self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
 
             let new_table = self.open_table(new_table_id, &new_table_path)?;
             Ok((new_table, new_table_id, discard_stats))
@@ -94,7 +108,9 @@ impl Compactor {
 
                 // Update VLog discard statistics in bulk
                 if !discard_stats.is_empty() {
-                    self.options.vlog.update_discard_stats(discard_stats);
+                    if let Some(ref vlog) = self.options.vlog {
+                        vlog.update_discard_stats(discard_stats);
+                    }
                 }
 
                 Ok(())
@@ -108,35 +124,11 @@ impl Compactor {
         }
     }
 
-    fn create_merge_iterator<'a>(
-        &self,
-        levels: &RwLockWriteGuard<'_, LevelManifest>,
-        input: &CompactionInput,
-    ) -> Result<MergeIterator<'a>> {
-        let tables = levels.get_all_tables();
-
-        let to_merge: Vec<_> = input
-            .tables_to_merge
-            .iter()
-            .filter_map(|&id| {
-                let table_opt = tables.get(&id);
-                table_opt.cloned()
-            })
-            .collect();
-
-        let iterators = to_merge
-            .into_iter()
-            .map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
-            .collect();
-
-        Ok(MergeIterator::new(iterators))
-    }
-
     fn write_merged_table(
         &self,
         path: &Path,
         table_id: u64,
-        merge_iter: MergeIterator,
+        merge_iter: Vec<BoxedIterator<'_>>,
         input: &CompactionInput,
     ) -> Result<HashMap<u64, i64>> {
         let file = SysFile::create(path)?;
@@ -146,13 +138,17 @@ impl Compactor {
         let max_level = self.options.lopts.level_count - 1;
 
         let is_bottom_level = input.target_level >= max_level;
-        let mut comp_iter = CompactionIterator::new(merge_iter, is_bottom_level);
+        let mut comp_iter =
+            CompactionIterator::new(merge_iter, is_bottom_level, self.options.vlog.clone());
 
         for (key, value) in &mut comp_iter {
             writer.add(key, &value)?;
         }
 
         writer.finish()?;
+
+        // Flush any remaining delete-list entries to VLog
+        comp_iter.flush_delete_list_batch()?;
 
         // Return collected discard statistics
         Ok(comp_iter.discard_stats)
@@ -217,7 +213,7 @@ impl Compactor {
             let path = base_path.join(table_id.to_string());
             if let Err(e) = std::fs::remove_file(path) {
                 // Log error but continue with cleanup
-                eprintln!("Failed to remove old table file: {}", e);
+                eprintln!("Failed to remove old table file: {e}");
             }
         }
     }

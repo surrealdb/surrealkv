@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::btree_map;
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -12,8 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
-use crate::vlog::ValueLocation;
-use crate::{Key, Value};
+use crate::{IterResult, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,12 +176,8 @@ impl Transaction {
         // The value is not in the write set, so attempt to get it from the snapshot.
         match self.snapshot.as_ref().unwrap().get(key)? {
             Some(val) => {
-                // Resolve the value reference through VLog if enabled
-                // let resolved_value = ValueLocation::from_encoded_value(&val.0, &self.core.vlog)
-                //     .unwrap_or_else(|_| val.0.to_vec());
-                let resolved_value =
-                    ValueLocation::from_encoded_value(&val.0, Some(self.core.vlog.as_ref()))
-                        .unwrap_or_else(|_| val.0.to_vec());
+                // Resolve the value reference through VLog if needed
+                let resolved_value = self.core.resolve_value(&val.0)?;
                 Ok(Some(resolved_value.into()))
             }
             None => Ok(None),
@@ -219,7 +213,7 @@ impl Transaction {
         start: K,
         end: K,
         limit: Option<usize>,
-    ) -> Result<impl Iterator<Item = (Key, Value)> + '_> {
+    ) -> Result<impl Iterator<Item = IterResult> + '_> {
         // Get the start and end keys as byte slices
         let start_key = start.as_ref().to_vec();
         let end_key = end.as_ref().to_vec();
@@ -330,7 +324,7 @@ impl Entry {
 /// An iterator that performs a merging scan over a transaction's snapshot and write set.
 pub struct TransactionRangeIterator<'a> {
     /// Iterator over the consistent snapshot
-    snapshot_iter: DoubleEndedPeekable<Box<dyn Iterator<Item = (Key, Value)> + 'a>>,
+    snapshot_iter: DoubleEndedPeekable<Box<dyn Iterator<Item = IterResult> + 'a>>,
 
     /// Iterator over the transaction's write set
     write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Option<Entry>>>,
@@ -371,7 +365,7 @@ impl<'a> TransactionRangeIterator<'a> {
 
         // Create a snapshot iterator for the range
         let iter = snapshot.range(start_bytes.clone(), end_bytes.clone())?;
-        let boxed_iter: Box<dyn Iterator<Item = (Key, Value)> + 'a> = Box::new(iter);
+        let boxed_iter: Box<dyn Iterator<Item = IterResult> + 'a> = Box::new(iter);
 
         // Use inclusive range for write set
         let write_set_range = (Bound::Included(start_bytes), Bound::Included(end_bytes));
@@ -386,7 +380,7 @@ impl<'a> TransactionRangeIterator<'a> {
     }
 
     /// Reads from the write set and skips deleted entries
-    fn read_from_write_set(&mut self) -> Option<(Key, Value)> {
+    fn read_from_write_set(&mut self) -> Option<IterResult> {
         if let Some((ws_key, Some(e))) = self.write_set_iter.next() {
             if e.is_tombstone() {
                 // Deleted key, skip it by recursively getting the next entry
@@ -394,7 +388,7 @@ impl<'a> TransactionRangeIterator<'a> {
             }
 
             if let Some(value) = &e.value {
-                return Some((ws_key.to_vec().into(), value.to_vec().into()));
+                return Some(Ok((ws_key.to_vec().into(), value.to_vec().into())));
             }
         }
         None
@@ -402,7 +396,7 @@ impl<'a> TransactionRangeIterator<'a> {
 }
 
 impl Iterator for TransactionRangeIterator<'_> {
-    type Item = (Key, Value);
+    type Item = IterResult;
 
     /// Merges results from write set and snapshot in key order
     fn next(&mut self) -> Option<Self::Item> {
@@ -438,7 +432,7 @@ impl Iterator for TransactionRangeIterator<'_> {
             (false, true) => self.read_from_write_set(),
             (true, true) => {
                 // Compare keys to determine which comes first
-                if let (Some((snap_key, _)), Some((ws_key, _))) =
+                if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
                     (self.snapshot_iter.peek(), self.write_set_iter.peek())
                 {
                     match snap_key.as_ref().cmp(ws_key.as_ref()) {
@@ -450,6 +444,9 @@ impl Iterator for TransactionRangeIterator<'_> {
                             self.read_from_write_set()
                         }
                     }
+                } else if self.snapshot_iter.peek().is_some() {
+                    // Snapshot has error, propagate it
+                    self.snapshot_iter.next()
                 } else {
                     // This should never happen since we checked above
                     None
@@ -787,22 +784,22 @@ mod tests {
         let mut i = 0;
         while i + size_of::<u128>() < slice.len() {
             let tmp = rng.u128(..);
-            slice[i..(i + size_of::<u128>())].copy_from_slice(&tmp.to_le_bytes());
+            slice[i..(i + size_of::<u128>())].copy_from_slice(&tmp.to_be_bytes());
             i += size_of::<u128>()
         }
         if i + size_of::<u64>() < slice.len() {
             let tmp = rng.u64(..);
-            slice[i..(i + size_of::<u64>())].copy_from_slice(&tmp.to_le_bytes());
+            slice[i..(i + size_of::<u64>())].copy_from_slice(&tmp.to_be_bytes());
             i += size_of::<u64>()
         }
         if i + size_of::<u32>() < slice.len() {
             let tmp = rng.u32(..);
-            slice[i..(i + size_of::<u32>())].copy_from_slice(&tmp.to_le_bytes());
+            slice[i..(i + size_of::<u32>())].copy_from_slice(&tmp.to_be_bytes());
             i += size_of::<u32>()
         }
         if i + size_of::<u16>() < slice.len() {
             let tmp = rng.u16(..);
-            slice[i..(i + size_of::<u16>())].copy_from_slice(&tmp.to_le_bytes());
+            slice[i..(i + size_of::<u16>())].copy_from_slice(&tmp.to_be_bytes());
             i += size_of::<u16>()
         }
         if i + size_of::<u8>() < slice.len() {
@@ -1096,6 +1093,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key2", b"key4", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 3);
@@ -1116,8 +1114,8 @@ mod tests {
         {
             let mut tx = store.begin().unwrap();
             for i in 1..=10 {
-                let key = format!("key{:02}", i);
-                let value = format!("value{}", i);
+                let key = format!("key{i:02}");
+                let value = format!("value{i}");
                 tx.set(key.as_bytes(), value.as_bytes()).unwrap();
             }
             tx.commit().await.unwrap();
@@ -1129,6 +1127,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key01", b"key10", Some(3))
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 3);
@@ -1163,7 +1162,11 @@ mod tests {
             tx.set(b"c", b"3_modified").unwrap();
 
             // Range should see all changes
-            let range: Vec<_> = tx.range(b"a", b"e", None).unwrap().collect::<Vec<_>>();
+            let range: Vec<_> = tx
+                .range(b"a", b"e", None)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 5);
             assert_eq!(range[0], (b"a".to_vec().into(), b"1".to_vec().into()));
@@ -1204,6 +1207,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key1", b"key5", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 3);
@@ -1238,6 +1242,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key1", b"key3", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 3);
@@ -1263,7 +1268,11 @@ mod tests {
         // Query range with no data
         {
             let tx = store.begin().unwrap();
-            let range: Vec<_> = tx.range(b"m", b"n", None).unwrap().collect::<Vec<_>>();
+            let range: Vec<_> = tx
+                .range(b"m", b"n", None)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 0);
         }
@@ -1290,6 +1299,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key1", b"key5", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 5);
@@ -1321,6 +1331,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key1", b"key3", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 3);
@@ -1334,6 +1345,7 @@ mod tests {
             let range: Vec<_> = tx
                 .range(b"key2", b"key2", None)
                 .unwrap()
+                .map(|r| r.unwrap())
                 .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 1);
@@ -1353,10 +1365,120 @@ mod tests {
             tx.set(b"key", b"value2").unwrap();
             tx.set(b"key", b"value3").unwrap();
 
-            let range: Vec<_> = tx.range(b"key", b"key", None).unwrap().collect::<Vec<_>>();
+            let range: Vec<_> = tx
+                .range(b"key", b"key", None)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
 
             assert_eq!(range.len(), 1);
             assert_eq!(range[0].1.as_ref(), b"value3"); // Latest value
+        }
+    }
+
+    #[tokio::test]
+    async fn test_range_value_pointer_resolution_bug() {
+        let temp_dir = create_temp_directory();
+        let opts = Arc::new(Options {
+            path: temp_dir.path().to_path_buf(),
+            max_memtable_size: 512,
+            ..Default::default()
+        });
+        let tree = Tree::new(opts).unwrap();
+
+        // Create values that will be stored in VLog (> 50 bytes)
+        let key1 = b"key1";
+        let key2 = b"key2";
+        let key3 = b"key3";
+
+        let large_value1 = "X".repeat(100); // > 50 bytes, goes to VLog
+        let large_value2 = "Y".repeat(100); // > 50 bytes, goes to VLog
+        let large_value3 = "Z".repeat(100); // > 50 bytes, goes to VLog
+
+        // Insert the values
+        {
+            let mut txn = tree.begin().unwrap();
+            txn.set(key1, large_value1.as_bytes()).unwrap();
+            txn.set(key2, large_value2.as_bytes()).unwrap();
+            txn.set(key3, large_value3.as_bytes()).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Force flush to ensure data goes to SSTables (and VLog)
+        tree.flush().unwrap();
+
+        // Test 1: Verify get() works correctly
+        {
+            let txn = tree.begin().unwrap();
+
+            let retrieved1 = txn.get(key1).unwrap().unwrap();
+            let retrieved2 = txn.get(key2).unwrap().unwrap();
+            let retrieved3 = txn.get(key3).unwrap().unwrap();
+
+            assert_eq!(
+                retrieved1.as_ref(),
+                large_value1.as_bytes(),
+                "get() should resolve value pointers correctly"
+            );
+            assert_eq!(
+                retrieved2.as_ref(),
+                large_value2.as_bytes(),
+                "get() should resolve value pointers correctly"
+            );
+            assert_eq!(
+                retrieved3.as_ref(),
+                large_value3.as_bytes(),
+                "get() should resolve value pointers correctly"
+            );
+        }
+
+        // Test 2: Verify range() also works correctly
+        {
+            let txn = tree.begin().unwrap();
+
+            let range_results: Vec<_> = txn
+                .range(b"key1", b"key3", None)
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                range_results.len(),
+                3,
+                "Should get 3 items from range query"
+            );
+
+            // Check that all values are correctly resolved (not value pointers)
+            for (i, (returned_key, returned_value)) in range_results.iter().enumerate() {
+                let expected_key = match i {
+                    0 => key1,
+                    1 => key2,
+                    2 => key3,
+                    _ => panic!("Unexpected index"),
+                };
+                let expected_value = match i {
+                    0 => &large_value1,
+                    1 => &large_value2,
+                    2 => &large_value3,
+                    _ => panic!("Unexpected index"),
+                };
+
+                assert_eq!(
+                    returned_key.as_ref(),
+                    expected_key,
+                    "Key mismatch in range result"
+                );
+
+                // The returned value should be the actual value, not a value pointer
+                assert_eq!(
+                    returned_value.as_ref(),
+                    expected_value.as_bytes(),
+                    "Range should return resolved values, not value pointers. \
+                     Expected actual value of {} bytes, but got a {}-byte value)",
+                    expected_value.len(),
+                    returned_value.len()
+                );
+            }
         }
     }
 }

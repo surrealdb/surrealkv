@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
+use crate::vlog::VLog;
+use crate::vlog::ValuePointer;
 use crate::{
     sstable::{InternalKey, InternalKeyKind},
     Key, Value,
@@ -61,10 +63,12 @@ pub struct MergeIterator<'a> {
     // Current key we're processing, to skip duplicate versions
     current_user_key: Option<Key>,
     initialized: bool,
+    // If true, skip tombstones at the bottom level
+    is_bottom_level: bool,
 }
 
 impl<'a> MergeIterator<'a> {
-    pub fn new(iterators: Vec<BoxedIterator<'a>>) -> Self {
+    pub fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
         let heap = BinaryHeap::with_capacity(iterators.len());
 
         Self {
@@ -72,6 +76,7 @@ impl<'a> MergeIterator<'a> {
             heap,
             current_user_key: None,
             initialized: false,
+            is_bottom_level,
         }
     }
 
@@ -112,6 +117,7 @@ impl Iterator for MergeIterator<'_> {
             }
 
             let user_key = heap_item.key.user_key.clone();
+            let is_tombstone = heap_item.key.kind() == InternalKeyKind::Delete;
 
             // Check if this is a new user key
             let is_new_key = match &self.current_user_key {
@@ -120,36 +126,162 @@ impl Iterator for MergeIterator<'_> {
             };
 
             if is_new_key {
-                // New user key - update tracking and return this item
+                // New user key - update tracking
                 self.current_user_key = Some(user_key);
+
+                // At the bottom level, skip tombstones since there are no older entries below
+                if is_tombstone && self.is_bottom_level {
+                    continue;
+                }
+
+                // Return this item (most recent version of this user key)
                 return Some((heap_item.key, heap_item.value));
             } else {
-                // Same user key - skip this older version and continue to next
+                // Same user key - this is an older version, skip it
                 continue;
             }
         }
     }
 }
 
+fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u64, i64>, value: &Value) -> Result<()> {
+    // When VLog is enabled, all values should be VLog pointers
+    if let Ok(pointer) = ValuePointer::decode(value) {
+        let value_data_size = pointer.total_entry_size() as i64;
+        *discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
+    }
+    Ok(())
+}
+
 pub struct CompactionIterator<'a> {
-    merge_iter: MergeIterator<'a>,
+    iterators: Vec<BoxedIterator<'a>>,
+    // Heap of iterators, ordered by their current key
+    heap: BinaryHeap<HeapItem>,
     is_bottom_level: bool,
 
-    // Track tombstone status
+    // Track the current key being processed
     current_user_key: Option<Key>,
-    current_key_has_tombstone: bool,
+
+    // Collected versions of the current key
+    current_key_versions: Vec<(Arc<InternalKey>, Value)>,
+
+    // Compaction state
     /// Collected discard statistics: file_id -> total_discarded_bytes
     pub discard_stats: HashMap<u64, i64>,
+
+    /// Reference to VLog for populating delete-list
+    vlog: Option<Arc<VLog>>,
+
+    /// Batch of stale entries to add to delete-list: (sequence_number, value_size)
+    delete_list_batch: Vec<(u64, u64)>,
+
+    initialized: bool,
 }
 
 impl<'a> CompactionIterator<'a> {
-    pub fn new(merge_iter: MergeIterator<'a>, is_bottom_level: bool) -> Self {
+    pub fn new(
+        iterators: Vec<BoxedIterator<'a>>,
+        is_bottom_level: bool,
+        vlog: Option<Arc<VLog>>,
+    ) -> Self {
+        let heap = BinaryHeap::with_capacity(iterators.len());
+
         Self {
-            merge_iter,
+            iterators,
+            heap,
             is_bottom_level,
             current_user_key: None,
-            current_key_has_tombstone: false,
+            current_key_versions: Vec::new(),
             discard_stats: HashMap::new(),
+            vlog,
+            delete_list_batch: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    fn initialize(&mut self) {
+        // Pull the first item from each iterator and add to heap
+        for (idx, iter) in self.iterators.iter_mut().enumerate() {
+            if let Some((key, value)) = iter.next() {
+                self.heap.push(HeapItem {
+                    key,
+                    value,
+                    iterator_index: idx,
+                });
+            }
+        }
+        self.initialized = true;
+    }
+
+    /// Flushes the batched delete-list entries to the VLog
+    pub fn flush_delete_list_batch(&mut self) -> Result<()> {
+        if let Some(ref vlog) = self.vlog {
+            if !self.delete_list_batch.is_empty() {
+                vlog.add_batch_to_delete_list(std::mem::take(&mut self.delete_list_batch))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Process all collected versions of the current key and return the one to output
+    fn process_current_key_versions(&mut self) -> Option<(Arc<InternalKey>, Value)> {
+        if self.current_key_versions.is_empty() {
+            return None;
+        }
+
+        // Sort by sequence number (descending) to get the latest version first
+        self.current_key_versions
+            .sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
+
+        // Clone the latest version data to avoid borrow conflicts
+        let latest_key = self.current_key_versions[0].0.clone();
+        let latest_value = self.current_key_versions[0].1.clone();
+        let is_latest_tombstone = latest_key.kind() == InternalKeyKind::Delete;
+
+        // Process all versions for delete list and discard stats
+        for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
+            let is_tombstone = key.kind() == InternalKeyKind::Delete;
+            let is_latest = i == 0;
+
+            // Determine if this entry should be marked as stale in VLog
+            let should_mark_stale = if is_latest {
+                // Latest version: mark stale if it's a tombstone being removed at bottom level
+                is_tombstone && self.is_bottom_level
+            } else {
+                // Older version: always mark as stale
+                true
+            };
+
+            // Add to delete list and collect discard stats if needed
+            if should_mark_stale && self.vlog.is_some() {
+                if is_tombstone {
+                    // Tombstone: add key size to delete list
+                    self.delete_list_batch
+                        .push((key.seq_num(), key.size() as u64));
+                } else {
+                    // Regular value: decode pointer and add value size
+                    if let Ok(pointer) = ValuePointer::decode(value) {
+                        let value_size = pointer.total_entry_size();
+                        self.delete_list_batch.push((key.seq_num(), value_size));
+                    }
+                }
+
+                // Collect discard statistics
+                if let Err(e) = collect_vlog_discard_stats(&mut self.discard_stats, value) {
+                    eprintln!("Error collecting discard stats: {e:?}");
+                }
+            }
+        }
+
+        // Clear the versions for the next key
+        self.current_key_versions.clear();
+
+        // Return the latest version if it should be returned
+        if is_latest_tombstone && self.is_bottom_level {
+            // At bottom level, don't return tombstones
+            None
+        } else {
+            Some((latest_key, latest_value))
         }
     }
 }
@@ -158,64 +290,58 @@ impl Iterator for CompactionIterator<'_> {
     type Item = (Arc<InternalKey>, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for (key, value) in self.merge_iter.by_ref() {
-            let user_key = key.user_key.clone();
-            let is_tombstone = key.kind() == InternalKeyKind::Delete;
+        if !self.initialized {
+            self.initialize();
+        }
 
-            // Check if this is a new key
+        loop {
+            // Get the next item from the heap
+            let heap_item = match self.heap.pop() {
+                Some(item) => item,
+                None => {
+                    // No more items in heap, process any remaining key versions
+                    return self.process_current_key_versions();
+                }
+            };
+
+            // Pull the next item from the same iterator and add back to heap
+            if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
+                self.heap.push(HeapItem {
+                    key,
+                    value,
+                    iterator_index: heap_item.iterator_index,
+                });
+            }
+
+            let user_key = heap_item.key.user_key.clone();
+
+            // Check if this is a new user key
             let is_new_key = match &self.current_user_key {
                 None => true,
                 Some(current) => &user_key != current,
             };
 
-            // Determine if this entry should be marked as stale in VLog
-            let should_mark_stale = if is_new_key {
-                // New key: mark stale if it's a tombstone being removed at bottom level
-                is_tombstone && self.is_bottom_level
-            } else {
-                // Same key, older version: mark stale if we've seen a tombstone for this key
-                self.current_key_has_tombstone
-            };
-
-            // Collect discard statistics instead of immediately updating VLog
-            if should_mark_stale {
-                collect_vlog_discard_stats(&mut self.discard_stats, &value).unwrap();
-            }
-
             if is_new_key {
-                // Reset tracking for the new key
-                self.current_user_key = Some(user_key.clone());
-                self.current_key_has_tombstone = is_tombstone;
-
-                // At the bottom level, skip tombstones
-                if is_tombstone && self.is_bottom_level {
-                    continue;
+                // Process any accumulated versions of the previous key
+                if let Some(result) = self.process_current_key_versions() {
+                    // Add the current item to the new key's versions
+                    self.current_user_key = Some(user_key);
+                    self.current_key_versions
+                        .push((heap_item.key, heap_item.value));
+                    return Some(result);
                 }
 
-                // Return this entry
-                return Some((key, value));
+                // Start collecting versions for the new key
+                self.current_user_key = Some(user_key);
+                self.current_key_versions
+                    .push((heap_item.key, heap_item.value));
             } else {
-                // Update tombstone status for same key
-                if is_tombstone {
-                    self.current_key_has_tombstone = true;
-                }
-
-                // Skip this entry - older version
-                continue;
+                // Same user key - add to current key's versions
+                self.current_key_versions
+                    .push((heap_item.key, heap_item.value));
             }
         }
-
-        None
     }
-}
-
-fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u64, i64>, value: &Value) -> Result<()> {
-    // Check if this value is a VLog pointer
-    if let Some(pointer) = crate::vlog::ValuePointer::try_decode(value)? {
-        let value_data_size = pointer.total_entry_size() as i64;
-        *discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -223,9 +349,10 @@ mod tests {
     use super::*;
     use crate::{
         sstable::{InternalKey, InternalKeyKind},
-        Value,
+        Options, VLogChecksumLevel, Value,
     };
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn create_internal_key(
         user_key: &str,
@@ -233,6 +360,28 @@ mod tests {
         kind: InternalKeyKind,
     ) -> Arc<InternalKey> {
         InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind).into()
+    }
+
+    fn create_test_vlog() -> (Arc<VLog>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let opts = Options::default();
+        let vlog_dir = temp_dir.path().join("vlog");
+        std::fs::create_dir_all(&vlog_dir).unwrap();
+        let vlog = Arc::new(
+            VLog::new(
+                &vlog_dir,
+                opts.vlog_max_file_size,
+                VLogChecksumLevel::Full,
+                opts.vlog_gc_discard_ratio,
+            )
+            .unwrap(),
+        );
+        (vlog, temp_dir)
+    }
+
+    fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
+        let pointer = vlog.append(key, value).unwrap();
+        pointer.encode().into()
     }
 
     // Creates a mock iterator with predefined entries
@@ -279,8 +428,7 @@ mod tests {
         for i in 0..10 {
             if i % 2 == 0 {
                 // Tombstone for even keys
-                let key =
-                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
                 let empty_value: Vec<u8> = Vec::new();
                 items1.push((key, empty_value.into()));
             }
@@ -289,8 +437,8 @@ mod tests {
         // Second iterator (L1) with values for all keys
         let mut items2 = Vec::new();
         for i in 0..20 {
-            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
-            let value_str = format!("value-{}", i);
+            let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{i}");
             let value_vec: Vec<u8> = value_str.into_bytes();
             items2.push((key, value_vec.into()));
         }
@@ -299,7 +447,7 @@ mod tests {
         let iter2 = Box::new(MockIterator::new(items2));
 
         // Create the merge iterator
-        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
+        let merge_iter = MergeIterator::new(vec![iter1, iter2], false);
 
         // Collect all items
         let mut result = Vec::new();
@@ -326,16 +474,16 @@ mod tests {
         for i in 0..10 {
             if i % 2 == 0 {
                 // Find this key in the result
-                let key = format!("key-{:03}", i);
+                let key = format!("key-{i:03}");
                 let entries: Vec<_> = result.iter().filter(|(k, _, _)| k == &key).collect();
 
                 // Should only have one entry per key due to deduplication
-                assert_eq!(entries.len(), 1, "Key {} has multiple entries", key);
+                assert_eq!(entries.len(), 1, "Key {key} has multiple entries");
 
                 // And it should be the tombstone (seq=200, kind=Delete)
                 let (_, seq, kind) = entries[0];
-                assert_eq!(*seq, 200, "Key {} has wrong sequence", key);
-                assert_eq!(*kind, InternalKeyKind::Delete, "Key {} has wrong kind", key);
+                assert_eq!(*seq, 200, "Key {key} has wrong sequence");
+                assert_eq!(*kind, InternalKeyKind::Delete, "Key {key} has wrong kind");
             }
         }
 
@@ -350,8 +498,7 @@ mod tests {
         for i in 0..10 {
             if i % 2 == 0 {
                 // Tombstone for even keys
-                let key =
-                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
                 let empty_value: Vec<u8> = Vec::new();
                 items1.push((key, empty_value.into()));
             }
@@ -359,8 +506,8 @@ mod tests {
 
         let mut items2 = Vec::new();
         for i in 0..20 {
-            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
-            let value_str = format!("value-{}", i);
+            let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{i}");
             let value_vec: Vec<u8> = value_str.into_bytes();
             items2.push((key, value_vec.into()));
         }
@@ -368,11 +515,8 @@ mod tests {
         let iter1 = Box::new(MockIterator::new(items1));
         let iter2 = Box::new(MockIterator::new(items2));
 
-        // Create the merge iterator
-        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
-
         // Test non-bottom level (should keep tombstones)
-        let comp_iter = CompactionIterator::new(merge_iter, false);
+        let comp_iter = MergeIterator::new(vec![iter1, iter2], false);
 
         // Collect all items
         let mut result = Vec::new();
@@ -404,17 +548,16 @@ mod tests {
 
             if key_num % 2 == 0 && key_num < 10 {
                 // Even keys under 10 should be tombstones with seq=200
-                assert_eq!(*seq, 200, "Even key {} has wrong sequence", key);
+                assert_eq!(*seq, 200, "Even key {key} has wrong sequence");
                 assert_eq!(
                     *kind,
                     InternalKeyKind::Delete,
-                    "Even key {} has wrong kind",
-                    key
+                    "Even key {key} has wrong kind"
                 );
             } else {
                 // Odd keys and even keys >= 10 should be values with seq=100
-                assert_eq!(*seq, 100, "Key {} has wrong sequence", key);
-                assert_eq!(*kind, InternalKeyKind::Set, "Key {} has wrong kind", key);
+                assert_eq!(*seq, 100, "Key {key} has wrong sequence");
+                assert_eq!(*kind, InternalKeyKind::Set, "Key {key} has wrong kind");
             }
         }
 
@@ -423,8 +566,7 @@ mod tests {
         for i in 0..10 {
             if i % 2 == 0 {
                 // Tombstone for even keys
-                let key =
-                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
                 // Create empty Vec<u8> and wrap it in Arc for tombstone value
                 let empty_value: Vec<u8> = Vec::new();
                 items1.push((key, empty_value.into()));
@@ -433,8 +575,8 @@ mod tests {
 
         let mut items2 = Vec::new();
         for i in 0..20 {
-            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
-            let value_str = format!("value-{}", i);
+            let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{i}");
             let value_vec: Vec<u8> = value_str.into_bytes();
             items2.push((key, value_vec.into()));
         }
@@ -442,11 +584,8 @@ mod tests {
         let iter1 = Box::new(MockIterator::new(items1));
         let iter2 = Box::new(MockIterator::new(items2));
 
-        // Create the merge iterator
-        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
-
         // Use bottom level
-        let comp_iter = CompactionIterator::new(merge_iter, true);
+        let comp_iter = MergeIterator::new(vec![iter1, iter2], true);
 
         // Collect all items
         let mut bottom_result = Vec::new();
@@ -457,23 +596,537 @@ mod tests {
 
         // At bottom level, tombstones should be removed
         for i in 0..20 {
-            let key = format!("key-{:03}", i);
+            let key = format!("key-{i:03}");
 
             if i % 2 == 0 && i < 10 {
                 // Even keys under 10 should be removed due to tombstones
                 assert!(
                     !bottom_result.contains(&key),
-                    "Key {} should be removed at bottom level",
-                    key
+                    "Key {key} should be removed at bottom level"
                 );
             } else {
                 // Other keys should remain
                 assert!(
                     bottom_result.contains(&key),
-                    "Key {} should exist at bottom level",
-                    key
+                    "Key {key} should exist at bottom level"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_combined_iterator_returns_latest_version() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        // Create multiple versions of the same key with different sequence numbers
+        let user_key = "key1";
+        let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
+        let key_v2 = create_internal_key(user_key, 200, InternalKeyKind::Set);
+        let key_v3 = create_internal_key(user_key, 300, InternalKeyKind::Set);
+
+        let value_v1 = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+        let value_v2 = create_vlog_value(&vlog, user_key.as_bytes(), b"value2");
+        let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
+
+        // Put them in different iterators to test different levels
+        let items1 = vec![(key_v1.clone(), value_v1.clone())]; // L0 - oldest
+        let items2 = vec![(key_v2.clone(), value_v2.clone())]; // L1 - middle
+        let items3 = vec![(key_v3.clone(), value_v3.clone())]; // L2 - newest
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+        let iter3 = Box::new(MockIterator::new(items3));
+
+        // Create compaction iterator (non-bottom level)
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2, iter3],
+            false, // not bottom level
+            Some(vlog.clone()),
+        );
+
+        // Should return only the latest version (seq=300)
+        let result: Vec<_> = comp_iter.by_ref().collect();
+        assert_eq!(result.len(), 1);
+
+        let (returned_key, returned_value) = &result[0];
+        assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+        assert_eq!(returned_key.seq_num(), 300);
+        assert_eq!(returned_key.kind(), InternalKeyKind::Set);
+        // Verify the correct value is returned (should be value_v3)
+        assert_eq!(
+            returned_value, &value_v3,
+            "Should return the value corresponding to the latest version (seq=300)"
+        );
+
+        // Flush any remaining delete list batch
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Verify that older versions are marked as stale, but latest is not
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "Older version (seq=100) should be marked as stale"
+        );
+        assert!(
+            vlog.is_stale(200).unwrap(),
+            "Older version (seq=200) should be marked as stale"
+        );
+        assert!(
+            !vlog.is_stale(300).unwrap(),
+            "Latest version (seq=300) should NOT be marked as stale since it was returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_iterator_adds_older_versions_to_delete_list() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        let user_key = "key1";
+        let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
+        let key_v2 = create_internal_key(user_key, 200, InternalKeyKind::Set);
+        let key_v3 = create_internal_key(user_key, 300, InternalKeyKind::Set);
+
+        let value_v1 = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+        let value_v2 = create_vlog_value(&vlog, user_key.as_bytes(), b"value2");
+        let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
+
+        let items1 = vec![(key_v1.clone(), value_v1.clone())];
+        let items2 = vec![(key_v2.clone(), value_v2.clone())];
+        let items3 = vec![(key_v3.clone(), value_v3.clone())];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+        let iter3 = Box::new(MockIterator::new(items3));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2, iter3],
+            false, // not bottom level
+            Some(vlog.clone()),
+        );
+
+        // Consume the iterator
+        let result: Vec<_> = comp_iter.by_ref().collect();
+
+        // Verify we get the latest version with correct value
+        assert_eq!(result.len(), 1);
+        let (returned_key, returned_value) = &result[0];
+        assert_eq!(returned_key.seq_num(), 300);
+        assert_eq!(
+            returned_value, &value_v3,
+            "Should return the value corresponding to the latest version (seq=300)"
+        );
+
+        // Flush delete list batch to VLog
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Verify that the delete list batch was properly flushed
+        assert_eq!(
+            comp_iter.delete_list_batch.len(),
+            0,
+            "Delete list batch should be empty after flush"
+        );
+
+        // Verify that older versions are marked as stale
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "Older version (seq=100) should be marked as stale"
+        );
+        assert!(
+            vlog.is_stale(200).unwrap(),
+            "Older version (seq=200) should be marked as stale"
+        );
+        // Latest version (seq=300) should NOT be marked as stale since it was returned
+        assert!(
+            !vlog.is_stale(300).unwrap(),
+            "Latest version (seq=300) should NOT be marked as stale since it was returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_at_bottom_level() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        let user_key = "key1";
+        let tombstone_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
+        let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
+
+        let empty_value: Vec<u8> = Vec::new();
+        let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+        let items1 = vec![(tombstone_key.clone(), empty_value.into())];
+        let items2 = vec![(value_key.clone(), actual_value.clone())];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2],
+            true, // bottom level
+            Some(vlog.clone()),
+        );
+
+        // At bottom level, tombstone should NOT be returned
+        let result: Vec<_> = comp_iter.by_ref().collect();
+        assert_eq!(
+            result.len(),
+            0,
+            "At bottom level, tombstone should not be returned"
+        );
+
+        // Flush delete list batch
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Both tombstone and older value should be added to delete list
+        // At bottom level, both the tombstone and the older value should be marked as stale
+        assert!(
+            vlog.is_stale(200).unwrap(),
+            "Tombstone (seq=200) should be marked as stale at bottom level"
+        );
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "Older value (seq=100) should be marked as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_at_non_bottom_level() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        let user_key = "key1";
+        let tombstone_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
+        let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
+
+        let empty_value: Vec<u8> = Vec::new();
+        let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+        let items1 = vec![(tombstone_key.clone(), empty_value.into())];
+        let items2 = vec![(value_key.clone(), actual_value.clone())];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2],
+            false, // not bottom level
+            Some(vlog.clone()),
+        );
+
+        // At non-bottom level, tombstone SHOULD be returned
+        let result: Vec<_> = comp_iter.by_ref().collect();
+        assert_eq!(
+            result.len(),
+            1,
+            "At non-bottom level, tombstone should be returned"
+        );
+
+        let (returned_key, returned_value) = &result[0];
+        assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+        assert_eq!(returned_key.seq_num(), 200);
+        assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
+        // Verify tombstone has empty value
+        assert_eq!(returned_value.len(), 0, "Tombstone should have empty value");
+
+        // Flush delete list batch
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Only the older value should be added to delete list (not the tombstone)
+        // Check that the older value (seq=100) is marked as stale
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "Older value (seq=100) should be marked as stale"
+        );
+        // Check that the tombstone (seq=200) is NOT marked as stale (since it was returned)
+        assert!(
+            !vlog.is_stale(200).unwrap(),
+            "Tombstone (seq=200) should NOT be marked as stale since it was returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_keys_with_mixed_scenarios() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        // Key1: Multiple versions (latest is value)
+        let key1_v1 = create_internal_key("key1", 100, InternalKeyKind::Set);
+        let key1_v2 = create_internal_key("key1", 200, InternalKeyKind::Set);
+        let key1_val1 = create_vlog_value(&vlog, b"key1", b"value1_old");
+        let key1_val2 = create_vlog_value(&vlog, b"key1", b"value1_new");
+
+        // Key2: Multiple versions (latest is tombstone)
+        let key2_v1 = create_internal_key("key2", 110, InternalKeyKind::Set);
+        let key2_v2 = create_internal_key("key2", 210, InternalKeyKind::Delete);
+        let key2_val1 = create_vlog_value(&vlog, b"key2", b"value2");
+        let key2_val2: Vec<u8> = Vec::new();
+
+        // Key3: Single version (value)
+        let key3_v1 = create_internal_key("key3", 150, InternalKeyKind::Set);
+        let key3_val1 = create_vlog_value(&vlog, b"key3", b"value3");
+
+        // Distribute across multiple iterators
+        let items1 = vec![
+            (key1_v2.clone(), key1_val2.clone()),
+            (key2_v2.clone(), key2_val2.into()),
+        ];
+        let items2 = vec![
+            (key1_v1.clone(), key1_val1.clone()),
+            (key3_v1.clone(), key3_val1.clone()),
+        ];
+        let items3 = vec![(key2_v1.clone(), key2_val1.clone())];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+        let iter3 = Box::new(MockIterator::new(items3));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2, iter3],
+            false, // not bottom level
+            Some(vlog.clone()),
+        );
+
+        let result: Vec<_> = comp_iter.by_ref().collect();
+
+        // Should get 3 keys back (latest version of each)
+        assert_eq!(result.len(), 3);
+
+        // Verify results are in order and contain latest versions
+        let keys: Vec<String> = result
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(&k.user_key).to_string())
+            .collect();
+        assert_eq!(keys, vec!["key1", "key2", "key3"]);
+
+        // Verify sequence numbers (latest versions)
+        assert_eq!(result[0].0.seq_num(), 200); // key1 latest
+        assert_eq!(result[1].0.seq_num(), 210); // key2 latest (tombstone)
+        assert_eq!(result[2].0.seq_num(), 150); // key3 only version
+
+        // Verify kinds
+        assert_eq!(result[0].0.kind(), InternalKeyKind::Set);
+        assert_eq!(result[1].0.kind(), InternalKeyKind::Delete);
+        assert_eq!(result[2].0.kind(), InternalKeyKind::Set);
+
+        // Verify values match the latest versions
+        assert_eq!(
+            result[0].1, key1_val2,
+            "key1 should have the latest value (key1_val2)"
+        );
+        assert_eq!(
+            result[1].1.len(),
+            0,
+            "key2 tombstone should have empty value"
+        );
+        assert_eq!(
+            result[2].1, key3_val1,
+            "key3 should have its only value (key3_val1)"
+        );
+
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Verify delete list behavior for complex scenario:
+        // Key1: seq=100 should be stale (older version), seq=200 should NOT be stale (latest, returned)
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "Key1 older version (seq=100) should be marked as stale"
+        );
+        assert!(
+            !vlog.is_stale(200).unwrap(),
+            "Key1 latest version (seq=200) should NOT be marked as stale since it was returned"
+        );
+
+        // Key2: seq=110 should be stale (older version), seq=210 should NOT be stale (latest tombstone, returned)
+        assert!(
+            vlog.is_stale(110).unwrap(),
+            "Key2 older version (seq=110) should be marked as stale"
+        );
+        assert!(
+            !vlog.is_stale(210).unwrap(),
+            "Key2 latest tombstone (seq=210) should NOT be marked as stale since it was returned"
+        );
+
+        // Key3: seq=150 should NOT be stale (only version, returned)
+        assert!(
+            !vlog.is_stale(150).unwrap(),
+            "Key3 only version (seq=150) should NOT be marked as stale since it was returned"
+        );
+    }
+
+    #[test]
+    fn test_no_vlog_no_delete_list() {
+        // Test CompactionIterator without VLog - should work but not track delete list
+
+        let user_key = "key1";
+        let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
+        let key_v2 = create_internal_key(user_key, 200, InternalKeyKind::Set);
+
+        let value_v1: Vec<u8> = b"value1".to_vec();
+        let value_v2: Vec<u8> = b"value2".to_vec();
+
+        let items1 = vec![(key_v2.clone(), value_v2.into())];
+        let items2 = vec![(key_v1.clone(), value_v1.into())];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2],
+            false, // not bottom level
+            None,  // no vlog
+        );
+
+        // Should still work and return latest version
+        let result: Vec<_> = comp_iter.by_ref().collect();
+        assert_eq!(result.len(), 1);
+
+        let (returned_key, returned_value) = &result[0];
+        assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+        assert_eq!(returned_key.seq_num(), 200);
+        // Verify the correct value is returned (should be value_v2)
+        assert_eq!(
+            returned_value.as_ref(),
+            b"value2",
+            "Should return the value corresponding to the latest version (seq=200)"
+        );
+
+        // Delete list batch should be empty since no VLog
+        assert_eq!(comp_iter.delete_list_batch.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_ordering_across_iterators() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        // Create entries across multiple iterators with overlapping keys
+        // and verify they are merged in correct order
+
+        // Iterator 1 (L0): Latest versions
+        let key_a_v3 = create_internal_key("key_a", 300, InternalKeyKind::Set);
+        let key_c_v3 = create_internal_key("key_c", 350, InternalKeyKind::Delete);
+        let val_a_v3 = create_vlog_value(&vlog, b"key_a", b"value_a_latest");
+        let val_c_v3: Vec<u8> = Vec::new();
+
+        // Iterator 2 (L1): Middle versions
+        let key_a_v2 = create_internal_key("key_a", 200, InternalKeyKind::Set);
+        let key_b_v2 = create_internal_key("key_b", 250, InternalKeyKind::Set);
+        let key_c_v2 = create_internal_key("key_c", 220, InternalKeyKind::Set);
+        let val_a_v2 = create_vlog_value(&vlog, b"key_a", b"value_a_middle");
+        let val_b_v2 = create_vlog_value(&vlog, b"key_b", b"value_b");
+        let val_c_v2 = create_vlog_value(&vlog, b"key_c", b"value_c_middle");
+
+        // Iterator 3 (L2): Oldest versions
+        let key_a_v1 = create_internal_key("key_a", 100, InternalKeyKind::Set);
+        let key_c_v1 = create_internal_key("key_c", 120, InternalKeyKind::Set);
+        let key_d_v1 = create_internal_key("key_d", 150, InternalKeyKind::Set);
+        let val_a_v1 = create_vlog_value(&vlog, b"key_a", b"value_a_oldest");
+        let val_c_v1 = create_vlog_value(&vlog, b"key_c", b"value_c_oldest");
+        let val_d_v1 = create_vlog_value(&vlog, b"key_d", b"value_d");
+
+        let items1 = vec![
+            (key_a_v3.clone(), val_a_v3.clone()),
+            (key_c_v3.clone(), val_c_v3.into()),
+        ];
+        let items2 = vec![
+            (key_a_v2.clone(), val_a_v2.clone()),
+            (key_b_v2.clone(), val_b_v2.clone()),
+            (key_c_v2.clone(), val_c_v2.clone()),
+        ];
+        let items3 = vec![
+            (key_a_v1.clone(), val_a_v1.clone()),
+            (key_c_v1.clone(), val_c_v1.clone()),
+            (key_d_v1.clone(), val_d_v1.clone()),
+        ];
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+        let iter3 = Box::new(MockIterator::new(items3));
+
+        let mut comp_iter = CompactionIterator::new(
+            vec![iter1, iter2, iter3],
+            false, // not bottom level
+            Some(vlog.clone()),
+        );
+
+        let result: Vec<_> = comp_iter.by_ref().collect();
+
+        // Should get 4 keys in alphabetical order
+        assert_eq!(result.len(), 4);
+
+        let keys: Vec<String> = result
+            .iter()
+            .map(|(k, _)| String::from_utf8_lossy(&k.user_key).to_string())
+            .collect();
+        assert_eq!(keys, vec!["key_a", "key_b", "key_c", "key_d"]);
+
+        // Verify we get the latest versions
+        assert_eq!(result[0].0.seq_num(), 300); // key_a latest
+        assert_eq!(result[1].0.seq_num(), 250); // key_b only version
+        assert_eq!(result[2].0.seq_num(), 350); // key_c latest (tombstone)
+        assert_eq!(result[3].0.seq_num(), 150); // key_d only version
+
+        // Verify kinds
+        assert_eq!(result[0].0.kind(), InternalKeyKind::Set);
+        assert_eq!(result[1].0.kind(), InternalKeyKind::Set);
+        assert_eq!(result[2].0.kind(), InternalKeyKind::Delete);
+        assert_eq!(result[3].0.kind(), InternalKeyKind::Set);
+
+        // Verify values match the latest versions of each key
+        assert_eq!(
+            result[0].1, val_a_v3,
+            "key_a should have the latest value (val_a_v3)"
+        );
+        assert_eq!(
+            result[1].1, val_b_v2,
+            "key_b should have its only value (val_b_v2)"
+        );
+        assert_eq!(
+            result[2].1.len(),
+            0,
+            "key_c tombstone should have empty value"
+        );
+        assert_eq!(
+            result[3].1, val_d_v1,
+            "key_d should have its only value (val_d_v1)"
+        );
+
+        comp_iter.flush_delete_list_batch().unwrap();
+
+        // Verify delete list behavior for sequence ordering test:
+        // key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be stale (latest, returned)
+        assert!(
+            vlog.is_stale(100).unwrap(),
+            "key_a oldest version (seq=100) should be marked as stale"
+        );
+        assert!(
+            vlog.is_stale(200).unwrap(),
+            "key_a middle version (seq=200) should be marked as stale"
+        );
+        assert!(
+            !vlog.is_stale(300).unwrap(),
+            "key_a latest version (seq=300) should NOT be marked as stale since it was returned"
+        );
+
+        // key_b: seq=250 should NOT be stale (only version, returned)
+        assert!(
+            !vlog.is_stale(250).unwrap(),
+            "key_b only version (seq=250) should NOT be marked as stale since it was returned"
+        );
+
+        // key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be stale (latest tombstone, returned)
+        assert!(
+            vlog.is_stale(120).unwrap(),
+            "key_c oldest version (seq=120) should be marked as stale"
+        );
+        assert!(
+            vlog.is_stale(220).unwrap(),
+            "key_c middle version (seq=220) should be marked as stale"
+        );
+        assert!(
+            !vlog.is_stale(350).unwrap(),
+            "key_c latest tombstone (seq=350) should NOT be marked as stale since it was returned"
+        );
+
+        // key_d: seq=150 should NOT be stale (only version, returned)
+        assert!(
+            !vlog.is_stale(150).unwrap(),
+            "key_d only version (seq=150) should NOT be marked as stale since it was returned"
+        );
     }
 }

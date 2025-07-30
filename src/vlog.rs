@@ -9,78 +9,16 @@ use std::{
     },
 };
 
-use crate::discard::DiscardStats;
-use crate::vfs;
+use crate::{batch::Batch, discard::DiscardStats};
+use crate::{sstable::InternalKey, vfs, Options, Tree, VLogChecksumLevel};
 
 use crc32fast::Hasher;
 
 use crate::commit::CommitPipeline;
 use crate::error::{Error, Result};
-use crate::levels::LevelManifest;
-use crate::memtable::{ImmutableMemtables, MemTable};
-
-const GC_DISCARD_RATIO_THRESHOLD: f64 = 0.5; // 50% discardable data triggers GC
 
 /// Size of a ValuePointer when encoded (8 + 8 + 4 + 4 + 4 bytes)
 pub const VALUE_POINTER_SIZE: usize = 28;
-
-/// Represents where a value is stored - either inline in the SSTable or in the value log
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValueLocation {
-    /// Value is stored inline in the SSTable
-    Inline(Vec<u8>),
-    /// Value is stored in the value log, referenced by a pointer
-    VLog(ValuePointer),
-}
-
-impl ValueLocation {
-    #[cfg(test)]
-    fn from_value(value: &[u8], threshold: usize) -> Self {
-        if value.len() < threshold {
-            ValueLocation::Inline(value.to_vec())
-        } else {
-            // For values that should go to VLog, we return a default pointer
-            // The actual VLog storage will be handled by the LSM tree
-            ValueLocation::VLog(ValuePointer::default())
-        }
-    }
-
-    /// Creates a ValueLocation from encoded value data, attempting to decode VLog pointers
-    pub fn from_encoded_value(encoded: &[u8], vlog: Option<&VLog>) -> Result<Vec<u8>> {
-        if let Some(pointer) = ValuePointer::try_decode(encoded)? {
-            // Valid VLog pointer, resolve it
-            if let Some(vlog) = vlog {
-                return vlog.get(&pointer);
-            }
-        }
-        // Not a VLog pointer or no VLog available, return as-is
-        Ok(encoded.to_vec())
-    }
-
-    /// Encodes the ValueLocation for storage
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            ValueLocation::Inline(data) => data.clone(),
-            ValueLocation::VLog(pointer) => pointer.encode(),
-        }
-    }
-
-    /// Decodes a ValueLocation from stored data
-    pub fn decode(data: &[u8]) -> Result<Self> {
-        if let Some(pointer) = ValuePointer::try_decode(data)? {
-            return Ok(ValueLocation::VLog(pointer));
-        }
-        Ok(ValueLocation::Inline(data.to_vec()))
-    }
-
-    /// Resolves the actual value, reading from VLog if necessary
-    pub fn resolve(&self, vlog: &VLog) -> Result<Vec<u8>> {
-        match self {
-            ValueLocation::Inline(data) => Ok(data.clone()),
-            ValueLocation::VLog(pointer) => vlog.get(pointer),
-        }
-    }
-}
 
 /// A pointer to a value stored in the value log
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -109,39 +47,14 @@ impl ValuePointer {
         }
     }
 
-    /// Checks if the given data could potentially be a ValuePointer
-    /// This is a lightweight check that only verifies the size
-    pub fn could_be_pointer(data: &[u8]) -> bool {
-        data.len() == VALUE_POINTER_SIZE
-    }
-
-    /// Attempts to decode data as a ValuePointer, returning None if it's clearly not a pointer
-    /// This performs additional validation beyond just size checking
-    pub fn try_decode(data: &[u8]) -> Result<Option<Self>> {
-        if !Self::could_be_pointer(data) {
-            return Ok(None);
-        }
-
-        if let Ok(pointer) = Self::decode(data) {
-            // Additional validation: a valid VLog pointer should have non-zero checksum
-            if pointer.checksum != 0 && pointer.total_entry_size() > 0 {
-                Ok(Some(pointer))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Encodes the pointer as bytes for storage
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
-        encoded.extend_from_slice(&self.file_id.to_le_bytes());
-        encoded.extend_from_slice(&self.offset.to_le_bytes());
-        encoded.extend_from_slice(&self.key_size.to_le_bytes());
-        encoded.extend_from_slice(&self.value_size.to_le_bytes());
-        encoded.extend_from_slice(&self.checksum.to_le_bytes());
+        encoded.extend_from_slice(&self.file_id.to_be_bytes());
+        encoded.extend_from_slice(&self.offset.to_be_bytes());
+        encoded.extend_from_slice(&self.key_size.to_be_bytes());
+        encoded.extend_from_slice(&self.value_size.to_be_bytes());
+        encoded.extend_from_slice(&self.checksum.to_be_bytes());
         encoded
     }
 
@@ -151,15 +64,15 @@ impl ValuePointer {
             return Err(Error::Corruption("Invalid ValuePointer size".to_string()));
         }
 
-        let file_id = u64::from_le_bytes([
+        let file_id = u64::from_be_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
-        let offset = u64::from_le_bytes([
+        let offset = u64::from_be_bytes([
             data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
-        let key_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let value_size = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-        let checksum = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        let key_size = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let value_size = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        let checksum = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
 
         Ok(Self::new(file_id, offset, key_size, value_size, checksum))
     }
@@ -230,8 +143,8 @@ impl VLogWriter {
         let crc32 = hasher.finalize();
 
         // Write header: [key_len: 4 bytes][value_len: 4 bytes]
-        self.writer.write_all(&key_len.to_le_bytes())?;
-        self.writer.write_all(&value_len.to_le_bytes())?;
+        self.writer.write_all(&key_len.to_be_bytes())?;
+        self.writer.write_all(&value_len.to_be_bytes())?;
 
         // Write key
         self.writer.write_all(key)?;
@@ -240,7 +153,7 @@ impl VLogWriter {
         self.writer.write_all(value)?;
 
         // Write CRC32
-        self.writer.write_all(&crc32.to_le_bytes())?;
+        self.writer.write_all(&crc32.to_be_bytes())?;
 
         let entry_size = 8 + key.len() as u64 + value.len() as u64 + 4; // header + key + value + crc32
         self.current_offset += entry_size;
@@ -279,14 +192,14 @@ pub struct VLog {
     /// Base directory for VLog files
     path: PathBuf,
 
-    /// Threshold for storing values in VLog vs LSM tree
-    value_threshold: u32,
-
     /// Maximum size for each VLog file before rotation
     max_file_size: u64,
 
     /// Checksum verification level
-    checksum_level: crate::VLogChecksumLevel,
+    checksum_level: VLogChecksumLevel,
+
+    /// Discard ratio threshold for triggering garbage collection (0.0 - 1.0)
+    gc_discard_ratio: f64,
 
     /// Next file ID to be assigned
     next_file_id: AtomicU64,
@@ -315,27 +228,22 @@ pub struct VLog {
     /// Discard statistics for GC candidate selection
     discard_stats: Mutex<DiscardStats>,
 
-    /// LSM components for staleness detection during GC
-    active_memtable: Arc<RwLock<Arc<MemTable>>>,
-    immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-    levels: Arc<RwLock<LevelManifest>>,
+    /// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
+    pub(crate) global_delete_list: Arc<GlobalDeleteListLSM>,
 }
 
 impl VLog {
     /// Returns the file path for a VLog file with the given ID
     fn vlog_file_path(&self, file_id: u64) -> PathBuf {
-        self.path.join(format!("vlog_{:08}.log", file_id))
+        self.path.join(format!("vlog_{file_id:08}.log"))
     }
 
     /// Creates a new VLog instance
     pub fn new<P: AsRef<Path>>(
         dir: P,
-        value_threshold: usize,
         max_file_size: u64,
-        checksum_level: crate::VLogChecksumLevel,
-        active_memtable: Arc<RwLock<Arc<MemTable>>>,
-        immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-        levels: Arc<RwLock<LevelManifest>>,
+        checksum_level: VLogChecksumLevel,
+        gc_discard_ratio: f64,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -347,11 +255,14 @@ impl VLog {
             .parent()
             .ok_or_else(|| Error::Other("VLog directory has no parent".to_string()))?;
 
+        // Initialize the global delete list LSM tree
+        let global_delete_list = Arc::new(GlobalDeleteListLSM::new(dir.clone())?);
+
         let vlog = Self {
             path: dir.clone(),
-            value_threshold: value_threshold as u32,
             max_file_size,
             checksum_level,
+            gc_discard_ratio, // Use the provided ratio
             next_file_id: AtomicU64::new(0),
             active_writer_id: AtomicU64::new(0),
             writer: RwLock::new(None),
@@ -361,9 +272,7 @@ impl VLog {
             files_to_be_deleted: RwLock::new(Vec::new()),
             gc_in_progress: AtomicBool::new(false),
             discard_stats: Mutex::new(DiscardStats::new(discard_stats_dir)?),
-            active_memtable,
-            immutable_memtables,
-            levels,
+            global_delete_list,
         };
 
         // Clean up any leftover temporary files from previous interrupted compactions
@@ -374,11 +283,6 @@ impl VLog {
 
     /// Appends a key+value pair to the log and returns a ValuePointer
     pub fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
-        // Only store in vlog if value is large enough
-        if value.len() < self.value_threshold as usize {
-            return Err(Error::Other("Value too small for vlog storage".to_string()));
-        }
-
         // Ensure we have a writer
         let _new_file_created = {
             let mut writer = self.writer.write().unwrap();
@@ -444,14 +348,13 @@ impl VLog {
 
         // Verify header sizes
         let header_key_len =
-            u32::from_le_bytes([entry_data[0], entry_data[1], entry_data[2], entry_data[3]]);
+            u32::from_be_bytes([entry_data[0], entry_data[1], entry_data[2], entry_data[3]]);
         let header_value_len =
-            u32::from_le_bytes([entry_data[4], entry_data[5], entry_data[6], entry_data[7]]);
+            u32::from_be_bytes([entry_data[4], entry_data[5], entry_data[6], entry_data[7]]);
 
         if header_key_len != key_len || header_value_len != value_len {
             return Err(Error::Corruption(format!(
-                "Header size mismatch: expected key {} value {}, got key {} value {}",
-                key_len, value_len, header_key_len, header_value_len
+                "Header size mismatch: expected key {key_len} value {value_len}, got key {header_key_len} value {header_value_len}"
             )));
         }
 
@@ -462,7 +365,7 @@ impl VLog {
 
         let key = &entry_data[key_start..value_start];
         let value = &entry_data[value_start..crc_start];
-        let stored_crc32 = u32::from_le_bytes([
+        let stored_crc32 = u32::from_be_bytes([
             entry_data[crc_start],
             entry_data[crc_start + 1],
             entry_data[crc_start + 2],
@@ -470,16 +373,14 @@ impl VLog {
         ]);
 
         // Checksum verification
-        if self.checksum_level != crate::VLogChecksumLevel::Disabled
-            && stored_crc32 != pointer.checksum
-        {
+        if self.checksum_level != VLogChecksumLevel::Disabled && stored_crc32 != pointer.checksum {
             return Err(Error::Corruption(format!(
                 "CRC32 mismatch: expected {}, got {}",
                 pointer.checksum, stored_crc32
             )));
         }
 
-        if self.checksum_level == crate::VLogChecksumLevel::Full {
+        if self.checksum_level == VLogChecksumLevel::Full {
             let mut hasher = Hasher::new();
             hasher.update(key);
             hasher.update(value);
@@ -581,7 +482,7 @@ impl VLog {
             if total_size == 0 {
                 false
             } else {
-                discard_ratio >= GC_DISCARD_RATIO_THRESHOLD
+                discard_ratio >= self.gc_discard_ratio
             }
         };
 
@@ -612,8 +513,7 @@ impl VLog {
             let files_to_delete = self.files_to_be_deleted.read().unwrap();
             if files_to_delete.contains(&file_id) {
                 return Err(Error::Other(format!(
-                    "Value log file already marked for deletion fid: {}",
-                    file_id
+                    "Value log file already marked for deletion fid: {file_id}"
                 )));
             }
         }
@@ -682,8 +582,9 @@ impl VLog {
 
         let mut offset = 0;
         let mut values_skipped = 0;
+        let mut stale_seq_nums = Vec::new();
 
-        let mut batch = crate::batch::Batch::default();
+        let mut batch = Batch::default();
         let mut batch_size = 0;
         const MAX_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB batch size limit
         const MAX_BATCH_COUNT: usize = 1000; // Maximum entries per batch
@@ -701,11 +602,11 @@ impl VLog {
                 Err(e) => return Err(e.into()),
             }
 
-            let key_len = u32::from_le_bytes(key_len_buf);
+            let key_len = u32::from_be_bytes(key_len_buf);
 
             let mut value_len_buf = [0u8; 4];
             source_file.read_exact(&mut value_len_buf)?;
-            let value_len = u32::from_le_bytes(value_len_buf);
+            let value_len = u32::from_be_bytes(value_len_buf);
 
             // Read key
             let mut key = vec![0u8; key_len as usize];
@@ -718,73 +619,54 @@ impl VLog {
             // Read CRC32
             let mut crc32_buf = [0u8; 4];
             source_file.read_exact(&mut crc32_buf)?;
-            let _crc32 = u32::from_le_bytes(crc32_buf);
+            let _crc32 = u32::from_be_bytes(crc32_buf);
 
             let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-            // Check if the LSM tree still points to this exact location
-            let should_rewrite = {
-                // The key stored in VLog is the encoded internal key (user_key + seq_num + kind)
-                // We need to extract the user key to query the LSM tree
-                if key.len() >= 8 {
-                    let internal_key = crate::sstable::InternalKey::decode(&key);
+            let internal_key = InternalKey::decode(&key);
+            let user_key = internal_key.user_key.to_vec();
 
-                    match self.get_from_tree(&internal_key.user_key) {
-                        Ok(Some(current_value)) => {
-                            // Key exists in LSM - check if the current version matches
-                            if let Some(current_pointer) =
-                                crate::vlog::ValuePointer::try_decode(&current_value)?
-                            {
-                                // This entry is still valid if the LSM points to this exact VLog location
-
-                                current_pointer.file_id == file_id
-                                    && current_pointer.offset == offset
-                            } else {
-                                // LSM value is not a valid VLog pointer (inline or invalid), so this VLog entry is stale
-                                false
-                            }
-                        }
-                        Ok(None) => {
-                            // Key no longer exists in LSM, so this VLog entry is stale
-                            false
-                        }
-                        Err(e) => {
-                            eprintln!("Error reading from LSM during compaction: {:?}", e);
-                            // Error reading from LSM - conservatively keep the entry
-                            true
-                        }
-                    }
-                } else {
-                    // Key too short to be a valid internal key - conservatively keep the entry
-                    true
+            // Check if this user key is stale using the global delete list
+            let is_stale = match self.global_delete_list.is_stale(internal_key.seq_num()) {
+                Ok(stale) => stale,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to check delete list for user key {user_key:?}: {e}"
+                    );
+                    false // Conservative: assume live on error
                 }
             };
 
-            if !should_rewrite {
+            if is_stale {
                 // Skip this entry (it's stale)
                 values_skipped += 1;
+                stale_seq_nums.push(internal_key.seq_num());
             } else {
-                // Extract the user key from the internal key
-                if key.len() >= 8 {
-                    let internal_key = crate::sstable::InternalKey::decode(&key);
+                let internal_key = InternalKey::decode(&key);
 
-                    // Add this entry to the batch to be rewritten
-                    // This will cause the value to be written to the active VLog file
-                    // and a new pointer to be stored in the LSM
-                    batch.set(&internal_key.user_key, &value)?;
+                // Add this entry to the batch to be rewritten with the correct operation type
+                // This preserves the original operation (Set, Delete, Merge, etc.)
+                // This will cause the value to be written to the active VLog file
+                // and a new pointer to be stored in the LSM
+                let kind = internal_key.kind();
+                let val = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.as_slice())
+                };
+                batch.add_record(kind, &internal_key.user_key, val)?;
 
-                    // Update batch size tracking
-                    batch_size += internal_key.user_key.len() + value.len();
+                // Update batch size tracking
+                batch_size += internal_key.user_key.len() + value.len();
 
-                    // If batch is full, commit it
-                    if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
-                        // Commit the batch to LSM (and VLog for large values)
-                        commit_pipeline.commit(batch, true).await?;
+                // If batch is full, commit it
+                if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
+                    // Commit the batch to LSM (and VLog for large values)
+                    commit_pipeline.commit(batch, true).await?;
 
-                        // Reset batch
-                        batch = crate::batch::Batch::default();
-                        batch_size = 0;
-                    }
+                    // Reset batch
+                    batch = Batch::default();
+                    batch_size = 0;
                 }
             }
 
@@ -794,6 +676,13 @@ impl VLog {
         // Commit any remaining entries in the batch
         if !batch.is_empty() {
             commit_pipeline.commit(batch, true).await?;
+        }
+
+        // Clean up delete list entries for merged stale data
+        if !stale_seq_nums.is_empty() {
+            if let Err(e) = self.global_delete_list.delete_entries_batch(stale_seq_nums) {
+                eprintln!("Warning: Failed to clean up delete list after merge: {e}");
+            }
         }
 
         // Only consider the file compacted if we skipped some values
@@ -823,11 +712,6 @@ impl VLog {
         self.discard_stats.lock().unwrap().sync()?;
 
         Ok(())
-    }
-
-    /// Gets the value size threshold
-    pub fn value_threshold(&self) -> usize {
-        self.value_threshold as usize
     }
 
     /// Gets the maximum file size
@@ -899,10 +783,7 @@ impl VLog {
 
                 // Try to remove the temporary file
                 if let Err(e) = std::fs::remove_file(&temp_path) {
-                    eprintln!(
-                        "Warning: Failed to cleanup temp file {:?}: {}",
-                        temp_path, e
-                    );
+                    eprintln!("Warning: Failed to cleanup temp file {temp_path:?}: {e}");
                 }
             }
         }
@@ -919,59 +800,20 @@ impl VLog {
         }
     }
 
-    /// Internal get method for VLog GC to check if entries are live
-    /// Returns the current value for a key from the LSM tree
-    fn get_from_tree(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        use crate::sstable::{InternalKey, InternalKeyKind};
-
-        // Use a high sequence number for GC reads (we want the most recent state)
-        let seq_num = u64::MAX;
-
-        // Check active memtable first
-        {
-            let active_memtable = self.active_memtable.read().unwrap();
-            if let Some((internal_key, value)) = active_memtable.get(key, Some(seq_num)) {
-                if internal_key.is_tombstone() {
-                    return Ok(None); // Key is deleted
-                } else {
-                    return Ok(Some(value.to_vec())); // Key found
-                }
-            }
+    /// Adds multiple stale entries to the global delete list in a batch
+    pub fn add_batch_to_delete_list(&self, entries: Vec<(u64, u64)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
         }
 
-        // Check immutable memtables
-        {
-            let immutable_memtables = self.immutable_memtables.read().unwrap();
-            for (_, memtable) in immutable_memtables.iter().rev() {
-                if let Some((internal_key, value)) = memtable.get(key, Some(seq_num)) {
-                    if internal_key.is_tombstone() {
-                        return Ok(None); // Key is deleted
-                    } else {
-                        return Ok(Some(value.to_vec())); // Key found
-                    }
-                }
-            }
-        }
+        // Call the synchronous method directly - no async needed
+        self.global_delete_list.add_stale_entries_batch(entries)
+    }
 
-        // Check SSTables in levels
-        {
-            let levels = self.levels.read().unwrap();
-            for level in levels.levels.get_levels() {
-                for table in &level.tables {
-                    // Create an InternalKey for the search
-                    let search_key = InternalKey::new(key.to_vec(), seq_num, InternalKeyKind::Max);
-                    if let Some((internal_key, value)) = table.get(search_key)? {
-                        if internal_key.is_tombstone() {
-                            return Ok(None); // Key is deleted
-                        } else {
-                            return Ok(Some(value.to_vec())); // Key found
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+    /// Checks if a sequence number is marked as stale in the delete list
+    /// This is primarily used for testing to verify delete list behavior
+    pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
+        self.global_delete_list.is_stale(seq_num)
     }
 }
 
@@ -1039,7 +881,7 @@ impl VLogGCManager {
                 // TODO: Use commit_pipeline during GC when VLog is enhanced to support it
                 if let Err(e) = vlog.garbage_collect(commit_pipeline.clone()).await {
                     // TODO: Handle error appropriately
-                    eprintln!("\n VLog GC task error: {:?}", e);
+                    eprintln!("\n VLog GC task error: {e:?}");
                 }
                 running.store(false, Ordering::SeqCst);
             }
@@ -1079,12 +921,108 @@ impl VLogGCManager {
 
         if let Some(handle) = handle_opt {
             if let Err(e) = handle.await {
-                eprintln!("Error shutting down VLog GC task: {:?}", e);
+                eprintln!("Error shutting down VLog GC task: {e:?}");
             }
         }
     }
 }
 
+/// Global Delete List using LSM Tree
+/// Uses a dedicated LSM tree for tracking stale user keys.
+/// This provides better performance and consistency with the main LSM tree design.
+pub struct GlobalDeleteListLSM {
+    /// LSM tree for storing delete list entries (user_key -> value_size)
+    delete_list_tree: Arc<Tree>,
+}
+
+impl GlobalDeleteListLSM {
+    pub fn new(base_path: PathBuf) -> Result<Self> {
+        let delete_list_path = base_path.join("global_delete_list");
+
+        // Create a dedicated LSM tree for the delete list
+        let delete_list_opts = Options {
+            path: delete_list_path,
+            // Disable VLog for the delete list to avoid circular dependency
+            disable_vlog: true,
+            ..Default::default()
+        };
+
+        let delete_list_tree =
+            Arc::new(Tree::new(Arc::new(delete_list_opts)).map_err(|e| {
+                Error::Other(format!("Failed to create global delete list LSM: {e}"))
+            })?);
+
+        Ok(Self { delete_list_tree })
+    }
+
+    /// Adds multiple stale entries in batch (synchronous)
+    /// This is called from CompactionIterator during LSM compaction
+    pub fn add_stale_entries_batch(&self, entries: Vec<(u64, u64)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = Batch::new();
+
+        for (seq_num, value_size) in entries {
+            // Convert sequence number to a byte array key
+            let seq_key = seq_num.to_be_bytes().to_vec();
+            // Store sequence number -> value_size mapping
+            batch.set(&seq_key, &value_size.to_be_bytes())?;
+        }
+
+        // Commit the batch to the LSM tree using sync commit
+        self.delete_list_tree
+            .sync_commit(batch, true)
+            .map_err(|e| Error::Other(format!("Failed to insert into delete list: {e}")))
+    }
+
+    /// Checks if a sequence number is in the delete list (stale)
+    pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
+        let tx = self
+            .delete_list_tree
+            .begin()
+            .map_err(|e| Error::Other(format!("Failed to begin transaction: {e}")))?;
+
+        // Convert sequence number to bytes for lookup
+        let seq_key = seq_num.to_be_bytes().to_vec();
+
+        match tx.get(&seq_key) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(Error::Other(format!("Failed to search delete list: {e}"))),
+        }
+    }
+
+    /// Syncs the delete list to disk
+    pub fn sync(&self) -> Result<()> {
+        self.delete_list_tree
+            .flush()
+            .map_err(|e| Error::Other(format!("Failed to sync delete list: {e}")))?;
+        Ok(())
+    }
+
+    /// Deletes multiple entries from the delete list in batch
+    /// This is called after successful compaction to clean up the delete list
+    pub fn delete_entries_batch(&self, seq_nums: Vec<u64>) -> Result<()> {
+        if seq_nums.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = Batch::new();
+
+        for seq_num in seq_nums {
+            // Convert sequence number to key format
+            let seq_key = seq_num.to_be_bytes().to_vec();
+            batch.delete(&seq_key)?;
+        }
+
+        // Commit the batch to the LSM tree using sync commit
+        self.delete_list_tree
+            .sync_commit(batch, true)
+            .map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,20 +1030,15 @@ mod tests {
 
     fn create_test_vlog() -> (VLog, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = crate::Options::default();
+        let opts = Options::default();
         // Create vlog subdirectory to simulate the real directory structure
         let vlog_dir = temp_dir.path().join("vlog");
         std::fs::create_dir_all(&vlog_dir).unwrap();
         let vlog = VLog::new(
             &vlog_dir,
-            opts.vlog_value_threshold,
             opts.vlog_max_file_size,
-            crate::VLogChecksumLevel::Full,
-            Arc::new(RwLock::new(Arc::new(MemTable::default()))),
-            Arc::new(RwLock::new(ImmutableMemtables::default())),
-            Arc::new(RwLock::new(
-                LevelManifest::new(opts.clone().into()).unwrap(),
-            )),
+            VLogChecksumLevel::Full,
+            opts.vlog_gc_discard_ratio, // Use default discard ratio from options
         )
         .unwrap();
         (vlog, temp_dir)
@@ -1121,59 +1054,22 @@ mod tests {
 
     #[test]
     fn test_value_pointer_utility_methods() {
-        // Test with valid VLog pointer
-        let pointer = ValuePointer::new(123, 456, 11, 789, 0xdeadbeef);
+        let pointer = ValuePointer::new(123, 456, 11, 789, 42);
         let encoded = pointer.encode();
 
-        assert!(ValuePointer::could_be_pointer(&encoded));
-        assert_eq!(ValuePointer::try_decode(&encoded).unwrap(), Some(pointer));
+        // Test with valid pointer
+        assert!(ValuePointer::decode(&encoded).is_ok());
+        assert_eq!(ValuePointer::decode(&encoded).unwrap(), pointer);
 
         // Test with wrong size data
         let wrong_size = vec![0u8; 20];
-        assert!(!ValuePointer::could_be_pointer(&wrong_size));
-        assert_eq!(ValuePointer::try_decode(&wrong_size).unwrap(), None);
+        assert!(ValuePointer::decode(&wrong_size).is_err());
 
-        // Test with correct size but invalid content (zero checksum)
-        let invalid_pointer = ValuePointer::new(123, 456, 11, 789, 0); // zero checksum
-        let invalid_encoded = invalid_pointer.encode();
-        assert!(ValuePointer::could_be_pointer(&invalid_encoded));
-        assert_eq!(ValuePointer::try_decode(&invalid_encoded).unwrap(), None);
-
-        // Test with random VALUE_POINTER_SIZE-byte data
+        // Test with random data of correct size
         let random_data = vec![0x42u8; VALUE_POINTER_SIZE];
-        assert!(ValuePointer::could_be_pointer(&random_data));
-        // is_likely_pointer should be more conservative and might reject this
-    }
-
-    #[test]
-    fn test_value_location_encoding() {
-        // Test inline value
-        let inline_value = ValueLocation::Inline(b"hello".to_vec());
-        let encoded = inline_value.encode();
-        let decoded = ValueLocation::decode(&encoded).unwrap();
-        assert_eq!(inline_value, decoded);
-
-        // Test vlog pointer
-        let pointer = ValuePointer::new(1, 100, 3, 5, 0x12345678);
-        let vlog_value = ValueLocation::VLog(pointer);
-        let encoded = vlog_value.encode();
-        let decoded = ValueLocation::decode(&encoded).unwrap();
-        assert_eq!(vlog_value, decoded);
-    }
-
-    #[test]
-    fn test_value_location_from_value() {
-        let opts = crate::Options::default();
-
-        // Small value should be inline
-        let small_value = vec![0u8; 100];
-        let location = ValueLocation::from_value(&small_value, opts.vlog_value_threshold);
-        assert!(matches!(location, ValueLocation::Inline(_)));
-
-        // Large value should use vlog
-        let large_value = vec![0u8; 300];
-        let location = ValueLocation::from_value(&large_value, opts.vlog_value_threshold);
-        assert!(matches!(location, ValueLocation::VLog(_)));
+        // With random data, decode might work but produce a nonsense pointer
+        // We just check it doesn't crash
+        let _ = ValuePointer::decode(&random_data);
     }
 
     #[test]
@@ -1225,8 +1121,8 @@ mod tests {
         assert_eq!(max_discard, 600);
     }
 
-    #[test]
-    fn test_vlog_append_and_get() {
+    #[tokio::test]
+    async fn test_vlog_append_and_get() {
         let (vlog, _temp_dir) = create_test_vlog();
 
         let key = b"test_key";
@@ -1238,13 +1134,16 @@ mod tests {
         assert_eq!(value, retrieved);
     }
 
-    #[test]
-    fn test_vlog_small_value_rejection() {
+    #[tokio::test]
+    async fn test_vlog_small_value_acceptance() {
         let (vlog, _temp_dir) = create_test_vlog();
 
         let key = b"test_key";
-        let small_value = vec![1u8; 100]; // Too small for vlog
-        let result = vlog.append(key, &small_value);
-        assert!(result.is_err());
+        let small_value = vec![1u8; 10]; // Small value should now be accepted
+        let pointer = vlog.append(key, &small_value).unwrap();
+        vlog.sync().unwrap();
+
+        let retrieved = vlog.get(&pointer).unwrap();
+        assert_eq!(small_value, retrieved);
     }
 }

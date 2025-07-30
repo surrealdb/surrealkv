@@ -101,8 +101,7 @@ pub fn replay_wal(
             Err(Error::Corruption(err)) => {
                 // Return the corruption information with the segment ID and last valid offset
                 eprintln!(
-                    "Corrupted WAL record detected in segment {:020} at offset {}: {}",
-                    latest_segment_id, last_valid_offset, err
+                    "Corrupted WAL record detected in segment {latest_segment_id:020} at offset {last_valid_offset}: {err}"
                 );
                 return Ok((
                     max_seq_num,
@@ -127,14 +126,13 @@ pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result
     use std::fs;
 
     // Build segment paths
-    let segment_path = wal_dir.join(format!("{:020}", segment_id));
-    let temp_path = wal_dir.join(format!("{:020}.repair", segment_id));
+    let segment_path = wal_dir.join(format!("{segment_id:020}"));
+    let temp_path = wal_dir.join(format!("{segment_id:020}.repair"));
 
     // Verify the corrupted segment exists
     if !segment_path.exists() {
         return Err(crate::error::Error::Other(format!(
-            "WAL segment {:020} does not exist",
-            segment_id
+            "WAL segment {segment_id:020} does not exist"
         )));
     }
 
@@ -167,7 +165,7 @@ pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result
             Ok((record_data, _offset)) => {
                 // We have a valid batch, write it to the new segment
                 if let Err(e) = new_segment.append(record_data) {
-                    eprintln!("Failed to write valid batch to repaired segment: {}", e);
+                    eprintln!("Failed to write valid batch to repaired segment: {e}");
                     repair_failed = true;
                     break;
                 }
@@ -176,21 +174,19 @@ pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result
             Err(Error::Corruption(err)) => {
                 // Stop at the first corruption - we've written all valid batches
                 eprintln!(
-                    "Stopped repair at corruption: {}. Recovered {} valid batches.",
-                    err, valid_batches_count
+                    "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
                 );
                 break;
             }
             Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // End of segment reached - all data was valid
                 eprintln!(
-                    "Repair completed successfully. Recovered {} valid batches.",
-                    valid_batches_count
+                    "Repair completed successfully. Recovered {valid_batches_count} valid batches."
                 );
                 break;
             }
             Err(err) => {
-                eprintln!("Unexpected error during repair: {}", err);
+                eprintln!("Unexpected error during repair: {err}");
                 repair_failed = true;
                 break;
             }
@@ -205,8 +201,7 @@ pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result
         let _ = fs::remove_file(&temp_path);
 
         return Err(crate::error::Error::Other(format!(
-            "Failed to repair WAL segment {}. Original segment unchanged.",
-            segment_id
+            "Failed to repair WAL segment {segment_id}. Original segment unchanged."
         )));
     }
 
@@ -214,8 +209,7 @@ pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result
     fs::rename(&temp_path, &segment_path)?;
 
     eprintln!(
-        "Successfully repaired WAL segment {} with {} valid batches.",
-        segment_id, valid_batches_count
+        "Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
     );
 
     Ok(())
