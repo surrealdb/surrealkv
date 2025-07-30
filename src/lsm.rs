@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::HashMap;
 use std::{
     fs::{create_dir_all, File},
     path::{Path, PathBuf},
@@ -23,9 +25,14 @@ use crate::{
     sstable::table::Table,
     task::TaskManager,
     transaction::{Mode, Transaction},
-    vlog::{VLog, VLogGCManager},
-    wal::{self, writer::Wal},
-    Options,
+    vlog::{VLog, VLogGCManager, ValuePointer},
+    wal::{
+        self,
+        cleanup::cleanup_old_segments,
+        recovery::{repair_corrupted_wal_segment, replay_wal},
+        writer::Wal,
+    },
+    Error, Options,
 };
 
 use async_trait::async_trait;
@@ -107,7 +114,7 @@ pub struct CoreInner {
     pub(crate) oracle: Arc<Oracle>,
 
     /// Value Log (VLog)
-    pub(crate) vlog: Arc<VLog>,
+    pub(crate) vlog: Option<Arc<VLog>>,
 
     /// Write-Ahead Log (WAL) for durability
     wal: parking_lot::RwLock<Wal>,
@@ -131,16 +138,17 @@ impl CoreInner {
         let wal_path = opts.path.join("wal");
         let wal = Wal::open(&wal_path, wal::Options::default())?;
 
-        let vlog_path = opts.path.join("vlog");
-        let vlog = Arc::new(VLog::new(
-            &vlog_path,
-            opts.vlog_value_threshold,
-            opts.vlog_max_file_size,
-            opts.vlog_checksum_verification,
-            active_memtable.clone(),
-            immutable_memtables.clone(),
-            levels.clone(),
-        )?);
+        let vlog = if opts.disable_vlog {
+            None
+        } else {
+            let vlog_path = opts.path.join("vlog");
+            Some(Arc::new(VLog::new(
+                &vlog_path,
+                opts.vlog_max_file_size,
+                opts.vlog_checksum_verification,
+                opts.vlog_gc_discard_ratio,
+            )?))
+        };
 
         Ok(Self {
             table_id_counter: Arc::new(AtomicU64::default()),
@@ -196,8 +204,8 @@ impl CoreInner {
         let wal_guard = self.wal.read();
         let wal_dir = wal_guard.get_dir_path().to_path_buf();
         tokio::spawn(async move {
-            if let Err(e) = crate::wal::cleanup::cleanup_old_segments(&wal_dir) {
-                eprintln!("Failed to clean up old WAL segments: {}", e);
+            if let Err(e) = cleanup_old_segments(&wal_dir) {
+                eprintln!("Failed to clean up old WAL segments: {e}");
             }
         });
 
@@ -300,6 +308,31 @@ impl CoreInner {
         memtable_lock.remove(table_id);
 
         Ok(())
+    }
+
+    /// Returns true if VLog is enabled
+    pub fn is_vlog_enabled(&self) -> bool {
+        self.vlog.is_some()
+    }
+
+    /// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
+    pub fn resolve_value(&self, value: &[u8]) -> Result<Vec<u8>> {
+        // If VLog is disabled, values are always stored inline
+        if !self.is_vlog_enabled() {
+            return Ok(value.to_vec());
+        }
+
+        // When VLog is enabled, all values should be VLog pointers
+        let vlog = self.vlog.as_ref().unwrap();
+
+        // Try to decode the value as a VLog pointer
+        match ValuePointer::decode(value) {
+            Ok(pointer) => vlog.get(&pointer),
+            Err(_) => {
+                // It could be a value that is not flushed to VLog yet
+                Ok(value.to_vec())
+            }
+        }
     }
 }
 
@@ -421,35 +454,32 @@ impl Core {
         let recovered_memtable = Arc::new(MemTable::default());
 
         // Replay WAL with automatic repair on corruption
-        let wal_seq_num = match crate::wal::recovery::replay_wal(wal_path, &recovered_memtable)? {
+        let wal_seq_num = match replay_wal(wal_path, &recovered_memtable)? {
             (seq_num, None) => {
                 // No corruption detected, successful replay
                 seq_num
             }
             (_seq_num, Some((corrupted_segment_id, last_valid_offset))) => {
                 eprintln!(
-                    "Detected WAL corruption in segment {} at offset {}. Attempting repair...",
-                    corrupted_segment_id, last_valid_offset
+                    "Detected WAL corruption in segment {corrupted_segment_id} at offset {last_valid_offset}. Attempting repair..."
                 );
 
                 // Attempt to repair the corrupted segment
-                if let Err(repair_err) = crate::wal::recovery::repair_corrupted_wal_segment(
-                    wal_path,
-                    corrupted_segment_id,
-                ) {
-                    eprintln!("Failed to repair WAL segment: {}", repair_err);
+                if let Err(repair_err) =
+                    repair_corrupted_wal_segment(wal_path, corrupted_segment_id)
+                {
+                    eprintln!("Failed to repair WAL segment: {repair_err}");
                     // Fail fast - cannot continue with corrupted WAL
-                    return Err(crate::error::Error::Other(format!(
-                        "{} failed: WAL segment {} is corrupted and could not be repaired. {}",
-                        context, corrupted_segment_id, repair_err
+                    return Err(Error::Other(format!(
+                        "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
                     )));
                 } else {
-                    eprintln!("Successfully repaired WAL segment {}", corrupted_segment_id);
+                    eprintln!("Successfully repaired WAL segment {corrupted_segment_id}");
 
                     // After repair, try to replay again to get any additional data
                     // Create a fresh memtable for the retry
                     let retry_memtable = Arc::new(MemTable::default());
-                    match crate::wal::recovery::replay_wal(wal_path, &retry_memtable) {
+                    match replay_wal(wal_path, &retry_memtable) {
                         Ok((retry_seq_num, None)) => {
                             // Successful replay after repair, use the retry memtable
                             if !retry_memtable.is_empty() {
@@ -459,16 +489,14 @@ impl Core {
                         }
                         Ok((_retry_seq_num, Some((seg_id, offset)))) => {
                             // WAL is still corrupted after repair - this is a serious problem
-                            return Err(crate::error::Error::Other(format!(
-                                "{} failed: WAL segment {} still corrupted after repair at offset {}. Repair was incomplete.",
-                                context, seg_id, offset
+                            return Err(Error::Other(format!(
+                                "{context} failed: WAL segment {seg_id} still corrupted after repair at offset {offset}. Repair was incomplete."
                             )));
                         }
                         Err(retry_err) => {
                             // Replay failed after successful repair - also a serious problem
-                            return Err(crate::error::Error::Other(format!(
-                                "{} failed: WAL replay failed after successful repair. {}",
-                                context, retry_err
+                            return Err(Error::Other(format!(
+                                "{context} failed: WAL replay failed after successful repair. {retry_err}"
                             )));
                         }
                     }
@@ -519,10 +547,12 @@ impl Core {
             vlog_gc_manager: Mutex::new(None),
         };
 
-        // Initialize VLog GC manager
-        let vlog_gc_manager = VLogGCManager::new(inner.vlog.clone(), commit_pipeline.clone());
-        vlog_gc_manager.start();
-        *core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
+        // Initialize VLog GC manager only if VLog is enabled
+        if let Some(ref vlog) = inner.vlog {
+            let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
+            vlog_gc_manager.start();
+            *core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
+        }
 
         Ok(core)
     }
@@ -530,6 +560,11 @@ impl Core {
     pub(crate) async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
         // Commit the batch using the commit pipeline
         self.commit_pipeline.commit(batch, sync_wal).await
+    }
+
+    pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+        // Use the synchronous commit path
+        self.commit_pipeline.sync_commit(batch, sync_wal)
     }
 
     pub(crate) fn seq_num(&self) -> u64 {
@@ -564,7 +599,7 @@ impl Core {
             let mut wal_guard = self.inner.wal.write();
             wal_guard
                 .close()
-                .map_err(|e| crate::error::Error::Other(format!("Failed to close WAL: {}", e)))?;
+                .map_err(|e| Error::Other(format!("Failed to close WAL: {e}")))?;
         }
 
         // Step 4: Flush all directories to ensure durability
@@ -573,15 +608,12 @@ impl Core {
         let wal_path = base_path.join("wal");
 
         // Sync all directories
-        fsync_directory(&table_folder_path).map_err(|e| {
-            crate::error::Error::Other(format!("Failed to sync table directory: {}", e))
-        })?;
-        fsync_directory(&wal_path).map_err(|e| {
-            crate::error::Error::Other(format!("Failed to sync WAL directory: {}", e))
-        })?;
-        fsync_directory(base_path).map_err(|e| {
-            crate::error::Error::Other(format!("Failed to sync base directory: {}", e))
-        })?;
+        fsync_directory(&table_folder_path)
+            .map_err(|e| Error::Other(format!("Failed to sync table directory: {e}")))?;
+        fsync_directory(&wal_path)
+            .map_err(|e| Error::Other(format!("Failed to sync WAL directory: {e}")))?;
+        fsync_directory(base_path)
+            .map_err(|e| Error::Other(format!("Failed to sync base directory: {e}")))?;
 
         Ok(())
     }
@@ -603,7 +635,6 @@ impl std::ops::Deref for Tree {
 impl Tree {
     /// Creates a new LSM tree with the specified options
     pub fn new(opts: Arc<Options>) -> Result<Self> {
-        opts.validate()?;
         let path = opts.path.clone();
 
         // Create directory structure
@@ -731,8 +762,19 @@ impl Tree {
     }
 
     #[cfg(test)]
-    pub fn get_all_vlog_stats(&self) -> Vec<(u64, u64, u64, f64)> {
-        self.core.vlog.get_all_file_stats()
+    fn get_all_vlog_stats(&self) -> Vec<(u64, u64, u64, f64)> {
+        match &self.core.vlog {
+            Some(vlog) => vlog.get_all_file_stats(),
+            None => Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    /// Updates VLog discard statistics if VLog is enabled
+    fn update_vlog_discard_stats(&self, stats: HashMap<u64, i64>) {
+        if let Some(ref vlog) = self.inner.vlog {
+            vlog.update_discard_stats(stats);
+        }
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -741,10 +783,10 @@ impl Tree {
 
     /// Triggers VLog garbage collection manually
     pub async fn garbage_collect_vlog(&self) -> Result<Vec<u64>> {
-        self.core
-            .vlog
-            .garbage_collect(self.core.commit_pipeline.clone())
-            .await
+        match &self.inner.vlog {
+            Some(vlog) => vlog.garbage_collect(self.commit_pipeline.clone()).await,
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Flushes the active memtable to disk
@@ -762,6 +804,10 @@ pub fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::compaction::leveled::Strategy;
+
     use super::*;
 
     use tempdir::TempDir;
@@ -897,9 +943,9 @@ mod tests {
 
         // Insert each key with multiple updates
         for i in 0..KEY_COUNT {
-            let key = format!("key_{:05}", i);
+            let key = format!("key_{i:05}");
             for update in 0..UPDATES_PER_KEY {
-                let value = format!("value_{:05}_update_{}", i, update);
+                let value = format!("value_{i:05}_update_{update}");
 
                 // Save the final value for verification
                 if update == UPDATES_PER_KEY - 1 {
@@ -923,9 +969,7 @@ mod tests {
             assert_eq!(
                 result,
                 expected_value.as_bytes().into(),
-                "Key '{}' should have final value '{}'",
-                key,
-                expected_value
+                "Key '{key}' should have final value '{expected_value}'"
             );
         }
 
@@ -933,7 +977,7 @@ mod tests {
         let l0_size = tree.core.levels.read().unwrap().levels.get_levels()[0]
             .tables
             .len();
-        assert!(l0_size > 0, "Expected SSTables in L0, got {}", l0_size);
+        assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
     }
 
     #[tokio::test]
@@ -963,9 +1007,9 @@ mod tests {
 
             // Insert each key with multiple updates
             for i in 0..KEY_COUNT {
-                let key = format!("key_{:05}", i);
+                let key = format!("key_{i:05}");
                 for update in 0..UPDATES_PER_KEY {
-                    let value = format!("value_{:05}_update_{}", i, update);
+                    let value = format!("value_{i:05}_update_{update}");
 
                     // Save the final value for verification
                     if update == UPDATES_PER_KEY - 1 {
@@ -991,8 +1035,7 @@ mod tests {
                 .len();
             assert!(
                 l0_size > 0,
-                "Expected SSTables in L0 before closing, got {}",
-                l0_size
+                "Expected SSTables in L0 before closing, got {l0_size}"
             );
 
             // Tree will be dropped here, closing the store
@@ -1008,8 +1051,7 @@ mod tests {
                 .len();
             assert!(
                 l0_size > 0,
-                "Expected SSTables in L0 after reopening, got {}",
-                l0_size
+                "Expected SSTables in L0 after reopening, got {l0_size}"
             );
 
             // Verify all keys have their final values
@@ -1019,8 +1061,7 @@ mod tests {
 
                 assert!(
                     result.is_some(),
-                    "Key '{}' not found after reopening store",
-                    key
+                    "Key '{key}' not found after reopening store"
                 );
 
                 let value = result.unwrap();
@@ -1052,8 +1093,8 @@ mod tests {
 
         // Insert some test data
         for i in 0..10 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let value = format!("value_{i:03}");
 
             let mut txn = tree.begin().unwrap();
             txn.set(key.as_bytes(), value.as_bytes()).unwrap();
@@ -1081,8 +1122,8 @@ mod tests {
 
         // Insert more data after checkpoint
         for i in 10..15 {
-            let key = format!("key_{:03}", i);
-            let value = format!("value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let value = format!("value_{i:03}");
 
             let mut txn = tree.begin().unwrap();
             txn.set(key.as_bytes(), value.as_bytes()).unwrap();
@@ -1094,14 +1135,10 @@ mod tests {
 
         // Verify all data exists before restore
         for i in 0..15 {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{i:03}");
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap();
-            assert!(
-                result.is_some(),
-                "Key '{}' should exist before restore",
-                key
-            );
+            assert!(result.is_some(), "Key '{key}' should exist before restore");
         }
 
         // Restore from checkpoint
@@ -1109,25 +1146,24 @@ mod tests {
 
         // Verify data is restored to checkpoint state (keys 0-9 exist, 10-14 don't)
         for i in 0..10 {
-            let key = format!("key_{:03}", i);
-            let expected_value = format!("value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let expected_value = format!("value_{i:03}");
 
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap();
-            assert!(result.is_some(), "Key '{}' should exist after restore", key);
+            assert!(result.is_some(), "Key '{key}' should exist after restore");
             assert_eq!(result.unwrap(), expected_value.as_bytes().into());
         }
 
         // Verify the newer keys don't exist after restore
         for i in 10..15 {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{i:03}");
 
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap();
             assert!(
                 result.is_none(),
-                "Key '{}' should not exist after restore",
-                key
+                "Key '{key}' should not exist after restore"
             );
         }
     }
@@ -1148,8 +1184,8 @@ mod tests {
 
         // Insert initial data
         for i in 0..5 {
-            let key = format!("key_{:03}", i);
-            let value = format!("checkpoint_value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let value = format!("checkpoint_value_{i:03}");
 
             let mut txn = tree.begin().unwrap();
             txn.set(key.as_bytes(), value.as_bytes()).unwrap();
@@ -1166,8 +1202,8 @@ mod tests {
 
         // Insert NEW data that should be discarded during restore
         for i in 0..5 {
-            let key = format!("key_{:03}", i);
-            let value = format!("pending_value_{:03}", i); // Different values
+            let key = format!("key_{i:03}");
+            let value = format!("pending_value_{i:03}"); // Different values
 
             let mut txn = tree.begin().unwrap();
             txn.set(key.as_bytes(), value.as_bytes()).unwrap();
@@ -1176,12 +1212,12 @@ mod tests {
 
         // Verify the pending writes are in memory but not yet flushed
         for i in 0..5 {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{i:03}");
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap().unwrap();
             assert_eq!(
                 result,
-                format!("pending_value_{:03}", i).as_bytes().into(),
+                format!("pending_value_{i:03}").as_bytes().into(),
                 "Expected pending value before restore"
             );
         }
@@ -1191,17 +1227,15 @@ mod tests {
 
         // Verify data is restored to checkpoint state (NOT the pending writes)
         for i in 0..5 {
-            let key = format!("key_{:03}", i);
-            let expected_value = format!("checkpoint_value_{:03}", i);
+            let key = format!("key_{i:03}");
+            let expected_value = format!("checkpoint_value_{i:03}");
 
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap().unwrap();
             assert_eq!(
                 result,
                 expected_value.as_bytes().into(),
-                "Key '{}' should have checkpoint value '{}', not pending value",
-                key,
-                expected_value
+                "Key '{key}' should have checkpoint value '{expected_value}', not pending value"
             );
         }
     }
@@ -1229,7 +1263,11 @@ mod tests {
 
         // Test range scan BEFORE flushing (should work from memtables)
         let txn = tree.begin().unwrap();
-        let range_before_flush: Vec<_> = txn.range(b"a", b"c", None).unwrap().collect::<Vec<_>>();
+        let range_before_flush: Vec<_> = txn
+            .range(b"a", b"c", None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         // Should return keys "a", "b", "c" (inclusive range)
         assert_eq!(
@@ -1245,13 +1283,11 @@ mod tests {
             let value_str = std::str::from_utf8(value.as_ref()).unwrap();
             assert_eq!(
                 key_str, expected_before[idx].0,
-                "Key mismatch at index {} before flush",
-                idx
+                "Key mismatch at index {idx} before flush"
             );
             assert_eq!(
                 value_str, expected_before[idx].1,
-                "Value mismatch at index {} before flush",
-                idx
+                "Value mismatch at index {idx} before flush"
             );
         }
 
@@ -1260,7 +1296,11 @@ mod tests {
 
         // Test range scan AFTER flushing (should work from SSTables)
         let txn = tree.begin().unwrap();
-        let range_after_flush: Vec<_> = txn.range(b"a", b"c", None).unwrap().collect::<Vec<_>>();
+        let range_after_flush: Vec<_> = txn
+            .range(b"a", b"c", None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         // Should return the same keys after flush
         assert_eq!(
@@ -1276,13 +1316,11 @@ mod tests {
             let value_str = std::str::from_utf8(value.as_ref()).unwrap();
             assert_eq!(
                 key_str, expected_after[idx].0,
-                "Key mismatch at index {} after flush",
-                idx
+                "Key mismatch at index {idx} after flush"
             );
             assert_eq!(
                 value_str, expected_after[idx].1,
-                "Value mismatch at index {} after flush",
-                idx
+                "Value mismatch at index {idx} after flush"
             );
         }
 
@@ -1291,13 +1329,12 @@ mod tests {
             let txn = tree.begin().unwrap();
             let result = txn.get(key.as_bytes()).unwrap();
 
-            assert!(result.is_some(), "Key '{}' should be found", key);
+            assert!(result.is_some(), "Key '{key}' should be found");
             let value = result.unwrap();
             let value_str = std::str::from_utf8(value.as_ref()).unwrap();
             assert_eq!(
                 value_str, *key,
-                "Value for key '{}' should match the key",
-                key
+                "Value for key '{key}' should match the key"
             );
         }
 
@@ -1326,7 +1363,7 @@ mod tests {
         let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
 
         for i in 0..TOTAL_ITEMS {
-            let key = format!("key_{:06}", i);
+            let key = format!("key_{i:06}");
             let value = format!("value_{:06}_content_data_{}", i, i * 2);
 
             expected_items.push((key.clone(), value.clone()));
@@ -1344,13 +1381,16 @@ mod tests {
         let end_key = "key_999999".as_bytes();
 
         let txn = tree.begin().unwrap();
-        let range_result: Vec<_> = txn.range(start_key, end_key, None).unwrap().collect();
+        let range_result: Vec<_> = txn
+            .range(start_key, end_key, None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             range_result.len(),
             TOTAL_ITEMS,
-            "Full range scan should return all {} items",
-            TOTAL_ITEMS
+            "Full range scan should return all {TOTAL_ITEMS} items"
         );
 
         // Verify each item is correct and in order
@@ -1363,13 +1403,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1381,7 +1419,8 @@ mod tests {
         let partial_result: Vec<_> = txn
             .range(partial_start, partial_end, None)
             .unwrap()
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             partial_result.len(),
@@ -1399,13 +1438,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Partial range key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Partial range key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Partial range value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Partial range value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1414,7 +1451,11 @@ mod tests {
         let middle_end = "key_005099".as_bytes();
 
         let txn = tree.begin().unwrap();
-        let middle_result: Vec<_> = txn.range(middle_start, middle_end, None).unwrap().collect();
+        let middle_result: Vec<_> = txn
+            .range(middle_start, middle_end, None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             middle_result.len(),
@@ -1433,13 +1474,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Middle range key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Middle range key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Middle range value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Middle range value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1448,7 +1487,11 @@ mod tests {
         let end_end = "key_009999".as_bytes();
 
         let txn = tree.begin().unwrap();
-        let end_result: Vec<_> = txn.range(end_start, end_end, None).unwrap().collect();
+        let end_result: Vec<_> = txn
+            .range(end_start, end_end, None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             end_result.len(),
@@ -1467,13 +1510,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "End range key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "End range key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "End range value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "End range value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1482,7 +1523,11 @@ mod tests {
         let single_end = "key_004567".as_bytes();
 
         let txn = tree.begin().unwrap();
-        let single_result: Vec<_> = txn.range(single_start, single_end, None).unwrap().collect();
+        let single_result: Vec<_> = txn
+            .range(single_start, single_end, None)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             single_result.len(),
@@ -1528,7 +1573,7 @@ mod tests {
         let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
 
         for i in 0..TOTAL_ITEMS {
-            let key = format!("key_{:06}", i);
+            let key = format!("key_{i:06}");
             let value = format!("value_{:06}_content_data_{}", i, i * 2);
 
             expected_items.push((key.clone(), value.clone()));
@@ -1549,7 +1594,8 @@ mod tests {
             .unwrap()
             .skip(5000)
             .take(100)
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             range_result.len(),
@@ -1567,13 +1613,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
     }
@@ -1631,7 +1675,8 @@ mod tests {
             .unwrap()
             .skip(5000)
             .take(100)
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             range_result.len(),
@@ -1649,13 +1694,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {}: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx}: expected '{expected_value}', found '{value_str}'"
             );
         }
     }
@@ -1677,7 +1720,7 @@ mod tests {
         let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
 
         for i in 0..TOTAL_ITEMS {
-            let key = format!("key_{:06}", i);
+            let key = format!("key_{i:06}");
             let value = format!("value_{:06}_content_data_{}", i, i * 2);
 
             expected_items.push((key.clone(), value.clone()));
@@ -1693,7 +1736,17 @@ mod tests {
         let end = [255u8].to_vec();
 
         let txn = tree.begin().unwrap();
-        let limited_result: Vec<_> = txn.range(&beg, &end, Some(100)).unwrap().collect();
+        let limited_result: Vec<_> = txn
+            .range(&beg, &end, Some(100))
+            .unwrap()
+            .map(|r| match r {
+                Ok(kv) => kv,
+                Err(e) => {
+                    eprintln!("Error in range iterator: {e:?}");
+                    panic!("Range iterator error: {e}");
+                }
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
             limited_result.len(),
@@ -1710,18 +1763,20 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {} with limit 100: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx} with limit 100: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {} with limit 100: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx} with limit 100: expected '{expected_value}', found '{value_str}'"
             );
         }
 
         let txn = tree.begin().unwrap();
-        let limited_result_1000: Vec<_> = txn.range(&beg, &end, Some(1000)).unwrap().collect();
+        let limited_result_1000: Vec<_> = txn
+            .range(&beg, &end, Some(1000))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             limited_result_1000.len(),
@@ -1738,13 +1793,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {} with limit 1000: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx} with limit 1000: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {} with limit 1000: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx} with limit 1000: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1754,8 +1807,7 @@ mod tests {
         assert_eq!(
             limited_result_large.len(),
             TOTAL_ITEMS,
-            "Range scan with limit 15000 should return all {} items",
-            TOTAL_ITEMS
+            "Range scan with limit 15000 should return all {TOTAL_ITEMS} items"
         );
 
         let txn = tree.begin().unwrap();
@@ -1764,12 +1816,15 @@ mod tests {
         assert_eq!(
             unlimited_result.len(),
             TOTAL_ITEMS,
-            "Range scan with no limit should return all {} items",
-            TOTAL_ITEMS
+            "Range scan with no limit should return all {TOTAL_ITEMS} items"
         );
 
         let txn = tree.begin().unwrap();
-        let single_result: Vec<_> = txn.range(&beg, &end, Some(1)).unwrap().collect();
+        let single_result: Vec<_> = txn
+            .range(&beg, &end, Some(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             single_result.len(),
@@ -1811,7 +1866,7 @@ mod tests {
         let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
 
         for i in 0..TOTAL_ITEMS {
-            let key = format!("key_{:06}", i);
+            let key = format!("key_{i:06}");
             let value = format!("value_{:06}_content_data_{}", i, i * 2);
 
             expected_items.push((key.clone(), value.clone()));
@@ -1844,7 +1899,8 @@ mod tests {
             .unwrap()
             .skip(5000)
             .take(100)
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             unlimited_range_result.len(),
@@ -1862,13 +1918,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {} with unlimited range: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx} with unlimited range: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {} with unlimited range: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx} with unlimited range: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1878,7 +1932,8 @@ mod tests {
             .unwrap()
             .skip(5000)
             .take(100)
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             large_limit_result.len(),
@@ -1896,13 +1951,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {} with limit 10000: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx} with limit 10000: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {} with limit 10000: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx} with limit 10000: expected '{expected_value}', found '{value_str}'"
             );
         }
 
@@ -1913,7 +1966,8 @@ mod tests {
             .unwrap()
             .skip(5000)
             .take(100)
-            .collect();
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
 
         assert_eq!(
             res.len(),
@@ -1931,13 +1985,11 @@ mod tests {
 
             assert_eq!(
                 key_str, expected_key,
-                "Key mismatch at index {} with limit 5050: expected '{}', found '{}'",
-                idx, expected_key, key_str
+                "Key mismatch at index {idx} with limit 5050: expected '{expected_key}', found '{key_str}'"
             );
             assert_eq!(
                 value_str, expected_value,
-                "Value mismatch at index {} with limit 5050: expected '{}', found '{}'",
-                idx, expected_value, value_str
+                "Value mismatch at index {idx} with limit 5050: expected '{expected_value}', found '{value_str}'"
             );
         }
     }
@@ -1949,15 +2001,14 @@ mod tests {
 
         let opts = Arc::new(Options {
             path: path.clone(),
-            vlog_value_threshold: 100, // Store values >= 100 bytes in VLog
             vlog_max_file_size: 1024 * 1024, // 1MB files
-            max_memtable_size: 64 * 1024, // 64KB
+            max_memtable_size: 64 * 1024,    // 64KB
             ..Default::default()
         });
 
         let tree = Tree::new(opts).unwrap();
 
-        // Test 1: Small values should be stored inline
+        // Test 1: Values should be stored in VLog
         let small_key = "small_key";
         let small_value = "small_value"; // < 100 bytes
 
@@ -1995,7 +2046,6 @@ mod tests {
 
         let opts = Arc::new(Options {
             path: path.clone(),
-            vlog_value_threshold: 50,
             vlog_max_file_size: 512 * 1024,
             max_memtable_size: 32 * 1024,
             ..Default::default()
@@ -2006,9 +2056,9 @@ mod tests {
         let mut expected_values = Vec::new();
 
         for i in 0..1000 {
-            let key = format!("key_{:04}", i);
+            let key = format!("key_{i:04}");
             let value = if i % 2 == 0 {
-                format!("small_value_{}", i)
+                format!("small_value_{i}")
             } else {
                 format!("large_value_{}_with_padding_{}", i, "X".repeat(100))
             };
@@ -2037,9 +2087,7 @@ mod tests {
                         assert_eq!(
                             retrieved,
                             expected_value.as_bytes().into(),
-                            "Reader {} failed to get correct value for key {}",
-                            reader_id,
-                            key
+                            "Reader {reader_id} failed to get correct value for key {key}"
                         );
                     }
                 })
@@ -2053,78 +2101,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vlog_garbage_collection_integration() {
-        let temp_dir = create_temp_directory();
-        let path = temp_dir.path().to_path_buf();
-
-        let opts = Arc::new(Options {
-            path: path.clone(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 1024, // Very small files to force rotation
-            max_memtable_size: 64 * 1024,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        // Insert many large values to create multiple VLog files
-        let num_keys = 100;
-        for i in 0..num_keys {
-            let key = format!("key_{:03}", i);
-            let value = format!("initial_value_{}_with_padding_{}", i, "X".repeat(100));
-
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Force flush to create SSTables
-        tree.flush().unwrap();
-
-        // Update half the keys to create stale values in VLog
-        for i in 0..num_keys / 2 {
-            let key = format!("key_{:03}", i);
-            let value = format!("updated_value_{}_with_padding_{}", i, "Y".repeat(120));
-
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Force another flush
-        tree.flush().unwrap();
-
-        // Trigger garbage collection
-        let _compacted_files = tree.garbage_collect_vlog().await.unwrap();
-
-        // Verify all data is still accessible after GC
-        for i in 0..num_keys {
-            let key = format!("key_{:03}", i);
-            let expected_value = if i < num_keys / 2 {
-                format!("updated_value_{}_with_padding_{}", i, "Y".repeat(120))
-            } else {
-                format!("initial_value_{}_with_padding_{}", i, "X".repeat(100))
-            };
-
-            let txn = tree.begin().unwrap();
-            let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
-            assert_eq!(
-                retrieved,
-                expected_value.as_bytes().into(),
-                "Key {} has incorrect value after GC",
-                key
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn test_vlog_file_rotation() {
         let temp_dir = create_temp_directory();
         let path = temp_dir.path().to_path_buf();
 
         let opts = Arc::new(Options {
             path: path.clone(),
-            vlog_value_threshold: 50,
             vlog_max_file_size: 2048, // 2KB files to force frequent rotation
             max_memtable_size: 64 * 1024,
             ..Default::default()
@@ -2135,7 +2117,7 @@ mod tests {
         // Insert enough data to force multiple file rotations
         let mut keys_and_values = Vec::new();
         for i in 0..50 {
-            let key = format!("rotation_key_{:03}", i);
+            let key = format!("rotation_key_{i:03}");
             let value = format!(
                 "rotation_value_{}_with_lots_of_padding_{}",
                 i,
@@ -2178,810 +2160,9 @@ mod tests {
             assert_eq!(
                 retrieved,
                 expected_value.as_bytes().into(),
-                "Key {} has incorrect value across file rotation",
-                key
+                "Key {key} has incorrect value across file rotation"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let opts = Arc::new(Options {
-            path: temp_dir.path().to_path_buf(),
-            vlog_value_threshold: 50, // Low threshold to force VLog usage
-            max_memtable_size: 512,   // Very small to force frequent flushes
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        // Insert key with large value that will go to VLog
-        let large_value = vec![42u8; 200];
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"test_key", &large_value).unwrap();
-        txn.commit().await.unwrap();
-        tree.flush().unwrap(); // Force flush
-
-        // Force enough writes to ensure compaction happens
-        for i in 0..10 {
-            let mut txn = tree.begin().unwrap();
-            txn.set(format!("key_{}", i).as_bytes(), &large_value)
-                .unwrap();
-            txn.commit().await.unwrap();
-            tree.flush().unwrap();
-        }
-
-        // Check that VLog files exist
-        let all_stats_before = tree.get_all_vlog_stats();
-        assert!(!all_stats_before.is_empty(), "Should have VLog files");
-
-        // Now delete the key - this creates a tombstone
-        let mut txn = tree.begin().unwrap();
-        txn.delete(b"test_key").unwrap();
-        txn.commit().await.unwrap();
-        tree.flush().unwrap(); // Force flush
-
-        // Force more compactions to push data to bottom levels
-        for i in 10..20 {
-            let mut txn = tree.begin().unwrap();
-            txn.set(format!("key_{}", i).as_bytes(), &large_value)
-                .unwrap();
-            txn.commit().await.unwrap();
-            tree.flush().unwrap();
-        }
-
-        // Force GC
-        tree.garbage_collect_vlog().await.unwrap();
-
-        // Verify that the key is actually deleted from LSM perspective
-        let txn = tree.begin().unwrap();
-        assert!(
-            txn.get(b"test_key").unwrap().is_none(),
-            "Key should be deleted"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_discard_statistics() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let opts = Arc::new(Options {
-            path: temp_dir.path().to_path_buf(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 600, // Small files to force multiple files
-            max_memtable_size: 512,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-        let large_value = vec![1u8; 200];
-
-        // Insert multiple keys to create multiple VLog files
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Get initial VLog stats
-        let initial_stats = tree.get_all_vlog_stats();
-        assert!(!initial_stats.is_empty(), "Should have VLog files");
-        assert!(
-            initial_stats.len() > 1,
-            "Should have multiple VLog files for meaningful GC test"
-        );
-
-        // Verify all initial entries are accessible
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-            assert!(result.is_some(), "Initial key {} should exist", key);
-            assert_eq!(result.unwrap(), large_value.clone().into());
-        }
-
-        // Update ALL keys to create stale entries in initial VLog files
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let updated_value = vec![2u8; 250]; // Different size to create new VLog entries
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &updated_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Verify all updates are accessible
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-            assert!(result.is_some(), "Updated key {} should exist", key);
-            assert_eq!(
-                result.unwrap(),
-                vec![2u8; 250].into(),
-                "Key {} should have updated value",
-                key
-            );
-        }
-
-        // Get stats after updates - should have more files now
-        let stats_after_updates = tree.get_all_vlog_stats();
-        assert!(
-            stats_after_updates.len() > initial_stats.len(),
-            "Should have more VLog files after updates ({} vs {})",
-            stats_after_updates.len(),
-            initial_stats.len()
-        );
-
-        // Now ALL the initial files should contain only stale entries
-        // Mark ALL initial files as having high discard ratios since ALL entries were updated
-        let mut discard_stats = std::collections::HashMap::new();
-
-        for (file_id, total_size, _current_discard, _ratio) in &initial_stats {
-            if *total_size > 0 {
-                // Mark 100% of initial files as discardable since ALL entries were updated
-                let guaranteed_discard = *total_size as i64;
-                discard_stats.insert(*file_id, guaranteed_discard);
-            }
-        }
-
-        assert!(
-            !discard_stats.is_empty(),
-            "Should have discard stats to apply"
-        );
-        assert_eq!(
-            discard_stats.len(),
-            initial_stats.len(),
-            "Should mark all initial files with discard stats"
-        );
-
-        tree.core.vlog.update_discard_stats(discard_stats);
-
-        // Trigger garbage collection with staleness detection
-        let compacted_files = tree.garbage_collect_vlog().await.unwrap();
-
-        // Since all initial entries are now stale (100% discard ratio), GC should compact files
-        assert!(
-            !compacted_files.is_empty(),
-            "VLog GC should have compacted at least one file with real staleness detection"
-        );
-
-        let stats_after_gc = tree.get_all_vlog_stats();
-        assert!(
-            stats_after_updates.len() > stats_after_gc.len(),
-            "Should have fewer VLog files after GC ({} vs {})",
-            stats_after_updates.len(),
-            stats_after_gc.len()
-        );
-
-        // Verify data integrity after GC
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-            assert!(result.is_some(), "Key {} should still exist after GC", key);
-
-            // All keys should have the updated value (not the original)
-            let expected_value = vec![2u8; 250];
-            assert_eq!(
-                result.unwrap(),
-                expected_value.into(),
-                "Key {} should have updated value after GC",
-                key
-            );
-        }
-
-        // Verify that some initial files were compacted (they contained 100% stale data)
-        let initial_file_ids: std::collections::HashSet<u64> =
-            initial_stats.iter().map(|(id, _, _, _)| *id).collect();
-        let compacted_initial_files: Vec<_> = compacted_files
-            .iter()
-            .filter(|id| initial_file_ids.contains(id))
-            .collect();
-        assert!(
-            !compacted_initial_files.is_empty(),
-            "At least one initial file should have been compacted due to 100% staleness"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_staleness_detection() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let opts = Arc::new(Options {
-            path: temp_dir.path().to_path_buf(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 2048, // Larger files for this test
-            max_memtable_size: 1024,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        // Test scenario: Create entries, update some, delete others
-        let large_value_v1 = vec![1u8; 200];
-        let large_value_v2 = vec![2u8; 220];
-
-        // Insert initial values
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value_v1).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        let stats_after_initial = tree.get_all_vlog_stats();
-        assert!(!stats_after_initial.is_empty(), "Should have VLog files");
-
-        // Update keys 0-4 (creates new VLog entries, making old ones stale)
-        for i in 0..5 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value_v2).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Delete keys 5-9 (makes VLog entries stale)
-        for i in 5..10 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.delete(key.as_bytes()).unwrap();
-            txn.commit().await.unwrap();
-        }
-
-        // Keys 10-14 remain unchanged (live entries)
-
-        tree.flush().unwrap();
-
-        // Force GC on specific files to test staleness detection
-        for (file_id, _total_size, _discard_bytes, _ratio) in &stats_after_initial {
-            // Force GC on this file regardless of discard ratio
-            let was_compacted = tree.garbage_collect_vlog().await.unwrap().contains(file_id);
-            if was_compacted {
-                println!("Successfully compacted VLog file {}", file_id);
-            }
-        }
-
-        // Verify the final state
-        for i in 0..15 {
-            let key = format!("key_{:03}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-
-            if i < 5 {
-                // Updated keys should have new values
-                assert!(result.is_some(), "Updated key {} should exist", key);
-                assert_eq!(result.unwrap(), large_value_v2.clone().into());
-            } else if i < 10 {
-                // Deleted keys should not exist
-                assert!(result.is_none(), "Deleted key {} should not exist", key);
-            } else {
-                // Unchanged keys should have original values
-                assert!(result.is_some(), "Unchanged key {} should exist", key);
-                assert_eq!(result.unwrap(), large_value_v1.clone().into());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_multiple_files() {
-        // Test GC behavior with multiple VLog files
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let opts = Arc::new(Options {
-            path: temp_dir.path().to_path_buf(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 512, // Very small to force many files
-            max_memtable_size: 256,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-        let large_value = vec![1u8; 150];
-
-        // Insert enough data to create multiple VLog files
-        for i in 0..50 {
-            let key = format!("key_{:04}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        let initial_stats = tree.get_all_vlog_stats();
-        assert!(initial_stats.len() > 1, "Should have multiple VLog files");
-        println!("Created {} VLog files", initial_stats.len());
-
-        // Update some keys to create stale entries in early files
-        for i in 0..25 {
-            let key = format!("key_{:04}", i);
-            let updated_value = vec![2u8; 180];
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &updated_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Simulate discard statistics for selective GC
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &initial_stats {
-            if *file_id % 2 == 0 {
-                // Mark even-numbered files as having high discard ratio
-                discard_updates.insert(*file_id, (*total_size as f64 * 0.8) as i64);
-            } else {
-                // Odd-numbered files have low discard ratio
-                discard_updates.insert(*file_id, (*total_size as f64 * 0.1) as i64);
-            }
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        // Run GC multiple times
-        for round in 0..3 {
-            let compacted_files = tree.garbage_collect_vlog().await.unwrap();
-            println!("GC round {}: compacted {:?}", round, compacted_files);
-        }
-
-        let final_stats = tree.get_all_vlog_stats();
-        println!("Final VLog stats: {:?}", final_stats);
-
-        // Verify all data integrity
-        for i in 0..50 {
-            let key = format!("key_{:04}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-            assert!(result.is_some(), "Key {} should exist after GC", key);
-
-            let expected_value = if i < 25 {
-                vec![2u8; 180] // Updated value
-            } else {
-                vec![1u8; 150] // Original value
-            };
-            assert_eq!(result.unwrap(), expected_value.into());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_integration_with_compaction() {
-        // Test that VLog GC works correctly in coordination with LSM compaction
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let opts = Arc::new(Options {
-            path: temp_dir.path().to_path_buf(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 2048,
-            max_memtable_size: 512, // Small to trigger LSM compaction
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-        let large_value = vec![1u8; 200];
-
-        // Create a pattern that will trigger both LSM compaction and VLog GC
-
-        // Phase 1: Insert initial data
-        for i in 0..30 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Phase 2: Update many keys (creates stale VLog entries)
-        for i in 0..20 {
-            let key = format!("key_{:03}", i);
-            let updated_value = vec![2u8; 250];
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &updated_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Phase 3: Delete some keys (creates tombstones and more stale VLog entries)
-        for i in 15..25 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.delete(key.as_bytes()).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        // Phase 4: Add more data to trigger compaction
-        for i in 30..60 {
-            let key = format!("key_{:03}", i);
-            let mut txn = tree.begin().unwrap();
-            txn.set(key.as_bytes(), &large_value).unwrap();
-            txn.commit().await.unwrap();
-        }
-        tree.flush().unwrap();
-
-        let stats_before = tree.get_all_vlog_stats();
-        println!("VLog stats before GC: {:?}", stats_before);
-
-        // Simulate the discard tracking that would happen during LSM compaction
-        let mut total_discardable = 0u64;
-        let mut discard_updates = std::collections::HashMap::new();
-
-        for (file_id, total_size, _current_discard, _ratio) in &stats_before {
-            // Simulate discard amounts based on our update pattern
-            let estimated_discard = (*total_size as f64 * 0.6) as i64; // 60% stale
-            discard_updates.insert(*file_id, estimated_discard);
-            total_discardable += estimated_discard as u64;
-        }
-
-        println!("Estimated total discardable bytes: {}", total_discardable);
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        // Trigger VLog GC
-        let compacted_files = tree.garbage_collect_vlog().await.unwrap();
-        println!("Compacted VLog files: {:?}", compacted_files);
-
-        let stats_after = tree.get_all_vlog_stats();
-        println!("VLog stats after GC: {:?}", stats_after);
-
-        // Verify data integrity after GC
-        for i in 0..60 {
-            let key = format!("key_{:03}", i);
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-
-            if i < 15 {
-                // Keys 0-14: updated values
-                assert!(result.is_some(), "Updated key {} should exist", key);
-                assert_eq!(result.unwrap(), vec![2u8; 250].into());
-            } else if i < 25 {
-                // Keys 15-24: deleted
-                assert!(result.is_none(), "Deleted key {} should not exist", key);
-            } else if i < 30 {
-                // Keys 25-29: original values
-                assert!(result.is_some(), "Original key {} should exist", key);
-                assert_eq!(result.unwrap(), large_value.clone().into());
-            } else {
-                // Keys 30-59: new values
-                assert!(result.is_some(), "New key {} should exist", key);
-                assert_eq!(result.unwrap(), large_value.clone().into());
-            }
-        }
-
-        // Test that VLog GC can be called multiple times safely
-        for round in 1..4 {
-            let additional_compacted = tree.garbage_collect_vlog().await.unwrap();
-            println!("GC round {}: compacted {:?}", round, additional_compacted);
-
-            // Verify data integrity is maintained
-            let key = "key_030"; // Test a representative key
-            let txn = tree.begin().unwrap();
-            let result = txn.get(key.as_bytes()).unwrap();
-            assert!(
-                result.is_some(),
-                "Key should exist after GC round {}",
-                round
-            );
-            assert_eq!(result.unwrap(), large_value.clone().into());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_tombstone_handling() {
-        // Test that VLog GC properly handles tombstones
-        let temp_dir = create_temp_directory();
-        let path = temp_dir.path().to_path_buf();
-
-        let opts = Arc::new(Options {
-            path: path.clone(),
-            vlog_value_threshold: 50, // Large values go to VLog
-            vlog_max_file_size: 2048, // Small files to test multiple files
-            max_memtable_size: 512,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        // Insert large values that will go to VLog (like the "dummy!" repeat pattern)
-        let big_value = b"dummy!".repeat(8_000); // Much smaller than original for faster test
-
-        // Insert 3 keys with large values
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"a", &big_value).unwrap();
-        txn.set(b"b", &big_value).unwrap();
-        txn.set(b"c", &big_value).unwrap();
-        txn.commit().await.unwrap();
-
-        // Verify all 3 keys exist
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), big_value.clone().into());
-        assert_eq!(txn.get(b"b").unwrap().unwrap(), big_value.clone().into());
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), big_value.clone().into());
-
-        // Flush to create SSTables and VLog files
-        tree.flush().unwrap();
-
-        // Verify data still exists after flush
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), big_value.clone().into());
-        assert_eq!(txn.get(b"b").unwrap().unwrap(), big_value.clone().into());
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), big_value.clone().into());
-
-        // Delete key "b" (creates tombstone)
-        let mut txn = tree.begin().unwrap();
-        txn.delete(b"b").unwrap();
-        txn.commit().await.unwrap();
-
-        // Verify key "b" is deleted, others remain
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), big_value.clone().into());
-        assert!(txn.get(b"b").unwrap().is_none());
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), big_value.clone().into());
-
-        // Flush to persist tombstone
-        tree.flush().unwrap();
-
-        // Verify state after tombstone flush
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), big_value.clone().into());
-        assert!(txn.get(b"b").unwrap().is_none());
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), big_value.clone().into());
-
-        // Get VLog stats before GC
-        let stats_before = tree.get_all_vlog_stats();
-        assert!(!stats_before.is_empty(), "Should have VLog files");
-
-        // Simulate discard stats (tombstone for "b" makes some data stale)
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &stats_before {
-            if *total_size > 0 {
-                // Mark approximately 1/3 of data as stale (key "b" was deleted)
-                let estimated_discard = (*total_size as f64 * 0.4) as i64;
-                discard_updates.insert(*file_id, estimated_discard);
-            }
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        // Apply GC with conservative strategy (should handle tombstones correctly)
-        let _compacted_files = tree.garbage_collect_vlog().await.unwrap();
-
-        // Verify data after GC
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), big_value.clone().into());
-        assert!(txn.get(b"b").unwrap().is_none()); // Should still be deleted
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), big_value.clone().into());
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_space_amplification_pattern() {
-        let temp_dir = create_temp_directory();
-        let path = temp_dir.path().to_path_buf();
-
-        let opts = Arc::new(Options {
-            path: path.clone(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 1024, // Small files for more frequent rotation
-            max_memtable_size: 512,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        // Simulate the "dummy" pattern from the original tests
-        let large_value = b"dummy".repeat(1_000); // Large enough for VLog
-
-        // Phase 1: Insert initial data
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"a", &large_value).unwrap();
-        txn.set(b"b", &large_value).unwrap();
-        txn.set(b"c", &large_value).unwrap();
-        txn.commit().await.unwrap();
-
-        tree.flush().unwrap();
-
-        // Verify initial state
-        let stats_initial = tree.get_all_vlog_stats();
-        assert!(
-            !stats_initial.is_empty(),
-            "Should have VLog files after initial insert"
-        );
-
-        let total_initial_size: u64 = stats_initial.iter().map(|(_, size, _, _)| size).sum();
-        assert!(total_initial_size > 0, "Should have non-zero VLog data");
-
-        // Phase 2: Update key "a" (creates stale data in VLog)
-        let small_value_a = b"a"; // Small value, will be stored inline
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"a", small_value_a).unwrap();
-        txn.commit().await.unwrap();
-
-        // Simulate discard stats tracking
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &stats_initial {
-            // Estimate that ~1/3 of the data is now stale (key "a" was updated)
-            let estimated_discard = (*total_size as f64 * 0.33) as i64;
-            discard_updates.insert(*file_id, estimated_discard);
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        let stats_after_a_update = tree.get_all_vlog_stats();
-        let space_amp_after_a = calculate_space_amplification(&stats_after_a_update);
-        assert!(
-            space_amp_after_a > 1.0,
-            "Space amplification should increase after update"
-        );
-
-        // Phase 3: Update key "b" (more stale data)
-        let small_value_b = b"b";
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"b", small_value_b).unwrap();
-        txn.commit().await.unwrap();
-
-        // Update discard stats for more staleness
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &stats_initial {
-            // Now ~2/3 of the original data is stale
-            let estimated_discard = (*total_size as f64 * 0.67) as i64;
-            discard_updates.insert(*file_id, estimated_discard);
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        let stats_after_b_update = tree.get_all_vlog_stats();
-        let space_amp_after_b = calculate_space_amplification(&stats_after_b_update);
-        assert!(
-            space_amp_after_b > space_amp_after_a,
-            "Space amplification should keep increasing"
-        );
-
-        // Phase 4: Update key "c" (most data now stale)
-        let small_value_c = b"c";
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"c", small_value_c).unwrap();
-        txn.commit().await.unwrap();
-
-        // Mark all original data as stale
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &stats_initial {
-            // All original data is now stale (all keys updated to small values)
-            let estimated_discard = *total_size as i64;
-            discard_updates.insert(*file_id, estimated_discard);
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        // Trigger GC to clean up stale data
-        let compacted_files = tree.garbage_collect_vlog().await.unwrap();
-
-        // Verify final state - all keys should have small values
-        let txn = tree.begin().unwrap();
-        assert_eq!(
-            txn.get(b"a").unwrap().unwrap(),
-            small_value_a.to_vec().into()
-        );
-        assert_eq!(
-            txn.get(b"b").unwrap().unwrap(),
-            small_value_b.to_vec().into()
-        );
-        assert_eq!(
-            txn.get(b"c").unwrap().unwrap(),
-            small_value_c.to_vec().into()
-        );
-
-        let stats_after_gc = tree.get_all_vlog_stats();
-        if !compacted_files.is_empty() {
-            // After GC, space amplification should be lower
-            let space_amp_after_gc = calculate_space_amplification(&stats_after_gc);
-            assert!(
-                space_amp_after_gc < space_amp_after_b,
-                "Space amplification should decrease after GC"
-            );
-
-            println!("Space amplification:");
-            println!("  After A update: {:.2}", space_amp_after_a);
-            println!("  After B update: {:.2}", space_amp_after_b);
-            println!("  After GC: {:.2}", space_amp_after_gc);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_vlog_gc_mixed_operations() {
-        // Test VLog GC with mixed insert, update, and delete operations
-        let temp_dir = create_temp_directory();
-        let path = temp_dir.path().to_path_buf();
-
-        let opts = Arc::new(Options {
-            path: path.clone(),
-            vlog_value_threshold: 50,
-            vlog_max_file_size: 800, // Small files for frequent rotation
-            max_memtable_size: 512,
-            ..Default::default()
-        });
-
-        let tree = Tree::new(opts).unwrap();
-
-        let large_value = b"dummy".repeat(1_000);
-
-        // Phase 1: Insert initial data
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"a", &large_value).unwrap();
-        txn.set(b"b", &large_value).unwrap();
-        txn.set(b"c", &large_value).unwrap();
-        txn.commit().await.unwrap();
-
-        tree.flush().unwrap();
-
-        let stats_initial = tree.get_all_vlog_stats();
-        assert!(!stats_initial.is_empty(), "Should have VLog files");
-
-        // Phase 2: Mixed operations to create staleness patterns
-
-        // Update "a" to small value (stale large value in VLog)
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"a", b"small_a").unwrap();
-        txn.commit().await.unwrap();
-
-        // Delete "b" (stale large value in VLog)
-        let mut txn = tree.begin().unwrap();
-        txn.delete(b"b").unwrap();
-        txn.commit().await.unwrap();
-
-        // Keep "c" unchanged (live large value in VLog)
-        // Add new key "d" with large value
-        let mut txn = tree.begin().unwrap();
-        txn.set(b"d", &large_value).unwrap();
-        txn.commit().await.unwrap();
-
-        tree.flush().unwrap();
-
-        // Mark files with appropriate staleness
-        let mut discard_updates = std::collections::HashMap::new();
-        for (file_id, total_size, _discard_bytes, _ratio) in &stats_initial {
-            // About 2/3 of original data is stale (keys "a" and "b" changed)
-            let estimated_discard = (*total_size as f64 * 0.67) as i64;
-            discard_updates.insert(*file_id, estimated_discard);
-        }
-        tree.core.vlog.update_discard_stats(discard_updates);
-
-        // Trigger GC
-        let compacted_files = tree.garbage_collect_vlog().await.unwrap();
-
-        // Verify final state
-        let txn = tree.begin().unwrap();
-        assert_eq!(txn.get(b"a").unwrap().unwrap(), b"small_a".to_vec().into()); // Updated to small value
-        assert!(txn.get(b"b").unwrap().is_none()); // Deleted
-        assert_eq!(txn.get(b"c").unwrap().unwrap(), large_value.clone().into()); // Unchanged large value
-        assert_eq!(txn.get(b"d").unwrap().unwrap(), large_value.clone().into()); // New large value
-
-        if !compacted_files.is_empty() {
-            println!("GC successfully compacted {} files", compacted_files.len());
-            let stats_after_gc = tree.get_all_vlog_stats();
-            let space_amp_before = calculate_space_amplification(&stats_initial);
-            let space_amp_after = calculate_space_amplification(&stats_after_gc);
-            println!(
-                "Space amplification: {:.2} -> {:.2}",
-                space_amp_before, space_amp_after
-            );
-        }
-    }
-
-    fn calculate_space_amplification(stats: &[(u64, u64, u64, f64)]) -> f64 {
-        if stats.is_empty() {
-            return 0.0;
-        }
-
-        let total_size: u64 = stats.iter().map(|(_, size, _, _)| size).sum();
-        let total_discard: u64 = stats.iter().map(|(_, _, discard, _)| discard).sum();
-        let live_size = total_size.saturating_sub(total_discard);
-
-        if live_size == 0 {
-            return 0.0;
-        }
-
-        total_size as f64 / live_size as f64
     }
 
     #[tokio::test]
@@ -2993,7 +2174,6 @@ mod tests {
 
         let opts = Arc::new(Options {
             path: path.clone(),
-            vlog_value_threshold: 50,
             vlog_max_file_size: 1024,
             max_memtable_size: 512,
             ..Default::default()
@@ -3004,7 +2184,7 @@ mod tests {
         // Insert some data to ensure VLog and discard stats are created
         let large_value = vec![1u8; 200]; // Large enough for VLog
         for i in 0..5 {
-            let key = format!("key_{}", i);
+            let key = format!("key_{i}");
             let mut txn = tree.begin().unwrap();
             txn.set(key.as_bytes(), &large_value).unwrap();
             txn.commit().await.unwrap();
@@ -3014,14 +2194,14 @@ mod tests {
         tree.flush().unwrap();
 
         // Update some keys to create discard statistics
-        let mut discard_updates = std::collections::HashMap::new();
+        let mut discard_updates = HashMap::new();
         let stats = tree.get_all_vlog_stats();
         for (file_id, total_size, _discard_bytes, _ratio) in &stats {
             if *total_size > 0 {
                 discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
             }
         }
-        tree.core.vlog.update_discard_stats(discard_updates);
+        tree.update_vlog_discard_stats(discard_updates);
 
         // Verify directory structure
         let main_db_dir = &path;
@@ -3041,13 +2221,11 @@ mod tests {
 
         assert!(
             discard_file_in_main.exists(),
-            "DISCARD file should exist in main database directory: {:?}",
-            discard_file_in_main
+            "DISCARD file should exist in main database directory: {discard_file_in_main:?}"
         );
         assert!(
             !discard_file_in_vlog.exists(),
-            "DISCARD file should NOT exist in VLog directory: {:?}",
-            discard_file_in_vlog
+            "DISCARD file should NOT exist in VLog directory: {discard_file_in_vlog:?}"
         );
 
         // Verify that VLog files are in the VLog directory
@@ -3085,14 +2263,14 @@ mod tests {
         );
 
         println!("✓ Directory structure verification passed:");
-        println!("  Main DB dir: {:?}", main_db_dir);
+        println!("  Main DB dir: {main_db_dir:?}");
         println!(
             "  DISCARD file: {:?} (exists: {})",
             discard_file_in_main,
             discard_file_in_main.exists()
         );
-        println!("  VLog dir: {:?}", vlog_dir);
-        println!("  VLog files: {:?}", vlog_files);
+        println!("  VLog dir: {vlog_dir:?}");
+        println!("  VLog files: {vlog_files:?}");
         println!(
             "  levels file: {:?} (exists: {})",
             levels_file,
@@ -3101,21 +2279,312 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_options_with_invalid_vlog_threshold() {
+    async fn test_compaction_with_updates_and_delete() {
         let temp_dir = create_temp_directory();
         let path = temp_dir.path().to_path_buf();
 
-        let opts = Arc::new(Options {
+        let opts = Options {
             path: path.clone(),
-            vlog_value_threshold: 28,
+            level_count: 2,
+            vlog_max_file_size: 20,
             ..Default::default()
-        });
+        };
 
-        let result = Tree::new(opts);
-        assert!(result.is_err());
+        let tree = Tree::new(Arc::new(opts)).unwrap();
+
+        // Create 5 keys in ascending order
+        let keys = ["key-1".as_bytes(), "key-2".as_bytes()];
+
+        // Insert first version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v1", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Insert second version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v2", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Verify the latest values before delete
+        for (i, key) in keys.iter().enumerate() {
+            let tx = tree.begin().unwrap();
+            let result = tx.get(key).unwrap();
+            assert_eq!(
+                result.map(|v| v.to_vec()),
+                Some(format!("value-{}-v2", i + 1).as_bytes().to_vec())
+            );
+        }
+
+        // Delete all keys
+        for key in keys.iter() {
+            let mut tx = tree.begin().unwrap();
+            tx.delete(key).unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Flush memtable
+        tree.flush().unwrap();
+
+        // Force compaction
+        let strategy = Arc::new(Strategy::default());
+        tree.inner.compact(strategy).unwrap();
+
+        // There could be multiple VLog files, need to garbage collect them all but
+        // only one should remain because the active VLog file does not get garbage collected
+        for _ in 0..6 {
+            tree.garbage_collect_vlog().await.unwrap();
+        }
+
+        // Verify all keys are gone after compaction
+        for key in keys.iter() {
+            let tx = tree.begin().unwrap();
+            let result = tx.get(key).unwrap();
+            assert_eq!(result, None);
+        }
+
+        // Verify that only one VLog file remains after garbage collection
+        let vlog_dir = path.join("vlog");
+        let entries = std::fs::read_dir(&vlog_dir).unwrap();
+        let vlog_files: Vec<_> = entries
+            .filter_map(|e| {
+                let entry = e.ok()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("vlog_") && name.ends_with(".log") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         assert_eq!(
-            result.err().unwrap().to_string(),
-            "Invalid argument: vlog_value_threshold must be greater than 28 bytes"
+            vlog_files.len(),
+            1,
+            "Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_with_updates_and_delete_on_same_key() {
+        let temp_dir = create_temp_directory();
+        let path = temp_dir.path().to_path_buf();
+
+        let opts = Options {
+            path: path.clone(),
+            level_count: 2,
+            vlog_max_file_size: 20,
+            ..Default::default()
+        };
+
+        let tree = Tree::new(Arc::new(opts)).unwrap();
+
+        // Create 5 keys in ascending order
+        let keys = ["key-1".as_bytes()];
+
+        // Insert first version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v1", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Insert second version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v2", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Insert third version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v3", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Insert fourth version of each key
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("value-{}-v4", i + 1);
+            let mut tx = tree.begin().unwrap();
+            tx.set(key, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Verify the latest values before delete
+        for (i, key) in keys.iter().enumerate() {
+            let tx = tree.begin().unwrap();
+            let result = tx.get(key).unwrap();
+            assert_eq!(
+                result.map(|v| v.to_vec()),
+                Some(format!("value-{}-v4", i + 1).as_bytes().to_vec())
+            );
+        }
+
+        // Delete all keys
+        for key in keys.iter() {
+            let mut tx = tree.begin().unwrap();
+            tx.delete(key).unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Flush memtable
+        tree.flush().unwrap();
+
+        // Force compaction
+        let strategy = Arc::new(Strategy::default());
+        tree.inner.compact(strategy).unwrap();
+
+        // There could be multiple VLog files, need to garbage collect them all but
+        // only one should remain because the active VLog file does not get garbage collected
+        for _ in 0..6 {
+            tree.garbage_collect_vlog().await.unwrap();
+        }
+
+        // Verify all keys are gone after compaction
+        for key in keys.iter() {
+            let tx = tree.begin().unwrap();
+            let result = tx.get(key).unwrap();
+            assert_eq!(result, None);
+        }
+
+        // Verify that only one VLog file remains after garbage collection
+        let vlog_dir = path.join("vlog");
+        let entries = std::fs::read_dir(&vlog_dir).unwrap();
+        let vlog_files: Vec<_> = entries
+            .filter_map(|e| {
+                let entry = e.ok()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("vlog_") && name.ends_with(".log") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            vlog_files.len(),
+            1,
+            "Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vlog_compaction_preserves_sequence_numbers() {
+        let temp_dir = create_temp_directory();
+        let path = temp_dir.path().to_path_buf();
+
+        let opts = Options {
+            path: path.clone(),
+            disable_vlog: false,        // Enable VLog
+            vlog_max_file_size: 950, // Small size to force frequent rotations (each entry ~190 bytes)
+            vlog_gc_discard_ratio: 0.0, // Disable discard ratio to preserve all values
+            level_count: 2,          // Two levels for compaction strategy
+            ..Default::default()
+        };
+
+        // Open the Tree (database instance)
+        let tree = Tree::new(Arc::new(opts)).unwrap();
+
+        // Define keys used throughout the test
+        let key1 = b"test_key_1".to_vec();
+        let key2 = b"test_key_2".to_vec();
+        let key3 = b"test_key_3".to_vec();
+
+        // --- Step 1: Insert multiple versions of key1 to fill the first VLog file ---
+        for i in 0..3 {
+            let value = format!("value1_version_{i}").repeat(10); // Large value to fill VLog
+            let mut tx = tree.begin().unwrap();
+            tx.set(&key1, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // --- Step 2: Insert and delete key2 ---
+        // We are doing this to make sure there are deleted keys in the VLog file
+        {
+            // Insert key2
+            let mut tx = tree.begin().unwrap();
+            tx.set(&key2, b"value2").unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+
+            // Delete key2
+            let mut tx = tree.begin().unwrap();
+            tx.delete(&key2).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // --- Step 3: Validate current value of key1 (should be last inserted version) ---
+        {
+            let tx = tree.begin().unwrap();
+            let current_value = tx.get(&key1).unwrap().unwrap();
+            assert_eq!(
+                current_value.as_ref(),
+                "value1_version_2".to_string().repeat(10).as_bytes()
+            );
+        }
+
+        // --- Step 4: Insert key3 values which will rotate VLog file ---
+        for i in 0..2 {
+            let value = format!("value2_version_{i}").repeat(10); // Large values
+            let mut tx = tree.begin().unwrap();
+            tx.set(&key3, value.as_bytes()).unwrap();
+            tx.commit().await.unwrap();
+            tree.flush().unwrap();
+        }
+
+        // --- Step 5: Update key1 with a final value ---
+        {
+            let mut tx = tree.begin().unwrap();
+            tx.set(&key1, "final_value_key1".repeat(10).as_bytes())
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        tree.flush().unwrap();
+
+        // --- Step 6: Verify latest value of key1 before compaction ---
+        {
+            let tx = tree.begin().unwrap();
+            let value = tx.get(&key1).unwrap().unwrap();
+            assert_eq!(value.as_ref(), "final_value_key1".repeat(10).as_bytes());
+        }
+
+        // --- Step 7: Trigger manual compaction of the LSM tree ---
+        let strategy = Arc::new(Strategy::default());
+        tree.inner.compact(strategy).unwrap();
+
+        // --- Step 8: Run VLog garbage collection (which internally can trigger file compaction) ---
+        tree.garbage_collect_vlog().await.unwrap();
+
+        // --- Step 9: Verify key1 still returns the correct latest value after compaction ---
+        {
+            let tx = tree.begin().unwrap();
+            let value = tx.get(&key1).unwrap().unwrap();
+            assert_eq!(
+                value.as_ref(),
+                "final_value_key1".repeat(10).as_bytes(),
+                "After VLog compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
+            );
+        }
+
+        // --- Step 10: Clean shutdown ---
+        tree.close().await.unwrap();
     }
 }

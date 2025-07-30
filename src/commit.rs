@@ -211,6 +211,49 @@ impl CommitPipeline {
         }
     }
 
+    /// Synchronous commit that bypasses the async pipeline machinery.
+    /// This is suitable for cases where no flow control or async coordination is needed,
+    /// such as delete list updates during compaction.
+    pub fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(Error::PipelineStall);
+        }
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Acquire write lock to ensure serialization
+        let _guard = self.write_mutex.lock().unwrap();
+
+        // Assign sequence number
+        let count = batch.count() as u64;
+        let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+
+        // Write to WAL
+        self.env.write(&batch, seq_num, sync_wal)?;
+
+        // Apply to memtable
+        self.env.apply(&batch, seq_num)?;
+
+        // Update visible sequence number
+        let new_visible = seq_num + count - 1;
+        let mut current = self.visible_seq_num.load(Ordering::Acquire);
+        while new_visible > current {
+            match self.visible_seq_num.compare_exchange_weak(
+                current,
+                new_visible,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(Error::PipelineStall);
@@ -500,6 +543,275 @@ mod tests {
         assert_eq!(pipeline.get_visible_seq_num(), 5);
 
         // Shutdown the pipeline
+        pipeline.shutdown();
+    }
+
+    // ===== Sync Commit Tests =====
+
+    #[test]
+    fn test_sync_commit_single() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+
+        let mut batch = Batch::new();
+        batch
+            .add_record(InternalKeyKind::Set, b"key1", Some(b"value1"))
+            .unwrap();
+
+        let result = pipeline.sync_commit(batch, false);
+        assert!(result.is_ok(), "Sync commit failed: {result:?}");
+
+        let visible = pipeline.get_visible_seq_num();
+        assert_eq!(visible, 1, "Expected visible=1 after sync commit");
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_multiple_sequential() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+
+        // Test multiple sequential sync commits
+        for i in 0..5 {
+            let mut batch = Batch::new();
+            batch
+                .add_record(
+                    InternalKeyKind::Set,
+                    &format!("key{i}").into_bytes(),
+                    Some(&[1, 2, 3]),
+                )
+                .unwrap();
+
+            let result = pipeline.sync_commit(batch, false);
+            assert!(result.is_ok(), "Sync commit {i} failed: {result:?}");
+        }
+
+        // Verify final sequence number
+        assert_eq!(pipeline.get_visible_seq_num(), 5);
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_empty_batch() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+
+        let batch = Batch::new();
+        let result = pipeline.sync_commit(batch, false);
+        assert!(result.is_ok(), "Empty batch sync commit should succeed");
+
+        // Sequence number should not change for empty batch
+        assert_eq!(pipeline.get_visible_seq_num(), 0);
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_with_sync_wal() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+
+        let mut batch = Batch::new();
+        batch
+            .add_record(InternalKeyKind::Set, b"key1", Some(b"value1"))
+            .unwrap();
+
+        let result = pipeline.sync_commit(batch, true); // sync_wal = true
+        assert!(
+            result.is_ok(),
+            "Sync commit with sync_wal failed: {result:?}"
+        );
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_sequence_number_consistency() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+
+        // Set initial sequence number
+        pipeline.set_seq_num(100);
+
+        let mut batch1 = Batch::new();
+        batch1
+            .add_record(InternalKeyKind::Set, b"key1", Some(b"value1"))
+            .unwrap();
+
+        let mut batch2 = Batch::new();
+        batch2
+            .add_record(InternalKeyKind::Set, b"key2", Some(b"value2"))
+            .unwrap();
+        batch2
+            .add_record(InternalKeyKind::Set, b"key3", Some(b"value3"))
+            .unwrap();
+
+        // Commit first batch
+        pipeline.sync_commit(batch1, false).unwrap();
+        assert_eq!(pipeline.get_visible_seq_num(), 101); // 100 + 1 - 1
+
+        // Commit second batch (2 records)
+        pipeline.sync_commit(batch2, false).unwrap();
+        assert_eq!(pipeline.get_visible_seq_num(), 103); // 101 + 2 - 1
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_after_shutdown() {
+        let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+        pipeline.shutdown();
+
+        let mut batch = Batch::new();
+        batch
+            .add_record(InternalKeyKind::Set, b"key1", Some(b"value1"))
+            .unwrap();
+
+        let result = pipeline.sync_commit(batch, false);
+        assert!(result.is_err(), "Sync commit after shutdown should fail");
+    }
+
+    // Mock environment that tracks calls for testing
+    struct TrackingMockEnv {
+        write_calls: std::sync::atomic::AtomicU64,
+        apply_calls: std::sync::atomic::AtomicU64,
+        last_sync_wal: std::sync::atomic::AtomicBool,
+    }
+
+    impl TrackingMockEnv {
+        fn new() -> Self {
+            Self {
+                write_calls: std::sync::atomic::AtomicU64::new(0),
+                apply_calls: std::sync::atomic::AtomicU64::new(0),
+                last_sync_wal: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn write_calls(&self) -> u64 {
+            self.write_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn apply_calls(&self) -> u64 {
+            self.apply_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn last_sync_wal(&self) -> bool {
+            self.last_sync_wal
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl CommitEnv for TrackingMockEnv {
+        fn write(&self, _batch: &Batch, _seq_num: u64, sync_wal: bool) -> Result<()> {
+            self.write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_sync_wal
+                .store(sync_wal, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn apply(&self, _batch: &Batch, _seq_num: u64) -> Result<()> {
+            self.apply_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_sync_commit_calls_write_and_apply() {
+        let env = Arc::new(TrackingMockEnv::new());
+        let pipeline = CommitPipeline::new(env.clone());
+
+        let mut batch = Batch::new();
+        batch
+            .add_record(InternalKeyKind::Set, b"key1", Some(b"value1"))
+            .unwrap();
+
+        // Verify initial state
+        assert_eq!(env.write_calls(), 0);
+        assert_eq!(env.apply_calls(), 0);
+
+        // Perform sync commit
+        pipeline.sync_commit(batch, true).unwrap();
+
+        // Verify both write and apply were called
+        assert_eq!(env.write_calls(), 1);
+        assert_eq!(env.apply_calls(), 1);
+        assert!(env.last_sync_wal());
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_multiple_batches_tracking() {
+        let env = Arc::new(TrackingMockEnv::new());
+        let pipeline = CommitPipeline::new(env.clone());
+
+        // Commit multiple batches
+        for i in 0..3 {
+            let mut batch = Batch::new();
+            batch
+                .add_record(
+                    InternalKeyKind::Set,
+                    &format!("key{i}").into_bytes(),
+                    Some(&[1, 2, 3]),
+                )
+                .unwrap();
+
+            pipeline.sync_commit(batch, i % 2 == 0).unwrap(); // Alternate sync_wal
+        }
+
+        // Verify correct number of calls
+        assert_eq!(env.write_calls(), 3);
+        assert_eq!(env.apply_calls(), 3);
+
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn test_sync_commit_concurrent_access() {
+        let env = Arc::new(TrackingMockEnv::new());
+        let pipeline = CommitPipeline::new(env.clone());
+        let pipeline = Arc::new(pipeline);
+
+        // Test concurrent access to sync_commit
+        let mut handles = vec![];
+        let num_threads = 8;
+        let batches_per_thread = 5;
+
+        for thread_id in 0..num_threads {
+            let pipeline = pipeline.clone();
+            let _env = env.clone();
+
+            let handle = std::thread::spawn(move || {
+                for batch_id in 0..batches_per_thread {
+                    let mut batch = Batch::new();
+                    batch
+                        .add_record(
+                            InternalKeyKind::Set,
+                            &format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
+                            Some(&[thread_id as u8, batch_id as u8]),
+                        )
+                        .unwrap();
+
+                    // This should be safe even under concurrency due to write_mutex
+                    pipeline.sync_commit(batch, false).unwrap();
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify all operations were processed
+        let expected_calls = num_threads * batches_per_thread;
+        assert_eq!(env.write_calls(), expected_calls);
+        assert_eq!(env.apply_calls(), expected_calls);
+
+        // Verify sequence numbers are continuous and correct
+        let final_visible = pipeline.get_visible_seq_num();
+        assert_eq!(final_visible, expected_calls);
+
         pipeline.shutdown();
     }
 }

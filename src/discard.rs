@@ -206,7 +206,7 @@ impl DiscardStats {
             if slot >= self.max_slots() {
                 drop(next_slot_guard); // Release lock before expand
                 if let Err(e) = self.expand() {
-                    eprintln!("Failed to expand discard stats file: {}", e);
+                    eprintln!("Failed to expand discard stats file: {e}");
                     return 0;
                 }
                 // After expansion, get the slot again

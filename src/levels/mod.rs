@@ -141,7 +141,7 @@ impl LevelManifest {
                     match Self::load_table(sstable_path.as_ref(), table_id, opts.clone()) {
                         Ok(table) => tables.push(table),
                         Err(err) => {
-                            eprintln!("Error loading table {}: {:?}", table_id, err);
+                            eprintln!("Error loading table {table_id}: {err:?}");
                             return Err(Error::LoadManifestFail(err.to_string()));
                         }
                     }
@@ -206,7 +206,7 @@ impl LevelManifest {
 
     /// Helper to load a single table by ID
     fn load_table(sstable_path: &Path, table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
-        let table_file_path = sstable_path.join(format!("{}", table_id));
+        let table_file_path = sstable_path.join(format!("{table_id}"));
 
         // Open the table file
         let file = SysFile::open(&table_file_path)?;
@@ -354,7 +354,7 @@ mod tests {
         num_items: u64,
         opts: Arc<Options>,
     ) -> Result<Arc<Table>> {
-        let table_file_path = sstable_path.join(format!("{}", table_id));
+        let table_file_path = sstable_path.join(format!("{table_id}"));
 
         let mut file = SysFile::create(&table_file_path)?;
 
@@ -363,8 +363,8 @@ mod tests {
 
         // Generate and add items
         for i in 0..num_items {
-            let key = format!("key_{:05}", i);
-            let value = format!("value_{:05}", i);
+            let key = format!("key_{i:05}");
+            let value = format!("value_{i:05}");
 
             let internal_key =
                 InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
@@ -507,21 +507,18 @@ mod tests {
         assert_eq!(level0.tables.len(), 2, "Level 0 should have 2 tables");
         assert!(
             level0.tables.iter().any(|t| t.id == table_id1),
-            "Level 0 should contain table with ID {}",
-            table_id1
+            "Level 0 should contain table with ID {table_id1}"
         );
         assert!(
             level0.tables.iter().any(|t| t.id == table_id2),
-            "Level 0 should contain table with ID {}",
-            table_id2
+            "Level 0 should contain table with ID {table_id2}"
         );
 
         let level1 = &new_manifest.levels.as_ref()[1];
         assert_eq!(level1.tables.len(), 1, "Level 1 should have 1 table");
         assert!(
             level1.tables.iter().any(|t| t.id == table_id3),
-            "Level 1 should contain table with ID {}",
-            table_id3
+            "Level 1 should contain table with ID {table_id3}"
         );
 
         // Verify table data was loaded correctly by checking properties

@@ -87,8 +87,8 @@ impl Batch {
         self.data.push(kind as u8);
         self.data.write_varint(key_len as u64)?;
         self.data.extend_from_slice(key);
+        self.data.write_varint(value_len as u64)?;
         if let Some(v) = value {
-            self.data.write_varint(value_len as u64)?;
             self.data.extend_from_slice(v);
         }
 
@@ -118,56 +118,68 @@ pub struct BatchIterator<'a> {
     pos: usize,
 }
 
+/// Helper function to decode a single record from batch data
+/// Returns: Ok(Some((kind, key, value))) for successful decode,
+///          Ok(None) for end of data,
+///          Err(...) for decode errors
+fn decode_record_at<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+) -> Result<Option<(InternalKeyKind, &'a [u8], Option<&'a [u8]>)>> {
+    if *pos >= data.len() {
+        return Ok(None);
+    }
+
+    // Read kind byte
+    let kind = InternalKeyKind::from(data[*pos]);
+    *pos += 1;
+    if kind == InternalKeyKind::Invalid {
+        return Err(Error::InvalidBatchRecord);
+    }
+
+    // Read key length
+    let (key_len, bytes_read) = u64::decode_var(&data[*pos..]).ok_or(Error::InvalidBatchRecord)?;
+    *pos += bytes_read;
+
+    // Read key bytes
+    let key_start = *pos;
+    let key_end = key_start + key_len as usize;
+    if key_end > data.len() {
+        return Err(Error::InvalidBatchRecord);
+    }
+    let key_slice = &data[key_start..key_end];
+    *pos = key_end;
+
+    // Read value length
+    let (val_len, bytes_read) = u64::decode_var(&data[*pos..]).ok_or(Error::InvalidBatchRecord)?;
+    *pos += bytes_read;
+
+    // Read value bytes (if any)
+    let value_slice = if val_len > 0 {
+        let val_start = *pos;
+        let val_end = val_start + val_len as usize;
+        if val_end > data.len() {
+            return Err(Error::InvalidBatchRecord);
+        }
+        let v = &data[val_start..val_end];
+        *pos = val_end;
+        Some(v)
+    } else {
+        None
+    };
+
+    Ok(Some((kind, key_slice, value_slice)))
+}
+
 impl<'a> Iterator for BatchIterator<'a> {
     type Item = Result<(InternalKeyKind, &'a [u8], Option<&'a [u8]>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.data.len() {
-            return None;
+        match decode_record_at(self.data, &mut self.pos) {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
-
-        let data = self.data;
-
-        let kind = InternalKeyKind::from(data[self.pos]);
-        self.pos += 1;
-        if kind != InternalKeyKind::Set && kind != InternalKeyKind::Delete {
-            return Some(Err(Error::InvalidBatchRecord));
-        }
-
-        // Read key length
-        let (key_len, bytes_read) = match u64::decode_var(data.get(self.pos..).unwrap()) {
-            Some(res) => res,
-            None => return Some(Err(Error::InvalidBatchRecord)),
-        };
-        self.pos += bytes_read;
-
-        let key_start = self.pos;
-        let key_end = key_start + key_len as usize;
-        if key_end > data.len() {
-            return Some(Err(Error::InvalidBatchRecord));
-        }
-        let key_slice = &data[key_start..key_end];
-        self.pos = key_end;
-
-        let value_slice = if kind == InternalKeyKind::Set {
-            let (val_len, bytes_read) = match u64::decode_var(data.get(self.pos..).unwrap()) {
-                Some(res) => res,
-                None => return Some(Err(Error::InvalidBatchRecord)),
-            };
-            self.pos += bytes_read;
-            let val_start = self.pos;
-            let val_end = val_start + val_len as usize;
-            if val_end > data.len() {
-                return Some(Err(Error::InvalidBatchRecord));
-            }
-            let v = &data[val_start..val_end];
-            self.pos = val_end;
-            Some(v)
-        } else {
-            None
-        };
-
-        Some(Ok((kind, key_slice, value_slice)))
     }
 }
 
@@ -200,45 +212,7 @@ impl<'a> BatchReader<'a> {
     }
 
     pub fn read_record(&mut self) -> RecordResult<'a> {
-        if self.pos >= self.data.len() {
-            return Ok(None);
-        }
-
-        let data = self.data;
-
-        let kind = InternalKeyKind::from(data[self.pos]);
-        self.pos += 1;
-        if kind != InternalKeyKind::Set && kind != InternalKeyKind::Delete {
-            return Err(Error::InvalidBatchRecord);
-        }
-
-        let (key_len, br) = u64::decode_var(&data[self.pos..]).ok_or(Error::InvalidBatchRecord)?;
-        self.pos += br;
-        let key_start = self.pos;
-        let key_end = key_start + key_len as usize;
-        if key_end > data.len() {
-            return Err(Error::InvalidBatchRecord);
-        }
-        let key_slice = &data[key_start..key_end];
-        self.pos = key_end;
-
-        let value_slice = if kind == InternalKeyKind::Set {
-            let (val_len, br) =
-                u64::decode_var(&data[self.pos..]).ok_or(Error::InvalidBatchRecord)?;
-            self.pos += br;
-            let val_start = self.pos;
-            let val_end = val_start + val_len as usize;
-            if val_end > data.len() {
-                return Err(Error::InvalidBatchRecord);
-            }
-            let v = &data[val_start..val_end];
-            self.pos = val_end;
-            Some(v)
-        } else {
-            None
-        };
-
-        Ok(Some((kind, key_slice, value_slice)))
+        decode_record_at(self.data, &mut self.pos)
     }
 }
 
@@ -443,7 +417,7 @@ mod tests {
         let (kind, key, value) = reader.read_record().unwrap().unwrap();
         assert_eq!(kind, InternalKeyKind::Set);
         assert_eq!(key, b"");
-        assert_eq!(value.unwrap(), b"");
+        assert!(value.is_none()); // Empty value now consistently returns None
 
         let (kind, key, value) = reader.read_record().unwrap().unwrap();
         assert_eq!(kind, InternalKeyKind::Delete);
@@ -533,8 +507,8 @@ mod tests {
         let mut batch = Batch::new();
 
         for i in 0..NUM_RECORDS {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
+            let key = format!("key{i}");
+            let value = format!("value{i}");
             if i % 2 == 0 {
                 batch.set(key.as_bytes(), value.as_bytes()).unwrap();
             } else {
@@ -549,12 +523,12 @@ mod tests {
 
         for i in 0..NUM_RECORDS {
             let (kind, key, value) = reader.read_record().unwrap().unwrap();
-            let expected_key = format!("key{}", i);
+            let expected_key = format!("key{i}");
 
             if i % 2 == 0 {
                 assert_eq!(kind, InternalKeyKind::Set);
                 assert_eq!(key, expected_key.as_bytes());
-                assert_eq!(value.unwrap(), format!("value{}", i).as_bytes());
+                assert_eq!(value.unwrap(), format!("value{i}").as_bytes());
             } else {
                 assert_eq!(kind, InternalKeyKind::Delete);
                 assert_eq!(key, expected_key.as_bytes());
@@ -631,5 +605,81 @@ mod tests {
         let val_ptr = value.unwrap().as_ptr() as usize;
         assert!(key_ptr >= encoded_ptr && key_ptr < encoded_ptr + encoded_len);
         assert!(val_ptr >= encoded_ptr && val_ptr < encoded_ptr + encoded_len);
+    }
+
+    #[test]
+    fn test_add_record_consistent_encoding() {
+        // Test that None and Some(&[]) now encode identically (both as value_len=0)
+        let mut batch_none = Batch::new();
+        batch_none
+            .add_record(InternalKeyKind::Delete, b"test_key", None)
+            .unwrap();
+
+        let mut batch_empty = Batch::new();
+        batch_empty
+            .add_record(InternalKeyKind::Delete, b"test_key", Some(&[]))
+            .unwrap();
+
+        let encoded_none = batch_none.encode(100).unwrap();
+        let encoded_empty = batch_empty.encode(100).unwrap();
+
+        // Now they should encode identically (both write value_len=0)
+        assert_eq!(
+            encoded_none, encoded_empty,
+            "None and Some(&[]) should now encode identically"
+        );
+
+        // Test reading them back - both should return None (since both encode as value_len=0)
+        let mut reader_none = BatchReader::new(&encoded_none).unwrap();
+        let (kind1, key1, value1) = reader_none.read_record().unwrap().unwrap();
+        assert_eq!(kind1, InternalKeyKind::Delete);
+        assert_eq!(key1, b"test_key");
+        assert!(
+            value1.is_none(),
+            "None encodes as value_len=0, reads back as None"
+        );
+
+        let mut reader_empty = BatchReader::new(&encoded_empty).unwrap();
+        let (kind2, key2, value2) = reader_empty.read_record().unwrap().unwrap();
+        assert_eq!(kind2, InternalKeyKind::Delete);
+        assert_eq!(key2, b"test_key");
+        assert!(
+            value2.is_none(),
+            "Some(&[]) also encodes as value_len=0, reads back as None"
+        );
+
+        // Test with different operation types to ensure they all work
+        let mut batch_merge = Batch::new();
+        batch_merge
+            .add_record(InternalKeyKind::Merge, b"merge_key", Some(b"merge_data"))
+            .unwrap();
+
+        let encoded_merge = batch_merge.encode(300).unwrap();
+        let mut reader_merge = BatchReader::new(&encoded_merge).unwrap();
+        let (kind3, key3, value3) = reader_merge.read_record().unwrap().unwrap();
+        assert_eq!(kind3, InternalKeyKind::Merge);
+        assert_eq!(key3, b"merge_key");
+        assert_eq!(
+            value3,
+            Some(&b"merge_data"[..]),
+            "Merge operations now work correctly"
+        );
+
+        // Test with Set operations (should still work as before)
+        let mut batch_set = Batch::new();
+        batch_set
+            .add_record(InternalKeyKind::Set, b"set_key", Some(b"set_data"))
+            .unwrap();
+
+        let encoded_set = batch_set.encode(400).unwrap();
+        let mut reader_set = BatchReader::new(&encoded_set).unwrap();
+        let (kind4, key4, value4) = reader_set.read_record().unwrap().unwrap();
+        assert_eq!(kind4, InternalKeyKind::Set);
+        assert_eq!(key4, b"set_key");
+        assert_eq!(
+            value4,
+            Some(&b"set_data"[..]),
+            "Set operations still work correctly"
+        );
     }
 }

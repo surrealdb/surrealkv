@@ -12,7 +12,7 @@ use std::{
 use crate::{
     batch::Batch,
     error::Result,
-    iter::{CompactionIterator, MergeIterator},
+    iter::MergeIterator,
     sstable::{
         table::{Table, TableWriter},
         InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
@@ -165,7 +165,7 @@ impl MemTable {
         table_id: u64,
         dir: PathBuf,
         lsm_opts: Arc<Options>,
-        vlog: Arc<VLog>,
+        vlog: Option<Arc<VLog>>,
     ) -> Result<Arc<Table>> {
         let table_file_path = dir.join(table_id.to_string());
         {
@@ -174,15 +174,15 @@ impl MemTable {
 
             let iter = self.iter();
             let iter = Box::new(iter);
-            let merge_iter = MergeIterator::new(vec![iter]);
-            let comp_iter = CompactionIterator::new(merge_iter, false);
-            for (key, val) in comp_iter {
-                // Process value through VLog if enabled and value is large enough
-                let processed_value = if val.len() >= lsm_opts.vlog_value_threshold {
-                    // Store large value in VLog and use pointer
+            let merge_iter = MergeIterator::new(vec![iter], false);
+            for (key, val) in merge_iter {
+                // Process value through VLog if enabled
+                let processed_value = if let Some(ref vlog) = vlog {
+                    // Store ALL values in VLog when enabled
                     let pointer = vlog.append(&key.encode(), &val)?;
                     pointer.encode()
                 } else {
+                    // VLog disabled, store all values inline
                     val.to_vec()
                 };
 
@@ -190,7 +190,9 @@ impl MemTable {
                 table_writer.add(key, &processed_value)?;
             }
 
-            vlog.sync()?;
+            if let Some(ref vlog) = vlog {
+                vlog.sync()?;
+            }
             // TODO: Check how to fsync this file
             table_writer.finish()?;
         }
@@ -806,8 +808,8 @@ mod tests {
         // Create a larger dataset to test performance and correctness
         let mut entries = Vec::new();
         for i in 0..1000 {
-            let key = format!("key{:04}", i);
-            let value = format!("value{:04}", i);
+            let key = format!("key{i:04}");
+            let value = format!("value{i:04}");
             entries.push((s2b(&key), s2b(&value), InternalKeyKind::Set, None));
         }
 

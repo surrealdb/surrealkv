@@ -40,7 +40,7 @@ pub fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
     // Remove all segments except the latest one
     for segment_id in segment_ids {
         if segment_id < last {
-            let segment_path = wal_dir.join(format!("{:020}", segment_id));
+            let segment_path = wal_dir.join(format!("{segment_id:020}"));
 
             match fs::remove_file(&segment_path) {
                 Ok(_) => {
@@ -48,7 +48,7 @@ pub fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
                 }
                 Err(e) => {
                     // Log error but continue trying to remove other segments
-                    eprintln!("Error removing old WAL segment {}: {}", segment_id, e);
+                    eprintln!("Error removing old WAL segment {segment_id}: {e}");
                 }
             }
         }

@@ -344,8 +344,9 @@ mod tests {
             CompactionChoice, CompactionStrategy,
         },
         error::Result,
+        iter::MergeIterator,
         levels::{write_levels_to_disk, Level, LevelManifest, Levels},
-        memtable::{ImmutableMemtables, MemTable},
+        memtable::ImmutableMemtables,
         sstable::{
             table::{Table, TableFormat, TableWriter},
             InternalKey, InternalKeyKind,
@@ -417,7 +418,7 @@ mod tests {
         let mut entries = Vec::new();
         for key_val in min_key..=max_key {
             // Generate string key with zero-padding
-            let user_key = format!("key-{:010}", key_val).into_bytes();
+            let user_key = format!("key-{key_val:010}").into_bytes();
 
             let key = InternalKey::new(
                 user_key.clone(),
@@ -426,7 +427,7 @@ mod tests {
             );
 
             // Use string value with key index
-            let value = format!("value-{}", key_val).into_bytes();
+            let value = format!("value-{key_val}").into_bytes();
 
             entries.push((key, value));
         }
@@ -487,12 +488,9 @@ mod tests {
         let vlog = Arc::new(
             crate::vlog::VLog::new(
                 opts.path.join("vlog"),
-                opts.vlog_value_threshold,
                 opts.vlog_max_file_size,
                 opts.vlog_checksum_verification,
-                Arc::new(RwLock::new(Arc::new(MemTable::default()))),
-                Arc::new(RwLock::new(ImmutableMemtables::default())),
-                manifest.clone(),
+                opts.vlog_gc_discard_ratio,
             )
             .unwrap(),
         );
@@ -502,7 +500,7 @@ mod tests {
             lopts: opts,
             levels: manifest,
             immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
-            vlog,
+            vlog: Some(vlog),
         }
     }
 
@@ -554,8 +552,7 @@ mod tests {
                 // Verify value matches
                 assert_eq!(
                     actual_value, expected_value,
-                    "Value mismatch for key {:?}",
-                    expected_key
+                    "Value mismatch for key {expected_key:?}"
                 );
             } else {
                 missing_keys.push(expected_key.clone());
@@ -565,8 +562,7 @@ mod tests {
         assert_eq!(
             missing_keys.len(),
             0,
-            "Missing keys after compaction: {:?}",
-            missing_keys
+            "Missing keys after compaction: {missing_keys:?}"
         );
 
         (count, all_key_values)
@@ -598,11 +594,11 @@ mod tests {
         for (expected_key, expected_value) in expected_keys {
             if let Some(actual_value) = all_key_values.get(expected_key) {
                 if actual_value != expected_value {
-                    println!("Value mismatch for key {:?}", expected_key);
+                    println!("Value mismatch for key {expected_key:?}");
                     all_keys_found = false;
                 }
             } else {
-                println!("Missing key {:?}", expected_key);
+                println!("Missing key {expected_key:?}");
                 all_keys_found = false;
             }
         }
@@ -620,7 +616,7 @@ mod tests {
                 i,
                 result.err()
             );
-            println!("Compaction round {} completed", i);
+            println!("Compaction round {i} completed");
         }
     }
 
@@ -669,8 +665,7 @@ mod tests {
                 for id in 1..=5 {
                     assert!(
                         input.tables_to_merge.contains(&id),
-                        "Table {} from L0 should be included",
-                        id
+                        "Table {id} from L0 should be included"
                     );
                 }
 
@@ -845,11 +840,11 @@ mod tests {
 
         for i in 0..keys_per_table {
             // Create a key with table and index - format: "table{:02d}-key-{:03d}"
-            let key = format!("table{:02}-key-{:03}", table_idx, i).into_bytes();
+            let key = format!("table{table_idx:02}-key-{i:03}").into_bytes();
             let internal_key = InternalKey::new(key.clone(), seq_num, InternalKeyKind::Set);
 
             // Create a value that's predictable - format: "value-{:02d}-{:03d}"
-            let value = format!("value-{:02}-{:03}", table_idx, i).into_bytes();
+            let value = format!("value-{table_idx:02}-{i:03}").into_bytes();
 
             entries.push((internal_key, value));
         }
@@ -857,8 +852,8 @@ mod tests {
         entries
     }
 
-    #[test]
-    fn test_simple_merge_compaction() {
+    #[tokio::test]
+    async fn test_simple_merge_compaction() {
         let env = TestEnv::new();
 
         // Create 10 tables, each with 10 keys
@@ -909,13 +904,11 @@ mod tests {
             assert_eq!(
                 levels.get_levels()[0].tables.len(),
                 TABLE_COUNT,
-                "Should have exactly {} tables in L0",
-                TABLE_COUNT
+                "Should have exactly {TABLE_COUNT} tables in L0"
             );
             assert_eq!(
                 total_keys, TOTAL_KEYS,
-                "Should have exactly {} keys across all tables",
-                TOTAL_KEYS
+                "Should have exactly {TOTAL_KEYS} keys across all tables"
             );
         }
 
@@ -995,14 +988,13 @@ mod tests {
 
             assert_eq!(
                 remaining_original_count, 0,
-                "All original L0 tables should be removed by compaction. Remaining: {}",
-                remaining_original_count
+                "All original L0 tables should be removed by compaction. Remaining: {remaining_original_count}"
             );
         }
     }
 
-    #[test]
-    fn test_multi_level_merge_compaction() {
+    #[tokio::test]
+    async fn test_multi_level_merge_compaction() {
         // Generate key-value entries for a table
         fn generate_entries(
             level: usize,
@@ -1015,9 +1007,9 @@ mod tests {
 
             for i in 0..keys_per_table {
                 let idx = start_idx + i;
-                let key = format!("L{}-T{:02}-K-{:05}", level, table_idx, idx).into_bytes();
+                let key = format!("L{level}-T{table_idx:02}-K-{idx:05}").into_bytes();
                 let internal_key = InternalKey::new(key.clone(), seq_num, InternalKeyKind::Set);
-                let value = format!("V-{}-{:02}-{:05}", level, table_idx, idx).into_bytes();
+                let value = format!("V-{level}-{table_idx:02}-{idx:05}").into_bytes();
                 entries.push((internal_key, value));
             }
 
@@ -1347,8 +1339,7 @@ mod tests {
         for (&id, &count) in &id_count {
             assert_eq!(
                 count, 1,
-                "Table ID {} appears {} times in the selected tables list",
-                id, count
+                "Table ID {id} appears {count} times in the selected tables list"
             );
         }
     }
@@ -1442,8 +1433,8 @@ mod tests {
         assert_eq!(selected_tables.len(), 1, "Should select exactly 1 table (only L1 table since overlap detection may not work in test)");
     }
 
-    #[test]
-    fn test_compaction_with_large_keys_and_values() {
+    #[tokio::test]
+    async fn test_compaction_with_large_keys_and_values() {
         let env = TestEnv::new();
 
         // Create tables with some large keys and values
@@ -1454,14 +1445,14 @@ mod tests {
         for i in 0..5 {
             // Reduced from 10 to 5 to keep test time manageable
             // Create large key (1KB)
-            let key_base = format!("large-key-{}", i);
+            let key_base = format!("large-key-{i}");
             let key_padding = "X".repeat(1000);
-            let key = format!("{}{}", key_base, key_padding).into_bytes();
+            let key = format!("{key_base}{key_padding}").into_bytes();
 
             // Create large value (4KB)
-            let value_base = format!("large-value-{}", i);
+            let value_base = format!("large-value-{i}");
             let value_padding = "Y".repeat(4000);
-            let value = format!("{}{}", value_base, value_padding).into_bytes();
+            let value = format!("{value_base}{value_padding}").into_bytes();
 
             let internal_key = InternalKey::new(key.clone(), 1000, InternalKeyKind::Set);
 
@@ -1507,8 +1498,8 @@ mod tests {
 
     // TODO: add more tests for:
     // - Compaction with keys that are split across multiple tables
-    #[test]
-    fn test_compaction_respects_sequence_numbers() {
+    #[tokio::test]
+    async fn test_compaction_respects_sequence_numbers() {
         let env = TestEnv::new();
 
         // Create tables with same keys but different sequence numbers
@@ -1524,7 +1515,7 @@ mod tests {
 
             // Create 10 keys, same keys in each table but with different values and seqs
             for j in 0..10 {
-                let key = format!("key-{:03}", j).into_bytes();
+                let key = format!("key-{j:03}").into_bytes();
                 let value = format!("value-from-table-{}-seq-{}", i, base_seq + j).into_bytes();
 
                 let internal_key =
@@ -1591,17 +1582,16 @@ mod tests {
                 assert_eq!(
                     actual_value.as_ref(),
                     expected_value.as_slice(),
-                    "Value for key {:?} doesn't match highest sequence number",
-                    key
+                    "Value for key {key:?} doesn't match highest sequence number"
                 );
             } else {
-                panic!("Key {:?} is missing after compaction", key);
+                panic!("Key {key:?} is missing after compaction");
             }
         }
     }
 
-    #[test]
-    fn test_tombstone_propagation() {
+    #[tokio::test]
+    async fn test_tombstone_propagation() {
         // Test 95% deletion via tombstones with bottom-level filtering
         let env = TestEnv::new();
         let mut levels = Levels::new(2, 10);
@@ -1609,7 +1599,7 @@ mod tests {
         // Create entries with tombstones before values (higher seq numbers first)
         let mut all_entries = Vec::new();
         for i in 0..100 {
-            let key = format!("key-{:03}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
 
             // Add tombstone first (higher sequence number) for 95% of keys
             if i < 95 {
@@ -1618,7 +1608,7 @@ mod tests {
             }
 
             // Add value second (lower sequence number)
-            let value = format!("original-value-{}", i).into_bytes();
+            let value = format!("original-value-{i}").into_bytes();
             let set_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set);
             all_entries.push((set_key, value));
         }
@@ -1665,8 +1655,8 @@ mod tests {
         assert_eq!(remaining_keys, expected_keys);
     }
 
-    #[test]
-    fn test_l0_overlapping_keys_compaction() {
+    #[tokio::test]
+    async fn test_l0_overlapping_keys_compaction() {
         let env = TestEnv::new();
         let mut levels = Levels::new(3, 10);
 
@@ -1674,8 +1664,8 @@ mod tests {
         // Table 1: key-005 to key-015, seq 105-115
         let mut entries1 = Vec::new();
         for i in 5..=15 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("value-from-table1-{}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("value-from-table1-{i}").into_bytes();
             let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set);
             entries1.push((internal_key, value));
         }
@@ -1683,8 +1673,8 @@ mod tests {
         // Table 2: key-010 to key-020, seq 150-160 (overlaps with table1)
         let mut entries2 = Vec::new();
         for i in 10..=20 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("value-from-table2-{}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("value-from-table2-{i}").into_bytes();
             let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set);
             entries2.push((internal_key, value));
         }
@@ -1692,8 +1682,8 @@ mod tests {
         // Table 3: key-008 to key-012 with highest seq numbers + tombstone for key-014
         let mut entries3 = Vec::new();
         for i in 8..=12 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("value-from-table3-{}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("value-from-table3-{i}").into_bytes();
             let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set);
             entries3.push((internal_key, value));
         }
@@ -1785,8 +1775,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_l0_tombstone_propagation_overlapping() {
+    #[tokio::test]
+    async fn test_l0_tombstone_propagation_overlapping() {
         let env = TestEnv::new();
         let mut levels = Levels::new(3, 10);
 
@@ -1794,21 +1784,21 @@ mod tests {
         // Table 1: Base data (seq 100-119) for keys 0-19
         let mut entries1 = Vec::new();
         for i in 0..20 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("original-value-{}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("original-value-{i}").into_bytes();
             entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), value));
         }
 
         // Table 2: Mixed updates/deletes (seq 150-159) for keys 5-14
         let mut entries2 = Vec::new();
         for i in 5..15 {
-            let key = format!("key-{:03}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
             let (kind, value) = if i % 3 == 0 {
                 (InternalKeyKind::Delete, vec![]) // Every 3rd key becomes tombstone
             } else {
                 (
                     InternalKeyKind::Set,
-                    format!("updated-value-{}", i).into_bytes(),
+                    format!("updated-value-{i}").into_bytes(),
                 )
             };
             entries2.push((InternalKey::new(key, 150 + i - 5, kind), value));
@@ -1817,7 +1807,7 @@ mod tests {
         // Table 3: Final tombstones (seq 200+) for specific keys
         let mut entries3 = Vec::new();
         for i in [2, 8, 14, 17] {
-            let key = format!("key-{:03}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
             entries3.push((
                 InternalKey::new(key, 200 + i / 2, InternalKeyKind::Delete),
                 vec![],
@@ -1914,8 +1904,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_tombstone_propagation_through_levels() {
+    #[tokio::test]
+    async fn test_tombstone_propagation_through_levels() {
         let env = TestEnv::new();
         let mut levels = Levels::new(4, 10);
 
@@ -1923,14 +1913,14 @@ mod tests {
         for table_idx in 0..4 {
             let mut l2_entries = Vec::new();
             for i in (table_idx * 3)..((table_idx + 1) * 3) {
-                let key = format!("key-{:03}", i).into_bytes();
+                let key = format!("key-{i:03}").into_bytes();
                 let (seq, kind, value) = if i % 2 == 0 {
                     (200 + i, InternalKeyKind::Delete, vec![]) // Even keys = tombstones
                 } else {
                     (
                         200 + i,
                         InternalKeyKind::Set,
-                        format!("l2-value-{}", i).into_bytes(),
+                        format!("l2-value-{i}").into_bytes(),
                     ) // Odd keys = values
                 };
                 l2_entries.push((InternalKey::new(key, seq, kind), value));
@@ -1942,8 +1932,8 @@ mod tests {
         // Create L3 with older values for all keys (overlapping with L2)
         let mut l3_entries = Vec::new();
         for i in 0..12 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("l3-old-value-{}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("l3-old-value-{i}").into_bytes();
             l3_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), value));
         }
         let l3_table = env.create_test_table(200, l3_entries).unwrap();
@@ -1992,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complete_tombstone_propagation_journey() {
+    fn test_tombstone_propagation_journey() {
         let env = TestEnv::new();
 
         // Create tombstone (seq=100) and older value (seq=50) for same key
@@ -2015,8 +2005,7 @@ mod tests {
             Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
             Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
         ];
-        let merge_iter = crate::iter::MergeIterator::new(iterators);
-        let comp_iter_non_bottom = crate::iter::CompactionIterator::new(merge_iter, false);
+        let comp_iter_non_bottom = MergeIterator::new(iterators, false);
         let non_bottom_result: Vec<_> = comp_iter_non_bottom.collect();
 
         // Non-bottom level should preserve tombstone
@@ -2038,8 +2027,7 @@ mod tests {
             Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
             Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
         ];
-        let merge_iter = crate::iter::MergeIterator::new(iterators);
-        let comp_iter_bottom = crate::iter::CompactionIterator::new(merge_iter, true);
+        let comp_iter_bottom = MergeIterator::new(iterators, true);
         let bottom_result: Vec<_> = comp_iter_bottom.collect();
 
         // Bottom level should filter out tombstones
@@ -2069,8 +2057,8 @@ mod tests {
         let expected_tombstones = 25u64;
 
         for i in 0..100 {
-            let key = format!("key-{:03}", i).into_bytes();
-            let value = format!("value-{:03}", i).into_bytes();
+            let key = format!("key-{i:03}").into_bytes();
+            let value = format!("value-{i:03}").into_bytes();
             let seq = 1000 + i;
 
             let kind = match i % 20 {

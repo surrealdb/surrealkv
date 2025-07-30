@@ -75,7 +75,7 @@ impl TaskManager {
                     running.store(true, Ordering::SeqCst);
                     if let Err(e) = core.compact_memtable() {
                         // TODO: Handle error appropriately
-                        eprintln!("\n Memtable compaction task error: {:?}", e);
+                        eprintln!("\n Memtable compaction task error: {e:?}");
                     } else {
                         // If memtable compaction succeeded, trigger level compaction
                         level_notify.notify_one();
@@ -107,7 +107,7 @@ impl TaskManager {
                     let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
                     if let Err(e) = core.compact(strategy) {
                         // TODO: Handle error appropriately
-                        eprintln!("\n Level compaction task error: {:?}", e);
+                        eprintln!("\n Level compaction task error: {e:?}");
                     }
                     running.store(false, Ordering::SeqCst);
                 }
@@ -160,7 +160,7 @@ impl TaskManager {
         let task_handles = self.task_handles.lock().unwrap().take().unwrap();
         for handle in task_handles {
             if let Err(e) = handle.await {
-                eprintln!("Error shutting down task: {:?}", e);
+                eprintln!("Error shutting down task: {e:?}");
             }
         }
     }
@@ -169,6 +169,7 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use crate::error::Result;
+    use crate::Error;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -222,7 +223,7 @@ mod tests {
 
             // Check if should fail
             if self.fail_memtable.load(Ordering::SeqCst) {
-                return Err(crate::error::Error::Other("memtable error".into()));
+                return Err(Error::Other("memtable error".into()));
             }
 
             // Only increment counter on success
@@ -238,7 +239,7 @@ mod tests {
 
             // Check if should fail
             if self.fail_level.load(Ordering::SeqCst) {
-                return Err(crate::error::Error::Other("level error".into()));
+                return Err(Error::Other("level error".into()));
             }
 
             // Only increment counter on success
@@ -427,8 +428,7 @@ mod tests {
 
         assert!(
             level_count > 0 && level_count <= 5,
-            "Expected between 1-5 level compactions, got {}",
-            level_count
+            "Expected between 1-5 level compactions, got {level_count}"
         );
 
         Arc::try_unwrap(task_manager)
@@ -452,10 +452,7 @@ mod tests {
             "Should return an error when fail_memtable is true"
         );
         let memtable_count_after_direct = core.memtable_compactions.load(Ordering::SeqCst);
-        println!(
-            "Memtable count after direct call: {}",
-            memtable_count_after_direct
-        );
+        println!("Memtable count after direct call: {memtable_count_after_direct}");
 
         // Reset counters
         core.memtable_compactions.store(0, Ordering::SeqCst);
@@ -473,14 +470,12 @@ mod tests {
         let level_count = core.level_compactions.load(Ordering::SeqCst);
 
         println!(
-            "After wake_up_memtable with failure: memtable_count={}, level_count={}",
-            memtable_count, level_count
+            "After wake_up_memtable with failure: memtable_count={memtable_count}, level_count={level_count}"
         );
 
         assert!(
             level_count == 0,
-            "Level compaction was triggered after memtable failure. Expected 0, got {}",
-            level_count
+            "Level compaction was triggered after memtable failure. Expected 0, got {level_count}"
         );
 
         // Reset counters
@@ -498,8 +493,7 @@ mod tests {
         // Read counts again
         let memtable_count = core.memtable_compactions.load(Ordering::SeqCst);
         let level_count = core.level_compactions.load(Ordering::SeqCst);
-        println!("After wake_up_memtable with success but level failure: memtable_count={}, level_count={}", 
-                 memtable_count, level_count);
+        println!("After wake_up_memtable with success but level failure: memtable_count={memtable_count}, level_count={level_count}");
 
         // Reset counters
         core.memtable_compactions.store(0, Ordering::SeqCst);
@@ -512,10 +506,7 @@ mod tests {
 
         // Read final counts
         let level_count = core.level_compactions.load(Ordering::SeqCst);
-        println!(
-            "After wake_up_level with success: level_count={}",
-            level_count
-        );
+        println!("After wake_up_level with success: level_count={level_count}");
 
         task_manager.stop().await;
     }
