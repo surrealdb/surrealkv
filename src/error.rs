@@ -7,72 +7,47 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// It includes various variants to represent different types of errors that can occur.
 #[derive(Clone, Debug)]
 pub enum Error {
-    Abort,              // The operation was aborted
-    Io(Arc<io::Error>), // An I/O error occurred
-    Send(String),
-    Receive(String),
-    CorruptedBlock(String),
-    Compression(String),
-    KeyNotInOrder,
-    FilterBlockEmpty,
-    Decompression(String),
-    InvalidFilename(String),
-    CorruptedTableMetadata(String),
-    InvalidTableFormat,
-    TableMetadataNotFound,
-    Wal(String),
-    BlockNotFound,
-    BatchTooLarge,
-    InvalidBatchRecord,
-    TransactionWriteConflict,
-    TransactionClosed,
-    EmptyKey,
-    TransactionWriteOnly,
-    TransactionReadOnly,
-    KeyNotFound,
-    WriteStall,
-    FileDescriptorNotFound,
-    TableIDCollision(u64),
-    PipelineStall,
-    Other(String), // Other errors
-    NoSnapshot,
-    CommitFail(String),
-    LoadManifestFail(String),
-    Corruption(String), // Data corruption detected
-    VlogGCAlreadyInProgress,
-    InvalidArgument(String),
-}
-
-/// Error structure for encoding errors
-#[derive(Debug)]
-pub struct EncodeError {
-    message: String,
-}
-
-/// Error structure for decoding errors
-#[derive(Debug)]
-pub struct DecodeError {
-    message: String,
-}
-
-// Implementation of Display trait for EncodeError
-impl fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "encode error: {}", self.message)
-    }
-}
-
-// Implementation of Display trait for DecodeError
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "decode error: {}", self.message)
-    }
+	Abort,              // The operation was aborted
+	Io(Arc<io::Error>), // An I/O error occurred
+	Send(String),
+	Receive(String),
+	CorruptedBlock(String),
+	Compression(String),
+	KeyNotInOrder,
+	FilterBlockEmpty,
+	Decompression(String),
+	InvalidFilename(String),
+	CorruptedTableMetadata(String),
+	InvalidTableFormat,
+	TableMetadataNotFound,
+	Wal(String),
+	BlockNotFound,
+	BatchTooLarge,
+	InvalidBatchRecord,
+	TransactionWriteConflict,
+	TransactionClosed,
+	EmptyKey,
+	TransactionWriteOnly,
+	TransactionReadOnly,
+	KeyNotFound,
+	WriteStall,
+	FileDescriptorNotFound,
+	TableIDCollision(u64),
+	PipelineStall,
+	Other(String), // Other errors
+	NoSnapshot,
+	CommitFail(String),
+	LoadManifestFail(String),
+	Corruption(String), // Data corruption detected
+	VlogGCAlreadyInProgress,
+	InvalidArgument(String),
+	InvalidTag(String),
 }
 
 // Implementation of Display trait for Error
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
             Error::Abort => write!(f, "Operation aborted"),
             Error::Io(err) => write!(f, "IO error: {err}"),
             Error::Send(err) => write!(f, "Send error: {err}"),
@@ -107,8 +82,9 @@ impl fmt::Display for Error {
             Error::Corruption(err) => write!(f, "Data corruption detected: {err}"),
             Error::VlogGCAlreadyInProgress => write!(f, "Vlog garbage collection already in progress"),
             Error::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
+            Error::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
         }
-    }
+	}
 }
 
 // Implementation of Error trait for Error
@@ -116,25 +92,25 @@ impl std::error::Error for Error {}
 
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Error {
-        Error::Io(Arc::new(e))
-    }
+	fn from(e: io::Error) -> Error {
+		Error::Io(Arc::new(e))
+	}
 }
 
 impl From<crate::wal::Error> for Error {
-    fn from(err: crate::wal::Error) -> Self {
-        Error::Wal(err.to_string())
-    }
+	fn from(err: crate::wal::Error) -> Self {
+		Error::Wal(err.to_string())
+	}
 }
 
 impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
-    fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
-        Error::Send(format!("Async channel send error: {error}"))
-    }
+	fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
+		Error::Send(format!("Async channel send error: {error}"))
+	}
 }
 
 impl From<async_channel::RecvError> for Error {
-    fn from(error: async_channel::RecvError) -> Self {
-        Error::Receive(format!("Async channel receive error: {error}"))
-    }
+	fn from(error: async_channel::RecvError) -> Self {
+		Error::Receive(format!("Async channel receive error: {error}"))
+	}
 }

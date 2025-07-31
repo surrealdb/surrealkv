@@ -1,233 +1,225 @@
 use crate::{
-    compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
-    error::Result,
-    iter::{BoxedIterator, CompactionIterator},
-    levels::{write_levels_to_disk, LevelManifest},
-    lsm::TABLE_FOLDER,
-    memtable::ImmutableMemtables,
-    sstable::table::{Table, TableWriter},
-    vfs::File,
-    vlog::VLog,
-    Options as LSMOptions,
+	compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
+	error::Result,
+	iter::{BoxedIterator, CompactionIterator},
+	levels::{write_levels_to_disk, LevelManifest},
+	lsm::TABLE_FOLDER,
+	memtable::ImmutableMemtables,
+	sstable::table::{Table, TableWriter},
+	vfs::File,
+	vlog::VLog,
+	Options as LSMOptions,
 };
 
 use std::{
-    collections::HashMap,
-    fs::File as SysFile,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock, RwLockWriteGuard,
-    },
+	collections::HashMap,
+	fs::File as SysFile,
+	path::{Path, PathBuf},
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		Arc, RwLock, RwLockWriteGuard,
+	},
 };
 
 /// Compaction options
 pub struct CompactionOptions {
-    pub table_id_counter: Arc<AtomicU64>,
-    pub lopts: Arc<LSMOptions>,
-    pub levels: Arc<RwLock<LevelManifest>>,
-    pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-    pub vlog: Option<Arc<VLog>>,
+	pub table_id_counter: Arc<AtomicU64>,
+	pub lopts: Arc<LSMOptions>,
+	pub levels: Arc<RwLock<LevelManifest>>,
+	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+	pub vlog: Option<Arc<VLog>>,
 }
 
 impl CompactionOptions {
-    pub fn from(tree: &crate::lsm::CoreInner) -> Self {
-        Self {
-            table_id_counter: tree.table_id_counter.clone(),
-            lopts: tree.opts.clone(),
-            levels: tree.levels.clone(),
-            immutable_memtables: tree.immutable_memtables.clone(),
-            vlog: tree.vlog.clone(),
-        }
-    }
+	pub fn from(tree: &crate::lsm::CoreInner) -> Self {
+		Self {
+			table_id_counter: tree.table_id_counter.clone(),
+			lopts: tree.opts.clone(),
+			levels: tree.levels.clone(),
+			immutable_memtables: tree.immutable_memtables.clone(),
+			vlog: tree.vlog.clone(),
+		}
+	}
 }
 
 /// Handles the compaction state and operations
 pub struct Compactor {
-    pub(crate) options: CompactionOptions,
-    pub(crate) strategy: Arc<dyn CompactionStrategy>,
+	pub(crate) options: CompactionOptions,
+	pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
 impl Compactor {
-    pub fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
-        Self { options, strategy }
-    }
+	pub fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
+		Self {
+			options,
+			strategy,
+		}
+	}
 
-    pub fn compact(&self) -> Result<()> {
-        let levels_guard = self.options.levels.write().unwrap();
-        let choice = self.strategy.pick_levels(&levels_guard);
+	pub fn compact(&self) -> Result<()> {
+		let levels_guard = self.options.levels.write().unwrap();
+		let choice = self.strategy.pick_levels(&levels_guard);
 
-        match choice {
-            CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
-            CompactionChoice::Skip => Ok(()),
-        }
-    }
+		match choice {
+			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
+			CompactionChoice::Skip => Ok(()),
+		}
+	}
 
-    fn merge_tables(
-        &self,
-        mut levels: RwLockWriteGuard<'_, LevelManifest>,
-        input: &CompactionInput,
-    ) -> Result<()> {
-        let merge_result = {
-            let tables = levels.get_all_tables();
+	fn merge_tables(
+		&self,
+		mut levels: RwLockWriteGuard<'_, LevelManifest>,
+		input: &CompactionInput,
+	) -> Result<()> {
+		let merge_result = {
+			let tables = levels.get_all_tables();
 
-            let to_merge: Vec<_> = input
-                .tables_to_merge
-                .iter()
-                .filter_map(|&id| {
-                    let table_opt = tables.get(&id);
-                    table_opt.cloned()
-                })
-                .collect();
+			let to_merge: Vec<_> = input
+				.tables_to_merge
+				.iter()
+				.filter_map(|&id| {
+					let table_opt = tables.get(&id);
+					table_opt.cloned()
+				})
+				.collect();
 
-            let iterators: Vec<BoxedIterator<'_>> = to_merge
-                .into_iter()
-                .map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
-                .collect();
+			let iterators: Vec<BoxedIterator<'_>> = to_merge
+				.into_iter()
+				.map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
+				.collect();
 
-            // Hide tables that are being merged
-            levels.hide_tables(&input.tables_to_merge);
-            drop(levels);
+			// Hide tables that are being merged
+			levels.hide_tables(&input.tables_to_merge);
+			drop(levels);
 
-            // Create new table
-            let new_table_id = self.generate_table_id();
-            let new_table_path = self.get_table_path(new_table_id);
+			// Create new table
+			let new_table_id = self.generate_table_id();
+			let new_table_path = self.get_table_path(new_table_id);
 
-            // Write merged data and collect discard statistics
-            let discard_stats =
-                self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
+			// Write merged data and collect discard statistics
+			let discard_stats =
+				self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
 
-            let new_table = self.open_table(new_table_id, &new_table_path)?;
-            Ok((new_table, new_table_id, discard_stats))
-        };
+			let new_table = self.open_table(new_table_id, &new_table_path)?;
+			Ok((new_table, new_table_id, discard_stats))
+		};
 
-        match merge_result {
-            Ok((new_table, _, discard_stats)) => {
-                self.update_manifest(input, new_table)?;
-                self.cleanup_old_tables(input);
+		match merge_result {
+			Ok((new_table, _, discard_stats)) => {
+				self.update_manifest(input, new_table)?;
+				self.cleanup_old_tables(input);
 
-                // Update VLog discard statistics in bulk
-                if !discard_stats.is_empty() {
-                    if let Some(ref vlog) = self.options.vlog {
-                        vlog.update_discard_stats(discard_stats);
-                    }
-                }
+				// Update VLog discard statistics in bulk
+				if !discard_stats.is_empty() {
+					if let Some(ref vlog) = self.options.vlog {
+						vlog.update_discard_stats(&discard_stats);
+					}
+				}
 
-                Ok(())
-            }
-            Err(e) => {
-                // Restore the original state
-                let mut levels = self.options.levels.write().unwrap();
-                levels.unhide_tables(&input.tables_to_merge);
-                Err(e)
-            }
-        }
-    }
+				Ok(())
+			}
+			Err(e) => {
+				// Restore the original state
+				let mut levels = self.options.levels.write().unwrap();
+				levels.unhide_tables(&input.tables_to_merge);
+				Err(e)
+			}
+		}
+	}
 
-    fn write_merged_table(
-        &self,
-        path: &Path,
-        table_id: u64,
-        merge_iter: Vec<BoxedIterator<'_>>,
-        input: &CompactionInput,
-    ) -> Result<HashMap<u64, i64>> {
-        let file = SysFile::create(path)?;
-        let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
+	fn write_merged_table(
+		&self,
+		path: &Path,
+		table_id: u64,
+		merge_iter: Vec<BoxedIterator<'_>>,
+		input: &CompactionInput,
+	) -> Result<HashMap<u64, i64>> {
+		let file = SysFile::create(path)?;
+		let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
 
-        // Create a compaction iterator that filters tombstones
-        let max_level = self.options.lopts.level_count - 1;
+		// Create a compaction iterator that filters tombstones
+		let max_level = self.options.lopts.level_count - 1;
 
-        let is_bottom_level = input.target_level >= max_level;
-        let mut comp_iter =
-            CompactionIterator::new(merge_iter, is_bottom_level, self.options.vlog.clone());
+		let is_bottom_level = input.target_level >= max_level;
+		let mut comp_iter =
+			CompactionIterator::new(merge_iter, is_bottom_level, self.options.vlog.clone());
 
-        for (key, value) in &mut comp_iter {
-            writer.add(key, &value)?;
-        }
+		for (key, value) in &mut comp_iter {
+			writer.add(key, &value)?;
+		}
 
-        writer.finish()?;
+		writer.finish()?;
 
-        // Flush any remaining delete-list entries to VLog
-        comp_iter.flush_delete_list_batch()?;
+		// Flush any remaining delete-list entries to VLog
+		comp_iter.flush_delete_list_batch()?;
 
-        // Return collected discard statistics
-        Ok(comp_iter.discard_stats)
-    }
+		// Return collected discard statistics
+		Ok(comp_iter.discard_stats)
+	}
 
-    fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
-        let mut manifest = self.options.levels.write().unwrap();
-        let _imm_guard = self.options.immutable_memtables.write();
+	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
+		let mut manifest = self.options.levels.write().unwrap();
+		let _imm_guard = self.options.immutable_memtables.write();
 
-        let new_table_id = new_table.id;
+		let new_table_id = new_table.id;
 
-        // Check for table ID collision before making any changes
-        if input.tables_to_merge.contains(&new_table_id) {
-            return Err(crate::error::Error::TableIDCollision(new_table_id));
-        }
+		// Check for table ID collision before making any changes
+		if input.tables_to_merge.contains(&new_table_id) {
+			return Err(crate::error::Error::TableIDCollision(new_table_id));
+		}
 
-        let mut levels = manifest.levels.clone();
+		let mut levels = manifest.levels.clone();
 
-        // Add new table to target level
-        Arc::make_mut(&mut levels.get_levels_mut()[input.target_level as usize])
-            .insert(new_table.clone());
+		// Add new table to target level
+		Arc::make_mut(&mut levels.get_levels_mut()[input.target_level as usize])
+			.insert(new_table.clone());
 
-        // Remove old tables
-        for level in levels.get_levels_mut().iter_mut() {
-            for &table_id in &input.tables_to_merge {
-                Arc::make_mut(level).remove(table_id);
-            }
-        }
+		// Remove old tables
+		for level in levels.get_levels_mut().iter_mut() {
+			for &table_id in &input.tables_to_merge {
+				Arc::make_mut(level).remove(table_id);
+			}
+		}
 
-        // Get current next_table_id counter value
-        let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
+		// Get current next_table_id counter value
+		let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
 
-        // Persist changes with the current counter value
-        if let Err(e) = write_levels_to_disk(&manifest.path, &levels, next_table_id) {
-            manifest.unhide_tables(&input.tables_to_merge);
-            return Err(e);
-        }
+		// Persist changes with the current counter value
+		if let Err(e) = write_levels_to_disk(&manifest.path, &levels, next_table_id) {
+			manifest.unhide_tables(&input.tables_to_merge);
+			return Err(e);
+		}
 
-        manifest.levels = levels;
-        manifest.unhide_tables(&input.tables_to_merge);
+		manifest.levels = levels;
+		manifest.unhide_tables(&input.tables_to_merge);
 
-        Ok(())
-    }
+		Ok(())
+	}
 
-    fn generate_table_id(&self) -> u64 {
-        self.options
-            .table_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
+	fn generate_table_id(&self) -> u64 {
+		self.options.table_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+	}
 
-    fn get_table_path(&self, table_id: u64) -> PathBuf {
-        self.options
-            .lopts
-            .path
-            .join(TABLE_FOLDER)
-            .join(table_id.to_string())
-    }
+	fn get_table_path(&self, table_id: u64) -> PathBuf {
+		self.options.lopts.path.join(TABLE_FOLDER).join(table_id.to_string())
+	}
 
-    fn cleanup_old_tables(&self, input: &CompactionInput) {
-        let base_path = self.options.lopts.path.join(TABLE_FOLDER);
-        for &table_id in &input.tables_to_merge {
-            let path = base_path.join(table_id.to_string());
-            if let Err(e) = std::fs::remove_file(path) {
-                // Log error but continue with cleanup
-                eprintln!("Failed to remove old table file: {e}");
-            }
-        }
-    }
+	fn cleanup_old_tables(&self, input: &CompactionInput) {
+		let base_path = self.options.lopts.path.join(TABLE_FOLDER);
+		for &table_id in &input.tables_to_merge {
+			let path = base_path.join(table_id.to_string());
+			if let Err(e) = std::fs::remove_file(path) {
+				// Log error but continue with cleanup
+				eprintln!("Failed to remove old table file: {e}");
+			}
+		}
+	}
 
-    fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
-        let file = SysFile::open(table_path)?;
-        let file: Arc<dyn File> = Arc::new(file);
-        let file_size = file.size()?;
+	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
+		let file = SysFile::open(table_path)?;
+		let file: Arc<dyn File> = Arc::new(file);
+		let file_size = file.size()?;
 
-        Ok(Arc::new(Table::new(
-            table_id,
-            self.options.lopts.clone(),
-            file,
-            file_size,
-        )?))
-    }
+		Ok(Arc::new(Table::new(table_id, self.options.lopts.clone(), file, file_size)?))
+	}
 }
