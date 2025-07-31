@@ -373,6 +373,7 @@ mod tests {
                 opts.vlog_max_file_size,
                 VLogChecksumLevel::Full,
                 opts.vlog_gc_discard_ratio,
+                opts.vlog_cache,
             )
             .unwrap(),
         );

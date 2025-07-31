@@ -32,7 +32,7 @@ use crate::{
         recovery::{repair_corrupted_wal_segment, replay_wal},
         writer::Wal,
     },
-    Error, Options,
+    Error, Options, Value,
 };
 
 use async_trait::async_trait;
@@ -147,6 +147,7 @@ impl CoreInner {
                 opts.vlog_max_file_size,
                 opts.vlog_checksum_verification,
                 opts.vlog_gc_discard_ratio,
+                opts.vlog_cache.clone(),
             )?))
         };
 
@@ -316,10 +317,10 @@ impl CoreInner {
     }
 
     /// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
-    pub fn resolve_value(&self, value: &[u8]) -> Result<Vec<u8>> {
+    pub fn resolve_value(&self, value: &[u8]) -> Result<Value> {
         // If VLog is disabled, values are always stored inline
         if !self.is_vlog_enabled() {
-            return Ok(value.to_vec());
+            return Ok(value.into());
         }
 
         // When VLog is enabled, all values should be VLog pointers
@@ -330,7 +331,7 @@ impl CoreInner {
             Ok(pointer) => vlog.get(&pointer),
             Err(_) => {
                 // It could be a value that is not flushed to VLog yet
-                Ok(value.to_vec())
+                Ok(value.into())
             }
         }
     }

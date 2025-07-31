@@ -52,6 +52,7 @@ pub struct Options {
     pub comparator: Arc<dyn Comparator>,
     pub compression: CompressionType,
     pub block_cache: Arc<cache::BlockCache>,
+    pub vlog_cache: Arc<cache::VLogCache>,
     pub path: PathBuf,
     pub level_count: u8,
     pub max_memtable_size: usize,
@@ -79,6 +80,7 @@ impl Default for Options {
             compression: CompressionType::None,
             filter_policy: Some(Arc::new(bf)),
             block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
+            vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
             path: PathBuf::from(""),
             level_count: 1,
             max_memtable_size: 100 * 1024 * 1024,  // 100 MB
@@ -130,6 +132,11 @@ impl Options {
         self.block_cache = value;
         self
     }
+    
+    pub fn with_vlog_cache(mut self, value: Arc<cache::VLogCache>) -> Self {
+        self.vlog_cache = value;
+        self
+    }
 
     pub fn with_path(mut self, value: PathBuf) -> Self {
         self.path = value;
@@ -149,6 +156,11 @@ impl Options {
     // Method to set block_cache capacity
     pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
         self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
+        self
+    }
+    
+    pub fn with_vlog_cache_capacity(mut self, capacity_bytes: u64) -> Self {
+        self.vlog_cache = Arc::new(cache::VLogCache::with_capacity_bytes(capacity_bytes));
         self
     }
 

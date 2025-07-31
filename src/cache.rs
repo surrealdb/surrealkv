@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use crate::sstable::block::Block;
+use crate::Value;
 
 pub type CacheID = u64;
 
@@ -11,6 +12,30 @@ pub type CacheID = u64;
 pub enum Item {
     Data(Arc<Block>),
     Index(Arc<Block>),
+    VLogValue(Value),
+}
+
+// VLog cache key: (file_id, offset)
+#[derive(Eq, std::hash::Hash, PartialEq)]
+pub struct VLogCacheKey {
+    pub file_id: u64,
+    pub offset: u64,
+}
+
+impl From<(u64, u64)> for VLogCacheKey {
+    fn from(value: (u64, u64)) -> Self {
+        Self {
+            file_id: value.0,
+            offset: value.1,
+        }
+    }
+}
+
+impl Equivalent<VLogCacheKey> for (u64, &u64) {
+    /// Checks if a tuple `(u64, &u64)` is equivalent to a `VLogCacheKey`.
+    fn equivalent(&self, key: &VLogCacheKey) -> bool {
+        self.0 == key.file_id && *self.1 == key.offset
+    }
 }
 
 // (Type (disk or index), SSTable ID, Block offset)
@@ -44,7 +69,54 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
         match block {
             Item::Data(block) => block.size() as u64,
             Item::Index(block) => block.size() as u64,
+            Item::VLogValue(value) => value.len() as u64,
         }
+    }
+}
+
+#[derive(Clone)]
+struct VLogValueWeighter;
+
+impl Weighter<VLogCacheKey, Value> for VLogValueWeighter {
+    fn weight(&self, _: &VLogCacheKey, value: &Value) -> u64 {
+        value.len() as u64
+    }
+}
+
+/// Dedicated cache for VLog values
+pub struct VLogCache {
+    data: QCache<VLogCacheKey, Value, VLogValueWeighter>,
+    id: AtomicU64,
+}
+
+impl VLogCache {
+    pub fn with_capacity_bytes(bytes: u64) -> Self {
+        Self {
+            data: QCache::with_weighter(10_000, bytes, VLogValueWeighter),
+            id: AtomicU64::new(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn insert(&self, file_id: u64, offset: u64, value: Value) {
+        self.data.insert((file_id, offset).into(), value);
+    }
+
+    pub fn get(&self, file_id: u64, offset: u64) -> Option<Value> {
+        let key = (file_id, &offset);
+        self.data.get(&key).map(|value| value.clone())
+    }
+
+    pub fn new_cache_id(&self) -> CacheID {
+        let id = self.id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        id + 1
     }
 }
 
@@ -89,6 +161,16 @@ impl BlockCache {
 
         match item {
             Item::Index(block) => Some(block.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_vlog_value(&self, file_id: u64, offset: u64) -> Option<Value> {
+        let key = (file_id, &offset);
+        let item = self.data.get(&key)?;
+
+        match item {
+            Item::VLogValue(value) => Some(value.clone()),
             _ => None,
         }
     }

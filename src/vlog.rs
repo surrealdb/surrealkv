@@ -9,8 +9,9 @@ use std::{
     },
 };
 
-use crate::{batch::Batch, discard::DiscardStats};
+use crate::{batch::Batch, discard::DiscardStats, Value};
 use crate::{sstable::InternalKey, vfs, Options, Tree, VLogChecksumLevel};
+use crate::cache::VLogCache;
 
 use crc32fast::Hasher;
 
@@ -230,6 +231,9 @@ pub struct VLog {
 
     /// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
     pub(crate) global_delete_list: Arc<GlobalDeleteListLSM>,
+
+    /// Dedicated cache for VLog values to avoid repeated disk reads
+    cache: Arc<VLogCache>,
 }
 
 impl VLog {
@@ -244,6 +248,7 @@ impl VLog {
         max_file_size: u64,
         checksum_level: VLogChecksumLevel,
         gc_discard_ratio: f64,
+        cache: Arc<VLogCache>,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -273,6 +278,7 @@ impl VLog {
             gc_in_progress: AtomicBool::new(false),
             discard_stats: Mutex::new(DiscardStats::new(discard_stats_dir)?),
             global_delete_list,
+            cache,
         };
 
         // Clean up any leftover temporary files from previous interrupted compactions
@@ -336,7 +342,12 @@ impl VLog {
     }
 
     /// Retrieves a value using a ValuePointer
-    pub fn get(&self, pointer: &ValuePointer) -> Result<Vec<u8>> {
+    pub fn get(&self, pointer: &ValuePointer) -> Result<Value> {
+        // Check cache first
+        if let Some(cached_value) = self.cache.get(pointer.file_id, pointer.offset) {
+            return Ok(cached_value);
+        }
+
         let file = self.get_file_handle(pointer.file_id)?;
 
         // Read the entire entry in a single call using sizes from the pointer
@@ -393,7 +404,16 @@ impl VLog {
             }
         }
 
-        Ok(value.to_vec())
+
+        // Cache the value for future reads
+        let value_bytes: Value = value.into();
+        self.cache.insert(
+            pointer.file_id,
+            pointer.offset,
+            value_bytes.clone(),
+        );
+
+        Ok(value_bytes)
     }
 
     /// Increments the active iterator count when a transaction/iterator starts
@@ -1034,11 +1054,16 @@ mod tests {
         // Create vlog subdirectory to simulate the real directory structure
         let vlog_dir = temp_dir.path().join("vlog");
         std::fs::create_dir_all(&vlog_dir).unwrap();
+        
+        // Create a dedicated VLog cache with default size (same as BlockCache)
+        let vlog_cache = Arc::new(VLogCache::with_capacity_bytes(64 * 1024 * 1024)); // 64MB default
+        
         let vlog = VLog::new(
             &vlog_dir,
             opts.vlog_max_file_size,
             VLogChecksumLevel::Full,
             opts.vlog_gc_discard_ratio, // Use default discard ratio from options
+            vlog_cache,
         )
         .unwrap();
         (vlog, temp_dir)
@@ -1131,7 +1156,7 @@ mod tests {
         vlog.sync().unwrap();
 
         let retrieved = vlog.get(&pointer).unwrap();
-        assert_eq!(value, retrieved);
+        assert_eq!(value, *retrieved);
     }
 
     #[tokio::test]
@@ -1144,6 +1169,30 @@ mod tests {
         vlog.sync().unwrap();
 
         let retrieved = vlog.get(&pointer).unwrap();
-        assert_eq!(small_value, retrieved);
+        assert_eq!(small_value, *retrieved);
+    }
+
+    #[tokio::test]
+    async fn test_vlog_caching() {
+        let (vlog, _temp_dir) = create_test_vlog();
+
+        let key = b"cache_test_key";
+        let value = vec![42u8; 1000]; // Large enough value
+        let pointer = vlog.append(key, &value).unwrap();
+        vlog.sync().unwrap();
+
+        // First read - should read from disk and cache the value
+        let retrieved1 = vlog.get(&pointer).unwrap();
+        assert_eq!(value, *retrieved1);
+
+        // Second read - should read from cache
+        let retrieved2 = vlog.get(&pointer).unwrap();
+        assert_eq!(value, *retrieved2);
+        assert_eq!(retrieved1, retrieved2);
+
+        // Verify that the cache contains the value
+        let cached_value = vlog.cache.get(pointer.file_id, pointer.offset);
+        assert!(cached_value.is_some());
+        assert_eq!(cached_value.unwrap(), value.into());
     }
 }

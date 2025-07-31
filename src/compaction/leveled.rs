@@ -491,6 +491,7 @@ mod tests {
                 opts.vlog_max_file_size,
                 opts.vlog_checksum_verification,
                 opts.vlog_gc_discard_ratio,
+                opts.vlog_cache.clone(),
             )
             .unwrap(),
         );
