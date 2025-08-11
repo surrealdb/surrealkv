@@ -257,7 +257,7 @@ impl Transaction {
         entry.set_ts(ts);
         // Replace when versions are disabled.
         entry.set_replace(!self.core.opts.enable_versions);
-        self.write(entry)?;
+        self.write_with_version(entry)?;
         Ok(())
     }
 
@@ -330,7 +330,8 @@ impl Transaction {
         }
     }
 
-    /// Writes a value for a key. None is used for deletion.
+    /// Adds an entry to the write set.
+    /// Will overwrite previous entries if one exists within the same savepoint.
     fn write(&mut self, e: Entry) -> Result<()> {
         // If the transaction mode is not mutable (i.e., it's read-only), return an error.
         if !self.mode.mutable() {
@@ -369,6 +370,30 @@ impl Transaction {
                 ve.insert(vec![ws_entry]);
             }
         };
+
+        Ok(())
+    }
+
+    /// Adds an entry to the write set, without merging previous entries.
+    fn write_with_version(&mut self, e: Entry) -> Result<()> {
+        // If the transaction mode is not mutable (i.e., it's read-only), return an error.
+        if !self.mode.mutable() {
+            return Err(Error::TransactionReadOnly);
+        }
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // If the key is empty, return an error.
+        if e.key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Set the transaction's latest savepoint number and add it to the write set.
+        let key = e.key.clone();
+        let write_seqno = self.next_write_seqno();
+        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno, self.read_ts);
+        self.write_set.entry(key).or_default().push(ws_entry);
 
         Ok(())
     }
