@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
-surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust. It offers the following features:
+surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust (under development). It offers the following features:
 
 ## Features
 
