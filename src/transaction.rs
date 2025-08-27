@@ -257,7 +257,7 @@ impl Transaction {
         entry.set_ts(ts);
         // Replace when versions are disabled.
         entry.set_replace(!self.core.opts.enable_versions);
-        self.write(entry)?;
+        self.write_with_version(entry)?;
         Ok(())
     }
 
@@ -330,7 +330,8 @@ impl Transaction {
         }
     }
 
-    /// Writes a value for a key. None is used for deletion.
+    /// Adds an entry to the write set.
+    /// Will overwrite previous entries if one exists within the same savepoint.
     fn write(&mut self, e: Entry) -> Result<()> {
         // If the transaction mode is not mutable (i.e., it's read-only), return an error.
         if !self.mode.mutable() {
@@ -369,6 +370,30 @@ impl Transaction {
                 ve.insert(vec![ws_entry]);
             }
         };
+
+        Ok(())
+    }
+
+    /// Adds an entry to the write set, without merging previous entries.
+    fn write_with_version(&mut self, e: Entry) -> Result<()> {
+        // If the transaction mode is not mutable (i.e., it's read-only), return an error.
+        if !self.mode.mutable() {
+            return Err(Error::TransactionReadOnly);
+        }
+        // If the transaction is closed, return an error.
+        if self.closed {
+            return Err(Error::TransactionClosed);
+        }
+        // If the key is empty, return an error.
+        if e.key.is_empty() {
+            return Err(Error::EmptyKey);
+        }
+
+        // Set the transaction's latest savepoint number and add it to the write set.
+        let key = e.key.clone();
+        let write_seqno = self.next_write_seqno();
+        let ws_entry = WriteSetEntry::new(e, self.savepoints, write_seqno, self.read_ts);
+        self.write_set.entry(key).or_default().push(ws_entry);
 
         Ok(())
     }
@@ -479,7 +504,7 @@ impl Transaction {
         // respecting the insertion order recorded with WriteSetEntry::seqno.
         let mut latest_writes: Vec<WriteSetEntry> = std::mem::take(&mut self.write_set)
             .into_values()
-            .filter_map(|mut entries| entries.pop())
+            .flatten()
             .collect();
         latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
         let entries: Vec<Entry> = latest_writes
@@ -2431,6 +2456,42 @@ mod tests {
     // Version management tests
     mod version_tests {
         use super::*;
+
+        #[test]
+        fn test_insert_multiple_versions_in_same_tx() {
+            let (store, _) = create_store(false);
+            let key = Bytes::from("key1");
+
+            // Insert multiple versions of the same key
+            let values = [
+                Bytes::from("value1"),
+                Bytes::from("value2"),
+                Bytes::from("value3"),
+            ];
+
+            let mut txn = store.begin().unwrap();
+            for (i, value) in values.iter().enumerate() {
+                let version = (i + 1) as u64; // Incremental version
+                txn.set_at_ts(&key, value, version).unwrap();
+            }
+            txn.commit().unwrap();
+
+            let range = key.as_ref()..=key.as_ref();
+            let txn = store.begin().unwrap();
+            let results: Vec<_> = txn
+                .scan_all_versions(range, None)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+
+            // Verify that the output contains all the versions of the key
+            assert_eq!(results.len(), values.len());
+            for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+                assert_eq!(k, &key);
+                assert_eq!(v, &values[i]);
+                assert_eq!(*version, (i + 1) as u64);
+                assert!(!(*is_deleted));
+            }
+        }
 
         #[test]
         fn test_scan_all_versions_single_key_multiple_versions() {
