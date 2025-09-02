@@ -1,277 +1,202 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bytes::Bytes;
-use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::{AtomicU64, Ordering};
-use vart::VariableSizeKey;
+use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Error, Result};
-use crate::option::Options;
-use crate::snapshot::Snapshot;
 use crate::transaction::Transaction;
 
+/// Entry used for tracking transaction operations in the commit queue
+struct CommitEntry {
+	writeset: Arc<BTreeMap<Bytes, Option<Bytes>>>,
+}
+
+impl CommitEntry {
+	/// Returns true if self has no elements in common with other
+	pub fn is_disjoint_writeset(&self, other: &Arc<CommitEntry>) -> bool {
+		// Create a key iterator for each writeset
+		let mut a = self.writeset.keys();
+		let mut b = other.writeset.keys();
+		// Move to the next value in each iterator
+		let mut next_a = a.next();
+		let mut next_b = b.next();
+		// Advance each iterator independently in order
+		while let (Some(ka), Some(kb)) = (next_a, next_b) {
+			match ka.cmp(kb) {
+				std::cmp::Ordering::Less => next_a = a.next(),
+				std::cmp::Ordering::Greater => next_b = b.next(),
+				std::cmp::Ordering::Equal => return false,
+			}
+		}
+		// No overlap was found
+		true
+	}
+}
+
 /// Oracle is responsible for managing transaction timestamps and isolation levels.
-/// It supports two isolation levels: SnapshotIsolation and SerializableSnapshotIsolation.
+/// The current implementation uses Snapshot Isolation (SI) for conflict detection
 pub(crate) struct Oracle {
-    /// Isolation level of the transactions.
-    isolation: IsolationLevel,
+	/// Transaction commit queue
+	pub(crate) transaction_commit_id: AtomicU64,
+	transaction_commit_queue: SkipMap<u64, Arc<CommitEntry>>,
+
+	/// Maximum number of entries to keep in queues
+	max_queue_size: usize,
+
+	/// Track active transaction start points
+	active_txn_starts: SkipMap<u64, AtomicUsize>,
 }
 
 impl Oracle {
-    /// Creates a new Oracle with the given options.
-    /// It sets the isolation level based on the options.
-    pub(crate) fn new(opts: &Options) -> Self {
-        let isolation = match opts.isolation_level {
-            crate::option::IsolationLevel::SnapshotIsolation => {
-                IsolationLevel::SnapshotIsolation(SnapshotIsolation::new())
-            }
-            crate::option::IsolationLevel::SerializableSnapshotIsolation => {
-                IsolationLevel::SerializableSnapshotIsolation(SerializableSnapshotIsolation::new())
-            }
-        };
+	/// Creates a new Oracle with default configuration.
+	pub(crate) fn new() -> Self {
+		Self {
+			transaction_commit_id: AtomicU64::new(0),
+			transaction_commit_queue: SkipMap::new(),
+			max_queue_size: 10000,
+			active_txn_starts: SkipMap::new(),
+		}
+	}
 
-        Self { isolation }
-    }
+	/// Gets the current timestamp (can be used for commit timestamp)
+	pub(crate) fn now() -> u64 {
+		SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+	}
 
-    /// Generates a new commit timestamp for the given transaction.
-    /// It delegates to the isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
-        self.isolation.new_commit_ts(txn)
-    }
+	/// Register a new transaction start
+	pub(crate) fn register_txn_start(&self, start_commit_id: u64) {
+		let entry =
+			self.active_txn_starts.get_or_insert_with(start_commit_id, || AtomicUsize::new(0));
+		entry.value().fetch_add(1, Ordering::Relaxed);
+	}
 
-    /// Returns the read timestamp.
-    /// It delegates to the isolation level to get the timestamp.
-    pub(crate) fn read_ts(&self) -> u64 {
-        self.isolation.read_ts()
-    }
+	/// Unregister a transaction when it commits or aborts
+	pub(crate) fn unregister_txn_start(&self, start_commit_id: u64) {
+		if let Some(entry) = self.active_txn_starts.get(&start_commit_id) {
+			let prev_count = entry.value().fetch_sub(1, Ordering::Relaxed);
 
-    /// Sets the timestamp and increments it.
-    /// It delegates to the isolation level to set and increment the timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.isolation.set_ts(ts);
-        self.isolation.increment_ts();
-    }
-}
+			// Only remove if we decremented from 1 to 0
+			if prev_count == 1 {
+				// Double-check by trying to remove only if counter is 0
+				if entry.value().load(Ordering::Relaxed) == 0 {
+					self.active_txn_starts.remove(&start_commit_id);
+				}
+			}
+		}
+	}
 
-/// Enum representing the isolation level of a transaction.
-/// It can be either SnapshotIsolation or SerializableSnapshotIsolation.
-pub(crate) enum IsolationLevel {
-    SnapshotIsolation(SnapshotIsolation),
-    SerializableSnapshotIsolation(SerializableSnapshotIsolation),
-}
+	/// Prepares a transaction for commit by checking conflicts and assigning a transaction ID.
+	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
+		// Convert transaction writeset to BTreeMap<Bytes, Option<Bytes>>
+		let mut writeset = BTreeMap::new();
+		for (key, entry_opt) in &txn.write_set {
+			let value = entry_opt.as_ref().and_then(|e| e.value.clone());
+			writeset.insert(key.clone(), value);
+		}
 
-macro_rules! isolation_level_method {
-    ($self:ident, $method:ident $(, $arg:ident)?) => {
-        match $self {
-            IsolationLevel::SnapshotIsolation(oracle) => oracle.$method($($arg)?),
-            IsolationLevel::SerializableSnapshotIsolation(oracle) => oracle.$method($($arg)?),
-        }
-    };
-}
+		// Create commit entry
+		let commit_entry = Arc::new(CommitEntry {
+			writeset: Arc::new(writeset),
+		});
 
-impl IsolationLevel {
-    /// Generates a new commit timestamp for the given transaction.
-    /// It delegates to the specific isolation level to generate the timestamp.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
-        isolation_level_method!(self, new_commit_ts, txn)
-    }
+		// Insert into queue with version
+		let version = self.atomic_commit(commit_entry.clone())?;
 
-    /// Returns the read timestamp.
-    /// It delegates to the specific isolation level to get the timestamp.
-    pub(crate) fn read_ts(&self) -> u64 {
-        isolation_level_method!(self, read_ts)
-    }
+		// Check for conflicts
+		let has_conflict = self.check_conflicts(version, txn.start_commit_id, &commit_entry)?;
+		if has_conflict {
+			self.transaction_commit_queue.remove(&version);
+			return Err(Error::TransactionWriteConflict);
+		}
 
-    /// Sets the timestamp.
-    /// It delegates to the specific isolation level to set the timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        isolation_level_method!(self, set_ts, ts)
-    }
+		// Clean up old entries
+		self.cleanup_queue();
 
-    /// Increments the timestamp.
-    /// It delegates to the specific isolation level to increment the timestamp.
-    pub(crate) fn increment_ts(&self) {
-        isolation_level_method!(self, increment_ts)
-    }
-}
+		// No conflicts found, return the tx_id and commit timestamp
+		let commit_ts = Self::now();
 
-/// Struct representing the Snapshot Isolation level in a transaction.
-/// It uses an atomic u64 to keep track of the next transaction ID.
-pub(crate) struct SnapshotIsolation {
-    next_tx_id: AtomicU64,
-}
+		Ok(commit_ts)
+	}
 
-impl SnapshotIsolation {
-    /// Creates a new SnapshotIsolation instance with the next transaction ID set to 0.
-    pub(crate) fn new() -> Self {
-        Self {
-            next_tx_id: AtomicU64::new(0),
-        }
-    }
+	/// Atomically insert an entry into the commit queue.
+	fn atomic_commit(&self, entry: Arc<CommitEntry>) -> Result<u64> {
+		let mut spins = 0;
+		loop {
+			// Get the next commit version
+			let version = self.transaction_commit_id.load(Ordering::Acquire) + 1;
 
-    /// Sets the next transaction ID to the given timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.next_tx_id.store(ts, Ordering::SeqCst);
-    }
+			// Try to insert entry at this version
+			let inserted =
+				self.transaction_commit_queue.get_or_insert_with(version, || Arc::clone(&entry));
 
-    /// Generates a new commit timestamp for the given transaction.
-    /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
-    /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
-    /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(&txn.core)?;
+			// Check if entry was inserted
+			if Arc::ptr_eq(inserted.value(), &entry) {
+				// We successfully inserted entry, increment the commit ID
+				// Use Release ordering to ensure all previous operations are visible
+				// to other threads before they see the updated commit ID
+				self.transaction_commit_id.store(version, Ordering::Release);
+				return Ok(version);
+			}
 
-        // Check write conflicts
-        for key in txn.write_set.keys() {
-            if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                // Detect if another transaction has written to this key.
-                if current_snapshot
-                    .get(&key[..].into())
-                    .is_some_and(|(_, version)| version > last_entry.version)
-                {
-                    return Err(Error::TransactionWriteConflict);
-                }
-            }
-        }
+			// Contention detected, back off and retry
+			spins += 1;
+			if spins > 10 {
+				std::thread::yield_now();
+			}
+		}
+	}
 
-        let ts = self.next_tx_id.load(Ordering::SeqCst);
-        self.increment_ts();
-        Ok(ts)
-    }
+	/// Check for conflicts with transactions that committed after we started.
+	/// Returns true if a conflict was found.
+	fn check_conflicts(
+		&self,
+		version: u64,
+		start_commit_id: u64,
+		entry: &Arc<CommitEntry>,
+	) -> Result<bool> {
+		// Check for conflicts with transactions that committed after we started
+		for tx in self.transaction_commit_queue.range((start_commit_id + 1)..version) {
+			// Check if previous transaction conflicts with writes
+			if !tx.value().is_disjoint_writeset(entry) {
+				return Ok(true); // Conflict found
+			}
+		}
 
-    /// Returns the read timestamp, which is the next transaction ID minus 1.
-    pub(crate) fn read_ts(&self) -> u64 {
-        self.next_tx_id.load(Ordering::SeqCst) - 1
-    }
+		Ok(false) // No conflicts
+	}
 
-    /// Increments the next transaction ID by 1.
-    pub(crate) fn increment_ts(&self) {
-        self.next_tx_id.fetch_add(1, Ordering::SeqCst);
-    }
-}
+	/// Clean up the commit queue based on active transactions
+	fn cleanup_queue(&self) {
+		// Only clean up if we have too many entries
+		if self.transaction_commit_queue.len() <= self.max_queue_size {
+			return;
+		}
 
-fn key_in_range(
-    key: &Bytes,
-    range_start: &Bound<&VariableSizeKey>,
-    range_end: &Bound<&VariableSizeKey>,
-) -> bool {
-    let key = VariableSizeKey::from_slice(key);
+		// Find the oldest active transaction start point
+		let oldest_active = match self.active_txn_starts.iter().next() {
+			Some(entry) => {
+				// There are active transactions - we can safely clean up entries
+				// older than the oldest active transaction's start point
+				*entry.key()
+			}
+			None => {
+				// No active transactions currently.
+				// New transactions will get start_commit_id = current transaction_commit_id
+				// So we can safely clean up entries older than the current commit ID
+				// since no future transaction will have a start_commit_id older than this
+				self.transaction_commit_id.load(Ordering::Acquire)
+			}
+		};
 
-    let start_inclusive = match &range_start {
-        Bound::Included(start) => key >= **start,
-        Bound::Excluded(start) => key > **start,
-        Bound::Unbounded => true,
-    };
+		// Only remove entries that are not needed for conflict detection
+		let keys_to_remove: Vec<u64> =
+			self.transaction_commit_queue.range(..oldest_active).map(|e| *e.key()).collect();
 
-    let end_exclusive = match &range_end {
-        Bound::Included(end) => key <= **end,
-        Bound::Excluded(end) => key < **end,
-        Bound::Unbounded => true,
-    };
-
-    start_inclusive && end_exclusive
-}
-
-/// Serializable Snapshot Isolation (SSI):
-/// https://www.cse.iitb.ac.in/infolab/Data/Courses/CS632/2009/Papers/p492-fekete.pdf
-///
-/// Serializable Snapshot Isolation (SSI) is a specific isolation level that falls under the
-/// category of "serializable" isolation levels. It provides serializability while allowing for
-/// a higher degree of concurrency compared to traditional serializability mechanisms.
-///
-/// This implementation adopts Write Snapshot Isolation as defined in the paper:
-/// https://arxiv.org/abs/2405.18393
-pub(crate) struct SerializableSnapshotIsolation {
-    next_tx_id: AtomicU64,
-}
-
-impl SerializableSnapshotIsolation {
-    /// Creates a new SerializableSnapshotIsolation instance with the next transaction ID set to 0.
-    pub(crate) fn new() -> Self {
-        Self {
-            next_tx_id: AtomicU64::new(0),
-        }
-    }
-
-    /// Sets the next transaction ID to the given timestamp.
-    pub(crate) fn set_ts(&self, ts: u64) {
-        self.next_tx_id.store(ts, Ordering::SeqCst);
-    }
-
-    /// Generates a new commit timestamp for the given transaction.
-    /// It performs optimistic concurrency control (OCC) by checking if the read keys in the transaction
-    /// are still valid in the latest snapshot, and if the timestamp of the read keys matches the timestamp
-    /// of the latest snapshot. If the timestamp does not match, then there is a conflict.
-    pub(crate) fn new_commit_ts(&self, txn: &Transaction) -> Result<u64> {
-        let current_snapshot = Snapshot::take(&txn.core)?;
-
-        // Check read conflicts
-        for entry in txn.read_set.iter() {
-            match current_snapshot.get(&entry.key[..].into()) {
-                Some((_, version)) => {
-                    if entry.ts != version {
-                        return Err(Error::TransactionReadConflict);
-                    }
-                }
-                None => {
-                    if entry.ts > 0 {
-                        return Err(Error::TransactionReadConflict);
-                    }
-                }
-            }
-        }
-
-        // Check write conflicts
-        for key in txn.write_set.keys() {
-            if let Some(last_entry) = txn.write_set.get(key).and_then(|entries| entries.last()) {
-                // Detect if another transaction has written to this key.
-                if current_snapshot
-                    .get(&key[..].into())
-                    .is_some_and(|(_, version)| version > last_entry.version)
-                {
-                    return Err(Error::TransactionWriteConflict);
-                }
-            }
-        }
-
-        // For each range, check if any write skew (including deletes) conflicts
-        for range in &txn.read_key_ranges {
-            // Get all writes in the range from the snapshot
-            let range_writes = current_snapshot.range(range.range.clone());
-
-            for (_, _, version, _) in range_writes {
-                if version > txn.read_ts {
-                    // Any modification after our read timestamp should cause a conflict
-                    // regardless of whether we're deleting the key or not
-                    return Err(Error::TransactionReadConflict);
-                }
-            }
-
-            // Check for deletes in current transaction that affect this range
-            for (key, entries) in &txn.write_set {
-                if key_in_range(key, &range.range.start_bound(), &range.range.end_bound()) {
-                    if let Some(entry) = entries.last() {
-                        let key = VariableSizeKey::from_slice(key);
-                        let res = current_snapshot.get(&key);
-                        if entry.e.is_deleted_or_tombstone() && res.is_none() {
-                            // This is a delete of a key that didn't exist at snapshot time
-                            return Err(Error::TransactionWriteConflict);
-                        }
-                    }
-                }
-            }
-        }
-
-        let ts = self.next_tx_id.load(Ordering::SeqCst);
-        self.increment_ts();
-        Ok(ts)
-    }
-
-    /// Returns the read timestamp, which is the next transaction ID minus 1.
-    pub(crate) fn read_ts(&self) -> u64 {
-        self.next_tx_id.load(Ordering::SeqCst) - 1
-    }
-
-    /// Increments the next transaction ID by 1.
-    pub(crate) fn increment_ts(&self) {
-        self.next_tx_id.fetch_add(1, Ordering::SeqCst);
-    }
+		for key in keys_to_remove {
+			self.transaction_commit_queue.remove(&key);
+		}
+	}
 }
