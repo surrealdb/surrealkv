@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
-use crate::vlog::VLog;
-use crate::vlog::ValueLocation;
+use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{
 	sstable::{InternalKey, InternalKeyKind},
@@ -145,15 +144,13 @@ impl Iterator for MergeIterator<'_> {
 	}
 }
 
-fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u64, i64>, value: &Value) -> Result<()> {
+fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Value) -> Result<()> {
 	// Check if this is a ValueLocation
 	let location = ValueLocation::decode(value)?;
-	match location {
-		ValueLocation::VLog(pointer) => {
-			let value_data_size = pointer.total_entry_size() as i64;
-			*discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
-		}
-		ValueLocation::Inline(_) => {}
+	if location.is_value_pointer() {
+		let pointer = ValuePointer::decode(&location.value)?;
+		let value_data_size = pointer.total_entry_size() as i64;
+		*discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
 	}
 	Ok(())
 }
@@ -172,7 +169,7 @@ pub struct CompactionIterator<'a> {
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
-	pub discard_stats: HashMap<u64, i64>,
+	pub discard_stats: HashMap<u32, i64>,
 
 	/// Reference to VLog for populating delete-list
 	vlog: Option<Arc<VLog>>,
@@ -263,12 +260,10 @@ impl<'a> CompactionIterator<'a> {
 					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
 				} else {
 					let location = ValueLocation::decode(value).unwrap();
-					match location {
-						ValueLocation::VLog(pointer) => {
-							let value_size = pointer.total_entry_size();
-							self.delete_list_batch.push((key.seq_num(), value_size));
-						}
-						ValueLocation::Inline(_) => {}
+					if location.is_value_pointer() {
+						let pointer = ValuePointer::decode(&location.value).unwrap();
+						let value_size = pointer.total_entry_size();
+						self.delete_list_batch.push((key.seq_num(), value_size));
 					}
 				}
 
@@ -367,25 +362,19 @@ mod tests {
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options::default();
+		let opts = Options {
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			..Default::default()
+		};
 		let vlog_dir = temp_dir.path().join("vlog");
 		std::fs::create_dir_all(&vlog_dir).unwrap();
-		let vlog = Arc::new(
-			VLog::new(
-				&vlog_dir,
-				opts.vlog_max_file_size,
-				VLogChecksumLevel::Full,
-				opts.vlog_gc_discard_ratio,
-				opts.vlog_cache,
-			)
-			.unwrap(),
-		);
+		let vlog = Arc::new(VLog::new(&vlog_dir, Arc::new(opts)).unwrap());
 		(vlog, temp_dir)
 	}
 
 	fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 		let pointer = vlog.append(key, value).unwrap();
-		ValueLocation::VLog(pointer).encode().unwrap()
+		ValueLocation::with_pointer(pointer).encode().into()
 	}
 
 	// Creates a mock iterator with predefined entries

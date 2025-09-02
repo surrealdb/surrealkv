@@ -133,7 +133,7 @@ impl Compactor {
 		table_id: u64,
 		merge_iter: Vec<BoxedIterator<'_>>,
 		input: &CompactionInput,
-	) -> Result<HashMap<u64, i64>> {
+	) -> Result<HashMap<u32, i64>> {
 		let file = SysFile::create(path)?;
 		let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
 

@@ -18,12 +18,12 @@ pub enum Item {
 // VLog cache key: (file_id, offset)
 #[derive(Eq, std::hash::Hash, PartialEq)]
 pub struct VLogCacheKey {
-	pub file_id: u64,
+	pub file_id: u32,
 	pub offset: u64,
 }
 
-impl From<(u64, u64)> for VLogCacheKey {
-	fn from(value: (u64, u64)) -> Self {
+impl From<(u32, u64)> for VLogCacheKey {
+	fn from(value: (u32, u64)) -> Self {
 		Self {
 			file_id: value.0,
 			offset: value.1,
@@ -31,8 +31,8 @@ impl From<(u64, u64)> for VLogCacheKey {
 	}
 }
 
-impl Equivalent<VLogCacheKey> for (u64, &u64) {
-	/// Checks if a tuple `(u64, &u64)` is equivalent to a `VLogCacheKey`.
+impl Equivalent<VLogCacheKey> for (u32, &u64) {
+	/// Checks if a tuple `(u32, &u64)` is equivalent to a `VLogCacheKey`.
 	fn equivalent(&self, key: &VLogCacheKey) -> bool {
 		self.0 == key.file_id && *self.1 == key.offset
 	}
@@ -105,11 +105,11 @@ impl VLogCache {
 		self.len() == 0
 	}
 
-	pub fn insert(&self, file_id: u64, offset: u64, value: Value) {
+	pub fn insert(&self, file_id: u32, offset: u64, value: Value) {
 		self.data.insert((file_id, offset).into(), value);
 	}
 
-	pub fn get(&self, file_id: u64, offset: u64) -> Option<Value> {
+	pub fn get(&self, file_id: u32, offset: u64) -> Option<Value> {
 		let key = (file_id, &offset);
 		self.data.get(&key)
 	}
@@ -161,16 +161,6 @@ impl BlockCache {
 
 		match item {
 			Item::Index(block) => Some(block.clone()),
-			_ => None,
-		}
-	}
-
-	pub fn get_vlog_value(&self, file_id: u64, offset: u64) -> Option<Value> {
-		let key = (file_id, &offset);
-		let item = self.data.get(&key)?;
-
-		match item {
-			Item::VLogValue(value) => Some(value.clone()),
 			_ => None,
 		}
 	}

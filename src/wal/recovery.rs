@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::wal::segment::list_segment_ids;
 use crate::{
-	batch::BatchReader,
+	batch::{Batch, BatchReader},
 	error::Result,
 	memtable::MemTable,
 	wal::{
@@ -83,7 +83,7 @@ pub fn replay_wal(
 				last_valid_offset = offset as usize;
 
 				// Parse the batch
-				let mut batch_reader = BatchReader::new(record_data)?;
+				let batch_reader = BatchReader::new(record_data)?;
 				let seq_num = batch_reader.get_seq_num();
 
 				// Update max sequence number
@@ -91,10 +91,15 @@ pub fn replay_wal(
 					max_seq_num = seq_num;
 				}
 
-				// Read and apply each record in the batch
-				while let Ok(Some((kind, key, value))) = batch_reader.read_record() {
-					memtable.add_entry(kind, key, value, seq_num)?;
+				// Convert BatchReader to Batch
+				let mut batch = Batch::new();
+				let mut reader = BatchReader::new(record_data)?;
+				while let Some((kind, key, value)) = reader.read_record()? {
+					batch.add_record(kind, key, value)?;
 				}
+
+				// Apply the batch to the memtable
+				memtable.add(&batch, seq_num)?;
 			}
 			Err(Error::Corruption(err)) => {
 				// Return the corruption information with the segment ID and last valid offset

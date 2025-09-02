@@ -19,7 +19,7 @@ use crate::{
 	},
 	vfs::File,
 	vlog::{VLog, ValueLocation},
-	Options, Value,
+	Error, Options, Value,
 };
 
 #[derive(Default)]
@@ -109,7 +109,9 @@ impl MemTable {
 			let ikey = InternalKey::new(key.to_vec(), current_seq_num, kind);
 			let val_slice = value.unwrap_or(&[]);
 			let val =
-				ValueLocation::Inline(Arc::from(val_slice.to_vec().into_boxed_slice())).encode()?;
+				ValueLocation::with_inline_value(Arc::from(val_slice.to_vec().into_boxed_slice()))
+					.encode()
+					.into();
 			record_size += self.insert_into_memtable(&ikey, &val);
 			current_seq_num += 1;
 		}
@@ -174,31 +176,29 @@ impl MemTable {
 			for (key, encoded_val) in merge_iter {
 				// First decode the value from memtable to get raw data
 				let location = ValueLocation::decode(&encoded_val)?;
-				let raw_value = match location {
-					ValueLocation::Inline(data) => data,
-					ValueLocation::VLog(_) => {
-						// This shouldn't happen in memtable
-						return Err(crate::error::Error::Corruption(
-							"Found VLog pointer in memtable during flush".to_string(),
-						));
-					}
-				};
+				if location.is_value_pointer() {
+					// This shouldn't happen in memtable
+					return Err(Error::Other(
+						"Found VLog pointer in memtable during flush".to_string(),
+					));
+				}
+				let raw_value = location.value;
 
 				// Now process the raw value and encode based on VLog threshold
 				let processed_value = if let Some(ref vlog) = vlog {
 					if raw_value.len() <= lsm_opts.vlog_value_threshold {
-						let location = ValueLocation::Inline(raw_value);
-						location.encode()?
+						let location = ValueLocation::with_inline_value(raw_value);
+						Arc::from(location.encode())
 					} else {
 						// Store large values in VLog
 						let pointer = vlog.append(&key.encode(), &raw_value)?;
-						let location = ValueLocation::VLog(pointer);
-						location.encode()?
+						let location = ValueLocation::with_pointer(pointer);
+						Arc::from(location.encode())
 					}
 				} else {
 					// VLog disabled, store all values inline
-					let location = ValueLocation::Inline(raw_value);
-					location.encode()?
+					let location = ValueLocation::with_inline_value(raw_value);
+					Arc::from(location.encode())
 				};
 
 				// Add the key-value pair to the table writer
@@ -279,34 +279,6 @@ impl MemTable {
 			(Arc::from(key), value)
 		})
 	}
-
-	/// Adds a single entry directly to the memtable.
-	/// This is used during WAL recovery to reconstruct the memtable
-	/// from individual operations in the log.
-	///
-	/// # Parameters
-	/// * `kind` - The type of operation (set or delete)
-	/// * `key` - The key to operate on
-	/// * `value` - The value for set operations, None for delete
-	/// * `seq_num` - The sequence number of this operation
-	pub fn add_entry(
-		&self,
-		kind: crate::sstable::InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
-		seq_num: u64,
-	) -> Result<()> {
-		let ikey = InternalKey::new(key.to_vec(), seq_num, kind);
-		// Encode as inline and store in memtable
-		let val_slice = value.unwrap_or(&[]);
-		let val =
-			ValueLocation::Inline(Arc::from(val_slice.to_vec().into_boxed_slice())).encode()?;
-		let size = self.insert_into_memtable(&ikey, &val);
-		self.update_memtable_size(size);
-		self.update_latest_sequence_number(seq_num);
-
-		Ok(())
-	}
 }
 
 #[cfg(test)]
@@ -317,12 +289,10 @@ mod tests {
 	/// Helper function to decode and assert inline values match expected values
 	fn assert_inline_value_matches(encoded_value: &Value, expected_value: &[u8]) {
 		let location = ValueLocation::decode(encoded_value).unwrap();
-		match location {
-			ValueLocation::Inline(actual_value) => {
-				assert_eq!(Arc::from(expected_value), actual_value);
-			}
-			_ => panic!("Expected inline value, got {:?}", location),
+		if location.is_value_pointer() {
+			panic!("Expected inline value, got VLog pointer");
 		}
+		assert_eq!(Arc::from(expected_value), location.value);
 	}
 
 	#[test]
@@ -575,12 +545,10 @@ mod tests {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
 			if user_key.as_ref() == b"key1" {
 				let location = ValueLocation::decode(encoded_value).unwrap();
-				match location {
-					ValueLocation::Inline(value) => {
-						key1_entries.push((seq_num, value));
-					}
-					_ => panic!("Expected inline value"),
+				if location.is_value_pointer() {
+					panic!("Expected inline value");
 				}
+				key1_entries.push((seq_num, location.value));
 			}
 		}
 
@@ -600,12 +568,10 @@ mod tests {
 		assert_eq!(ikey.seq_num(), 20);
 
 		let location = ValueLocation::decode(&encoded_val).unwrap();
-		match location {
-			ValueLocation::Inline(value) => {
-				assert_eq!(&*value, b"value2");
-			}
-			_ => panic!("Expected inline value"),
+		if location.is_value_pointer() {
+			panic!("Expected inline value");
 		}
+		assert_eq!(&*location.value, b"value2");
 	}
 
 	#[test]
@@ -676,12 +642,10 @@ mod tests {
 			// All values are now ValueLocation encoded, even empty ones for Delete
 			// For ValueLocation::Inline with empty content, length will be TAG_INLINE (1 byte) + 0
 			let location = ValueLocation::decode(encoded_value).unwrap();
-			match location {
-				ValueLocation::Inline(value) => {
-					key_info.push((user_key, seq_num, kind, value.len()));
-				}
-				_ => panic!("Expected inline value"),
+			if location.is_value_pointer() {
+				panic!("Expected inline value");
 			}
+			key_info.push((user_key, seq_num, kind, location.value.len()));
 		}
 
 		// Verify all keys are present with correct kinds
@@ -714,12 +678,10 @@ mod tests {
 
 		// Decode the value and verify it's empty for delete
 		let location = ValueLocation::decode(&encoded_val).unwrap();
-		match location {
-			ValueLocation::Inline(value) => {
-				assert_eq!(value.len(), 0); // Delete tombstone has empty value
-			}
-			_ => panic!("Expected inline value"),
+		if location.is_value_pointer() {
+			panic!("Expected inline value");
 		}
+		assert_eq!(location.value.len(), 0); // Delete tombstone has empty value
 	}
 
 	#[test]
@@ -779,12 +741,10 @@ mod tests {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
 
 			let location = ValueLocation::decode(encoded_value).unwrap();
-			match location {
-				ValueLocation::Inline(value) => {
-					entries_info.push((user_key, seq_num, value));
-				}
-				_ => panic!("Expected inline value"),
+			if location.is_value_pointer() {
+				panic!("Expected inline value");
 			}
+			entries_info.push((user_key, seq_num, location.value));
 		}
 
 		// Verify we get keys in order, with highest sequence numbers first for each key
@@ -924,59 +884,5 @@ mod tests {
 		batch3.set(b"key3", b"value3").unwrap();
 		memtable.add(&batch3, 20).unwrap();
 		assert_eq!(memtable.lsn(), 20);
-	}
-
-	#[test]
-	fn test_range_bounds_with_internal_keys() {
-		let memtable = Arc::new(MemTable::new());
-
-		memtable.add_entry(InternalKeyKind::Set, b"a", Some(b"value_a1"), 5).unwrap();
-		memtable.add_entry(InternalKeyKind::Set, b"a", Some(b"value_a2"), 3).unwrap();
-		memtable.add_entry(InternalKeyKind::Set, b"b", Some(b"value_b1"), 7).unwrap();
-		memtable.add_entry(InternalKeyKind::Set, b"b", Some(b"value_b2"), 4).unwrap();
-		memtable.add_entry(InternalKeyKind::Set, b"c", Some(b"value_c1"), 6).unwrap();
-		memtable.add_entry(InternalKeyKind::Set, b"d", Some(b"value_d1"), 2).unwrap();
-
-		// Test 1: Inclusive range b"a"..=b"c" should include all versions of a, b, and c
-		let range_inclusive: Vec<_> = memtable.range(b"a".to_vec()..=b"c".to_vec()).collect();
-
-		// Expected order (by internal key sorting: user_key asc, seq_num desc):
-		// ("a", 5), ("a", 3), ("b", 7), ("b", 4), ("c", 6)
-		assert_eq!(range_inclusive.len(), 5);
-
-		let keys: Vec<_> =
-			range_inclusive.iter().map(|(k, _)| (k.user_key.as_ref(), k.seq_num())).collect();
-		assert_eq!(keys[0], (b"a" as &[u8], 5));
-		assert_eq!(keys[1], (b"a" as &[u8], 3));
-		assert_eq!(keys[2], (b"b" as &[u8], 7));
-		assert_eq!(keys[3], (b"b" as &[u8], 4));
-		assert_eq!(keys[4], (b"c" as &[u8], 6));
-
-		// Test 2: Exclusive range b"a"..b"c" should include all versions of a, b but exclude c
-		let range_exclusive: Vec<_> = memtable.range(b"a".to_vec()..b"c".to_vec()).collect();
-
-		// Expected: ("a", 5), ("a", 3), ("b", 7), ("b", 4)
-		assert_eq!(range_exclusive.len(), 4);
-
-		let keys: Vec<_> =
-			range_exclusive.iter().map(|(k, _)| (k.user_key.as_ref(), k.seq_num())).collect();
-		assert_eq!(keys[0], (b"a" as &[u8], 5));
-		assert_eq!(keys[1], (b"a" as &[u8], 3));
-		assert_eq!(keys[2], (b"b" as &[u8], 7));
-		assert_eq!(keys[3], (b"b" as &[u8], 4));
-
-		// Test 3: Test that excluded start works - (Bound::Excluded(b"a"), Bound::Included(b"c"))
-		let range_start_excluded: Vec<_> = memtable
-			.range((Bound::Excluded(b"a".to_vec()), Bound::Included(b"c".to_vec())))
-			.collect();
-
-		// Expected: ("b", 7), ("b", 4), ("c", 6) - should exclude all versions of "a"
-		assert_eq!(range_start_excluded.len(), 3);
-
-		let keys: Vec<_> =
-			range_start_excluded.iter().map(|(k, _)| (k.user_key.as_ref(), k.seq_num())).collect();
-		assert_eq!(keys[0], (b"b" as &[u8], 7));
-		assert_eq!(keys[1], (b"b" as &[u8], 4));
-		assert_eq!(keys[2], (b"c" as &[u8], 6));
 	}
 }

@@ -3,13 +3,15 @@ use integer_encoding::{VarInt, VarIntWriter};
 use crate::error::{Error, Result};
 use crate::sstable::InternalKeyKind;
 
-const MAX_BATCH_SIZE: u64 = 1 << 32; // Adjust as needed
+const MAX_BATCH_SIZE: u64 = 1 << 32;
+const BATCH_VERSION: u8 = 1;
 
 type RecordKey<'a> = (InternalKeyKind, &'a [u8], Option<&'a [u8]>);
 type RecordResult<'a> = Result<Option<RecordKey<'a>>>;
 
 #[derive(Debug, Clone)]
 pub struct Batch {
+	version: u8,
 	data: Vec<u8>,
 	count: u32,
 }
@@ -25,6 +27,7 @@ impl Batch {
 		Self {
 			data: Vec::new(),
 			count: 0,
+			version: BATCH_VERSION,
 		}
 	}
 
@@ -39,7 +42,10 @@ impl Batch {
 	}
 
 	pub fn encode(&self, seq_num: u64) -> Result<Vec<u8>> {
-		let mut encoded = Vec::with_capacity(self.data.len());
+		let mut encoded = Vec::with_capacity(self.data.len() + 1);
+
+		// Write version (1 byte)
+		encoded.push(self.version);
 
 		// Write sequence number (8 bytes)
 		encoded.write_varint(seq_num)?;
@@ -185,18 +191,26 @@ pub struct BatchReader<'a> {
 	pos: usize,
 	count: u32,
 	seq_num: u64,
+	version: u8,
 }
 
 impl<'a> BatchReader<'a> {
 	pub fn new(data: &'a [u8]) -> Result<Self> {
-		let (seq_num, read1) = u64::decode_var(data).ok_or(Error::InvalidBatchRecord)?;
-		let (count, read2) = u32::decode_var(&data[read1..]).ok_or(Error::InvalidBatchRecord)?;
+		if data.is_empty() {
+			return Err(Error::InvalidBatchRecord);
+		}
+
+		let version = data[0];
+		let (seq_num, read1) = u64::decode_var(&data[1..]).ok_or(Error::InvalidBatchRecord)?;
+		let (count, read2) =
+			u32::decode_var(&data[1 + read1..]).ok_or(Error::InvalidBatchRecord)?;
 
 		Ok(Self {
 			data,
-			pos: read1 + read2,
+			pos: 1 + read1 + read2,
 			count,
 			seq_num,
+			version,
 		})
 	}
 
@@ -206,6 +220,10 @@ impl<'a> BatchReader<'a> {
 
 	pub fn get_count(&self) -> u32 {
 		self.count
+	}
+
+	pub fn get_version(&self) -> u8 {
+		self.version
 	}
 
 	pub fn read_record(&mut self) -> RecordResult<'a> {
@@ -600,6 +618,25 @@ mod tests {
 		let val_ptr = value.unwrap().as_ptr() as usize;
 		assert!(key_ptr >= encoded_ptr && key_ptr < encoded_ptr + encoded_len);
 		assert!(val_ptr >= encoded_ptr && val_ptr < encoded_ptr + encoded_len);
+	}
+
+	#[test]
+	fn test_batch_version() {
+		let batch = Batch::new();
+		assert_eq!(batch.version, BATCH_VERSION);
+
+		let encoded = batch.encode(1).unwrap();
+		let reader = BatchReader::new(&encoded).unwrap();
+		assert_eq!(reader.get_version(), BATCH_VERSION);
+
+		// Test with a batch that has data
+		let mut batch_with_data = Batch::new();
+		batch_with_data.set(b"key", b"value").unwrap();
+		let encoded = batch_with_data.encode(100).unwrap();
+		let reader = BatchReader::new(&encoded).unwrap();
+		assert_eq!(reader.get_version(), BATCH_VERSION);
+		assert_eq!(reader.get_seq_num(), 100);
+		assert_eq!(reader.get_count(), 1);
 	}
 
 	#[test]

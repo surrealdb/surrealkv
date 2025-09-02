@@ -25,7 +25,7 @@ use crate::{
 
 use super::meta::KeyRange;
 
-const TABLE_FOOTER_LENGTH: usize = 40;
+const TABLE_FOOTER_LENGTH: usize = 42; // 2 + 16 + 16 + 8 (format + checksum + meta + index + magic)
 const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
 const TABLE_MAGIC_FOOTER_ENCODED: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb];
 
@@ -44,7 +44,7 @@ pub fn unmask(masked: u32) -> u32 {
 	rot.rotate_left(15)
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ChecksumType {
 	CRC32c = 1,
 }
@@ -97,60 +97,62 @@ impl Footer {
 
 	pub fn decode(buf: &[u8]) -> Result<Footer> {
 		let magic = &buf[buf.len() - TABLE_MAGIC_FOOTER_ENCODED.len()..];
-		let mut footer = Footer {
-			format: TableFormat::LSMV1,
-			checksum: ChecksumType::CRC32c,
-			meta_index: BlockHandle::default(),
-			index: BlockHandle::default(),
-		};
 
-		match magic {
-			lsmv1_magic if lsmv1_magic == TABLE_MAGIC_FOOTER_ENCODED => {
-				if buf.len() < TABLE_FOOTER_LENGTH {
-					return Err(Error::CorruptedBlock(format!(
-						"invalid table (footer too short): {}",
-						buf.len()
-					)));
-				}
-				assert_eq!(&buf[TABLE_FOOTER_LENGTH..], &TABLE_MAGIC_FOOTER_ENCODED);
-
-				let (meta, metalen) = BlockHandle::decode(&buf[0..])?;
-				let (ix, _) = BlockHandle::decode(&buf[metalen..])?;
-
-				footer.meta_index = meta;
-				footer.index = ix;
-				footer.format = TableFormat::LSMV1;
-				footer.checksum = ChecksumType::CRC32c;
-			}
-			_ => {
-				return Err(Error::CorruptedBlock(format!(
-					"invalid table (bad magic number: {magic:x?})"
-				)))
-			}
+		// Validate magic number first
+		if magic != TABLE_MAGIC_FOOTER_ENCODED {
+			return Err(Error::CorruptedBlock(format!(
+				"invalid table (bad magic number: {magic:x?})"
+			)));
 		}
 
-		let (meta_index, n) = BlockHandle::decode(buf)?;
-		if n == 0 {
+		if buf.len() < TABLE_FOOTER_LENGTH {
+			return Err(Error::CorruptedBlock(format!(
+				"invalid table (footer too short): {}",
+				buf.len()
+			)));
+		}
+
+		// Read format and checksum from footer (first 2 bytes)
+		let format = TableFormat::from_u8(buf[0])?;
+		let checksum = match buf[1] {
+			1 => ChecksumType::CRC32c,
+			_ => return Err(Error::CorruptedBlock("Invalid checksum type".into())),
+		};
+
+		// Read block handles (starting at offset 2)
+		let (meta_index, metalen) = BlockHandle::decode(&buf[2..])?;
+		if metalen == 0 {
 			return Err(Error::CorruptedBlock(
 				"invalid table (bad meta_index block handle)".into(),
 			));
 		}
-		footer.meta_index = meta_index;
 
-		let (index_handle, _) = BlockHandle::decode(&buf[n..])?;
-		footer.index = index_handle;
+		let (index_handle, _) = BlockHandle::decode(&buf[2 + metalen..])?;
 
-		Ok(footer)
+		Ok(Footer {
+			format,
+			checksum,
+			meta_index,
+			index: index_handle,
+		})
 	}
 
 	pub fn encode(&self, dst: &mut [u8]) {
 		match self.format {
 			TableFormat::LSMV1 => {
-				// TODO: Add checksum also to the footer
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
-				let n = self.meta_index.encode_into(&mut dst[..]);
-				// n += self.index.encode_into(&mut dst[n..]);
-				self.index.encode_into(&mut dst[n..]);
+
+				// Encode format version (1 byte)
+				dst[0] = self.format as u8;
+
+				// Encode checksum type (1 byte)
+				dst[1] = self.checksum as u8;
+
+				// Encode block handles (starting at offset 2)
+				let n = self.meta_index.encode_into(&mut dst[2..]);
+				self.index.encode_into(&mut dst[2 + n..]);
+
+				// Magic footer at the end
 				dst[TABLE_FOOTER_LENGTH..TABLE_FULL_FOOTER_LENGTH]
 					.copy_from_slice(&TABLE_MAGIC_FOOTER_ENCODED);
 			}
@@ -1279,7 +1281,7 @@ mod tests {
 	#[test]
 	fn test_footer() {
 		let f = Footer::new(BlockHandle::new(44, 4), BlockHandle::new(55, 5));
-		let mut buf = [0; 48];
+		let mut buf = [0; 50]; // Updated to match new footer size (42 + 8 magic)
 		f.encode(&mut buf[..]);
 
 		let f2 = Footer::decode(&buf).unwrap();
@@ -1287,6 +1289,8 @@ mod tests {
 		assert_eq!(f2.meta_index.size(), 4);
 		assert_eq!(f2.index.offset(), 55);
 		assert_eq!(f2.index.size(), 5);
+		assert_eq!(f2.format, TableFormat::LSMV1);
+		assert_eq!(f2.checksum, ChecksumType::CRC32c);
 	}
 
 	#[test]
@@ -1313,7 +1317,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(586, actual);
+		assert_eq!(588, actual);
 	}
 
 	#[test]

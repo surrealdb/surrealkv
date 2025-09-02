@@ -9,13 +9,13 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::error::{Error, Result};
 
 const DISCARD_STATS_FILENAME: &str = "DISCARD";
-const ENTRY_SIZE: usize = 16; // 8 bytes for file_id + 8 bytes for discard_bytes
+const ENTRY_SIZE: usize = 12; // 4 bytes for file_id + 8 bytes for discard_bytes
 const INITIAL_SIZE: usize = 1 << 20; // 1MB, can store 65,536 entries
 
 /// Memory-mapped discard statistics for efficient persistence and lookup
 ///
-/// Each entry is 16 bytes:
-/// - 8 bytes: file_id (big-endian u64)
+/// Each entry is 12 bytes:
+/// - 4 bytes: file_id (big-endian u32)
 /// - 8 bytes: discard_bytes (big-endian u64)
 ///
 /// Entries are kept sorted by file_id for binary search
@@ -86,26 +86,22 @@ impl DiscardStats {
 	}
 
 	/// Gets the file ID at the given slot
-	fn get_file_id(&self, slot: usize) -> u64 {
+	fn get_file_id(&self, slot: usize) -> u32 {
 		let offset = slot * ENTRY_SIZE;
-		if offset + 8 > self.mmap.len() {
+		if offset + 4 > self.mmap.len() {
 			return 0;
 		}
-		u64::from_be_bytes([
+		u32::from_be_bytes([
 			self.mmap[offset],
 			self.mmap[offset + 1],
 			self.mmap[offset + 2],
 			self.mmap[offset + 3],
-			self.mmap[offset + 4],
-			self.mmap[offset + 5],
-			self.mmap[offset + 6],
-			self.mmap[offset + 7],
 		])
 	}
 
 	/// Gets the discard bytes at the given slot
 	fn get_discard_bytes(&self, slot: usize) -> u64 {
-		let offset = slot * ENTRY_SIZE + 8;
+		let offset = slot * ENTRY_SIZE + 4;
 		if offset + 8 > self.mmap.len() {
 			return 0;
 		}
@@ -122,14 +118,14 @@ impl DiscardStats {
 	}
 
 	/// Sets the file ID at the given slot
-	fn set_file_id(&mut self, slot: usize, file_id: u64) {
+	fn set_file_id(&mut self, slot: usize, file_id: u32) {
 		let offset = slot * ENTRY_SIZE;
-		self.mmap[offset..offset + 8].copy_from_slice(&file_id.to_be_bytes());
+		self.mmap[offset..offset + 4].copy_from_slice(&file_id.to_be_bytes());
 	}
 
 	/// Sets the discard bytes at the given slot
 	fn set_discard_bytes(&mut self, slot: usize, discard_bytes: u64) {
-		let offset = slot * ENTRY_SIZE + 8;
+		let offset = slot * ENTRY_SIZE + 4;
 		self.mmap[offset..offset + 8].copy_from_slice(&discard_bytes.to_be_bytes());
 	}
 
@@ -144,7 +140,7 @@ impl DiscardStats {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
 		// Create a vector of (file_id, discard_bytes) tuples
-		let mut entries: Vec<(u64, u64)> = Vec::with_capacity(next_empty_slot);
+		let mut entries: Vec<(u32, u64)> = Vec::with_capacity(next_empty_slot);
 		for slot in 0..next_empty_slot {
 			let file_id = self.get_file_id(slot);
 			let discard_bytes = self.get_discard_bytes(slot);
@@ -165,7 +161,7 @@ impl DiscardStats {
 	/// - If discard_bytes is 0, returns current discard bytes
 	/// - If discard_bytes is negative, resets discard bytes to 0
 	/// - If discard_bytes is positive, adds to current discard bytes
-	pub fn update(&mut self, file_id: u64, discard_bytes: i64) -> u64 {
+	pub fn update(&mut self, file_id: u32, discard_bytes: i64) -> u64 {
 		// Binary search for the file_id
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 		let idx = self.binary_search(file_id, next_empty_slot);
@@ -231,7 +227,7 @@ impl DiscardStats {
 	}
 
 	/// Binary search for a file_id, returns the slot index if found
-	fn binary_search(&self, file_id: u64, next_empty_slot: usize) -> Option<usize> {
+	fn binary_search(&self, file_id: u32, next_empty_slot: usize) -> Option<usize> {
 		let mut left = 0;
 		let mut right = next_empty_slot;
 
@@ -275,7 +271,7 @@ impl DiscardStats {
 	}
 
 	/// Returns the file with maximum discard bytes
-	pub fn max_discard(&self) -> Result<(u64, u64)> {
+	pub fn max_discard(&self) -> Result<(u32, u64)> {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
 		let mut max_file_id = 0;
@@ -301,7 +297,7 @@ impl DiscardStats {
 	}
 
 	/// Gets discard bytes for a specific file
-	pub fn get_file_stats(&self, file_id: u64) -> u64 {
+	pub fn get_file_stats(&self, file_id: u32) -> u64 {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
 		if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
@@ -312,7 +308,7 @@ impl DiscardStats {
 	}
 
 	/// Removes statistics for a file
-	pub fn remove_file(&mut self, file_id: u64) {
+	pub fn remove_file(&mut self, file_id: u32) {
 		let (slot_to_remove, next_empty_slot) = {
 			let next_empty_slot_guard = self.next_empty_slot.lock().unwrap();
 			let next_empty_slot = *next_empty_slot_guard;
@@ -440,12 +436,12 @@ mod tests {
 		let entries_to_add = 1000; // Much smaller test
 
 		for i in 0..entries_to_add {
-			stats.update(i as u64, 100);
+			stats.update(i as u32, 100);
 		}
 
 		// Verify all entries exist
 		for i in 0..entries_to_add {
-			assert_eq!(stats.get_file_stats(i as u64), 100);
+			assert_eq!(stats.get_file_stats(i as u32), 100);
 		}
 	}
 }

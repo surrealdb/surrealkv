@@ -142,13 +142,7 @@ impl CoreInner {
 			None
 		} else {
 			let vlog_path = opts.path.join("vlog");
-			Some(Arc::new(VLog::new(
-				&vlog_path,
-				opts.vlog_max_file_size,
-				opts.vlog_checksum_verification,
-				opts.vlog_gc_discard_ratio,
-				opts.vlog_cache.clone(),
-			)?))
+			Some(Arc::new(VLog::new(&vlog_path, opts.clone())?))
 		};
 
 		Ok(Self {
@@ -321,10 +315,8 @@ impl CoreInner {
 		}
 
 		let vlog = self.vlog.as_ref().unwrap();
-		match ValueLocation::decode(value)? {
-			ValueLocation::Inline(val) => Ok(val),
-			ValueLocation::VLog(pointer) => vlog.get(&pointer),
-		}
+		let location = ValueLocation::decode(value)?;
+		location.resolve_value(Some(vlog))
 	}
 }
 
@@ -585,8 +577,9 @@ impl Core {
 			vlog_gc_manager.stop().await;
 		}
 
-		// Step 3: Flush any remaining data in active memtable after background tasks stopped
-		if self.inner.active_memtable.read().unwrap().size() > 0 {
+		// Step 3: Flush the active memtable only if it exceeds the configured size
+		let active_memtable = self.inner.active_memtable.read().unwrap();
+		if active_memtable.size() > self.inner.opts.max_memtable_size {
 			self.inner.compact_memtable()?;
 		}
 
@@ -763,7 +756,7 @@ impl Tree {
 	}
 
 	#[cfg(test)]
-	fn get_all_vlog_stats(&self) -> Vec<(u64, u64, u64, f64)> {
+	fn get_all_vlog_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		match &self.core.vlog {
 			Some(vlog) => vlog.get_all_file_stats(),
 			None => Vec::new(),
@@ -772,7 +765,7 @@ impl Tree {
 
 	#[cfg(test)]
 	/// Updates VLog discard statistics if VLog is enabled
-	fn update_vlog_discard_stats(&self, stats: &HashMap<u64, i64>) {
+	fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		if let Some(ref vlog) = self.inner.vlog {
 			vlog.update_discard_stats(stats);
 		}
@@ -783,7 +776,7 @@ impl Tree {
 	}
 
 	/// Triggers VLog garbage collection manually
-	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u64>> {
+	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u32>> {
 		match &self.inner.vlog {
 			Some(vlog) => vlog.garbage_collect(self.commit_pipeline.clone()).await,
 			None => Ok(Vec::new()),

@@ -4,7 +4,7 @@ use std::{
 	io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 	sync::{
-		atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 		Arc, Mutex, RwLock,
 	},
 };
@@ -19,60 +19,245 @@ use crc32fast::Hasher;
 use crate::commit::CommitPipeline;
 use crate::error::{Error, Result};
 
-/// Size of a ValuePointer when encoded (8 + 8 + 4 + 4 + 4 bytes)
-pub const VALUE_POINTER_SIZE: usize = 28;
+/// VLog format version
+pub const VLOG_FORMAT_VERSION: u16 = 1;
 
-/// Represents where a value is stored - either inline in the SSTable or in the value log
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValueLocation {
-	/// Value is stored inline in the SSTable
-	Inline(Value),
-	/// Value is stored in the value log, referenced by a pointer
-	VLog(ValuePointer),
+/// Size of a ValuePointer when encoded (1 + 4 + 8 + 4 + 4 + 4 bytes)
+pub const VALUE_POINTER_SIZE: usize = 25;
+
+/// Bit flags for meta operations
+pub const BIT_VALUE_POINTER: u8 = 1; // Set if the value is NOT stored directly next to key
+pub const VALUE_LOCATION_VERSION: u8 = 1;
+pub const VALUE_POINTER_VERSION: u8 = 1;
+
+/// VLog file header with comprehensive metadata
+#[derive(Debug, Clone)]
+pub(crate) struct VLogFileHeader {
+	pub magic: u32,         // "VLOG"
+	pub version: u16,       // Format version
+	pub file_id: u32,       // File ID
+	pub created_at: u64,    // Creation timestamp
+	pub max_file_size: u64, // Maximum file size from options
+	pub compression: u8,    // Compression type
+	pub reserved: u32,      // Reserved for future use
 }
 
-const TAG_INLINE: u8 = 0;
-const TAG_VLOG: u8 = 1;
+impl VLogFileHeader {
+	const MAGIC: u32 = 0x564C4F47; // "VLOG" in hex
+	const SIZE: usize = 31; // 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
 
-impl ValueLocation {
-	/// Creates a ValueLocation from encoded value data, decoding based on tag
-	pub fn from_encoded_value(encoded: &[u8], vlog: Option<&VLog>) -> Result<Value> {
-		let location = Self::decode(encoded)?;
-		match location {
-			ValueLocation::Inline(data) => Ok(data),
-			ValueLocation::VLog(pointer) => {
-				if let Some(vlog) = vlog {
-					vlog.get(&pointer)
-				} else {
-					Err(Error::Corruption("VLog not available for pointer resolution".to_string()))
-				}
-			}
+	pub(crate) fn new(file_id: u32, opts: &crate::Options) -> Self {
+		Self {
+			magic: Self::MAGIC,
+			version: VLOG_FORMAT_VERSION,
+			file_id,
+			created_at: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_millis() as u64,
+			max_file_size: opts.vlog_max_file_size,
+			compression: opts.compression as u8,
+			reserved: 0,
 		}
 	}
 
-	/// Encodes the ValueLocation for storage with tag prefix
-	pub fn encode(&self) -> Result<Value> {
-		let mut encoded = Vec::new();
-		self.encode_into(&mut encoded)?;
-		Ok(Arc::from(encoded))
+	pub(crate) fn encode(&self) -> [u8; Self::SIZE] {
+		let mut encoded = [0u8; Self::SIZE];
+		let mut offset = 0;
+
+		// Magic (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.magic.to_be_bytes());
+		offset += 4;
+
+		// Version (2 bytes)
+		encoded[offset..offset + 2].copy_from_slice(&self.version.to_be_bytes());
+		offset += 2;
+
+		// File ID (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.file_id.to_be_bytes());
+		offset += 4;
+
+		// Created at (8 bytes)
+		encoded[offset..offset + 8].copy_from_slice(&self.created_at.to_be_bytes());
+		offset += 8;
+
+		// Max file size (8 bytes)
+		encoded[offset..offset + 8].copy_from_slice(&self.max_file_size.to_be_bytes());
+		offset += 8;
+
+		// Compression (1 byte)
+		encoded[offset] = self.compression;
+		offset += 1;
+
+		// Reserved (4 bytes)
+		encoded[offset..offset + 4].copy_from_slice(&self.reserved.to_be_bytes());
+
+		encoded
+	}
+
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+		if data.len() != Self::SIZE {
+			return Err(Error::Corruption("Invalid header size".to_string()));
+		}
+
+		let mut offset = 0;
+
+		// Magic (4 bytes)
+		let magic = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+		offset += 4;
+
+		if magic != Self::MAGIC {
+			return Err(Error::Corruption("Invalid magic number".to_string()));
+		}
+
+		// Version (2 bytes)
+		let version = u16::from_be_bytes([data[offset], data[offset + 1]]);
+		offset += 2;
+
+		// File ID (4 bytes)
+		let file_id = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+		offset += 4;
+
+		// Created at (8 bytes)
+		let created_at = u64::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+			data[offset + 4],
+			data[offset + 5],
+			data[offset + 6],
+			data[offset + 7],
+		]);
+		offset += 8;
+
+		// Max file size (8 bytes)
+		let max_file_size = u64::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+			data[offset + 4],
+			data[offset + 5],
+			data[offset + 6],
+			data[offset + 7],
+		]);
+		offset += 8;
+
+		// Compression (1 byte)
+		let compression = data[offset];
+		offset += 1;
+
+		// Reserved (4 bytes)
+		let reserved = u32::from_be_bytes([
+			data[offset],
+			data[offset + 1],
+			data[offset + 2],
+			data[offset + 3],
+		]);
+
+		Ok(Self {
+			magic,
+			version,
+			file_id,
+			created_at,
+			max_file_size,
+			compression,
+			reserved,
+		})
+	}
+
+	pub(crate) fn is_compatible(&self) -> bool {
+		self.version == VLOG_FORMAT_VERSION
+	}
+
+	pub(crate) fn validate(&self, file_id: u32) -> Result<()> {
+		if self.file_id != file_id {
+			return Err(Error::Corruption(format!(
+				"File ID mismatch: expected {}, got {}",
+				file_id, self.file_id
+			)));
+		}
+
+		Ok(())
+	}
+}
+/// ValueLocation represents the value info that can be associated with a key, including the internal
+/// Meta field for various flags and operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValueLocation {
+	/// Meta flags for various operations (value pointer etc.)
+	pub meta: u8,
+	/// The actual value data
+	pub value: Value,
+	/// Version number for the value
+	pub version: u8,
+}
+
+impl ValueLocation {
+	/// Creates a new ValueLocation
+	pub fn new(meta: u8, value: Value, version: u8) -> Self {
+		Self {
+			meta,
+			value,
+			version,
+		}
+	}
+
+	/// Creates a ValueLocation that points to a value in VLog
+	pub fn with_pointer(pointer: ValuePointer) -> Self {
+		let encoded_pointer = pointer.encode();
+		Self::new(BIT_VALUE_POINTER, Arc::from(encoded_pointer), VALUE_LOCATION_VERSION)
+	}
+
+	/// Creates a ValueLocation with inline value
+	pub fn with_inline_value(value: Value) -> Self {
+		Self::new(0, value, VALUE_LOCATION_VERSION)
+	}
+
+	/// Checks if the value is a pointer to VLog
+	pub fn is_value_pointer(&self) -> bool {
+		(self.meta & BIT_VALUE_POINTER) != 0
+	}
+
+	/// Calculates the encoded size of this ValueLocation
+	pub fn encoded_size(&self) -> usize {
+		// meta (1 byte) + version (1 byte) + value length
+		1 + 1 + self.value.len()
+	}
+
+	/// Encodes the ValueLocation into a byte vector
+	pub fn encode(&self) -> Vec<u8> {
+		let mut encoded = Vec::with_capacity(self.encoded_size());
+		self.encode_into(&mut encoded).unwrap();
+		encoded
 	}
 
 	/// Encodes the ValueLocation into a writer
 	pub fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
-		match self {
-			ValueLocation::Inline(data) => {
-				writer.write_u8(TAG_INLINE)?;
-				writer.write_all(data)?;
-			}
-			ValueLocation::VLog(pointer) => {
-				writer.write_u8(TAG_VLOG)?;
-				pointer.encode_into(writer)?;
-			}
-		}
+		// Write meta byte
+		writer.write_u8(self.meta)?;
+
+		// Write version as u8
+		writer.write_u8(self.version)?;
+
+		// Write value
+		writer.write_all(&self.value)?;
+
 		Ok(())
 	}
 
-	/// Decodes a ValueLocation from stored data using tag
+	/// Decodes a ValueLocation from bytes
 	pub fn decode(data: &[u8]) -> Result<Self> {
 		let mut cursor = Cursor::new(data);
 		Self::decode_from(&mut cursor)
@@ -80,54 +265,44 @@ impl ValueLocation {
 
 	/// Decodes a ValueLocation from a reader
 	pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
-		let tag = reader.read_u8()?;
+		// Read meta byte
+		let meta = reader.read_u8()?;
 
-		match tag {
-			TAG_INLINE => {
-				let mut data = Vec::new();
-				reader.read_to_end(&mut data)?;
-				Ok(ValueLocation::Inline(Arc::from(data)))
+		// Read version as u8
+		let version = reader.read_u8()?;
+
+		// Read remaining data as value
+		let mut value = Vec::new();
+		reader.read_to_end(&mut value)?;
+
+		Ok(Self::new(meta, Arc::from(value), version))
+	}
+
+	/// Resolves the actual value, handling both inline and pointer cases
+	// TODO:: Check if this pattern copies the value unnecessarily.
+	pub fn resolve_value(&self, vlog: Option<&VLog>) -> Result<Value> {
+		if self.is_value_pointer() {
+			// Value is a pointer to VLog
+			if let Some(vlog) = vlog {
+				let pointer = ValuePointer::decode(&self.value)?;
+				vlog.get(&pointer)
+			} else {
+				Err(Error::Other("VLog not available for pointer resolution".to_string()))
 			}
-			TAG_VLOG => {
-				let pointer = ValuePointer::decode_from(reader)?;
-				Ok(ValueLocation::VLog(pointer))
-			}
-			x => Err(Error::Corruption(format!("Invalid ValueLocation tag: {x}"))),
+		} else {
+			// Value is stored inline
+			Ok(self.value.clone())
 		}
-	}
-
-	/// Returns the size of the value without resolving it
-	pub fn size(&self) -> Result<usize> {
-		match self {
-			ValueLocation::Inline(data) => Ok(data.len()),
-			ValueLocation::VLog(_) => Ok(VALUE_POINTER_SIZE),
-		}
-	}
-
-	/// Resolves the actual value, reading from VLog if necessary
-	pub fn resolve(&self, vlog: Arc<VLog>) -> Result<Value> {
-		match self {
-			ValueLocation::Inline(data) => Ok(data.clone()),
-			ValueLocation::VLog(pointer) => vlog.get(pointer),
-		}
-	}
-
-	/// Returns true if the value is stored inline
-	pub fn is_inline(&self) -> bool {
-		matches!(self, ValueLocation::Inline(_))
-	}
-
-	/// Returns true if the value is stored in VLog
-	pub fn is_vlog(&self) -> bool {
-		matches!(self, ValueLocation::VLog(_))
 	}
 }
 
 /// A pointer to a value stored in the value log
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValuePointer {
+	/// Version of the ValuePointer format
+	pub version: u8,
 	/// ID of the VLog file containing the value
-	pub file_id: u64,
+	pub file_id: u32,
 	/// Offset within the file where the value starts
 	pub offset: u64,
 	/// Size of the key in bytes
@@ -140,8 +315,9 @@ pub struct ValuePointer {
 
 impl ValuePointer {
 	/// Creates a new ValuePointer
-	pub fn new(file_id: u64, offset: u64, key_size: u32, value_size: u32, checksum: u32) -> Self {
+	pub fn new(file_id: u32, offset: u64, key_size: u32, value_size: u32, checksum: u32) -> Self {
 		Self {
+			version: VALUE_POINTER_VERSION,
 			file_id,
 			offset,
 			key_size,
@@ -153,6 +329,7 @@ impl ValuePointer {
 	/// Encodes the pointer as bytes for storage
 	pub fn encode(&self) -> Vec<u8> {
 		let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
+		encoded.push(self.version);
 		encoded.extend_from_slice(&self.file_id.to_be_bytes());
 		encoded.extend_from_slice(&self.offset.to_be_bytes());
 		encoded.extend_from_slice(&self.key_size.to_be_bytes());
@@ -163,6 +340,7 @@ impl ValuePointer {
 
 	/// Encodes the pointer into a writer
 	pub fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
+		writer.write_u8(self.version)?;
 		writer.write_all(&self.file_id.to_be_bytes())?;
 		writer.write_all(&self.offset.to_be_bytes())?;
 		writer.write_all(&self.key_size.to_be_bytes())?;
@@ -177,34 +355,23 @@ impl ValuePointer {
 			return Err(Error::Corruption("Invalid ValuePointer size".to_string()));
 		}
 
-		let file_id = u64::from_be_bytes([
-			data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-		]);
+		let version = data[0];
+		let file_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
 		let offset = u64::from_be_bytes([
-			data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+			data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
 		]);
-		let key_size = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
-		let value_size = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
-		let checksum = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
+		let key_size = u32::from_be_bytes([data[13], data[14], data[15], data[16]]);
+		let value_size = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
+		let checksum = u32::from_be_bytes([data[21], data[22], data[23], data[24]]);
 
-		Ok(Self::new(file_id, offset, key_size, value_size, checksum))
-	}
-
-	/// Decodes a pointer from a reader
-	pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
-		let mut buf = [0u8; VALUE_POINTER_SIZE];
-		reader.read_exact(&mut buf)?;
-
-		let file_id =
-			u64::from_be_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
-		let offset = u64::from_be_bytes([
-			buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-		]);
-		let key_size = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-		let value_size = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
-		let checksum = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
-
-		Ok(Self::new(file_id, offset, key_size, value_size, checksum))
+		Ok(Self {
+			version,
+			file_id,
+			offset,
+			key_size,
+			value_size,
+			checksum,
+		})
 	}
 
 	/// Calculates the total entry size (header + key + value + crc32)
@@ -217,7 +384,7 @@ impl ValuePointer {
 #[derive(Debug)]
 pub struct VLogFile {
 	/// File ID
-	pub id: u64,
+	pub id: u32,
 	/// File path
 	pub path: PathBuf,
 	/// File size
@@ -225,7 +392,7 @@ pub struct VLogFile {
 }
 
 impl VLogFile {
-	pub fn new(id: u64, path: PathBuf, size: u64) -> Self {
+	pub fn new(id: u32, path: PathBuf, size: u64) -> Self {
 		Self {
 			id,
 			path,
@@ -241,18 +408,34 @@ struct VLogWriter {
 	/// Current offset in the file
 	current_offset: u64,
 	/// ID of this VLog file
-	file_id: u64,
+	file_id: u32,
 	/// Total bytes written to this file
 	bytes_written: u64,
 }
 
 impl VLogWriter {
 	/// Creates a new VLogWriter for the specified file
-	fn new(path: &Path, file_id: u64) -> Result<Self> {
+	fn new(path: &Path, file_id: u32, opts: &crate::Options) -> Result<Self> {
+		let file_exists = path.exists();
 		let file = OpenOptions::new().create(true).append(true).open(path)?;
 
 		let current_offset = file.metadata()?.len();
-		let writer = BufWriter::new(file);
+		let mut writer = BufWriter::new(file);
+
+		// If this is a new file, write the header
+		if !file_exists || current_offset == 0 {
+			let header = VLogFileHeader::new(file_id, opts);
+			let header_bytes = header.encode();
+			writer.write_all(&header_bytes)?;
+			writer.flush()?;
+		}
+
+		// Update offset to account for header
+		let current_offset = if !file_exists || current_offset == 0 {
+			VLogFileHeader::SIZE as u64
+		} else {
+			current_offset
+		};
 
 		Ok(Self {
 			writer,
@@ -264,7 +447,8 @@ impl VLogWriter {
 
 	/// Appends a key+value entry to the file and returns a pointer to it
 	/// Layout: +--------+-----+-------+-------+
-	///         | header | key | value | crc32 |
+	///         | header  | key | value | crc32 |
+	///         +--------+-----+-------+--------+
 	fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
 		let key_len = key.len() as u32;
 		let value_len = value.len() as u32;
@@ -330,10 +514,10 @@ pub struct VLog {
 	gc_discard_ratio: f64,
 
 	/// Next file ID to be assigned
-	next_file_id: AtomicU64,
+	next_file_id: AtomicU32,
 
 	/// ID of the file currently open for writing
-	active_writer_id: AtomicU64,
+	active_writer_id: AtomicU32,
 
 	/// Writer for the current active file
 	writer: RwLock<Option<VLogWriter>>,
@@ -342,13 +526,13 @@ pub struct VLog {
 	num_active_iterators: AtomicI32,
 
 	/// Maps file_id to VLogFile metadata
-	files_map: RwLock<HashMap<u64, Arc<VLogFile>>>,
+	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
 
 	/// Cached open file handles for reading
-	file_handles: RwLock<HashMap<u64, Arc<File>>>,
+	file_handles: RwLock<HashMap<u32, Arc<File>>>,
 
 	/// Files marked for deletion but waiting for iterators to finish
-	files_to_be_deleted: RwLock<Vec<u64>>,
+	files_to_be_deleted: RwLock<Vec<u32>>,
 
 	/// Prevents concurrent garbage collection
 	gc_in_progress: AtomicBool,
@@ -361,22 +545,19 @@ pub struct VLog {
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
 	cache: Arc<VLogCache>,
+
+	/// Options for VLog configuration
+	opts: Arc<Options>,
 }
 
 impl VLog {
 	/// Returns the file path for a VLog file with the given ID
-	fn vlog_file_path(&self, file_id: u64) -> PathBuf {
+	fn vlog_file_path(&self, file_id: u32) -> PathBuf {
 		self.path.join(format!("vlog_{file_id:08}.log"))
 	}
 
 	/// Creates a new VLog instance
-	pub fn new<P: AsRef<Path>>(
-		dir: P,
-		max_file_size: u64,
-		checksum_level: VLogChecksumLevel,
-		gc_discard_ratio: f64,
-		cache: Arc<VLogCache>,
-	) -> Result<Self> {
+	pub fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options>) -> Result<Self> {
 		let dir = dir.as_ref().to_path_buf();
 		std::fs::create_dir_all(&dir)?;
 
@@ -391,11 +572,11 @@ impl VLog {
 
 		let vlog = Self {
 			path: dir.clone(),
-			max_file_size,
-			checksum_level,
-			gc_discard_ratio, // Use the provided ratio
-			next_file_id: AtomicU64::new(0),
-			active_writer_id: AtomicU64::new(0),
+			max_file_size: opts.vlog_max_file_size,
+			checksum_level: opts.vlog_checksum_verification,
+			gc_discard_ratio: opts.vlog_gc_discard_ratio,
+			next_file_id: AtomicU32::new(0),
+			active_writer_id: AtomicU32::new(0),
 			writer: RwLock::new(None),
 			num_active_iterators: AtomicI32::new(0),
 			files_map: RwLock::new(HashMap::new()),
@@ -404,7 +585,8 @@ impl VLog {
 			gc_in_progress: AtomicBool::new(false),
 			discard_stats: Mutex::new(DiscardStats::new(discard_stats_dir)?),
 			global_delete_list,
-			cache,
+			cache: opts.vlog_cache.clone(),
+			opts,
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -426,7 +608,7 @@ impl VLog {
 				// Create new file
 				let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 				let file_path = self.vlog_file_path(file_id);
-				let new_writer = VLogWriter::new(&file_path, file_id)?;
+				let new_writer = VLogWriter::new(&file_path, file_id, &self.opts)?;
 
 				// Register the new file for GC safety
 				self.register_vlog_file(file_id, file_path, 0); // Start with size 0
@@ -457,7 +639,8 @@ impl VLog {
 			Err(_) => return Ok(()), // Directory doesn't exist yet
 		};
 
-		let mut max_file_id = 0u64;
+		let mut max_file_id: Option<u32> = None;
+		let mut max_file_path: Option<PathBuf> = None;
 		let mut file_handles = self.file_handles.write().unwrap();
 		let mut files_map = self.files_map.write().unwrap();
 
@@ -472,15 +655,27 @@ impl VLog {
 				if let Some(id_part) =
 					file_name_str.strip_prefix("vlog_").and_then(|s| s.strip_suffix(".log"))
 				{
-					if let Ok(file_id) = id_part.parse::<u64>() {
-						max_file_id = max_file_id.max(file_id);
-
+					if let Ok(file_id) = id_part.parse::<u32>() {
 						let file_path = entry.path();
 						let file_size = entry.metadata()?.len();
 
-						// Pre-open the file handle
+						// Track the file with maximum ID for active writer setup
+						if max_file_id.is_none_or(|current_max| file_id >= current_max) {
+							max_file_id = Some(file_id);
+							max_file_path = Some(file_path.clone());
+						}
+
+						// Pre-open the file handle and validate header
 						match File::open(&file_path) {
 							Ok(file) => {
+								// Validate file header for existing files
+								if file_size > 0 {
+									let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+									vfs::File::read_at(&file, 0, &mut header_data)?;
+									let header = VLogFileHeader::decode(&header_data)?;
+									header.validate(file_id)?;
+								}
+
 								let handle = Arc::new(file);
 								file_handles.insert(file_id, handle);
 
@@ -501,8 +696,16 @@ impl VLog {
 			}
 		}
 
-		// Set next_file_id to one past the highest existing file ID
-		self.next_file_id.store(max_file_id + 1, Ordering::SeqCst);
+		// Set next_file_id based on whether we found existing files
+		if let Some(highest_file_id) = max_file_id {
+			// Found existing files, set next_file_id to one past the highest existing file ID
+			self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
+
+			// Set the last file up as the active writer
+			let writer = VLogWriter::new(&max_file_path.unwrap(), highest_file_id, &self.opts)?;
+			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
+			*self.writer.write().unwrap() = Some(writer);
+		}
 
 		// println!(
 		//     "Pre-filled {} VLog file handles, next_file_id set to {}",
@@ -514,7 +717,7 @@ impl VLog {
 	}
 
 	/// Retrieves (and caches) an open file handle for the given file ID
-	fn get_file_handle(&self, file_id: u64) -> Result<Arc<File>> {
+	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
 		{
 			let handles = self.file_handles.read().unwrap();
 			if let Some(handle) = handles.get(&file_id) {
@@ -522,9 +725,29 @@ impl VLog {
 			}
 		}
 
-		// Open and insert the handle
+		// Open and validate the file
 		let file_path = self.vlog_file_path(file_id);
 		let file = File::open(&file_path)?;
+
+		// Validate file header for existing files
+		let file_size = file.metadata()?.len();
+		if file_size > 0 {
+			// Only validate header if file has content (not a new empty file)
+			let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+			vfs::File::read_at(&file, 0, &mut header_data)?;
+
+			let header = VLogFileHeader::decode(&header_data)?;
+			if !header.is_compatible() {
+				return Err(Error::Corruption(format!(
+					"Incompatible VLog file version: {} (expected {})",
+					header.version, VLOG_FORMAT_VERSION
+				)));
+			}
+
+			// Validate header against current options
+			header.validate(file_id)?;
+		}
+
 		let handle = Arc::new(file);
 
 		let mut handles = self.file_handles.write().unwrap();
@@ -645,7 +868,7 @@ impl VLog {
 	}
 
 	/// Selects files based on discard statistics and compacts them
-	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u64>> {
+	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u32>> {
 		// Try to set the gc_in_progress flag to true, if it's already true, return error
 		if self
 			.gc_in_progress
@@ -707,7 +930,7 @@ impl VLog {
 	/// Compacts a single value log file
 	async fn compact_vlog_file_safe(
 		&self,
-		file_id: u64,
+		file_id: u32,
 		commit_pipeline: Arc<CommitPipeline>,
 	) -> Result<bool> {
 		// Check if file is already marked for deletion
@@ -759,7 +982,7 @@ impl VLog {
 	/// Compacts a single value log file, copying only live values
 	async fn compact_vlog_file(
 		&self,
-		file_id: u64,
+		file_id: u32,
 		commit_pipeline: Arc<CommitPipeline>,
 	) -> Result<bool> {
 		let source_path = self.vlog_file_path(file_id);
@@ -780,9 +1003,10 @@ impl VLog {
 		// Open source file
 		let mut source_file = BufReader::new(File::open(&source_path)?);
 
-		let mut offset = 0;
+		// Start reading after the file header
+		let mut offset = VLogFileHeader::SIZE as u64;
 		let mut values_skipped = 0;
-		let mut stale_seq_nums = Vec::new();
+		let mut stale_seq_nums: Vec<u64> = Vec::new();
 
 		let mut batch = Batch::default();
 		let mut batch_size = 0;
@@ -920,7 +1144,7 @@ impl VLog {
 	}
 
 	/// Gets statistics for a specific file
-	pub fn get_file_stats(&self, file_id: u64) -> (u64, u64, f64) {
+	pub fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
 		let discard_stats = self.discard_stats.lock().unwrap();
 		let discard_bytes = discard_stats.get_file_stats(file_id);
 
@@ -942,7 +1166,7 @@ impl VLog {
 	}
 
 	/// Gets statistics for all VLog files (for debugging)
-	pub fn get_all_file_stats(&self) -> Vec<(u64, u64, u64, f64)> {
+	pub fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		let mut all_stats = Vec::new();
 
 		// Check files from 0 to next counter
@@ -960,7 +1184,7 @@ impl VLog {
 	}
 
 	/// Registers a VLog file in the files map for tracking
-	pub fn register_vlog_file(&self, file_id: u64, path: PathBuf, size: u64) {
+	pub fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
 		let mut files_map = self.files_map.write().unwrap();
 		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
 	}
@@ -993,7 +1217,7 @@ impl VLog {
 
 	/// Updates discard statistics for a file
 	/// This should be called during LSM compaction when outdated VLog pointers are found
-	pub fn update_discard_stats(&self, stats: &HashMap<u64, i64>) {
+	pub fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		let mut discard_stats = self.discard_stats.lock().unwrap();
 
 		for (file_id, discard_bytes) in stats {
@@ -1233,22 +1457,16 @@ mod tests {
 
 	fn create_test_vlog() -> (VLog, TempDir) {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options::default();
+		let opts = Options {
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
+			..Default::default()
+		};
 		// Create vlog subdirectory to simulate the real directory structure
 		let vlog_dir = temp_dir.path().join("vlog");
 		std::fs::create_dir_all(&vlog_dir).unwrap();
 
-		// Create a dedicated VLog cache with default size (same as BlockCache)
-		let vlog_cache = Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)); // 1MB default
-
-		let vlog = VLog::new(
-			&vlog_dir,
-			opts.vlog_max_file_size,
-			VLogChecksumLevel::Full,
-			opts.vlog_gc_discard_ratio, // Use default discard ratio from options
-			vlog_cache,
-		)
-		.unwrap();
+		let vlog = VLog::new(&vlog_dir, Arc::new(opts)).unwrap();
 		(vlog, temp_dir)
 	}
 
@@ -1385,6 +1603,8 @@ mod tests {
 		let opts = Options {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 1024, // Small file size to force multiple files
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
 
@@ -1392,18 +1612,8 @@ mod tests {
 		let vlog_dir = temp_dir.path().join("vlog");
 		std::fs::create_dir_all(&vlog_dir).unwrap();
 
-		// Create a dedicated VLog cache
-		let vlog_cache = Arc::new(VLogCache::with_capacity_bytes(1024 * 1024));
-
 		// Create initial VLog and add data to create multiple files
-		let vlog1 = VLog::new(
-			&vlog_dir,
-			opts.vlog_max_file_size,
-			VLogChecksumLevel::Full,
-			opts.vlog_gc_discard_ratio,
-			vlog_cache.clone(),
-		)
-		.unwrap();
+		let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
 
 		// Add data to create multiple VLog files
 		let mut file_ids = Vec::new();
@@ -1433,14 +1643,7 @@ mod tests {
 		drop(vlog1);
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
-		let vlog2 = VLog::new(
-			&vlog_dir,
-			opts.vlog_max_file_size,
-			VLogChecksumLevel::Full,
-			opts.vlog_gc_discard_ratio,
-			vlog_cache.clone(),
-		)
-		.unwrap();
+		let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
 
 		// Verify that all existing files can be read
 		for (i, pointer) in pointers.iter().enumerate() {
@@ -1499,7 +1702,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_value_pointer_encode_into_decode_from() {
+	fn test_value_pointer_encode_into_decode() {
 		let pointer = ValuePointer::new(123, 456, 111, 789, 0xdeadbeef);
 
 		// Test encode_into
@@ -1507,92 +1710,84 @@ mod tests {
 		pointer.encode_into(&mut encoded).unwrap();
 		assert_eq!(encoded.len(), VALUE_POINTER_SIZE);
 
-		// Test decode_from
-		let mut cursor = Cursor::new(&encoded);
-		let decoded = ValuePointer::decode_from(&mut cursor).unwrap();
+		// Test decode
+		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(pointer, decoded);
 	}
 
 	#[test]
 	fn test_value_pointer_codec() {
-		let pointer = ValuePointer::new(0, 0, 0, 0, 0);
+		let pointer = ValuePointer::new(1, 2, 3, 4, 0);
 
 		// Test with zero values
 		let mut encoded = Vec::new();
 		pointer.encode_into(&mut encoded).unwrap();
-		let mut cursor = Cursor::new(&encoded);
-		let decoded = ValuePointer::decode_from(&mut cursor).unwrap();
+		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(pointer, decoded);
 
 		// Test with maximum values
-		let max_pointer = ValuePointer::new(u64::MAX, u64::MAX, u32::MAX, u32::MAX, u32::MAX);
+		let max_pointer = ValuePointer::new(u32::MAX, u64::MAX, u32::MAX, u32::MAX, u32::MAX);
 		let mut encoded = Vec::new();
 		max_pointer.encode_into(&mut encoded).unwrap();
-		let mut cursor = Cursor::new(&encoded);
-		let decoded = ValuePointer::decode_from(&mut cursor).unwrap();
+		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(max_pointer, decoded);
 	}
 
 	#[test]
-	fn test_value_pointer_decode_from_insufficient_data() {
+	fn test_value_pointer_decode_insufficient_data() {
 		let incomplete_data = vec![0u8; VALUE_POINTER_SIZE - 1];
-		let mut cursor = Cursor::new(&incomplete_data);
-		let result = ValuePointer::decode_from(&mut cursor);
+		let result = ValuePointer::decode(&incomplete_data);
 		assert!(result.is_err());
 	}
 
 	#[test]
 	fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
-		let location = ValueLocation::Inline(Arc::from(test_data.as_slice()));
+		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 
 		// Test encode
-		let encoded = location.encode().unwrap();
-		assert_eq!(encoded.len(), 1 + test_data.len()); // tag + data
-		assert_eq!(encoded[0], TAG_INLINE);
-		assert_eq!(&encoded[1..], test_data);
+		let encoded = location.encode();
+		assert_eq!(encoded.len(), 1 + 1 + test_data.len()); // meta + version (1 byte) + data
+		assert_eq!(encoded[0], 0); // meta should be 0 for inline
+		assert_eq!(encoded[1], VALUE_LOCATION_VERSION); // version should be 1
+		assert_eq!(&encoded[2..], test_data); // Skip meta (1) and version (1)
 
 		// Test decode
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
 
 		// Verify it's inline
-		assert!(decoded.is_inline());
-		assert!(!decoded.is_vlog());
+		assert!(!decoded.is_value_pointer());
 	}
 
 	#[test]
 	fn test_value_location_vlog_encoding() {
 		let pointer = ValuePointer::new(1, 1024, 8, 256, 0x12345678);
-		let location = ValueLocation::VLog(pointer.clone());
+		let location = ValueLocation::with_pointer(pointer.clone());
 
 		// Test encode
-		let encoded = location.encode().unwrap();
-		assert_eq!(encoded.len(), 1 + VALUE_POINTER_SIZE); // tag + pointer size
-		assert_eq!(encoded[0], TAG_VLOG);
+		let encoded = location.encode();
+		assert_eq!(encoded.len(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version (1 byte) + pointer size
+		assert_eq!(encoded[0], BIT_VALUE_POINTER); // meta should have BIT_VALUE_POINTER set
 
 		// Test decode
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
 
-		// Verify it's vlog
-		assert!(!decoded.is_inline());
-		assert!(decoded.is_vlog());
+		// Verify it's a value pointer
+		assert!(decoded.is_value_pointer());
 
-		// Verify pointer matches
-		if let ValueLocation::VLog(decoded_pointer) = decoded {
-			assert_eq!(pointer, decoded_pointer);
-		} else {
-			panic!("Expected VLog variant");
-		}
+		// Verify pointer matches by decoding the value
+		let decoded_pointer = ValuePointer::decode(&decoded.value).unwrap();
+		assert_eq!(pointer, decoded_pointer);
 	}
 
 	#[test]
-	fn test_value_location_encode_into_decode_from() {
+	fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
-			ValueLocation::Inline(Arc::from(b"small data".as_slice())),
-			ValueLocation::VLog(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
-			ValueLocation::Inline(Arc::from(b"".as_slice())), // empty data
+			ValueLocation::with_inline_value(Arc::from(b"small data".as_slice())),
+			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
+			ValueLocation::with_inline_value(Arc::from(b"".as_slice())), // empty data
 		];
 
 		for location in test_cases {
@@ -1600,24 +1795,10 @@ mod tests {
 			let mut encoded = Vec::new();
 			location.encode_into(&mut encoded).unwrap();
 
-			// Test decode_from
-			let mut cursor = Cursor::new(&encoded);
-			let decoded = ValueLocation::decode_from(&mut cursor).unwrap();
+			// Test decode
+			let decoded = ValueLocation::decode(&encoded).unwrap();
 
 			assert_eq!(location, decoded);
-		}
-	}
-
-	#[test]
-	fn test_value_location_invalid_tag() {
-		let invalid_data = vec![99u8, 1, 2, 3]; // Invalid tag 99
-		let result = ValueLocation::decode(&invalid_data);
-		assert!(result.is_err());
-
-		if let Err(Error::Corruption(msg)) = result {
-			assert!(msg.contains("Invalid ValueLocation tag"));
-		} else {
-			panic!("Expected corruption error");
 		}
 	}
 
@@ -1625,13 +1806,13 @@ mod tests {
 	fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
-		let inline_location = ValueLocation::Inline(Arc::from(inline_data.as_slice()));
-		assert_eq!(inline_location.size().unwrap(), inline_data.len());
+		let inline_location = ValueLocation::with_inline_value(Arc::from(inline_data.as_slice()));
+		assert_eq!(inline_location.encoded_size(), 1 + 1 + inline_data.len()); // meta + version + data
 
-		// Test VLog size (without actual VLog)
+		// Test VLog size
 		let pointer = ValuePointer::new(1, 100, 8, 256, 0x12345);
-		let vlog_location = ValueLocation::VLog(pointer);
-		assert_eq!(vlog_location.size().unwrap(), VALUE_POINTER_SIZE);
+		let vlog_location = ValueLocation::with_pointer(pointer);
+		assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version + pointer
 	}
 
 	#[tokio::test]
@@ -1639,9 +1820,9 @@ mod tests {
 		let (vlog, _temp_dir) = create_test_vlog();
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
-		let location = ValueLocation::Inline(Arc::from(test_data.as_slice()));
+		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 
-		let resolved = location.resolve(vlog).unwrap();
+		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1655,21 +1836,22 @@ mod tests {
 		// Append to vlog to get a real pointer
 		let pointer = vlog.append(key, value).unwrap();
 		vlog.sync().unwrap(); // Sync to ensure data is written to disk
-		let location = ValueLocation::VLog(pointer);
+		let location = ValueLocation::with_pointer(pointer);
 
 		// Resolve should return the original value
-		let resolved = location.resolve(vlog).unwrap();
+		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, value);
 	}
 
 	#[test]
 	fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
-		let location = ValueLocation::Inline(Arc::from(test_data.as_slice()));
-		let encoded = location.encode().unwrap();
+		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
+		let encoded = location.encode();
 
 		// Should work without VLog for inline data
-		let resolved = ValueLocation::from_encoded_value(&encoded, None).unwrap();
+		let decoded_location = ValueLocation::decode(&encoded).unwrap();
+		let resolved = decoded_location.resolve_value(None).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1682,15 +1864,16 @@ mod tests {
 		// Append to vlog and create encoded VLog location
 		let pointer = vlog.append(key, value).unwrap();
 		vlog.sync().unwrap(); // Sync to ensure data is written to disk
-		let location = ValueLocation::VLog(pointer);
-		let encoded = location.encode().unwrap();
+		let location = ValueLocation::with_pointer(pointer);
+		let encoded = location.encode();
 
 		// Should resolve with VLog
-		let resolved = ValueLocation::from_encoded_value(&encoded, Some(&vlog)).unwrap();
+		let decoded_location = ValueLocation::decode(&encoded).unwrap();
+		let resolved = decoded_location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, value);
 
 		// Should fail without VLog
-		let result = ValueLocation::from_encoded_value(&encoded, None);
+		let result = decoded_location.resolve_value(None);
 		assert!(result.is_err());
 	}
 
@@ -1698,16 +1881,559 @@ mod tests {
 	fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
-		let location = ValueLocation::Inline(Arc::from(max_inline.as_slice()));
-		let encoded = location.encode().unwrap();
+		let location = ValueLocation::with_inline_value(Arc::from(max_inline.as_slice()));
+		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
 
 		// Test with pointer containing edge values
-		let edge_pointer = ValuePointer::new(0, u64::MAX, 0, u32::MAX, 0);
-		let location = ValueLocation::VLog(edge_pointer);
-		let encoded = location.encode().unwrap();
+		let edge_pointer = ValuePointer::new(1, u64::MAX, 0, u32::MAX, 0);
+		let location = ValueLocation::with_pointer(edge_pointer);
+		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
+	}
+
+	#[test]
+	fn test_vlog_file_header_encoding() {
+		let opts = crate::Options::default();
+		let header = VLogFileHeader::new(123, &opts);
+		let encoded = header.encode();
+		let decoded = VLogFileHeader::decode(&encoded).unwrap();
+
+		assert_eq!(header.magic, decoded.magic);
+		assert_eq!(header.version, decoded.version);
+		assert_eq!(header.file_id, decoded.file_id);
+		assert_eq!(header.created_at, decoded.created_at);
+		assert_eq!(header.max_file_size, decoded.max_file_size);
+		assert_eq!(header.compression, decoded.compression);
+		assert_eq!(header.reserved, decoded.reserved);
+		assert!(decoded.is_compatible());
+	}
+
+	#[test]
+	fn test_vlog_file_header_invalid_magic() {
+		let opts = crate::Options::default();
+		let mut header = VLogFileHeader::new(123, &opts);
+		header.magic = 0x12345678; // Invalid magic
+		let encoded = header.encode();
+
+		assert!(VLogFileHeader::decode(&encoded).is_err());
+	}
+
+	#[test]
+	fn test_vlog_file_header_invalid_size() {
+		let opts = crate::Options::default();
+		let header = VLogFileHeader::new(123, &opts);
+		let mut encoded = header.encode().to_vec();
+		encoded.pop(); // Remove one byte to make it invalid size
+
+		assert!(VLogFileHeader::decode(&encoded).is_err());
+	}
+
+	#[test]
+	fn test_vlog_file_header_version_compatibility() {
+		let opts = crate::Options::default();
+		let mut header = VLogFileHeader::new(123, &opts);
+		header.version = VLOG_FORMAT_VERSION;
+		assert!(header.is_compatible());
+
+		header.version = VLOG_FORMAT_VERSION + 1;
+		assert!(!header.is_compatible());
+	}
+
+	#[tokio::test]
+	async fn test_vlog_with_file_header() {
+		let (vlog, _temp_dir) = create_test_vlog();
+
+		// Append some data to create a VLog file with header
+		let key = b"test_key";
+		let value = b"test_value";
+		let pointer = vlog.append(key, value).unwrap();
+		vlog.sync().unwrap();
+
+		// Retrieve the value to ensure header validation works
+		let retrieved_value = vlog.get(&pointer).unwrap();
+		assert_eq!(retrieved_value.as_ref(), value);
+	}
+
+	#[tokio::test]
+	async fn test_vlog_restart_continues_last_file() {
+		let temp_dir = TempDir::new().unwrap();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			vlog_max_file_size: 2048,
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
+			..Default::default()
+		};
+
+		// Create vlog subdirectory
+		let vlog_dir = temp_dir.path().join("vlog");
+		std::fs::create_dir_all(&vlog_dir).unwrap();
+
+		let mut pointers = Vec::new();
+
+		// Phase 1: Create initial VLog and add some data (but not enough to fill the file)
+		{
+			let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+
+			// Add some data to the first file
+			for i in 0..3 {
+				let key = format!("key_{i}").into_bytes();
+				let value = vec![i as u8; 100];
+				let pointer = vlog1.append(&key, &value).unwrap();
+				pointers.push((pointer, value));
+			}
+			vlog1.sync().unwrap();
+
+			// Verify we're writing to file 0
+			let first_file_id = pointers[0].0.file_id;
+			assert_eq!(first_file_id, 0, "First data should go to file 0");
+
+			// All data should be in the same file since we're not filling it
+			assert!(
+				pointers.iter().all(|(p, _)| p.file_id == first_file_id),
+				"All initial data should be in the same file"
+			);
+
+			// Get the file size to ensure it's not at max capacity
+			let file_path = vlog1.vlog_file_path(first_file_id);
+			let file_size = std::fs::metadata(&file_path).unwrap().len();
+			assert!(file_size < opts.vlog_max_file_size, "File should not be at max capacity");
+
+			// Check that active_writer_id is correctly set
+			let active_writer_id = vlog1.active_writer_id.load(Ordering::SeqCst);
+			assert_eq!(
+				active_writer_id, first_file_id,
+				"Active writer ID should be set to the first file"
+			);
+
+			// Verify writer is set up
+			assert!(vlog1.writer.read().unwrap().is_some(), "Writer should be set up");
+		} // vlog1 is dropped here, simulating shutdown
+
+		// Phase 2: Restart VLog and verify it continues with the last file
+		{
+			let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+
+			// Check that active_writer_id is set to the last file (file 0)
+			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
+			assert_eq!(
+				active_writer_id, 0,
+				"After restart, active writer ID should be set to the last file (0)"
+			);
+
+			// Check that writer is set up
+			assert!(
+				vlog2.writer.read().unwrap().is_some(),
+				"After restart, writer should be set up for the last file"
+			);
+
+			// Check that next_file_id is correct
+			let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
+			assert_eq!(
+				next_file_id, 1,
+				"Next file ID should be 1 (one past the highest existing file)"
+			);
+
+			// Verify all previous data can still be read
+			for (pointer, expected_value) in &pointers {
+				let retrieved = vlog2.get(pointer).unwrap();
+				assert_eq!(
+					*retrieved, *expected_value,
+					"Should be able to read existing data after restart"
+				);
+			}
+
+			// Add new data and verify it goes to the same file (not a new file)
+			let new_key = b"new_key_after_restart";
+			let new_value = vec![99u8; 100];
+			let new_pointer = vlog2.append(new_key, &new_value).unwrap();
+			vlog2.sync().unwrap();
+
+			// New data should go to the same file (file 0) since it has space
+			assert_eq!(
+				new_pointer.file_id, 0,
+				"New data after restart should go to the existing file with space"
+			);
+
+			// Verify the new data can be read
+			let retrieved_new = vlog2.get(&new_pointer).unwrap();
+			assert_eq!(
+				*retrieved_new, new_value,
+				"Should be able to read new data added after restart"
+			);
+
+			// Add more data to fill the file and trigger creation of a new file
+			let mut large_pointers = Vec::new();
+			for i in 0..10 {
+				let key = format!("large_key_{i}").into_bytes();
+				let value = vec![i as u8; 200]; // Larger values to fill the file
+				let pointer = vlog2.append(&key, &value).unwrap();
+				large_pointers.push((pointer, value));
+			}
+			vlog2.sync().unwrap();
+
+			// Check if we eventually created a new file (file 1)
+			let has_file_1 = large_pointers.iter().any(|(p, _)| p.file_id == 1);
+			if has_file_1 {
+				// If we created file 1, verify the active writer ID updated
+				let final_active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
+				assert_eq!(
+					final_active_writer_id, 1,
+					"Active writer ID should update to the new file"
+				);
+			}
+
+			// Verify all data (old and new) can still be read
+			for (pointer, expected_value) in &pointers {
+				let retrieved = vlog2.get(pointer).unwrap();
+				assert_eq!(*retrieved, *expected_value);
+			}
+			for (pointer, expected_value) in &large_pointers {
+				let retrieved = vlog2.get(pointer).unwrap();
+				assert_eq!(*retrieved, *expected_value);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn test_vlog_restart_with_multiple_files() {
+		let temp_dir = TempDir::new().unwrap();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			vlog_max_file_size: 800,
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
+			..Default::default()
+		};
+
+		// Create vlog subdirectory
+		let vlog_dir = temp_dir.path().join("vlog");
+		std::fs::create_dir_all(&vlog_dir).unwrap();
+
+		let mut all_pointers = Vec::new();
+		let mut highest_file_id = 0;
+
+		// Phase 1: Create VLog and add enough data to create 5+ files
+		{
+			let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+
+			// Add enough data to create at least 5 VLog files
+			for i in 0..50 {
+				let key = format!("multifile_key_{:04}", i).into_bytes();
+				let value = vec![i as u8; 80]; // Data to fill files moderately
+				let pointer = vlog1.append(&key, &value).unwrap();
+				all_pointers.push((pointer.clone(), key, value));
+				highest_file_id = highest_file_id.max(pointer.file_id);
+			}
+			vlog1.sync().unwrap();
+
+			// Verify we created at least 5 files
+			let unique_file_ids: std::collections::HashSet<_> =
+				all_pointers.iter().map(|(p, _, _)| p.file_id).collect();
+			assert!(
+				unique_file_ids.len() >= 5,
+				"Should have created at least 5 VLog files, got {}",
+				unique_file_ids.len()
+			);
+
+			// Add a final small entry that shouldn't fill the last file completely
+			let final_key = b"final_small_entry";
+			let final_value = vec![255u8; 20]; // Small entry
+			let final_pointer = vlog1.append(final_key, &final_value).unwrap();
+			all_pointers.push((final_pointer.clone(), final_key.to_vec(), final_value));
+			highest_file_id = highest_file_id.max(final_pointer.file_id);
+
+			vlog1.sync().unwrap();
+		} // vlog1 is dropped here, simulating shutdown
+
+		// Phase 2: Restart VLog and verify it picks up the correct active writer
+		{
+			let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+
+			// Check that active_writer_id is set to the highest file ID
+			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
+			assert_eq!(
+				active_writer_id, highest_file_id,
+				"After restart, active writer ID should be set to the highest file ID"
+			);
+
+			// Check that writer is set up
+			assert!(
+				vlog2.writer.read().unwrap().is_some(),
+				"After restart, writer should be set up for the last file"
+			);
+
+			// Check that next_file_id is correct
+			let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
+			assert_eq!(
+				next_file_id,
+				highest_file_id + 1,
+				"Next file ID should be one past the highest existing file ID"
+			);
+
+			// Verify all previous data can still be read
+			for (pointer, expected_key, expected_value) in &all_pointers {
+				let retrieved = vlog2.get(pointer).unwrap();
+				assert_eq!(
+					*retrieved,
+					*expected_value,
+					"Should be able to read existing data for key {:?} after restart",
+					String::from_utf8_lossy(expected_key)
+				);
+			}
+
+			// Add new data and verify it goes to the correct file
+			let new_key = b"new_data_after_restart";
+			let new_value = vec![42u8; 100];
+			let new_pointer = vlog2.append(new_key, &new_value).unwrap();
+			vlog2.sync().unwrap();
+
+			// New data should go to the highest file ID (since we set it up as active writer)
+			assert_eq!(
+				new_pointer.file_id, highest_file_id,
+				"New data after restart should go to the last existing file"
+			);
+
+			// Verify the new data can be read
+			let retrieved_new = vlog2.get(&new_pointer).unwrap();
+			assert_eq!(
+				*retrieved_new, new_value,
+				"Should be able to read new data added after restart"
+			);
+
+			// Add a lot more data to eventually trigger creation of a new file
+			let mut more_pointers = Vec::new();
+			for i in 0..20 {
+				let key = format!("bulk_new_key_{:04}", i).into_bytes();
+				let value = vec![(i % 256) as u8; 100]; // Large values to fill files
+				let pointer = vlog2.append(&key, &value).unwrap();
+				more_pointers.push((pointer, value));
+			}
+			vlog2.sync().unwrap();
+
+			// Check if we eventually created a new file
+			let has_new_file = more_pointers.iter().any(|(p, _)| p.file_id > highest_file_id);
+			if has_new_file {
+				// If we created a new file, verify the active writer ID updated
+				let new_active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
+				assert!(
+					new_active_writer_id > highest_file_id,
+					"Active writer ID should update to the new file"
+				);
+			}
+
+			// Verify all data (original, restart-added, and bulk-added) can still be read
+			for (pointer, expected_value) in &more_pointers {
+				let retrieved = vlog2.get(pointer).unwrap();
+				assert_eq!(*retrieved, *expected_value, "Should be able to read bulk-added data");
+			}
+
+			// Final verification: count total number of files
+			let final_file_ids: std::collections::HashSet<_> = all_pointers
+				.iter()
+				.map(|(p, _, _)| p.file_id)
+				.chain(std::iter::once(new_pointer.file_id))
+				.chain(more_pointers.iter().map(|(p, _)| p.file_id))
+				.collect();
+
+			assert!(
+				final_file_ids.len() >= 5,
+				"Should maintain at least 5 VLog files throughout the test"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_vlog_writer_reopen_append_only_behavior() {
+		let temp_dir = TempDir::new().unwrap();
+		let opts = Arc::new(Options {
+			path: temp_dir.path().to_path_buf(),
+			vlog_max_file_size: 2048,
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
+			..Default::default()
+		});
+
+		// Create a test file path
+		let test_file_path = temp_dir.path().join("vlog_writer_test.log");
+		let file_id = 10;
+
+		let mut phase1_pointers = Vec::new();
+		let mut phase1_data = Vec::new();
+
+		// Phase 1: Create VLogWriter and write initial data
+		{
+			let mut writer1 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+
+			// Write several entries in the first phase
+			for i in 0..5 {
+				let key = format!("phase1_key_{:02}", i).into_bytes();
+				let value = vec![i as u8; 50 + i * 10]; // Variable-sized values
+				let pointer = writer1.append(&key, &value).unwrap();
+				phase1_pointers.push(pointer);
+				phase1_data.push((key, value));
+			}
+
+			// Flush to ensure data is written
+			writer1.sync().unwrap();
+
+			// Get file size and last entry offset for verification
+			let file_size_after_phase1 = std::fs::metadata(&test_file_path).unwrap().len();
+			println!(
+				"Phase 1: File size after writing {} entries: {} bytes",
+				phase1_pointers.len(),
+				file_size_after_phase1
+			);
+
+			// Verify all phase 1 entries have offsets < file size
+			for (i, pointer) in phase1_pointers.iter().enumerate() {
+				assert!(
+					pointer.offset < file_size_after_phase1,
+					"Phase 1 entry {} offset ({}) should be < file size ({})",
+					i,
+					pointer.offset,
+					file_size_after_phase1
+				);
+			}
+		} // writer1 is dropped here, file is closed
+
+		let file_size_between_phases = std::fs::metadata(&test_file_path).unwrap().len();
+
+		// Phase 2: Reopen the same file with a new VLogWriter and append more data
+		let mut phase2_pointers = Vec::new();
+		let mut phase2_data = Vec::new();
+		{
+			let mut writer2 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+
+			// Verify the writer starts at the end of the existing file
+			assert_eq!(
+				writer2.current_offset, file_size_between_phases,
+				"Writer should start at the end of existing file (offset: {}, file size: {})",
+				writer2.current_offset, file_size_between_phases
+			);
+
+			// Write more entries in the second phase
+			for i in 0..4 {
+				let key = format!("phase2_key_{:02}", i).into_bytes();
+				let value = vec![(100 + i) as u8; 40 + i * 5]; // Different pattern
+				let pointer = writer2.append(&key, &value).unwrap();
+
+				// CRITICAL: Verify new entries have offsets >= original file size
+				assert!(pointer.offset >= file_size_between_phases,
+					"Phase 2 entry {} offset ({}) should be >= original file size ({}), proving append not overwrite",
+					i, pointer.offset, file_size_between_phases);
+
+				phase2_pointers.push(pointer);
+				phase2_data.push((key, value));
+			}
+
+			// Flush to ensure data is written
+			writer2.sync().unwrap();
+
+			// Verify file size increased
+			let file_size_after_phase2 = std::fs::metadata(&test_file_path).unwrap().len();
+			assert!(
+				file_size_after_phase2 > file_size_between_phases,
+				"File size should have increased (before: {}, after: {})",
+				file_size_between_phases,
+				file_size_after_phase2
+			);
+
+			println!(
+				"Phase 2: File size grew from {} to {} bytes after adding {} entries",
+				file_size_between_phases,
+				file_size_after_phase2,
+				phase2_pointers.len()
+			);
+		} // writer2 is dropped here
+
+		// Phase 3: Verification - Read all data back using VLog to ensure no corruption/overwriting
+		{
+			// Create a VLog instance that can read from our test file
+			let vlog_dir = temp_dir.path().join("vlog");
+			std::fs::create_dir_all(&vlog_dir).unwrap();
+
+			// Copy our test file to the VLog directory with the expected naming convention
+			let vlog_file_path = vlog_dir.join(format!("vlog_{:08}.log", file_id));
+			std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
+
+			let vlog = VLog::new(&vlog_dir, opts.clone()).unwrap();
+
+			// Verify ALL phase 1 data can still be read (proving no overwrite occurred)
+			for (i, (pointer, (_, expected_value))) in
+				phase1_pointers.iter().zip(phase1_data.iter()).enumerate()
+			{
+				let retrieved = vlog.get(pointer).unwrap();
+				assert_eq!(
+					*retrieved, *expected_value,
+					"Phase 1 entry {} should be readable after phase 2 writes",
+					i
+				);
+			}
+
+			// Verify ALL phase 2 data can be read correctly
+			for (i, (pointer, (_, expected_value))) in
+				phase2_pointers.iter().zip(phase2_data.iter()).enumerate()
+			{
+				let retrieved = vlog.get(pointer).unwrap();
+				assert_eq!(*retrieved, *expected_value, "Phase 2 entry {} should be readable", i);
+			}
+
+			println!(
+				"Verification passed: All {} phase 1 + {} phase 2 entries readable",
+				phase1_pointers.len(),
+				phase2_pointers.len()
+			);
+		}
+
+		// Phase 4: Additional verification - Test a third reopen to ensure pattern continues
+		{
+			let mut writer3 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+			let current_file_size = std::fs::metadata(&test_file_path).unwrap().len();
+
+			// Verify writer3 starts at the current end of file
+			assert_eq!(
+				writer3.current_offset, current_file_size,
+				"Third writer should start at current end of file"
+			);
+
+			// Add one more entry
+			let final_key = b"final_verification_entry";
+			let final_value = vec![255u8; 30];
+			let final_pointer = writer3.append(final_key, &final_value).unwrap();
+
+			// Verify this entry also has offset >= previous file size
+			assert!(
+				final_pointer.offset >= current_file_size,
+				"Final entry offset ({}) should be >= file size before append ({})",
+				final_pointer.offset,
+				current_file_size
+			);
+
+			writer3.sync().unwrap();
+
+			println!(
+				"Phase 4: Successfully appended final entry at offset {} (file was {} bytes)",
+				final_pointer.offset, current_file_size
+			);
+		}
+
+		// Final verification: Check that offsets are strictly increasing across phases
+		let all_offsets: Vec<u64> =
+			phase1_pointers.iter().chain(phase2_pointers.iter()).map(|p| p.offset).collect();
+
+		for i in 1..all_offsets.len() {
+			assert!(
+				all_offsets[i] > all_offsets[i - 1],
+				"Offsets should be strictly increasing: offset[{}]={} should be > offset[{}]={}",
+				i,
+				all_offsets[i],
+				i - 1,
+				all_offsets[i - 1]
+			);
+		}
 	}
 }

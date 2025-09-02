@@ -412,8 +412,9 @@ mod tests {
 
 	/// Helper function to create encoded inline values for testing
 	fn create_inline_value(value: &[u8]) -> Vec<u8> {
-		let location = ValueLocation::Inline(Arc::from(value.to_vec().into_boxed_slice()));
-		location.encode().unwrap().to_vec()
+		let location =
+			ValueLocation::with_inline_value(Arc::from(value.to_vec().into_boxed_slice()));
+		location.encode().to_vec()
 	}
 
 	/// Helper function to create test entries with automatic value encoding
@@ -515,16 +516,7 @@ mod tests {
 	) -> CompactionOptions {
 		let table_id_counter = manifest.read().unwrap().next_table_id.clone();
 
-		let vlog = Arc::new(
-			crate::vlog::VLog::new(
-				opts.path.join("vlog"),
-				opts.vlog_max_file_size,
-				opts.vlog_checksum_verification,
-				opts.vlog_gc_discard_ratio,
-				opts.vlog_cache.clone(),
-			)
-			.unwrap(),
-		);
+		let vlog = Arc::new(crate::vlog::VLog::new(opts.path.join("vlog"), opts.clone()).unwrap());
 
 		CompactionOptions {
 			table_id_counter,
@@ -1542,14 +1534,11 @@ mod tests {
 				for result in iter {
 					// Decode the ValueLocation before comparing
 					let encoded_value = result.1.clone();
-					match ValueLocation::decode(&encoded_value).unwrap() {
-						ValueLocation::Inline(decoded_value) => {
-							all_keys.insert(result.0.user_key.clone(), decoded_value.to_vec());
-						}
-						ValueLocation::VLog(_) => {
-							panic!("Unexpected VLog pointer in test");
-						}
+					let location = ValueLocation::decode(&encoded_value).unwrap();
+					if location.is_value_pointer() {
+						panic!("Unexpected VLog pointer in test");
 					}
+					all_keys.insert(result.0.user_key.clone(), (*location.value).to_vec());
 				}
 			}
 		}
@@ -1714,17 +1703,12 @@ mod tests {
 					match key.kind() {
 						InternalKeyKind::Set => {
 							// Decode the ValueLocation
-							match ValueLocation::decode(&encoded_value).unwrap() {
-								ValueLocation::Inline(decoded_value) => {
-									all_keys.insert(
-										key.user_key.as_ref().to_vec(),
-										decoded_value.to_vec(),
-									);
-								}
-								ValueLocation::VLog(_) => {
-									panic!("Unexpected VLog pointer in test");
-								}
+							let location = ValueLocation::decode(&encoded_value).unwrap();
+							if location.is_value_pointer() {
+								panic!("Unexpected VLog pointer in test");
 							}
+							all_keys
+								.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
 						}
 						InternalKeyKind::Delete => {
 							tombstones.insert(key.user_key.as_ref().to_vec(), key.seq_num());
@@ -1835,15 +1819,12 @@ mod tests {
 				for (key, encoded_value) in table.iter() {
 					if key.kind() == InternalKeyKind::Set {
 						// Decode the ValueLocation
-						match ValueLocation::decode(&encoded_value).unwrap() {
-							ValueLocation::Inline(decoded_value) => {
-								survivors
-									.insert(key.user_key.as_ref().to_vec(), decoded_value.to_vec());
-							}
-							ValueLocation::VLog(_) => {
-								panic!("Unexpected VLog pointer in test");
-							}
+						let location = ValueLocation::decode(&encoded_value).unwrap();
+						if location.is_value_pointer() {
+							panic!("Unexpected VLog pointer in test");
 						}
+						survivors
+							.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
 					}
 				}
 			}
@@ -2082,7 +2063,7 @@ mod tests {
 		assert_eq!(props.num_data_blocks, 2);
 		assert_eq!(props.top_level_index_size, 0);
 		assert!(props.created_at > 0);
-		assert_eq!(props.file_size, 2326);
+		assert_eq!(props.file_size, 2328);
 		assert_eq!(props.block_size, 1030);
 		assert_eq!(props.block_count, 2);
 		assert_eq!(props.compression, CompressionType::None);
