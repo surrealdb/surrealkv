@@ -1,445 +1,479 @@
-use std::{
-    cmp::Ordering,
-    collections::{btree_map, VecDeque},
-    iter::Peekable,
-    marker::PhantomData,
-    ops::RangeBounds,
-};
+use std::collections::BinaryHeap;
+use std::collections::HashMap;
+use std::{cmp::Ordering, sync::Arc};
 
-use bytes::Bytes;
-use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
-use vart::VariableSizeKey;
-
+use crate::error::Result;
 use crate::{
-    indexer::IndexValue,
-    store::Core,
-    transaction::{ReadSet, ReadSetEntry, ScanResult, ScanVersionResult, WriteSet, WriteSetEntry},
-    util::convert_range_bounds_bytes,
-    Result,
+    sstable::{InternalKey, InternalKeyKind},
+    Key, Value,
 };
 
-// Fields: key, value, version, ts
-type SnapItem<'a> = (&'a [u8], &'a IndexValue, u64, u64);
+pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
 
-/// An iterator over the snapshot and write set.
-/// This iterator is used to perform a merging scan over the snapshot and write set.
-/// The iterator will return the values in the snapshot and write set in the order of
-/// their keys.
-/// If a key is present in both the snapshot and the write set, the value from the write
-/// set will be returned.
-/// If a key is present in the snapshot but not in the write set, the value from the snapshot
-/// will be returned.
-/// If a key is present in the write set but not in the snapshot, the value from the write set
-/// will be returned.
-/// The iterator will add the keys that are read from the snapshot to the read set.
-pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
-    core: &'a Core,
-    read_set: Option<&'a mut ReadSet>,
-    savepoints: u32,
-    snap_iter: DoubleEndedPeekable<I>,
-    write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
-    limit: usize,
-    count: usize,
-    _phantom: PhantomData<R>,
+// Holds a key-value pair and the iterator index
+#[derive(Eq)]
+pub(crate) struct HeapItem {
+    pub(crate) key: Arc<InternalKey>,
+    pub(crate) value: Value,
+    pub(crate) iterator_index: usize,
 }
 
-impl<'a, R, I: Iterator> MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    pub(crate) fn new(
-        core: &'a Core,
-        write_set: &'a WriteSet,
-        read_set: Option<&'a mut ReadSet>,
-        savepoints: u32,
-        snap_iter: I,
-        range: &R,
-        limit: Option<usize>,
-    ) -> Self {
-        let range_bytes = convert_range_bounds_bytes(range);
-        MergingScanIterator::<R, I> {
-            core,
-            read_set,
-            savepoints,
-            snap_iter: snap_iter.double_ended_peekable(),
-            write_set_iter: write_set.range(range_bytes).double_ended_peekable(),
-            limit: limit.unwrap_or(usize::MAX),
-            count: 0,
-            _phantom: PhantomData,
-        }
-    }
-
-    fn add_to_read_set(read_set: &mut ReadSet, key: &[u8], version: u64, savepoints: u32) {
-        let entry = ReadSetEntry::new(key, version, savepoints);
-        read_set.push(entry);
-    }
-
-    fn read_from_snapshot(&mut self) -> Option<<Self as Iterator>::Item> {
-        self.snap_iter.next().map(|(key, value, version, ts)| {
-            if let Some(read_set) = self.read_set.as_mut() {
-                Self::add_to_read_set(read_set, key, version, self.savepoints);
-            }
-            match value.resolve(self.core) {
-                Ok(v) => Ok((key, v, ts)),
-                Err(e) => Err(e),
-            }
-        })
-    }
-
-    fn read_from_write_set(&mut self) -> Option<<Self as Iterator>::Item> {
-        if let Some((ws_key, ws_entries)) = self.write_set_iter.next() {
-            if let Some(ws_entry) = ws_entries.last() {
-                if ws_entry.e.is_deleted_or_tombstone() {
-                    return self.next();
-                }
-                return Some(Ok((
-                    ws_key.as_ref(),
-                    ws_entry.e.value.to_vec(),
-                    ws_entry.e.ts,
-                )));
-            }
-        }
-        None
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
     }
 }
 
-impl<'a, R, I> Iterator for MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    type Item = Result<ScanResult<'a>>;
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Invert for min-heap behavior
+        other.cmp_internal(self)
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.count >= self.limit {
-            return None;
-        }
-
-        // Fast path when write set is empty
-        if self.write_set_iter.peek().is_none() {
-            // If the write set does not contain values in the scan range,
-            // do the scan only in the snapshot. This optimisation is quite
-            // important according to the benches.
-            let result = self.read_from_snapshot();
-            if result.is_some() {
-                self.count += 1;
-            }
-            return result;
-        }
-
-        // Merging path
-        // If both the write set and the snapshot contain values from the requested
-        // range, perform a somewhat slower merging scan.
-
-        // Determine which iterator has the next value
-        let has_snap = self.snap_iter.peek().is_some();
-        let has_ws = self.write_set_iter.peek().is_some();
-
-        let result = match (has_snap, has_ws) {
-            (false, false) => None,
-            (true, false) => self.read_from_snapshot(),
-            (false, true) => self.read_from_write_set(),
-            (true, true) => {
-                // Now we can safely do the comparison
-                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
-                    (self.snap_iter.peek(), self.write_set_iter.peek())
-                {
-                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
-                        Ordering::Less => self.read_from_snapshot(),
-                        Ordering::Greater => self.read_from_write_set(),
-                        Ordering::Equal => {
-                            self.snap_iter.next(); // Skip snapshot entry
-                            self.read_from_write_set()
-                        }
-                    }
-                } else {
-                    // This should never happen since we checked above
-                    None
+impl HeapItem {
+    fn cmp_internal(&self, other: &Self) -> Ordering {
+        // First compare by user key
+        match self.key.user_key.cmp(&other.key.user_key) {
+            Ordering::Equal => {
+                // Same user key, compare by sequence number in DESCENDING order
+                // (higher sequence number = more recent)
+                match other.key.seq_num().cmp(&self.key.seq_num()) {
+                    Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
+                    ord => ord,
                 }
             }
-        };
-
-        if result.is_some() {
-            self.count += 1;
+            ord => ord, // Different user keys
         }
-        result
     }
 }
 
-impl<'a, R, I> DoubleEndedIterator for MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: DoubleEndedIterator<Item = SnapItem<'a>>,
-{
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.count >= self.limit {
-            return None;
-        }
-
-        // Fast path when write set is empty
-        if self.write_set_iter.peek().is_none() {
-            let result = self.read_from_snapshot_back();
-            if result.is_some() {
-                self.count += 1;
-            }
-            return result;
-        }
-
-        // Merging path
-        let has_snap = self.snap_iter.peek_back().is_some();
-        let has_ws = self.write_set_iter.peek_back().is_some();
-
-        let result = match (has_snap, has_ws) {
-            (false, false) => None,
-            (true, false) => self.read_from_snapshot_back(),
-            (false, true) => self.read_from_write_set_back(),
-            (true, true) => {
-                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
-                    (self.snap_iter.peek_back(), self.write_set_iter.peek_back())
-                {
-                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
-                        Ordering::Greater => self.read_from_snapshot_back(),
-                        Ordering::Less => self.read_from_write_set_back(),
-                        Ordering::Equal => {
-                            self.snap_iter.next_back(); // Skip snapshot entry
-                            self.read_from_write_set_back()
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-
-        if result.is_some() {
-            self.count += 1;
-        }
-        result
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
-impl<'a, R, I> MergingScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: DoubleEndedIterator<Item = SnapItem<'a>>,
-{
-    fn read_from_snapshot_back(&mut self) -> Option<<Self as Iterator>::Item> {
-        self.snap_iter.next_back().map(|(key, value, version, ts)| {
-            if let Some(read_set) = self.read_set.as_mut() {
-                Self::add_to_read_set(read_set, key, version, self.savepoints);
-            }
-            match value.resolve(self.core) {
-                Ok(v) => Ok((key, v, ts)),
-                Err(e) => Err(e),
-            }
-        })
-    }
-
-    fn read_from_write_set_back(&mut self) -> Option<<Self as Iterator>::Item> {
-        if let Some((ws_key, ws_entries)) = self.write_set_iter.next_back() {
-            if let Some(ws_entry) = ws_entries.last() {
-                if ws_entry.e.is_deleted_or_tombstone() {
-                    return self.next_back();
-                }
-                return Some(Ok((
-                    ws_key.as_ref(),
-                    ws_entry.e.value.to_vec(),
-                    ws_entry.e.ts,
-                )));
-            }
-        }
-        None
-    }
+pub struct MergeIterator<'a> {
+    iterators: Vec<BoxedIterator<'a>>,
+    // Heap of iterators, ordered by their current key
+    heap: BinaryHeap<HeapItem>,
+    // Current key we're processing, to skip duplicate versions
+    current_user_key: Option<Key>,
+    initialized: bool,
 }
 
-/// An iterator over the keys in the snapshot and write set.
-/// It does not add anything to the read set.
-pub(crate) struct KeyScanIterator<'a, R, I: Iterator> {
-    snap_iter: Peekable<I>,
-    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
-    limit: Option<usize>,
-    count: usize,
-    _phantom: PhantomData<R>,
-}
+impl<'a> MergeIterator<'a> {
+    pub fn new(iterators: Vec<BoxedIterator<'a>>) -> Self {
+        let heap = BinaryHeap::with_capacity(iterators.len());
 
-impl<'a, R, I: Iterator> KeyScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    pub(crate) fn new(
-        write_set: &'a WriteSet,
-        snap_iter: I,
-        range: &R,
-        limit: Option<usize>,
-    ) -> Self {
-        let range_bytes = convert_range_bounds_bytes(range);
-        KeyScanIterator {
-            snap_iter: snap_iter.peekable(),
-            write_set_iter: write_set.range(range_bytes).peekable(),
-            limit,
-            count: 0,
-            _phantom: PhantomData,
-        }
-    }
-
-    fn read_from_snapshot(&mut self) -> Option<&'a [u8]> {
-        self.snap_iter.next().map(|(key, ..)| key)
-    }
-
-    fn read_from_write_set(&mut self) -> Option<&'a [u8]> {
-        if let Some((ws_key, ws_entries)) = self.write_set_iter.next() {
-            if let Some(ws_entry) = ws_entries.last() {
-                if ws_entry.e.is_deleted_or_tombstone() {
-                    return self.next();
-                }
-                return Some(ws_key.as_ref());
-            }
-        }
-        None
-    }
-}
-
-impl<'a, R, I> Iterator for KeyScanIterator<'a, R, I>
-where
-    R: RangeBounds<VariableSizeKey>,
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(limit) = self.limit {
-            if self.count >= limit {
-                return None;
-            }
-        }
-
-        // Fast path when write set is empty
-        if self.write_set_iter.peek().is_none() {
-            let result = self.read_from_snapshot();
-            if result.is_some() {
-                self.count += 1;
-            }
-            return result;
-        }
-
-        // Determine which iterator has the next value
-        let has_snap = self.snap_iter.peek().is_some();
-        let has_ws = self.write_set_iter.peek().is_some();
-
-        let result = match (has_snap, has_ws) {
-            (false, false) => None,
-            (true, false) => self.read_from_snapshot(),
-            (false, true) => self.read_from_write_set(),
-            (true, true) => {
-                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
-                    (self.snap_iter.peek(), self.write_set_iter.peek())
-                {
-                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
-                        Ordering::Less => self.read_from_snapshot(),
-                        Ordering::Greater => self.read_from_write_set(),
-                        Ordering::Equal => {
-                            self.snap_iter.next(); // Skip snapshot entry
-                            self.read_from_write_set()
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-        };
-
-        if result.is_some() {
-            self.count += 1;
-        }
-        result
-    }
-}
-
-/// An iterator that returns all versions of keys within a given range.
-/// For each key, it returns all versions before moving to the next key.
-/// Optionally limits the number of unique keys returned.
-pub struct VersionScanIterator<'a, I: Iterator> {
-    snap_iter: Peekable<I>,
-    current_key_versions: VecDeque<(&'a [u8], Vec<u8>, u64, bool)>,
-    unique_keys_count: usize,
-    current_key: Option<&'a [u8]>, // Track current key to detect changes
-    limit: Option<usize>,
-    core: &'a Core,
-}
-
-impl<'a, I: Iterator> VersionScanIterator<'a, I>
-where
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    pub(crate) fn new(core: &'a Core, snap_iter: I, limit: Option<usize>) -> Self {
         Self {
-            snap_iter: snap_iter.peekable(),
-            current_key_versions: VecDeque::new(),
-            unique_keys_count: 0,
-            current_key: None,
-            limit,
-            core,
+            iterators,
+            heap,
+            current_user_key: None,
+            initialized: false,
+        }
+    }
+
+    fn initialize(&mut self) {
+        // Pull the first item from each iterator and add to heap
+        for (idx, iter) in self.iterators.iter_mut().enumerate() {
+            if let Some((key, value)) = iter.next() {
+                self.heap.push(HeapItem {
+                    key,
+                    value,
+                    iterator_index: idx,
+                });
+            }
+        }
+        self.initialized = true;
+    }
+}
+
+impl Iterator for MergeIterator<'_> {
+    type Item = (Arc<InternalKey>, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.initialized {
+            self.initialize();
+        }
+
+        loop {
+            // Get the smallest item from the heap
+            let heap_item = self.heap.pop()?;
+
+            // Pull the next item from the same iterator and add back to heap
+            if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
+                self.heap.push(HeapItem {
+                    key,
+                    value,
+                    iterator_index: heap_item.iterator_index,
+                });
+            }
+
+            let user_key = heap_item.key.user_key.clone();
+
+            // Check if this is a new user key
+            let is_new_key = match &self.current_user_key {
+                None => true,
+                Some(current) => &user_key != current,
+            };
+
+            if is_new_key {
+                // New user key - update tracking and return this item
+                self.current_user_key = Some(user_key);
+                return Some((heap_item.key, heap_item.value));
+            } else {
+                // Same user key - skip this older version and continue to next
+                continue;
+            }
         }
     }
 }
 
-impl<'a, I> Iterator for VersionScanIterator<'a, I>
-where
-    I: Iterator<Item = SnapItem<'a>>,
-{
-    type Item = Result<ScanVersionResult<'a>>;
+pub struct CompactionIterator<'a> {
+    merge_iter: MergeIterator<'a>,
+    is_bottom_level: bool,
+
+    // Track tombstone status
+    current_user_key: Option<Key>,
+    current_key_has_tombstone: bool,
+    /// Collected discard statistics: file_id -> total_discarded_bytes
+    pub discard_stats: HashMap<u64, i64>,
+}
+
+impl<'a> CompactionIterator<'a> {
+    pub fn new(merge_iter: MergeIterator<'a>, is_bottom_level: bool) -> Self {
+        Self {
+            merge_iter,
+            is_bottom_level,
+            current_user_key: None,
+            current_key_has_tombstone: false,
+            discard_stats: HashMap::new(),
+        }
+    }
+}
+
+impl Iterator for CompactionIterator<'_> {
+    type Item = (Arc<InternalKey>, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Return any pending versions first
-        if let Some(version) = self.current_key_versions.pop_front() {
-            return Some(Ok(version));
-        }
+        for (key, value) in self.merge_iter.by_ref() {
+            let user_key = key.user_key.clone();
+            let is_tombstone = key.kind() == InternalKeyKind::Delete;
 
-        // Get next item
-        let next_item = self.snap_iter.next()?;
-        let (key, value, _, ts) = next_item;
+            // Check if this is a new key
+            let is_new_key = match &self.current_user_key {
+                None => true,
+                Some(current) => &user_key != current,
+            };
 
-        // Check if this is a new key
-        if self.current_key != Some(key) {
-            self.current_key = Some(key);
-            self.unique_keys_count += 1;
+            // Determine if this entry should be marked as stale in VLog
+            let should_mark_stale = if is_new_key {
+                // New key: mark stale if it's a tombstone being removed at bottom level
+                is_tombstone && self.is_bottom_level
+            } else {
+                // Same key, older version: mark stale if we've seen a tombstone for this key
+                self.current_key_has_tombstone
+            };
 
-            // Check limit
-            if let Some(limit) = self.limit {
-                if self.unique_keys_count > limit {
-                    return None;
+            // Collect discard statistics instead of immediately updating VLog
+            if should_mark_stale {
+                collect_vlog_discard_stats(&mut self.discard_stats, &value).unwrap();
+            }
+
+            if is_new_key {
+                // Reset tracking for the new key
+                self.current_user_key = Some(user_key.clone());
+                self.current_key_has_tombstone = is_tombstone;
+
+                // At the bottom level, skip tombstones
+                if is_tombstone && self.is_bottom_level {
+                    continue;
                 }
+
+                // Return this entry
+                return Some((key, value));
+            } else {
+                // Update tombstone status for same key
+                if is_tombstone {
+                    self.current_key_has_tombstone = true;
+                }
+
+                // Skip this entry - older version
+                continue;
             }
         }
 
-        // Process version
-        let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
-        match value.resolve(self.core) {
-            Ok(v) => {
-                // Add first version
-                self.current_key_versions
-                    .push_back((key, v, ts, is_deleted));
+        None
+    }
+}
 
-                // Collect all other versions for this key
-                while let Some(&(next_key, value, _, ts)) = self.snap_iter.peek() {
-                    if next_key != key {
-                        break;
-                    }
-                    // Consume the peeked item
-                    self.snap_iter.next();
-                    let is_deleted = value.metadata().is_some_and(|md| md.is_tombstone());
-                    if let Ok(v) = value.resolve(self.core) {
-                        self.current_key_versions
-                            .push_back((key, v, ts, is_deleted));
-                    }
-                }
+fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u64, i64>, value: &Value) -> Result<()> {
+    // Check if this value is a VLog pointer
+    if let Some(pointer) = crate::vlog::ValuePointer::try_decode(value)? {
+        let value_data_size = pointer.total_entry_size() as i64;
+        *discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
+    }
+    Ok(())
+}
 
-                // The next iteration will handle returning the first version
-                self.next()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sstable::{InternalKey, InternalKeyKind},
+        Value,
+    };
+    use std::sync::Arc;
+
+    fn create_internal_key(
+        user_key: &str,
+        sequence: u64,
+        kind: InternalKeyKind,
+    ) -> Arc<InternalKey> {
+        InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind).into()
+    }
+
+    // Creates a mock iterator with predefined entries
+    struct MockIterator {
+        items: Vec<(Arc<InternalKey>, Value)>,
+        index: usize,
+    }
+
+    impl MockIterator {
+        fn new(items: Vec<(Arc<InternalKey>, Value)>) -> Self {
+            Self { items, index: 0 }
+        }
+    }
+
+    impl Iterator for MockIterator {
+        type Item = (Arc<InternalKey>, Value);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.index < self.items.len() {
+                let item = self.items[self.index].clone();
+                self.index += 1;
+                Some(item)
+            } else {
+                None
             }
-            Err(e) => Some(Err(e)),
+        }
+    }
+
+    impl DoubleEndedIterator for MockIterator {
+        fn next_back(&mut self) -> Option<Self::Item> {
+            if self.index < self.items.len() {
+                let item = self.items.pop()?;
+                Some(item)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_iterator_sequence_ordering() {
+        // First iterator (L0) with tombstones for even keys
+        let mut items1 = Vec::new();
+        for i in 0..10 {
+            if i % 2 == 0 {
+                // Tombstone for even keys
+                let key =
+                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                let empty_value: Vec<u8> = Vec::new();
+                items1.push((key, empty_value.into()));
+            }
+        }
+
+        // Second iterator (L1) with values for all keys
+        let mut items2 = Vec::new();
+        for i in 0..20 {
+            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{}", i);
+            let value_vec: Vec<u8> = value_str.into_bytes();
+            items2.push((key, value_vec.into()));
+        }
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        // Create the merge iterator
+        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
+
+        // Collect all items
+        let mut result = Vec::new();
+        for (key, _) in merge_iter {
+            let key_str = String::from_utf8_lossy(&key.user_key).to_string();
+            let seq = key.seq_num();
+            let kind = key.kind();
+            result.push((key_str, seq, kind));
+        }
+
+        // Now verify the output
+
+        // 1. First, check that all keys are in ascending order by user key
+        for i in 1..result.len() {
+            assert!(
+                result[i - 1].0 <= result[i].0,
+                "Keys not in ascending order: {} vs {}",
+                result[i - 1].0,
+                result[i].0
+            );
+        }
+
+        // 2. Check that for keys with tombstones, the tombstone comes first
+        for i in 0..10 {
+            if i % 2 == 0 {
+                // Find this key in the result
+                let key = format!("key-{:03}", i);
+                let entries: Vec<_> = result.iter().filter(|(k, _, _)| k == &key).collect();
+
+                // Should only have one entry per key due to deduplication
+                assert_eq!(entries.len(), 1, "Key {} has multiple entries", key);
+
+                // And it should be the tombstone (seq=200, kind=Delete)
+                let (_, seq, kind) = entries[0];
+                assert_eq!(*seq, 200, "Key {} has wrong sequence", key);
+                assert_eq!(*kind, InternalKeyKind::Delete, "Key {} has wrong kind", key);
+            }
+        }
+
+        // 3. Check that we have the correct total number of entries
+        // All keys (20) because we get 5 keys with tombstones from items1 and 15 other keys from items2
+        assert_eq!(result.len(), 20, "Wrong number of entries");
+    }
+
+    #[test]
+    fn test_compaction_iterator_tombstone_filtering() {
+        let mut items1 = Vec::new();
+        for i in 0..10 {
+            if i % 2 == 0 {
+                // Tombstone for even keys
+                let key =
+                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                let empty_value: Vec<u8> = Vec::new();
+                items1.push((key, empty_value.into()));
+            }
+        }
+
+        let mut items2 = Vec::new();
+        for i in 0..20 {
+            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{}", i);
+            let value_vec: Vec<u8> = value_str.into_bytes();
+            items2.push((key, value_vec.into()));
+        }
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        // Create the merge iterator
+        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
+
+        // Test non-bottom level (should keep tombstones)
+        let comp_iter = CompactionIterator::new(merge_iter, false);
+
+        // Collect all items
+        let mut result = Vec::new();
+        for (key, _) in comp_iter {
+            let key_str = String::from_utf8_lossy(&key.user_key).to_string();
+            let seq = key.seq_num();
+            let kind = key.kind();
+            result.push((key_str, seq, kind));
+        }
+
+        // Now verify the output
+
+        // 1. Verify all keys are in ascending order (important for block writer)
+        for i in 1..result.len() {
+            assert!(
+                result[i - 1].0 <= result[i].0,
+                "Keys not in ascending order: {} vs {}",
+                result[i - 1].0,
+                result[i].0
+            );
+        }
+
+        // 2. For even keys (0, 2, 4...), we should have tombstones
+        for entry in &result {
+            let (key, seq, kind) = entry;
+
+            // Extract key number
+            let key_num = key.strip_prefix("key-").unwrap().parse::<i32>().unwrap();
+
+            if key_num % 2 == 0 && key_num < 10 {
+                // Even keys under 10 should be tombstones with seq=200
+                assert_eq!(*seq, 200, "Even key {} has wrong sequence", key);
+                assert_eq!(
+                    *kind,
+                    InternalKeyKind::Delete,
+                    "Even key {} has wrong kind",
+                    key
+                );
+            } else {
+                // Odd keys and even keys >= 10 should be values with seq=100
+                assert_eq!(*seq, 100, "Key {} has wrong sequence", key);
+                assert_eq!(*kind, InternalKeyKind::Set, "Key {} has wrong kind", key);
+            }
+        }
+
+        // 3. Test bottom level (should drop tombstones)
+        let mut items1 = Vec::new();
+        for i in 0..10 {
+            if i % 2 == 0 {
+                // Tombstone for even keys
+                let key =
+                    create_internal_key(&format!("key-{:03}", i), 200, InternalKeyKind::Delete);
+                // Create empty Vec<u8> and wrap it in Arc for tombstone value
+                let empty_value: Vec<u8> = Vec::new();
+                items1.push((key, empty_value.into()));
+            }
+        }
+
+        let mut items2 = Vec::new();
+        for i in 0..20 {
+            let key = create_internal_key(&format!("key-{:03}", i), 100, InternalKeyKind::Set);
+            let value_str = format!("value-{}", i);
+            let value_vec: Vec<u8> = value_str.into_bytes();
+            items2.push((key, value_vec.into()));
+        }
+
+        let iter1 = Box::new(MockIterator::new(items1));
+        let iter2 = Box::new(MockIterator::new(items2));
+
+        // Create the merge iterator
+        let merge_iter = MergeIterator::new(vec![iter1, iter2]);
+
+        // Use bottom level
+        let comp_iter = CompactionIterator::new(merge_iter, true);
+
+        // Collect all items
+        let mut bottom_result = Vec::new();
+        for (key, _) in comp_iter {
+            let key_str = String::from_utf8_lossy(&key.user_key).to_string();
+            bottom_result.push(key_str);
+        }
+
+        // At bottom level, tombstones should be removed
+        for i in 0..20 {
+            let key = format!("key-{:03}", i);
+
+            if i % 2 == 0 && i < 10 {
+                // Even keys under 10 should be removed due to tombstones
+                assert!(
+                    !bottom_result.contains(&key),
+                    "Key {} should be removed at bottom level",
+                    key
+                );
+            } else {
+                // Other keys should remain
+                assert!(
+                    bottom_result.contains(&key),
+                    "Key {} should exist at bottom level",
+                    key
+                );
+            }
         }
     }
 }
