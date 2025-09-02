@@ -2,182 +2,160 @@
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
-surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust. It offers the following features:
+> **⚠️ Development Status**: SurrealKV is currently under active development and is not feature complete. The API and implementation may change significantly between versions. Use with caution in production environments.
+
+surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust using an LSM (Log-Structured Merge) tree architecture. It offers the following features:
 
 ## Features
 
 - ✨ **ACID Compliance**: Full support for Atomicity, Consistency, Isolation, and Durability
 - 🔄 **Rich Transaction Support**: Atomic operations for multiple inserts, updates, and deletes
-- 🔒 **Isolation Levels**: Choose between Snapshot Isolation and Serializable Snapshot Isolation
+- 🔒 **Isolation Level**: Supports Snapshot Isolation
 - 💾 **Durability Guaranteed**: Persistent storage with protection against system failures
 - 📦 **Embedded Database**: Easily integrate into your Rust applications
-- 🔄 **MVCC Support**: Non-blocking concurrent reads and writes using [versioned adaptive radix trie](https://github.com/surrealdb/vart)
-- 📚 **Built-in Versioning**: Track and access historical versions of your data
-- 🗜️ **Compaction**: Efficient storage management through compaction
-
-## Platform Compatibility
-
-### ✅ Supported Platforms
-- **Linux** (x86_64, aarch64): Full support including all features and tests
-- **macOS** (x86_64, aarch64): Full support including all features and tests
-
-### ❌ Not Supported
-- **WebAssembly (WASM)**: Not supported due to fundamental incompatibilities:
-  - Requires file system access not available in WASM environments
-  - Write-Ahead Log (WAL) and Value Log (VLog) operations are not compatible
-  - System-level I/O operations are not available
-
-- **Windows** (x86_64): Basic functionality supported, but some features are limited:
-  - File operations are not thread safe (TODO)
-  - Some advanced file system operations may have reduced functionality
-  - Performance may be lower compared to Unix-like systems
+- 🔄 **MVCC Support**: Non-blocking concurrent reads and writes with snapshot isolation
+- 📚 [TODO] **Built-in Versioning**: Track and access historical versions of your data
 
 ## Quick Start
 
 ```rust
-use surrealkv::{Store, Options};
-use bytes::Bytes;
+use surrealkv::{Tree, Options};
+use std::sync::Arc;
 
-// Create a new store
-let mut opts = Options::new();
-opts.dir = "path/to/db".into();
-let store = Store::new(opts).expect("failed to create store");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a new LSM tree
+    let mut opts = Options::new();
+    opts.path = "path/to/db".into();
+    let tree = Tree::new(Arc::new(opts))?;
 
-// Start a read-write transaction
-let mut txn = store.begin().unwrap();
+    // Start a read-write transaction
+    let mut txn = tree.begin()?;
 
-// Set some key-value pairs
-let key = Bytes::from("hello");
-let value = Bytes::from("world");
-txn.set(&key, &value).unwrap();
+    // Set some key-value pairs
+    let key = b"hello";
+    let value = b"world";
+    txn.set(key, value)?;
 
-// Commit the transaction
-txn.commit().unwrap();
+    // Commit the transaction (async)
+    txn.commit().await?;
+
+    Ok(())
+}
 ```
 
 ## Configuration
 
-SurrealKV can be configured through various options when creating a new store:
+SurrealKV can be configured through various options when creating a new LSM tree:
 
 ```rust
-let mut opts = Options::new();
+use surrealkv::{Tree, Options};
+use std::sync::Arc;
 
-// Required configuration
-opts.dir = "path/to/db".into();                    // Database directory path
+let opts = Options::new()
+    .with_path("path/to/db")                    // Database directory path
+    .with_max_memtable_size(100 * 1024 * 1024)  // 100MB memtable size
+    .with_block_size(4096)                      // 4KB block size
+    .with_level_count(7)                        // Number of levels in LSM tree
+    .with_vlog_value_threshold(4096)            // Values smaller than this stored inline
+    .with_vlog_max_file_size(128 * 1024 * 1024) // 128MB VLog file size
+    .with_disable_vlog(false);                  // Enable/disable VLog
 
-// Storage configuration
-opts.disk_persistence = true;                       // false for in-memory only operation
-opts.max_value_threshold = 4096;                    // Values smaller than this stored in memory
-opts.max_segment_size = 268_435_456;               // 256MB segment size
-opts.max_compaction_segment_size = 1_073_741_824;  // 1GB max compaction segment
-
-// Transaction and versioning
-opts.isolation_level = IsolationLevel::Snapshot;    // Controls transaction isolation
-opts.enable_versions = true;                        // Enable/disable versioning
-
-// Cache settings
-opts.max_value_cache_size = 10000;            // Number of values that can be cached to avoid disk lookups
-
-let store = Store::new(opts).expect("failed to create store");
+let tree = Tree::new(Arc::new(opts))?;
 ```
 
 ### Storage Options
 
-- `disk_persistence`: Controls whether data is persisted to disk or kept only in memory
-- `max_value_threshold`: Values within this size are stored and served directly from memory
-- `max_segment_size`: Controls when new log segments are created, affects compaction frequency
+- `path`: Database directory path where SSTables and WAL files are stored
+- `max_memtable_size`: Size threshold for memtable before flushing to SSTable
+- `block_size`: Size of data blocks in SSTables (affects read performance)
+- `level_count`: Number of levels in the LSM tree structure
 
-### Transaction Options
+### VLog Options
 
-- `isolation_level`: Choose between Snapshot Isolation and Serializable Snapshot Isolation
-- `enable_versions`: Toggle version tracking functionality, disable for pure key-value usage
+- `vlog_value_threshold`: Values smaller than this are stored inline in SSTables
+- `vlog_max_file_size`: Maximum size of VLog files before rotation
+- `disable_vlog`: Enable/disable Value Log for large value storage
+- `vlog_gc_discard_ratio`: Threshold for triggering VLog garbage collection
 
 ### Performance Options
 
-- `max_value_cache_size`: Controls the size of value cache, affects read performance for frequently accessed values
+- `block_cache`: Cache for frequently accessed data blocks
+- `vlog_cache`: Cache for VLog entries to reduce disk I/O
 
 ## Transaction Operations
 
 ### Basic Operations
 
 ```rust
-use surrealkv::{Store, Options};
-use bytes::Bytes;
+use surrealkv::{Tree, Options};
+use std::sync::Arc;
 
-// Initialize the store
-let mut opts = Options::new();
-opts.dir = "path/to/db".into();
-let store = Store::new(opts).expect("failed to create store");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize the LSM tree
+    let mut opts = Options::new();
+    opts.path = "path/to/db".into();
+    let tree = Tree::new(Arc::new(opts))?;
 
-// Write Transaction
-{
-    let mut txn = store.begin().unwrap();
-    
-    // Set multiple key-value pairs
-    let key1 = Bytes::from("foo1");
-    let key2 = Bytes::from("foo2");
-    let value = Bytes::from("bar");
-    
-    txn.set(&key1, &value).unwrap();
-    txn.set(&key2, &value).unwrap();
-    
-    // Commit changes
-    txn.commit().unwrap();
-}
-
-// Read Transaction
-{
-    let mut txn = store.begin().unwrap();
-    
-    let key = Bytes::from("foo1");
-    if let Some(value) = txn.get(&key).unwrap() {
-        println!("Value: {:?}", value);
+    // Write Transaction
+    {
+        let mut txn = tree.begin()?;
+        
+        // Set multiple key-value pairs
+        txn.set(b"foo1", b"bar")?;
+        txn.set(b"foo2", b"bar")?;
+        
+        // Commit changes (async)
+        txn.commit().await?;
     }
+
+    // Read Transaction
+    {
+        let txn = tree.begin()?;
+        
+        if let Some(value) = txn.get(b"foo1")? {
+            println!("Value: {:?}", value);
+        }
+    }
+
+    Ok(())
 }
-
-// Close the store when done
-store.close().unwrap();
-```
-
-### Versioned Operations
-
-```rust
-// Get value at specific timestamp
-let value = tx.get_at_version(b"key1", timestamp)?;
-
-// Get complete history of a key
-let history = tx.get_all_versions(b"key1")?;
-
-// Scan range at specific timestamp
-let range = b"start"..b"end";
-let results = tx.scan_at_version(range, timestamp, Some(10));
-```
-
-### Transaction Control
-
-```rust
-// Set a savepoint
-tx.set_savepoint()?;
-
-// Make some changes
-tx.set(b"key", b"value")?;
-
-// Rollback to savepoint if needed
-tx.rollback_to_savepoint()?;
-
-// Or rollback entire transaction
-tx.rollback();
 ```
 
 ### Range Operations
 
 ```rust
-// Scan a range of keys
-let range = b"start"..b"end";
-let results = tx.scan(range, Some(10));
+// Range scan between keys
+let mut txn = tree.begin()?;
+let range: Vec<_> = txn.range(b"key1", b"key5", None)?
+    .map(|r| r.unwrap())
+    .collect();
 
-// Scan all versions in a range
-let all_versions = tx.scan_all_versions(range, Some(10));
+// Keys-only scan (more efficient for large values)
+let keys: Vec<_> = txn.keys(b"key1", b"key5", None)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Delete a key
+txn.delete(b"key1")?;
+txn.commit().await?;
+```
+
+### Transaction Control
+
+```rust
+// Read-only transaction
+let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+
+// Write-only transaction
+let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
+
+// Rollback transaction
+txn.rollback();
+
+// Set durability level
+txn.set_durability(Durability::Immediate);
 ```
 
 ## Advanced Features
@@ -197,280 +175,62 @@ tx.set_durability(Durability::Eventual);
 tx.set_durability(Durability::Immediate);
 ```
 
-### Custom Queries
+### Read-Your-Own-Writes (RYOW)
 
 ```rust
-// Use custom query types for specific lookups
-let result = tx.get_value_by_query(&key, QueryType::LatestByTs)?;
+// RYOW semantics: Read your own writes within the same transaction
+let mut txn = tree.begin()?;
+txn.set(b"key1", b"value1")?;
+
+// This will return the value written above, even though not yet committed
+if let Some(value) = txn.get(b"key1")? {
+    println!("Value: {:?}", value); // Prints "value1"
+}
+
+txn.commit().await?;
 ```
 
-## Implementation Details
+## Platform Compatibility
 
-### Architecture
+### ✅ Supported Platforms
+- **Linux** (x86_64, aarch64): Full support including all features and tests
+- **macOS** (x86_64, aarch64): Full support including all features and tests
 
-SurrealKV implements a two-component architecture:
+### ❌ Not Supported
+- **WebAssembly (WASM)**: Not supported due to fundamental incompatibilities:
+  - Requires file system access not available in WASM environments
+  - Write-Ahead Log (WAL) and Value Log (VLog) operations are not compatible
+  - System-level I/O operations are not available
 
-1. **Index Component**
-   - In-memory versioned adaptive radix trie using [vart](https://github.com/surrealdb/vart)
-   - Stores key-to-offset mappings for each version of the key
+- **Windows** (x86_64): Basic functionality supported, but some features are limited:
+  - File operations are not thread safe (TODO)
+  - Some advanced file system operations may have reduced functionality
+  - Performance may be lower compared to Unix-like systems
 
-2. **Log Component**
-   - Sequential append-only storage divided into segments
-   - Each segment is a separate file with a monotonically increasing ID
-   - Active segment receives all new writes
-   - Older segments are immutable and candidates for compaction
-   - Records stored in the binary format described below
-   - Sequential writes for optimal write performance
-   - No in-place updates
+## History
 
-### Data Operations
+SurrealKV has undergone a significant architectural evolution to address scalability challenges:
 
-1. **Write Path**
-   - Serialize record in binary format
-   - Append to log file
-   - Update index with new offset
+### Previous Design (VART-based)
+The original implementation used a **versioned adaptive radix trie (VART)** architecture with the following components:
 
-2. **Read Path**
-   - Query index for file offset
-   - Seek to file position
-   - Deserialize record
+- **In-Memory Index**: Versioned adaptive radix trie using [vart](https://github.com/surrealdb/vart) for key-to-offset mappings
+- **Sequential Log Storage**: Append-only storage divided into segments with binary record format
+- **Memory Limitations**: The entire index had to reside in memory, limiting scalability for large datasets
 
-3. **Compaction Process**
-   - Identify obsolete records
-   - Copy valid records to new file
-   - Update index references
-   - Remove old log file
+**Why the Change?**
+The VART-based design had fundamental scalability limitations:
+- **Memory Constraint**: The entire index must fit in memory, making it unsuitable for datasets larger than available RAM
+- **Recovery Overhead**: Startup required scanning all log segments to rebuild the in-memory index
+- **Write Amplification**: Each update created new versions, leading to memory pressure
 
-4. **Recovery Process**
-   - Sequential scan of all log segments during startup
-   - Reconstruction of in-memory index from log entries
-   - Startup time directly proportional to:
-     * Total size of all segments
-     * Number of unique keys and versions
+### Current Design (LSM Tree)
+The new LSM (Log-Structured Merge) tree architecture provides:
 
+- **Efficient Compaction**: Leveled compaction strategy for optimal space utilization
+- **Better Scalability**: Supports datasets much larger than available memory
 
-### Storage Format
-
-SurrealKV stores records on disk in a strictly defined binary format:
-
-```
-Record Layout:
-|----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
-| crc32(4) | version(2) | tx_id(8)   | ts(8)   | metadata_len(2) | metadata   | key_len(4) | key | value_len(4) | value |
-|----------|------------|------------|---------|-----------------|------------|------------|-----|--------------|-------|
-```
-
-Each field serves a specific purpose:
-- `crc32`: 4-byte checksum for data integrity verification
-- `version`: 2-byte format version identifier
-- `tx_id`: 8-byte transaction identifier
-- `ts`: 8-byte timestamp
-- `metadata_len`: 2-byte length of metadata section
-- `metadata`: Variable-length metadata
-- `key_len`: 4-byte length of key
-- `key`: Variable-length key data
-- `value_len`: 4-byte length of value
-- `value`: Variable-length value data
-
-
-### MVCC Implementation
-
-The Multi-Version Concurrency Control system allows:
-- Multiple concurrent readers without blocking
-- Multiple concurrent writers without blocking
-- Snapshot isolation for consistent reads
-
-
-## Performance Characteristics and Trade-offs
-
-### Strengths
-
-1. **Latency Characteristics**
-   - Constant-time retrieval operations due to direct offset lookups
-   - Write latency bound by sequential I/O performance
-   - Minimal disk seeks during normal operation
-
-2. **Throughput Properties**
-   - Sequential write patterns maximize I/O bandwidth utilization
-   - Concurrent read operations scale with available CPU cores
-   - Range queries benefit from trie's prefix-based organization
-
-3. **Recovery Semantics**
-   - Initial startup requires full segment scan to rebuild index
-   - Recovery time proportional to total size of all segments
-   - Repair time proportional to size of last active segment
-   - CRC verification ensures data integrity during recovery
-   - Partial write detection:
-     * Uses CRC32 calculated from the record fields to detect truncated writes
-     * Identifies and truncates incomplete records during recovery
-     * Transaction logs are recovered to the last valid record boundary
-
-
-4. **Operational Advantages**
-   - Compaction process runs concurrently with normal operations
-   - Append-only format simplifies replication procedures
-
-### Limitations
-
-1. **Memory Requirements**
-   - Index must reside in memory
-   - Memory usage scales with:
-     * Number of unique keys
-     * Key size distribution
-     * Number of versions per key
-
-2. **Write Amplification**
-   - Each update creates new version
-   - Requires periodic compaction
-   - Space usage temporarily increases during compaction
-
-3. **Range Query Performance**
-   - Performance dependent on:
-     * Key distribution
-     * Version history depth
-     * Range size
-   - May require multiple disk reads for large ranges
-
-4. **Operational Considerations**
-   - Compaction necessary for space reclamation
-   - Restart time increases with log size
-   - Memory pressure in high-cardinality keyspaces
-
-### Performance Implications
-
-1. **Optimal Use Cases**
-   - Write-intensive workloads
-   - Point query dominated patterns
-   - Prefix-based access patterns
-   - Time-series data with version tracking
-
-2. **Suboptimal Scenarios**
-   - Memory-constrained environments
-   - Very large key spaces
-   - Scan-heavy workloads
-   - Random updates to large datasets
-
-## Benchmarks
-
-### Key-Value Operations Performance
-
-The following benchmarks measure single-operation latency across different key and value sizes.
-
-#### Sequential Insert Performance (μs)
-
-| Value Size | Key Size (bytes) ||||
-|------------|-----------|-----------|-----------|-----------|
-| (bytes)    | 8         | 32        | 128       | 256       |
-|------------|-----------|-----------|-----------|-----------|
-| 8          | 16.57     | 15.60     | 16.19     | 16.61     |
-| 256        | 16.44     | 16.21     | 16.82     | 16.60     |
-| 1024       | 17.71     | 18.12     | 18.01     | 18.17     |
-| 4096       | 25.47     | 26.67     | 26.92     | 26.55     |
-
-#### Random Insert Performance (μs)
-
-| Value Size | Key Size (bytes) ||||
-|------------|-----------|-----------|-----------|-----------|
-| (bytes)    | 8         | 32        | 128       | 256       |
-|------------|-----------|-----------|-----------|-----------|
-| 8          | 19.55     | 19.01     | 20.84     | 19.99     |
-| 256        | 20.07     | 19.33     | 21.58     | 21.16     |
-| 1024       | 20.18     | 20.60     | 22.65     | 20.45     |
-| 4096       | 24.08     | 22.73     | 24.39     | 23.24     |
-
-#### Range Scan Performance
-
-| Number of Keys | Key Size (bytes) | Value Size (bytes) | Latency (μs)
-|---------------|------------------|-------------------|--------------|
-| 100           | 4 (u32)          | 100               | 7.01         |
-| 1,000         | 4 (u32)          | 100               | 71.92        |
-| 10,000        | 4 (u32)          | 100               | 823.29       |
-
-#### Concurrent Operations
-
-##### Multi-threaded Insert Performance
-Configuration:
-- Key size: 16 bytes
-- Value size: 32 bytes
-- Dataset size: 5MB
-
-| Thread Count | Latency (ms) | Throughput (K ops/sec) |
-|--------------|-------------|----------------------|
-| 1            | 1,055.6     | 94.7                |
-| 2            | 739.3       | 135.3               |
-| 4            | 589.8       | 169.6               |
-
-
-All benchmarks were performed with:
-- Durability: Eventual
-- Disk persistence: Enabled
-
-
-### Startup Performance
-
-SurrealKV rebuilds its index from log segments during startup. The following benchmarks demonstrate how different factors affect startup performance.
-
-#### Impact of Key-Value Sizes on Load Time
-
-This benchmark shows how different key-value size combinations affect load time and storage size (1M entries each):
-
-| Key Size | Value Size | Distribution | Load Time (s) | Store Size (GB) |
-|----------|------------|--------------|---------------|-----------------|
-| 32       | 64        | Sequential   | 0.61         | 0.12           |
-| 32       | 64        | Random       | 0.70         | 0.12           |
-| 32       | 256       | Sequential   | 0.74         | 0.30           |
-| 32       | 256       | Random       | 0.83         | 0.30           |
-| 32       | 1024      | Sequential   | 1.13         | 1.01           |
-| 32       | 1024      | Random       | 1.43         | 1.01           |
-| 32       | 4096      | Sequential   | 2.85         | 3.87           |
-| 32       | 4096      | Random       | 2.82         | 3.87           |
-| 32       | 16384     | Sequential   | 8.63         | 15.32          |
-| 32       | 16384     | Random       | 8.99         | 15.32          |
-| 32       | 65536     | Sequential   | 31.04        | 61.09          |
-| 32       | 65536     | Random       | 31.79        | 61.09          |
-| 128      | 64        | Sequential   | 0.63         | 0.21           |
-| 128      | 64        | Random       | 0.64         | 0.21           |
-| 128      | 256       | Sequential   | 0.68         | 0.39           |
-| 128      | 256       | Random       | 0.81         | 0.39           |
-| 128      | 1024      | Sequential   | 1.10         | 1.10           |
-| 128      | 1024      | Random       | 1.31         | 1.10           |
-| 128      | 4096      | Sequential   | 2.95         | 3.96           |
-| 128      | 4096      | Random       | 3.01         | 3.96           |
-| 128      | 16384     | Sequential   | 8.67         | 15.41          |
-| 128      | 16384     | Random       | 8.91         | 15.41          |
-| 128      | 65536     | Sequential   | 31.36        | 61.18          |
-| 128      | 65536     | Random       | 31.47        | 61.18          |
-| 256      | 64        | Sequential   | 0.73         | 0.33           |
-| 256      | 64        | Random       | 0.71         | 0.33           |
-| 256      | 256       | Sequential   | 0.77         | 0.51           |
-| 256      | 256       | Random       | 0.91         | 0.51           |
-| 256      | 1024      | Sequential   | 1.22         | 1.22           |
-| 256      | 1024      | Random       | 1.29         | 1.22           |
-| 256      | 4096      | Sequential   | 3.11         | 4.08           |
-| 256      | 4096      | Random       | 3.03         | 4.08           |
-| 256      | 16384     | Sequential   | 8.81         | 15.53          |
-| 256      | 16384     | Random       | 9.12         | 15.53          |
-| 256      | 65536     | Sequential   | 31.42        | 61.30          |
-| 256      | 65536     | Random       | 32.66        | 61.30          |
-
-Key observations:
-- Load time scales roughly linearly with store size
-- Key and value size impact load time because each record's checksum is calculated based on their bytes, so an increase in size leads to an increase in time to calculate the checksum. However, the insertion into the index only stores the value offset against the key, which does not significantly affect load time.
-
-
-#### Impact of Version Count
-
-This benchmark demonstrates how the number of versions affects load time while maintaining a constant total entry count:
-
-| Versions | Keys    | Load Time (s) | Store Size (MB) |
-|----------|---------|---------------|-----------------|
-| 10       | 100,000 | 1.01         | 1,251.22       |
-| 100      | 10,000  | 0.97         | 1,251.22       |
-| 1,000    | 1,000   | 1.10         | 1,251.22       |
-
-Key observations:
-- Version count has minimal impact on load time when total data size remains constant
-
+This architectural change enables SurrealKV to handle large-scale datasets while maintaining ACID properties and high performance.
 
 ## License
 

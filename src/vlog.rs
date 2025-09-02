@@ -541,7 +541,7 @@ pub struct VLog {
 	discard_stats: Mutex<DiscardStats>,
 
 	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
-	pub(crate) global_delete_list: Arc<GlobalDeleteListLSM>,
+	pub(crate) global_delete_list: Arc<DeleteList>,
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
 	cache: Arc<VLogCache>,
@@ -568,7 +568,7 @@ impl VLog {
 			dir.parent().ok_or_else(|| Error::Other("VLog directory has no parent".to_string()))?;
 
 		// Initialize the global delete list LSM tree
-		let global_delete_list = Arc::new(GlobalDeleteListLSM::new(dir.clone())?);
+		let global_delete_list = Arc::new(DeleteList::new(dir.clone())?);
 
 		let vlog = Self {
 			path: dir.clone(),
@@ -1355,12 +1355,12 @@ impl VLogGCManager {
 /// Global Delete List using LSM Tree
 /// Uses a dedicated LSM tree for tracking stale user keys.
 /// This provides better performance and consistency with the main LSM tree design.
-pub struct GlobalDeleteListLSM {
+pub struct DeleteList {
 	/// LSM tree for storing delete list entries (user_key -> value_size)
-	delete_list_tree: Arc<Tree>,
+	tree: Arc<Tree>,
 }
 
-impl GlobalDeleteListLSM {
+impl DeleteList {
 	pub fn new(base_path: PathBuf) -> Result<Self> {
 		let delete_list_path = base_path.join("global_delete_list");
 
@@ -1372,13 +1372,13 @@ impl GlobalDeleteListLSM {
 			..Default::default()
 		};
 
-		let delete_list_tree =
+		let tree =
 			Arc::new(Tree::new(Arc::new(delete_list_opts)).map_err(|e| {
 				Error::Other(format!("Failed to create global delete list LSM: {e}"))
 			})?);
 
 		Ok(Self {
-			delete_list_tree,
+			tree,
 		})
 	}
 
@@ -1399,7 +1399,7 @@ impl GlobalDeleteListLSM {
 		}
 
 		// Commit the batch to the LSM tree using sync commit
-		self.delete_list_tree
+		self.tree
 			.sync_commit(batch, true)
 			.map_err(|e| Error::Other(format!("Failed to insert into delete list: {e}")))
 	}
@@ -1407,7 +1407,7 @@ impl GlobalDeleteListLSM {
 	/// Checks if a sequence number is in the delete list (stale)
 	pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
 		let tx = self
-			.delete_list_tree
+			.tree
 			.begin()
 			.map_err(|e| Error::Other(format!("Failed to begin transaction: {e}")))?;
 
@@ -1423,9 +1423,7 @@ impl GlobalDeleteListLSM {
 
 	/// Syncs the delete list to disk
 	pub fn sync(&self) -> Result<()> {
-		self.delete_list_tree
-			.flush()
-			.map_err(|e| Error::Other(format!("Failed to sync delete list: {e}")))?;
+		self.tree.flush().map_err(|e| Error::Other(format!("Failed to sync delete list: {e}")))?;
 		Ok(())
 	}
 
@@ -1445,7 +1443,7 @@ impl GlobalDeleteListLSM {
 		}
 
 		// Commit the batch to the LSM tree using sync commit
-		self.delete_list_tree
+		self.tree
 			.sync_commit(batch, true)
 			.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
 	}

@@ -45,7 +45,7 @@ impl Mode {
 	}
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 pub enum Durability {
 	/// Writes are buffered in OS page cache.
 	/// May lose recent commits on power failure but fast.
@@ -280,7 +280,8 @@ impl Transaction {
 		}
 
 		// Write the batch to storage
-		self.core.commit(batch, false).await?;
+		let sync_wal = self.durability == Durability::Immediate;
+		self.core.commit(batch, sync_wal).await?;
 
 		// Mark the transaction as closed
 		self.closed = true;

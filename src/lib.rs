@@ -46,7 +46,6 @@ pub enum VLogChecksumLevel {
 
 #[derive(Clone)]
 pub struct Options {
-	pub max_open_files: usize,
 	pub block_size: usize,
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
@@ -76,7 +75,6 @@ impl Default for Options {
 		let bf = LevelDBBloomFilter::new(10);
 
 		Options {
-			max_open_files: 1000,
 			block_size: 1 << 10,
 			block_restart_interval: 16,
 			comparator: Arc::new(crate::BytewiseComparator {}),
@@ -100,11 +98,6 @@ impl Default for Options {
 impl Options {
 	pub fn new() -> Self {
 		Options::default()
-	}
-
-	pub fn with_max_open_files(mut self, value: usize) -> Self {
-		self.max_open_files = value;
-		self
 	}
 
 	pub fn with_block_size(mut self, value: usize) -> Self {
