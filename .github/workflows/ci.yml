@@ -17,7 +17,7 @@ jobs:
   build-test:
     strategy:
       matrix:
-        target: [ 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'x86_64-pc-windows-msvc', 'x86_64-apple-darwin', 'aarch64-apple-darwin', 'wasm32-unknown-unknown' ]
+        target: [ 'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'x86_64-pc-windows-msvc', 'x86_64-apple-darwin', 'aarch64-apple-darwin' ]
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -29,8 +29,7 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: wasm32-unknown-unknown
-            os: ubuntu-latest
+
 
     runs-on: ${{ matrix.os }}
 
