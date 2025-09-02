@@ -54,7 +54,7 @@ jobs:
 
       - name: Run tests
         if: ${{ !contains(matrix.os, 'windows') }}
-        # Skip tests on Windows as compaction tests are not supported
+        # Skip tests on Windows as compaction tests and some file system operations are not supported
         run: make test
 
   ci:

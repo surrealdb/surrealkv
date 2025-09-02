@@ -15,6 +15,24 @@ surrealkv is a versioned, low-level, persistent, embedded key-value database imp
 - 📚 **Built-in Versioning**: Track and access historical versions of your data
 - 🗜️ **Compaction**: Efficient storage management through compaction
 
+## Platform Compatibility
+
+### ✅ Supported Platforms
+- **Linux** (x86_64, aarch64): Full support including all features and tests
+- **macOS** (x86_64, aarch64): Full support including all features and tests
+
+### ⚠️ Limited Support
+- **Windows** (x86_64): Basic functionality supported, but some features are limited:
+  - Compaction tests are not supported
+  - Some advanced file system operations may have reduced functionality
+  - Performance may be lower compared to Unix-like systems
+
+### ❌ Not Supported
+- **WebAssembly (WASM)**: Not supported due to fundamental incompatibilities:
+  - Requires file system access not available in WASM environments
+  - Write-Ahead Log (WAL) and Value Log (VLog) operations are not compatible
+  - System-level I/O operations are not available
+
 ## Quick Start
 
 ```rust
