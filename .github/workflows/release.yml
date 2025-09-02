@@ -63,26 +63,6 @@ jobs:
           git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
 
-      - name: Generate changelog
-        id: changelog
-        uses: orhun/git-cliff-action@v2
-        with:
-          config: cliff.toml
-          args: --verbose --latest --tag v${{ steps.version.outputs.version }}
-        env:
-          OUTPUT: CHANGELOG.md
-
-      - name: Commit changelog
-        run: |
-          if [[ -n $(git status --porcelain) ]]; then
-            git add CHANGELOG.md
-            git commit -m "chore(release): update changelog for ${{ steps.version.outputs.version }}"
-            git push origin HEAD
-            echo "Changes committed and pushed to branche"
-          else
-            echo "No changes to commit"
-          fi
-
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -93,7 +73,6 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
-          body_path: CHANGELOG.md
           draft: false
           prerelease: false
         env:
