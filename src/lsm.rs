@@ -264,14 +264,8 @@ impl CoreInner {
 
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
 	pub fn resolve_value(&self, value: &[u8]) -> Result<Value> {
-		// If VLog is disabled, values are always stored inline
-		if !self.is_vlog_enabled() {
-			return Ok(value.into());
-		}
-
-		let vlog = self.vlog.as_ref().unwrap();
 		let location = ValueLocation::decode(value)?;
-		location.resolve_value(Some(vlog))
+		location.resolve_value(self.vlog.as_ref())
 	}
 }
 
@@ -2404,6 +2398,274 @@ mod tests {
 
 		// --- Step 10: Clean shutdown ---
 		tree.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn test_sstable_lsn_bug() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Small memtable to force flushes
+			opts.level_count = 2;
+		});
+
+		// Step 1: Create database and write data for first table
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data for first table
+			for i in 0..6 {
+				let key = format!("batch_0_key_{:03}", i);
+				let value = format!("batch_0_value_{:03}", i);
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Force first flush
+			tree.flush().unwrap();
+
+			// Write data for second table
+			for i in 0..6 {
+				let key = format!("batch_1_key_{:03}", i);
+				let value = format!("batch_1_value_{:03}", i);
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Force second flush
+			tree.flush().unwrap();
+
+			// Verify all keys exist immediately after flush
+			for batch in 0..2 {
+				for i in 0..6 {
+					let key = format!("batch_{}_key_{:03}", batch, i);
+					let expected_value = format!("batch_{}_value_{:03}", batch, i);
+
+					let txn = tree.begin().unwrap();
+					let result = txn.get(key.as_bytes()).unwrap();
+					assert!(result.is_some(), "Key '{}' should exist immediately after flush", key);
+					assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+				}
+			}
+
+			// Close the database
+			tree.close().await.unwrap();
+		}
+
+		// Step 2: Reopen database and verify data persistence
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Verify all keys still exist after restart
+			for batch in 0..2 {
+				for i in 0..6 {
+					let key = format!("batch_{}_key_{:03}", batch, i);
+					let expected_value = format!("batch_{}_value_{:03}", batch, i);
+
+					let txn = tree.begin().unwrap();
+					let result = txn.get(key.as_bytes()).unwrap();
+					assert!(result.is_some(), "Key '{}' should exist after restart", key);
+					assert_eq!(result.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+				}
+			}
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn test_table_id_assignment_across_restart() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		// Create options with very small memtable to force frequent flushes
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Very small to force flushes
+			opts.level_count = 2;
+		});
+
+		// Step 1: Create initial database and write data for 2 memtables
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data for first table
+			for i in 0..6 {
+				let key = format!("batch_0_key_{:03}", i);
+				let value = format!("batch_0_value_{:03}", i);
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Force first flush to create first table
+			tree.flush().unwrap();
+
+			// Write data for second table
+			for i in 0..6 {
+				let key = format!("batch_1_key_{:03}", i);
+				let value = format!("batch_1_value_{:03}", i);
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Force second flush to create second table
+			tree.flush().unwrap();
+
+			// Verify we have 2 tables in L0
+			let l0_size =
+				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
+
+			// Get the table IDs from the first session
+			let manifest = tree.core.level_manifest.read().unwrap();
+			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
+			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+			let next_table_id = manifest.next_table_id();
+
+			// Verify table IDs are increasing (note: tables are stored in reverse order by sequence number)
+			// So the first table in the vector has the higher ID
+			assert!(
+				table1_id > table2_id,
+				"Table 1 ID should be greater than table 2 ID (newer table first)"
+			);
+			assert!(
+				table1_id < next_table_id,
+				"Next table ID should be greater than existing table IDs"
+			);
+
+			// Close the database
+			tree.close().await.unwrap();
+		}
+
+		// Step 2: Reopen the database
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			{
+				// Verify we still have 2 tables in L0 after reopening
+				let l0_size =
+					tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				assert_eq!(l0_size, 2, "Expected 2 tables in L0 after reopening, got {l0_size}");
+				// Get the table IDs after reopening
+				let manifest = tree.core.level_manifest.read().unwrap();
+				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
+				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+				let next_table_id = manifest.next_table_id();
+
+				// Verify table IDs are still in correct order (newer table first)
+				assert!(
+					table1_id > table2_id,
+					"Table 1 ID should be greater than table 2 ID (newer table first)"
+				);
+				assert!(
+					table1_id < next_table_id,
+					"Next table ID should be greater than existing table IDs after reopen"
+				);
+			}
+
+			// Step 3: Add more data to create a 3rd table
+			for i in 0..6 {
+				let key = format!("batch_2_key_{:03}", i);
+				let value = format!("batch_2_value_{:03}", i);
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Force flush to create the 3rd table
+			tree.flush().unwrap();
+
+			{
+				// Verify we now have 3 tables in L0
+				let l0_size =
+					tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				assert_eq!(
+					l0_size, 3,
+					"Expected 3 tables in L0 after adding more data, got {l0_size}"
+				);
+
+				// Get the table IDs from all 3 tables
+				let manifest = tree.core.level_manifest.read().unwrap();
+				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
+				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+				let table3_id = manifest.levels.get_levels()[0].tables[2].id;
+				let next_table_id = manifest.next_table_id();
+
+				// Verify table IDs are in correct order (newer tables first)
+				assert!(
+					table1_id > table2_id,
+					"Table 1 ID should be greater than table 2 ID (newer table first)"
+				);
+				assert!(
+					table2_id > table3_id,
+					"Table 2 ID should be greater than table 3 ID (newer table first)"
+				);
+				assert!(
+					table1_id < next_table_id,
+					"Next table ID should be greater than all existing table IDs"
+				);
+			}
+
+			// Verify we can read data from all tables
+			for batch in 0..3 {
+				for i in 0..6 {
+					let key = format!("batch_{}_key_{:03}", batch, i);
+					let expected_value = format!("batch_{}_value_{:03}", batch, i);
+
+					let txn = tree.begin().unwrap();
+					let result = txn.get(key.as_bytes()).unwrap();
+					assert!(result.is_some(), "Key '{}' should exist after restart", key);
+					assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+				}
+			}
+
+			// Close the database
+			tree.close().await.unwrap();
+		}
+
+		// Step 4: Final verification - reopen and check everything is still correct
+		{
+			let tree = Tree::new(opts).unwrap();
+
+			// Verify we still have 3 tables
+			let l0_size =
+				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			assert_eq!(l0_size, 3, "Expected 3 tables in L0 after final reopen, got {l0_size}");
+
+			// Verify table IDs are still in correct order (newer tables first)
+			let manifest = tree.core.level_manifest.read().unwrap();
+			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
+			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+			let table3_id = manifest.levels.get_levels()[0].tables[2].id;
+			let next_table_id = manifest.next_table_id();
+
+			assert!(
+				table1_id > table2_id,
+				"Final check: Table 1 ID should be greater than table 2 ID (newer table first)"
+			);
+			assert!(
+				table2_id > table3_id,
+				"Final check: Table 2 ID should be greater than table 3 ID (newer table first)"
+			);
+			assert!(
+				table1_id < next_table_id,
+				"Final check: Next table ID should be greater than all existing table IDs"
+			);
+
+			// Verify that we can read some data (simplified check)
+			let txn = tree.begin().unwrap();
+			let result = txn.get("batch_0_key_000".as_bytes()).unwrap();
+			assert!(result.is_some(), "Should be able to read at least one key");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

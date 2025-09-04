@@ -280,7 +280,7 @@ impl ValueLocation {
 
 	/// Resolves the actual value, handling both inline and pointer cases
 	// TODO:: Check if this pattern copies the value unnecessarily.
-	pub fn resolve_value(&self, vlog: Option<&VLog>) -> Result<Value> {
+	pub fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
 			// Value is a pointer to VLog
 			if let Some(vlog) = vlog {
@@ -1867,7 +1867,7 @@ mod tests {
 
 		// Should resolve with VLog
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved = decoded_location.resolve_value(Some(&vlog)).unwrap();
+		let resolved = decoded_location.resolve_value(Some(&Arc::new(vlog))).unwrap();
 		assert_eq!(&*resolved, value);
 
 		// Should fail without VLog
