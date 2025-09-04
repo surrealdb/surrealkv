@@ -472,9 +472,8 @@ impl LSMIterator for BlockIterator {
 		if self.offset >= self.restart_offset {
 			self.reset();
 			return false;
-		} else {
-			self.current_entry_offset = self.offset;
 		}
+		self.current_entry_offset = self.offset;
 
 		self.seek_next_entry().is_some()
 	}

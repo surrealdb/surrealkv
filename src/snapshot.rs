@@ -102,9 +102,8 @@ impl Snapshot {
 		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
 			if item.0.is_tombstone() {
 				return Ok(None); // Key is a tombstone, return None
-			} else {
-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
+			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 		}
 		drop(memtable_lock); // Release the lock on the active memtable
 
@@ -116,9 +115,8 @@ impl Snapshot {
 			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None); // Key is a tombstone, return None
-				} else {
-					return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 				}
+				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
 		}
 		drop(memtable_lock); // Release the lock on the immutable memtables
@@ -142,9 +140,8 @@ impl Snapshot {
 					let ikey = &item.0;
 					if ikey.is_tombstone() {
 						return Ok(None); // Key is a tombstone, return None
-					} else {
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 					}
+					return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 				}
 			}
 		}

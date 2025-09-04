@@ -2,7 +2,7 @@ use crate::FilterPolicy;
 
 // Hash returns the hash of the given data.
 pub(crate) fn hash(data: &[u8], seed: u32) -> u32 {
-	const M: u32 = 0xc6a4a793;
+	const M: u32 = 0xc6a4_a793;
 	const R: u32 = 24;
 
 	let mut h = seed ^ ((data.len() as u64) * M as u64) as u32;
@@ -53,7 +53,7 @@ impl LevelDBBloomFilter {
 	}
 
 	fn bloom_hash(key: &[u8]) -> u32 {
-		hash(key, 0xbc9f1d34)
+		hash(key, 0xbc9f_1d34)
 	}
 }
 

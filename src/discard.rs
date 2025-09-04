@@ -337,7 +337,7 @@ impl DiscardStats {
 	}
 
 	/// Syncs the memory-mapped file to disk
-	pub fn sync(&mut self) -> Result<()> {
+	pub fn sync(&self) -> Result<()> {
 		self.mmap.flush()?;
 		Ok(())
 	}

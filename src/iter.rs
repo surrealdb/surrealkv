@@ -136,10 +136,9 @@ impl Iterator for MergeIterator<'_> {
 
 				// Return this item (most recent version of this user key)
 				return Some((heap_item.key, heap_item.value));
-			} else {
-				// Same user key - this is an older version, skip it
-				continue;
 			}
+			// Same user key - this is an older version, skip it
+			continue;
 		}
 	}
 }

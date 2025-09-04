@@ -32,7 +32,7 @@ const TABLE_MAGIC_FOOTER_ENCODED: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75,
 pub const BLOCK_CKSUM_LEN: usize = 4;
 pub const BLOCK_COMPRESS_LEN: usize = 1;
 
-const MASK_DELTA: u32 = 0xa282ead8;
+const MASK_DELTA: u32 = 0xa282_ead8;
 
 pub fn mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(MASK_DELTA)

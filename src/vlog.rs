@@ -43,7 +43,7 @@ pub(crate) struct VLogFileHeader {
 }
 
 impl VLogFileHeader {
-	const MAGIC: u32 = 0x564C4F47; // "VLOG" in hex
+	const MAGIC: u32 = 0x564C_4F47; // "VLOG" in hex
 	const SIZE: usize = 31; // 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
 
 	pub(crate) fn new(file_id: u32, opts: &crate::Options) -> Self {

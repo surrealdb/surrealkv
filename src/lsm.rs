@@ -397,32 +397,31 @@ impl Core {
 					return Err(Error::Other(format!(
                         "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
                     )));
-				} else {
-					eprintln!("Successfully repaired WAL segment {corrupted_segment_id}");
+				}
+				eprintln!("Successfully repaired WAL segment {corrupted_segment_id}");
 
-					// After repair, try to replay again to get any additional data
-					// Create a fresh memtable for the retry
-					let retry_memtable = Arc::new(MemTable::default());
-					match replay_wal(wal_path, &retry_memtable) {
-						Ok((retry_seq_num, None)) => {
-							// Successful replay after repair, use the retry memtable
-							if !retry_memtable.is_empty() {
-								set_recovered_memtable(retry_memtable)?;
-							}
-							retry_seq_num
+				// After repair, try to replay again to get any additional data
+				// Create a fresh memtable for the retry
+				let retry_memtable = Arc::new(MemTable::default());
+				match replay_wal(wal_path, &retry_memtable) {
+					Ok((retry_seq_num, None)) => {
+						// Successful replay after repair, use the retry memtable
+						if !retry_memtable.is_empty() {
+							set_recovered_memtable(retry_memtable)?;
 						}
-						Ok((_retry_seq_num, Some((seg_id, offset)))) => {
-							// WAL is still corrupted after repair - this is a serious problem
-							return Err(Error::Other(format!(
-                                "{context} failed: WAL segment {seg_id} still corrupted after repair at offset {offset}. Repair was incomplete."
-                            )));
-						}
-						Err(retry_err) => {
-							// Replay failed after successful repair - also a serious problem
-							return Err(Error::Other(format!(
-                                "{context} failed: WAL replay failed after successful repair. {retry_err}"
-                            )));
-						}
+						retry_seq_num
+					}
+					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
+						// WAL is still corrupted after repair - this is a serious problem
+						return Err(Error::Other(format!(
+                            "{context} failed: WAL segment {seg_id} still corrupted after repair at offset {offset}. Repair was incomplete."
+                        )));
+					}
+					Err(retry_err) => {
+						// Replay failed after successful repair - also a serious problem
+						return Err(Error::Other(format!(
+                            "{context} failed: WAL replay failed after successful repair. {retry_err}"
+                        )));
 					}
 				}
 			}

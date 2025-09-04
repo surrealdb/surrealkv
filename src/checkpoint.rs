@@ -130,7 +130,7 @@ impl CheckpointMetadata {
 			.read_u64::<BigEndian>()
 			.map_err(|e| Error::Other(format!("Failed to read total_size: {e}")))?;
 
-		Ok(CheckpointMetadata {
+		Ok(Self {
 			version,
 			timestamp,
 			sequence_number,
