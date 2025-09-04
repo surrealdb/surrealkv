@@ -55,7 +55,10 @@ impl SnapshotInfo {
 	pub fn decode(mut buf: &[u8]) -> Result<Self> {
 		let seq_num = buf.read_u64::<BigEndian>()?;
 		let created_at = buf.read_u128::<BigEndian>()?;
-		Ok(Self { seq_num, created_at })
+		Ok(Self {
+			seq_num,
+			created_at,
+		})
 	}
 }
 
@@ -77,9 +80,6 @@ pub struct ManifestChangeSet {
 	/// The most recent SST in the WAL at the time manifest was updated, if changed
 	pub wal_id_last_seen: Option<u64>,
 
-	/// Next table ID if changed
-	pub next_table_id: Option<u64>,
-
 	/// Tables to delete from manifest
 	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
 
@@ -92,7 +92,6 @@ pub struct ManifestChangeSet {
 	/// Snapshots to delete (by sequence number)
 	pub deleted_snapshots: HashSet<u64>,
 }
-
 
 mod iter;
 mod level;
@@ -141,26 +140,31 @@ impl LevelManifest {
 
 		// Check if the manifest file already exists
 		if level_path.exists() {
-			// Load existing manifest
-			let (loaded_levels, next_id) =
-				Self::load_with_tables(&level_path, &sstable_path, opts)?;
+			// Load existing manifest with all versioned fields
+			let (
+				loaded_levels,
+				next_id,
+				_,
+				writer_epoch,
+				compactor_epoch,
+				wal_id_last_compacted,
+				wal_id_last_seen,
+				snapshots,
+			) = Self::load_with_tables(&level_path, &sstable_path, opts)?;
 
-			// Initialize with the loaded next_table_id
+			// Initialize with all the loaded fields
 			let manifest = Self {
 				path: level_path.to_path_buf(),
 				levels: loaded_levels,
 				hidden_set: HashSet::with_capacity(10),
 				next_table_id: Arc::new(AtomicU64::new(next_id)),
 				manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
-				writer_epoch: 1,
-				compactor_epoch: 0,
-				wal_id_last_compacted: 0,
-				wal_id_last_seen: 0,
-				snapshots: Vec::new(),
+				writer_epoch,
+				compactor_epoch,
+				wal_id_last_compacted,
+				wal_id_last_seen,
+				snapshots,
 			};
-
-			// Ensure manifest is written to disk with the counter
-			write_manifest_to_disk(&manifest)?;
 
 			return Ok(manifest);
 		}
@@ -214,9 +218,18 @@ impl LevelManifest {
 		manifest_path: P,
 		sstable_path: P,
 		opts: Arc<Options>,
-	) -> Result<(Levels, u64)> {
-		// First load the raw level data (IDs)
-		let (level_data, next_id) = Self::load(manifest_path)?;
+	) -> Result<(Levels, u64, u16, u64, u64, u64, u64, Vec<SnapshotInfo>)> {
+		// First load the raw level data (IDs) and versioned fields
+		let (
+			level_data,
+			next_id,
+			version,
+			writer_epoch,
+			compactor_epoch,
+			wal_id_last_compacted,
+			wal_id_last_seen,
+			snapshots,
+		) = Self::load(manifest_path)?;
 
 		// Now convert the level data into actual Level objects with Table instances
 		let mut levels_vec = Vec::with_capacity(opts.level_count as usize);
@@ -260,7 +273,16 @@ impl LevelManifest {
 			levels_vec.push(Arc::new(level));
 		}
 
-		Ok((Levels(levels_vec), next_id))
+		Ok((
+			Levels(levels_vec),
+			next_id,
+			version,
+			writer_epoch,
+			compactor_epoch,
+			wal_id_last_compacted,
+			wal_id_last_seen,
+			snapshots,
+		))
 	}
 
 	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
@@ -311,7 +333,9 @@ impl LevelManifest {
 	}
 
 	// Load versioned manifest format
-	pub(crate) fn load<P: AsRef<Path>>(path: P) -> Result<(Vec<Vec<u64>>, u64)> {
+	pub(crate) fn load<P: AsRef<Path>>(
+		path: P,
+	) -> Result<(Vec<Vec<u64>>, u64, u16, u64, u64, u64, u64, Vec<SnapshotInfo>)> {
 		let data = std::fs::read(&path)?;
 		let mut level_manifest = Cursor::new(data);
 
@@ -324,25 +348,37 @@ impl LevelManifest {
 			)));
 		}
 
-		let _writer_epoch = level_manifest.read_u64::<BigEndian>()?;
-		let _compactor_epoch = level_manifest.read_u64::<BigEndian>()?;
-		let _wal_id_last_compacted = level_manifest.read_u64::<BigEndian>()?;
-		let _wal_id_last_seen = level_manifest.read_u64::<BigEndian>()?;
+		let writer_epoch = level_manifest.read_u64::<BigEndian>()?;
+		let compactor_epoch = level_manifest.read_u64::<BigEndian>()?;
+		let wal_id_last_compacted = level_manifest.read_u64::<BigEndian>()?;
+		let wal_id_last_seen = level_manifest.read_u64::<BigEndian>()?;
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 
 		// Read levels data
 		let level_count = level_manifest.read_u8()?;
 		let levels = Self::load_levels(&mut level_manifest, level_count)?;
 
-		// Skip snapshots for now (we don't need them for basic loading)
-		let _snapshot_count = level_manifest.read_u32::<BigEndian>()?;
-		for _ in 0.._snapshot_count {
+		// Read snapshots
+		let snapshot_count = level_manifest.read_u32::<BigEndian>()?;
+		let mut snapshots = Vec::new();
+		for _ in 0..snapshot_count {
 			let snapshot_len = level_manifest.read_u32::<BigEndian>()? as usize;
-			let mut _snapshot_bytes = vec![0u8; snapshot_len];
-			level_manifest.read_exact(&mut _snapshot_bytes)?;
+			let mut snapshot_bytes = vec![0u8; snapshot_len];
+			level_manifest.read_exact(&mut snapshot_bytes)?;
+			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
+			snapshots.push(snapshot);
 		}
 
-		Ok((levels, next_table_id))
+		Ok((
+			levels,
+			next_table_id,
+			version,
+			writer_epoch,
+			compactor_epoch,
+			wal_id_last_compacted,
+			wal_id_last_seen,
+			snapshots,
+		))
 	}
 
 	/// Loads levels from the manifest
@@ -408,7 +444,6 @@ impl LevelManifest {
 			compactor_epoch: Some(self.compactor_epoch),
 			wal_id_last_compacted: Some(self.wal_id_last_compacted),
 			wal_id_last_seen: Some(self.wal_id_last_seen),
-			next_table_id: Some(self.next_table_id.load(Ordering::SeqCst)),
 			deleted_tables: HashSet::new(),
 			new_tables: Vec::new(),
 			new_snapshots: Vec::new(),
@@ -433,9 +468,6 @@ impl LevelManifest {
 		}
 		if let Some(wal_id) = changeset.wal_id_last_seen {
 			self.wal_id_last_seen = wal_id;
-		}
-		if let Some(next_id) = changeset.next_table_id {
-			self.next_table_id.store(next_id, Ordering::SeqCst);
 		}
 
 		// Add new tables to levels
@@ -492,6 +524,12 @@ impl LevelManifest {
 	/// Check if a table is hidden
 	pub fn is_table_hidden(&self, table_id: u64) -> bool {
 		self.hidden_set.contains(&table_id)
+	}
+
+	/// Generates the next unique table ID for a new SSTable
+	/// This is the single source of truth for table ID generation
+	pub fn next_table_id(&self) -> u64 {
+		self.next_table_id.fetch_add(1, std::sync::atomic::Ordering::Release)
 	}
 }
 
@@ -647,12 +685,11 @@ mod tests {
 		manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
 
 		// Persist the manifest with our custom next_table_id
-		write_manifest_to_disk(&manifest)
-			.expect("Failed to write to disk");
+		write_manifest_to_disk(&manifest).expect("Failed to write to disk");
 
 		// Load the data directly using load() to verify raw persistence
 		let manifest_path = repo_path.join(LEVELS_MANIFEST_FILE);
-		let (loaded_levels_data, loaded_next_id) =
+		let (loaded_levels_data, loaded_next_id, _, _, _, _, _, _) =
 			LevelManifest::load(&manifest_path).expect("Failed to load manifest");
 
 		// Verify next_table_id was persisted correctly

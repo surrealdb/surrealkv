@@ -15,15 +15,11 @@ use std::{
 	collections::HashMap,
 	fs::File as SysFile,
 	path::{Path, PathBuf},
-	sync::{
-		atomic::AtomicU64,
-		Arc, RwLock, RwLockWriteGuard,
-	},
+	sync::{Arc, RwLock, RwLockWriteGuard},
 };
 
 /// Compaction options
 pub struct CompactionOptions {
-	pub table_id_counter: Arc<AtomicU64>,
 	pub lopts: Arc<LSMOptions>,
 	pub level_manifest: Arc<RwLock<LevelManifest>>,
 	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
@@ -33,7 +29,6 @@ pub struct CompactionOptions {
 impl CompactionOptions {
 	pub fn from(tree: &crate::lsm::CoreInner) -> Self {
 		Self {
-			table_id_counter: tree.table_id_counter.clone(),
 			lopts: tree.opts.clone(),
 			level_manifest: tree.level_manifest.clone(),
 			immutable_memtables: tree.immutable_memtables.clone(),
@@ -93,7 +88,7 @@ impl Compactor {
 			drop(levels);
 
 			// Create new table
-			let new_table_id = self.generate_table_id();
+			let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
 			let new_table_path = self.get_table_path(new_table_id);
 
 			// Write merged data and collect discard statistics
@@ -170,7 +165,7 @@ impl Compactor {
 
 		// Create a changeset for the compaction
 		let mut changeset = ManifestChangeSet::default();
-		
+
 		// Add tables to delete (the ones being merged) - use the same efficient approach as original
 		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
 			for &table_id in &input.tables_to_merge {
@@ -182,9 +177,6 @@ impl Compactor {
 
 		// Add the new table to the changeset
 		changeset.new_tables.push((input.target_level, new_table.clone()));
-		
-		// Update next_table_id to match the new table ID
-		changeset.next_table_id = Some(new_table_id);
 
 		// Apply the changeset to remove old tables and add new table
 		manifest.apply_changeset(&changeset)?;
@@ -195,10 +187,6 @@ impl Compactor {
 		manifest.unhide_tables(&input.tables_to_merge);
 
 		Ok(())
-	}
-
-	fn generate_table_id(&self) -> u64 {
-		self.options.table_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 	}
 
 	fn get_table_path(&self, table_id: u64) -> PathBuf {

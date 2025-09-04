@@ -3,10 +3,7 @@ use std::collections::HashMap;
 use std::{
 	fs::{create_dir_all, File},
 	path::{Path, PathBuf},
-	sync::{
-		atomic::AtomicU64,
-		Arc, Mutex, RwLock,
-	},
+	sync::{Arc, Mutex, RwLock},
 };
 
 use crate::{
@@ -75,10 +72,6 @@ pub trait CompactionOperations: Send + Sync {
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
 pub struct CoreInner {
-	/// Monotonically increasing counter for generating unique SSTable IDs.
-	/// Each SSTable needs a unique identifier for file naming and tracking.
-	pub table_id_counter: Arc<AtomicU64>,
-
 	/// The active memtable (write buffer) that receives all new writes.
 	///
 	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
@@ -125,7 +118,6 @@ impl CoreInner {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Initialize the level manifest which tracks the SSTable organization
 		let manifest = LevelManifest::new(opts.clone())?;
-		let next_table_id = manifest.next_table_id.clone();
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize active and immutable memtables
@@ -148,7 +140,6 @@ impl CoreInner {
 		};
 
 		Ok(Self {
-			table_id_counter: next_table_id.clone(),
 			opts,
 			active_memtable,
 			immutable_memtables,
@@ -158,11 +149,6 @@ impl CoreInner {
 			vlog,
 			wal: parking_lot::RwLock::new(wal),
 		})
-	}
-
-	/// Generates the next unique table ID for a new SSTable
-	pub fn next_table_id(&self) -> u64 {
-		self.table_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 	}
 
 	/// Makes room for new writes by flushing the active memtable if needed.
@@ -227,7 +213,7 @@ impl CoreInner {
 		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
 		// Track the immutable memtable until it's successfully flushed
-		let memtable_id = self.next_table_id();
+		let memtable_id = self.level_manifest.read().unwrap().next_table_id();
 		immutable_memtables.add(memtable_id, flushed_memtable.clone());
 
 		// Now rotate the WAL while still holding the active_memtable lock
@@ -243,35 +229,6 @@ impl CoreInner {
 		Ok(Some((memtable_id, flushed_memtable)))
 	}
 
-	/// Converts the active memtable to immutable and creates a new active memtable.
-	///
-	/// This is a key operation in the LSM write path that ensures:
-	/// - Writes can continue without blocking on disk I/O
-	/// - The immutable memtable preserves a consistent snapshot for flushing
-	///
-	/// Note: This method does NOT rotate the WAL. For coordinated memtable flush + WAL rotation,
-	/// use flush_active_memtable_and_rotate_wal() instead.
-	pub fn flush_active_memtable(&self) -> Option<(u64, Arc<MemTable>)> {
-		let mut active_memtable = self.active_memtable.write().unwrap();
-
-		// Don't flush an empty memtable
-		if active_memtable.is_empty() {
-			return None;
-		}
-
-		let mut immutable_memtables = self.immutable_memtables.write().unwrap();
-
-		// Atomically swap the active memtable with a new empty one
-		// This allows writes to continue immediately
-		let flushed_memtable = std::mem::take(&mut *active_memtable);
-
-		// Track the immutable memtable until it's successfully flushed
-		let memtable_id = self.next_table_id();
-		immutable_memtables.add(memtable_id, flushed_memtable.clone());
-
-		Some((memtable_id, flushed_memtable))
-	}
-
 	/// Adds a newly flushed SSTable to Level 0.
 	///
 	/// Level 0 is unique in the LSM tree hierarchy:
@@ -284,10 +241,9 @@ impl CoreInner {
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
 		let table_id = table.id;
 
-		// Create a changeset to add the table and update next_table_id
+		// Create a changeset to add the table
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, table));
-		changeset.next_table_id = Some(table_id); // Set next_table_id to table_id
 
 		// Apply the changeset
 		original_manifest.apply_changeset(&changeset)?;
@@ -1045,7 +1001,8 @@ mod tests {
 			expected_values = values;
 
 			// Verify L0 has tables before closing
-			let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size =
+				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 before closing, got {l0_size}");
 
 			// Tree will be dropped here, closing the store
@@ -1057,7 +1014,8 @@ mod tests {
 			let tree = Tree::new(opts.clone()).unwrap();
 
 			// Verify L0 has tables after reopening
-			let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size =
+				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 after reopening, got {l0_size}");
 
 			// Verify all keys have their final values
@@ -2189,10 +2147,8 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let tx = tree.begin().unwrap();
 			let result = tx.get(key).unwrap();
-			assert_eq!(
-				result.map(|v| v.to_vec()),
-				Some(format!("value-{}-v2", i + 1).as_bytes().to_vec())
-			);
+			let expected = format!("value-{}-v2", i + 1);
+			assert_eq!(result.map(|v| v.to_vec()), Some(expected.as_bytes().to_vec()));
 		}
 
 		// Delete all keys

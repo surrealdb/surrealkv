@@ -520,12 +520,9 @@ mod tests {
 		opts: Arc<LSMOptions>,
 		manifest: Arc<RwLock<LevelManifest>>,
 	) -> CompactionOptions {
-		let table_id_counter = manifest.read().unwrap().next_table_id.clone();
-
 		let vlog = Arc::new(crate::vlog::VLog::new(opts.path.join("vlog"), opts.clone()).unwrap());
 
 		CompactionOptions {
-			table_id_counter,
 			lopts: opts,
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
@@ -1107,11 +1104,14 @@ mod tests {
 		let manifest_path = env.options.path.join("test_manifest");
 		let next_table_id = 1000; // Start well above existing IDs
 
+		// Create a shared table ID counter that will be used by both the test and compactor
+		let shared_table_id_counter = Arc::new(AtomicU64::new(next_table_id));
+
 		let manifest = LevelManifest {
 			path: manifest_path.clone(),
 			levels,
 			hidden_set: HashSet::new(),
-			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			next_table_id: shared_table_id_counter.clone(),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			writer_epoch: 1,
 			compactor_epoch: 0,
