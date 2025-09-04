@@ -364,6 +364,7 @@ mod tests {
 		let temp_dir = TempDir::new().unwrap();
 		let opts = Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
+			path: temp_dir.path().to_path_buf(),
 			..Default::default()
 		};
 		let vlog_dir = temp_dir.path().join("vlog");

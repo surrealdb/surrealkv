@@ -9,13 +9,7 @@ use std::{
 	},
 };
 
-use crate::{
-	error::Error,
-	lsm::{LEVELS_MANIFEST_FILE, TABLE_FOLDER},
-	sstable::table::Table,
-	vfs::File,
-	Options, Result,
-};
+use crate::{error::Error, sstable::table::Table, vfs::File, Options, Result};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
@@ -135,13 +129,12 @@ impl LevelManifest {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
 
-		let level_path = opts.path.join(LEVELS_MANIFEST_FILE);
-		let sstable_path = opts.path.join(TABLE_FOLDER);
+		let manifest_file_path = opts.manifest_file_path(0);
 
 		// Check if the manifest file already exists
-		if level_path.exists() {
+		if manifest_file_path.exists() {
 			// Load existing manifest from file
-			return Self::load_from_file(&level_path, &sstable_path, opts);
+			return Self::load_from_file(&manifest_file_path, opts);
 		}
 
 		// If no manifest exists, create a new one
@@ -153,7 +146,7 @@ impl LevelManifest {
 		let next_table_id = Arc::new(AtomicU64::new(1));
 
 		let manifest = Self {
-			path: level_path.to_path_buf(),
+			path: manifest_file_path,
 			levels,
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
@@ -190,11 +183,7 @@ impl LevelManifest {
 	}
 
 	/// Load a manifest from file and return a complete LevelManifest instance
-	fn load_from_file<P: AsRef<Path>>(
-		manifest_path: P,
-		sstable_path: P,
-		opts: Arc<Options>,
-	) -> Result<Self> {
+	fn load_from_file<P: AsRef<Path>>(manifest_path: P, opts: Arc<Options>) -> Result<Self> {
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
 		let mut level_manifest = Cursor::new(data);
@@ -241,7 +230,7 @@ impl LevelManifest {
 
 				for &table_id in table_ids {
 					// Load the actual table from disk
-					match Self::load_table(sstable_path.as_ref(), table_id, opts.clone()) {
+					match Self::load_table(table_id, opts.clone()) {
 						Ok(table) => tables.push(table),
 						Err(err) => {
 							eprintln!("Error loading table {table_id}: {err:?}");
@@ -320,8 +309,8 @@ impl LevelManifest {
 	}
 
 	/// Helper to load a single table by ID
-	fn load_table(sstable_path: &Path, table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
-		let table_file_path = sstable_path.join(format!("{table_id}"));
+	fn load_table(table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
+		let table_file_path = opts.sstable_file_path(table_id);
 
 		// Open the table file
 		let file = SysFile::open(&table_file_path)?;
@@ -539,23 +528,20 @@ pub fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::{table::TableWriter, InternalKey, InternalKeyKind};
+	use crate::{
+		lsm::TABLE_FOLDER,
+		sstable::{table::TableWriter, InternalKey, InternalKeyKind},
+	};
 
 	use super::*;
 	use std::{
 		fs::{self, File as SysFile},
-		path::Path,
 		sync::atomic::Ordering,
 	};
 
 	// Helper function to create a test table with direct file IO
-	fn create_test_table(
-		sstable_path: &Path,
-		table_id: u64,
-		num_items: u64,
-		opts: Arc<Options>,
-	) -> Result<Arc<Table>> {
-		let table_file_path = sstable_path.join(format!("{table_id}"));
+	fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
+		let table_file_path = opts.sstable_file_path(table_id);
 
 		let mut file = SysFile::create(&table_file_path)?;
 
@@ -601,18 +587,21 @@ mod tests {
 		let sstable_path = repo_path.join(TABLE_FOLDER);
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
+		// Create manifest directory
+		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+
 		// Create a new manifest with 3 levels
 		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
 		// Create tables and add them to the manifest
 		// Create 2 tables for level 0
 		let table_id1 = 1;
-		let table1 = create_test_table(&sstable_path, table_id1, 100, opts.clone())
-			.expect("Failed to create table 1");
+		let table1 =
+			create_test_table(table_id1, 100, opts.clone()).expect("Failed to create table 1");
 
 		let table_id2 = 2;
-		let table2 = create_test_table(&sstable_path, table_id2, 200, opts.clone())
-			.expect("Failed to create table 2");
+		let table2 =
+			create_test_table(table_id2, 200, opts.clone()).expect("Failed to create table 2");
 
 		// Add tables to level 0
 		{
@@ -623,8 +612,8 @@ mod tests {
 
 		// Create a table for level 1
 		let table_id3 = 3;
-		let table3 = create_test_table(&sstable_path, table_id3, 300, opts.clone())
-			.expect("Failed to create table 3");
+		let table3 =
+			create_test_table(table_id3, 300, opts.clone()).expect("Failed to create table 3");
 
 		// Add table to level 1
 		{
@@ -652,10 +641,9 @@ mod tests {
 		write_manifest_to_disk(&manifest).expect("Failed to write to disk");
 
 		// Load the manifest directly to verify persistence
-		let manifest_path = repo_path.join(LEVELS_MANIFEST_FILE);
-		let loaded_manifest =
-			LevelManifest::load_from_file(&manifest_path, &sstable_path, opts.clone())
-				.expect("Failed to load manifest");
+		let manifest_path = opts.manifest_file_path(0);
+		let loaded_manifest = LevelManifest::load_from_file(&manifest_path, opts.clone())
+			.expect("Failed to load manifest");
 
 		// Verify all manifest fields were persisted correctly
 		assert_eq!(
@@ -738,11 +726,7 @@ mod tests {
 		assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
 		assert_eq!(new_manifest.snapshots[0].seq_num, 10, "First snapshot not loaded correctly");
 		assert_eq!(new_manifest.snapshots[1].seq_num, 20, "Second snapshot not loaded correctly");
-		assert_eq!(
-			new_manifest.path,
-			repo_path.join(LEVELS_MANIFEST_FILE),
-			"Path not set correctly"
-		);
+		assert_eq!(new_manifest.path, opts.manifest_file_path(0), "Path not set correctly");
 
 		// Verify the number of levels in the new manifest
 		assert_eq!(
@@ -924,13 +908,12 @@ mod tests {
 
 	// Helper function to create a test table with specific sequence numbers
 	fn create_test_table_with_seq_nums(
-		sstable_path: &Path,
 		table_id: u64,
 		seq_start: u64,
 		seq_end: u64,
 		opts: Arc<Options>,
 	) -> Result<Arc<Table>> {
-		let table_file_path = sstable_path.join(format!("{table_id}"));
+		let table_file_path = opts.sstable_file_path(table_id);
 
 		let mut file = SysFile::create(&table_file_path)?;
 
@@ -976,6 +959,9 @@ mod tests {
 		let sstable_path = repo_path.join(TABLE_FOLDER);
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
+		// Create manifest directory
+		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+
 		// Create a new manifest
 		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
@@ -984,7 +970,7 @@ mod tests {
 
 		// Test 2: Single table in L0
 		// Create table with sequence numbers 1-10 (largest_seq_num = 10)
-		let table1 = create_test_table_with_seq_nums(&sstable_path, 1, 1, 10, opts.clone())
+		let table1 = create_test_table_with_seq_nums(1, 1, 10, opts.clone())
 			.expect("Failed to create table 1");
 
 		{
@@ -996,7 +982,7 @@ mod tests {
 
 		// Test 3: Multiple tables in L0 - add tables in ascending sequence order
 		// Create table with sequence numbers 11-20 (largest_seq_num = 20)
-		let table2 = create_test_table_with_seq_nums(&sstable_path, 2, 11, 20, opts.clone())
+		let table2 = create_test_table_with_seq_nums(2, 11, 20, opts.clone())
 			.expect("Failed to create table 2");
 
 		{
@@ -1008,7 +994,7 @@ mod tests {
 
 		// Test 4: Add another table with higher sequence numbers
 		// Create table with sequence numbers 21-30 (largest_seq_num = 30)
-		let table3 = create_test_table_with_seq_nums(&sstable_path, 3, 21, 30, opts.clone())
+		let table3 = create_test_table_with_seq_nums(3, 21, 30, opts.clone())
 			.expect("Failed to create table 3");
 
 		{
@@ -1040,7 +1026,7 @@ mod tests {
 
 		// Test 6: Add table with lower sequence numbers (simulating out-of-order insertion)
 		// Create table with sequence numbers 5-8 (largest_seq_num = 8)
-		let table4 = create_test_table_with_seq_nums(&sstable_path, 4, 5, 8, opts.clone())
+		let table4 = create_test_table_with_seq_nums(4, 5, 8, opts.clone())
 			.expect("Failed to create table 4");
 
 		{
@@ -1081,7 +1067,7 @@ mod tests {
 
 		// Test 7: Test with overlapping sequence ranges
 		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with table3)
-		let table5 = create_test_table_with_seq_nums(&sstable_path, 5, 25, 35, opts.clone())
+		let table5 = create_test_table_with_seq_nums(5, 25, 35, opts.clone())
 			.expect("Failed to create table 5");
 
 		{
@@ -1118,6 +1104,9 @@ mod tests {
 		let sstable_path = repo_path.join(TABLE_FOLDER);
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
+		// Create manifest directory
+		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
+
 		let expected_lsn = 50;
 
 		// Create manifest with tables and verify LSN
@@ -1125,12 +1114,11 @@ mod tests {
 			let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
 			// Create tables with different sequence ranges
-			let table1 = create_test_table_with_seq_nums(&sstable_path, 1, 1, 20, opts.clone())
+			let table1 = create_test_table_with_seq_nums(1, 1, 20, opts.clone())
 				.expect("Failed to create table 1");
-			let table2 =
-				create_test_table_with_seq_nums(&sstable_path, 2, 21, expected_lsn, opts.clone())
-					.expect("Failed to create table 2");
-			let table3 = create_test_table_with_seq_nums(&sstable_path, 3, 10, 30, opts.clone())
+			let table2 = create_test_table_with_seq_nums(2, 21, expected_lsn, opts.clone())
+				.expect("Failed to create table 2");
+			let table3 = create_test_table_with_seq_nums(3, 10, 30, opts.clone())
 				.expect("Failed to create table 3");
 
 			{

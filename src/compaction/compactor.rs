@@ -3,7 +3,6 @@ use crate::{
 	error::Result,
 	iter::{BoxedIterator, CompactionIterator},
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
-	lsm::TABLE_FOLDER,
 	memtable::ImmutableMemtables,
 	sstable::table::{Table, TableWriter},
 	vfs::File,
@@ -190,13 +189,12 @@ impl Compactor {
 	}
 
 	fn get_table_path(&self, table_id: u64) -> PathBuf {
-		self.options.lopts.path.join(TABLE_FOLDER).join(table_id.to_string())
+		self.options.lopts.sstable_file_path(table_id)
 	}
 
 	fn cleanup_old_tables(&self, input: &CompactionInput) {
-		let base_path = self.options.lopts.path.join(TABLE_FOLDER);
 		for &table_id in &input.tables_to_merge {
-			let path = base_path.join(table_id.to_string());
+			let path = self.options.lopts.sstable_file_path(table_id);
 			if let Err(e) = std::fs::remove_file(path) {
 				// Log error but continue with cleanup
 				eprintln!("Failed to remove old table file: {e}");

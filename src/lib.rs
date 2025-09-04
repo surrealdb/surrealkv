@@ -187,6 +187,125 @@ impl Options {
 		self.vlog_gc_discard_ratio = value;
 		self
 	}
+
+	/// Returns the path for a WAL file with the given ID
+	/// Format: {path}/wal/{id:020}
+	pub fn wal_file_path(&self, id: u64) -> PathBuf {
+		self.path.join("wal").join(format!("{id:020}"))
+	}
+
+	/// Returns the path for a manifest file with the given ID
+	/// Format: {path}/manifest/{id:020}.manifest
+	pub fn manifest_file_path(&self, id: u64) -> PathBuf {
+		self.path.join("manifest").join(format!("{id:020}.manifest"))
+	}
+
+	/// Returns the path for an SSTable file with the given ID
+	/// Format: {path}/sstables/{id:020}.sst
+	pub fn sstable_file_path(&self, id: u64) -> PathBuf {
+		self.path.join("sstables").join(format!("{id:020}.sst"))
+	}
+
+	/// Returns the path for a VLog file with the given ID
+	/// Format: {path}/vlog/{id:020}.vlog
+	pub fn vlog_file_path(&self, id: u64) -> PathBuf {
+		self.path.join("vlog").join(format!("{id:020}.vlog"))
+	}
+
+	/// Returns the directory path for WAL files
+	pub fn wal_dir(&self) -> PathBuf {
+		self.path.join("wal")
+	}
+
+	/// Returns the directory path for SSTable files
+	pub fn sstable_dir(&self) -> PathBuf {
+		self.path.join("sstables")
+	}
+
+	/// Returns the directory path for VLog files
+	pub fn vlog_dir(&self) -> PathBuf {
+		self.path.join("vlog")
+	}
+
+	/// Returns the directory path for manifest files
+	pub fn manifest_dir(&self) -> PathBuf {
+		self.path.join("manifest")
+	}
+
+	/// Checks if a filename matches the VLog file naming pattern
+	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
+	pub fn is_vlog_filename(&self, filename: &str) -> bool {
+		filename.len() == 25 && filename.ends_with(".vlog")
+	}
+
+	/// Checks if a filename matches the SSTable file naming pattern
+	/// Expected format: 20-digit zero-padded ID + ".sst" (24 characters total)
+	pub fn is_sstable_filename(&self, filename: &str) -> bool {
+		filename.len() == 24 && filename.ends_with(".sst")
+	}
+
+	/// Checks if a filename matches the manifest file naming pattern
+	/// Expected format: 20-digit zero-padded ID + ".manifest" (29 characters total)
+	pub fn is_manifest_filename(&self, filename: &str) -> bool {
+		filename.len() == 29 && filename.ends_with(".manifest")
+	}
+
+	/// Checks if a filename matches the WAL file naming pattern
+	/// Expected format: 20-digit zero-padded ID (20 characters total)
+	pub fn is_wal_filename(&self, filename: &str) -> bool {
+		filename.len() == 20 && filename.chars().all(|c| c.is_ascii_digit())
+	}
+
+	/// Extracts the file ID from a VLog filename
+	/// Returns None if the filename doesn't match the expected pattern
+	pub fn extract_vlog_file_id(&self, filename: &str) -> Option<u32> {
+		if self.is_vlog_filename(filename) {
+			if let Some(id_part) = filename.strip_suffix(".vlog") {
+				if id_part.len() == 20 && id_part.chars().all(|c| c.is_ascii_digit()) {
+					return id_part.parse::<u32>().ok();
+				}
+			}
+		}
+		None
+	}
+
+	/// Extracts the file ID from an SSTable filename
+	/// Returns None if the filename doesn't match the expected pattern
+	pub fn extract_sstable_file_id(&self, filename: &str) -> Option<u32> {
+		if self.is_sstable_filename(filename) {
+			if let Some(id_part) = filename.strip_suffix(".sst") {
+				if id_part.len() == 20 && id_part.chars().all(|c| c.is_ascii_digit()) {
+					return id_part.parse::<u32>().ok();
+				}
+			}
+		}
+		None
+	}
+
+	/// Extracts the file ID from a manifest filename
+	/// Returns None if the filename doesn't match the expected pattern
+	pub fn extract_manifest_file_id(&self, filename: &str) -> Option<u32> {
+		if self.is_manifest_filename(filename) {
+			if let Some(id_part) = filename.strip_suffix(".manifest") {
+				if id_part.len() == 20 && id_part.chars().all(|c| c.is_ascii_digit()) {
+					return id_part.parse::<u32>().ok();
+				}
+			}
+		}
+		None
+	}
+
+	/// Extracts the file ID from a WAL filename
+	/// Returns None if the filename doesn't match the expected pattern
+	pub fn extract_wal_file_id(&self, filename: &str) -> Option<u32> {
+		if self.is_wal_filename(filename)
+			&& filename.len() == 20
+			&& filename.chars().all(|c| c.is_ascii_digit())
+		{
+			return filename.parse::<u32>().ok();
+		}
+		None
+	}
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]

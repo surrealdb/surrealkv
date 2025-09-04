@@ -541,7 +541,7 @@ pub struct VLog {
 	discard_stats: Mutex<DiscardStats>,
 
 	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
-	pub(crate) global_delete_list: Arc<DeleteList>,
+	pub(crate) delete_list: Arc<DeleteList>,
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
 	cache: Arc<VLogCache>,
@@ -553,13 +553,12 @@ pub struct VLog {
 impl VLog {
 	/// Returns the file path for a VLog file with the given ID
 	fn vlog_file_path(&self, file_id: u32) -> PathBuf {
-		self.path.join(format!("vlog_{file_id:08}.log"))
+		self.opts.vlog_file_path(file_id as u64)
 	}
 
 	/// Creates a new VLog instance
 	pub fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options>) -> Result<Self> {
 		let dir = dir.as_ref().to_path_buf();
-		std::fs::create_dir_all(&dir)?;
 
 		// Get the parent directory for the discard stats file
 		// This ensures the DISCARD file lives in the main database directory,
@@ -568,7 +567,7 @@ impl VLog {
 			dir.parent().ok_or_else(|| Error::Other("VLog directory has no parent".to_string()))?;
 
 		// Initialize the global delete list LSM tree
-		let global_delete_list = Arc::new(DeleteList::new(dir.clone())?);
+		let delete_list = Arc::new(DeleteList::new(dir.clone())?);
 
 		let vlog = Self {
 			path: dir.clone(),
@@ -584,7 +583,7 @@ impl VLog {
 			files_to_be_deleted: RwLock::new(Vec::new()),
 			gc_in_progress: AtomicBool::new(false),
 			discard_stats: Mutex::new(DiscardStats::new(discard_stats_dir)?),
-			global_delete_list,
+			delete_list,
 			cache: opts.vlog_cache.clone(),
 			opts,
 		};
@@ -649,48 +648,39 @@ impl VLog {
 			let file_name = entry.file_name();
 			let file_name_str = file_name.to_string_lossy();
 
-			// Look for VLog files: vlog_12345678.log
-			if file_name_str.starts_with("vlog_") && file_name_str.ends_with(".log") {
-				// Extract file ID from filename
-				if let Some(id_part) =
-					file_name_str.strip_prefix("vlog_").and_then(|s| s.strip_suffix(".log"))
-				{
-					if let Ok(file_id) = id_part.parse::<u32>() {
-						let file_path = entry.path();
-						let file_size = entry.metadata()?.len();
+			// Look for VLog files
+			if let Some(file_id) = self.opts.extract_vlog_file_id(&file_name_str) {
+				let file_path = entry.path();
+				let file_size = entry.metadata()?.len();
 
-						// Track the file with maximum ID for active writer setup
-						if max_file_id.is_none_or(|current_max| file_id >= current_max) {
-							max_file_id = Some(file_id);
-							max_file_path = Some(file_path.clone());
+				// Track the file with maximum ID for active writer setup
+				if max_file_id.is_none_or(|current_max| file_id >= current_max) {
+					max_file_id = Some(file_id);
+					max_file_path = Some(file_path.clone());
+				}
+
+				// Pre-open the file handle and validate header
+				match File::open(&file_path) {
+					Ok(file) => {
+						// Validate file header for existing files
+						if file_size > 0 {
+							let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+							vfs::File::read_at(&file, 0, &mut header_data)?;
+							let header = VLogFileHeader::decode(&header_data)?;
+							header.validate(file_id)?;
 						}
 
-						// Pre-open the file handle and validate header
-						match File::open(&file_path) {
-							Ok(file) => {
-								// Validate file header for existing files
-								if file_size > 0 {
-									let mut header_data = vec![0u8; VLogFileHeader::SIZE];
-									vfs::File::read_at(&file, 0, &mut header_data)?;
-									let header = VLogFileHeader::decode(&header_data)?;
-									header.validate(file_id)?;
-								}
+						let handle = Arc::new(file);
+						file_handles.insert(file_id, handle);
 
-								let handle = Arc::new(file);
-								file_handles.insert(file_id, handle);
-
-								// Also register in files_map
-								files_map.insert(
-									file_id,
-									Arc::new(VLogFile::new(file_id, file_path, file_size)),
-								);
-							}
-							Err(e) => {
-								eprintln!(
-									"Warning: Failed to pre-open VLog file {file_name_str}: {e}"
-								);
-							}
-						}
+						// Also register in files_map
+						files_map.insert(
+							file_id,
+							Arc::new(VLogFile::new(file_id, file_path, file_size)),
+						);
+					}
+					Err(e) => {
+						eprintln!("Warning: Failed to pre-open VLog file {file_name_str}: {e}");
 					}
 				}
 			}
@@ -1051,7 +1041,7 @@ impl VLog {
 			let user_key = internal_key.user_key.to_vec();
 
 			// Check if this user key is stale using the global delete list
-			let is_stale = match self.global_delete_list.is_stale(internal_key.seq_num()) {
+			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
 					eprintln!(
@@ -1104,7 +1094,7 @@ impl VLog {
 
 		// Clean up delete list entries for merged stale data
 		if !stale_seq_nums.is_empty() {
-			if let Err(e) = self.global_delete_list.delete_entries_batch(stale_seq_nums) {
+			if let Err(e) = self.delete_list.delete_entries_batch(stale_seq_nums) {
 				eprintln!("Warning: Failed to clean up delete list after merge: {e}");
 			}
 		}
@@ -1202,7 +1192,7 @@ impl VLog {
 			let file_name_str = file_name.to_string_lossy();
 
 			// Look for .tmp files that match our VLog pattern
-			if file_name_str.starts_with("vlog_") && file_name_str.ends_with(".log.tmp") {
+			if file_name_str.len() == 28 && file_name_str.ends_with(".log.tmp") {
 				let temp_path = entry.path();
 
 				// Try to remove the temporary file
@@ -1232,13 +1222,13 @@ impl VLog {
 		}
 
 		// Call the synchronous method directly - no async needed
-		self.global_delete_list.add_stale_entries_batch(entries)
+		self.delete_list.add_stale_entries_batch(entries)
 	}
 
 	/// Checks if a sequence number is marked as stale in the delete list
 	/// This is primarily used for testing to verify delete list behavior
 	pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		self.global_delete_list.is_stale(seq_num)
+		self.delete_list.is_stale(seq_num)
 	}
 }
 
@@ -1362,7 +1352,7 @@ pub struct DeleteList {
 
 impl DeleteList {
 	pub fn new(base_path: PathBuf) -> Result<Self> {
-		let delete_list_path = base_path.join("global_delete_list");
+		let delete_list_path = base_path.join("delete_list");
 
 		// Create a dedicated LSM tree for the delete list
 		let delete_list_opts = Options {
@@ -1455,11 +1445,14 @@ mod tests {
 
 	fn create_test_vlog() -> (VLog, TempDir) {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options {
+		let mut opts = Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
 			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
+		// Set the path to the temp directory so vlog_file_path works correctly
+		opts.path = temp_dir.path().to_path_buf();
+
 		// Create vlog subdirectory to simulate the real directory structure
 		let vlog_dir = temp_dir.path().join("vlog");
 		std::fs::create_dir_all(&vlog_dir).unwrap();
@@ -1598,13 +1591,14 @@ mod tests {
 	#[tokio::test]
 	async fn test_prefill_file_handles() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options {
-			path: temp_dir.path().to_path_buf(),
+		let mut opts = Options {
 			vlog_max_file_size: 1024, // Small file size to force multiple files
 			vlog_checksum_verification: VLogChecksumLevel::Full,
 			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
+		// Set the path to the temp directory so vlog_file_path works correctly
+		opts.path = temp_dir.path().to_path_buf();
 
 		// Create vlog subdirectory
 		let vlog_dir = temp_dir.path().join("vlog");
@@ -2355,7 +2349,7 @@ mod tests {
 			std::fs::create_dir_all(&vlog_dir).unwrap();
 
 			// Copy our test file to the VLog directory with the expected naming convention
-			let vlog_file_path = vlog_dir.join(format!("vlog_{:08}.log", file_id));
+			let vlog_file_path = opts.vlog_file_path(file_id as u64);
 			std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
 
 			let vlog = VLog::new(&vlog_dir, opts.clone()).unwrap();

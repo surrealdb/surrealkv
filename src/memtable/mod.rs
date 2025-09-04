@@ -2,7 +2,6 @@ use crossbeam_skiplist::SkipMap;
 use std::{
 	fs::File as SysFile,
 	ops::{Bound, RangeBounds},
-	path::PathBuf,
 	sync::{
 		atomic::{AtomicU32, AtomicU64, Ordering},
 		Arc,
@@ -161,11 +160,10 @@ impl MemTable {
 	pub fn flush(
 		&self,
 		table_id: u64,
-		dir: PathBuf,
 		lsm_opts: Arc<Options>,
 		vlog: Option<Arc<VLog>>,
 	) -> Result<Arc<Table>> {
-		let table_file_path = dir.join(table_id.to_string());
+		let table_file_path = lsm_opts.sstable_file_path(table_id);
 		{
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone());

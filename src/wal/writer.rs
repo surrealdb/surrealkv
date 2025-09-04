@@ -65,8 +65,8 @@ impl Wal {
 	}
 
 	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
-		fs::create_dir_all(dir)?;
-
+		// Directory should already be created by Tree::new()
+		// Just set permissions if needed
 		if let Ok(metadata) = fs::metadata(dir) {
 			let mut permissions = metadata.permissions();
 

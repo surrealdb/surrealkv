@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::{
 	fs::{create_dir_all, File},
-	path::{Path, PathBuf},
+	path::Path,
 	sync::{Arc, Mutex, RwLock},
 };
 
@@ -36,7 +36,6 @@ use async_trait::async_trait;
 
 // ===== Constants =====
 pub const TABLE_FOLDER: &str = "sstables";
-pub const LEVELS_MANIFEST_FILE: &str = "levels";
 
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
@@ -129,13 +128,13 @@ impl CoreInner {
 		// The oracle provides monotonic timestamps for transaction ordering
 		let oracle = Oracle::new();
 
-		let wal_path = opts.path.join("wal");
+		let wal_path = opts.wal_dir();
 		let wal = Wal::open(&wal_path, wal::Options::default())?;
 
 		let vlog = if opts.disable_vlog {
 			None
 		} else {
-			let vlog_path = opts.path.join("vlog");
+			let vlog_path = opts.vlog_dir();
 			Some(Arc::new(VLog::new(&vlog_path, opts.clone())?))
 		};
 
@@ -158,24 +157,17 @@ impl CoreInner {
 	/// 2. A new empty active memtable is created for new writes
 	/// 3. The immutable memtable is flushed to disk as an SSTable
 	/// 4. The new SSTable is added to Level 0
-	pub fn make_room_for_write(&self) -> Result<Option<PathBuf>> {
+	pub fn make_room_for_write(&self) -> Result<()> {
 		// Atomically flush memtable and rotate WAL under a single lock
 		// This prevents race conditions where writes could go to the wrong WAL segment
 		let Some((table_id, flushed_memtable)) = self.flush_active_memtable_and_rotate_wal()?
 		else {
-			return Ok(None);
+			return Ok(());
 		};
-
-		let table_folder = self.opts.path.join(TABLE_FOLDER);
 
 		// Flush the immutable memtable to disk as an SSTable
 		// This converts the in-memory sorted data structure to an on-disk format
-		let table = flushed_memtable.flush(
-			table_id,
-			table_folder.clone(),
-			self.opts.clone(),
-			self.vlog.clone(),
-		)?;
+		let table = flushed_memtable.flush(table_id, self.opts.clone(), self.vlog.clone())?;
 
 		// Add the new SSTable to Level 0
 		// L0 is special: it contains recently flushed SSTables that may have overlapping keys
@@ -191,7 +183,7 @@ impl CoreInner {
 			}
 		});
 
-		Ok(Some(table_folder))
+		Ok(())
 	}
 
 	/// Atomically flushes the active memtable and rotates WAL.
@@ -272,8 +264,7 @@ impl CoreInner {
 impl CompactionOperations for CoreInner {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
-		let _memtable_path = self.make_room_for_write()?;
-		Ok(())
+		self.make_room_for_write()
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -456,7 +447,7 @@ impl Core {
 		let commit_pipeline = CommitPipeline::new(commit_env);
 
 		// Path for the WAL directory
-		let wal_path = opts.path.join("wal");
+		let wal_path = opts.wal_dir();
 
 		// Replay WAL with automatic repair on corruption
 		let wal_seq_num =
@@ -578,29 +569,47 @@ impl std::ops::Deref for Tree {
 impl Tree {
 	/// Creates a new LSM tree with the specified options
 	pub fn new(opts: Arc<Options>) -> Result<Self> {
-		let path = opts.path.clone();
-
-		// Create directory structure
-		create_dir_all(&path)?;
-		let table_folder_path = path.join(TABLE_FOLDER);
-		create_dir_all(&table_folder_path)?;
-		let wal_path = path.join("wal");
-		create_dir_all(&wal_path)?;
+		// Create all required directory structure
+		Self::create_directory_structure(&opts)?;
 
 		// Create the core LSM tree components
-		let core = Core::new(opts)?;
+		let core = Core::new(opts.clone())?;
 
 		// TODO: Add file to write options manifest
 		// TODO: Add version header in file similar to table in WAL
 
 		// Ensure directory changes are persisted
-		fsync_directory(&table_folder_path)?;
-		fsync_directory(&wal_path)?;
-		fsync_directory(&path)?;
+		Self::sync_directory_structure(&opts)?;
 
 		Ok(Self {
 			core: Arc::new(core),
 		})
+	}
+
+	/// Creates all required directory structure for the LSM tree
+	fn create_directory_structure(opts: &Options) -> Result<()> {
+		// Create base directory
+		create_dir_all(&opts.path)?;
+
+		// Create all subdirectories
+		create_dir_all(opts.sstable_dir())?;
+		create_dir_all(opts.wal_dir())?;
+		create_dir_all(opts.manifest_dir())?;
+		create_dir_all(opts.vlog_dir())?;
+
+		Ok(())
+	}
+
+	/// Syncs all directory changes to disk
+	fn sync_directory_structure(opts: &Options) -> Result<()> {
+		// Sync all subdirectories
+		fsync_directory(opts.sstable_dir())?;
+		fsync_directory(opts.wal_dir())?;
+		fsync_directory(opts.manifest_dir())?;
+		fsync_directory(opts.vlog_dir())?;
+		fsync_directory(&opts.path)?;
+
+		Ok(())
 	}
 
 	/// Transactions provide a consistent, atomic view of the database.
@@ -733,7 +742,7 @@ impl Tree {
 	}
 
 	/// Flushes the active memtable to disk
-	pub fn flush(&self) -> Result<Option<PathBuf>> {
+	pub fn flush(&self) -> Result<()> {
 		self.core.make_room_for_write()
 	}
 }
@@ -747,7 +756,7 @@ pub fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
+	use std::{collections::HashMap, path::PathBuf};
 
 	use crate::compaction::leveled::Strategy;
 
@@ -830,7 +839,7 @@ mod tests {
 		let key = "hello";
 		let values = ["world", "universe", "everyone", "planet"];
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert the same key multiple times with different values
 		for value in values.iter() {
@@ -864,7 +873,7 @@ mod tests {
 		let key = "hello";
 		let values = ["world", "universe", "everyone"];
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert the same key multiple times with different values
 		for value in values.iter() {
@@ -900,7 +909,7 @@ mod tests {
 		// Set a reasonable memtable size to trigger multiple flushes
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Number of keys to insert
 		const KEY_COUNT: usize = 10001;
@@ -1040,7 +1049,7 @@ mod tests {
 		let opts = create_small_memtable_options(path.clone());
 
 		// Create initial data
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert some test data
 		for i in 0..10 {
@@ -1068,7 +1077,7 @@ mod tests {
 		assert!(checkpoint_dir.exists());
 		assert!(checkpoint_dir.join("sstables").exists());
 		assert!(checkpoint_dir.join("wal").exists());
-		assert!(checkpoint_dir.join("levels").exists());
+		assert!(checkpoint_dir.join("manifest").exists());
 		assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
 
 		// Insert more data after checkpoint
@@ -1191,7 +1200,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert simple keys
 		let keys = ["a", "b", "c", "d", "e"];
@@ -1269,7 +1278,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert 10,000 items with zero-padded keys for consistent ordering
 		const TOTAL_ITEMS: usize = 10_000;
@@ -1450,7 +1459,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		const TOTAL_ITEMS: usize = 10_000;
 		let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -1512,7 +1521,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		fn generate_alphabetical_key(index: usize) -> String {
 			let mut result = String::new();
@@ -1589,7 +1598,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		const TOTAL_ITEMS: usize = 10_000;
 		let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -1717,7 +1726,7 @@ mod tests {
 
 		let opts = create_small_memtable_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		const TOTAL_ITEMS: usize = 20_000;
 		let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -1858,7 +1867,7 @@ mod tests {
 
 		let opts = create_vlog_test_options(path.clone());
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Test 1: Values should be stored in VLog
 		let small_key = "small_key";
@@ -1899,7 +1908,7 @@ mod tests {
 			opts.max_memtable_size = 32 * 1024;
 		});
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		let mut expected_values = Vec::new();
 
@@ -1957,7 +1966,7 @@ mod tests {
 			opts.vlog_max_file_size = 2048; // 2KB files to force frequent rotation
 		});
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert enough data to force multiple file rotations
 		let mut keys_and_values = Vec::new();
@@ -1981,7 +1990,7 @@ mod tests {
 			.filter_map(|e| {
 				let entry = e.ok()?;
 				let name = entry.file_name().to_string_lossy().to_string();
-				if name.starts_with("vlog_") && name.ends_with(".log") {
+				if opts.is_vlog_filename(&name) {
 					Some(name)
 				} else {
 					None
@@ -2015,7 +2024,7 @@ mod tests {
 			opts.max_memtable_size = 512;
 		});
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Insert some data to ensure VLog and discard stats are created
 		let large_value = vec![1u8; 200]; // Large enough for VLog
@@ -2070,7 +2079,7 @@ mod tests {
 			.filter_map(|entry| {
 				let entry = entry.ok()?;
 				let name = entry.file_name().to_string_lossy().to_string();
-				if name.starts_with("vlog_") && name.ends_with(".log") {
+				if opts.is_vlog_filename(&name) {
 					Some(name)
 				} else {
 					None
@@ -2086,10 +2095,10 @@ mod tests {
 		}
 
 		// Verify other expected files are in the main directory
-		let levels_file = main_db_dir.join("levels");
+		let manifest_dir = main_db_dir.join("manifest");
 		assert!(
-			levels_file.exists(),
-			"levels manifest should be in main directory alongside DISCARD"
+			manifest_dir.exists(),
+			"manifest directory should be in main directory alongside DISCARD"
 		);
 
 		println!("✓ Directory structure verification passed:");
@@ -2101,7 +2110,7 @@ mod tests {
 		);
 		println!("  VLog dir: {vlog_dir:?}");
 		println!("  VLog files: {vlog_files:?}");
-		println!("  levels file: {:?} (exists: {})", levels_file, levels_file.exists());
+		println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
 	}
 
 	#[tokio::test]
@@ -2114,7 +2123,7 @@ mod tests {
 			opts.vlog_max_file_size = 20;
 		});
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Create 2 keys in ascending order
 		let keys = ["key-1".as_bytes(), "key-2".as_bytes()];
@@ -2179,7 +2188,7 @@ mod tests {
 			.filter_map(|e| {
 				let entry = e.ok()?;
 				let name = entry.file_name().to_string_lossy().to_string();
-				if name.starts_with("vlog_") && name.ends_with(".log") {
+				if opts.is_vlog_filename(&name) {
 					Some(name)
 				} else {
 					None
@@ -2204,7 +2213,7 @@ mod tests {
 			opts.vlog_max_file_size = 20;
 		});
 
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Create single key
 		let keys = ["key-1".as_bytes()];
@@ -2289,7 +2298,7 @@ mod tests {
 			.filter_map(|e| {
 				let entry = e.ok()?;
 				let name = entry.file_name().to_string_lossy().to_string();
-				if name.starts_with("vlog_") && name.ends_with(".log") {
+				if opts.is_vlog_filename(&name) {
 					Some(name)
 				} else {
 					None
@@ -2312,7 +2321,7 @@ mod tests {
 		let opts = create_vlog_compaction_options(path.clone());
 
 		// Open the Tree (database instance)
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::new(opts.clone()).unwrap();
 
 		// Define keys used throughout the test
 		let key1 = b"test_key_1".to_vec();
@@ -2525,10 +2534,13 @@ mod tests {
 			assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
 
 			// Get the table IDs from the first session
-			let manifest = tree.core.level_manifest.read().unwrap();
-			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
-			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
-			let next_table_id = manifest.next_table_id();
+			let (table1_id, table2_id, next_table_id) = {
+				let manifest = tree.core.level_manifest.read().unwrap();
+				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
+				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+				let next_table_id = manifest.next_table_id();
+				(table1_id, table2_id, next_table_id)
+			};
 
 			// Verify table IDs are increasing (note: tables are stored in reverse order by sequence number)
 			// So the first table in the vector has the higher ID
@@ -2634,7 +2646,7 @@ mod tests {
 
 		// Step 4: Final verification - reopen and check everything is still correct
 		{
-			let tree = Tree::new(opts).unwrap();
+			let tree = Tree::new(opts.clone()).unwrap();
 
 			// Verify we still have 3 tables
 			let l0_size =

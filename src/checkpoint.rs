@@ -7,7 +7,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
-use crate::lsm::{CompactionOperations, CoreInner, LEVELS_MANIFEST_FILE, TABLE_FOLDER};
+use crate::lsm::{CompactionOperations, CoreInner, TABLE_FOLDER};
+
+/// Recursively copies a directory and all its contents
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+	fs::create_dir_all(dst)?;
+
+	for entry in fs::read_dir(src)? {
+		let entry = entry?;
+		let src_path = entry.path();
+		let dst_path = dst.join(entry.file_name());
+
+		if src_path.is_dir() {
+			copy_dir_all(&src_path, &dst_path)?;
+		} else {
+			fs::copy(&src_path, &dst_path)?;
+		}
+	}
+
+	Ok(())
+}
 
 /// Current checkpoint metadata format version
 const CHECKPOINT_VERSION: u32 = 1;
@@ -213,23 +232,26 @@ impl DatabaseCheckpoint {
 
 		// Restore SSTables
 		let sstables_source = checkpoint_path.join(TABLE_FOLDER);
-		let sstables_dest = self.core.opts.path.join(TABLE_FOLDER);
+		let sstables_dest = self.core.opts.sstable_dir();
 		if sstables_source.exists() {
 			Self::copy_directory_sync(&sstables_source, &sstables_dest)?;
 		}
 
 		// Restore WAL segments
 		let wal_source = checkpoint_path.join("wal");
-		let wal_dest = self.core.opts.path.join("wal");
+		let wal_dest = self.core.opts.wal_dir();
 		if wal_source.exists() {
 			Self::copy_directory_sync(&wal_source, &wal_dest)?;
 		}
 
-		// Restore level manifest
-		let manifest_source = checkpoint_path.join(LEVELS_MANIFEST_FILE);
-		let manifest_dest = self.core.opts.path.join(LEVELS_MANIFEST_FILE);
+		// Restore level manifest directory
+		let manifest_source = checkpoint_path.join("manifest");
+		let manifest_dest = self.core.opts.manifest_dir();
 		if manifest_source.exists() {
-			fs::copy(&manifest_source, &manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			if manifest_dest.exists() {
+				fs::remove_dir_all(&manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+			copy_dir_all(&manifest_source, &manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
 		Ok(metadata)
@@ -271,8 +293,7 @@ impl DatabaseCheckpoint {
 		// Use the iterator method to iterate over all tables
 		for table in levels_guard.iter() {
 			// Construct the source path using the table ID, similar to load_table
-			let sstable_dir = self.core.opts.path.join(TABLE_FOLDER);
-			let source_path = sstable_dir.join(format!("{}", table.id));
+			let source_path = self.core.opts.sstable_file_path(table.id);
 
 			let filename = source_path
 				.file_name()
@@ -311,17 +332,26 @@ impl DatabaseCheckpoint {
 		Ok(())
 	}
 
-	/// Copies the level manifest to the checkpoint directory
+	/// Copies the level manifest directory to the checkpoint directory
 	fn copy_level_manifest(&self, dest_dir: &Path) -> Result<u64> {
-		let source_path = self.core.opts.path.join(LEVELS_MANIFEST_FILE);
-		let dest_path = dest_dir.join(LEVELS_MANIFEST_FILE);
+		let source_path = self.core.opts.manifest_dir();
+		let dest_path = dest_dir.join("manifest");
 
 		if source_path.exists() {
-			fs::copy(&source_path, &dest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+			copy_dir_all(&source_path, &dest_path).map_err(|e| Error::Io(Arc::new(e)))?;
 
-			if let Ok(metadata) = fs::metadata(&dest_path) {
-				return Ok(metadata.len());
+			// Calculate total size of copied directory
+			let mut total_size = 0u64;
+			if let Ok(entries) = fs::read_dir(&dest_path) {
+				for entry in entries.flatten() {
+					if let Ok(metadata) = entry.metadata() {
+						if metadata.is_file() {
+							total_size += metadata.len();
+						}
+					}
+				}
 			}
+			return Ok(total_size);
 		}
 
 		Ok(0)
@@ -387,21 +417,21 @@ impl DatabaseCheckpoint {
 	/// Clears the current database state (for restoration)
 	fn clear_current_state(&self) -> Result<()> {
 		// Clear SSTables directory
-		let sstables_dir = self.core.opts.path.join(TABLE_FOLDER);
+		let sstables_dir = self.core.opts.sstable_dir();
 		if sstables_dir.exists() {
 			fs::remove_dir_all(&sstables_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
 		// Clear WAL directory
-		let wal_dir = self.core.opts.path.join("wal");
+		let wal_dir = self.core.opts.wal_dir();
 		if wal_dir.exists() {
 			fs::remove_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
-		// Remove level manifest
-		let manifest_path = self.core.opts.path.join(LEVELS_MANIFEST_FILE);
+		// Remove level manifest directory
+		let manifest_path = self.core.opts.manifest_dir();
 		if manifest_path.exists() {
-			fs::remove_file(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+			fs::remove_dir_all(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
 		Ok(())

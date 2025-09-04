@@ -327,7 +327,6 @@ mod tests {
 	use std::{
 		collections::{HashMap, HashSet},
 		fs::File,
-		path::PathBuf,
 		sync::{atomic::AtomicU64, Arc, RwLock},
 	};
 
@@ -355,7 +354,6 @@ mod tests {
 	struct TestEnv {
 		#[allow(dead_code)]
 		temp_dir: TempDir,
-		table_dir: PathBuf,
 		options: Arc<LSMOptions>,
 	}
 
@@ -374,7 +372,6 @@ mod tests {
 
 			Self {
 				temp_dir,
-				table_dir,
 				options,
 			}
 		}
@@ -384,7 +381,7 @@ mod tests {
 			id: u64,
 			entries: Vec<(InternalKey, Vec<u8>)>,
 		) -> Result<Arc<Table>> {
-			let table_path = self.table_dir.join(id.to_string());
+			let table_path = self.options.sstable_file_path(id);
 			let file = File::create(&table_path)?;
 
 			// Create a TableWriter

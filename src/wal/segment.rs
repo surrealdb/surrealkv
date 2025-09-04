@@ -650,9 +650,10 @@ fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
 
 pub(crate) fn segment_name(index: u64, ext: &str) -> String {
 	if ext.is_empty() {
-		return format!("{index:020}");
+		format!("{index:020}")
+	} else {
+		format!("{index:020}.{ext}")
 	}
-	format!("{index:020}.{ext}")
 }
 
 /// Gets the range of segment IDs present in the specified directory.
