@@ -124,7 +124,7 @@ impl Snapshot {
 		drop(memtable_lock); // Release the lock on the immutable memtables
 
 		// Read lock on the level manifest
-		let level_manifest = self.core.levels.read().unwrap();
+		let level_manifest = self.core.level_manifest.read().unwrap();
 
 		// Check the tables in each level for the key
 		for level in &level_manifest.levels {
@@ -193,7 +193,7 @@ impl SnapshotIterator<'_> {
 			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
 
 		// Collect iterators from all tables in all levels
-		let manifest = guardian::ArcRwLockReadGuardian::take(core.levels.clone()).unwrap();
+		let manifest = guardian::ArcRwLockReadGuardian::take(core.level_manifest.clone()).unwrap();
 
 		let iter_state = IterState {
 			active: active.clone(),

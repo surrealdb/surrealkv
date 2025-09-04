@@ -4,7 +4,7 @@ use std::{
 	fs::{create_dir_all, File},
 	path::{Path, PathBuf},
 	sync::{
-		atomic::{AtomicU64, Ordering},
+		atomic::AtomicU64,
 		Arc, Mutex, RwLock,
 	},
 };
@@ -18,7 +18,7 @@ use crate::{
 		CompactionStrategy,
 	},
 	error::Result,
-	levels::{write_levels_to_disk, LevelManifest},
+	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
@@ -100,7 +100,7 @@ pub struct CoreInner {
 	/// - L0: Contains SSTables flushed directly from memtables. May have overlapping key ranges.
 	/// - L1+: Each level is larger than the previous. SSTables have non-overlapping
 	///   key ranges within a level, enabling efficient binary search.
-	pub levels: Arc<RwLock<LevelManifest>>,
+	pub level_manifest: Arc<RwLock<LevelManifest>>,
 
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
@@ -124,7 +124,9 @@ impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Initialize the level manifest which tracks the SSTable organization
-		let levels = Arc::new(RwLock::new(LevelManifest::new(opts.clone())?));
+		let manifest = LevelManifest::new(opts.clone())?;
+		let next_table_id = manifest.next_table_id.clone();
+		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize active and immutable memtables
 		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::default())));
@@ -146,11 +148,11 @@ impl CoreInner {
 		};
 
 		Ok(Self {
-			table_id_counter: Arc::new(AtomicU64::default()),
+			table_id_counter: next_table_id.clone(),
 			opts,
 			active_memtable,
 			immutable_memtables,
-			levels,
+			level_manifest,
 			snapshot_counter: SnapshotCounter::default(),
 			oracle: Arc::new(oracle),
 			vlog,
@@ -278,23 +280,20 @@ impl CoreInner {
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
 	pub fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
-		let mut original_manifest = self.levels.write().unwrap();
+		let mut original_manifest = self.level_manifest.write().unwrap();
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
-		let mut current_levels = original_manifest.levels.clone();
 		let table_id = table.id;
 
-		// Add the SSTable to Level 0
-		Arc::make_mut(
-			current_levels.get_first_level_mut().expect("Level 0 must exist in LSM tree"),
-		)
-		.insert(table);
+		// Create a changeset to add the table and update next_table_id
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, table));
+		changeset.next_table_id = Some(table_id); // Set next_table_id to table_id
 
-		// Persist the updated level structure to disk for crash recovery
-		let next_table_id = original_manifest.next_table_id.load(Ordering::SeqCst);
-		write_levels_to_disk(&original_manifest.path, &current_levels, next_table_id)?;
+		// Apply the changeset
+		original_manifest.apply_changeset(&changeset)?;
 
-		// Update in-memory state
-		original_manifest.levels = current_levels;
+		// Persist the updated manifest to disk for crash recovery
+		write_manifest_to_disk(&original_manifest)?;
 
 		// Remove the successfully flushed memtable from tracking
 		memtable_lock.remove(table_id);
@@ -518,7 +517,7 @@ impl Core {
 			})?;
 
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = inner.levels.read().unwrap().lsn();
+		let current_seq_num = inner.level_manifest.read().unwrap().lsn();
 		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
 		// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
@@ -712,7 +711,7 @@ impl Tree {
 
 		// Replace the current levels with the reloaded ones
 		{
-			let mut levels_guard = self.core.inner.levels.write().unwrap();
+			let mut levels_guard = self.core.inner.level_manifest.write().unwrap();
 			*levels_guard = new_levels;
 		}
 
@@ -746,7 +745,7 @@ impl Tree {
 			})?;
 
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = self.core.inner.levels.read().unwrap().lsn();
+		let current_seq_num = self.core.inner.level_manifest.read().unwrap().lsn();
 		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
 		// Set visible sequence number to highest of lsn from WAL or latest table in manifest
@@ -994,7 +993,7 @@ mod tests {
 		}
 
 		// Verify the LSM state: we should have multiple SSTables
-		let l0_size = tree.core.levels.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 		assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
 	}
 
@@ -1046,7 +1045,7 @@ mod tests {
 			expected_values = values;
 
 			// Verify L0 has tables before closing
-			let l0_size = tree.core.levels.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 before closing, got {l0_size}");
 
 			// Tree will be dropped here, closing the store
@@ -1058,7 +1057,7 @@ mod tests {
 			let tree = Tree::new(opts.clone()).unwrap();
 
 			// Verify L0 has tables after reopening
-			let l0_size = tree.core.levels.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 after reopening, got {l0_size}");
 
 			// Verify all keys have their final values

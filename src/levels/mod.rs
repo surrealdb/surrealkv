@@ -22,6 +22,78 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 
+/// Current manifest format version
+pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
+
+/// Snapshot information stored in the manifest
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+	/// Snapshot sequence number
+	pub seq_num: u64,
+	/// Creation timestamp (system time in nanoseconds)
+	pub created_at: u128,
+}
+
+impl SnapshotInfo {
+	pub fn new(seq_num: u64) -> Self {
+		Self {
+			seq_num,
+			created_at: std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|d| d.as_nanos())
+				.unwrap_or(0),
+		}
+	}
+
+	pub fn encode(&self) -> Result<Vec<u8>> {
+		let mut buf = Vec::new();
+		buf.write_u64::<BigEndian>(self.seq_num)?;
+		buf.write_u128::<BigEndian>(self.created_at)?;
+		Ok(buf)
+	}
+
+	pub fn decode(mut buf: &[u8]) -> Result<Self> {
+		let seq_num = buf.read_u64::<BigEndian>()?;
+		let created_at = buf.read_u128::<BigEndian>()?;
+		Ok(Self { seq_num, created_at })
+	}
+}
+
+/// Represents a set of changes to be applied to the manifest
+#[derive(Clone, Default)]
+pub struct ManifestChangeSet {
+	/// Manifest format version if changed
+	pub manifest_format_version: Option<u16>,
+
+	/// Writer epoch if changed
+	pub writer_epoch: Option<u64>,
+
+	/// Compactor epoch if changed
+	pub compactor_epoch: Option<u64>,
+
+	/// The most recent SST in the WAL that's been compacted, if changed
+	pub wal_id_last_compacted: Option<u64>,
+
+	/// The most recent SST in the WAL at the time manifest was updated, if changed
+	pub wal_id_last_seen: Option<u64>,
+
+	/// Next table ID if changed
+	pub next_table_id: Option<u64>,
+
+	/// Tables to delete from manifest
+	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
+
+	/// Tables to add to manifest
+	pub new_tables: Vec<(u8, Arc<Table>)>, // (level, table)
+
+	/// Snapshots to add
+	pub new_snapshots: Vec<SnapshotInfo>,
+
+	/// Snapshots to delete (by sequence number)
+	pub deleted_snapshots: HashSet<u64>,
+}
+
+
 mod iter;
 mod level;
 
@@ -40,6 +112,24 @@ pub struct LevelManifest {
 
 	/// Next table ID to use (persisted to disk for safe recovery)
 	pub(crate) next_table_id: Arc<AtomicU64>,
+
+	/// Manifest format version to allow schema evolution
+	pub manifest_format_version: u16,
+
+	/// The current writer's epoch (incremented when a new writer takes over)
+	pub writer_epoch: u64,
+
+	/// The current compactor's epoch (incremented when compaction process starts)
+	pub compactor_epoch: u64,
+
+	/// The most recent SST in the WAL that's been compacted
+	pub wal_id_last_compacted: u64,
+
+	/// The most recent SST in the WAL at the time manifest was updated
+	pub wal_id_last_seen: u64,
+
+	/// A list of read snapshots that are currently open
+	pub snapshots: Vec<SnapshotInfo>,
 }
 
 impl LevelManifest {
@@ -61,14 +151,16 @@ impl LevelManifest {
 				levels: loaded_levels,
 				hidden_set: HashSet::with_capacity(10),
 				next_table_id: Arc::new(AtomicU64::new(next_id)),
+				manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
+				writer_epoch: 1,
+				compactor_epoch: 0,
+				wal_id_last_compacted: 0,
+				wal_id_last_seen: 0,
+				snapshots: Vec::new(),
 			};
 
 			// Ensure manifest is written to disk with the counter
-			write_levels_to_disk(
-				&manifest.path,
-				&manifest.levels,
-				manifest.next_table_id.load(Ordering::SeqCst),
-			)?;
+			write_manifest_to_disk(&manifest)?;
 
 			return Ok(manifest);
 		}
@@ -86,14 +178,16 @@ impl LevelManifest {
 			levels,
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
+			manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
 		// Write levels to disk with the counter
-		write_levels_to_disk(
-			&manifest.path,
-			&manifest.levels,
-			manifest.next_table_id.load(Ordering::SeqCst),
-		)?;
+		write_manifest_to_disk(&manifest)?;
 
 		Ok(manifest)
 	}
@@ -216,18 +310,37 @@ impl LevelManifest {
 		Ok(table)
 	}
 
-	// The original load function stays the same, it just loads IDs
+	// Load versioned manifest format
 	pub(crate) fn load<P: AsRef<Path>>(path: P) -> Result<(Vec<Vec<u64>>, u64)> {
-		let mut level_manifest = Cursor::new(std::fs::read(&path)?);
+		let data = std::fs::read(&path)?;
+		let mut level_manifest = Cursor::new(data);
 
-		// Read the next table ID
+		// Read versioned manifest format
+		let version = level_manifest.read_u16::<BigEndian>()?;
+		if version != MANIFEST_FORMAT_VERSION_V1 {
+			return Err(Error::LoadManifestFail(format!(
+				"Unsupported manifest format version: {}",
+				version
+			)));
+		}
+
+		let _writer_epoch = level_manifest.read_u64::<BigEndian>()?;
+		let _compactor_epoch = level_manifest.read_u64::<BigEndian>()?;
+		let _wal_id_last_compacted = level_manifest.read_u64::<BigEndian>()?;
+		let _wal_id_last_seen = level_manifest.read_u64::<BigEndian>()?;
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 
-		// Read the number of levels
+		// Read levels data
 		let level_count = level_manifest.read_u8()?;
-
-		// Load levels from the manifest
 		let levels = Self::load_levels(&mut level_manifest, level_count)?;
+
+		// Skip snapshots for now (we don't need them for basic loading)
+		let _snapshot_count = level_manifest.read_u32::<BigEndian>()?;
+		for _ in 0.._snapshot_count {
+			let snapshot_len = level_manifest.read_u32::<BigEndian>()? as usize;
+			let mut _snapshot_bytes = vec![0u8; snapshot_len];
+			level_manifest.read_exact(&mut _snapshot_bytes)?;
+		}
 
 		Ok((levels, next_table_id))
 	}
@@ -286,6 +399,100 @@ impl LevelManifest {
 			self.hidden_set.insert(*key);
 		}
 	}
+
+	/// Create a changeset for incremental manifest changes
+	pub fn create_changeset(&self) -> ManifestChangeSet {
+		ManifestChangeSet {
+			manifest_format_version: Some(self.manifest_format_version),
+			writer_epoch: Some(self.writer_epoch),
+			compactor_epoch: Some(self.compactor_epoch),
+			wal_id_last_compacted: Some(self.wal_id_last_compacted),
+			wal_id_last_seen: Some(self.wal_id_last_seen),
+			next_table_id: Some(self.next_table_id.load(Ordering::SeqCst)),
+			deleted_tables: HashSet::new(),
+			new_tables: Vec::new(),
+			new_snapshots: Vec::new(),
+			deleted_snapshots: HashSet::new(),
+		}
+	}
+
+	/// Apply a changeset to this manifest
+	pub fn apply_changeset(&mut self, changeset: &ManifestChangeSet) -> Result<()> {
+		// Apply scalar values if present in changeset
+		if let Some(version) = changeset.manifest_format_version {
+			self.manifest_format_version = version;
+		}
+		if let Some(epoch) = changeset.writer_epoch {
+			self.writer_epoch = epoch;
+		}
+		if let Some(epoch) = changeset.compactor_epoch {
+			self.compactor_epoch = epoch;
+		}
+		if let Some(wal_id) = changeset.wal_id_last_compacted {
+			self.wal_id_last_compacted = wal_id;
+		}
+		if let Some(wal_id) = changeset.wal_id_last_seen {
+			self.wal_id_last_seen = wal_id;
+		}
+		if let Some(next_id) = changeset.next_table_id {
+			self.next_table_id.store(next_id, Ordering::SeqCst);
+		}
+
+		// Add new tables to levels
+		for (level, table) in &changeset.new_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
+				Arc::make_mut(level_ref).insert(table.clone());
+			}
+		}
+
+		// Delete tables from levels
+		for (level, table_id) in &changeset.deleted_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
+				Arc::make_mut(level_ref).remove(*table_id);
+			}
+		}
+
+		// Delete snapshots
+		self.snapshots.retain(|snapshot| !changeset.deleted_snapshots.contains(&snapshot.seq_num));
+
+		// Add new snapshots
+		for snapshot in &changeset.new_snapshots {
+			self.snapshots.push(snapshot.clone());
+		}
+
+		Ok(())
+	}
+
+	/// Add a snapshot to the manifest
+	pub fn add_snapshot(&mut self, seq_num: u64) {
+		self.snapshots.push(SnapshotInfo::new(seq_num));
+	}
+
+	/// Remove snapshots by sequence number
+	pub fn remove_snapshots(&mut self, seq_nums: &[u64]) {
+		self.snapshots.retain(|snapshot| !seq_nums.contains(&snapshot.seq_num));
+	}
+
+	/// Update WAL tracking information
+	pub fn update_wal_info(&mut self, last_compacted: u64, last_seen: u64) {
+		self.wal_id_last_compacted = last_compacted;
+		self.wal_id_last_seen = last_seen;
+	}
+
+	/// Increment writer epoch (when a new writer takes over)
+	pub fn increment_writer_epoch(&mut self) {
+		self.writer_epoch += 1;
+	}
+
+	/// Increment compactor epoch (when compaction process starts)
+	pub fn increment_compactor_epoch(&mut self) {
+		self.compactor_epoch += 1;
+	}
+
+	/// Check if a table is hidden
+	pub fn is_table_hidden(&self, table_id: u64) -> bool {
+		self.hidden_set.contains(&table_id)
+	}
 }
 
 /// Safely updates a file's content.
@@ -313,23 +520,30 @@ pub fn replace_file_content<P: AsRef<Path>>(
 	Ok(())
 }
 
-pub fn write_levels_to_disk<P: AsRef<Path>>(
-	path: P,
-	levels: &Levels,
-	next_table_id: u64,
-) -> Result<()> {
-	let path = path.as_ref();
+/// Write the full versioned manifest to disk
+pub fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+	let mut buf = Vec::new();
 
-	let mut enc_bytes = vec![];
+	// Write header
+	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
+	buf.write_u64::<BigEndian>(manifest.writer_epoch)?;
+	buf.write_u64::<BigEndian>(manifest.compactor_epoch)?;
+	buf.write_u64::<BigEndian>(manifest.wal_id_last_compacted)?;
+	buf.write_u64::<BigEndian>(manifest.wal_id_last_seen)?;
+	buf.write_u64::<BigEndian>(manifest.next_table_id.load(Ordering::SeqCst))?;
 
-	// Write the next table ID
-	enc_bytes.write_u64::<BigEndian>(next_table_id)?;
+	// Write levels data
+	manifest.levels.encode(&mut buf)?;
 
-	// Write the level data
-	levels.encode(&mut enc_bytes)?;
+	// Write snapshots
+	buf.write_u32::<BigEndian>(manifest.snapshots.len() as u32)?;
+	for snapshot in &manifest.snapshots {
+		let snapshot_bytes = snapshot.encode()?;
+		buf.write_u32::<BigEndian>(snapshot_bytes.len() as u32)?;
+		buf.extend_from_slice(&snapshot_bytes);
+	}
 
-	replace_file_content(path, &enc_bytes)?;
-
+	replace_file_content(&manifest.path, &buf)?;
 	Ok(())
 }
 
@@ -433,7 +647,7 @@ mod tests {
 		manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
 
 		// Persist the manifest with our custom next_table_id
-		write_levels_to_disk(&manifest.path, &manifest.levels, expected_next_id)
+		write_manifest_to_disk(&manifest)
 			.expect("Failed to write to disk");
 
 		// Load the data directly using load() to verify raw persistence

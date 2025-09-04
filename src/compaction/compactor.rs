@@ -2,7 +2,7 @@ use crate::{
 	compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
 	error::Result,
 	iter::{BoxedIterator, CompactionIterator},
-	levels::{write_levels_to_disk, LevelManifest},
+	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	lsm::TABLE_FOLDER,
 	memtable::ImmutableMemtables,
 	sstable::table::{Table, TableWriter},
@@ -16,7 +16,7 @@ use std::{
 	fs::File as SysFile,
 	path::{Path, PathBuf},
 	sync::{
-		atomic::{AtomicU64, Ordering},
+		atomic::AtomicU64,
 		Arc, RwLock, RwLockWriteGuard,
 	},
 };
@@ -25,7 +25,7 @@ use std::{
 pub struct CompactionOptions {
 	pub table_id_counter: Arc<AtomicU64>,
 	pub lopts: Arc<LSMOptions>,
-	pub levels: Arc<RwLock<LevelManifest>>,
+	pub level_manifest: Arc<RwLock<LevelManifest>>,
 	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub vlog: Option<Arc<VLog>>,
 }
@@ -35,7 +35,7 @@ impl CompactionOptions {
 		Self {
 			table_id_counter: tree.table_id_counter.clone(),
 			lopts: tree.opts.clone(),
-			levels: tree.levels.clone(),
+			level_manifest: tree.level_manifest.clone(),
 			immutable_memtables: tree.immutable_memtables.clone(),
 			vlog: tree.vlog.clone(),
 		}
@@ -57,7 +57,7 @@ impl Compactor {
 	}
 
 	pub fn compact(&self) -> Result<()> {
-		let levels_guard = self.options.levels.write().unwrap();
+		let levels_guard = self.options.level_manifest.write().unwrap();
 		let choice = self.strategy.pick_levels(&levels_guard);
 
 		match choice {
@@ -120,7 +120,7 @@ impl Compactor {
 			}
 			Err(e) => {
 				// Restore the original state
-				let mut levels = self.options.levels.write().unwrap();
+				let mut levels = self.options.level_manifest.write().unwrap();
 				levels.unhide_tables(&input.tables_to_merge);
 				Err(e)
 			}
@@ -158,7 +158,7 @@ impl Compactor {
 	}
 
 	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
-		let mut manifest = self.options.levels.write().unwrap();
+		let mut manifest = self.options.level_manifest.write().unwrap();
 		let _imm_guard = self.options.immutable_memtables.write();
 
 		let new_table_id = new_table.id;
@@ -168,29 +168,30 @@ impl Compactor {
 			return Err(crate::error::Error::TableIDCollision(new_table_id));
 		}
 
-		let mut levels = manifest.levels.clone();
-
-		// Add new table to target level
-		Arc::make_mut(&mut levels.get_levels_mut()[input.target_level as usize])
-			.insert(new_table.clone());
-
-		// Remove old tables
-		for level in levels.get_levels_mut().iter_mut() {
+		// Create a changeset for the compaction
+		let mut changeset = ManifestChangeSet::default();
+		
+		// Add tables to delete (the ones being merged) - use the same efficient approach as original
+		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
 			for &table_id in &input.tables_to_merge {
-				Arc::make_mut(level).remove(table_id);
+				if level.tables.iter().any(|t| t.id == table_id) {
+					changeset.deleted_tables.insert((level_idx as u8, table_id));
+				}
 			}
 		}
 
-		// Get current next_table_id counter value
-		let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
+		// Add the new table to the changeset
+		changeset.new_tables.push((input.target_level, new_table.clone()));
+		
+		// Update next_table_id to match the new table ID
+		changeset.next_table_id = Some(new_table_id);
 
-		// Persist changes with the current counter value
-		if let Err(e) = write_levels_to_disk(&manifest.path, &levels, next_table_id) {
-			manifest.unhide_tables(&input.tables_to_merge);
-			return Err(e);
-		}
+		// Apply the changeset to remove old tables and add new table
+		manifest.apply_changeset(&changeset)?;
 
-		manifest.levels = levels;
+		// Persist the updated manifest
+		write_manifest_to_disk(&manifest)?;
+
 		manifest.unhide_tables(&input.tables_to_merge);
 
 		Ok(())

@@ -341,7 +341,7 @@ mod tests {
 		},
 		error::Result,
 		iter::MergeIterator,
-		levels::{write_levels_to_disk, Level, LevelManifest, Levels},
+		levels::{write_manifest_to_disk, Level, LevelManifest, Levels},
 		memtable::ImmutableMemtables,
 		sstable::{
 			table::{Table, TableFormat, TableWriter},
@@ -501,10 +501,16 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
 		// Write the manifest to disk
-		write_levels_to_disk(&manifest_path, &manifest.levels, next_table_id)?;
+		write_manifest_to_disk(&manifest)?;
 
 		Ok(Arc::new(RwLock::new(manifest)))
 	}
@@ -521,7 +527,7 @@ mod tests {
 		CompactionOptions {
 			table_id_counter,
 			lopts: opts,
-			levels: manifest,
+			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
 		}
@@ -915,9 +921,15 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
-		write_levels_to_disk(&manifest_path, &manifest.levels, next_table_id).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		// Create the leveled compaction strategy
@@ -1100,9 +1112,15 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
-		write_levels_to_disk(&manifest_path, &manifest.levels, next_table_id).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		// Create the strategy and compactor
@@ -1433,9 +1451,15 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		// Track expected data
@@ -1506,9 +1530,15 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
 
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		// Set up compaction
@@ -1591,8 +1621,14 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		// Run compaction
@@ -1682,8 +1718,14 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
@@ -1800,8 +1842,14 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
@@ -1917,8 +1965,14 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			writer_epoch: 1,
+			compactor_epoch: 0,
+			wal_id_last_compacted: 0,
+			wal_id_last_seen: 0,
+			snapshots: Vec::new(),
 		};
-		write_levels_to_disk(&manifest_path, &manifest.levels, 1000).unwrap();
+		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
