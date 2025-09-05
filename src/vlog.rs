@@ -1358,7 +1358,7 @@ impl DeleteList {
 		let delete_list_opts = Options {
 			path: delete_list_path,
 			// Disable VLog for the delete list to avoid circular dependency
-			disable_vlog: true,
+			enable_vlog: false,
 			..Default::default()
 		};
 

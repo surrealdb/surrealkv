@@ -131,11 +131,11 @@ impl CoreInner {
 		let wal_path = opts.wal_dir();
 		let wal = Wal::open(&wal_path, wal::Options::default())?;
 
-		let vlog = if opts.disable_vlog {
-			None
-		} else {
+		let vlog = if opts.enable_vlog {
 			let vlog_path = opts.vlog_dir();
 			Some(Arc::new(VLog::new(&vlog_path, opts.clone())?))
+		} else {
+			None
 		};
 
 		Ok(Self {
@@ -1963,6 +1963,7 @@ mod tests {
 
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.vlog_max_file_size = 2048; // 2KB files to force frequent rotation
+			opts.enable_vlog = true;
 		});
 
 		let tree = Tree::new(opts.clone()).unwrap();
@@ -2021,6 +2022,7 @@ mod tests {
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.vlog_max_file_size = 1024;
 			opts.max_memtable_size = 512;
+			opts.enable_vlog = true;
 		});
 
 		let tree = Tree::new(opts.clone()).unwrap();
@@ -2120,6 +2122,7 @@ mod tests {
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.level_count = 2;
 			opts.vlog_max_file_size = 20;
+			opts.enable_vlog = true;
 		});
 
 		let tree = Tree::new(opts.clone()).unwrap();
@@ -2210,6 +2213,7 @@ mod tests {
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.level_count = 2;
 			opts.vlog_max_file_size = 20;
+			opts.enable_vlog = true;
 		});
 
 		let tree = Tree::new(opts.clone()).unwrap();
@@ -2686,6 +2690,7 @@ mod tests {
 
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.vlog_max_file_size = 10; // Very small to force multiple files
+			opts.enable_vlog = true;
 		});
 
 		// Create initial database and add data to create multiple VLog files

@@ -62,7 +62,7 @@ pub struct Options {
 	pub vlog_max_file_size: u64,
 	pub vlog_checksum_verification: VLogChecksumLevel,
 	/// If true, disables `VLog` creation entirely
-	pub disable_vlog: bool,
+	pub enable_vlog: bool,
 	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 - 1.0)
 	/// Default: 0.5 (50% discardable data triggers GC)
 	pub vlog_gc_discard_ratio: f64,
@@ -88,7 +88,7 @@ impl Default for Options {
 			index_partition_size: 16384,           // 16KB
 			vlog_max_file_size: 128 * 1024 * 1024, // 128MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
-			disable_vlog: false,
+			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 4096, // 4KB default
 		}
@@ -177,8 +177,8 @@ impl Options {
 		self
 	}
 
-	pub const fn with_disable_vlog(mut self, value: bool) -> Self {
-		self.disable_vlog = value;
+	pub const fn with_enable_vlog(mut self, value: bool) -> Self {
+		self.enable_vlog = value;
 		self
 	}
 
