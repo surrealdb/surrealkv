@@ -158,7 +158,7 @@ txn.rollback();
 txn.set_durability(Durability::Immediate);
 ```
 
-## Advanced Features
+## Features
 
 ### Durability Levels
 
@@ -173,21 +173,6 @@ tx.set_durability(Durability::Eventual);
 
 // Set transaction durability to Immediate
 tx.set_durability(Durability::Immediate);
-```
-
-### Read-Your-Own-Writes (RYOW)
-
-```rust
-// RYOW semantics: Read your own writes within the same transaction
-let mut txn = tree.begin()?;
-txn.set(b"key1", b"value1")?;
-
-// This will return the value written above, even though not yet committed
-if let Some(value) = txn.get(b"key1")? {
-    println!("Value: {:?}", value); // Prints "value1"
-}
-
-txn.commit().await?;
 ```
 
 ## Platform Compatibility
