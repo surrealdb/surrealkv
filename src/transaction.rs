@@ -459,7 +459,7 @@ impl Transaction {
         &'b self,
         range: R,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = &'b [u8]>
+    ) -> impl DoubleEndedIterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -707,7 +707,7 @@ impl Transaction {
         range: R,
         version: u64,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = Result<(&'b [u8], Vec<u8>)>>
+    ) -> impl DoubleEndedIterator<Item = Result<(&'b [u8], Vec<u8>)>>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -737,7 +737,7 @@ impl Transaction {
         range: R,
         version: u64,
         limit: Option<usize>,
-    ) -> impl Iterator<Item = &'b [u8]>
+    ) -> impl DoubleEndedIterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -776,7 +776,11 @@ impl Transaction {
     }
 
     /// Returns only keys within the specified range.
-    pub fn keys<'b, R>(&'b self, range: R, limit: Option<usize>) -> impl Iterator<Item = &'b [u8]>
+    pub fn keys<'b, R>(
+        &'b self,
+        range: R,
+        limit: Option<usize>,
+    ) -> impl DoubleEndedIterator<Item = &'b [u8]>
     where
         R: RangeBounds<&'b [u8]>,
     {
@@ -1830,6 +1834,334 @@ mod tests {
                 iter.next_back().is_none(),
                 "Iterator should be exhausted going backward"
             );
+        }
+
+        #[test]
+        fn test_scan_at_version_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert some data with different versions
+            let keys = vec!["key1", "key2", "key3", "key4"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Test backward iteration for scan_at_version
+            let range = "key1".as_bytes()..="key4".as_bytes();
+            let version = u64::MAX;
+
+            // Forward iteration
+            let mut txn1 = store.begin().unwrap();
+            let forward_results: Vec<_> =
+                txn1.scan_at_version(range.clone(), version, None).collect();
+            assert_eq!(forward_results.len(), 4);
+
+            // Backward iteration
+            let mut txn2 = store.begin().unwrap();
+            let mut iter = txn2.scan_at_version(range, version, None);
+            let backward_results: Vec<_> = iter.by_ref().rev().collect();
+            assert_eq!(backward_results.len(), 4);
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_results.iter().zip(backward_results.iter().rev()) {
+                assert_eq!(forward.as_ref().unwrap().0, backward.as_ref().unwrap().0);
+                assert_eq!(forward.as_ref().unwrap().1, backward.as_ref().unwrap().1);
+            }
+        }
+
+        #[test]
+        fn test_keys_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert some data
+            let keys = vec!["apple", "banana", "cherry", "date"];
+            for key in &keys {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), key.as_bytes()).unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Test backward iteration for keys
+            let txn = store.begin().unwrap();
+            let range = "a".as_bytes()..="z".as_bytes();
+
+            // Forward iteration
+            let forward_keys: Vec<_> = txn.keys(range.clone(), None).collect();
+            assert_eq!(forward_keys.len(), 4);
+
+            // Backward iteration
+            let mut iter = txn.keys(range, None);
+            let backward_keys: Vec<_> = iter.by_ref().rev().collect();
+            assert_eq!(backward_keys.len(), 4);
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_keys.iter().zip(backward_keys.iter().rev()) {
+                assert_eq!(*forward, *backward);
+            }
+        }
+
+        #[test]
+        fn test_keys_at_version_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert some data with different versions
+            let keys = vec!["key1", "key2", "key3"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Test backward iteration for keys_at_version
+            let txn = store.begin().unwrap();
+            let range = "key1".as_bytes()..="key3".as_bytes();
+            let version = u64::MAX;
+
+            // Forward iteration
+            let forward_keys: Vec<_> = txn.keys_at_version(range.clone(), version, None).collect();
+            assert_eq!(forward_keys.len(), 3);
+
+            // Backward iteration
+            let mut iter = txn.keys_at_version(range, version, None);
+            let backward_keys: Vec<_> = iter.by_ref().rev().collect();
+            assert_eq!(backward_keys.len(), 3);
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_keys.iter().zip(backward_keys.iter().rev()) {
+                assert_eq!(*forward, *backward);
+            }
+        }
+
+        #[test]
+        fn test_scan_at_version_with_limits_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert exactly the limit amount of data
+            let keys = vec!["key1", "key2", "key3"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let range = "key1".as_bytes()..="key3".as_bytes();
+            let version = u64::MAX;
+            let limit = Some(3);
+
+            // Forward iteration with limit
+            let mut txn1 = store.begin().unwrap();
+            let forward_results: Vec<_> = txn1
+                .scan_at_version(range.clone(), version, limit)
+                .collect();
+            assert_eq!(forward_results.len(), 3);
+
+            // Backward iteration with limit - create a fresh iterator
+            let mut txn2 = store.begin().unwrap();
+            let backward_results: Vec<_> =
+                txn2.scan_at_version(range, version, limit).rev().collect();
+            assert_eq!(backward_results.len(), 3);
+
+            // Verify we got the same number of results
+            assert_eq!(forward_results.len(), backward_results.len());
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_results.iter().zip(backward_results.iter().rev()) {
+                assert_eq!(forward.as_ref().unwrap().0, backward.as_ref().unwrap().0);
+                assert_eq!(forward.as_ref().unwrap().1, backward.as_ref().unwrap().1);
+            }
+        }
+
+        #[test]
+        fn test_keys_with_limits_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert exactly the limit amount of data
+            let keys = vec!["a", "b", "c"];
+            for key in &keys {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), key.as_bytes()).unwrap();
+                txn.commit().unwrap();
+            }
+
+            let range = "a".as_bytes()..="c".as_bytes();
+            let limit = Some(3);
+
+            // Forward iteration with limit
+            let txn1 = store.begin().unwrap();
+            let forward_keys: Vec<_> = txn1.keys(range.clone(), limit).collect();
+            assert_eq!(forward_keys.len(), 3);
+
+            // Backward iteration with limit - create a fresh iterator
+            let txn2 = store.begin().unwrap();
+            let backward_keys: Vec<_> = txn2.keys(range, limit).rev().collect();
+            assert_eq!(backward_keys.len(), 3);
+
+            // Verify we got the same number of results
+            assert_eq!(forward_keys.len(), backward_keys.len());
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_keys.iter().zip(backward_keys.iter().rev()) {
+                assert_eq!(*forward, *backward);
+            }
+        }
+
+        #[test]
+        fn test_keys_at_version_with_limits_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert exactly the limit amount of data
+            let keys = vec!["key1", "key2", "key3"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let range = "key1".as_bytes()..="key3".as_bytes();
+            let version = u64::MAX;
+            let limit = Some(3);
+
+            // Forward iteration with limit
+            let txn1 = store.begin().unwrap();
+            let forward_keys: Vec<_> = txn1
+                .keys_at_version(range.clone(), version, limit)
+                .collect();
+            assert_eq!(forward_keys.len(), 3);
+
+            // Backward iteration with limit - create a fresh iterator
+            let txn2 = store.begin().unwrap();
+            let backward_keys: Vec<_> = txn2.keys_at_version(range, version, limit).rev().collect();
+            assert_eq!(backward_keys.len(), 3);
+
+            // Verify we got the same number of results
+            assert_eq!(forward_keys.len(), backward_keys.len());
+
+            // Verify the order is reversed
+            for (forward, backward) in forward_keys.iter().zip(backward_keys.iter().rev()) {
+                assert_eq!(*forward, *backward);
+            }
+        }
+
+        #[test]
+        fn test_empty_range_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Test with empty range
+            let txn = store.begin().unwrap();
+            let range = "z".as_bytes()..="zz".as_bytes();
+
+            // Forward iteration
+            let forward_keys: Vec<_> = txn.keys(range.clone(), None).collect();
+            assert_eq!(forward_keys.len(), 0);
+
+            // Backward iteration
+            let mut iter = txn.keys(range, None);
+            let backward_keys: Vec<_> = iter.by_ref().rev().collect();
+            assert_eq!(backward_keys.len(), 0);
+        }
+
+        #[test]
+        fn test_scan_at_version_mixed_forward_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert some data
+            let keys = vec!["key1", "key2", "key3", "key4", "key5"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let mut txn = store.begin().unwrap();
+            let range = "key1".as_bytes()..="key5".as_bytes();
+            let version = u64::MAX;
+
+            // Test mixed forward and backward iteration
+            let mut iter = txn.scan_at_version(range, version, None);
+
+            // Get first item forward
+            let first = iter.next().unwrap().unwrap();
+            assert_eq!(first.0, b"key1");
+
+            // Get last item backward
+            let last = iter.next_back().unwrap().unwrap();
+            assert_eq!(last.0, b"key5");
+
+            // Get second item forward
+            let second = iter.next().unwrap().unwrap();
+            assert_eq!(second.0, b"key2");
+
+            // Get second-to-last item backward
+            let second_last = iter.next_back().unwrap().unwrap();
+            assert_eq!(second_last.0, b"key4");
+
+            // Get middle item forward
+            let middle = iter.next().unwrap().unwrap();
+            assert_eq!(middle.0, b"key3");
+
+            // Exhausted
+            let none = iter.next();
+            assert!(none.is_none());
+
+            // Exhausted
+            let none = iter.next_back();
+            assert!(none.is_none());
+        }
+
+        #[test]
+        fn test_keys_at_version_mixed_forward_backward_iteration() {
+            let (store, _) = create_store(false);
+
+            // Insert some data
+            let keys = vec!["key1", "key2", "key3", "key4", "key5"];
+            for (i, key) in keys.iter().enumerate() {
+                let mut txn = store.begin().unwrap();
+                txn.set(key.as_bytes(), format!("value{}", i + 1).as_bytes())
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            let txn = store.begin().unwrap();
+            let range = "key1".as_bytes()..="key5".as_bytes();
+            let version = u64::MAX;
+
+            // Test mixed forward and backward iteration
+            let mut iter = txn.keys_at_version(range, version, None);
+
+            // Get first item forward
+            let first = iter.next().unwrap();
+            assert_eq!(first, b"key1");
+
+            // Get last item backward
+            let last = iter.next_back().unwrap();
+            assert_eq!(last, b"key5");
+
+            // Get second item forward
+            let second = iter.next().unwrap();
+            assert_eq!(second, b"key2");
+
+            // Get second-to-last item backward
+            let second_last = iter.next_back().unwrap();
+            assert_eq!(second_last, b"key4");
+
+            // Get middle item forward
+            let middle = iter.next().unwrap();
+            assert_eq!(middle, b"key3");
+
+            // Exhausted
+            let none = iter.next();
+            assert!(none.is_none());
+
+            // Exhausted
+            let none = iter.next_back();
+            assert!(none.is_none());
         }
     }
 

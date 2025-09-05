@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{btree_map, VecDeque},
-    iter::Peekable,
+    collections::{btree_map, HashSet, VecDeque},
     marker::PhantomData,
     ops::RangeBounds,
 };
@@ -40,6 +39,7 @@ pub(crate) struct MergingScanIterator<'a, R, I: Iterator> {
     write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     limit: usize,
     count: usize,
+    consumed_keys: HashSet<Vec<u8>>,
     _phantom: PhantomData<R>,
 }
 
@@ -66,6 +66,7 @@ where
             write_set_iter: write_set.range(range_bytes).double_ended_peekable(),
             limit: limit.unwrap_or(usize::MAX),
             count: 0,
+            consumed_keys: HashSet::new(),
             _phantom: PhantomData,
         }
     }
@@ -122,6 +123,15 @@ where
             // do the scan only in the snapshot. This optimisation is quite
             // important according to the benches.
             let result = self.read_from_snapshot();
+            if let Some(Ok((key, _, _))) = &result {
+                // Check if this key has already been consumed
+                if self.consumed_keys.contains(key.as_ref()) {
+                    // Skip this item and try the next one
+                    return self.next();
+                }
+                // Mark this key as consumed
+                self.consumed_keys.insert(key.to_vec());
+            }
             if result.is_some() {
                 self.count += 1;
             }
@@ -160,6 +170,16 @@ where
             }
         };
 
+        if let Some(Ok((key, _, _))) = &result {
+            // Check if this key has already been consumed
+            if self.consumed_keys.contains(key.as_ref()) {
+                // Skip this item and try the next one
+                return self.next();
+            }
+            // Mark this key as consumed
+            self.consumed_keys.insert(key.to_vec());
+        }
+
         if result.is_some() {
             self.count += 1;
         }
@@ -180,6 +200,15 @@ where
         // Fast path when write set is empty
         if self.write_set_iter.peek().is_none() {
             let result = self.read_from_snapshot_back();
+            if let Some(Ok((key, _, _))) = &result {
+                // Check if this key has already been consumed
+                if self.consumed_keys.contains(key.as_ref()) {
+                    // Skip this item and try the next one
+                    return self.next_back();
+                }
+                // Mark this key as consumed
+                self.consumed_keys.insert(key.to_vec());
+            }
             if result.is_some() {
                 self.count += 1;
             }
@@ -211,6 +240,16 @@ where
                 }
             }
         };
+
+        if let Some(Ok((key, _, _))) = &result {
+            // Check if this key has already been consumed
+            if self.consumed_keys.contains(key.as_ref()) {
+                // Skip this item and try the next one
+                return self.next_back();
+            }
+            // Mark this key as consumed
+            self.consumed_keys.insert(key.to_vec());
+        }
 
         if result.is_some() {
             self.count += 1;
@@ -256,10 +295,11 @@ where
 /// An iterator over the keys in the snapshot and write set.
 /// It does not add anything to the read set.
 pub(crate) struct KeyScanIterator<'a, R, I: Iterator> {
-    snap_iter: Peekable<I>,
-    write_set_iter: Peekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
+    snap_iter: DoubleEndedPeekable<I>,
+    write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<WriteSetEntry>>>,
     limit: Option<usize>,
     count: usize,
+    consumed_keys: HashSet<Vec<u8>>,
     _phantom: PhantomData<R>,
 }
 
@@ -276,10 +316,11 @@ where
     ) -> Self {
         let range_bytes = convert_range_bounds_bytes(range);
         KeyScanIterator {
-            snap_iter: snap_iter.peekable(),
-            write_set_iter: write_set.range(range_bytes).peekable(),
+            snap_iter: snap_iter.double_ended_peekable(),
+            write_set_iter: write_set.range(range_bytes).double_ended_peekable(),
             limit,
             count: 0,
+            consumed_keys: HashSet::new(),
             _phantom: PhantomData,
         }
     }
@@ -318,7 +359,14 @@ where
         // Fast path when write set is empty
         if self.write_set_iter.peek().is_none() {
             let result = self.read_from_snapshot();
-            if result.is_some() {
+            if let Some(key) = result {
+                // Check if this key has already been consumed
+                if self.consumed_keys.contains(key.as_ref()) {
+                    // Skip this item and try the next one
+                    return self.next();
+                }
+                // Mark this key as consumed
+                self.consumed_keys.insert(key.to_vec());
                 self.count += 1;
             }
             return result;
@@ -350,10 +398,107 @@ where
             }
         };
 
-        if result.is_some() {
+        if let Some(key) = result {
+            // Check if this key has already been consumed
+            if self.consumed_keys.contains(key.as_ref()) {
+                // Skip this item and try the next one
+                return self.next();
+            }
+            // Mark this key as consumed
+            self.consumed_keys.insert(key.to_vec());
             self.count += 1;
         }
         result
+    }
+}
+
+impl<'a, R, I> DoubleEndedIterator for KeyScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: DoubleEndedIterator<Item = SnapItem<'a>>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if let Some(limit) = self.limit {
+            if self.count >= limit {
+                return None;
+            }
+        }
+
+        // Fast path when write set is empty
+        if self.write_set_iter.peek_back().is_none() {
+            let result = self.read_from_snapshot_back();
+            if let Some(key) = result {
+                // Check if this key has already been consumed
+                if self.consumed_keys.contains(key.as_ref()) {
+                    // Skip this item and try the next one
+                    return self.next_back();
+                }
+                // Mark this key as consumed
+                self.consumed_keys.insert(key.to_vec());
+                self.count += 1;
+            }
+            return result;
+        }
+
+        // Merging path
+        let has_snap = self.snap_iter.peek_back().is_some();
+        let has_ws = self.write_set_iter.peek_back().is_some();
+
+        let result = match (has_snap, has_ws) {
+            (false, false) => None,
+            (true, false) => self.read_from_snapshot_back(),
+            (false, true) => self.read_from_write_set_back(),
+            (true, true) => {
+                if let (Some((snap_key, _, _, _)), Some((ws_key, _))) =
+                    (self.snap_iter.peek_back(), self.write_set_iter.peek_back())
+                {
+                    match snap_key.as_ref().cmp(ws_key.as_ref()) {
+                        Ordering::Greater => self.read_from_snapshot_back(),
+                        Ordering::Less => self.read_from_write_set_back(),
+                        Ordering::Equal => {
+                            self.snap_iter.next_back(); // Skip snapshot entry
+                            self.read_from_write_set_back()
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(key) = result {
+            // Check if this key has already been consumed
+            if self.consumed_keys.contains(key.as_ref()) {
+                // Skip this item and try the next one
+                return self.next_back();
+            }
+            // Mark this key as consumed
+            self.consumed_keys.insert(key.to_vec());
+            self.count += 1;
+        }
+        result
+    }
+}
+
+impl<'a, R, I> KeyScanIterator<'a, R, I>
+where
+    R: RangeBounds<VariableSizeKey>,
+    I: DoubleEndedIterator<Item = SnapItem<'a>>,
+{
+    fn read_from_snapshot_back(&mut self) -> Option<&'a [u8]> {
+        self.snap_iter.next_back().map(|(key, ..)| key)
+    }
+
+    fn read_from_write_set_back(&mut self) -> Option<&'a [u8]> {
+        if let Some((ws_key, ws_entries)) = self.write_set_iter.next_back() {
+            if let Some(ws_entry) = ws_entries.last() {
+                if ws_entry.e.is_deleted_or_tombstone() {
+                    return self.next_back();
+                }
+                return Some(ws_key.as_ref());
+            }
+        }
+        None
     }
 }
 
@@ -361,7 +506,7 @@ where
 /// For each key, it returns all versions before moving to the next key.
 /// Optionally limits the number of unique keys returned.
 pub struct VersionScanIterator<'a, I: Iterator> {
-    snap_iter: Peekable<I>,
+    snap_iter: DoubleEndedPeekable<I>,
     current_key_versions: VecDeque<(&'a [u8], Vec<u8>, u64, bool)>,
     unique_keys_count: usize,
     current_key: Option<&'a [u8]>, // Track current key to detect changes
@@ -375,7 +520,7 @@ where
 {
     pub(crate) fn new(core: &'a Core, snap_iter: I, limit: Option<usize>) -> Self {
         Self {
-            snap_iter: snap_iter.peekable(),
+            snap_iter: snap_iter.double_ended_peekable(),
             current_key_versions: VecDeque::new(),
             unique_keys_count: 0,
             current_key: None,

@@ -118,7 +118,7 @@ impl Snapshot {
         &'a self,
         range: R,
         version: u64,
-    ) -> impl Iterator<Item = VersionedEntry<'a, IndexValue>>
+    ) -> impl DoubleEndedIterator<Item = VersionedEntry<'a, IndexValue>>
     where
         R: RangeBounds<VariableSizeKey> + 'a,
     {
