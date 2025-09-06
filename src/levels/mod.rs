@@ -52,18 +52,6 @@ pub struct ManifestChangeSet {
 	/// Manifest format version if changed
 	pub manifest_format_version: Option<u16>,
 
-	/// Writer epoch if changed
-	pub writer_epoch: Option<u64>,
-
-	/// Compactor epoch if changed
-	pub compactor_epoch: Option<u64>,
-
-	/// The most recent SST in the WAL that's been compacted, if changed
-	pub wal_id_last_compacted: Option<u64>,
-
-	/// The most recent SST in the WAL at the time manifest was updated, if changed
-	pub wal_id_last_seen: Option<u64>,
-
 	/// Tables to delete from manifest
 	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
 
@@ -99,18 +87,6 @@ pub struct LevelManifest {
 	/// Manifest format version to allow schema evolution
 	pub manifest_format_version: u16,
 
-	/// The current writer's epoch (incremented when a new writer takes over)
-	pub writer_epoch: u64,
-
-	/// The current compactor's epoch (incremented when compaction process starts)
-	pub compactor_epoch: u64,
-
-	/// The most recent SST in the WAL that's been compacted
-	pub wal_id_last_compacted: u64,
-
-	/// The most recent SST in the WAL at the time manifest was updated
-	pub wal_id_last_seen: u64,
-
 	/// A list of read snapshots that are currently open
 	pub snapshots: Vec<SnapshotInfo>,
 }
@@ -141,10 +117,6 @@ impl LevelManifest {
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
 			manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -187,10 +159,6 @@ impl LevelManifest {
 			)));
 		}
 
-		let writer_epoch = level_manifest.read_u64::<BigEndian>()?;
-		let compactor_epoch = level_manifest.read_u64::<BigEndian>()?;
-		let wal_id_last_compacted = level_manifest.read_u64::<BigEndian>()?;
-		let wal_id_last_seen = level_manifest.read_u64::<BigEndian>()?;
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 
 		// Read levels data
@@ -258,10 +226,6 @@ impl LevelManifest {
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: version,
-			writer_epoch,
-			compactor_epoch,
-			wal_id_last_compacted,
-			wal_id_last_seen,
 			snapshots,
 		})
 	}
@@ -374,18 +338,6 @@ impl LevelManifest {
 		if let Some(version) = changeset.manifest_format_version {
 			self.manifest_format_version = version;
 		}
-		if let Some(epoch) = changeset.writer_epoch {
-			self.writer_epoch = epoch;
-		}
-		if let Some(epoch) = changeset.compactor_epoch {
-			self.compactor_epoch = epoch;
-		}
-		if let Some(wal_id) = changeset.wal_id_last_compacted {
-			self.wal_id_last_compacted = wal_id;
-		}
-		if let Some(wal_id) = changeset.wal_id_last_seen {
-			self.wal_id_last_seen = wal_id;
-		}
 
 		// Add new tables to levels
 		for (level, table) in &changeset.new_tables {
@@ -450,10 +402,6 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 
 	// Write header
 	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
-	buf.write_u64::<BigEndian>(manifest.writer_epoch)?;
-	buf.write_u64::<BigEndian>(manifest.compactor_epoch)?;
-	buf.write_u64::<BigEndian>(manifest.wal_id_last_compacted)?;
-	buf.write_u64::<BigEndian>(manifest.wal_id_last_seen)?;
 	buf.write_u64::<BigEndian>(manifest.next_table_id.load(Ordering::SeqCst))?;
 
 	// Write levels data
@@ -571,10 +519,6 @@ mod tests {
 
 		// Create changeset for manifest field updates
 		let changeset = ManifestChangeSet {
-			writer_epoch: Some(42),
-			compactor_epoch: Some(17),
-			wal_id_last_compacted: Some(123),
-			wal_id_last_seen: Some(456),
 			new_snapshots: vec![
 				SnapshotInfo {
 					seq_num: 10,
@@ -614,16 +558,6 @@ mod tests {
 		assert_eq!(
 			loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 			"Manifest version not persisted correctly"
-		);
-		assert_eq!(loaded_manifest.writer_epoch, 42, "Writer epoch not persisted correctly");
-		assert_eq!(loaded_manifest.compactor_epoch, 17, "Compactor epoch not persisted correctly");
-		assert_eq!(
-			loaded_manifest.wal_id_last_compacted, 123,
-			"WAL ID last compacted not persisted correctly"
-		);
-		assert_eq!(
-			loaded_manifest.wal_id_last_seen, 456,
-			"WAL ID last seen not persisted correctly"
 		);
 		assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
 		assert_eq!(
@@ -676,13 +610,6 @@ mod tests {
 			new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 			"Manifest version not loaded correctly"
 		);
-		assert_eq!(new_manifest.writer_epoch, 42, "Writer epoch not loaded correctly");
-		assert_eq!(new_manifest.compactor_epoch, 17, "Compactor epoch not loaded correctly");
-		assert_eq!(
-			new_manifest.wal_id_last_compacted, 123,
-			"WAL ID last compacted not loaded correctly"
-		);
-		assert_eq!(new_manifest.wal_id_last_seen, 456, "WAL ID last seen not loaded correctly");
 		assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
 		assert_eq!(new_manifest.snapshots[0].seq_num, 10, "First snapshot not loaded correctly");
 		assert_eq!(new_manifest.snapshots[1].seq_num, 20, "Second snapshot not loaded correctly");

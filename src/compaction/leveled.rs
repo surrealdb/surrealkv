@@ -499,10 +499,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -916,10 +912,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -1110,10 +1102,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: shared_table_id_counter.clone(),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -1449,10 +1437,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -1528,10 +1512,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 
@@ -1619,10 +1599,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1716,10 +1692,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1840,10 +1812,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1963,10 +1931,6 @@ mod tests {
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			writer_epoch: 1,
-			compactor_epoch: 0,
-			wal_id_last_compacted: 0,
-			wal_id_last_seen: 0,
 			snapshots: Vec::new(),
 		};
 		write_manifest_to_disk(&manifest).unwrap();
