@@ -92,7 +92,9 @@ pub(crate) struct CoreInner {
 	/// - L0: Contains SSTables flushed directly from memtables. May have overlapping key ranges.
 	/// - L1+: Each level is larger than the previous. SSTables have non-overlapping
 	///   key ranges within a level, enabling efficient binary search.
-	pub level_manifest: Arc<RwLock<LevelManifest>>,
+	///
+	/// In memory-only mode, this is None since we don't persist to disk.
+	pub level_manifest: Option<Arc<RwLock<LevelManifest>>>,
 
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
@@ -109,16 +111,13 @@ pub(crate) struct CoreInner {
 	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
-	wal: parking_lot::RwLock<Wal>,
+	/// In memory-only mode, this is None since we don't persist to disk.
+	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
 }
 
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		// Initialize the level manifest which tracks the SSTable organization
-		let manifest = LevelManifest::new(opts.clone())?;
-		let level_manifest = Arc::new(RwLock::new(manifest));
-
 		// Initialize active and immutable memtables
 		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::default())));
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
@@ -128,10 +127,19 @@ impl CoreInner {
 		// The oracle provides monotonic timestamps for transaction ordering
 		let oracle = Oracle::new();
 
-		let wal_path = opts.wal_dir();
-		let wal = Wal::open(&wal_path, wal::Options::default())?;
+		// Initialize WAL and level manifest only if not in memory-only mode
+		let (wal, level_manifest) = if opts.in_memory_only {
+			// In memory-only mode, we don't need WAL or level manifest since we don't persist to disk
+			(None, None)
+		} else {
+			let wal_path = opts.wal_dir();
+			let wal = Some(Wal::open(&wal_path, wal::Options::default())?);
+			let manifest = LevelManifest::new(opts.clone())?;
+			let level_manifest = Some(Arc::new(RwLock::new(manifest)));
+			(wal, level_manifest)
+		};
 
-		let vlog = if opts.enable_vlog {
+		let vlog = if opts.enable_vlog && !opts.in_memory_only {
 			let vlog_path = opts.vlog_dir();
 			Some(Arc::new(VLog::new(&vlog_path, opts.clone())?))
 		} else {
@@ -146,7 +154,7 @@ impl CoreInner {
 			snapshot_counter: SnapshotCounter::default(),
 			oracle: Arc::new(oracle),
 			vlog,
-			wal: parking_lot::RwLock::new(wal),
+			wal: wal.map(parking_lot::RwLock::new),
 		})
 	}
 
@@ -175,7 +183,7 @@ impl CoreInner {
 
 		// Clean up old WAL segments since the memtable has been successfully flushed
 		// Done asynchronously to avoid blocking the flush operation
-		let wal_guard = self.wal.read();
+		let wal_guard = self.wal.as_ref().unwrap().read();
 		let wal_dir = wal_guard.get_dir_path().to_path_buf();
 		tokio::spawn(async move {
 			if let Err(e) = cleanup_old_segments(&wal_dir) {
@@ -205,7 +213,7 @@ impl CoreInner {
 		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
 		// Track the immutable memtable until it's successfully flushed
-		let memtable_id = self.level_manifest.read().unwrap().next_table_id();
+		let memtable_id = self.level_manifest.as_ref().unwrap().read().unwrap().next_table_id();
 		immutable_memtables.add(memtable_id, flushed_memtable.clone());
 
 		// Now rotate the WAL while still holding the active_memtable lock
@@ -213,10 +221,8 @@ impl CoreInner {
 		// - The flushed memtable corresponds to the previous WAL segment(s)
 		// - New writes (to the new active memtable) go to a new WAL segment
 		// - No race condition between memtable swap and WAL rotation
-		{
-			let mut wal_guard = self.wal.write();
-			wal_guard.rotate()?;
-		}
+		let mut wal_guard = self.wal.as_ref().unwrap().write();
+		wal_guard.rotate()?;
 
 		Ok(Some((memtable_id, flushed_memtable)))
 	}
@@ -229,7 +235,7 @@ impl CoreInner {
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
 	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
-		let mut original_manifest = self.level_manifest.write().unwrap();
+		let mut original_manifest = self.level_manifest.as_ref().unwrap().write().unwrap();
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
 		let table_id = table.id;
 
@@ -284,7 +290,8 @@ struct LsmCommitEnv {
 	core: Arc<CoreInner>,
 
 	/// Manages background tasks like flushing and compaction
-	task_manager: Arc<TaskManager>,
+	/// In memory-only mode, this is None since we don't need background tasks
+	task_manager: Option<Arc<TaskManager>>,
 }
 
 impl LsmCommitEnv {
@@ -292,17 +299,34 @@ impl LsmCommitEnv {
 	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
-			task_manager,
+			task_manager: Some(task_manager),
+		})
+	}
+
+	/// Creates a new commit environment for in-memory mode (without task manager)
+	pub(crate) fn new_in_memory(core: Arc<CoreInner>) -> Result<Self> {
+		Ok(Self {
+			core,
+			task_manager: None,
 		})
 	}
 }
 
 impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &Batch, seq_num: u64, _sync_wal: bool) -> Result<()> {
-		let mut wal_guard = self.core.wal.write();
-		let enc_bytes = batch.encode(seq_num)?;
-		wal_guard.append(&enc_bytes).map_err(|e: crate::wal::Error| e.into()).map(|_| ())
+	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
+		if let Some(ref wal) = self.core.wal {
+			let mut wal_guard = wal.write();
+			let enc_bytes = batch.encode(seq_num)?;
+			wal_guard.append(&enc_bytes)?;
+			if sync_wal {
+				wal_guard.sync()?;
+			}
+			Ok(())
+		} else {
+			// In memory-only mode, we don't write to WAL
+			Ok(())
+		}
 	}
 
 	// Apply batch to memtable (can be called concurrently)
@@ -319,7 +343,9 @@ impl CommitEnv for LsmCommitEnv {
 		// Check if memtable needs flushing
 		if active_memtable.size() > self.core.opts.max_memtable_size {
 			// Wake up background thread to flush memtable
-			self.task_manager.wake_up_memtable();
+			if let Some(ref task_manager) = self.task_manager {
+				task_manager.wake_up_memtable();
+			}
 		}
 
 		// Add the batch to the active memtable
@@ -433,46 +459,62 @@ impl Core {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		let inner = Arc::new(CoreInner::new(opts.clone())?);
 
-		// Initialize background task manager
-		let task_manager = Arc::new(TaskManager::new(inner.clone()));
+		if opts.in_memory_only {
+			// For in-memory mode, create a minimal core without background tasks
+			let commit_env = Arc::new(LsmCommitEnv::new_in_memory(inner.clone())?);
+			let commit_pipeline = CommitPipeline::new(commit_env);
 
-		let commit_env = Arc::new(LsmCommitEnv::new(inner.clone(), task_manager.clone())?);
+			// Set initial sequence number
+			commit_pipeline.set_seq_num(1);
 
-		let commit_pipeline = CommitPipeline::new(commit_env);
+			Ok(Self {
+				inner: inner.clone(),
+				commit_pipeline: commit_pipeline.clone(),
+				task_manager: Mutex::new(None),
+				vlog_gc_manager: Mutex::new(None),
+			})
+		} else {
+			// Initialize background task manager
+			let task_manager = Arc::new(TaskManager::new(inner.clone()));
 
-		// Path for the WAL directory
-		let wal_path = opts.wal_dir();
+			let commit_env = Arc::new(LsmCommitEnv::new(inner.clone(), task_manager.clone())?);
 
-		// Replay WAL with automatic repair on corruption
-		let wal_seq_num =
-			Self::replay_wal_with_repair(&wal_path, "Database startup", |memtable| {
-				let mut active_memtable = inner.active_memtable.write().unwrap();
-				*active_memtable = memtable;
-				Ok(())
-			})?;
+			let commit_pipeline = CommitPipeline::new(commit_env);
 
-		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = inner.level_manifest.read().unwrap().lsn();
-		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
+			// Path for the WAL directory
+			let wal_path = opts.wal_dir();
 
-		// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
-		commit_pipeline.set_seq_num(max_seq_num);
+			// Replay WAL with automatic repair on corruption
+			let wal_seq_num =
+				Self::replay_wal_with_repair(&wal_path, "Database startup", |memtable| {
+					let mut active_memtable = inner.active_memtable.write().unwrap();
+					*active_memtable = memtable;
+					Ok(())
+				})?;
 
-		let core = Self {
-			inner: inner.clone(),
-			commit_pipeline: commit_pipeline.clone(),
-			task_manager: Mutex::new(Some(task_manager)),
-			vlog_gc_manager: Mutex::new(None),
-		};
+			// Update sequence number to max of LSM sequence number and WAL sequence number
+			let current_seq_num = inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
+			let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
-		// Initialize VLog GC manager only if VLog is enabled
-		if let Some(ref vlog) = inner.vlog {
-			let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
-			vlog_gc_manager.start();
-			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
+			// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
+			commit_pipeline.set_seq_num(max_seq_num);
+
+			let core = Self {
+				inner: inner.clone(),
+				commit_pipeline: commit_pipeline.clone(),
+				task_manager: Mutex::new(Some(task_manager)),
+				vlog_gc_manager: Mutex::new(None),
+			};
+
+			// Initialize VLog GC manager only if VLog is enabled
+			if let Some(ref vlog) = inner.vlog {
+				let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
+				vlog_gc_manager.start();
+				*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
+			}
+
+			Ok(core)
 		}
-
-		Ok(core)
 	}
 
 	pub(crate) async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
@@ -512,36 +554,24 @@ impl Core {
 		}
 
 		// Step 3: Flush the active memtable only if it exceeds the configured size
-		let active_memtable = self.inner.active_memtable.read().unwrap();
-		if active_memtable.size() > self.inner.opts.max_memtable_size {
-			self.inner.compact_memtable()?;
+		// Skip this in memory-only mode since we don't persist to disk
+		if !self.inner.opts.in_memory_only {
+			let active_memtable = self.inner.active_memtable.read().unwrap();
+			if active_memtable.size() > self.inner.opts.max_memtable_size {
+				self.inner.compact_memtable()?;
+			}
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
-		{
-			let mut wal_guard = self.inner.wal.write();
+		if let Some(ref wal) = self.inner.wal {
+			let mut wal_guard = wal.write();
 			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {e}")))?;
 		}
 
 		// Step 5: Flush all directories to ensure durability
-		let base_path = &self.inner.opts.path;
-		let table_folder_path = base_path.join(TABLE_FOLDER);
-		let wal_path = base_path.join("wal");
-
-		// Sync all directories
-		fsync_directory(&table_folder_path)
-			.map_err(|e| Error::Other(format!("Failed to sync table directory: {e}")))?;
-		if self.inner.vlog.is_some() {
-			let vlog_path = self.opts.path.join("vlog");
-			fsync_directory(&vlog_path)
-				.map_err(|e| Error::Other(format!("Failed to sync VLog directory: {e}")))?;
-		}
-		fsync_directory(&wal_path)
-			.map_err(|e| Error::Other(format!("Failed to sync WAL directory: {e}")))?;
-
-		fsync_directory(base_path)
-			.map_err(|e| Error::Other(format!("Failed to sync base directory: {e}")))?;
+		// Skip this in memory-only mode since we don't persist to disk
+		sync_directory_structure(&self.inner.opts)?;
 
 		Ok(())
 	}
@@ -565,7 +595,7 @@ impl Tree {
 		// TODO: Add version header in file similar to table in WAL
 
 		// Ensure directory changes are persisted
-		Self::sync_directory_structure(&opts)?;
+		sync_directory_structure(&opts)?;
 
 		Ok(Self {
 			core: Arc::new(core),
@@ -574,6 +604,10 @@ impl Tree {
 
 	/// Creates all required directory structure for the LSM tree
 	fn create_directory_structure(opts: &Options) -> Result<()> {
+		if opts.in_memory_only {
+			return Ok(());
+		}
+
 		// Create base directory
 		create_dir_all(&opts.path)?;
 
@@ -582,18 +616,6 @@ impl Tree {
 		create_dir_all(opts.wal_dir())?;
 		create_dir_all(opts.manifest_dir())?;
 		create_dir_all(opts.vlog_dir())?;
-
-		Ok(())
-	}
-
-	/// Syncs all directory changes to disk
-	fn sync_directory_structure(opts: &Options) -> Result<()> {
-		// Sync all subdirectories
-		fsync_directory(opts.sstable_dir())?;
-		fsync_directory(opts.wal_dir())?;
-		fsync_directory(opts.manifest_dir())?;
-		fsync_directory(opts.vlog_dir())?;
-		fsync_directory(&opts.path)?;
 
 		Ok(())
 	}
@@ -656,7 +678,8 @@ impl Tree {
 
 		// Replace the current levels with the reloaded ones
 		{
-			let mut levels_guard = self.core.inner.level_manifest.write().unwrap();
+			let mut levels_guard =
+				self.core.inner.level_manifest.as_ref().unwrap().write().unwrap();
 			*levels_guard = new_levels;
 		}
 
@@ -674,7 +697,7 @@ impl Tree {
 
 		// Reopen the WAL from the restored directory
 		{
-			let mut wal_guard = self.core.inner.wal.write();
+			let mut wal_guard = self.core.inner.wal.as_ref().unwrap().write();
 			let wal_path = self.core.inner.opts.path.join("wal");
 			let new_wal = Wal::open(&wal_path, wal::Options::default())?;
 			*wal_guard = new_wal;
@@ -690,7 +713,8 @@ impl Tree {
 			})?;
 
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = self.core.inner.level_manifest.read().unwrap().lsn();
+		let current_seq_num =
+			self.core.inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
 		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
 		// Set visible sequence number to highest of lsn from WAL or latest table in manifest
@@ -738,6 +762,49 @@ fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let file = File::open(path)?;
 	debug_assert!(file.metadata()?.is_dir());
 	file.sync_all()
+}
+
+/// Syncs all directory structures for the LSM store to ensure durability
+/// Returns explicit errors indicating which path failed
+fn sync_directory_structure(opts: &Options) -> Result<()> {
+	if opts.in_memory_only {
+		return Ok(());
+	}
+
+	// Sync all subdirectories with explicit error handling
+	fsync_directory(opts.sstable_dir()).map_err(|e| {
+		Error::Other(format!(
+			"Failed to sync SSTable directory '{}': {}",
+			opts.sstable_dir().display(),
+			e
+		))
+	})?;
+
+	fsync_directory(opts.wal_dir()).map_err(|e| {
+		Error::Other(format!("Failed to sync WAL directory '{}': {}", opts.wal_dir().display(), e))
+	})?;
+
+	fsync_directory(opts.manifest_dir()).map_err(|e| {
+		Error::Other(format!(
+			"Failed to sync manifest directory '{}': {}",
+			opts.manifest_dir().display(),
+			e
+		))
+	})?;
+
+	fsync_directory(opts.vlog_dir()).map_err(|e| {
+		Error::Other(format!(
+			"Failed to sync VLog directory '{}': {}",
+			opts.vlog_dir().display(),
+			e
+		))
+	})?;
+
+	fsync_directory(&opts.path).map_err(|e| {
+		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
+	})?;
+
+	Ok(())
 }
 
 #[cfg(test)]
@@ -938,7 +1005,10 @@ mod tests {
 		}
 
 		// Verify the LSM state: we should have multiple SSTables
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size =
+			tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
+				.tables
+				.len();
 		assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
 	}
 
@@ -991,7 +1061,9 @@ mod tests {
 
 			// Verify L0 has tables before closing
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
+					.tables
+					.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 before closing, got {l0_size}");
 
 			// Tree will be dropped here, closing the store
@@ -1004,7 +1076,9 @@ mod tests {
 
 			// Verify L0 has tables after reopening
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
+					.tables
+					.len();
 			assert!(l0_size > 0, "Expected SSTables in L0 after reopening, got {l0_size}");
 
 			// Verify all keys have their final values
@@ -2520,12 +2594,14 @@ mod tests {
 
 			// Verify we have 2 tables in L0
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
+					.tables
+					.len();
 			assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
 
 			// Get the table IDs from the first session
 			let (table1_id, table2_id, next_table_id) = {
-				let manifest = tree.core.level_manifest.read().unwrap();
+				let manifest = tree.core.level_manifest.as_ref().unwrap().read().unwrap();
 				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 				let next_table_id = manifest.next_table_id();
@@ -2554,10 +2630,13 @@ mod tests {
 			{
 				// Verify we still have 2 tables in L0 after reopening
 				let l0_size =
-					tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+					tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()
+						[0]
+					.tables
+					.len();
 				assert_eq!(l0_size, 2, "Expected 2 tables in L0 after reopening, got {l0_size}");
 				// Get the table IDs after reopening
-				let manifest = tree.core.level_manifest.read().unwrap();
+				let manifest = tree.core.level_manifest.as_ref().unwrap().read().unwrap();
 				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 				let next_table_id = manifest.next_table_id();
@@ -2589,14 +2668,17 @@ mod tests {
 			{
 				// Verify we now have 3 tables in L0
 				let l0_size =
-					tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+					tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()
+						[0]
+					.tables
+					.len();
 				assert_eq!(
 					l0_size, 3,
 					"Expected 3 tables in L0 after adding more data, got {l0_size}"
 				);
 
 				// Get the table IDs from all 3 tables
-				let manifest = tree.core.level_manifest.read().unwrap();
+				let manifest = tree.core.level_manifest.as_ref().unwrap().read().unwrap();
 				let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 				let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 				let table3_id = manifest.levels.get_levels()[0].tables[2].id;
@@ -2640,11 +2722,13 @@ mod tests {
 
 			// Verify we still have 3 tables
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
+					.tables
+					.len();
 			assert_eq!(l0_size, 3, "Expected 3 tables in L0 after final reopen, got {l0_size}");
 
 			// Verify table IDs are still in correct order (newer tables first)
-			let manifest = tree.core.level_manifest.read().unwrap();
+			let manifest = tree.core.level_manifest.as_ref().unwrap().read().unwrap();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 			let table3_id = manifest.levels.get_levels()[0].tables[2].id;
@@ -2668,6 +2752,89 @@ mod tests {
 			let result = txn.get("batch_0_key_000".as_bytes()).unwrap();
 			assert!(result.is_some(), "Should be able to read at least one key");
 		}
+	}
+
+	#[tokio::test]
+	async fn test_in_memory_only_mode() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		// Create options with in-memory mode enabled
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.in_memory_only = true;
+		});
+
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Test basic operations
+		let key = "test_key";
+		let value = "test_value";
+
+		// Insert a key-value pair
+		let mut txn = tree.begin().unwrap();
+		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+
+		// Read back the key-value pair
+		let txn = tree.begin().unwrap();
+		let result = txn.get(key.as_bytes()).unwrap().unwrap();
+		assert_eq!(result, value.as_bytes().into());
+
+		// Test multiple operations
+		for i in 0..10 {
+			let key = format!("key_{}", i);
+			let value = format!("value_{}", i);
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Verify all keys exist
+		for i in 0..10 {
+			let key = format!("key_{}", i);
+			let expected_value = format!("value_{}", i);
+
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap().unwrap();
+			assert_eq!(result, expected_value.as_bytes().into());
+		}
+
+		// Test range scan
+		let txn = tree.begin().unwrap();
+		let range_result: Vec<_> =
+			txn.range(b"key_0", b"key_9", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+
+		assert_eq!(range_result.len(), 10, "Range scan should return 10 items");
+
+		// Test delete
+		let mut txn = tree.begin().unwrap();
+		txn.delete("key_5".as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+
+		let txn = tree.begin().unwrap();
+		let result = txn.get("key_5".as_bytes()).unwrap();
+		assert!(result.is_none(), "Deleted key should not exist");
+
+		// Verify other keys still exist
+		let txn = tree.begin().unwrap();
+		let result = txn.get("key_4".as_bytes()).unwrap().unwrap();
+		assert_eq!(result, "value_4".as_bytes().into());
+
+		// Verify that level_manifest is None in memory-only mode
+		assert!(
+			tree.core.level_manifest.is_none(),
+			"Level manifest should be None in memory-only mode"
+		);
+
+		// Verify that WAL is None in memory-only mode
+		assert!(tree.core.wal.is_none(), "WAL should be None in memory-only mode");
+
+		// Verify that task_manager is None in memory-only mode
+		assert!(
+			tree.core.task_manager.lock().unwrap().is_none(),
+			"Task manager should be None in memory-only mode"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

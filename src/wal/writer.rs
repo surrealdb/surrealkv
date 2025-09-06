@@ -173,7 +173,6 @@ impl Wal {
 		Ok(())
 	}
 
-	#[cfg(test)]
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		let _lock = self.mutex.write();
 		self.active_segment.sync()?;

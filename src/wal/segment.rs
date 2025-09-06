@@ -895,7 +895,6 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	// Flushes the current block to disk.
 	// This method also synchronize file metadata to the filesystem
 	// hence it is a bit slower than fdatasync (sync_data).
-	#[cfg(test)]
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));

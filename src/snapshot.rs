@@ -122,26 +122,28 @@ impl Snapshot {
 		drop(memtable_lock); // Release the lock on the immutable memtables
 
 		// Read lock on the level manifest
-		let level_manifest = self.core.level_manifest.read().unwrap();
+		if let Some(ref level_manifest) = self.core.level_manifest {
+			let level_manifest = level_manifest.read().unwrap();
 
-		// Check the tables in each level for the key
-		for level in &level_manifest.levels {
-			for table in level.tables.iter() {
-				let ikey =
-					InternalKey::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set);
+			// Check the tables in each level for the key
+			for level in &level_manifest.levels {
+				for table in level.tables.iter() {
+					let ikey =
+						InternalKey::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set);
 
-				if !table.is_key_in_key_range(&ikey) {
-					continue; // Skip this table if the key is not in its range
-				}
-
-				let maybe_item = table.get(ikey)?;
-
-				if let Some(item) = maybe_item {
-					let ikey = &item.0;
-					if ikey.is_tombstone() {
-						return Ok(None); // Key is a tombstone, return None
+					if !table.is_key_in_key_range(&ikey) {
+						continue; // Skip this table if the key is not in its range
 					}
-					return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+
+					let maybe_item = table.get(ikey)?;
+
+					if let Some(item) = maybe_item {
+						let ikey = &item.0;
+						if ikey.is_tombstone() {
+							return Ok(None); // Key is a tombstone, return None
+						}
+						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					}
 				}
 			}
 		}
@@ -190,12 +192,20 @@ impl SnapshotIterator<'_> {
 			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
 
 		// Collect iterators from all tables in all levels
-		let manifest = guardian::ArcRwLockReadGuardian::take(core.level_manifest.clone()).unwrap();
-
-		let iter_state = IterState {
-			active: active.clone(),
-			immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
-			levels: manifest.levels.clone(),
+		let iter_state = if let Some(ref level_manifest) = core.level_manifest {
+			let manifest = guardian::ArcRwLockReadGuardian::take(level_manifest.clone()).unwrap();
+			IterState {
+				active: active.clone(),
+				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+				levels: manifest.levels.clone(),
+			}
+		} else {
+			// In memory-only mode, only use memtables
+			IterState {
+				active: active.clone(),
+				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+				levels: Levels(vec![]), // Empty levels
+			}
 		};
 
 		// Convert bounds to owned for passing to merge iterator

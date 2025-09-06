@@ -68,6 +68,8 @@ pub struct Options {
 	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
+	/// If true, runs the LSM store completely in memory
+	pub in_memory_only: bool,
 }
 
 impl Default for Options {
@@ -91,6 +93,7 @@ impl Default for Options {
 			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 4096, // 4KB default
+			in_memory_only: false,
 		}
 	}
 }
@@ -180,6 +183,17 @@ impl Options {
 	pub fn with_vlog_gc_discard_ratio(mut self, value: f64) -> Self {
 		assert!((0.0..=1.0).contains(&value), "VLog GC discard ratio must be between 0.0 and 1.0");
 		self.vlog_gc_discard_ratio = value;
+		self
+	}
+
+	/// Sets the in-memory only mode.
+	///
+	/// When enabled, the LSM store will run completely in memory without:
+	/// - WAL (Write-Ahead Log)
+	/// - Compactor and task manager
+	/// - Disk persistence
+	pub const fn with_in_memory_only(mut self, value: bool) -> Self {
+		self.in_memory_only = value;
 		self
 	}
 

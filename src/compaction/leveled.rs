@@ -7,9 +7,9 @@ use crate::levels::{Level, LevelManifest};
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 
-/// Compaction priority strategy similar to RocksDB's compaction_pri options
+/// Compaction priority strategy similar to RocksDB's compaction_priority options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CompactionPri {
+pub enum CompactionPriority {
 	#[allow(unused)]
 	/// Files whose range hasn't been compacted for the longest (RocksDB's kOldestSmallestSeqFirst)
 	OldestSmallestSeqFirst,
@@ -31,7 +31,7 @@ pub(crate) struct Strategy {
 	// Track the last compacted level for round-robin selection
 	last_compacted_level: AtomicUsize,
 	// Compaction priority strategy
-	compaction_pri: CompactionPri,
+	compaction_priority: CompactionPriority,
 }
 
 impl Default for Strategy {
@@ -40,7 +40,7 @@ impl Default for Strategy {
 			base_level_size: 4,
 			size_multiplier: 10,
 			last_compacted_level: AtomicUsize::new(0),
-			compaction_pri: CompactionPri::default(),
+			compaction_priority: CompactionPriority::default(),
 		}
 	}
 }
@@ -52,7 +52,7 @@ impl Strategy {
 			base_level_size,
 			size_multiplier,
 			last_compacted_level: AtomicUsize::new(0),
-			compaction_pri: CompactionPri::default(),
+			compaction_priority: CompactionPriority::default(),
 		}
 	}
 
@@ -124,14 +124,14 @@ impl Strategy {
 			return None;
 		}
 
-		match self.compaction_pri {
-			CompactionPri::OldestSmallestSeqFirst => {
+		match self.compaction_priority {
+			CompactionPriority::OldestSmallestSeqFirst => {
 				self.select_oldest_smallest_seq_first(source_level)
 			}
-			CompactionPri::OldestLargestSeqFirst => {
+			CompactionPriority::OldestLargestSeqFirst => {
 				self.select_oldest_largest_seq_first(source_level)
 			}
-			CompactionPri::ByCompensatedSize => self.select_by_compensated_size(source_level),
+			CompactionPriority::ByCompensatedSize => self.select_by_compensated_size(source_level),
 		}
 	}
 

@@ -3,6 +3,7 @@ use crate::{
 	error::Result,
 	iter::{BoxedIterator, CompactionIterator},
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
+	lsm::CoreInner,
 	memtable::ImmutableMemtables,
 	sstable::table::{Table, TableWriter},
 	vfs::File,
@@ -26,10 +27,13 @@ pub(crate) struct CompactionOptions {
 }
 
 impl CompactionOptions {
-	pub(crate) fn from(tree: &crate::lsm::CoreInner) -> Self {
+	pub(crate) fn from(tree: &CoreInner) -> Self {
 		Self {
 			lopts: tree.opts.clone(),
-			level_manifest: tree.level_manifest.clone(),
+			level_manifest: tree
+				.level_manifest
+				.clone()
+				.expect("Compaction requires level manifest"),
 			immutable_memtables: tree.immutable_memtables.clone(),
 			vlog: tree.vlog.clone(),
 		}
