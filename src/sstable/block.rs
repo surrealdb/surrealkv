@@ -12,30 +12,30 @@ use super::InternalKey;
 pub(crate) type BlockData = Vec<u8>;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
-pub struct BlockHandle {
+pub(crate) struct BlockHandle {
 	pub(crate) offset: usize,
 	pub(crate) size: usize,
 }
 
 impl BlockHandle {
-	pub fn new(offset: usize, size: usize) -> BlockHandle {
+	pub(crate) fn new(offset: usize, size: usize) -> BlockHandle {
 		BlockHandle {
 			offset,
 			size,
 		}
 	}
 
-	pub fn offset(&self) -> usize {
+	pub(crate) fn offset(&self) -> usize {
 		self.offset
 	}
 
-	pub fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		self.size
 	}
 
 	/// Appends varint encoded offset and size into given `dst`
 	#[inline]
-	pub fn encode_into(&self, dst: &mut [u8]) -> usize {
+	pub(crate) fn encode_into(&self, dst: &mut [u8]) -> usize {
 		assert!(dst.len() >= self.offset.required_space() + self.size.required_space());
 
 		let off = self.offset.encode_var(dst);
@@ -45,7 +45,7 @@ impl BlockHandle {
 
 	/// Returns bytes for a encoded BlockHandle
 	#[inline]
-	pub fn encode(&self) -> Vec<u8> {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let cap = self.offset.required_space() + self.size.required_space();
 		let mut v = vec![0; cap]; // Initialize v with zeros
 		self.encode_into(&mut v);
@@ -54,7 +54,7 @@ impl BlockHandle {
 
 	/// Decodes a block handle from `from` and returns a block handle
 	/// together with how many bytes were read from the slice.
-	pub fn decode(src: &[u8]) -> Result<(Self, usize)> {
+	pub(crate) fn decode(src: &[u8]) -> Result<(Self, usize)> {
 		let (off, offsize) = usize::decode_var(src)
 			.ok_or(Error::CorruptedBlock("corrupted block handle".to_owned()))?;
 		let (sz, szsize) = usize::decode_var(&src[offsize..])
@@ -92,15 +92,11 @@ pub struct Block {
 }
 
 impl Block {
-	pub fn iter(&self) -> BlockIterator {
+	pub(crate) fn iter(&self) -> BlockIterator {
 		BlockIterator::new(self.opts.clone(), self.block.clone())
 	}
 
-	pub fn data(&self) -> Arc<BlockData> {
-		self.block.clone()
-	}
-
-	pub fn new(data: BlockData, opts: Arc<Options>) -> Block {
+	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: Arc::new(data),
@@ -108,12 +104,12 @@ impl Block {
 		}
 	}
 
-	pub fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		self.block.len()
 	}
 }
 
-pub struct BlockWriter {
+pub(crate) struct BlockWriter {
 	restart_interval: usize,
 	// Destination buffer
 	buffer: Vec<u8>,
@@ -178,7 +174,7 @@ Block writer logic:
 */
 impl BlockWriter {
 	// Constructor for BlockWriter
-	pub fn new(opt: Arc<Options>) -> Self {
+	pub(crate) fn new(opt: Arc<Options>) -> Self {
 		BlockWriter {
 			internal_cmp: Arc::new(InternalKeyComparator::new(opt.comparator.clone())),
 			buffer: Vec::with_capacity(opt.block_size),
@@ -191,7 +187,7 @@ impl BlockWriter {
 	}
 
 	// Adds a key-value pair to the block
-	pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		// println!("key: {:?}", key);
 		// Ensure the restart counter is within the interval limit
 		assert!(self.restart_counter <= self.restart_interval);
@@ -252,7 +248,7 @@ impl BlockWriter {
 	}
 
 	// Finalizes the block and returns the block data
-	pub fn finish(mut self) -> BlockData {
+	pub(crate) fn finish(mut self) -> BlockData {
 		// 1. Append RESTARTS
 		for &r in self.restart_points.iter() {
 			self.buffer.write_fixedint(r).expect("block write failed");
@@ -265,12 +261,12 @@ impl BlockWriter {
 	}
 
 	// Estimates the current size of the block
-	pub fn size_estimate(&self) -> usize {
+	pub(crate) fn size_estimate(&self) -> usize {
 		self.buffer.len() + self.restart_points.len() * 4 + 4
 	}
 
 	// Returns the number of entries in the block
-	pub fn entries(&self) -> usize {
+	pub(crate) fn entries(&self) -> usize {
 		self.num_entries
 	}
 }
@@ -293,7 +289,7 @@ pub struct BlockIterator {
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
+	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);

@@ -41,12 +41,12 @@ pub(crate) fn hash(data: &[u8], seed: u32) -> u32 {
 	h
 }
 
-pub struct LevelDBBloomFilter {
+pub(crate) struct LevelDBBloomFilter {
 	bits_per_key: usize,
 }
 
 impl LevelDBBloomFilter {
-	pub fn new(bits_per_key: usize) -> Self {
+	pub(crate) fn new(bits_per_key: usize) -> Self {
 		Self {
 			bits_per_key,
 		}

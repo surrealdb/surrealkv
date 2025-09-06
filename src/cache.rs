@@ -12,12 +12,11 @@ pub type CacheID = u64;
 pub enum Item {
 	Data(Arc<Block>),
 	Index(Arc<Block>),
-	VLogValue(Value),
 }
 
 // VLog cache key: (file_id, offset)
 #[derive(Eq, std::hash::Hash, PartialEq)]
-pub struct VLogCacheKey {
+pub(crate) struct VLogCacheKey {
 	pub file_id: u32,
 	pub offset: u64,
 }
@@ -69,7 +68,6 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 		match block {
 			Item::Data(block) => block.size() as u64,
 			Item::Index(block) => block.size() as u64,
-			Item::VLogValue(value) => value.len() as u64,
 		}
 	}
 }
@@ -84,68 +82,45 @@ impl Weighter<VLogCacheKey, Value> for VLogValueWeighter {
 }
 
 /// Dedicated cache for VLog values
-pub struct VLogCache {
+pub(crate) struct VLogCache {
 	data: QCache<VLogCacheKey, Value, VLogValueWeighter>,
-	id: AtomicU64,
 }
 
 impl VLogCache {
-	pub fn with_capacity_bytes(bytes: u64) -> Self {
+	pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, VLogValueWeighter),
-			id: AtomicU64::new(0),
 		}
 	}
 
-	pub fn len(&self) -> usize {
-		self.data.len()
-	}
-
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
-
-	pub fn insert(&self, file_id: u32, offset: u64, value: Value) {
+	pub(crate) fn insert(&self, file_id: u32, offset: u64, value: Value) {
 		self.data.insert((file_id, offset).into(), value);
 	}
 
-	pub fn get(&self, file_id: u32, offset: u64) -> Option<Value> {
+	pub(crate) fn get(&self, file_id: u32, offset: u64) -> Option<Value> {
 		let key = (file_id, &offset);
 		self.data.get(&key)
 	}
-
-	pub fn new_cache_id(&self) -> CacheID {
-		let id = self.id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-		id + 1
-	}
 }
 
-pub struct BlockCache {
+pub(crate) struct BlockCache {
 	data: QCache<CacheKey, Item, BlockWeighter>,
 	id: AtomicU64,
 }
 
 impl BlockCache {
-	pub fn with_capacity_bytes(bytes: u64) -> Self {
+	pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, BlockWeighter),
 			id: AtomicU64::new(0),
 		}
 	}
 
-	pub fn len(&self) -> usize {
-		self.data.len()
-	}
-
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
-	}
-
-	pub fn insert(&self, table_id: u64, offset: u64, value: Item) {
+	pub(crate) fn insert(&self, table_id: u64, offset: u64, value: Item) {
 		self.data.insert((table_id, offset).into(), value);
 	}
 
-	pub fn get_data_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
+	pub(crate) fn get_data_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
 		let item = self.data.get(&key)?;
 
@@ -155,7 +130,7 @@ impl BlockCache {
 		}
 	}
 
-	pub fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
+	pub(crate) fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
 		let item = self.data.get(&key)?;
 
@@ -165,7 +140,7 @@ impl BlockCache {
 		}
 	}
 
-	pub fn new_cache_id(&self) -> CacheID {
+	pub(crate) fn new_cache_id(&self) -> CacheID {
 		let id = self.id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		id + 1
 	}

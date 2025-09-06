@@ -20,7 +20,7 @@ const INITIAL_SIZE: usize = 1 << 20; // 1MB, can store 65,536 entries
 ///
 /// Entries are kept sorted by file_id for binary search
 #[derive(Debug)]
-pub struct DiscardStats {
+pub(crate) struct DiscardStats {
 	/// Memory-mapped file
 	mmap: MmapMut,
 	/// File handle
@@ -31,7 +31,7 @@ pub struct DiscardStats {
 
 impl DiscardStats {
 	/// Creates or opens a memory-mapped discard stats file
-	pub fn new<P: AsRef<Path>>(dir: P) -> Result<Self> {
+	pub(crate) fn new<P: AsRef<Path>>(dir: P) -> Result<Self> {
 		let path = dir.as_ref().join(DISCARD_STATS_FILENAME);
 
 		let file_exists = path.exists();
@@ -161,7 +161,7 @@ impl DiscardStats {
 	/// - If discard_bytes is 0, returns current discard bytes
 	/// - If discard_bytes is negative, resets discard bytes to 0
 	/// - If discard_bytes is positive, adds to current discard bytes
-	pub fn update(&mut self, file_id: u32, discard_bytes: i64) -> u64 {
+	pub(crate) fn update(&mut self, file_id: u32, discard_bytes: i64) -> u64 {
 		// Binary search for the file_id
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 		let idx = self.binary_search(file_id, next_empty_slot);
@@ -271,7 +271,7 @@ impl DiscardStats {
 	}
 
 	/// Returns the file with maximum discard bytes
-	pub fn max_discard(&self) -> Result<(u32, u64)> {
+	pub(crate) fn max_discard(&self) -> Result<(u32, u64)> {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
 		let mut max_file_id = 0;
@@ -297,7 +297,7 @@ impl DiscardStats {
 	}
 
 	/// Gets discard bytes for a specific file
-	pub fn get_file_stats(&self, file_id: u32) -> u64 {
+	pub(crate) fn get_file_stats(&self, file_id: u32) -> u64 {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
 		if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
@@ -308,7 +308,7 @@ impl DiscardStats {
 	}
 
 	/// Removes statistics for a file
-	pub fn remove_file(&mut self, file_id: u32) {
+	pub(crate) fn remove_file(&mut self, file_id: u32) {
 		let (slot_to_remove, next_empty_slot) = {
 			let next_empty_slot_guard = self.next_empty_slot.lock().unwrap();
 			let next_empty_slot = *next_empty_slot_guard;
@@ -337,7 +337,7 @@ impl DiscardStats {
 	}
 
 	/// Syncs the memory-mapped file to disk
-	pub fn sync(&self) -> Result<()> {
+	pub(crate) fn sync(&self) -> Result<()> {
 		self.mmap.flush()?;
 		Ok(())
 	}

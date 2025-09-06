@@ -34,12 +34,12 @@ pub const BLOCK_COMPRESS_LEN: usize = 1;
 
 const MASK_DELTA: u32 = 0xa282_ead8;
 
-pub fn mask(crc: u32) -> u32 {
+pub(crate) fn mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(MASK_DELTA)
 }
 
 /// Return the crc whose masked representation is `masked`.
-pub fn unmask(masked: u32) -> u32 {
+pub(crate) fn unmask(masked: u32) -> u32 {
 	let rot = masked.wrapping_sub(MASK_DELTA);
 	rot.rotate_left(15)
 }
@@ -64,7 +64,7 @@ impl TableFormat {
 }
 
 #[derive(Debug, Clone)]
-pub struct Footer {
+pub(crate) struct Footer {
 	pub format: TableFormat,
 	pub checksum: ChecksumType,
 	pub meta_index: BlockHandle,
@@ -72,7 +72,7 @@ pub struct Footer {
 }
 
 impl Footer {
-	pub fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
+	pub(crate) fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
 		Footer {
 			meta_index: metaix,
 			index,
@@ -81,7 +81,7 @@ impl Footer {
 		}
 	}
 
-	pub fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
+	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
 		if file_size < TABLE_FULL_FOOTER_LENGTH {
 			return Err(Error::CorruptedBlock(format!(
 				"invalid table (file size is too small: {file_size} bytes)"
@@ -95,7 +95,7 @@ impl Footer {
 		Ok(buf)
 	}
 
-	pub fn decode(buf: &[u8]) -> Result<Footer> {
+	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
 		let magic = &buf[buf.len() - TABLE_MAGIC_FOOTER_ENCODED.len()..];
 
 		// Validate magic number first
@@ -137,7 +137,7 @@ impl Footer {
 		})
 	}
 
-	pub fn encode(&self, dst: &mut [u8]) {
+	pub(crate) fn encode(&self, dst: &mut [u8]) {
 		match self.format {
 			TableFormat::LSMV1 => {
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
@@ -161,7 +161,7 @@ impl Footer {
 }
 
 // Defines a writer for constructing and writing table structures to a storage medium.
-pub struct TableWriter<W: Write> {
+pub(crate) struct TableWriter<W: Write> {
 	writer: W,          // Underlying writer to write data to.
 	opts: Arc<Options>, // Shared table options.
 
@@ -180,7 +180,7 @@ pub struct TableWriter<W: Write> {
 
 impl<W: Write> TableWriter<W> {
 	// Constructs a new TableWriter with the provided writer and options.
-	pub fn new(writer: W, id: u64, opts: Arc<Options>) -> Self {
+	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(policy.clone());
@@ -209,7 +209,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Estimates the size of the table being written.
-	pub fn size_estimate(&self) -> usize {
+	pub(crate) fn size_estimate(&self) -> usize {
 		let data_block_size = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
 		let index_block_size = self.partitioned_index.size_estimate();
 		let filter_block_size = self.filter_block.as_ref().map_or(0, |b| b.size_estimate());
@@ -224,7 +224,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub fn add(&mut self, key: Arc<InternalKey>, val: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: Arc<InternalKey>, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -304,7 +304,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Finalizes the table writing process, writing any pending blocks and the footer.
-	pub fn finish(mut self) -> Result<usize> {
+	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
 		self.meta.properties.file_size = self.size_estimate() as u64;
 		self.meta.properties.created_at =
@@ -515,7 +515,7 @@ pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType
 }
 
 /// Reads a serialized filter block from a file and returns a FilterBlockReader.
-pub fn read_filter_block(
+pub(crate) fn read_filter_block(
 	src: Arc<dyn File>,
 	location: &BlockHandle,
 	policy: Arc<dyn FilterPolicy>,
@@ -546,7 +546,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	Ok(None)
 }
 
-pub fn read_table_block(
+pub(crate) fn read_table_block(
 	opt: Arc<Options>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
@@ -593,6 +593,7 @@ pub enum IndexType {
 pub struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
+	#[allow(dead_code)] // Used in test code and compaction
 	pub file_size: u64,
 	cache_id: cache::CacheID,
 
@@ -606,7 +607,12 @@ pub struct Table {
 }
 
 impl Table {
-	pub fn new(id: u64, opts: Arc<Options>, file: Arc<dyn File>, file_size: u64) -> Result<Table> {
+	pub(crate) fn new(
+		id: u64,
+		opts: Arc<Options>,
+		file: Arc<dyn File>,
+		file_size: u64,
+	) -> Result<Table> {
 		// Read in the following order:
 		//    1. Footer
 		//    2. [index block]
@@ -707,7 +713,7 @@ impl Table {
 		Ok(b)
 	}
 
-	pub fn get(&self, key: InternalKey) -> Result<Option<(Arc<InternalKey>, Value)>> {
+	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(Arc<InternalKey>, Value)>> {
 		let key_encoded = &key.encode();
 
 		// Check filter first
@@ -772,7 +778,7 @@ impl Table {
 		}
 	}
 
-	pub fn iter(&self) -> TableIterator {
+	pub(crate) fn iter(&self) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
@@ -800,7 +806,7 @@ impl Table {
 		}
 	}
 
-	pub fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
+	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
 		if let Some(ref range) = self.meta.properties.key_range {
 			return self.opts.comparator.compare(&key.user_key, &range.low) >= Ordering::Equal
 				&& self.opts.comparator.compare(&key.user_key, &range.high) <= Ordering::Equal;

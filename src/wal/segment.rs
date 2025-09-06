@@ -213,7 +213,7 @@ impl Default for Options {
 }
 
 impl Options {
-	pub fn validate(&self) -> Result<()> {
+	pub(crate) fn validate(&self) -> Result<()> {
 		if self.max_file_size == 0 {
 			return Err(Error::IO(IOError::new(
 				io::ErrorKind::InvalidInput,
@@ -225,7 +225,7 @@ impl Options {
 	}
 
 	#[allow(dead_code)]
-	pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+	pub(crate) fn with_max_file_size(mut self, max_file_size: u64) -> Self {
 		self.max_file_size = max_file_size;
 		self
 	}
@@ -237,7 +237,7 @@ impl Options {
 /// can be used to hold additional information about a file. The data is stored in a hash map where
 /// each key is a string and each value is a vector of bytes.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Metadata {
+pub(crate) struct Metadata {
 	/// The map holding key-value pairs of metadata.
 	///
 	/// The `data` field is a hash map that allows associating arbitrary data with descriptive keys.
@@ -436,7 +436,7 @@ fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
 }
 
 // Reads a field from the given reader
-pub fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+pub(crate) fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 	let mut len_buf = [0; 4];
 	reader.read_exact(&mut len_buf)?; // Read 4 bytes for the length
 	let len = u32::from_be_bytes(len_buf) as usize; // Convert bytes to length
@@ -446,7 +446,7 @@ pub fn read_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 }
 
 // Writes a field to the given writer
-pub fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
+pub(crate) fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
 	let mut len_buf = [0; 4];
 	len_buf.copy_from_slice(&(b.len() as u32).to_be_bytes());
 	writer.write_all(&len_buf)?; // Write 4 bytes for the length
@@ -454,7 +454,7 @@ pub fn write_field<W: Write>(b: &[u8], writer: &mut W) -> Result<()> {
 	Ok(())
 }
 
-pub fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
+pub(crate) fn read_file_header(file: &mut File) -> Result<Vec<u8>> {
 	// Read the header using read_field
 	read_field(file)
 }
@@ -556,7 +556,7 @@ fn validate_compression(header: &[u8], opts: &Options) -> Result<()> {
 	Ok(())
 }
 
-pub fn validate_record_type(record_type: &RecordType, i: usize) -> Result<()> {
+pub(crate) fn validate_record_type(record_type: &RecordType, i: usize) -> Result<()> {
 	match record_type {
 		RecordType::Full => {
 			if i != 0 {
@@ -598,7 +598,7 @@ pub fn validate_record_type(record_type: &RecordType, i: usize) -> Result<()> {
 	Ok(())
 }
 
-pub fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
+pub(crate) fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
 	let mut hasher = Hasher::new();
 	hasher.update(record_type);
 	hasher.update(data);
@@ -648,7 +648,7 @@ fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
 	Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid segment name format")))
 }
 
-pub fn segment_name(index: u64, ext: &str) -> String {
+pub(crate) fn segment_name(index: u64, ext: &str) -> String {
 	if ext.is_empty() {
 		format!("{index:020}")
 	} else {
@@ -660,7 +660,7 @@ pub fn segment_name(index: u64, ext: &str) -> String {
 ///
 /// This function returns a tuple containing the minimum and maximum segment IDs
 /// found in the directory. If no segments are found, the tuple will contain (0, 0).
-pub fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
+pub(crate) fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 	let refs = list_segment_ids(dir)?;
 	if refs.is_empty() {
 		return Ok((0, 0));
@@ -673,7 +673,7 @@ pub fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 /// This function reads the names of segment files in the directory and extracts the segment IDs.
 /// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
 /// vector is returned.
-pub fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
+pub(crate) fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 	let mut refs: Vec<u64> = Vec::new();
 	let entries = read_dir(dir)?;
 
@@ -695,7 +695,7 @@ pub fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 }
 
 #[derive(Debug)]
-pub struct SegmentRef {
+pub(crate) struct SegmentRef {
 	/// The path where the segment file is located.
 	pub file_path: PathBuf,
 	/// The base offset of the file.
@@ -706,7 +706,7 @@ pub struct SegmentRef {
 
 impl SegmentRef {
 	/// Creates a vector of SegmentRef instances by reading segments in the specified directory.
-	pub fn read_segments_from_directory(directory_path: &Path) -> Result<Vec<SegmentRef>> {
+	pub(crate) fn read_segments_from_directory(directory_path: &Path) -> Result<Vec<SegmentRef>> {
 		let mut segment_refs = Vec::new();
 
 		// Read the directory and iterate through its entries
@@ -769,7 +769,7 @@ impl SegmentRef {
 	 .                                                       |
 	 +------+------+------+------+------+------+------+------+
 */
-pub struct Segment<const RECORD_HEADER_SIZE: usize> {
+pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	/// The unique identifier of the segment.
 	#[allow(dead_code)]
 	pub id: u64,
@@ -800,7 +800,7 @@ pub struct Segment<const RECORD_HEADER_SIZE: usize> {
 }
 
 impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
-	pub fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
+	pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
 		// Ensure the options are valid
 		opts.validate()?;
 
@@ -896,7 +896,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	// This method also synchronize file metadata to the filesystem
 	// hence it is a bit slower than fdatasync (sync_data).
 	#[cfg(test)]
-	pub fn sync(&mut self) -> Result<()> {
+	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
 		}
@@ -904,7 +904,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 		self.flush_and_sync()
 	}
 
-	pub fn close(&mut self) -> Result<()> {
+	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
 		}
@@ -915,7 +915,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 		Ok(())
 	}
 
-	pub fn flush_block(&mut self, clear: bool) -> Result<()> {
+	pub(crate) fn flush_block(&mut self, clear: bool) -> Result<()> {
 		let p = &mut self.block;
 		let clear = clear || p.is_full();
 
@@ -941,7 +941,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	}
 
 	// Returns the current offset within the segment.
-	pub fn offset(&self) -> u64 {
+	pub(crate) fn offset(&self) -> u64 {
 		self.file_offset + self.block.unwritten() as u64
 	}
 
@@ -961,7 +961,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	/// # Errors
 	///
 	/// Returns an error if the segment is closed.
-	pub fn append(&mut self, mut rec: &[u8]) -> Result<(u64, usize)> {
+	pub(crate) fn append(&mut self, mut rec: &[u8]) -> Result<(u64, usize)> {
 		// If the segment is closed, return an error
 		if self.closed {
 			return Err(Error::SegmentClosed);
@@ -1003,7 +1003,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	}
 
 	#[cfg(test)]
-	pub fn read_at(&self, bs: &mut [u8], off: u64) -> Result<usize> {
+	pub(crate) fn read_at(&self, bs: &mut [u8], off: u64) -> Result<usize> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
 		}
@@ -1119,14 +1119,14 @@ pub struct IOError {
 }
 
 impl IOError {
-	pub fn new(kind: io::ErrorKind, message: &str) -> Self {
+	pub(crate) fn new(kind: io::ErrorKind, message: &str) -> Self {
 		IOError {
 			kind,
 			message: message.to_string(),
 		}
 	}
 
-	pub fn kind(&self) -> io::ErrorKind {
+	pub(crate) fn kind(&self) -> io::ErrorKind {
 		self.kind
 	}
 }
@@ -1146,7 +1146,7 @@ pub struct CorruptionError {
 }
 
 impl CorruptionError {
-	pub fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: u64) -> Self {
+	pub(crate) fn new(kind: io::ErrorKind, message: &str, segment_id: u64, offset: u64) -> Self {
 		CorruptionError {
 			kind,
 			message: message.to_string(),
@@ -1174,7 +1174,7 @@ impl std::error::Error for CorruptionError {}
 // track multiple segment and offset for corruption detection. Since data is
 // written to WAL in multiples of BLOCK_SIZE, non-block aligned segments
 // are padded with zeros. This is done to avoid partial reads from the WAL.
-pub struct MultiSegmentReader {
+pub(crate) struct MultiSegmentReader {
 	buf: BufReader<File>,      // Buffer for reading from the current segment.
 	segments: Vec<SegmentRef>, // List of segments to read from.
 	cur: usize,                // Index of current segment in segments.
@@ -1182,7 +1182,7 @@ pub struct MultiSegmentReader {
 }
 
 impl MultiSegmentReader {
-	pub fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader> {
+	pub(crate) fn new(segments: Vec<SegmentRef>) -> Result<MultiSegmentReader> {
 		if segments.is_empty() {
 			return Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Empty segment list")));
 		}
@@ -1253,11 +1253,11 @@ impl MultiSegmentReader {
 		Ok(())
 	}
 
-	pub fn current_segment_id(&self) -> u64 {
+	pub(crate) fn current_segment_id(&self) -> u64 {
 		self.segments[self.cur].id
 	}
 
-	pub fn current_offset(&self) -> usize {
+	pub(crate) fn current_offset(&self) -> usize {
 		self.off
 	}
 }

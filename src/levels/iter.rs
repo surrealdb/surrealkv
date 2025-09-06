@@ -3,7 +3,7 @@ use crate::sstable::table::Table;
 use std::sync::Arc;
 
 /// Iterates through all levels
-pub struct LevelManifestIterator<'a> {
+pub(crate) struct LevelManifestIterator<'a> {
 	level_manifest: &'a LevelManifest,
 	current_level: usize,
 	current_idx: usize,
@@ -11,7 +11,7 @@ pub struct LevelManifestIterator<'a> {
 
 impl<'a> LevelManifestIterator<'a> {
 	#[must_use]
-	pub fn new(level_manifest: &'a LevelManifest) -> Self {
+	pub(crate) fn new(level_manifest: &'a LevelManifest) -> Self {
 		Self {
 			level_manifest,
 			current_idx: 0,

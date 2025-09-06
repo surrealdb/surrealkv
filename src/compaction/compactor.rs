@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Compaction options
-pub struct CompactionOptions {
+pub(crate) struct CompactionOptions {
 	pub lopts: Arc<LSMOptions>,
 	pub level_manifest: Arc<RwLock<LevelManifest>>,
 	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
@@ -26,7 +26,7 @@ pub struct CompactionOptions {
 }
 
 impl CompactionOptions {
-	pub fn from(tree: &crate::lsm::CoreInner) -> Self {
+	pub(crate) fn from(tree: &crate::lsm::CoreInner) -> Self {
 		Self {
 			lopts: tree.opts.clone(),
 			level_manifest: tree.level_manifest.clone(),
@@ -37,20 +37,20 @@ impl CompactionOptions {
 }
 
 /// Handles the compaction state and operations
-pub struct Compactor {
+pub(crate) struct Compactor {
 	pub(crate) options: CompactionOptions,
 	pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
 impl Compactor {
-	pub fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
+	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
 		Self {
 			options,
 			strategy,
 		}
 	}
 
-	pub fn compact(&self) -> Result<()> {
+	pub(crate) fn compact(&self) -> Result<()> {
 		let levels_guard = self.options.level_manifest.write().unwrap();
 		let choice = self.strategy.pick_levels(&levels_guard);
 

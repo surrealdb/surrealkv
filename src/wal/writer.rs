@@ -11,7 +11,7 @@ use crate::wal::segment::{
 
 /// Write-Ahead Log (Wal) is a data structure used to sequentially
 /// store records in a series of segments.
-pub struct Wal {
+pub(crate) struct Wal {
 	/// The currently active segment where data is being written.
 	active_segment: Segment<WAL_RECORD_HEADER_SIZE>,
 
@@ -41,7 +41,7 @@ impl Wal {
 	///
 	/// - `dir`: The directory where segment files are located.
 	/// - `opts`: Configuration options for the WAL instance.
-	pub fn open(dir: &Path, opts: Options) -> Result<Self> {
+	pub(crate) fn open(dir: &Path, opts: Options) -> Result<Self> {
 		// Ensure the options are valid
 		opts.validate()?;
 
@@ -116,7 +116,7 @@ impl Wal {
 	///
 	/// This function may return an error if the active segment is closed, the provided record
 	/// is empty, or any I/O error occurs during the appending process.
-	pub fn append(&mut self, rec: &[u8]) -> Result<u64> {
+	pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
 		}
@@ -167,7 +167,7 @@ impl Wal {
 		}
 	}
 
-	pub fn close(&mut self) -> Result<()> {
+	pub(crate) fn close(&mut self) -> Result<()> {
 		let _lock = self.mutex.write();
 		self.active_segment.close()?;
 		Ok(())
@@ -187,7 +187,7 @@ impl Wal {
 		self.active_segment.offset()
 	}
 
-	pub fn get_dir_path(&self) -> &Path {
+	pub(crate) fn get_dir_path(&self) -> &Path {
 		&self.dir
 	}
 
@@ -199,7 +199,7 @@ impl Wal {
 	/// # Returns
 	///
 	/// The ID of the newly created segment, or an error if something went wrong.
-	pub fn rotate(&mut self) -> Result<u64> {
+	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let _lock = self.mutex.write();
 
 		// Sync and close the current active segment

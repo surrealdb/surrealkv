@@ -141,7 +141,7 @@ impl CheckpointMetadata {
 }
 
 /// Database checkpoint manager for creating consistent point-in-time snapshots
-pub struct DatabaseCheckpoint {
+pub(crate) struct DatabaseCheckpoint {
 	/// Reference to the LSM core
 	core: Arc<CoreInner>,
 }

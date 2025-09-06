@@ -176,7 +176,7 @@ impl CommitQueue {
 	}
 }
 
-pub struct CommitPipeline {
+pub(crate) struct CommitPipeline {
 	env: Arc<dyn CommitEnv>,
 	log_seq_num: AtomicU64,
 	visible_seq_num: Arc<AtomicU64>,
@@ -190,7 +190,7 @@ pub struct CommitPipeline {
 }
 
 impl CommitPipeline {
-	pub fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
+	pub(crate) fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
 		Arc::new(Self {
 			env,
 			log_seq_num: AtomicU64::new(1),
@@ -202,7 +202,7 @@ impl CommitPipeline {
 		})
 	}
 
-	pub fn set_seq_num(&self, seq_num: u64) {
+	pub(crate) fn set_seq_num(&self, seq_num: u64) {
 		if seq_num > 0 {
 			self.visible_seq_num.store(seq_num, Ordering::Release);
 			self.log_seq_num.store(seq_num + 1, Ordering::Release);
@@ -212,7 +212,7 @@ impl CommitPipeline {
 	/// Synchronous commit that bypasses the async pipeline machinery.
 	/// This is suitable for cases where no flow control or async coordination is needed,
 	/// such as delete list updates during compaction.
-	pub fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -252,7 +252,7 @@ impl CommitPipeline {
 		Ok(())
 	}
 
-	pub async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+	pub(crate) async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -352,11 +352,11 @@ impl CommitPipeline {
 		}
 	}
 
-	pub fn get_visible_seq_num(&self) -> u64 {
+	pub(crate) fn get_visible_seq_num(&self) -> u64 {
 		self.visible_seq_num.load(Ordering::Acquire)
 	}
 
-	pub fn shutdown(&self) {
+	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 	}
 }

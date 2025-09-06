@@ -70,7 +70,7 @@ pub trait CompactionOperations: Send + Sync {
 ///   has progressively larger SSTables with non-overlapping key ranges (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
-pub struct CoreInner {
+pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
 	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
@@ -157,7 +157,7 @@ impl CoreInner {
 	/// 2. A new empty active memtable is created for new writes
 	/// 3. The immutable memtable is flushed to disk as an SSTable
 	/// 4. The new SSTable is added to Level 0
-	pub fn make_room_for_write(&self) -> Result<()> {
+	fn make_room_for_write(&self) -> Result<()> {
 		// Atomically flush memtable and rotate WAL under a single lock
 		// This prevents race conditions where writes could go to the wrong WAL segment
 		let Some((table_id, flushed_memtable)) = self.flush_active_memtable_and_rotate_wal()?
@@ -228,7 +228,7 @@ impl CoreInner {
 	/// - SSTables may have overlapping key ranges
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
-	pub fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
+	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
 		let mut original_manifest = self.level_manifest.write().unwrap();
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
 		let table_id = table.id;
@@ -249,13 +249,8 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Returns true if VLog is enabled
-	pub fn is_vlog_enabled(&self) -> bool {
-		self.vlog.is_some()
-	}
-
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
-	pub fn resolve_value(&self, value: &[u8]) -> Result<Value> {
+	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
 		let location = ValueLocation::decode(value)?;
 		location.resolve_value(self.vlog.as_ref())
 	}
@@ -294,7 +289,7 @@ struct LsmCommitEnv {
 
 impl LsmCommitEnv {
 	/// Creates a new commit environment for the LSM tree
-	pub fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
+	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager,
@@ -341,7 +336,7 @@ impl CommitEnv for LsmCommitEnv {
 /// - Memtable flushing: Converting full memtables to SSTables
 /// - Compaction: Merging SSTables to maintain read performance
 /// - Garbage collection: Removing obsolete SSTables
-pub struct Core {
+pub(crate) struct Core {
 	/// The inner LSM tree implementation
 	inner: Arc<CoreInner>,
 
@@ -554,15 +549,7 @@ impl Core {
 
 #[derive(Clone)]
 pub struct Tree {
-	core: Arc<Core>,
-}
-
-impl std::ops::Deref for Tree {
-	type Target = Core;
-
-	fn deref(&self) -> &Self::Target {
-		&self.core
-	}
+	pub(crate) core: Arc<Core>,
 }
 
 impl Tree {
@@ -723,7 +710,7 @@ impl Tree {
 	#[cfg(test)]
 	/// Updates VLog discard statistics if VLog is enabled
 	fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
-		if let Some(ref vlog) = self.inner.vlog {
+		if let Some(ref vlog) = self.core.vlog {
 			vlog.update_discard_stats(stats);
 		}
 	}
@@ -734,8 +721,8 @@ impl Tree {
 
 	/// Triggers VLog garbage collection manually
 	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u32>> {
-		match &self.inner.vlog {
-			Some(vlog) => vlog.garbage_collect(self.commit_pipeline.clone()).await,
+		match &self.core.vlog {
+			Some(vlog) => vlog.garbage_collect(self.core.commit_pipeline.clone()).await,
 			None => Ok(Vec::new()),
 		}
 	}
@@ -747,7 +734,7 @@ impl Tree {
 }
 
 /// Syncs a directory to ensure all changes are persisted to disk
-pub fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let file = File::open(path)?;
 	debug_assert!(file.metadata()?.is_dir());
 	file.sync_all()
@@ -2168,7 +2155,7 @@ mod tests {
 
 		// Force compaction
 		let strategy = Arc::new(Strategy::default());
-		tree.inner.compact(strategy).unwrap();
+		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
 		// only one should remain because the active VLog file does not get garbage collected
@@ -2279,7 +2266,7 @@ mod tests {
 
 		// Force compaction
 		let strategy = Arc::new(Strategy::default());
-		tree.inner.compact(strategy).unwrap();
+		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
 		// only one should remain because the active VLog file does not get garbage collected
@@ -2392,7 +2379,7 @@ mod tests {
 
 		// --- Step 7: Trigger manual compaction of the LSM tree ---
 		let strategy = Arc::new(Strategy::default());
-		tree.inner.compact(strategy).unwrap();
+		tree.core.compact(strategy).unwrap();
 
 		// --- Step 8: Run VLog garbage collection (which internally can trigger file compaction) ---
 		tree.garbage_collect_vlog().await.unwrap();
@@ -2697,7 +2684,7 @@ mod tests {
 		let tree1 = Tree::new(opts.clone()).unwrap();
 
 		// Verify VLog is enabled
-		assert!(tree1.inner.is_vlog_enabled(), "VLog should be enabled");
+		assert!(tree1.core.vlog.is_some(), "VLog should be enabled");
 
 		// Add data to create multiple VLog files
 		for i in 0..10 {
@@ -2730,7 +2717,7 @@ mod tests {
 
 		// Create a new database instance - this should trigger VLog prefill
 		let tree2 = Tree::new(opts.clone()).unwrap();
-		assert!(tree2.inner.is_vlog_enabled(), "VLog should be enabled in second database");
+		assert!(tree2.core.vlog.is_some(), "VLog should be enabled in second database");
 
 		// Verify that all existing data can still be read
 		for i in 0..10 {

@@ -10,7 +10,7 @@ type RecordKey<'a> = (InternalKeyKind, &'a [u8], Option<&'a [u8]>);
 type RecordResult<'a> = Result<Option<RecordKey<'a>>>;
 
 #[derive(Debug, Clone)]
-pub struct Batch {
+pub(crate) struct Batch {
 	version: u8,
 	data: Vec<u8>,
 	count: u32,
@@ -23,7 +23,7 @@ impl Default for Batch {
 }
 
 impl Batch {
-	pub fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self {
 			data: Vec::new(),
 			count: 0,
@@ -41,7 +41,7 @@ impl Batch {
 		Ok(())
 	}
 
-	pub fn encode(&self, seq_num: u64) -> Result<Vec<u8>> {
+	pub(crate) fn encode(&self, seq_num: u64) -> Result<Vec<u8>> {
 		let mut encoded = Vec::with_capacity(self.data.len() + 1);
 
 		// Write version (1 byte)
@@ -59,15 +59,11 @@ impl Batch {
 		Ok(encoded)
 	}
 
-	pub fn get_count(&self) -> u32 {
-		self.count
-	}
-
-	pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub(crate) fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.add_record(InternalKeyKind::Set, key, Some(value))
 	}
 
-	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+	pub(crate) fn delete(&mut self, key: &[u8]) -> Result<()> {
 		self.add_record(InternalKeyKind::Delete, key, None)
 	}
 
@@ -103,23 +99,23 @@ impl Batch {
 		Ok(())
 	}
 
-	pub fn iter(&self) -> BatchIterator<'_> {
+	pub(crate) fn iter(&self) -> BatchIterator<'_> {
 		BatchIterator {
 			data: &self.data,
 			pos: 0,
 		}
 	}
 
-	pub fn count(&self) -> u32 {
+	pub(crate) fn count(&self) -> u32 {
 		self.count
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub(crate) fn is_empty(&self) -> bool {
 		self.data.is_empty()
 	}
 }
 
-pub struct BatchIterator<'a> {
+pub(crate) struct BatchIterator<'a> {
 	data: &'a [u8],
 	pos: usize,
 }
@@ -186,47 +182,34 @@ impl<'a> Iterator for BatchIterator<'a> {
 	}
 }
 
-pub struct BatchReader<'a> {
+pub(crate) struct BatchReader<'a> {
 	data: &'a [u8],
 	pos: usize,
-	count: u32,
 	seq_num: u64,
-	version: u8,
 }
 
 impl<'a> BatchReader<'a> {
-	pub fn new(data: &'a [u8]) -> Result<Self> {
+	pub(crate) fn new(data: &'a [u8]) -> Result<Self> {
 		if data.is_empty() {
 			return Err(Error::InvalidBatchRecord);
 		}
 
-		let version = data[0];
 		let (seq_num, read1) = u64::decode_var(&data[1..]).ok_or(Error::InvalidBatchRecord)?;
-		let (count, read2) =
+		let (_count, read2) =
 			u32::decode_var(&data[1 + read1..]).ok_or(Error::InvalidBatchRecord)?;
 
 		Ok(Self {
 			data,
 			pos: 1 + read1 + read2,
-			count,
 			seq_num,
-			version,
 		})
 	}
 
-	pub fn get_seq_num(&self) -> u64 {
+	pub(crate) fn get_seq_num(&self) -> u64 {
 		self.seq_num
 	}
 
-	pub fn get_count(&self) -> u32 {
-		self.count
-	}
-
-	pub fn get_version(&self) -> u8 {
-		self.version
-	}
-
-	pub fn read_record(&mut self) -> RecordResult<'a> {
+	pub(crate) fn read_record(&mut self) -> RecordResult<'a> {
 		decode_record_at(self.data, &mut self.pos)
 	}
 }
@@ -260,23 +243,23 @@ mod tests {
 	#[test]
 	fn test_batch_get_count() {
 		let mut batch = Batch::new();
-		assert_eq!(batch.get_count(), 0);
+		assert_eq!(batch.count, 0);
 		batch.set(b"key1", b"value1").unwrap();
-		assert_eq!(batch.get_count(), 1);
+		assert_eq!(batch.count, 1);
 	}
 
 	#[test]
 	fn test_batch_set() {
 		let mut batch = Batch::new();
 		batch.set(b"key1", b"value1").unwrap();
-		assert_eq!(batch.get_count(), 1);
+		assert_eq!(batch.count, 1);
 	}
 
 	#[test]
 	fn test_batch_delete() {
 		let mut batch = Batch::new();
 		batch.delete(b"key1").unwrap();
-		assert_eq!(batch.get_count(), 1);
+		assert_eq!(batch.count, 1);
 	}
 
 	#[test]
@@ -286,7 +269,7 @@ mod tests {
 		let encoded = batch.encode(100).unwrap();
 		let reader = BatchReader::new(&encoded).unwrap();
 		assert_eq!(reader.get_seq_num(), 100);
-		assert_eq!(reader.get_count(), 1);
+		// Note: get_count method was removed as it was unused
 	}
 
 	#[test]
@@ -295,15 +278,6 @@ mod tests {
 		let encoded = batch.encode(100).unwrap();
 		let reader = BatchReader::new(&encoded).unwrap();
 		assert_eq!(reader.get_seq_num(), 100);
-	}
-
-	#[test]
-	fn test_batchreader_get_count() {
-		let mut batch = Batch::new();
-		batch.set(b"key1", b"value1").unwrap();
-		let encoded = batch.encode(1).unwrap();
-		let reader = BatchReader::new(&encoded).unwrap();
-		assert_eq!(reader.get_count(), 1);
 	}
 
 	#[test]
@@ -323,7 +297,7 @@ mod tests {
 		let batch = Batch::new();
 		let encoded = batch.encode(1).unwrap();
 		let mut reader = BatchReader::new(&encoded).unwrap();
-		assert_eq!(reader.get_count(), 0);
+		// Note: get_count method was removed as it was unused
 		assert_eq!(reader.get_seq_num(), 1);
 		assert!(reader.read_record().unwrap().is_none());
 	}
@@ -335,7 +309,7 @@ mod tests {
 		batch.delete(b"key2").unwrap();
 		batch.set(b"key3", b"value3").unwrap();
 
-		assert_eq!(batch.get_count(), 3);
+		assert_eq!(batch.count, 3);
 
 		let encoded = batch.encode(1).unwrap();
 		let mut reader = BatchReader::new(&encoded).unwrap();
@@ -511,7 +485,7 @@ mod tests {
 		let reader = BatchReader::new(&encoded).unwrap();
 
 		assert_eq!(reader.get_seq_num(), 100);
-		assert_eq!(reader.get_count(), 2);
+		// Note: get_count method was removed as it was unused
 	}
 
 	#[test]
@@ -529,7 +503,7 @@ mod tests {
 			}
 		}
 
-		assert_eq!(batch.get_count() as usize, NUM_RECORDS);
+		assert_eq!(batch.count as usize, NUM_RECORDS);
 
 		let encoded = batch.encode(1).unwrap();
 		let mut reader = BatchReader::new(&encoded).unwrap();
@@ -626,17 +600,17 @@ mod tests {
 		assert_eq!(batch.version, BATCH_VERSION);
 
 		let encoded = batch.encode(1).unwrap();
-		let reader = BatchReader::new(&encoded).unwrap();
-		assert_eq!(reader.get_version(), BATCH_VERSION);
+		let _reader = BatchReader::new(&encoded).unwrap();
+		// Note: get_version method was removed as it was unused
 
 		// Test with a batch that has data
 		let mut batch_with_data = Batch::new();
 		batch_with_data.set(b"key", b"value").unwrap();
 		let encoded = batch_with_data.encode(100).unwrap();
 		let reader = BatchReader::new(&encoded).unwrap();
-		assert_eq!(reader.get_version(), BATCH_VERSION);
+		// Note: get_version method was removed as it was unused
 		assert_eq!(reader.get_seq_num(), 100);
-		assert_eq!(reader.get_count(), 1);
+		// Note: get_count method was removed as it was unused
 	}
 
 	#[test]

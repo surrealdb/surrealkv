@@ -206,7 +206,7 @@ pub(crate) struct ValueLocation {
 
 impl ValueLocation {
 	/// Creates a new ValueLocation
-	pub fn new(meta: u8, value: Value, version: u8) -> Self {
+	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
 		Self {
 			meta,
 			value,
@@ -215,36 +215,36 @@ impl ValueLocation {
 	}
 
 	/// Creates a ValueLocation that points to a value in VLog
-	pub fn with_pointer(pointer: ValuePointer) -> Self {
+	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
 		let encoded_pointer = pointer.encode();
 		Self::new(BIT_VALUE_POINTER, Arc::from(encoded_pointer), VALUE_LOCATION_VERSION)
 	}
 
 	/// Creates a ValueLocation with inline value
-	pub fn with_inline_value(value: Value) -> Self {
+	pub(crate) fn with_inline_value(value: Value) -> Self {
 		Self::new(0, value, VALUE_LOCATION_VERSION)
 	}
 
 	/// Checks if the value is a pointer to VLog
-	pub fn is_value_pointer(&self) -> bool {
+	pub(crate) fn is_value_pointer(&self) -> bool {
 		(self.meta & BIT_VALUE_POINTER) != 0
 	}
 
 	/// Calculates the encoded size of this ValueLocation
-	pub fn encoded_size(&self) -> usize {
+	pub(crate) fn encoded_size(&self) -> usize {
 		// meta (1 byte) + version (1 byte) + value length
 		1 + 1 + self.value.len()
 	}
 
 	/// Encodes the ValueLocation into a byte vector
-	pub fn encode(&self) -> Vec<u8> {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut encoded = Vec::with_capacity(self.encoded_size());
 		self.encode_into(&mut encoded).unwrap();
 		encoded
 	}
 
 	/// Encodes the ValueLocation into a writer
-	pub fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
+	fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
 		// Write meta byte
 		writer.write_u8(self.meta)?;
 
@@ -258,13 +258,13 @@ impl ValueLocation {
 	}
 
 	/// Decodes a ValueLocation from bytes
-	pub fn decode(data: &[u8]) -> Result<Self> {
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
 		let mut cursor = Cursor::new(data);
 		Self::decode_from(&mut cursor)
 	}
 
 	/// Decodes a ValueLocation from a reader
-	pub fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
+	fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
 		// Read meta byte
 		let meta = reader.read_u8()?;
 
@@ -280,7 +280,7 @@ impl ValueLocation {
 
 	/// Resolves the actual value, handling both inline and pointer cases
 	// TODO:: Check if this pattern copies the value unnecessarily.
-	pub fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
+	pub(crate) fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
 			// Value is a pointer to VLog
 			if let Some(vlog) = vlog {
@@ -298,7 +298,7 @@ impl ValueLocation {
 
 /// A pointer to a value stored in the value log
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValuePointer {
+pub(crate) struct ValuePointer {
 	/// Version of the ValuePointer format
 	pub version: u8,
 	/// ID of the VLog file containing the value
@@ -315,7 +315,13 @@ pub struct ValuePointer {
 
 impl ValuePointer {
 	/// Creates a new ValuePointer
-	pub fn new(file_id: u32, offset: u64, key_size: u32, value_size: u32, checksum: u32) -> Self {
+	pub(crate) fn new(
+		file_id: u32,
+		offset: u64,
+		key_size: u32,
+		value_size: u32,
+		checksum: u32,
+	) -> Self {
 		Self {
 			version: VALUE_POINTER_VERSION,
 			file_id,
@@ -327,7 +333,7 @@ impl ValuePointer {
 	}
 
 	/// Encodes the pointer as bytes for storage
-	pub fn encode(&self) -> Vec<u8> {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
 		encoded.push(self.version);
 		encoded.extend_from_slice(&self.file_id.to_be_bytes());
@@ -338,19 +344,8 @@ impl ValuePointer {
 		encoded
 	}
 
-	/// Encodes the pointer into a writer
-	pub fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
-		writer.write_u8(self.version)?;
-		writer.write_all(&self.file_id.to_be_bytes())?;
-		writer.write_all(&self.offset.to_be_bytes())?;
-		writer.write_all(&self.key_size.to_be_bytes())?;
-		writer.write_all(&self.value_size.to_be_bytes())?;
-		writer.write_all(&self.checksum.to_be_bytes())?;
-		Ok(())
-	}
-
 	/// Decodes a pointer from bytes
-	pub fn decode(data: &[u8]) -> Result<Self> {
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
 		if data.len() != VALUE_POINTER_SIZE {
 			return Err(Error::Corruption("Invalid ValuePointer size".to_string()));
 		}
@@ -375,28 +370,22 @@ impl ValuePointer {
 	}
 
 	/// Calculates the total entry size (header + key + value + crc32)
-	pub fn total_entry_size(&self) -> u64 {
+	pub(crate) fn total_entry_size(&self) -> u64 {
 		8 + self.key_size as u64 + self.value_size as u64 + 4
 	}
 }
 
 /// Represents a VLog file that can be read from
 #[derive(Debug)]
-pub struct VLogFile {
-	/// File ID
-	pub id: u32,
+pub(crate) struct VLogFile {
 	/// File path
 	pub path: PathBuf,
-	/// File size
-	pub size: u64,
 }
 
 impl VLogFile {
-	pub fn new(id: u32, path: PathBuf, size: u64) -> Self {
+	fn new(_id: u32, path: PathBuf, _size: u64) -> Self {
 		Self {
-			id,
 			path,
-			size,
 		}
 	}
 }
@@ -500,7 +489,7 @@ impl VLogWriter {
 /// - Discard statistics tracking for intelligent GC candidate selection
 /// - Atomic file replacement during compaction
 /// - LSM integration for staleness detection
-pub struct VLog {
+pub(crate) struct VLog {
 	/// Base directory for VLog files
 	path: PathBuf,
 
@@ -557,7 +546,7 @@ impl VLog {
 	}
 
 	/// Creates a new VLog instance
-	pub fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options>) -> Result<Self> {
+	pub(crate) fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options>) -> Result<Self> {
 		let dir = dir.as_ref().to_path_buf();
 
 		// Get the parent directory for the discard stats file
@@ -598,7 +587,7 @@ impl VLog {
 	}
 
 	/// Appends a key+value pair to the log and returns a ValuePointer
-	pub fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
 			let mut writer = self.writer.write().unwrap();
@@ -747,7 +736,7 @@ impl VLog {
 	}
 
 	/// Retrieves a value using a ValuePointer
-	pub fn get(&self, pointer: &ValuePointer) -> Result<Value> {
+	pub(crate) fn get(&self, pointer: &ValuePointer) -> Result<Value> {
 		// Check cache first
 		if let Some(cached_value) = self.cache.get(pointer.file_id, pointer.offset) {
 			return Ok(cached_value);
@@ -817,13 +806,13 @@ impl VLog {
 	}
 
 	/// Increments the active iterator count when a transaction/iterator starts
-	pub fn incr_iterator_count(&self) {
+	pub(crate) fn incr_iterator_count(&self) {
 		self.num_active_iterators.fetch_add(1, Ordering::SeqCst);
 	}
 
 	/// Decrements the active iterator count when a transaction/iterator ends
 	/// If count reaches zero, processes deferred file deletions
-	pub fn decr_iterator_count(&self) -> Result<()> {
+	pub(crate) fn decr_iterator_count(&self) -> Result<()> {
 		let count = self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
 
 		if count == 1 {
@@ -835,7 +824,7 @@ impl VLog {
 	}
 
 	/// Gets the current number of active iterators  
-	pub fn iterator_count(&self) -> i32 {
+	pub(crate) fn iterator_count(&self) -> i32 {
 		self.num_active_iterators.load(Ordering::SeqCst)
 	}
 
@@ -1118,7 +1107,7 @@ impl VLog {
 	}
 
 	/// Syncs all data to disk
-	pub fn sync(&self) -> Result<()> {
+	pub(crate) fn sync(&self) -> Result<()> {
 		if let Some(ref mut writer) = *self.writer.write().unwrap() {
 			writer.sync()?;
 		}
@@ -1128,13 +1117,8 @@ impl VLog {
 		Ok(())
 	}
 
-	/// Gets the maximum file size
-	pub fn max_file_size(&self) -> u64 {
-		self.max_file_size
-	}
-
 	/// Gets statistics for a specific file
-	pub fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
+	fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
 		let discard_stats = self.discard_stats.lock().unwrap();
 		let discard_bytes = discard_stats.get_file_stats(file_id);
 
@@ -1155,26 +1139,8 @@ impl VLog {
 		(total_size, discard_bytes, discard_ratio)
 	}
 
-	/// Gets statistics for all VLog files (for debugging)
-	pub fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
-		let mut all_stats = Vec::new();
-
-		// Check files from 0 to next counter
-		let next_file_id = self.next_file_id.load(std::sync::atomic::Ordering::SeqCst);
-
-		for file_id in 0..next_file_id {
-			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
-			if total_size > 0 {
-				// Only include files that exist
-				all_stats.push((file_id, total_size, discard_bytes, discard_ratio));
-			}
-		}
-
-		all_stats
-	}
-
 	/// Registers a VLog file in the files map for tracking
-	pub fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
+	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
 		let mut files_map = self.files_map.write().unwrap();
 		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
 	}
@@ -1207,7 +1173,7 @@ impl VLog {
 
 	/// Updates discard statistics for a file
 	/// This should be called during LSM compaction when outdated VLog pointers are found
-	pub fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
+	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		let mut discard_stats = self.discard_stats.lock().unwrap();
 
 		for (file_id, discard_bytes) in stats {
@@ -1216,7 +1182,7 @@ impl VLog {
 	}
 
 	/// Adds multiple stale entries to the global delete list in a batch
-	pub fn add_batch_to_delete_list(&self, entries: Vec<(u64, u64)>) -> Result<()> {
+	pub(crate) fn add_batch_to_delete_list(&self, entries: Vec<(u64, u64)>) -> Result<()> {
 		if entries.is_empty() {
 			return Ok(());
 		}
@@ -1225,16 +1191,36 @@ impl VLog {
 		self.delete_list.add_stale_entries_batch(entries)
 	}
 
+	/// Gets statistics for all VLog files (for debugging)
+	#[allow(dead_code)] // Used in test code
+	pub(crate) fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
+		let mut all_stats = Vec::new();
+
+		// Check files from 0 to next counter
+		let next_file_id = self.next_file_id.load(std::sync::atomic::Ordering::SeqCst);
+
+		for file_id in 0..next_file_id {
+			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
+			if total_size > 0 {
+				// Only include files that exist
+				all_stats.push((file_id, total_size, discard_bytes, discard_ratio));
+			}
+		}
+
+		all_stats
+	}
+
 	/// Checks if a sequence number is marked as stale in the delete list
 	/// This is primarily used for testing to verify delete list behavior
-	pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
+	#[allow(dead_code)] // Used in test code
+	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
 		self.delete_list.is_stale(seq_num)
 	}
 }
 
 // ===== VLog GC Manager =====
 /// Manages VLog garbage collection as an independent task
-pub struct VLogGCManager {
+pub(crate) struct VLogGCManager {
 	/// Reference to the VLog
 	vlog: Arc<VLog>,
 
@@ -1256,7 +1242,7 @@ pub struct VLogGCManager {
 
 impl VLogGCManager {
 	/// Creates a new VLog GC manager
-	pub fn new(vlog: Arc<VLog>, commit_pipeline: Arc<CommitPipeline>) -> Self {
+	pub(crate) fn new(vlog: Arc<VLog>, commit_pipeline: Arc<CommitPipeline>) -> Self {
 		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let notify = Arc::new(tokio::sync::Notify::new());
@@ -1273,7 +1259,7 @@ impl VLogGCManager {
 	}
 
 	/// Starts the VLog GC background task
-	pub fn start(&self) {
+	pub(crate) fn start(&self) {
 		let vlog = self.vlog.clone();
 		let commit_pipeline = self.commit_pipeline.clone();
 		let stop_flag = self.stop_flag.clone();
@@ -1305,16 +1291,8 @@ impl VLogGCManager {
 		*self.task_handle.lock().unwrap() = Some(handle);
 	}
 
-	/// Triggers VLog garbage collection manually
-	pub fn trigger_gc(&self) {
-		// Only notify if not already running
-		if !self.running.load(Ordering::Acquire) {
-			self.notify.notify_one();
-		}
-	}
-
 	/// Stops the VLog GC background task
-	pub async fn stop(&self) {
+	pub(crate) async fn stop(&self) {
 		// Set the stop flag to prevent new operations from starting
 		self.stop_flag.store(true, Ordering::SeqCst);
 
@@ -1345,13 +1323,13 @@ impl VLogGCManager {
 /// Global Delete List using LSM Tree
 /// Uses a dedicated LSM tree for tracking stale user keys.
 /// This provides better performance and consistency with the main LSM tree design.
-pub struct DeleteList {
+pub(crate) struct DeleteList {
 	/// LSM tree for storing delete list entries (user_key -> value_size)
 	tree: Arc<Tree>,
 }
 
 impl DeleteList {
-	pub fn new(base_path: PathBuf) -> Result<Self> {
+	pub(crate) fn new(base_path: PathBuf) -> Result<Self> {
 		let delete_list_path = base_path.join("delete_list");
 
 		// Create a dedicated LSM tree for the delete list
@@ -1374,7 +1352,7 @@ impl DeleteList {
 
 	/// Adds multiple stale entries in batch (synchronous)
 	/// This is called from CompactionIterator during LSM compaction
-	pub fn add_stale_entries_batch(&self, entries: Vec<(u64, u64)>) -> Result<()> {
+	pub(crate) fn add_stale_entries_batch(&self, entries: Vec<(u64, u64)>) -> Result<()> {
 		if entries.is_empty() {
 			return Ok(());
 		}
@@ -1390,12 +1368,13 @@ impl DeleteList {
 
 		// Commit the batch to the LSM tree using sync commit
 		self.tree
+			.core
 			.sync_commit(batch, true)
 			.map_err(|e| Error::Other(format!("Failed to insert into delete list: {e}")))
 	}
 
 	/// Checks if a sequence number is in the delete list (stale)
-	pub fn is_stale(&self, seq_num: u64) -> Result<bool> {
+	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
 		let tx = self
 			.tree
 			.begin()
@@ -1411,15 +1390,9 @@ impl DeleteList {
 		}
 	}
 
-	/// Syncs the delete list to disk
-	pub fn sync(&self) -> Result<()> {
-		self.tree.flush().map_err(|e| Error::Other(format!("Failed to sync delete list: {e}")))?;
-		Ok(())
-	}
-
 	/// Deletes multiple entries from the delete list in batch
 	/// This is called after successful compaction to clean up the delete list
-	pub fn delete_entries_batch(&self, seq_nums: Vec<u64>) -> Result<()> {
+	pub(crate) fn delete_entries_batch(&self, seq_nums: Vec<u64>) -> Result<()> {
 		if seq_nums.is_empty() {
 			return Ok(());
 		}
@@ -1434,6 +1407,7 @@ impl DeleteList {
 
 		// Commit the batch to the LSM tree using sync commit
 		self.tree
+			.core
 			.sync_commit(batch, true)
 			.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
 	}
@@ -1697,9 +1671,8 @@ mod tests {
 	fn test_value_pointer_encode_into_decode() {
 		let pointer = ValuePointer::new(123, 456, 111, 789, 0xdeadbeef);
 
-		// Test encode_into
-		let mut encoded = Vec::new();
-		pointer.encode_into(&mut encoded).unwrap();
+		// Test encode
+		let encoded = pointer.encode();
 		assert_eq!(encoded.len(), VALUE_POINTER_SIZE);
 
 		// Test decode
@@ -1712,15 +1685,13 @@ mod tests {
 		let pointer = ValuePointer::new(1, 2, 3, 4, 0);
 
 		// Test with zero values
-		let mut encoded = Vec::new();
-		pointer.encode_into(&mut encoded).unwrap();
+		let encoded = pointer.encode();
 		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(pointer, decoded);
 
 		// Test with maximum values
 		let max_pointer = ValuePointer::new(u32::MAX, u64::MAX, u32::MAX, u32::MAX, u32::MAX);
-		let mut encoded = Vec::new();
-		max_pointer.encode_into(&mut encoded).unwrap();
+		let encoded = max_pointer.encode();
 		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(max_pointer, decoded);
 	}

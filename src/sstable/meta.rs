@@ -16,20 +16,20 @@ pub(crate) struct KeyRange {
 }
 
 impl KeyRange {
-	pub fn new(range: (Value, Value)) -> Self {
+	pub(crate) fn new(range: (Value, Value)) -> Self {
 		KeyRange {
 			low: range.0,
 			high: range.1,
 		}
 	}
 
-	pub fn overlaps(&self, other: &Self) -> bool {
+	pub(crate) fn overlaps(&self, other: &Self) -> bool {
 		self.high >= other.low && self.low <= other.high
 	}
 
 	/// Creates a new KeyRange that encompasses both input ranges.
 	/// This is useful for finding the total span of multiple ranges.
-	pub fn merge(&self, other: &Self) -> Self {
+	pub(crate) fn merge(&self, other: &Self) -> Self {
 		KeyRange {
 			low: min(self.low.clone(), other.low.clone()),
 			high: max(self.high.clone(), other.high.clone()),
@@ -60,7 +60,7 @@ pub(crate) struct Properties {
 }
 
 impl Properties {
-	pub fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Properties {
 			id: 0,
 			table_format: TableFormat::LSMV1,
@@ -83,7 +83,7 @@ impl Properties {
 		}
 	}
 
-	pub fn encode(&self) -> Bytes {
+	pub(crate) fn encode(&self) -> Bytes {
 		let mut buf = BytesMut::with_capacity(128);
 		buf.put_u64(self.id);
 		buf.put_u8(self.table_format as u8);
@@ -117,7 +117,7 @@ impl Properties {
 		buf.freeze()
 	}
 
-	pub fn decode(mut buf: Bytes) -> Result<Self> {
+	pub(crate) fn decode(mut buf: Bytes) -> Result<Self> {
 		let id = buf.get_u64();
 		let table_format = buf.get_u8();
 		let num_entries = buf.get_u64();
@@ -181,7 +181,7 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
-	pub fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		TableMetadata {
 			smallest_point: None,
 			largest_point: None,
@@ -192,17 +192,17 @@ impl TableMetadata {
 		}
 	}
 
-	pub fn set_smallest_point_key(&mut self, k: InternalKey) {
+	pub(crate) fn set_smallest_point_key(&mut self, k: InternalKey) {
 		self.smallest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
 
-	pub fn set_largest_point_key(&mut self, k: InternalKey) {
+	pub(crate) fn set_largest_point_key(&mut self, k: InternalKey) {
 		self.largest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
 
-	pub fn update_seq_num(&mut self, seq_num: u64) {
+	pub(crate) fn update_seq_num(&mut self, seq_num: u64) {
 		// Handle first sequence number specially
 		if self.largest_seq_num == 0 && self.smallest_seq_num == 0 {
 			self.smallest_seq_num = seq_num;
@@ -217,7 +217,7 @@ impl TableMetadata {
 		}
 	}
 
-	pub fn encode(&self) -> Bytes {
+	pub(crate) fn encode(&self) -> Bytes {
 		let mut buf = BytesMut::new();
 
 		// Encode has_point_keys as 0 for None, 1 for Some(true), and 2 for Some(false)
@@ -260,7 +260,7 @@ impl TableMetadata {
 		buf.freeze()
 	}
 
-	pub fn decode(src: &Bytes) -> Result<Self> {
+	pub(crate) fn decode(src: &Bytes) -> Result<Self> {
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys

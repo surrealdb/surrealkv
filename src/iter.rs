@@ -56,7 +56,7 @@ impl PartialOrd for HeapItem {
 	}
 }
 
-pub struct MergeIterator<'a> {
+pub(crate) struct MergeIterator<'a> {
 	iterators: Vec<BoxedIterator<'a>>,
 	// Heap of iterators, ordered by their current key
 	heap: BinaryHeap<HeapItem>,
@@ -68,7 +68,7 @@ pub struct MergeIterator<'a> {
 }
 
 impl<'a> MergeIterator<'a> {
-	pub fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
+	pub(crate) fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
 		let heap = BinaryHeap::with_capacity(iterators.len());
 
 		Self {
@@ -154,7 +154,7 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Val
 	Ok(())
 }
 
-pub struct CompactionIterator<'a> {
+pub(crate) struct CompactionIterator<'a> {
 	iterators: Vec<BoxedIterator<'a>>,
 	// Heap of iterators, ordered by their current key
 	heap: BinaryHeap<HeapItem>,
@@ -180,7 +180,7 @@ pub struct CompactionIterator<'a> {
 }
 
 impl<'a> CompactionIterator<'a> {
-	pub fn new(
+	pub(crate) fn new(
 		iterators: Vec<BoxedIterator<'a>>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog>>,
@@ -215,7 +215,7 @@ impl<'a> CompactionIterator<'a> {
 	}
 
 	/// Flushes the batched delete-list entries to the VLog
-	pub fn flush_delete_list_batch(&mut self) -> Result<()> {
+	pub(crate) fn flush_delete_list_batch(&mut self) -> Result<()> {
 		if let Some(ref vlog) = self.vlog {
 			if !self.delete_list_batch.is_empty() {
 				vlog.add_batch_to_delete_list(std::mem::take(&mut self.delete_list_batch))?;

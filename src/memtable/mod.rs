@@ -22,42 +22,39 @@ use crate::{
 };
 
 #[derive(Default)]
-pub struct ImmutableMemtables(Vec<(u64, Arc<MemTable>)>);
+pub(crate) struct ImmutableMemtables(Vec<(u64, Arc<MemTable>)>);
 
 impl ImmutableMemtables {
-	pub fn add(&mut self, id: u64, memtable: Arc<MemTable>) {
+	pub(crate) fn add(&mut self, id: u64, memtable: Arc<MemTable>) {
 		self.0.push((id, memtable));
 		self.0.sort_by_key(|(id, _)| *id); // Maintain sorted order by ID
 	}
 
-	pub fn remove(&mut self, id_to_remove: u64) {
+	pub(crate) fn remove(&mut self, id_to_remove: u64) {
 		if let Ok(index) = self.0.binary_search_by_key(&id_to_remove, |(id, _)| *id) {
 			self.0.remove(index);
 		}
 	}
 
-	pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(u64, Arc<MemTable>)> {
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &(u64, Arc<MemTable>)> {
 		self.0.iter()
 	}
 
-	pub fn len(&self) -> usize {
-		self.0.len()
-	}
-
-	pub fn is_empty(&self) -> bool {
+	pub(crate) fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
 }
 
 #[derive(Default)]
-pub struct MemTable {
+pub(crate) struct MemTable {
 	map: SkipMap<InternalKey, Value>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
 }
 
 impl MemTable {
-	pub fn new() -> Self {
+	#[allow(dead_code)] // Used in test code
+	pub(crate) fn new() -> Self {
 		MemTable {
 			map: SkipMap::new(),
 			latest_seq_num: AtomicU64::new(0),
@@ -65,7 +62,7 @@ impl MemTable {
 		}
 	}
 
-	pub fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let range = InternalKey::new(key.to_vec(), seq_no, InternalKeyKind::Max)..;
 
@@ -73,11 +70,11 @@ impl MemTable {
 		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
 	}
 
-	pub fn is_empty(&self) -> bool {
+	pub(crate) fn is_empty(&self) -> bool {
 		self.map.is_empty()
 	}
 
-	pub fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		self.map_size.load(Ordering::Acquire) as usize
 	}
 
@@ -88,7 +85,7 @@ impl MemTable {
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
 	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive numbers)
-	pub fn add(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u32)> {
+	pub(crate) fn add(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u32)> {
 		let (record_size, highest_seq_num) =
 			self.apply_batch_to_memtable(batch, starting_seq_num)?;
 		let size_before = self.update_memtable_size(record_size);
@@ -153,11 +150,12 @@ impl MemTable {
 		}
 	}
 
-	pub fn lsn(&self) -> u64 {
+	#[allow(dead_code)] // Used in test code
+	pub(crate) fn lsn(&self) -> u64 {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}
 
-	pub fn flush(
+	pub(crate) fn flush(
 		&self,
 		table_id: u64,
 		lsm_opts: Arc<Options>,
@@ -219,7 +217,7 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
 		self.map.iter().map(|entry| {
 			let key = entry.key().clone();
 			let value = entry.value().clone();
@@ -227,7 +225,7 @@ impl MemTable {
 		})
 	}
 
-	pub fn range<R>(
+	pub(crate) fn range<R>(
 		&self,
 		range: R,
 	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_

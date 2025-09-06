@@ -23,7 +23,7 @@ pub enum CompactionPri {
 	ByCompensatedSize,
 }
 
-pub struct Strategy {
+pub(crate) struct Strategy {
 	// Base size for L0 (in number of tables)
 	base_level_size: usize,
 	// Size multiplier between levels

@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Manages background tasks for the LSM tree
-pub struct TaskManager {
+pub(crate) struct TaskManager {
 	/// Flag to signal tasks to stop
 	stop_flag: Arc<AtomicBool>,
 
@@ -44,7 +44,7 @@ impl fmt::Debug for TaskManager {
 }
 
 impl TaskManager {
-	pub fn new(core: Arc<dyn CompactionOperations>) -> Self {
+	pub(crate) fn new(core: Arc<dyn CompactionOperations>) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
 		let memtable_notify = Arc::new(Notify::new());
 		let level_notify = Arc::new(Notify::new());
@@ -122,7 +122,7 @@ impl TaskManager {
 		}
 	}
 
-	pub fn wake_up_memtable(&self) {
+	pub(crate) fn wake_up_memtable(&self) {
 		// Only notify if not already running
 		if !self.memtable_running.load(Ordering::Acquire) {
 			self.memtable_notify.notify_one();
@@ -130,7 +130,7 @@ impl TaskManager {
 	}
 
 	#[cfg(test)]
-	pub fn wake_up_level(&self) {
+	pub(crate) fn wake_up_level(&self) {
 		// Only notify if not already running
 		if !self.level_running.load(Ordering::Acquire) {
 			self.level_notify.notify_one();

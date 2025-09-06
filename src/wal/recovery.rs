@@ -27,7 +27,7 @@ use crate::{
 ///
 /// If no corruption is found, the second element will be None.
 /// If corruption is found, the second element contains (segment_id, last_valid_offset) for repair.
-pub fn replay_wal(
+pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	memtable: &Arc<MemTable>,
 ) -> Result<(u64, Option<(usize, usize)>)> {
@@ -120,7 +120,7 @@ pub fn replay_wal(
 	Ok((max_seq_num, None))
 }
 
-pub fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
+pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
 	use crate::wal::reader::Reader;
 	use crate::wal::segment::{Options, Segment, WAL_RECORD_HEADER_SIZE};
 	use std::fs;

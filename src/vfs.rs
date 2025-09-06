@@ -11,13 +11,21 @@ use fs4::FileExt as LockFileExt;
 use std::fs::File as SysFile;
 
 pub trait File: Send + Sync {
+	#[allow(dead_code)] // Used in test code and WAL
 	fn write(&mut self, buf: &[u8]) -> Result<usize>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn flush(&mut self) -> Result<()>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn close(&mut self) -> Result<()>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn read_all(&mut self, buf: &mut Vec<u8>) -> Result<usize>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn lock(&self) -> Result<()>;
+	#[allow(dead_code)] // Used in test code and WAL
 	fn unlock(&self) -> Result<()>;
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 	fn size(&self) -> Result<u64>;

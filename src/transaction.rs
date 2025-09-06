@@ -84,7 +84,7 @@ pub struct Transaction {
 
 impl Transaction {
 	/// Prepare a new transaction in the given mode.
-	pub fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
 
 		let start_commit_id =
@@ -110,11 +110,6 @@ impl Transaction {
 			closed: false,
 			start_commit_id,
 		})
-	}
-
-	/// Returns the transaction mode.
-	pub fn mode(&self) -> Mode {
-		self.mode
 	}
 
 	/// Sets the durability level of the transaction.
@@ -309,7 +304,7 @@ impl Drop for Transaction {
 
 /// Represents a pending write operation in a transaction's write set
 #[derive(Clone)]
-pub struct Entry {
+pub(crate) struct Entry {
 	/// The key being written
 	pub(crate) key: Bytes,
 
@@ -321,7 +316,7 @@ pub struct Entry {
 }
 
 impl Entry {
-	pub fn new(key: &[u8], value: Option<&[u8]>, kind: InternalKeyKind) -> Entry {
+	fn new(key: &[u8], value: Option<&[u8]>, kind: InternalKeyKind) -> Entry {
 		Entry {
 			key: Bytes::copy_from_slice(key),
 			value: value.map(Bytes::copy_from_slice),
@@ -330,7 +325,7 @@ impl Entry {
 	}
 
 	/// Checks if this entry represents a deletion (tombstone)
-	pub fn is_tombstone(&self) -> bool {
+	fn is_tombstone(&self) -> bool {
 		let kind = self.kind;
 		if kind == InternalKeyKind::Delete || kind == InternalKeyKind::RangeDelete {
 			return true;
@@ -341,7 +336,7 @@ impl Entry {
 }
 
 /// An iterator that performs a merging scan over a transaction's snapshot and write set.
-pub struct TransactionRangeIterator<'a> {
+pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn Iterator<Item = IterResult> + 'a>>,
 
@@ -360,7 +355,7 @@ pub struct TransactionRangeIterator<'a> {
 
 impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with RYOW semantics
-	pub fn new(
+	pub(crate) fn new(
 		tx: &'a Transaction,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,

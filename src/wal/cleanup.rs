@@ -16,7 +16,7 @@ use crate::wal::segment::{get_segment_range, list_segment_ids, Result};
 /// # Returns
 ///
 /// A result with the count of removed segments or an error
-pub fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
+pub(crate) fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		return Ok(0);

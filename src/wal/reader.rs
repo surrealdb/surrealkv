@@ -14,7 +14,7 @@ use crate::wal::segment::{
 //
 // No partial writes are allowed. If the segment is not full, and the record can't fit in the remaining space, the
 // segment is padded with zeros. This is important for the reader to be able to read the records in BLOCK_SIZE chunks.
-pub struct Reader {
+pub(crate) struct Reader {
 	rdr: MultiSegmentReader,
 	rec: Vec<u8>,
 	buf: [u8; BLOCK_SIZE],

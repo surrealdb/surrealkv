@@ -21,7 +21,7 @@ pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
-pub struct SnapshotInfo {
+pub(crate) struct SnapshotInfo {
 	/// Snapshot sequence number
 	pub seq_num: u64,
 	/// Creation timestamp (system time in nanoseconds)
@@ -29,24 +29,14 @@ pub struct SnapshotInfo {
 }
 
 impl SnapshotInfo {
-	pub fn new(seq_num: u64) -> Self {
-		Self {
-			seq_num,
-			created_at: std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map(|d| d.as_nanos())
-				.unwrap_or(0),
-		}
-	}
-
-	pub fn encode(&self) -> Result<Vec<u8>> {
+	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
 		let mut buf = Vec::new();
 		buf.write_u64::<BigEndian>(self.seq_num)?;
 		buf.write_u128::<BigEndian>(self.created_at)?;
 		Ok(buf)
 	}
 
-	pub fn decode(mut buf: &[u8]) -> Result<Self> {
+	pub(crate) fn decode(mut buf: &[u8]) -> Result<Self> {
 		let seq_num = buf.read_u64::<BigEndian>()?;
 		let created_at = buf.read_u128::<BigEndian>()?;
 		Ok(Self {
@@ -255,8 +245,9 @@ impl LevelManifest {
 			};
 
 			// Create the level with the loaded tables
-			let mut level = Level::default();
-			level.tables = level_tables;
+			let level = Level {
+				tables: level_tables,
+			};
 			levels_vec.push(Arc::new(level));
 		}
 
@@ -341,17 +332,17 @@ impl LevelManifest {
 		Ok(levels)
 	}
 
-	pub fn depth(&self) -> u8 {
+	fn depth(&self) -> u8 {
 		let len = self.levels.as_ref().len() as u8;
 
 		len
 	}
 
-	pub fn last_level_index(&self) -> u8 {
+	pub(crate) fn last_level_index(&self) -> u8 {
 		self.depth() - 1
 	}
 
-	pub fn iter(&self) -> impl Iterator<Item = Arc<Table>> + '_ {
+	pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<Table>> + '_ {
 		LevelManifestIterator::new(self)
 	}
 
@@ -377,23 +368,8 @@ impl LevelManifest {
 		}
 	}
 
-	/// Create a changeset for incremental manifest changes
-	pub fn create_changeset(&self) -> ManifestChangeSet {
-		ManifestChangeSet {
-			manifest_format_version: Some(self.manifest_format_version),
-			writer_epoch: Some(self.writer_epoch),
-			compactor_epoch: Some(self.compactor_epoch),
-			wal_id_last_compacted: Some(self.wal_id_last_compacted),
-			wal_id_last_seen: Some(self.wal_id_last_seen),
-			deleted_tables: HashSet::new(),
-			new_tables: Vec::new(),
-			new_snapshots: Vec::new(),
-			deleted_snapshots: HashSet::new(),
-		}
-	}
-
 	/// Apply a changeset to this manifest
-	pub fn apply_changeset(&mut self, changeset: &ManifestChangeSet) -> Result<()> {
+	pub(crate) fn apply_changeset(&mut self, changeset: &ManifestChangeSet) -> Result<()> {
 		// Apply scalar values if present in changeset
 		if let Some(version) = changeset.manifest_format_version {
 			self.manifest_format_version = version;
@@ -436,46 +412,15 @@ impl LevelManifest {
 		Ok(())
 	}
 
-	/// Add a snapshot to the manifest
-	pub fn add_snapshot(&mut self, seq_num: u64) {
-		self.snapshots.push(SnapshotInfo::new(seq_num));
-	}
-
-	/// Remove snapshots by sequence number
-	pub fn remove_snapshots(&mut self, seq_nums: &[u64]) {
-		self.snapshots.retain(|snapshot| !seq_nums.contains(&snapshot.seq_num));
-	}
-
-	/// Update WAL tracking information
-	pub fn update_wal_info(&mut self, last_compacted: u64, last_seen: u64) {
-		self.wal_id_last_compacted = last_compacted;
-		self.wal_id_last_seen = last_seen;
-	}
-
-	/// Increment writer epoch (when a new writer takes over)
-	pub fn increment_writer_epoch(&mut self) {
-		self.writer_epoch += 1;
-	}
-
-	/// Increment compactor epoch (when compaction process starts)
-	pub fn increment_compactor_epoch(&mut self) {
-		self.compactor_epoch += 1;
-	}
-
-	/// Check if a table is hidden
-	pub fn is_table_hidden(&self, table_id: u64) -> bool {
-		self.hidden_set.contains(&table_id)
-	}
-
 	/// Generates the next unique table ID for a new SSTable
 	/// This is the single source of truth for table ID generation
-	pub fn next_table_id(&self) -> u64 {
+	pub(crate) fn next_table_id(&self) -> u64 {
 		self.next_table_id.fetch_add(1, std::sync::atomic::Ordering::Release)
 	}
 }
 
 /// Safely updates a file's content.
-pub fn replace_file_content<P: AsRef<Path>>(
+pub(crate) fn replace_file_content<P: AsRef<Path>>(
 	file_path: P,
 	new_content: &[u8],
 ) -> std::io::Result<()> {
@@ -500,7 +445,7 @@ pub fn replace_file_content<P: AsRef<Path>>(
 }
 
 /// Write the full versioned manifest to disk
-pub fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	let mut buf = Vec::new();
 
 	// Write header
@@ -630,7 +575,22 @@ mod tests {
 			compactor_epoch: Some(17),
 			wal_id_last_compacted: Some(123),
 			wal_id_last_seen: Some(456),
-			new_snapshots: vec![SnapshotInfo::new(10), SnapshotInfo::new(20)],
+			new_snapshots: vec![
+				SnapshotInfo {
+					seq_num: 10,
+					created_at: std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.map(|d| d.as_nanos())
+						.unwrap_or(0),
+				},
+				SnapshotInfo {
+					seq_num: 20,
+					created_at: std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.map(|d| d.as_nanos())
+						.unwrap_or(0),
+				},
+			],
 			..Default::default()
 		};
 

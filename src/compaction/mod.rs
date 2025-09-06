@@ -7,7 +7,7 @@ use crate::levels::LevelManifest;
 
 /// Represents the input for a compaction operation
 #[derive(Debug, Eq, PartialEq, Clone)]
-pub struct CompactionInput {
+pub(crate) struct CompactionInput {
 	pub tables_to_merge: Vec<u64>,
 	pub target_level: u8,
 	pub source_level: u8, // Added to track the source level

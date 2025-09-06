@@ -21,7 +21,7 @@ use crate::{Key, Value};
 ///
 /// TODO: This check needs to be implemented in the compaction logic.
 #[derive(Clone, Debug, Default)]
-pub struct Counter(Arc<AtomicU32>);
+pub(crate) struct Counter(Arc<AtomicU32>);
 
 impl std::ops::Deref for Counter {
 	type Target = Arc<AtomicU32>;
@@ -33,19 +33,19 @@ impl std::ops::Deref for Counter {
 
 impl Counter {
 	/// Increments when a new snapshot is created
-	pub fn increment(&self) -> u32 {
+	pub(crate) fn increment(&self) -> u32 {
 		self.fetch_add(1, std::sync::atomic::Ordering::Release)
 	}
 
 	/// Decrements when a snapshot is dropped
-	pub fn decrement(&self) -> u32 {
+	pub(crate) fn decrement(&self) -> u32 {
 		self.fetch_sub(1, std::sync::atomic::Ordering::Release)
 	}
 }
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
-pub struct IterState {
+pub(crate) struct IterState {
 	/// The active memtable receiving current writes
 	pub active: Arc<MemTable>,
 	/// Immutable memtables waiting to be flushed
@@ -63,7 +63,7 @@ pub struct IterState {
 /// All reads through the snapshot only see data with sequence numbers less than
 /// or equal to the snapshot's sequence number.
 #[derive(Clone)]
-pub struct Snapshot {
+pub(crate) struct Snapshot {
 	/// Reference to the LSM tree core
 	core: Arc<Core>,
 
@@ -93,7 +93,7 @@ impl Snapshot {
 	/// 3. **Level**: From SSTables
 	///
 	/// The search stops at the first version found with seq_num <= snapshot seq_num.
-	pub fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
+	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
 		let memtable_lock = self.core.active_memtable.read().unwrap();
@@ -150,7 +150,7 @@ impl Snapshot {
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
-	pub fn range<K: AsRef<[u8]>>(
+	pub(crate) fn range<K: AsRef<[u8]>>(
 		&self,
 		start: K,
 		end: K,
@@ -169,7 +169,7 @@ impl Drop for Snapshot {
 	}
 }
 
-pub struct SnapshotIterator<'a> {
+pub(crate) struct SnapshotIterator<'a> {
 	snapshot_merge_iter: SnapshotMergeIterator<'a>,
 	core: Arc<Core>,
 	/// When true, only return keys without resolving values
@@ -248,7 +248,7 @@ impl Drop for SnapshotIterator<'_> {
 }
 
 /// A merge iterator that respects snapshot isolation by filtering entries based on sequence numbers
-pub struct SnapshotMergeIterator<'a> {
+pub(crate) struct SnapshotMergeIterator<'a> {
 	// Owned state
 	_iter_state: Box<IterState>,
 
@@ -275,7 +275,7 @@ pub struct SnapshotMergeIterator<'a> {
 }
 
 impl<'a> SnapshotMergeIterator<'a> {
-	pub fn new_from(
+	fn new_from(
 		iter_state: IterState,
 		snapshot_seq_num: u64,
 		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),

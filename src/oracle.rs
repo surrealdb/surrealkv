@@ -16,7 +16,7 @@ struct CommitEntry {
 
 impl CommitEntry {
 	/// Returns true if self has no elements in common with other
-	pub fn is_disjoint_writeset(&self, other: &Arc<CommitEntry>) -> bool {
+	fn is_disjoint_writeset(&self, other: &Arc<CommitEntry>) -> bool {
 		// Create a key iterator for each writeset
 		let mut a = self.writeset.keys();
 		let mut b = other.writeset.keys();
