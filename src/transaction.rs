@@ -96,6 +96,10 @@ pub struct ReadOptions {
 	pub keys_only: bool,
 	/// Maximum number of items to return (for range operations)
 	pub limit: Option<usize>,
+	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
+	pub iterate_lower_bound: Option<Vec<u8>>,
+	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
+	pub iterate_upper_bound: Option<Vec<u8>>,
 }
 
 impl ReadOptions {
@@ -113,6 +117,28 @@ impl ReadOptions {
 	/// Sets the maximum number of items to return
 	pub fn with_limit(mut self, limit: Option<usize>) -> Self {
 		self.limit = limit;
+		self
+	}
+
+	/// Sets the lower bound for iteration (inclusive)
+	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
+		self.iterate_lower_bound = bound;
+	}
+
+	/// Sets the upper bound for iteration (exclusive)
+	pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
+		self.iterate_upper_bound = bound;
+	}
+
+	/// Sets the lower bound for iteration (inclusive) - builder pattern
+	pub fn with_iterate_lower_bound(mut self, bound: Option<Vec<u8>>) -> Self {
+		self.iterate_lower_bound = bound;
+		self
+	}
+
+	/// Sets the upper bound for iteration (exclusive) - builder pattern
+	pub fn with_iterate_upper_bound(mut self, bound: Option<Vec<u8>>) -> Self {
+		self.iterate_upper_bound = bound;
 		self
 	}
 }
@@ -285,19 +311,21 @@ impl Transaction {
 		end: K,
 		limit: Option<usize>,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
-		self.range_with_options(start, end, &ReadOptions::default().with_limit(limit))
+		let mut options = ReadOptions::default().with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.range_with_options(&options)
 	}
 
-	/// Creates an iterator for a range scan between start and end keys with custom read options.
-	pub fn range_with_options<K: AsRef<[u8]>>(
+	/// Creates an iterator for a range scan with custom read options.
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	pub fn range_with_options(
 		&self,
-		start: K,
-		end: K,
 		options: &ReadOptions,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
-		// Get the start and end keys as byte slices
-		let start_key = start.as_ref().to_vec();
-		let end_key = end.as_ref().to_vec();
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
+		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
 
 		// Check if keys are empty
 		if start_key.is_empty() || end_key.is_empty() {
@@ -315,23 +343,21 @@ impl Transaction {
 		end: K,
 		limit: Option<usize>,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
-		self.keys_with_options(
-			start,
-			end,
-			&ReadOptions::default().with_keys_only(true).with_limit(limit),
-		)
+		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.keys_with_options(&options)
 	}
 
-	/// Creates an iterator that returns only keys in the given range with custom read options.
-	pub fn keys_with_options<K: AsRef<[u8]>>(
+	/// Creates an iterator that returns only keys with custom read options.
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	pub fn keys_with_options(
 		&self,
-		start: K,
-		end: K,
 		options: &ReadOptions,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
-		// Get the start and end keys as byte slices
-		let start_key = start.as_ref().to_vec();
-		let end_key = end.as_ref().to_vec();
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
+		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
 
 		// Check if keys are empty
 		if start_key.is_empty() || end_key.is_empty() {
