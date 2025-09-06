@@ -224,7 +224,7 @@ impl Options {
 		Ok(())
 	}
 
-	#[allow(dead_code)]
+	#[allow(unused)]
 	pub(crate) fn with_max_file_size(mut self, max_file_size: u64) -> Self {
 		self.max_file_size = max_file_size;
 		self
@@ -771,10 +771,10 @@ impl SegmentRef {
 */
 pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	/// The unique identifier of the segment.
-	#[allow(dead_code)]
+	#[allow(unused)]
 	pub id: u64,
 
-	#[allow(dead_code)]
+	#[allow(unused)]
 	/// The path where the segment file is located.
 	pub file_path: PathBuf,
 
@@ -785,13 +785,13 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	file: File,
 
 	/// The base offset of the file.
-	#[allow(dead_code)]
+	#[allow(unused)]
 	pub file_header_offset: u64,
 
 	/// The current offset within the file.
 	file_offset: u64,
 
-	#[allow(dead_code)]
+	#[allow(unused)]
 	/// The maximum size of the segment file.
 	pub file_size: u64,
 

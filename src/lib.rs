@@ -20,7 +20,7 @@ mod wal;
 
 pub use crate::error::{Error, Result};
 pub use crate::lsm::Tree;
-pub use crate::transaction::{Durability, Mode, Transaction};
+pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
 use sstable::{bloom::LevelDBBloomFilter, InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};

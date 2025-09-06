@@ -593,7 +593,7 @@ pub enum IndexType {
 pub struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
-	#[allow(dead_code)] // Used in test code and compaction
+	#[allow(unused)]
 	pub file_size: u64,
 	cache_id: cache::CacheID,
 

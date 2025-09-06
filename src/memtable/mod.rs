@@ -53,7 +53,7 @@ pub(crate) struct MemTable {
 }
 
 impl MemTable {
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn new() -> Self {
 		MemTable {
 			map: SkipMap::new(),
@@ -150,7 +150,7 @@ impl MemTable {
 		}
 	}
 
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn lsn(&self) -> u64 {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}

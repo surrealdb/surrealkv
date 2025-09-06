@@ -32,7 +32,7 @@ impl Default for Level {
 
 impl Level {
 	/// Creates a new Level with a specified maximum capacity
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn with_capacity(capacity: usize) -> Self {
 		Self {
 			tables: Vec::with_capacity(capacity),
@@ -70,7 +70,7 @@ pub(crate) struct Levels(pub(crate) Vec<Arc<Level>>);
 
 impl Levels {
 	/// Creates a new Levels structure with specified number of levels and capacity per level
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn new(level_count: usize, capacity_per_level: usize) -> Self {
 		Self((0..level_count).map(|_| Arc::new(Level::with_capacity(capacity_per_level))).collect())
 	}

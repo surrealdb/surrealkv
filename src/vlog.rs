@@ -1192,7 +1192,7 @@ impl VLog {
 	}
 
 	/// Gets statistics for all VLog files (for debugging)
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		let mut all_stats = Vec::new();
 
@@ -1212,7 +1212,7 @@ impl VLog {
 
 	/// Checks if a sequence number is marked as stale in the delete list
 	/// This is primarily used for testing to verify delete list behavior
-	#[allow(dead_code)] // Used in test code
+	#[allow(unused)]
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
 		self.delete_list.is_stale(seq_num)
 	}

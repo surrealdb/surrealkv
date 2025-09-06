@@ -352,7 +352,7 @@ mod tests {
 
 	/// Test environment setup helpers
 	struct TestEnv {
-		#[allow(dead_code)]
+		#[allow(unused)]
 		temp_dir: TempDir,
 		options: Arc<LSMOptions>,
 	}

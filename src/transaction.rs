@@ -57,6 +57,66 @@ pub enum Durability {
 	Immediate,
 }
 
+/// Options for write operations in transactions.
+/// Similar to RocksDB's WriteOptions, this struct allows configuring
+/// various parameters for write operations like set() and delete().
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOptions {
+	/// Durability level for the write operation
+	pub durability: Durability,
+}
+
+impl Default for WriteOptions {
+	fn default() -> Self {
+		Self {
+			durability: Durability::Eventual,
+		}
+	}
+}
+
+impl WriteOptions {
+	/// Creates a new WriteOptions with default values
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Sets the durability level for write operations
+	pub fn with_durability(mut self, durability: Durability) -> Self {
+		self.durability = durability;
+		self
+	}
+}
+
+/// Options for read operations in transactions.
+/// Similar to RocksDB's ReadOptions, this struct allows configuring
+/// various parameters for read operations like get(), range(), and keys().
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReadOptions {
+	/// Whether to return only keys without values (for range operations)
+	pub keys_only: bool,
+	/// Maximum number of items to return (for range operations)
+	pub limit: Option<usize>,
+}
+
+impl ReadOptions {
+	/// Creates a new ReadOptions with default values
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Sets whether to return only keys without values
+	pub fn with_keys_only(mut self, keys_only: bool) -> Self {
+		self.keys_only = keys_only;
+		self
+	}
+
+	/// Sets the maximum number of items to return
+	pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+		self.limit = limit;
+		self
+	}
+}
+
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction {
@@ -112,27 +172,42 @@ impl Transaction {
 		})
 	}
 
-	/// Sets the durability level of the transaction.
-	pub fn set_durability(&mut self, durability: Durability) {
-		self.durability = durability;
-	}
-
 	/// Adds a key-value pair to the store.
 	pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+		self.set_with_options(key, value, &WriteOptions::default())
+	}
+
+	/// Adds a key-value pair to the store with custom write options.
+	pub fn set_with_options(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		options: &WriteOptions,
+	) -> Result<()> {
 		let entry = Entry::new(key, Some(value), InternalKeyKind::Set);
-		self.write(entry)?;
+		self.write_with_options(entry, options)?;
 		Ok(())
 	}
 
 	// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+		self.delete_with_options(key, &WriteOptions::default())
+	}
+
+	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
 		let entry = Entry::new(key, None, InternalKeyKind::Delete);
-		self.write(entry)?;
+		self.write_with_options(entry, options)?;
 		Ok(())
 	}
 
 	/// Gets a value for a key if it exists.
 	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+		self.get_with_options(key, &ReadOptions::default())
+	}
+
+	/// Gets a value for a key if it exists with custom read options.
+	pub fn get_with_options(&self, key: &[u8], _options: &ReadOptions) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -178,7 +253,8 @@ impl Transaction {
 	}
 
 	/// Writes a value for a key. None is used for deletion.
-	fn write(&mut self, e: Entry) -> Result<()> {
+	/// Writes a value for a key with custom write options. None is used for deletion.
+	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
@@ -191,6 +267,8 @@ impl Transaction {
 		if e.key.is_empty() {
 			return Err(Error::EmptyKey);
 		}
+
+		self.durability = options.durability;
 
 		// Set the transaction's latest savepoint number and add it to the write set.
 		let key = e.key.clone();
@@ -207,25 +285,15 @@ impl Transaction {
 		end: K,
 		limit: Option<usize>,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
-		// Get the start and end keys as byte slices
-		let start_key = start.as_ref().to_vec();
-		let end_key = end.as_ref().to_vec();
-
-		// Check if keys are empty
-		if start_key.is_empty() || end_key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-
-		TransactionRangeIterator::new(self, start_key, end_key, limit, false)
+		self.range_with_options(start, end, &ReadOptions::default().with_limit(limit))
 	}
 
-	/// Creates an iterator that returns only keys in the given range.
-	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
-	pub fn keys<K: AsRef<[u8]>>(
+	/// Creates an iterator for a range scan between start and end keys with custom read options.
+	pub fn range_with_options<K: AsRef<[u8]>>(
 		&self,
 		start: K,
 		end: K,
-		limit: Option<usize>,
+		options: &ReadOptions,
 	) -> Result<impl Iterator<Item = IterResult> + '_> {
 		// Get the start and end keys as byte slices
 		let start_key = start.as_ref().to_vec();
@@ -236,7 +304,44 @@ impl Transaction {
 			return Err(Error::EmptyKey);
 		}
 
-		TransactionRangeIterator::new(self, start_key, end_key, limit, true)
+		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
+	}
+
+	/// Creates an iterator that returns only keys in the given range.
+	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
+	pub fn keys<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<impl Iterator<Item = IterResult> + '_> {
+		self.keys_with_options(
+			start,
+			end,
+			&ReadOptions::default().with_keys_only(true).with_limit(limit),
+		)
+	}
+
+	/// Creates an iterator that returns only keys in the given range with custom read options.
+	pub fn keys_with_options<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		options: &ReadOptions,
+	) -> Result<impl Iterator<Item = IterResult> + '_> {
+		// Get the start and end keys as byte slices
+		let start_key = start.as_ref().to_vec();
+		let end_key = end.as_ref().to_vec();
+
+		// Check if keys are empty
+		if start_key.is_empty() || end_key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+
+		// Force keys_only to true for this method
+		let mut options = options.clone();
+		options.keys_only = true;
+		TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
@@ -354,13 +459,12 @@ pub(crate) struct TransactionRangeIterator<'a> {
 }
 
 impl<'a> TransactionRangeIterator<'a> {
-	/// Creates a new range iterator with RYOW semantics
-	pub(crate) fn new(
+	/// Creates a new range iterator with custom read options
+	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
-		limit: Option<usize>,
-		keys_only: bool,
+		options: &ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
 		if tx.closed {
@@ -382,7 +486,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		let end_bytes = Bytes::copy_from_slice(&end_key);
 
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), keys_only)?;
+		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
 		let boxed_iter: Box<dyn Iterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive range for write set
@@ -392,9 +496,9 @@ impl<'a> TransactionRangeIterator<'a> {
 		Ok(Self {
 			snapshot_iter: boxed_iter.double_ended_peekable(),
 			write_set_iter: write_set_iter.double_ended_peekable(),
-			limit: limit.unwrap_or(usize::MAX),
+			limit: options.limit.unwrap_or(usize::MAX),
 			count: 0,
-			keys_only,
+			keys_only: options.keys_only,
 		})
 	}
 
