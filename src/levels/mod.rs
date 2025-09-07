@@ -162,8 +162,7 @@ impl LevelManifest {
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 
 		// Read levels data
-		let level_count = level_manifest.read_u8()?;
-		let level_data = Self::load_levels(&mut level_manifest, level_count)?;
+		let level_data = Levels::decode(&mut level_manifest)?;
 
 		// Read snapshots
 		let snapshot_count = level_manifest.read_u32::<BigEndian>()?;
@@ -177,44 +176,32 @@ impl LevelManifest {
 		}
 
 		// Now convert the level data into actual Level objects with Table instances
-		let mut levels_vec = Vec::with_capacity(opts.level_count as usize);
+		// Use the actual number of levels from the manifest, not the configured level count
+		let mut levels_vec = Vec::with_capacity(level_data.len());
 
-		// Make sure we have the expected number of levels
-		for level_idx in 0..opts.level_count {
-			let level_tables = if level_idx < level_data.len() as u8 {
-				// Load tables for this level
-				let table_ids = &level_data[level_idx as usize];
-				let mut tables = Vec::with_capacity(table_ids.len());
+		// Load all levels that exist in the manifest
+		for (level_idx, table_ids) in level_data.iter().enumerate() {
+			let mut tables = Vec::with_capacity(table_ids.len());
 
-				for &table_id in table_ids {
-					// Load the actual table from disk
-					match Self::load_table(table_id, opts.clone()) {
-						Ok(table) => tables.push(table),
-						Err(err) => {
-							eprintln!("Error loading table {table_id}: {err:?}");
-							return Err(Error::LoadManifestFail(err.to_string()));
-						}
+			for &table_id in table_ids {
+				// Load the actual table from disk
+				match Self::load_table(table_id, opts.clone()) {
+					Ok(table) => tables.push(table),
+					Err(err) => {
+						eprintln!("Error loading table {table_id}: {err:?}");
+						return Err(Error::LoadManifestFail(err.to_string()));
 					}
 				}
+			}
 
-				// Validate sequence numbers based on level
-				if level_idx > 0 && !tables.is_empty() {
-					Self::validate_table_sequence_numbers(level_idx, &tables)?;
-				}
-
-				tables
-			} else {
-				// This level wasn't in the manifest
-				return Err(Error::LoadManifestFail(format!(
-					"Level index {} exceeds loaded level data length {}",
-					level_idx,
-					level_data.len()
-				)));
-			};
+			// Validate sequence numbers based on level
+			if level_idx > 0 && !tables.is_empty() {
+				Self::validate_table_sequence_numbers(level_idx as u8, &tables)?;
+			}
 
 			// Create the level with the loaded tables
 			let level = Level {
-				tables: level_tables,
+				tables,
 			};
 			levels_vec.push(Arc::new(level));
 		}
@@ -275,25 +262,6 @@ impl LevelManifest {
 		// Create and return the table
 		let table = Arc::new(Table::new(table_id, opts, file, file_size)?);
 		Ok(table)
-	}
-
-	/// Loads levels from the manifest
-	fn load_levels<R: Read>(reader: &mut R, level_count: u8) -> Result<Vec<Vec<u64>>> {
-		let mut levels = vec![];
-
-		for _ in 0..level_count {
-			let mut level = vec![];
-			let table_count = reader.read_u32::<BigEndian>()?;
-
-			for _ in 0..table_count {
-				let id = reader.read_u64::<BigEndian>()?;
-				level.push(id);
-			}
-
-			levels.push(level);
-		}
-
-		Ok(levels)
 	}
 
 	fn depth(&self) -> u8 {

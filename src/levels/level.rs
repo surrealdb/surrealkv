@@ -2,8 +2,11 @@ use crate::{
 	sstable::{meta::KeyRange, table::Table},
 	Result,
 };
-use byteorder::{BigEndian, WriteBytesExt};
-use std::{io::Write, sync::Arc};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::{
+	io::{Read, Write},
+	sync::Arc,
+};
 
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.
@@ -94,6 +97,34 @@ impl Levels {
 		}
 
 		Ok(())
+	}
+
+	/// Decodes the levels structure from a reader in a binary format
+	/// Format:
+	/// - Number of levels (u8)
+	/// - For each level:
+	///   - Number of tables (u32, BigEndian)
+	///   - For each table:
+	///     - Table ID (u64, BigEndian)
+	///
+	/// Returns a vector of vectors containing table IDs for each level
+	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<u64>>> {
+		let level_count = reader.read_u8()?;
+		let mut levels = Vec::with_capacity(level_count as usize);
+
+		for _ in 0..level_count {
+			let table_count = reader.read_u32::<BigEndian>()?;
+			let mut level = Vec::with_capacity(table_count as usize);
+
+			for _ in 0..table_count {
+				let table_id = reader.read_u64::<BigEndian>()?;
+				level.push(table_id);
+			}
+
+			levels.push(level);
+		}
+
+		Ok(levels)
 	}
 
 	/// Returns a reference to all levels
