@@ -1,16 +1,55 @@
-use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
 
 use crate::error::Result;
-use crate::iter::{BoxedIterator, HeapItem};
+use crate::iter::BoxedIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
+
+use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
+use interval_heap::IntervalHeap;
+
+#[derive(Eq)]
+struct HeapItem {
+	key: Arc<InternalKey>,
+	value: Value,
+	iterator_index: usize,
+}
+
+impl PartialEq for HeapItem {
+	fn eq(&self, other: &Self) -> bool {
+		self.cmp(other) == Ordering::Equal
+	}
+}
+
+impl Ord for HeapItem {
+	fn cmp(&self, other: &Self) -> Ordering {
+		// First compare by user key
+		match self.key.user_key.cmp(&other.key.user_key) {
+			Ordering::Equal => {
+				// Same user key, compare by sequence number in DESCENDING order
+				// (higher sequence number = more recent)
+				match other.key.seq_num().cmp(&self.key.seq_num()) {
+					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
+					ord => ord,
+				}
+			}
+			ord => ord, // Different user keys
+		}
+	}
+}
+
+impl PartialOrd for HeapItem {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
 
 // ===== Snapshot Counter =====
 /// Tracks the number of active snapshots in the system.
@@ -157,7 +196,7 @@ impl Snapshot {
 		start: K,
 		end: K,
 		keys_only: bool,
-	) -> Result<impl Iterator<Item = IterResult>> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
 		// Create a range from start (inclusive) to end (inclusive)
 		let range = start.as_ref().to_vec()..=end.as_ref().to_vec();
 		SnapshotIterator::new_from(self.core.clone(), self.seq_num, range, keys_only)
@@ -171,120 +210,28 @@ impl Drop for Snapshot {
 	}
 }
 
-pub(crate) struct SnapshotIterator<'a> {
-	snapshot_merge_iter: SnapshotMergeIterator<'a>,
-	core: Arc<Core>,
-	/// When true, only return keys without resolving values
-	keys_only: bool,
-}
-
-impl SnapshotIterator<'_> {
-	/// Creates a new iterator over a specific key range
-	fn new_from<R>(core: Arc<Core>, seq_num: u64, range: R, keys_only: bool) -> Result<Self>
-	where
-		R: RangeBounds<Vec<u8>>,
-	{
-		// Collect iterator from active memtable
-		let active = guardian::ArcRwLockReadGuardian::take(core.active_memtable.clone()).unwrap();
-
-		// Collect iterators from immutable memtables
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
-
-		// Collect iterators from all tables in all levels
-		let iter_state = if let Some(ref level_manifest) = core.level_manifest {
-			let manifest = guardian::ArcRwLockReadGuardian::take(level_manifest.clone()).unwrap();
-			IterState {
-				active: active.clone(),
-				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
-				levels: manifest.levels.clone(),
-			}
-		} else {
-			// In memory-only mode, only use memtables
-			IterState {
-				active: active.clone(),
-				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
-				levels: Levels(vec![]), // Empty levels
-			}
-		};
-
-		// Convert bounds to owned for passing to merge iterator
-		let start = range.start_bound().map(|v| v.clone());
-		let end = range.end_bound().map(|v| v.clone());
-
-		// Increment VLog iterator count
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
-		Ok(Self {
-			snapshot_merge_iter: SnapshotMergeIterator::new_from(iter_state, seq_num, (start, end)),
-			core: core.clone(),
-			keys_only,
-		})
-	}
-}
-
-impl Iterator for SnapshotIterator<'_> {
-	type Item = IterResult;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if let Some((key, value)) = self.snapshot_merge_iter.next() {
-			if self.keys_only {
-				// For keys-only mode, return None for the value to avoid allocations
-				Some(Ok((key, None)))
-			} else {
-				// Resolve value pointers to actual values
-				match self.core.resolve_value(&value) {
-					Ok(resolved_value) => Some(Ok((key, Some(resolved_value)))),
-					Err(e) => Some(Err(e)),
-				}
-			}
-		} else {
-			None
-		}
-	}
-}
-
-impl Drop for SnapshotIterator<'_> {
-	fn drop(&mut self) {
-		// Decrement VLog iterator count when iterator is dropped
-		if let Some(ref vlog) = self.core.vlog {
-			if let Err(e) = vlog.decr_iterator_count() {
-				eprintln!("Warning: Failed to decrement VLog iterator count: {e}");
-			}
-		}
-	}
-}
-
-/// A merge iterator that respects snapshot isolation by filtering entries based on sequence numbers
-pub(crate) struct SnapshotMergeIterator<'a> {
+/// A merge iterator that sorts by key+seqno.
+pub(crate) struct KMergeIterator<'a> {
 	// Owned state
 	_iter_state: Box<IterState>,
 
 	/// Array of iterators to merge over
 	iterators: NonNull<Vec<BoxedIterator<'a>>>,
 
-	/// Min-heap of items ordered by their current key
-	heap: BinaryHeap<HeapItem>,
-
-	/// Snapshot sequence number for version visibility
-	snapshot_seq_num: u64,
-
-	// Current user key being processed
-	current_user_key: Option<Key>,
-
-	/// Whether we've found a valid version for the current key
-	current_key_resolved: bool,
+	/// Interval heap of items ordered by their current key
+	heap: IntervalHeap<HeapItem>,
 
 	/// Range bounds for filtering
 	range_end: Bound<Vec<u8>>,
 
-	/// Whether the iterator has been initialized
-	initialized: bool,
+	/// Whether the iterator has been initialized for forward iteration
+	initialized_lo: bool,
+
+	/// Whether the iterator has been initialized for backward iteration
+	initialized_hi: bool,
 }
 
-impl<'a> SnapshotMergeIterator<'a> {
+impl<'a> KMergeIterator<'a> {
 	fn new_from(
 		iter_state: IterState,
 		snapshot_seq_num: u64,
@@ -358,13 +305,16 @@ impl<'a> SnapshotMergeIterator<'a> {
 					}
 
 					if table_iter.valid() {
-						iterators.push(Box::new(table_iter));
+						iterators.push(Box::new(table_iter.filter(move |item| {
+							// Filter out items that are not visible in this snapshot
+							item.0.seq_num() <= snapshot_seq_num
+						})));
 					}
 				}
 			}
 		}
 
-		let heap = BinaryHeap::with_capacity(iterators.len());
+		let heap = IntervalHeap::with_capacity(iterators.len());
 
 		// Box the iterators and get a raw pointer
 		let boxed_iterators = Box::new(iterators);
@@ -375,39 +325,48 @@ impl<'a> SnapshotMergeIterator<'a> {
 			_iter_state: boxed_state,
 			iterators: iterators_ptr,
 			heap,
-			snapshot_seq_num,
-			current_user_key: None,
-			current_key_resolved: false,
 			range_end: range.1,
-			initialized: false,
+			initialized_lo: false,
+			initialized_hi: false,
 		}
 	}
 
-	fn initialize(&mut self) {
+	fn initialize_lo(&mut self) {
 		// Pull the first item from each iterator and add to heap
 		unsafe {
 			let iterators = self.iterators.as_mut();
 			for (idx, iter) in iterators.iter_mut().enumerate() {
-				// Keep trying to get the next valid item from this iterator
-				for (key, value) in iter.by_ref() {
-					// Filter by snapshot sequence number
-					if key.seq_num() <= self.snapshot_seq_num {
-						self.heap.push(HeapItem {
-							key,
-							value,
-							iterator_index: idx,
-						});
-						break; // Found a valid item, add to heap and move to next iterator
-					}
-					// Continue to next item if filtered out by sequence number
+				if let Some((key, value)) = iter.next() {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: idx,
+					});
 				}
 			}
 		}
-		self.initialized = true;
+		self.initialized_lo = true;
+	}
+
+	fn initialize_hi(&mut self) {
+		// Pull the last item from each iterator and add to heap
+		unsafe {
+			let iterators = self.iterators.as_mut();
+			for (idx, iter) in iterators.iter_mut().enumerate() {
+				if let Some((key, value)) = iter.next_back() {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: idx,
+					});
+				}
+			}
+		}
+		self.initialized_hi = true;
 	}
 }
 
-impl Drop for SnapshotMergeIterator<'_> {
+impl Drop for KMergeIterator<'_> {
 	fn drop(&mut self) {
 		// Must drop the iterators before iter_state
 		// because the iterators contain references to iter_state
@@ -418,12 +377,12 @@ impl Drop for SnapshotMergeIterator<'_> {
 	}
 }
 
-impl Iterator for SnapshotMergeIterator<'_> {
-	type Item = (Key, Value);
+impl Iterator for KMergeIterator<'_> {
+	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if !self.initialized {
-			self.initialize();
+		if !self.initialized_lo {
+			self.initialize_lo();
 		}
 
 		loop {
@@ -432,54 +391,22 @@ impl Iterator for SnapshotMergeIterator<'_> {
 			}
 
 			// Get the smallest item from the heap
-			let heap_item = self.heap.pop()?;
+			let heap_item = self.heap.pop_min()?;
 
 			// Pull the next item from the same iterator and add back to heap if valid
 			unsafe {
 				let iterators = self.iterators.as_mut();
-				for (key, value) in iterators[heap_item.iterator_index].by_ref() {
-					// Filter by snapshot sequence number
-					if key.seq_num() <= self.snapshot_seq_num {
-						self.heap.push(HeapItem {
-							key,
-							value,
-							iterator_index: heap_item.iterator_index,
-						});
-						break;
-					}
-					// Continue to next item if filtered out
+				if let Some((key, value)) = iterators[heap_item.iterator_index].next() {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: heap_item.iterator_index,
+					});
 				}
 			}
 
-			// Process the key-value pair
-			let user_key = heap_item.key.user_key.clone();
-			let kind = heap_item.key.kind();
-
-			// Check if this is a new user key
-			let is_new_key = match &self.current_user_key {
-				None => true,
-				Some(current) => &user_key != current,
-			};
-
-			if is_new_key {
-				self.current_user_key = Some(user_key.clone());
-				self.current_key_resolved = false;
-			}
-
-			// Skip if we've already resolved this key
-			if self.current_key_resolved {
-				continue;
-			}
-
-			// This is the latest visible version of this key
-			self.current_key_resolved = true;
-
-			// If it's a tombstone, the key is deleted in this snapshot
-			if kind == InternalKeyKind::Delete {
-				continue;
-			}
-
-			// Skip if the key exceeds the range end
+			// Check if the key exceeds the range end
+			let user_key = &heap_item.key.user_key;
 			match &self.range_end {
 				Bound::Included(end) => {
 					if user_key.as_ref() > end.as_slice() {
@@ -496,8 +423,233 @@ impl Iterator for SnapshotMergeIterator<'_> {
 				}
 			}
 
-			// Return the user key and value
-			return Some((user_key, heap_item.value));
+			// Return the key-value pair
+			return Some((heap_item.key, heap_item.value));
+		}
+	}
+}
+
+impl DoubleEndedIterator for KMergeIterator<'_> {
+	fn next_back(&mut self) -> Option<Self::Item> {
+		if !self.initialized_hi {
+			self.initialize_hi();
+		}
+
+		loop {
+			if self.heap.is_empty() {
+				return None;
+			}
+
+			// Get the largest item from the heap
+			let heap_item = self.heap.pop_max()?;
+
+			// Pull the previous item from the same iterator and add back to heap if valid
+			unsafe {
+				let iterators = self.iterators.as_mut();
+				if let Some((key, value)) = iterators[heap_item.iterator_index].next_back() {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: heap_item.iterator_index,
+					});
+				}
+			}
+
+			// Check if the key exceeds the range end
+			let user_key = &heap_item.key.user_key;
+			match &self.range_end {
+				Bound::Included(end) => {
+					if user_key.as_ref() > end.as_slice() {
+						continue;
+					}
+				}
+				Bound::Excluded(end) => {
+					if user_key.as_ref() >= end.as_slice() {
+						continue;
+					}
+				}
+				Bound::Unbounded => {
+					// No end bound to check
+				}
+			}
+
+			// Return the key-value pair
+			return Some((heap_item.key, heap_item.value));
+		}
+	}
+}
+
+/// Consumes a stream of KVs and emits a new stream to the filter rules
+pub struct FilterIter<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> {
+	inner: DoubleEndedPeekable<I>,
+}
+
+impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> FilterIter<I> {
+	pub fn new(iter: I) -> Self {
+		let iter = iter.double_ended_peekable();
+		Self {
+			inner: iter,
+		}
+	}
+
+	fn skip_to_latest(&mut self, key: &Key) -> Result<()> {
+		loop {
+			let Some(next) = self.inner.peek() else {
+				return Ok(());
+			};
+
+			// Consume version
+			if next.0.user_key == *key {
+				self.inner.next().expect("should not be empty");
+			} else {
+				return Ok(());
+			}
+		}
+	}
+}
+
+impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> Iterator for FilterIter<I> {
+	type Item = (Arc<InternalKey>, Value);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let head = self.inner.next()?;
+
+		// Keep only latest version of the key
+		let _ = self.skip_to_latest(&head.0.user_key);
+
+		Some(head)
+	}
+}
+
+impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> DoubleEndedIterator
+	for FilterIter<I>
+{
+	fn next_back(&mut self) -> Option<Self::Item> {
+		loop {
+			let tail = self.inner.next_back()?;
+
+			let prev = match self.inner.peek_back() {
+				Some(prev) => prev,
+				None => {
+					return Some(tail);
+				}
+			};
+
+			if prev.0.user_key < tail.0.user_key {
+				return Some(tail);
+			}
+		}
+	}
+}
+
+pub(crate) struct SnapshotIterator<'a> {
+	// The complete pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
+	pipeline: Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>,
+	core: Arc<Core>,
+	/// When true, only return keys without resolving values
+	keys_only: bool,
+}
+
+impl SnapshotIterator<'_> {
+	/// Creates a new iterator over a specific key range
+	fn new_from<R>(core: Arc<Core>, seq_num: u64, range: R, keys_only: bool) -> Result<Self>
+	where
+		R: RangeBounds<Vec<u8>>,
+	{
+		// Collect iterator from active memtable
+		let active = guardian::ArcRwLockReadGuardian::take(core.active_memtable.clone()).unwrap();
+
+		// Collect iterators from immutable memtables
+		let immutable =
+			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
+
+		// Collect iterators from all tables in all levels
+		let iter_state = if let Some(ref level_manifest) = core.level_manifest {
+			let manifest = guardian::ArcRwLockReadGuardian::take(level_manifest.clone()).unwrap();
+			IterState {
+				active: active.clone(),
+				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+				levels: manifest.levels.clone(),
+			}
+		} else {
+			// In memory-only mode, only use memtables
+			IterState {
+				active: active.clone(),
+				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+				levels: Levels(vec![]), // Empty levels
+			}
+		};
+
+		// Convert bounds to owned for passing to merge iterator
+		let start = range.start_bound().map(|v| v.clone());
+		let end = range.end_bound().map(|v| v.clone());
+
+		// Increment VLog iterator count
+		if let Some(ref vlog) = core.vlog {
+			vlog.incr_iterator_count();
+		}
+
+		// Build the pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
+		let merge_iter = KMergeIterator::new_from(iter_state, seq_num, (start, end));
+		let filter_iter = FilterIter::new(merge_iter);
+		let pipeline =
+			Box::new(filter_iter.filter(|(key, _value)| key.kind() != InternalKeyKind::Delete));
+
+		Ok(Self {
+			pipeline,
+			core: core.clone(),
+			keys_only,
+		})
+	}
+}
+
+impl Iterator for SnapshotIterator<'_> {
+	type Item = IterResult;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if let Some((key, value)) = self.pipeline.next() {
+			if self.keys_only {
+				// For keys-only mode, return None for the value to avoid allocations
+				Some(Ok((key.user_key.clone(), None)))
+			} else {
+				// Resolve value pointers to actual values
+				match self.core.resolve_value(&value) {
+					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
+					Err(e) => Some(Err(e)),
+				}
+			}
+		} else {
+			None
+		}
+	}
+}
+
+impl DoubleEndedIterator for SnapshotIterator<'_> {
+	fn next_back(&mut self) -> Option<Self::Item> {
+		if let Some((key, value)) = self.pipeline.next_back() {
+			if self.keys_only {
+				// For keys-only mode, return None for the value to avoid allocations
+				Some(Ok((key.user_key.clone(), None)))
+			} else {
+				// Resolve value pointers to actual values
+				match self.core.resolve_value(&value) {
+					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
+					Err(e) => Some(Err(e)),
+				}
+			}
+		} else {
+			None
+		}
+	}
+}
+
+impl Drop for SnapshotIterator<'_> {
+	fn drop(&mut self) {
+		// Decrement VLog iterator count when iterator is dropped
+		if let Some(ref vlog) = self.core.vlog {
+			if let Err(e) = vlog.decr_iterator_count() {
+				eprintln!("Warning: Failed to decrement VLog iterator count: {e}");
+			}
 		}
 	}
 }
@@ -508,7 +660,7 @@ mod tests {
 	use std::collections::HashSet;
 	use std::sync::Arc;
 
-	use super::{IterState, SnapshotMergeIterator};
+	use super::{IterState, KMergeIterator};
 	use crate::levels::Level;
 	use crate::levels::Levels;
 	use crate::memtable::MemTable;
@@ -988,11 +1140,150 @@ mod tests {
 		// Range that only overlaps with table2
 		let range = (Bound::Included(b"z0".to_vec()), Bound::Included(b"zz".to_vec()));
 
-		let merge_iter = SnapshotMergeIterator::new_from(iter_state, 1, range);
+		let merge_iter = KMergeIterator::new_from(iter_state, 1, range);
 
 		let items: Vec<_> = merge_iter.collect();
 		assert_eq!(items.len(), 2);
-		assert_eq!(items[0].0.as_ref(), b"z1");
-		assert_eq!(items[1].0.as_ref(), b"z2");
+		assert_eq!(items[0].0.user_key.as_ref(), b"z1");
+		assert_eq!(items[1].0.user_key.as_ref(), b"z2");
+	}
+
+	#[tokio::test]
+	async fn test_double_ended_iteration() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Create snapshot via transaction
+		let tx = store.begin().unwrap();
+		let snapshot = tx.snapshot.as_ref().unwrap();
+
+		// Test forward iteration
+		let forward_iter = snapshot.range(b"key1", b"key5", false).unwrap();
+		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+
+		assert_eq!(forward_items.len(), 5);
+		assert_eq!(forward_items[0].0.as_ref(), b"key1");
+		assert_eq!(forward_items[4].0.as_ref(), b"key5");
+
+		// Test backward iteration
+		let backward_iter = snapshot.range(b"key1", b"key5", false).unwrap();
+		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+
+		assert_eq!(backward_items.len(), 5);
+		assert_eq!(backward_items[0].0.as_ref(), b"key5");
+		assert_eq!(backward_items[4].0.as_ref(), b"key1");
+
+		// Verify both iterations produce the same items in reverse order
+		for i in 0..5 {
+			assert_eq!(forward_items[i].0, backward_items[4 - i].0);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_double_ended_iteration_with_tombstones() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take a snapshot before deletion
+		let snapshot1 = store.begin().unwrap();
+
+		// Delete key2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take another snapshot after deletion
+		let snapshot2 = store.begin().unwrap();
+
+		// Test forward iteration on first snapshot (should see all keys)
+		let snapshot1_ref = snapshot1.snapshot.as_ref().unwrap();
+		let forward_iter1 = snapshot1_ref.range(b"key1", b"key3", false).unwrap();
+		let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
+		assert_eq!(forward_items1.len(), 3);
+
+		// Test backward iteration on first snapshot
+		let backward_iter1 = snapshot1_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
+		assert_eq!(backward_items1.len(), 3);
+
+		// Test forward iteration on second snapshot (should not see deleted key)
+		let snapshot2_ref = snapshot2.snapshot.as_ref().unwrap();
+		let forward_iter2 = snapshot2_ref.range(b"key1", b"key3", false).unwrap();
+		let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
+		assert_eq!(forward_items2.len(), 2);
+
+		// Test backward iteration on second snapshot
+		let backward_iter2 = snapshot2_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
+		assert_eq!(backward_items2.len(), 2);
+
+		// Verify both iterations produce the same items in reverse order
+		for i in 0..forward_items2.len() {
+			assert_eq!(forward_items2[i].0, backward_items2[forward_items2.len() - 1 - i].0);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_double_ended_iteration_mixed_operations() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=10 {
+				let key = format!("key{i:02}");
+				let value = format!("value{i}");
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Take a snapshot
+		let snapshot = store.begin().unwrap();
+
+		// Test forward iteration
+		let snapshot_ref = snapshot.snapshot.as_ref().unwrap();
+		let forward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+
+		// Test backward iteration
+		let backward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+
+		// Both should have 10 items
+		assert_eq!(forward_items.len(), 10);
+		assert_eq!(backward_items.len(), 10);
+
+		// Verify ordering
+		for i in 1..=10 {
+			let expected_key = format!("key{i:02}");
+			assert_eq!(forward_items[i - 1].0.as_ref(), expected_key.as_bytes());
+			assert_eq!(backward_items[10 - i].0.as_ref(), expected_key.as_bytes());
+		}
+
+		// Verify both iterations produce the same items in reverse order
+		for i in 0..10 {
+			assert_eq!(forward_items[i].0, backward_items[9 - i].0);
+		}
 	}
 }

@@ -310,7 +310,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl Iterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		let mut options = ReadOptions::default().with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
@@ -322,7 +322,7 @@ impl Transaction {
 	pub fn range_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<impl Iterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		// Get the start and end keys from options
 		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
 		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
@@ -342,7 +342,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl Iterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
@@ -354,7 +354,7 @@ impl Transaction {
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<impl Iterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		// Get the start and end keys from options
 		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
 		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
@@ -469,7 +469,7 @@ impl Entry {
 /// An iterator that performs a merging scan over a transaction's snapshot and write set.
 pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
-	snapshot_iter: DoubleEndedPeekable<Box<dyn Iterator<Item = IterResult> + 'a>>,
+	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
 	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Option<Entry>>>,
@@ -513,7 +513,7 @@ impl<'a> TransactionRangeIterator<'a> {
 
 		// Create a snapshot iterator for the range
 		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
-		let boxed_iter: Box<dyn Iterator<Item = IterResult> + 'a> = Box::new(iter);
+		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive range for write set
 		let write_set_range = (Bound::Included(start_bytes), Bound::Included(end_bytes));
@@ -534,6 +534,24 @@ impl<'a> TransactionRangeIterator<'a> {
 			if e.is_tombstone() {
 				// Deleted key, skip it by recursively getting the next entry
 				return self.next();
+			}
+
+			if self.keys_only {
+				// For keys-only mode, return None for the value to avoid allocations
+				return Some(Ok((ws_key.to_vec().into(), None)));
+			} else if let Some(value) = &e.value {
+				return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+			}
+		}
+		None
+	}
+
+	/// Reads from the write set in reverse order and skips deleted entries
+	fn read_from_write_set_back(&mut self) -> Option<IterResult> {
+		if let Some((ws_key, Some(e))) = self.write_set_iter.next_back() {
+			if e.is_tombstone() {
+				// Deleted key, skip it by recursively getting the next entry
+				return self.next_back();
 			}
 
 			if self.keys_only {
@@ -599,6 +617,71 @@ impl Iterator for TransactionRangeIterator<'_> {
 				} else if self.snapshot_iter.peek().is_some() {
 					// Snapshot has error, propagate it
 					self.snapshot_iter.next()
+				} else {
+					// This should never happen since we checked above
+					None
+				}
+			}
+		};
+
+		if result.is_some() {
+			self.count += 1;
+		}
+
+		result
+	}
+}
+
+impl DoubleEndedIterator for TransactionRangeIterator<'_> {
+	/// Merges results from write set and snapshot in reverse key order
+	fn next_back(&mut self) -> Option<Self::Item> {
+		if self.count >= self.limit {
+			return None;
+		}
+
+		// Fast path: if write set is empty, just use snapshot
+		if self.write_set_iter.peek_back().is_none() {
+			let result = self.snapshot_iter.next_back();
+			if result.is_some() {
+				self.count += 1;
+			}
+			return result;
+		}
+
+		// Fast path: if snapshot is empty, just use write set
+		if self.snapshot_iter.peek_back().is_none() {
+			let result = self.read_from_write_set_back();
+			if result.is_some() {
+				self.count += 1;
+			}
+			return result;
+		}
+
+		// Merge results from both iterators
+		let has_snap = self.snapshot_iter.peek_back().is_some();
+		let has_ws = self.write_set_iter.peek_back().is_some();
+
+		let result = match (has_snap, has_ws) {
+			(false, false) => None,
+			(true, false) => self.snapshot_iter.next_back(),
+			(false, true) => self.read_from_write_set_back(),
+			(true, true) => {
+				// Compare keys to determine which comes last
+				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
+					(self.snapshot_iter.peek_back(), self.write_set_iter.peek_back())
+				{
+					match snap_key.as_ref().cmp(ws_key.as_ref()) {
+						Ordering::Greater => self.snapshot_iter.next_back(),
+						Ordering::Less => self.read_from_write_set_back(),
+						Ordering::Equal => {
+							// Same key - prioritize write set and skip snapshot
+							self.snapshot_iter.next_back();
+							self.read_from_write_set_back()
+						}
+					}
+				} else if self.snapshot_iter.peek_back().is_some() {
+					// Snapshot has error, propagate it
+					self.snapshot_iter.next_back()
 				} else {
 					// This should never happen since we checked above
 					None
