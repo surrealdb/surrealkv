@@ -3,7 +3,10 @@ use std::{
 	sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::levels::{Level, LevelManifest};
+use crate::{
+	levels::{Level, LevelManifest},
+	sstable::InternalKeyTrait,
+};
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 
@@ -63,10 +66,10 @@ impl Strategy {
 		self.base_level_size * self.size_multiplier.pow(level as u32)
 	}
 
-	fn select_tables_for_compaction(
+	fn select_tables_for_compaction<K: InternalKeyTrait>(
 		&self,
-		source_level: &Level,
-		next_level: &Level,
+		source_level: &Level<K>,
+		next_level: &Level<K>,
 		source_level_num: u8,
 	) -> Vec<u64> {
 		let mut tables = vec![];
@@ -119,7 +122,10 @@ impl Strategy {
 		tables
 	}
 
-	fn select_best_table_for_compaction(&self, source_level: &Level) -> Option<u64> {
+	fn select_best_table_for_compaction<K: InternalKeyTrait>(
+		&self,
+		source_level: &Level<K>,
+	) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -136,7 +142,10 @@ impl Strategy {
 	}
 
 	/// RocksDB's kOldestSmallestSeqFirst: ranges that haven't been compacted for longest
-	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_smallest_seq_first<K: InternalKeyTrait>(
+		&self,
+		source_level: &Level<K>,
+	) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -171,7 +180,10 @@ impl Strategy {
 	}
 
 	/// RocksDB's kOldestLargestSeqFirst: files whose latest update is oldest (cold data)
-	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_largest_seq_first<K: InternalKeyTrait>(
+		&self,
+		source_level: &Level<K>,
+	) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -206,7 +218,10 @@ impl Strategy {
 	}
 
 	/// Selects files based on compensated size (RocksDB's kByCompensatedSize)
-	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<u64> {
+	pub(crate) fn select_by_compensated_size<K: InternalKeyTrait>(
+		&self,
+		source_level: &Level<K>,
+	) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -247,7 +262,10 @@ impl Strategy {
 		choices.first().map(|choice| choice.table_id)
 	}
 
-	fn find_compaction_level(&self, manifest: &LevelManifest) -> Option<u8> {
+	fn find_compaction_level<K: InternalKeyTrait>(
+		&self,
+		manifest: &LevelManifest<K>,
+	) -> Option<u8> {
 		let levels = manifest.levels.get_levels();
 		let last_level_index = manifest.last_level_index();
 
@@ -291,8 +309,8 @@ impl Strategy {
 	}
 }
 
-impl CompactionStrategy for Strategy {
-	fn pick_levels(&self, manifest: &LevelManifest) -> CompactionChoice {
+impl<K: InternalKeyTrait> CompactionStrategy<K> for Strategy {
+	fn pick_levels(&self, manifest: &LevelManifest<K>) -> CompactionChoice {
 		let source_level = match self.find_compaction_level(manifest) {
 			Some(level) => level,
 			None => return CompactionChoice::Skip,
@@ -380,7 +398,7 @@ mod tests {
 			&self,
 			id: u64,
 			entries: Vec<(InternalKey, Vec<u8>)>,
-		) -> Result<Arc<Table>> {
+		) -> Result<Arc<Table<InternalKey>>> {
 			let table_path = self.options.sstable_file_path(id);
 			let file = File::create(&table_path)?;
 
@@ -467,7 +485,7 @@ mod tests {
 	fn create_test_manifest(
 		env: &TestEnv,
 		level_tables: Vec<Vec<(u64, u64, u64, u64)>>, // id, min_seq, min_key, max_key
-	) -> Result<Arc<RwLock<LevelManifest>>> {
+	) -> Result<Arc<RwLock<LevelManifest<InternalKey>>>> {
 		let manifest_path = env.options.path.join("test_manifest");
 
 		// Initialize empty levels
@@ -511,8 +529,8 @@ mod tests {
 	/// Creates compaction options for testing
 	fn create_compaction_options(
 		opts: Arc<LSMOptions>,
-		manifest: Arc<RwLock<LevelManifest>>,
-	) -> CompactionOptions {
+		manifest: Arc<RwLock<LevelManifest<InternalKey>>>,
+	) -> CompactionOptions<InternalKey> {
 		let vlog = Arc::new(crate::vlog::VLog::new(opts.path.join("vlog"), opts.clone()).unwrap());
 
 		CompactionOptions {
@@ -525,7 +543,7 @@ mod tests {
 
 	/// Verifies all expected key-value pairs are present after compaction
 	fn verify_keys_after_compaction(
-		manifest: &RwLock<LevelManifest>,
+		manifest: &RwLock<LevelManifest<InternalKey>>,
 		expected_keys: &HashSet<(Arc<[u8]>, Vec<u8>)>,
 	) -> (usize, HashMap<Arc<[u8]>, Vec<u8>>) {
 		let manifest_guard = manifest.read().unwrap();
@@ -564,7 +582,7 @@ mod tests {
 
 	/// Verifies that all expected keys are present with correct values
 	fn verify_all_keys_present(
-		manifest: &RwLock<LevelManifest>,
+		manifest: &RwLock<LevelManifest<InternalKey>>,
 		expected_keys: &HashMap<Arc<[u8]>, Vec<u8>>,
 	) -> bool {
 		let manifest_guard = manifest.read().unwrap();
@@ -601,7 +619,7 @@ mod tests {
 	}
 
 	/// Performs N rounds of compaction
-	fn perform_compaction_rounds(compactor: &Compactor, rounds: usize) {
+	fn perform_compaction_rounds(compactor: &Compactor<InternalKey>, rounds: usize) {
 		for i in 1..=rounds {
 			let result = compactor.compact();
 			assert!(result.is_ok(), "Compaction round {} failed: {:?}", i, result.err());
@@ -776,7 +794,7 @@ mod tests {
 		struct TestStrategy<'a> {
 			base: &'a Strategy,
 			selected_candidates: &'a mut Vec<u8>,
-			levels_guard: &'a LevelManifest,
+			levels_guard: &'a LevelManifest<InternalKey>,
 		}
 
 		impl TestStrategy<'_> {
@@ -1053,7 +1071,8 @@ mod tests {
 		// Track expected keys for verification
 		let mut expected_keys = HashSet::new();
 		let mut key_to_level_map = HashMap::new();
-		let mut all_tables: Vec<Vec<Arc<Table>>> = vec![Vec::new(); level_configs.len()];
+		let mut all_tables: Vec<Vec<Arc<Table<InternalKey>>>> =
+			vec![Vec::new(); level_configs.len()];
 
 		for config in &level_configs {
 			let mut level_tables = Vec::new();
@@ -1991,7 +2010,7 @@ mod tests {
 			Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
 			Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
-		let comp_iter_non_bottom = MergeIterator::new(iterators, false);
+		let comp_iter_non_bottom = MergeIterator::<InternalKey>::new(iterators, false);
 		let non_bottom_result: Vec<_> = comp_iter_non_bottom.collect();
 
 		// Non-bottom level should preserve tombstone
@@ -2009,7 +2028,7 @@ mod tests {
 			Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
 			Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
-		let comp_iter_bottom = MergeIterator::new(iterators, true);
+		let comp_iter_bottom = MergeIterator::<InternalKey>::new(iterators, true);
 		let bottom_result: Vec<_> = comp_iter_bottom.collect();
 
 		// Bottom level should filter out tombstones

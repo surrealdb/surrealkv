@@ -16,7 +16,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
+		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -161,26 +161,28 @@ impl Footer {
 }
 
 // Defines a writer for constructing and writing table structures to a storage medium.
-pub(crate) struct TableWriter<W: Write> {
-	writer: W,          // Underlying writer to write data to.
-	opts: Arc<Options>, // Shared table options.
+pub(crate) struct TableWriter<W: Write, K: InternalKeyTrait> {
+	writer: W,             // Underlying writer to write data to.
+	opts: Arc<Options<K>>, // Shared table options.
 
-	meta: TableMetadata, // Metadata properties of the table.
+	meta: TableMetadata<K>, // Metadata properties of the table.
 
 	offset: usize, // Current offset in the writer where the next write will happen.
 	prev_block_last_key: Vec<u8>, // Last key of the previous block.
 
-	data_block: Option<BlockWriter>, // Writer for the current data block.
-	partitioned_index: TopLevelIndexWriter, // Writer for partitioned index.
+	data_block: Option<BlockWriter<K>>, // Writer for the current data block.
+	partitioned_index: TopLevelIndexWriter<K>, // Writer for partitioned index.
 	filter_block: Option<FilterBlockWriter>, // Writer for the optional filter block.
 
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
+	/// Internal key phantom data to track key type
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<W: Write> TableWriter<W> {
+impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 	// Constructs a new TableWriter with the provided writer and options.
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>) -> Self {
+	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options<K>>) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(policy.clone());
@@ -191,7 +193,7 @@ impl<W: Write> TableWriter<W> {
 			}
 		};
 
-		let mut meta = TableMetadata::new();
+		let mut meta = TableMetadata::<K>::new();
 		meta.properties.id = id;
 
 		TableWriter {
@@ -201,10 +203,14 @@ impl<W: Write> TableWriter<W> {
 			meta,
 			prev_block_last_key: Vec::new(),
 
-			data_block: Some(BlockWriter::new(opts.clone())),
-			partitioned_index: TopLevelIndexWriter::new(opts.clone(), opts.index_partition_size),
+			data_block: Some(BlockWriter::<K>::new(opts.clone())),
+			partitioned_index: TopLevelIndexWriter::<K>::new(
+				opts.clone(),
+				opts.index_partition_size,
+			),
 			filter_block: fb,
-			internal_cmp: Arc::new(InternalKeyComparator::new(opts.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::<K>::new(opts.comparator.clone())),
+			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -218,13 +224,13 @@ impl<W: Write> TableWriter<W> {
 		data_block_size
 			+ index_block_size
 			+ filter_block_size
-			+ size_of_writer_metadata()
+			+ size_of_writer_metadata::<K>()
 			+ self.offset
 			+ TABLE_FULL_FOOTER_LENGTH
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub(crate) fn add(&mut self, key: Arc<InternalKey>, val: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: Arc<K>, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -255,7 +261,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Optionally add the key to the filter block.
 		if let Some(fblock) = self.filter_block.as_mut() {
-			fblock.add_key(&key.user_key);
+			fblock.add_key(key.user_key());
 		}
 
 		// Add the key-value pair to the data block and increment the entry count.
@@ -291,14 +297,13 @@ impl<W: Write> TableWriter<W> {
 		let handle = self.write_compressed_block(&contents, self.opts.compression)?;
 
 		// Encode the block handle and add it to the index block.
-		let sep_key =
-			InternalKey::new(separator_key, INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator);
+		let sep_key = K::new(separator_key, INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator);
 		let handle_encoded = handle.encode();
 
 		self.partitioned_index.add(&sep_key.encode(), &handle_encoded)?;
 
 		// Prepare for the next data block.
-		self.data_block = Some(BlockWriter::new(self.opts.clone()));
+		self.data_block = Some(BlockWriter::<K>::new(self.opts.clone()));
 
 		Ok(())
 	}
@@ -323,7 +328,7 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Initialize meta_index block
-		let mut meta_ix_block = BlockWriter::new(self.opts.clone());
+		let mut meta_ix_block = BlockWriter::<K>::new(self.opts.clone());
 
 		// Write the filter block to the meta index block if present.
 		if let Some(fblock) = self.filter_block.take() {
@@ -340,20 +345,14 @@ impl<W: Write> TableWriter<W> {
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
 				// TODO: Add this as part of property as the current trailer will mark it as deleted
-				let filter_key = InternalKey {
-					user_key: Arc::from(filter_key.as_bytes().to_vec().into_boxed_slice()),
-					trailer: 0,
-				};
+				let filter_key = K::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set);
 
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
 
 		// Write meta properties to the meta index block
-		let meta_key = InternalKey {
-			user_key: Arc::from("meta".as_bytes().to_vec().into_boxed_slice()),
-			trailer: 0,
-		};
+		let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
@@ -403,7 +402,7 @@ impl<W: Write> TableWriter<W> {
 		Ok(handle)
 	}
 
-	fn update_meta_properties(&mut self, key: &InternalKey, value: &[u8]) {
+	fn update_meta_properties(&mut self, key: &K, value: &[u8]) {
 		let seq_num = key.seq_num();
 
 		// Update sequence numbers
@@ -428,18 +427,20 @@ impl<W: Write> TableWriter<W> {
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
 
+		let user_key = key.user_key();
+
 		// Update key range if needed
 		if props.key_range.is_none() {
 			props.key_range = Some(KeyRange {
-				low: key.user_key.clone(),
-				high: key.user_key.clone(),
+				low: user_key.clone(),
+				high: user_key.clone(),
 			});
 		} else if let Some(ref mut range) = props.key_range {
-			if self.opts.comparator.compare(&key.user_key, &range.low) == Ordering::Less {
-				range.low = key.user_key.clone();
+			if self.opts.comparator.compare(user_key, &range.low) == Ordering::Less {
+				range.low = user_key.clone();
 			}
-			if self.opts.comparator.compare(&key.user_key, &range.high) == Ordering::Greater {
-				range.high = key.user_key.clone();
+			if self.opts.comparator.compare(user_key, &range.high) == Ordering::Greater {
+				range.high = user_key.clone();
 			}
 		}
 	}
@@ -527,12 +528,10 @@ pub(crate) fn read_filter_block(
 	Ok(FilterBlockReader::new(buf, policy))
 }
 
-fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
-	let meta_key = InternalKey {
-		user_key: Arc::from("meta".as_bytes().to_vec().into_boxed_slice()),
-		trailer: 0,
-	}
-	.encode();
+fn read_writer_meta_properties<K: InternalKeyTrait>(
+	metaix: &Block<K>,
+) -> Result<Option<TableMetadata<K>>> {
+	let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter();
@@ -546,11 +545,11 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	Ok(None)
 }
 
-pub(crate) fn read_table_block(
-	opt: Arc<Options>,
+pub(crate) fn read_table_block<K: InternalKeyTrait>(
+	opt: Arc<Options<K>>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
-) -> Result<Block> {
+) -> Result<Block<K>> {
 	let buf = read_bytes(f.clone(), location)?;
 	let compress = read_bytes(
 		f.clone(),
@@ -573,7 +572,7 @@ pub(crate) fn read_table_block(
 
 	let block = decompress_block(&buf, CompressionType::from(compress[0]))?;
 
-	Ok(Block::new(block, opt))
+	Ok(Block::<K>::new(block, opt))
 }
 
 /// Verify checksum of block
@@ -585,34 +584,34 @@ fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
 }
 
 #[derive(Clone)]
-pub enum IndexType {
-	Partitioned(TopLevelIndex),
+pub enum IndexType<K: InternalKeyTrait> {
+	Partitioned(TopLevelIndex<K>),
 }
 
 #[derive(Clone)]
-pub struct Table {
+pub struct Table<K: InternalKeyTrait> {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
 	pub file_size: u64,
 	cache_id: cache::CacheID,
 
-	opts: Arc<Options>,             // Shared table options.
-	pub(crate) meta: TableMetadata, // Metadata properties of the table.
+	opts: Arc<Options<K>>,             // Shared table options.
+	pub(crate) meta: TableMetadata<K>, // Metadata properties of the table.
 
-	index_block: IndexType,
+	index_block: IndexType<K>,
 	filter_reader: Option<FilterBlockReader>,
 
-	pub(crate) internal_cmp: Arc<InternalKeyComparator>, // Internal key comparator for the table.
+	pub(crate) internal_cmp: Arc<InternalKeyComparator<K>>, // Internal key comparator for the table.
 }
 
-impl Table {
+impl<K: InternalKeyTrait> Table<K> {
 	pub(crate) fn new(
 		id: u64,
-		opts: Arc<Options>,
+		opts: Arc<Options<K>>,
 		file: Arc<dyn File>,
 		file_size: u64,
-	) -> Result<Table> {
+	) -> Result<Table<K>> {
 		// Read in the following order:
 		//    1. Footer
 		//    2. [index block]
@@ -625,15 +624,15 @@ impl Table {
 		// Using partitioned index
 		let index_block = {
 			let partitioned_index =
-				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
-			IndexType::Partitioned(partitioned_index)
+				TopLevelIndex::<K>::new(id, opts.clone(), file.clone(), &footer.index)?;
+			IndexType::<K>::Partitioned(partitioned_index)
 		};
 
 		let metaindexblock = read_table_block(opts.clone(), file.clone(), &footer.meta_index)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
-		let writer_metadata =
-			read_writer_meta_properties(&metaindexblock)?.ok_or(Error::TableMetadataNotFound)?;
+		let writer_metadata = read_writer_meta_properties::<K>(&metaindexblock)?
+			.ok_or(Error::TableMetadataNotFound)?;
 		// println!("Writer metadata: {:?}", writer_metadata);
 
 		let filter_reader = if opts.filter_policy.is_some() {
@@ -645,7 +644,7 @@ impl Table {
 
 		let cache_id = opts.block_cache.new_cache_id();
 
-		Ok(Table {
+		Ok(Table::<K> {
 			id,
 			file,
 			file_size,
@@ -659,9 +658,9 @@ impl Table {
 	}
 
 	fn read_filter_block(
-		metaix: &Block,
+		metaix: &Block<K>,
 		file: Arc<dyn File>,
-		options: &Options,
+		options: &Options<K>,
 	) -> Result<Option<FilterBlockReader>> {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name())
 			.as_bytes()
@@ -694,14 +693,14 @@ impl Table {
 		Ok(None)
 	}
 
-	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block<K>>> {
 		if let Some(block) =
 			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
 		{
 			return Ok(block.clone());
 		}
 
-		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;
+		let b = read_table_block::<K>(self.opts.clone(), self.file.clone(), location)?;
 		let b = Arc::new(b);
 
 		self.opts.block_cache.insert(
@@ -713,21 +712,21 @@ impl Table {
 		Ok(b)
 	}
 
-	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(Arc<InternalKey>, Value)>> {
+	pub(crate) fn get(&self, key: K) -> Result<Option<(Arc<K>, Value)>> {
 		let key_encoded = &key.encode();
 
 		// Check filter first
 		if let Some(ref filters) = self.filter_reader {
-			let may_contain = filters.may_contain(&key.user_key, 0);
+			let may_contain = filters.may_contain(key.user_key(), 0);
 			if !may_contain {
 				return Ok(None);
 			}
 		}
 
 		let handle = match &self.index_block {
-			IndexType::Partitioned(partitioned_index) => {
+			IndexType::<K>::Partitioned(partitioned_index) => {
 				// First find the correct partition using just the user key (optimization)
-				let partition_block = match partitioned_index.get(&key.user_key) {
+				let partition_block = match partitioned_index.get(key.user_key()) {
 					Ok(block) => block,
 					Err(_e) => {
 						return Ok(None);
@@ -741,8 +740,8 @@ impl Table {
 				if partition_iter.valid() {
 					let last_key_in_block = partition_iter.key();
 					let val = partition_iter.value();
-					if self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
-						== Ordering::Less
+					if Ordering::Less
+						== self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
 					{
 						Some(BlockHandle::decode(&val).unwrap().0)
 					} else {
@@ -778,9 +777,9 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(&self) -> TableIterator {
+	pub(crate) fn iter(&self) -> TableIterator<K> {
 		let index_block_iter = match &self.index_block {
-			IndexType::Partitioned(partitioned_index) => {
+			IndexType::<K>::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
 				if let Ok(first_block) = partitioned_index.first_partition() {
 					first_block.iter()
@@ -788,7 +787,7 @@ impl Table {
 					// If there are no partitions, create a proper empty block
 					let empty_writer = BlockWriter::new(self.opts.clone());
 					let empty_block_data = empty_writer.finish();
-					let empty_block = Block::new(empty_block_data, self.opts.clone());
+					let empty_block = Block::<K>::new(empty_block_data, self.opts.clone());
 					empty_block.iter()
 				}
 			}
@@ -806,10 +805,10 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
+	pub(crate) fn is_key_in_key_range(&self, key: &K) -> bool {
 		if let Some(ref range) = self.meta.properties.key_range {
-			return self.opts.comparator.compare(&key.user_key, &range.low) >= Ordering::Equal
-				&& self.opts.comparator.compare(&key.user_key, &range.high) <= Ordering::Equal;
+			return self.opts.comparator.compare(key.user_key(), &range.low) >= Ordering::Equal
+				&& self.opts.comparator.compare(key.user_key(), &range.high) <= Ordering::Equal;
 		}
 		true // If no key range is defined, assume the key is in range.
 	}
@@ -825,23 +824,23 @@ impl Table {
 	}
 }
 
-pub struct TableIterator {
-	table: Arc<Table>,
-	current_block: Option<BlockIterator>,
+pub struct TableIterator<K: InternalKeyTrait> {
+	table: Arc<Table<K>>,
+	current_block: Option<BlockIterator<K>>,
 	current_block_off: usize,
-	index_block: BlockIterator,
+	index_block: BlockIterator<K>,
 	/// Whether the iterator has been positioned at least once
 	positioned: bool,
 	/// Whether the iterator has been exhausted (reached the end)
 	exhausted: bool,
 	// For partitioned index support
 	current_partition_index: usize,
-	current_partition_iter: Option<BlockIterator>,
+	current_partition_iter: Option<BlockIterator<K>>,
 }
 
-impl TableIterator {
+impl<K: InternalKeyTrait> TableIterator<K> {
 	fn skip_to_next_entry(&mut self) -> Result<bool> {
-		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// First try to advance within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
@@ -911,7 +910,7 @@ impl TableIterator {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
-	fn key(&self) -> Arc<InternalKey> {
+	fn key(&self) -> Arc<K> {
 		self.current_block.as_ref().unwrap().key()
 	}
 
@@ -960,7 +959,7 @@ impl TableIterator {
 		// Current partition exhausted, move to previous partition
 		if self.current_partition_index > 0 {
 			// Get the partitioned index
-			let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
+			let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
 
 			self.current_partition_index -= 1;
 			let partition_handle = &partitioned_index.blocks[self.current_partition_index];
@@ -991,8 +990,8 @@ impl TableIterator {
 	}
 }
 
-impl Iterator for TableIterator {
-	type Item = (Arc<InternalKey>, Value);
+impl<K: InternalKeyTrait> Iterator for TableIterator<K> {
+	type Item = (Arc<K>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		// If not positioned, position at first entry
@@ -1018,7 +1017,7 @@ impl Iterator for TableIterator {
 	}
 }
 
-impl DoubleEndedIterator for TableIterator {
+impl<K: InternalKeyTrait> DoubleEndedIterator for TableIterator<K> {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.prev() {
 			return None;
@@ -1030,7 +1029,7 @@ impl DoubleEndedIterator for TableIterator {
 	}
 }
 
-impl LSMIterator for TableIterator {
+impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 	fn valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
@@ -1041,7 +1040,7 @@ impl LSMIterator for TableIterator {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
-		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
 
 		if !partitioned_index.blocks.is_empty() {
 			let partition_handle = &partitioned_index.blocks[0];
@@ -1073,7 +1072,7 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn seek_to_last(&mut self) {
-		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
 		if !partitioned_index.blocks.is_empty() {
@@ -1116,13 +1115,14 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn seek(&mut self, target: &[u8]) -> Option<()> {
-		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// Extract user key from target for partition lookup (optimization)
-		let target_key = InternalKey::decode(target);
+		let target_key = K::decode(target);
 
 		// For partitioned index, first find the correct partition
-		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(&target_key.user_key)
+		if let Some(block_handle) =
+			partitioned_index.find_block_handle_by_key(target_key.user_key())
 		{
 			// Find the partition index
 			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
@@ -1253,7 +1253,7 @@ impl LSMIterator for TableIterator {
 		false
 	}
 
-	fn key(&self) -> Arc<InternalKey> {
+	fn key(&self) -> Arc<K> {
 		self.key()
 	}
 
@@ -1265,6 +1265,8 @@ impl LSMIterator for TableIterator {
 #[cfg(test)]
 mod tests {
 	use std::vec;
+
+	use crate::sstable::InternalKey;
 
 	use super::*;
 	use rand::rngs::StdRng;
@@ -1595,7 +1597,7 @@ mod tests {
 	}
 
 	fn add_key(
-		writer: &mut TableWriter<Vec<u8>>,
+		writer: &mut TableWriter<Vec<u8>, InternalKey>,
 		key: &[u8],
 		seq: u64,
 		value: &[u8],
@@ -2731,7 +2733,7 @@ mod tests {
 
 		// Verify it's using partitioned index
 		match &table.index_block {
-			IndexType::Partitioned(_) => {
+			IndexType::<InternalKey>::Partitioned(_) => {
 				// Expected - partitioned index is the only supported type
 			}
 		}

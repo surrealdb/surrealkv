@@ -6,6 +6,7 @@ use crate::{
 	batch::{Batch, BatchReader},
 	error::Result,
 	memtable::MemTable,
+	sstable::InternalKeyTrait,
 	wal::{
 		reader::Reader,
 		segment::{get_segment_range, Error, MultiSegmentReader, SegmentRef},
@@ -27,9 +28,9 @@ use crate::{
 ///
 /// If no corruption is found, the second element will be None.
 /// If corruption is found, the second element contains (segment_id, last_valid_offset) for repair.
-pub(crate) fn replay_wal(
+pub(crate) fn replay_wal<K: InternalKeyTrait>(
 	wal_dir: &Path,
-	memtable: &Arc<MemTable>,
+	memtable: &Arc<MemTable<K>>,
 ) -> Result<(u64, Option<(usize, usize)>)> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {

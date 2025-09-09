@@ -8,6 +8,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
 use crate::lsm::{CompactionOperations, CoreInner, TABLE_FOLDER};
+use crate::sstable::InternalKeyTrait;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -69,7 +70,6 @@ impl CheckpointMetadata {
 	/// Checks if this metadata version is compatible with current implementation
 	pub fn is_compatible(&self) -> bool {
 		// For now, we only support version 1
-		// In the future, you can add backwards compatibility logic here
 		self.version == CHECKPOINT_VERSION
 	}
 
@@ -141,14 +141,14 @@ impl CheckpointMetadata {
 }
 
 /// Database checkpoint manager for creating consistent point-in-time snapshots
-pub(crate) struct DatabaseCheckpoint {
+pub(crate) struct DatabaseCheckpoint<K: InternalKeyTrait> {
 	/// Reference to the LSM core
-	core: Arc<CoreInner>,
+	core: Arc<CoreInner<K>>,
 }
 
-impl DatabaseCheckpoint {
+impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 	/// Creates a new database checkpoint manager
-	pub fn new(core: Arc<CoreInner>) -> Self {
+	pub fn new(core: Arc<CoreInner<K>>) -> Self {
 		Self {
 			core,
 		}
@@ -468,7 +468,7 @@ mod tests {
 		let metadata = CheckpointMetadata::new(0, 0, 0, 0);
 		assert!(metadata.is_compatible());
 
-		// Test future version rejection
+		// Test version rejection
 		let mut future_data = Vec::new();
 		future_data.extend_from_slice(&999u32.to_be_bytes()); // version 999
 		future_data.extend_from_slice(&[0u8; 32]); // dummy data

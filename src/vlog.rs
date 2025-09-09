@@ -9,9 +9,9 @@ use std::{
 	},
 };
 
-use crate::cache::VLogCache;
 use crate::{batch::Batch, discard::DiscardStats, Value};
-use crate::{sstable::InternalKey, vfs, Options, Tree, VLogChecksumLevel};
+use crate::{cache::VLogCache, TreeBuilder};
+use crate::{sstable::InternalKeyTrait, vfs, Options, Tree, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -46,7 +46,7 @@ impl VLogFileHeader {
 	const MAGIC: u32 = 0x564C_4F47; // "VLOG" in hex
 	const SIZE: usize = 31; // 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
 
-	pub(crate) fn new(file_id: u32, opts: &crate::Options) -> Self {
+	pub(crate) fn new(file_id: u32, max_file_size: u64, compression: u8) -> Self {
 		Self {
 			magic: Self::MAGIC,
 			version: VLOG_FORMAT_VERSION,
@@ -55,8 +55,8 @@ impl VLogFileHeader {
 				.duration_since(std::time::UNIX_EPOCH)
 				.unwrap()
 				.as_millis() as u64,
-			max_file_size: opts.vlog_max_file_size,
-			compression: opts.compression as u8,
+			max_file_size,
+			compression,
 			reserved: 0,
 		}
 	}
@@ -280,7 +280,10 @@ impl ValueLocation {
 
 	/// Resolves the actual value, handling both inline and pointer cases
 	// TODO:: Check if this pattern copies the value unnecessarily.
-	pub(crate) fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
+	pub(crate) fn resolve_value<K: InternalKeyTrait>(
+		&self,
+		vlog: Option<&Arc<VLog<K>>>,
+	) -> Result<Value> {
 		if self.is_value_pointer() {
 			// Value is a pointer to VLog
 			if let Some(vlog) = vlog {
@@ -404,7 +407,7 @@ struct VLogWriter {
 
 impl VLogWriter {
 	/// Creates a new VLogWriter for the specified file
-	fn new(path: &Path, file_id: u32, opts: &crate::Options) -> Result<Self> {
+	fn new(path: &Path, file_id: u32, max_file_size: u64, compression: u8) -> Result<Self> {
 		let file_exists = path.exists();
 		let file = OpenOptions::new().create(true).append(true).open(path)?;
 
@@ -413,7 +416,7 @@ impl VLogWriter {
 
 		// If this is a new file, write the header
 		if !file_exists || current_offset == 0 {
-			let header = VLogFileHeader::new(file_id, opts);
+			let header = VLogFileHeader::new(file_id, max_file_size, compression);
 			let header_bytes = header.encode();
 			writer.write_all(&header_bytes)?;
 			writer.flush()?;
@@ -489,7 +492,7 @@ impl VLogWriter {
 /// - Discard statistics tracking for intelligent GC candidate selection
 /// - Atomic file replacement during compaction
 /// - LSM integration for staleness detection
-pub(crate) struct VLog {
+pub(crate) struct VLog<K: InternalKeyTrait> {
 	/// Base directory for VLog files
 	path: PathBuf,
 
@@ -530,23 +533,23 @@ pub(crate) struct VLog {
 	discard_stats: Mutex<DiscardStats>,
 
 	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
-	pub(crate) delete_list: Arc<DeleteList>,
+	pub(crate) delete_list: Arc<DeleteList<K>>,
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
 	cache: Arc<VLogCache>,
 
 	/// Options for VLog configuration
-	opts: Arc<Options>,
+	opts: Arc<Options<K>>,
 }
 
-impl VLog {
+impl<K: InternalKeyTrait> VLog<K> {
 	/// Returns the file path for a VLog file with the given ID
 	fn vlog_file_path(&self, file_id: u32) -> PathBuf {
 		self.opts.vlog_file_path(file_id as u64)
 	}
 
 	/// Creates a new VLog instance
-	pub(crate) fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options>) -> Result<Self> {
+	pub(crate) fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options<K>>) -> Result<Self> {
 		let dir = dir.as_ref().to_path_buf();
 
 		// Get the parent directory for the discard stats file
@@ -556,7 +559,8 @@ impl VLog {
 			dir.parent().ok_or_else(|| Error::Other("VLog directory has no parent".to_string()))?;
 
 		// Initialize the global delete list LSM tree
-		let delete_list = Arc::new(DeleteList::new(dir.clone())?);
+		// TODO: Make this internalkey
+		let delete_list = Arc::new(DeleteList::<K>::new(dir.clone())?);
 
 		let vlog = Self {
 			path: dir.clone(),
@@ -596,7 +600,12 @@ impl VLog {
 				// Create new file
 				let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 				let file_path = self.vlog_file_path(file_id);
-				let new_writer = VLogWriter::new(&file_path, file_id, &self.opts)?;
+				let new_writer = VLogWriter::new(
+					&file_path,
+					file_id,
+					self.opts.vlog_max_file_size,
+					self.opts.compression as u8,
+				)?;
 
 				// Register the new file for GC safety
 				self.register_vlog_file(file_id, file_path, 0); // Start with size 0
@@ -681,7 +690,12 @@ impl VLog {
 			self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
 
 			// Set the last file up as the active writer
-			let writer = VLogWriter::new(&max_file_path.unwrap(), highest_file_id, &self.opts)?;
+			let writer = VLogWriter::new(
+				&max_file_path.unwrap(),
+				highest_file_id,
+				self.opts.vlog_max_file_size,
+				self.opts.compression as u8,
+			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
 			*self.writer.write().unwrap() = Some(writer);
 		}
@@ -1026,8 +1040,8 @@ impl VLog {
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-			let internal_key = InternalKey::decode(&key);
-			let user_key = internal_key.user_key.to_vec();
+			let internal_key = K::decode(&key);
+			let user_key = internal_key.user_key().to_vec();
 
 			// Check if this user key is stale using the global delete list
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
@@ -1045,7 +1059,7 @@ impl VLog {
 				values_skipped += 1;
 				stale_seq_nums.push(internal_key.seq_num());
 			} else {
-				let internal_key = InternalKey::decode(&key);
+				let internal_key = K::decode(&key);
 
 				// Add this entry to the batch to be rewritten with the correct operation type
 				// This preserves the original operation (Set, Delete, Merge, etc.)
@@ -1057,10 +1071,10 @@ impl VLog {
 				} else {
 					Some(value.as_slice())
 				};
-				batch.add_record(kind, &internal_key.user_key, val)?;
+				batch.add_record(kind, internal_key.user_key().as_ref(), val)?;
 
 				// Update batch size tracking
-				batch_size += internal_key.user_key.len() + value.len();
+				batch_size += internal_key.user_key().len() + value.len();
 
 				// If batch is full, commit it
 				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
@@ -1220,9 +1234,9 @@ impl VLog {
 
 // ===== VLog GC Manager =====
 /// Manages VLog garbage collection as an independent task
-pub(crate) struct VLogGCManager {
+pub(crate) struct VLogGCManager<K: InternalKeyTrait> {
 	/// Reference to the VLog
-	vlog: Arc<VLog>,
+	vlog: Arc<VLog<K>>,
 
 	/// Reference to the commit pipeline for coordinating writes during GC
 	commit_pipeline: Arc<CommitPipeline>,
@@ -1240,9 +1254,9 @@ pub(crate) struct VLogGCManager {
 	task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl VLogGCManager {
+impl<K: InternalKeyTrait> VLogGCManager<K> {
 	/// Creates a new VLog GC manager
-	pub(crate) fn new(vlog: Arc<VLog>, commit_pipeline: Arc<CommitPipeline>) -> Self {
+	pub(crate) fn new(vlog: Arc<VLog<K>>, commit_pipeline: Arc<CommitPipeline>) -> Self {
 		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let notify = Arc::new(tokio::sync::Notify::new());
@@ -1323,27 +1337,25 @@ impl VLogGCManager {
 /// Global Delete List using LSM Tree
 /// Uses a dedicated LSM tree for tracking stale user keys.
 /// This provides better performance and consistency with the main LSM tree design.
-pub(crate) struct DeleteList {
+pub(crate) struct DeleteList<K: InternalKeyTrait> {
 	/// LSM tree for storing delete list entries (user_key -> value_size)
-	tree: Arc<Tree>,
+	tree: Arc<Tree<K>>,
 }
 
-impl DeleteList {
+impl<K: InternalKeyTrait> DeleteList<K> {
 	pub(crate) fn new(base_path: PathBuf) -> Result<Self> {
 		let delete_list_path = base_path.join("delete_list");
 
-		// Create a dedicated LSM tree for the delete list
-		let delete_list_opts = Options {
-			path: delete_list_path,
-			// Disable VLog for the delete list to avoid circular dependency
-			enable_vlog: false,
-			..Default::default()
-		};
-
-		let tree =
-			Arc::new(Tree::new(Arc::new(delete_list_opts)).map_err(|e| {
-				Error::Other(format!("Failed to create global delete list LSM: {e}"))
-			})?);
+		// Disable VLog for the delete list to avoid circular dependency
+		let tree = Arc::new(
+			TreeBuilder::new()
+				.with_path(delete_list_path)
+				.with_enable_vlog(false)
+				.build()
+				.map_err(|e| {
+					Error::Other(format!("Failed to create global delete list LSM: {e}"))
+				})?,
+		);
 
 		Ok(Self {
 			tree,
@@ -1414,10 +1426,12 @@ impl DeleteList {
 }
 #[cfg(test)]
 mod tests {
+	use crate::sstable::InternalKey;
+
 	use super::*;
 	use tempfile::TempDir;
 
-	fn create_test_vlog() -> (VLog, TempDir) {
+	fn create_test_vlog() -> (VLog<InternalKey>, TempDir) {
 		let temp_dir = TempDir::new().unwrap();
 		let mut opts = Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -1579,7 +1593,7 @@ mod tests {
 		std::fs::create_dir_all(&vlog_dir).unwrap();
 
 		// Create initial VLog and add data to create multiple files
-		let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+		let vlog1 = VLog::<InternalKey>::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
 
 		// Add data to create multiple VLog files
 		let mut file_ids = Vec::new();
@@ -1609,7 +1623,7 @@ mod tests {
 		drop(vlog1);
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
-		let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+		let vlog2 = VLog::<InternalKey>::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
 
 		// Verify that all existing files can be read
 		for (i, pointer) in pointers.iter().enumerate() {
@@ -1785,7 +1799,7 @@ mod tests {
 		let test_data = b"inline test data";
 		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 
-		let resolved = location.resolve_value(Some(&vlog)).unwrap();
+		let resolved = location.resolve_value::<InternalKey>(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1802,7 +1816,7 @@ mod tests {
 		let location = ValueLocation::with_pointer(pointer);
 
 		// Resolve should return the original value
-		let resolved = location.resolve_value(Some(&vlog)).unwrap();
+		let resolved = location.resolve_value::<InternalKey>(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, value);
 	}
 
@@ -1814,7 +1828,7 @@ mod tests {
 
 		// Should work without VLog for inline data
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved = decoded_location.resolve_value(None).unwrap();
+		let resolved = decoded_location.resolve_value::<InternalKey>(None).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1832,11 +1846,12 @@ mod tests {
 
 		// Should resolve with VLog
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved = decoded_location.resolve_value(Some(&Arc::new(vlog))).unwrap();
+		let resolved =
+			decoded_location.resolve_value::<InternalKey>(Some(&Arc::new(vlog))).unwrap();
 		assert_eq!(&*resolved, value);
 
 		// Should fail without VLog
-		let result = decoded_location.resolve_value(None);
+		let result = decoded_location.resolve_value::<InternalKey>(None);
 		assert!(result.is_err());
 	}
 
@@ -1859,8 +1874,8 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_encoding() {
-		let opts = crate::Options::default();
-		let header = VLogFileHeader::new(123, &opts);
+		let opts = Options::<InternalKey>::default();
+		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let encoded = header.encode();
 		let decoded = VLogFileHeader::decode(&encoded).unwrap();
 
@@ -1876,8 +1891,8 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_invalid_magic() {
-		let opts = crate::Options::default();
-		let mut header = VLogFileHeader::new(123, &opts);
+		let opts = Options::<InternalKey>::default();
+		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.magic = 0x12345678; // Invalid magic
 		let encoded = header.encode();
 
@@ -1886,8 +1901,8 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_invalid_size() {
-		let opts = crate::Options::default();
-		let header = VLogFileHeader::new(123, &opts);
+		let opts = Options::<InternalKey>::default();
+		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let mut encoded = header.encode().to_vec();
 		encoded.pop(); // Remove one byte to make it invalid size
 
@@ -1896,8 +1911,8 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_version_compatibility() {
-		let opts = crate::Options::default();
-		let mut header = VLogFileHeader::new(123, &opts);
+		let opts = Options::<InternalKey>::default();
+		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.version = VLOG_FORMAT_VERSION;
 		assert!(header.is_compatible());
 
@@ -1923,7 +1938,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_restart_continues_last_file() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options {
+		let opts = Options::<InternalKey> {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -2064,7 +2079,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_restart_with_multiple_files() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options {
+		let opts = Options::<InternalKey> {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 800,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -2212,7 +2227,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_writer_reopen_append_only_behavior() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Arc::new(Options {
+		let opts = Arc::new(Options::<InternalKey> {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -2229,7 +2244,13 @@ mod tests {
 
 		// Phase 1: Create VLogWriter and write initial data
 		{
-			let mut writer1 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+			let mut writer1 = VLogWriter::new(
+				&test_file_path,
+				file_id,
+				opts.vlog_max_file_size,
+				opts.compression as u8,
+			)
+			.unwrap();
 
 			// Write several entries in the first phase
 			for i in 0..5 {
@@ -2269,7 +2290,13 @@ mod tests {
 		let mut phase2_pointers = Vec::new();
 		let mut phase2_data = Vec::new();
 		{
-			let mut writer2 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+			let mut writer2 = VLogWriter::new(
+				&test_file_path,
+				file_id,
+				opts.vlog_max_file_size,
+				opts.compression as u8,
+			)
+			.unwrap();
 
 			// Verify the writer starts at the end of the existing file
 			assert_eq!(
@@ -2354,7 +2381,13 @@ mod tests {
 
 		// Phase 4: Additional verification - Test a third reopen to ensure pattern continues
 		{
-			let mut writer3 = VLogWriter::new(&test_file_path, file_id, &opts).unwrap();
+			let mut writer3 = VLogWriter::new(
+				&test_file_path,
+				file_id,
+				opts.vlog_max_file_size,
+				opts.compression as u8,
+			)
+			.unwrap();
 			let current_file_size = std::fs::metadata(&test_file_path).unwrap().len();
 
 			// Verify writer3 starts at the current end of file

@@ -19,7 +19,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::table::Table,
+	sstable::{table::Table, InternalKey, InternalKeyTrait},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -29,7 +29,7 @@ use crate::{
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		writer::Wal,
 	},
-	Error, Options, Value,
+	Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value,
 };
 
 use async_trait::async_trait;
@@ -42,14 +42,14 @@ pub const TABLE_FOLDER: &str = "sstables";
 /// Compaction is essential for maintaining read performance by merging
 /// overlapping SSTables and removing deleted entries.
 #[async_trait]
-pub trait CompactionOperations: Send + Sync {
+pub trait CompactionOperations<K: InternalKeyTrait>: Send + Sync {
 	/// Flushes the active memtable to disk, converting it into an immutable SSTable.
 	/// This is the first step in the LSM tree's write path.
 	fn compact_memtable(&self) -> Result<()>;
 
 	/// Performs compaction according to the specified strategy.
 	/// Compaction merges SSTables to reduce read amplification and remove tombstones.
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy<K>>) -> Result<()>;
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -70,13 +70,13 @@ pub trait CompactionOperations: Send + Sync {
 ///   has progressively larger SSTables with non-overlapping key ranges (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
-pub(crate) struct CoreInner {
+pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
 	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
 	/// This memtable is typically implemented as a skip list or balanced tree to
 	/// maintain sorted order while supporting concurrent access.
-	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
+	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable<K>>>>,
 
 	/// Collection of immutable memtables waiting to be flushed to disk.
 	///
@@ -84,7 +84,7 @@ pub(crate) struct CoreInner {
 	/// immutable and a new active memtable is created. These immutable memtables
 	/// continue serving reads while waiting for background threads to flush them
 	/// to disk as SSTables.
-	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -94,10 +94,10 @@ pub(crate) struct CoreInner {
 	///   key ranges within a level, enabling efficient binary search.
 	///
 	/// In memory-only mode, this is None since we don't persist to disk.
-	pub level_manifest: Option<Arc<RwLock<LevelManifest>>>,
+	pub level_manifest: Option<Arc<RwLock<LevelManifest<K>>>>,
 
 	/// Configuration options controlling LSM tree behavior
-	pub opts: Arc<Options>,
+	pub opts: Arc<Options<K>>,
 
 	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency Control).
 	/// Snapshots provide consistent point-in-time views of the data.
@@ -108,18 +108,18 @@ pub(crate) struct CoreInner {
 	pub(crate) oracle: Arc<Oracle>,
 
 	/// Value Log (VLog)
-	pub(crate) vlog: Option<Arc<VLog>>,
+	pub(crate) vlog: Option<Arc<VLog<K>>>,
 
 	/// Write-Ahead Log (WAL) for durability
 	/// In memory-only mode, this is None since we don't persist to disk.
 	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
 }
 
-impl CoreInner {
+impl<K: InternalKeyTrait> CoreInner<K> {
 	/// Creates a new LSM tree core instance
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
 		// Initialize active and immutable memtables
-		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::default())));
+		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new())));
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
 		// TODO: Add a way to recover from the WAL or level manifest
@@ -141,7 +141,7 @@ impl CoreInner {
 
 		let vlog = if opts.enable_vlog && !opts.in_memory_only {
 			let vlog_path = opts.vlog_dir();
-			Some(Arc::new(VLog::new(&vlog_path, opts.clone())?))
+			Some(Arc::new(VLog::<K>::new(&vlog_path, opts.clone())?))
 		} else {
 			None
 		};
@@ -198,7 +198,7 @@ impl CoreInner {
 	///
 	/// This prevents race conditions by holding the active_memtable write lock
 	/// for both the memtable swap and WAL rotation operations.
-	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable>)>> {
+	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable<K>>)>> {
 		let mut active_memtable = self.active_memtable.write().unwrap();
 
 		// Don't flush an empty memtable
@@ -234,13 +234,13 @@ impl CoreInner {
 	/// - SSTables may have overlapping key ranges
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
-	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
+	fn add_table_to_l0(&self, table: Arc<Table<K>>) -> Result<()> {
 		let mut original_manifest = self.level_manifest.as_ref().unwrap().write().unwrap();
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
 		let table_id = table.id;
 
 		// Create a changeset to add the table
-		let mut changeset = ManifestChangeSet::default();
+		let mut changeset = ManifestChangeSet::<K>::default();
 		changeset.new_tables.push((0, table));
 
 		// Apply the changeset
@@ -262,7 +262,7 @@ impl CoreInner {
 	}
 }
 
-impl CompactionOperations for CoreInner {
+impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
 		self.make_room_for_write()
@@ -274,7 +274,7 @@ impl CompactionOperations for CoreInner {
 	/// - Merges overlapping SSTables to reduce read amplification
 	/// - Removes deleted entries (tombstones) to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy<K>>) -> Result<()> {
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
@@ -286,17 +286,17 @@ impl CompactionOperations for CoreInner {
 	}
 }
 
-struct LsmCommitEnv {
-	core: Arc<CoreInner>,
+struct LsmCommitEnv<K: InternalKeyTrait> {
+	core: Arc<CoreInner<K>>,
 
 	/// Manages background tasks like flushing and compaction
 	/// In memory-only mode, this is None since we don't need background tasks
 	task_manager: Option<Arc<TaskManager>>,
 }
 
-impl LsmCommitEnv {
+impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 	/// Creates a new commit environment for the LSM tree
-	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
+	pub(crate) fn new(core: Arc<CoreInner<K>>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager: Some(task_manager),
@@ -304,7 +304,7 @@ impl LsmCommitEnv {
 	}
 
 	/// Creates a new commit environment for in-memory mode (without task manager)
-	pub(crate) fn new_in_memory(core: Arc<CoreInner>) -> Result<Self> {
+	pub(crate) fn new_in_memory(core: Arc<CoreInner<K>>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager: None,
@@ -312,7 +312,7 @@ impl LsmCommitEnv {
 	}
 }
 
-impl CommitEnv for LsmCommitEnv {
+impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 	// Write batch to WAL (synchronous operation)
 	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
 		if let Some(ref wal) = self.core.wal {
@@ -362,9 +362,9 @@ impl CommitEnv for LsmCommitEnv {
 /// - Memtable flushing: Converting full memtables to SSTables
 /// - Compaction: Merging SSTables to maintain read performance
 /// - Garbage collection: Removing obsolete SSTables
-pub(crate) struct Core {
+pub(crate) struct Core<K: InternalKeyTrait> {
 	/// The inner LSM tree implementation
-	inner: Arc<CoreInner>,
+	inner: Arc<CoreInner<K>>,
 
 	/// The commit pipeline that handles write batches
 	commit_pipeline: Arc<CommitPipeline>,
@@ -373,18 +373,18 @@ pub(crate) struct Core {
 	task_manager: Mutex<Option<Arc<TaskManager>>>,
 
 	/// VLog garbage collection manager
-	vlog_gc_manager: Mutex<Option<VLogGCManager>>,
+	vlog_gc_manager: Mutex<Option<VLogGCManager<K>>>,
 }
 
-impl std::ops::Deref for Core {
-	type Target = CoreInner;
+impl<K: InternalKeyTrait> std::ops::Deref for Core<K> {
+	type Target = CoreInner<K>;
 
 	fn deref(&self) -> &Self::Target {
 		&self.inner
 	}
 }
 
-impl Core {
+impl<K: InternalKeyTrait> Core<K> {
 	/// Function to replay WAL with automatic repair on corruption.
 	///
 	fn replay_wal_with_repair<F>(
@@ -393,13 +393,13 @@ impl Core {
 		mut set_recovered_memtable: F,
 	) -> Result<u64>
 	where
-		F: FnMut(Arc<MemTable>) -> Result<()>,
+		F: FnMut(Arc<MemTable<K>>) -> Result<()>,
 	{
 		// Create a new empty memtable to recover WAL entries
-		let recovered_memtable = Arc::new(MemTable::default());
+		let recovered_memtable = Arc::new(MemTable::<K>::default());
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num = match replay_wal(wal_path, &recovered_memtable)? {
+		let wal_seq_num = match replay_wal::<K>(wal_path, &recovered_memtable)? {
 			(seq_num, None) => {
 				// No corruption detected, successful replay
 				seq_num
@@ -456,12 +456,12 @@ impl Core {
 	}
 
 	/// Creates a new LSM tree with background task management
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		let inner = Arc::new(CoreInner::new(opts.clone())?);
+	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
+		let inner = Arc::new(CoreInner::<K>::new(opts.clone())?);
 
 		if opts.in_memory_only {
 			// For in-memory mode, create a minimal core without background tasks
-			let commit_env = Arc::new(LsmCommitEnv::new_in_memory(inner.clone())?);
+			let commit_env = Arc::new(LsmCommitEnv::<K>::new_in_memory(inner.clone())?);
 			let commit_pipeline = CommitPipeline::new(commit_env);
 
 			// Set initial sequence number
@@ -508,7 +508,8 @@ impl Core {
 
 			// Initialize VLog GC manager only if VLog is enabled
 			if let Some(ref vlog) = inner.vlog {
-				let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
+				let vlog_gc_manager =
+					VLogGCManager::<K>::new(vlog.clone(), commit_pipeline.clone());
 				vlog_gc_manager.start();
 				*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
 			}
@@ -571,20 +572,20 @@ impl Core {
 
 		// Step 5: Flush all directories to ensure durability
 		// Skip this in memory-only mode since we don't persist to disk
-		sync_directory_structure(&self.inner.opts)?;
+		sync_directory_structure(&*self.inner.opts)?;
 
 		Ok(())
 	}
 }
 
 #[derive(Clone)]
-pub struct Tree {
-	pub(crate) core: Arc<Core>,
+pub struct Tree<K: InternalKeyTrait = InternalKey> {
+	pub(crate) core: Arc<Core<K>>,
 }
 
-impl Tree {
+impl<K: InternalKeyTrait> Tree<K> {
 	/// Creates a new LSM tree with the specified options
-	pub fn new(opts: Arc<Options>) -> Result<Self> {
+	fn new(opts: Arc<Options<K>>) -> Result<Self> {
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
@@ -603,7 +604,7 @@ impl Tree {
 	}
 
 	/// Creates all required directory structure for the LSM tree
-	fn create_directory_structure(opts: &Options) -> Result<()> {
+	fn create_directory_structure(opts: &Options<K>) -> Result<()> {
 		if opts.in_memory_only {
 			return Ok(());
 		}
@@ -621,13 +622,13 @@ impl Tree {
 	}
 
 	/// Transactions provide a consistent, atomic view of the database.
-	pub fn begin(&self) -> Result<Transaction> {
+	pub fn begin(&self) -> Result<Transaction<K>> {
 		let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
 		Ok(txn)
 	}
 
 	/// Begins a new transaction with the specified mode
-	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction<K>> {
 		let txn = Transaction::new(self.core.clone(), mode)?;
 		Ok(txn)
 	}
@@ -635,7 +636,7 @@ impl Tree {
 	/// Executes a read-only operation in a consistent snapshot.
 	///
 	/// This provides a consistent view of the database without blocking writes.
-	pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
+	pub fn view(&self, f: impl FnOnce(&mut Transaction<K>) -> Result<()>) -> Result<()> {
 		let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
 		f(&mut txn)?;
 		Ok(())
@@ -757,6 +758,148 @@ impl Tree {
 	}
 }
 
+/// A builder for creating LSM trees with type-safe configuration.
+pub struct TreeBuilder<K: InternalKeyTrait> {
+	opts: Options<K>,
+}
+
+impl<K: InternalKeyTrait> TreeBuilder<K> {
+	/// Creates a new TreeBuilder with default options for the specified key type.
+	pub fn new() -> Self {
+		Self {
+			opts: Options::<K>::default(),
+		}
+	}
+
+	/// Creates a new TreeBuilder with the specified options.
+	///
+	/// This method ensures type safety by requiring the options to use the same key type.
+	pub fn with_options(opts: Options<K>) -> Self {
+		Self {
+			opts,
+		}
+	}
+
+	/// Sets the database path.
+	pub fn with_path(mut self, path: std::path::PathBuf) -> Self {
+		self.opts = self.opts.with_path(path);
+		self
+	}
+
+	/// Sets the block size.
+	pub fn with_block_size(mut self, size: usize) -> Self {
+		self.opts = self.opts.with_block_size(size);
+		self
+	}
+
+	/// Sets the block restart interval.
+	pub fn with_block_restart_interval(mut self, interval: usize) -> Self {
+		self.opts = self.opts.with_block_restart_interval(interval);
+		self
+	}
+
+	/// Sets the filter policy.
+	pub fn with_filter_policy(mut self, policy: Option<Arc<dyn FilterPolicy>>) -> Self {
+		self.opts = self.opts.with_filter_policy(policy);
+		self
+	}
+
+	/// Sets the comparator.
+	pub fn with_comparator(mut self, comparator: Arc<dyn Comparator>) -> Self {
+		self.opts = self.opts.with_comparator(comparator);
+		self
+	}
+
+	/// Sets the compression type.
+	pub fn with_compression(mut self, compression: CompressionType) -> Self {
+		self.opts = self.opts.with_compression(compression);
+		self
+	}
+
+	/// Sets the number of levels.
+	pub fn with_level_count(mut self, count: u8) -> Self {
+		self.opts = self.opts.with_level_count(count);
+		self
+	}
+
+	/// Sets the maximum memtable size.
+	pub fn with_max_memtable_size(mut self, size: usize) -> Self {
+		self.opts = self.opts.with_max_memtable_size(size);
+		self
+	}
+
+	/// Sets the block cache capacity.
+	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
+		self.opts = self.opts.with_block_cache_capacity(capacity_bytes);
+		self
+	}
+
+	/// Sets the VLog cache capacity.
+	pub fn with_vlog_cache_capacity(mut self, capacity_bytes: u64) -> Self {
+		self.opts = self.opts.with_vlog_cache_capacity(capacity_bytes);
+		self
+	}
+
+	/// Sets the index partition size.
+	pub fn with_index_partition_size(mut self, size: usize) -> Self {
+		self.opts = self.opts.with_index_partition_size(size);
+		self
+	}
+
+	/// Sets the VLog maximum file size.
+	pub fn with_vlog_max_file_size(mut self, size: u64) -> Self {
+		self.opts = self.opts.with_vlog_max_file_size(size);
+		self
+	}
+
+	/// Sets the VLog checksum verification level.
+	pub fn with_vlog_checksum_verification(mut self, level: VLogChecksumLevel) -> Self {
+		self.opts = self.opts.with_vlog_checksum_verification(level);
+		self
+	}
+
+	/// Enables or disables VLog.
+	pub fn with_enable_vlog(mut self, enable: bool) -> Self {
+		self.opts = self.opts.with_enable_vlog(enable);
+		self
+	}
+
+	/// Sets the VLog garbage collection discard ratio.
+	pub fn with_vlog_gc_discard_ratio(mut self, ratio: f64) -> Self {
+		self.opts = self.opts.with_vlog_gc_discard_ratio(ratio);
+		self
+	}
+
+	/// Sets the in-memory only mode.
+	pub fn with_in_memory_only(mut self, in_memory: bool) -> Self {
+		self.opts = self.opts.with_in_memory_only(in_memory);
+		self
+	}
+
+	/// Builds the LSM tree with the configured options.
+	///
+	/// This method ensures type safety by using the same key type K
+	/// for both the builder and the resulting tree.
+	pub fn build(self) -> Result<Tree<K>> {
+		Tree::new(Arc::new(self.opts))
+	}
+
+	/// Builds the LSM tree and returns both the tree and the options.
+	///
+	/// This is useful when you need to keep a reference to the options
+	/// after creating the tree.
+	pub fn build_with_options(self) -> Result<(Tree<K>, Arc<Options<K>>)> {
+		let opts = Arc::new(self.opts);
+		let tree = Tree::new(opts.clone())?;
+		Ok((tree, opts))
+	}
+}
+
+impl<K: InternalKeyTrait> Default for TreeBuilder<K> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 /// Syncs a directory to ensure all changes are persisted to disk
 fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let file = File::open(path)?;
@@ -766,7 +909,7 @@ fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 
 /// Syncs all directory structures for the LSM store to ensure durability
 /// Returns explicit errors indicating which path failed
-fn sync_directory_structure(opts: &Options) -> Result<()> {
+fn sync_directory_structure<K: InternalKeyTrait>(opts: &Options<K>) -> Result<()> {
 	if opts.in_memory_only {
 		return Ok(());
 	}
@@ -2924,5 +3067,50 @@ mod tests {
 
 		// Clean shutdown (drop will close it)
 		tree2.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn test_tree_builder() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		// Test TreeBuilder with default key type (InternalKey)
+		let tree = TreeBuilder::<InternalKey>::new()
+			.with_path(path.clone())
+			.with_max_memtable_size(64 * 1024)
+			.with_enable_vlog(true)
+			.with_vlog_max_file_size(1024 * 1024)
+			.with_in_memory_only(false)
+			.build()
+			.unwrap();
+
+		// Test basic operations
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"test_key", b"test_value").unwrap();
+		txn.commit().await.unwrap();
+
+		let txn = tree.begin().unwrap();
+		let result = txn.get(b"test_key").unwrap().unwrap();
+		assert_eq!(result, Arc::from(b"test_value".as_slice()));
+
+		// Test build_with_options
+		let (tree2, opts) = TreeBuilder::<InternalKey>::new()
+			.with_path(temp_dir.path().join("tree2"))
+			.with_in_memory_only(true)
+			.build_with_options()
+			.unwrap();
+
+		// Verify the options are accessible
+		assert!(opts.in_memory_only);
+		assert_eq!(opts.path, temp_dir.path().join("tree2"));
+
+		// Test basic operations on the second tree
+		let mut txn = tree2.begin().unwrap();
+		txn.set(b"key2", b"value2").unwrap();
+		txn.commit().await.unwrap();
+
+		let txn = tree2.begin().unwrap();
+		let result = txn.get(b"key2").unwrap().unwrap();
+		assert_eq!(result, Arc::from(b"value2".as_slice()));
 	}
 }

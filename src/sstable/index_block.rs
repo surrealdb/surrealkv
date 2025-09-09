@@ -9,7 +9,7 @@ use crate::{
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockWriter},
 		table::{compress_block, read_table_block, write_block_at_offset},
-		InternalKey,
+		InternalKeyTrait,
 	},
 	vfs::File,
 	CompressionType, Options,
@@ -47,20 +47,22 @@ impl BlockHandleWithKey {
 // ...
 // [index block - partition N]
 // [index block - top-level index]
-pub(crate) struct TopLevelIndexWriter {
-	opts: Arc<Options>,
-	index_blocks: Vec<BlockWriter>,
-	current_block: BlockWriter,
+pub(crate) struct TopLevelIndexWriter<K: InternalKeyTrait> {
+	opts: Arc<Options<K>>,
+	index_blocks: Vec<BlockWriter<K>>,
+	current_block: BlockWriter<K>,
 	max_block_size: usize,
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl TopLevelIndexWriter {
-	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> TopLevelIndexWriter {
+impl<K: InternalKeyTrait> TopLevelIndexWriter<K> {
+	pub(crate) fn new(opts: Arc<Options<K>>, max_block_size: usize) -> TopLevelIndexWriter<K> {
 		TopLevelIndexWriter {
 			opts: opts.clone(),
 			index_blocks: Vec::new(),
 			current_block: BlockWriter::new(opts),
 			max_block_size,
+			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -73,8 +75,7 @@ impl TopLevelIndexWriter {
 		let total_size = finished_blocks_size + self.current_block.size_estimate();
 
 		// Add an estimate for the top-level index
-		let top_level_estimate =
-			(self.index_blocks.len() + 1) * (std::mem::size_of::<InternalKey>() + 8);
+		let top_level_estimate = (self.index_blocks.len() + 1) * (std::mem::size_of::<K>() + 8);
 
 		total_size + top_level_estimate
 	}
@@ -144,18 +145,19 @@ impl TopLevelIndexWriter {
 
 // TODO: use block_cache to store top-level index blocks
 #[derive(Clone)]
-pub(crate) struct TopLevelIndex {
+pub(crate) struct TopLevelIndex<K: InternalKeyTrait> {
 	id: u64,
-	opts: Arc<Options>,
+	opts: Arc<Options<K>>,
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
 	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
 	file: Arc<dyn File>,
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl TopLevelIndex {
+impl<K: InternalKeyTrait> TopLevelIndex<K> {
 	pub(crate) fn new(
 		id: u64,
-		opt: Arc<Options>,
+		opt: Arc<Options<K>>,
 		f: Arc<dyn File>,
 		location: &BlockHandle,
 	) -> Result<Self> {
@@ -164,10 +166,10 @@ impl TopLevelIndex {
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
 			// Extract user key from the encoded internal key
-			let internal_key = InternalKey::decode(&key);
+			let internal_key = K::decode(&key);
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
-				user_key: internal_key.user_key.as_ref().to_vec(),
+				user_key: internal_key.user_key().as_ref().to_vec(),
 				handle,
 			});
 		}
@@ -176,6 +178,7 @@ impl TopLevelIndex {
 			opts: opt.clone(),
 			blocks,
 			file: f.clone(),
+			_phantom: std::marker::PhantomData,
 		})
 	}
 
@@ -196,7 +199,7 @@ impl TopLevelIndex {
 		result
 	}
 
-	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
+	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block<K>>> {
 		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
 			return Ok(block);
 		}
@@ -209,7 +212,7 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn get(&self, user_key: &[u8]) -> Result<Arc<Block>> {
+	pub(crate) fn get(&self, user_key: &[u8]) -> Result<Arc<Block<K>>> {
 		let Some(block_handle) = self.find_block_handle_by_key(user_key) else {
 			return Err(Error::BlockNotFound);
 		};
@@ -218,7 +221,7 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn first_partition(&self) -> Result<Arc<Block>> {
+	pub(crate) fn first_partition(&self) -> Result<Arc<Block<K>>> {
 		if let Some(first_block_handle) = self.blocks.first() {
 			self.load_block(first_block_handle)
 		} else {
@@ -230,7 +233,7 @@ impl TopLevelIndex {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::sstable::InternalKeyKind;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::Iterator;
 	use std::sync::Arc;
 
@@ -244,9 +247,9 @@ mod tests {
 
 	#[test]
 	fn test_top_level_index_writer_basic() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let max_block_size = 100;
-		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+		let mut writer = TopLevelIndexWriter::<InternalKey>::new(opts, max_block_size);
 
 		let key1 = create_internal_key(b"key1".to_vec(), 1);
 		let handle1 = vec![1, 2, 3];
@@ -259,9 +262,9 @@ mod tests {
 
 	#[test]
 	fn test_top_level_index_writer_multiple_blocks() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let max_block_size = 50; // Small size to force multiple blocks
-		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+		let mut writer = TopLevelIndexWriter::<InternalKey>::new(opts, max_block_size);
 
 		for i in 0..10 {
 			let key = create_internal_key(format!("key{i}").as_bytes().to_vec(), i as u64);
@@ -288,9 +291,9 @@ mod tests {
 
 	#[test]
 	fn test_top_level_index_writer_large_entries() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let max_block_size = 1000;
-		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+		let mut writer = TopLevelIndexWriter::<InternalKey>::new(opts, max_block_size);
 
 		let large_key = create_internal_key(vec![b'a'; 500], 1);
 		let large_handle = vec![b'b'; 500];
@@ -303,9 +306,9 @@ mod tests {
 
 	#[test]
 	fn test_top_level_index_writer_exact_block_size() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let max_block_size = 100;
-		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+		let mut writer = TopLevelIndexWriter::<InternalKey>::new(opts, max_block_size);
 
 		// Add entries that exactly fill up one block
 		let key = create_internal_key(b"key".to_vec(), 1);
@@ -339,12 +342,12 @@ mod tests {
 
 	#[test]
 	fn test_find_block_handle_by_key() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
 		// Initialize TopLevelIndex with predefined blocks using user keys only
-		let index = TopLevelIndex {
+		let index = TopLevelIndex::<InternalKey> {
 			id: 0,
 			opts: opts.clone(),
 			blocks: vec![
@@ -353,6 +356,7 @@ mod tests {
 				BlockHandleWithKey::new(b"j".to_vec(), BlockHandle::new(20, 10)),
 			],
 			file: f.clone(),
+			_phantom: std::marker::PhantomData,
 		};
 
 		// A list of tuples where the first element is the key to find,
@@ -383,9 +387,9 @@ mod tests {
 
 	#[test]
 	fn test_partitioned_index_lookup() {
-		let opts = Arc::new(Options::default());
+		let opts = Arc::new(Options::<InternalKey>::default());
 		let max_block_size = 50; // Small size to force multiple partitions
-		let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+		let mut writer = TopLevelIndexWriter::<InternalKey>::new(opts.clone(), max_block_size);
 
 		// Add enough entries to create multiple partitions
 		let entries = vec![
