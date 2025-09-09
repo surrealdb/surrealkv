@@ -7,6 +7,7 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Error, Result};
+use crate::sstable::InternalKeyTrait;
 use crate::transaction::Transaction;
 
 /// Entry used for tracking transaction operations in the commit queue
@@ -89,7 +90,7 @@ impl Oracle {
 	}
 
 	/// Prepares a transaction for commit by checking conflicts and assigning a transaction ID.
-	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
+	pub(crate) fn prepare_commit<K: InternalKeyTrait>(&self, txn: &Transaction<K>) -> Result<u64> {
 		// Convert transaction writeset to BTreeMap<Bytes, Option<Bytes>>
 		let mut writeset = BTreeMap::new();
 		for (key, entry_opt) in &txn.write_set {

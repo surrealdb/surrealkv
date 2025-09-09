@@ -5,7 +5,10 @@ use crate::{
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	lsm::CoreInner,
 	memtable::ImmutableMemtables,
-	sstable::table::{Table, TableWriter},
+	sstable::{
+		table::{Table, TableWriter},
+		InternalKeyTrait,
+	},
 	vfs::File,
 	vlog::VLog,
 	Options as LSMOptions,
@@ -19,15 +22,15 @@ use std::{
 };
 
 /// Compaction options
-pub(crate) struct CompactionOptions {
-	pub lopts: Arc<LSMOptions>,
-	pub level_manifest: Arc<RwLock<LevelManifest>>,
-	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-	pub vlog: Option<Arc<VLog>>,
+pub(crate) struct CompactionOptions<K: InternalKeyTrait> {
+	pub lopts: Arc<LSMOptions<K>>,
+	pub level_manifest: Arc<RwLock<LevelManifest<K>>>,
+	pub immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
+	pub vlog: Option<Arc<VLog<K>>>,
 }
 
-impl CompactionOptions {
-	pub(crate) fn from(tree: &CoreInner) -> Self {
+impl<K: InternalKeyTrait> CompactionOptions<K> {
+	pub(crate) fn from(tree: &CoreInner<K>) -> Self {
 		Self {
 			lopts: tree.opts.clone(),
 			level_manifest: tree
@@ -41,13 +44,16 @@ impl CompactionOptions {
 }
 
 /// Handles the compaction state and operations
-pub(crate) struct Compactor {
-	pub(crate) options: CompactionOptions,
-	pub(crate) strategy: Arc<dyn CompactionStrategy>,
+pub(crate) struct Compactor<K: InternalKeyTrait> {
+	pub(crate) options: CompactionOptions<K>,
+	pub(crate) strategy: Arc<dyn CompactionStrategy<K>>,
 }
 
-impl Compactor {
-	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
+impl<K: InternalKeyTrait> Compactor<K> {
+	pub(crate) fn new(
+		options: CompactionOptions<K>,
+		strategy: Arc<dyn CompactionStrategy<K>>,
+	) -> Self {
 		Self {
 			options,
 			strategy,
@@ -66,7 +72,7 @@ impl Compactor {
 
 	fn merge_tables(
 		&self,
-		mut levels: RwLockWriteGuard<'_, LevelManifest>,
+		mut levels: RwLockWriteGuard<'_, LevelManifest<K>>,
 		input: &CompactionInput,
 	) -> Result<()> {
 		let merge_result = {
@@ -81,9 +87,9 @@ impl Compactor {
 				})
 				.collect();
 
-			let iterators: Vec<BoxedIterator<'_>> = to_merge
+			let iterators: Vec<BoxedIterator<'_, K>> = to_merge
 				.into_iter()
-				.map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
+				.map(|table| Box::new(table.iter()) as BoxedIterator<'_, K>)
 				.collect();
 
 			// Hide tables that are being merged
@@ -129,7 +135,7 @@ impl Compactor {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedIterator<'_>>,
+		merge_iter: Vec<BoxedIterator<'_, K>>,
 		input: &CompactionInput,
 	) -> Result<HashMap<u32, i64>> {
 		let file = SysFile::create(path)?;
@@ -155,7 +161,7 @@ impl Compactor {
 		Ok(comp_iter.discard_stats)
 	}
 
-	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
+	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table<K>>) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write().unwrap();
 		let _imm_guard = self.options.immutable_memtables.write();
 
@@ -167,7 +173,7 @@ impl Compactor {
 		}
 
 		// Create a changeset for the compaction
-		let mut changeset = ManifestChangeSet::default();
+		let mut changeset = ManifestChangeSet::<K>::default();
 
 		// Add tables to delete (the ones being merged) - use the same efficient approach as original
 		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
@@ -206,11 +212,11 @@ impl Compactor {
 		}
 	}
 
-	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
+	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table<K>>> {
 		let file = SysFile::open(table_path)?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		Ok(Arc::new(Table::new(table_id, self.options.lopts.clone(), file, file_size)?))
+		Ok(Arc::new(Table::<K>::new(table_id, self.options.lopts.clone(), file, file_size)?))
 	}
 }

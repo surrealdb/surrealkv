@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
 	error::Error,
-	sstable::{table::TableFormat, InternalKey},
+	sstable::{table::TableFormat, InternalKeyTrait},
 	CompressionType, Result, Value,
 };
 
@@ -171,16 +171,16 @@ impl Properties {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableMetadata {
+pub(crate) struct TableMetadata<K: InternalKeyTrait> {
 	pub(crate) has_point_keys: Option<bool>,
 	pub(crate) smallest_seq_num: u64,
 	pub(crate) largest_seq_num: u64,
 	pub(crate) properties: Properties,
-	pub(crate) smallest_point: Option<InternalKey>,
-	pub(crate) largest_point: Option<InternalKey>,
+	pub(crate) smallest_point: Option<K>,
+	pub(crate) largest_point: Option<K>,
 }
 
-impl TableMetadata {
+impl<K: InternalKeyTrait> TableMetadata<K> {
 	pub(crate) fn new() -> Self {
 		TableMetadata {
 			smallest_point: None,
@@ -192,12 +192,12 @@ impl TableMetadata {
 		}
 	}
 
-	pub(crate) fn set_smallest_point_key(&mut self, k: InternalKey) {
+	pub(crate) fn set_smallest_point_key(&mut self, k: K) {
 		self.smallest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
 
-	pub(crate) fn set_largest_point_key(&mut self, k: InternalKey) {
+	pub(crate) fn set_largest_point_key(&mut self, k: K) {
 		self.largest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
@@ -290,7 +290,7 @@ impl TableMetadata {
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
 				let key_bytes = Bytes::from(key_bytes);
-				Some(InternalKey::decode(&key_bytes))
+				Some(K::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
 		};
@@ -303,7 +303,7 @@ impl TableMetadata {
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
 				let key_bytes = Bytes::from(key_bytes);
-				Some(InternalKey::decode(&key_bytes))
+				Some(K::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
 		};
@@ -319,11 +319,11 @@ impl TableMetadata {
 	}
 }
 
-pub(crate) fn size_of_writer_metadata() -> usize {
+pub(crate) fn size_of_writer_metadata<K: InternalKeyTrait>() -> usize {
 	size_of::<Option<bool>>()
 		+ size_of::<u64>() * 2
 		+ size_of_properties()
-		+ size_of::<Option<InternalKey>>() * 2
+		+ size_of::<Option<K>>() * 2
 }
 
 fn size_of_properties() -> usize {

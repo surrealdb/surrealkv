@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
+use crate::sstable::InternalKeyTrait;
 use crate::{IterResult, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -145,7 +146,7 @@ impl ReadOptions {
 
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
-pub struct Transaction {
+pub struct Transaction<K: InternalKeyTrait> {
 	/// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
 
@@ -153,10 +154,10 @@ pub struct Transaction {
 	durability: Durability,
 
 	/// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
-	pub(crate) snapshot: Option<Snapshot>,
+	pub(crate) snapshot: Option<Snapshot<K>>,
 
 	/// `core` is the underlying core for the transaction. This is shared between transactions.
-	pub(crate) core: Arc<Core>,
+	pub(crate) core: Arc<Core<K>>,
 
 	/// `write_set` is a map of keys to entries.
 	pub(crate) write_set: BTreeMap<Bytes, Option<Entry>>,
@@ -168,9 +169,9 @@ pub struct Transaction {
 	pub(crate) start_commit_id: u64,
 }
 
-impl Transaction {
+impl<K: InternalKeyTrait> Transaction<K> {
 	/// Prepare a new transaction in the given mode.
-	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+	pub(crate) fn new(core: Arc<Core<K>>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
 
 		let start_commit_id =
@@ -305,10 +306,10 @@ impl Transaction {
 	}
 
 	/// Creates an iterator for a range scan between start and end keys (inclusive).
-	pub fn range<K: AsRef<[u8]>>(
+	pub fn range<Key: AsRef<[u8]>>(
 		&self,
-		start: K,
-		end: K,
+		start: Key,
+		end: Key,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		let mut options = ReadOptions::default().with_limit(limit);
@@ -337,10 +338,10 @@ impl Transaction {
 
 	/// Creates an iterator that returns only keys in the given range.
 	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
-	pub fn keys<K: AsRef<[u8]>>(
+	pub fn keys<Key: AsRef<[u8]>>(
 		&self,
-		start: K,
-		end: K,
+		start: Key,
+		end: Key,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
@@ -427,7 +428,7 @@ impl Transaction {
 	}
 }
 
-impl Drop for Transaction {
+impl<K: InternalKeyTrait> Drop for Transaction<K> {
 	fn drop(&mut self) {
 		self.rollback();
 	}
@@ -467,7 +468,7 @@ impl Entry {
 }
 
 /// An iterator that performs a merging scan over a transaction's snapshot and write set.
-pub(crate) struct TransactionRangeIterator<'a> {
+pub(crate) struct TransactionRangeIterator<'a, K: InternalKeyTrait> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
@@ -482,12 +483,15 @@ pub(crate) struct TransactionRangeIterator<'a> {
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
+
+	/// Phantom data to hold the key type
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<'a> TransactionRangeIterator<'a> {
+impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
-		tx: &'a Transaction,
+		tx: &'a Transaction<K>,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
 		options: &ReadOptions,
@@ -525,6 +529,7 @@ impl<'a> TransactionRangeIterator<'a> {
 			limit: options.limit.unwrap_or(usize::MAX),
 			count: 0,
 			keys_only: options.keys_only,
+			_phantom: std::marker::PhantomData,
 		})
 	}
 
@@ -565,7 +570,7 @@ impl<'a> TransactionRangeIterator<'a> {
 	}
 }
 
-impl Iterator for TransactionRangeIterator<'_> {
+impl<K: InternalKeyTrait> Iterator for TransactionRangeIterator<'_, K> {
 	type Item = IterResult;
 
 	/// Merges results from write set and snapshot in key order
@@ -632,7 +637,7 @@ impl Iterator for TransactionRangeIterator<'_> {
 	}
 }
 
-impl DoubleEndedIterator for TransactionRangeIterator<'_> {
+impl<K: InternalKeyTrait> DoubleEndedIterator for TransactionRangeIterator<'_, K> {
 	/// Merges results from write set and snapshot in reverse key order
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if self.count >= self.limit {
@@ -703,7 +708,7 @@ mod tests {
 
 	use bytes::Bytes;
 
-	use crate::{lsm::Tree, Options};
+	use crate::{lsm::Tree, sstable::InternalKey, Options};
 
 	use super::*;
 
@@ -1672,7 +1677,7 @@ mod tests {
 			max_memtable_size: 512,
 			..Default::default()
 		});
-		let tree = Tree::new(opts).unwrap();
+		let tree = Tree::<InternalKey>::new(opts).unwrap();
 
 		// Create values that will be stored in VLog (> 50 bytes)
 		let key1 = b"key1";

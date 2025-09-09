@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use crate::{
 	compaction::{leveled::Strategy, CompactionStrategy},
 	lsm::CompactionOperations,
+	sstable::InternalKeyTrait,
 };
 
 /// Manages background tasks for the LSM tree
@@ -44,7 +45,7 @@ impl fmt::Debug for TaskManager {
 }
 
 impl TaskManager {
-	pub(crate) fn new(core: Arc<dyn CompactionOperations>) -> Self {
+	pub(crate) fn new<K: InternalKeyTrait>(core: Arc<dyn CompactionOperations<K>>) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
 		let memtable_notify = Arc::new(Notify::new());
 		let level_notify = Arc::new(Notify::new());
@@ -101,7 +102,7 @@ impl TaskManager {
 
 					running.store(true, Ordering::SeqCst);
 					// Use leveled compaction strategy
-					let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
+					let strategy: Arc<dyn CompactionStrategy<K>> = Arc::new(Strategy::default());
 					if let Err(e) = core.compact(strategy) {
 						// TODO: Handle error appropriately
 						eprintln!("\n Level compaction task error: {e:?}");
@@ -166,6 +167,7 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
 	use crate::error::Result;
+	use crate::sstable::InternalKey;
 	use crate::Error;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::sync::Arc;
@@ -211,7 +213,7 @@ mod tests {
 		}
 	}
 
-	impl CompactionOperations for MockCoreInner {
+	impl CompactionOperations<InternalKey> for MockCoreInner {
 		fn compact_memtable(&self) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_millis(self.memtable_delay_ms) {
@@ -228,7 +230,7 @@ mod tests {
 			Ok(())
 		}
 
-		fn compact(&self, _strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		fn compact(&self, _strategy: Arc<dyn CompactionStrategy<InternalKey>>) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_millis(self.level_delay_ms) {
 				std::hint::spin_loop();

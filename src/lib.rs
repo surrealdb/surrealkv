@@ -19,10 +19,10 @@ pub mod vlog;
 mod wal;
 
 pub use crate::error::{Error, Result};
-pub use crate::lsm::Tree;
+pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
-use sstable::{bloom::LevelDBBloomFilter, InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
+use sstable::{bloom::LevelDBBloomFilter, InternalKey, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};
 
 /// Type alias for iterator results containing key-value pairs
@@ -45,13 +45,13 @@ pub enum VLogChecksumLevel {
 }
 
 #[derive(Clone)]
-pub struct Options {
+pub struct Options<K: InternalKeyTrait = InternalKey> {
 	pub block_size: usize,
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
 	pub compression: CompressionType,
-	block_cache: Arc<cache::BlockCache>,
+	block_cache: Arc<cache::BlockCache<K>>,
 	vlog_cache: Arc<cache::VLogCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
@@ -72,7 +72,7 @@ pub struct Options {
 	pub in_memory_only: bool,
 }
 
-impl Default for Options {
+impl<K: InternalKeyTrait> Default for Options<K> {
 	fn default() -> Self {
 		let bf = LevelDBBloomFilter::new(10);
 
@@ -82,7 +82,7 @@ impl Default for Options {
 			comparator: Arc::new(crate::BytewiseComparator {}),
 			compression: CompressionType::None,
 			filter_policy: Some(Arc::new(bf)),
-			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
+			block_cache: Arc::new(cache::BlockCache::<K>::with_capacity_bytes(1 << 20)),
 			vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
 			path: PathBuf::from(""),
 			level_count: 1,
@@ -98,7 +98,7 @@ impl Default for Options {
 	}
 }
 
-impl Options {
+impl<K: InternalKeyTrait> Options<K> {
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -145,7 +145,7 @@ impl Options {
 
 	// Method to set block_cache capacity
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
-		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
+		self.block_cache = Arc::new(cache::BlockCache::<K>::with_capacity_bytes(capacity_bytes));
 		self
 	}
 
@@ -323,7 +323,7 @@ pub trait FilterPolicy: Send + Sync {
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
 
-pub trait Iterator {
+pub trait Iterator<K: InternalKeyTrait> {
 	/// An iterator is either positioned at a key/value pair, or
 	/// not valid.  This method returns true iff the iterator is valid.
 	fn valid(&self) -> bool;
@@ -355,7 +355,7 @@ pub trait Iterator {
 	/// the returned slice is valid only until the next modification of
 	/// the iterator.
 	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<InternalKey>;
+	fn key(&self) -> Arc<K>;
 
 	/// Return the value for the current entry.  The underlying storage for
 	/// the returned slice is valid only until the next modification of
@@ -456,30 +456,32 @@ impl Comparator for BytewiseComparator {
 }
 
 #[derive(Clone)]
-pub(crate) struct InternalKeyComparator {
+pub(crate) struct InternalKeyComparator<K: InternalKeyTrait> {
 	user_comparator: Arc<dyn Comparator>,
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl InternalKeyComparator {
+impl<K: InternalKeyTrait> InternalKeyComparator<K> {
 	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
 		Self {
 			user_comparator,
+			_phantom: std::marker::PhantomData,
 		}
 	}
 }
 
-impl Comparator for InternalKeyComparator {
+impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 	fn name(&self) -> &'static str {
 		"leveldb.InternalKeyComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
+		// Decode internal keys using the generic trait
+		let key_a = K::decode(a);
+		let key_b = K::decode(b);
 
 		// First compare by user key (ascending)
-		match self.user_comparator.compare(&key_a.user_key, &key_b.user_key) {
+		match self.user_comparator.compare(key_a.user_key().as_ref(), key_b.user_key().as_ref()) {
 			Ordering::Equal => {
 				// If user keys are equal, compare by sequence number (descending)
 				key_b.seq_num().cmp(&key_a.seq_num())
@@ -493,24 +495,28 @@ impl Comparator for InternalKeyComparator {
 			return a.to_vec();
 		}
 
-		// Decode keys
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
+		// Decode keys using the generic trait
+		let key_a = K::decode(a);
+		let key_b = K::decode(b);
 
 		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(&key_a.user_key, &key_b.user_key) != Ordering::Equal {
-			let sep = self.user_comparator.separator(&key_a.user_key, &key_b.user_key);
+		if self.user_comparator.compare(key_a.user_key().as_ref(), key_b.user_key().as_ref())
+			!= Ordering::Equal
+		{
+			let sep = self
+				.user_comparator
+				.separator(key_a.user_key().as_ref(), key_b.user_key().as_ref());
 
 			// Use MAX_SEQUENCE_NUMBER when separator is shorter than original
-			if sep.len() < key_a.user_key.len()
-				&& self.user_comparator.compare(&key_a.user_key, &sep) == Ordering::Less
+			if sep.len() < key_a.user_key().len()
+				&& self.user_comparator.compare(key_a.user_key().as_ref(), &sep) == Ordering::Less
 			{
-				let result = InternalKey::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, key_a.kind());
+				let result = K::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, key_a.kind());
 				return result.encode();
 			}
 
 			// Otherwise use original sequence number
-			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind());
+			let result = K::new(sep, key_a.seq_num(), key_a.kind());
 			return result.encode();
 		}
 
@@ -519,11 +525,11 @@ impl Comparator for InternalKeyComparator {
 	}
 
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = InternalKey::decode(key);
-		let user_key_succ = self.user_comparator.successor(&internal_key.user_key);
+		let internal_key = K::decode(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key().as_ref());
 
 		// Create a new internal key with the successor user key and original sequence/kind
-		let result = InternalKey::new(user_key_succ, internal_key.seq_num(), internal_key.kind());
+		let result = K::new(user_key_succ, internal_key.seq_num(), internal_key.kind());
 		result.encode()
 	}
 }

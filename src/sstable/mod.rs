@@ -6,6 +6,7 @@ pub(crate) mod meta;
 pub(crate) mod table;
 
 use std::cmp::Reverse;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 // FilterPolicy is an algorithm for probabilistically encoding a set of keys.
@@ -15,6 +16,37 @@ pub trait FilterPolicy: Send + Sync {
 	fn name(&self) -> &str;
 	fn may_contain(&self, filter: &[u8], key: &[u8]) -> bool;
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
+}
+
+/// Trait for internal key implementations that provide key format and operations
+/// for the LSM tree. This allows different internal key formats to be used
+/// in different scenarios while maintaining a consistent interface.
+pub trait InternalKeyTrait:
+	Clone + Debug + PartialEq + Eq + PartialOrd + Ord + Send + Sync + Default + 'static
+{
+	/// Create a new internal key from user key, sequence number, and kind
+	fn new(user_key: Vec<u8>, seq_num: u64, kind: InternalKeyKind) -> Self;
+
+	/// Decode an internal key from its encoded byte representation
+	fn decode(encoded_key: &[u8]) -> Self;
+
+	/// Encode this internal key to its byte representation
+	fn encode(&self) -> Vec<u8>;
+
+	/// Get the user key portion
+	fn user_key(&self) -> &Arc<[u8]>;
+
+	/// Get the sequence number
+	fn seq_num(&self) -> u64;
+
+	/// Get the key kind/type
+	fn kind(&self) -> InternalKeyKind;
+
+	/// Check if this key represents a tombstone (delete operation)
+	fn is_tombstone(&self) -> bool;
+
+	/// Calculate the size of this key in bytes
+	fn size(&self) -> usize;
 }
 
 #[repr(u8)]
@@ -51,7 +83,7 @@ impl From<u8> for InternalKeyKind {
 // Subtracting 1 gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 // InternalKey is a key used for on-disk representation of a key.
 //
 // <user-key>.<kind>.<seq-num>
@@ -123,6 +155,41 @@ impl InternalKey {
 		}
 
 		false
+	}
+}
+
+// Implement the InternalKeyTrait for the default InternalKey
+impl InternalKeyTrait for InternalKey {
+	fn new(user_key: Vec<u8>, seq_num: u64, kind: InternalKeyKind) -> Self {
+		Self::new(user_key, seq_num, kind)
+	}
+
+	fn decode(encoded_key: &[u8]) -> Self {
+		Self::decode(encoded_key)
+	}
+
+	fn encode(&self) -> Vec<u8> {
+		self.encode()
+	}
+
+	fn user_key(&self) -> &Arc<[u8]> {
+		&self.user_key
+	}
+
+	fn seq_num(&self) -> u64 {
+		self.seq_num()
+	}
+
+	fn kind(&self) -> InternalKeyKind {
+		self.kind()
+	}
+
+	fn is_tombstone(&self) -> bool {
+		self.is_tombstone()
+	}
+
+	fn size(&self) -> usize {
+		self.size()
 	}
 }
 

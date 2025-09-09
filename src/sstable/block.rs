@@ -3,11 +3,10 @@ use std::sync::Arc;
 
 use crate::{
 	error::{Error, Result},
+	sstable::InternalKeyTrait,
 	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Options, Value,
 };
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
-
-use super::InternalKey;
 
 pub(crate) type BlockData = Vec<u8>;
 
@@ -86,21 +85,24 @@ impl BlockHandle {
 /// ```
 ///
 #[derive(Clone)]
-pub struct Block {
+pub struct Block<K: InternalKeyTrait> {
 	pub(crate) block: Arc<BlockData>,
-	opts: Arc<Options>,
+	opts: Arc<Options<K>>,
+	/// Phantom data to hold the key type
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl Block {
-	pub(crate) fn iter(&self) -> BlockIterator {
+impl<K: InternalKeyTrait> Block<K> {
+	pub(crate) fn iter(&self) -> BlockIterator<K> {
 		BlockIterator::new(self.opts.clone(), self.block.clone())
 	}
 
-	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
+	pub(crate) fn new(data: BlockData, opts: Arc<Options<K>>) -> Block<K> {
 		assert!(data.len() > 4);
 		Block {
 			block: Arc::new(data),
 			opts,
+			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -109,7 +111,7 @@ impl Block {
 	}
 }
 
-pub(crate) struct BlockWriter {
+pub(crate) struct BlockWriter<K: InternalKeyTrait> {
 	restart_interval: usize,
 	// Destination buffer
 	buffer: Vec<u8>,
@@ -121,6 +123,8 @@ pub(crate) struct BlockWriter {
 	num_entries: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
+	/// Phantom data to hold the key type
+	_phantom: std::marker::PhantomData<K>,
 }
 
 /*
@@ -172,17 +176,18 @@ Block writer logic:
    67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
 
 */
-impl BlockWriter {
+impl<K: InternalKeyTrait> BlockWriter<K> {
 	// Constructor for BlockWriter
-	pub(crate) fn new(opt: Arc<Options>) -> Self {
+	pub(crate) fn new(opt: Arc<Options<K>>) -> Self {
 		BlockWriter {
-			internal_cmp: Arc::new(InternalKeyComparator::new(opt.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::<K>::new(opt.comparator.clone())),
 			buffer: Vec::with_capacity(opt.block_size),
 			restart_interval: opt.block_restart_interval,
 			restart_points: vec![0],
 			last_key: Vec::new(),
 			restart_counter: 0,
 			num_entries: 0,
+			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -271,7 +276,7 @@ impl BlockWriter {
 	}
 }
 
-pub struct BlockIterator {
+pub struct BlockIterator<K: InternalKeyTrait> {
 	block: Arc<BlockData>,
 	restart_points: Vec<u32>,
 	offset: usize,
@@ -285,11 +290,13 @@ pub struct BlockIterator {
 	current_value_offset_end: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
+	/// Phantom data to hold the key type
+	_phantom: std::marker::PhantomData<K>,
 }
 
-impl BlockIterator {
+impl<K: InternalKeyTrait> BlockIterator<K> {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
+	pub(crate) fn new(options: Arc<Options<K>>, block: Arc<BlockData>) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -300,7 +307,8 @@ impl BlockIterator {
 			*restart_point = u32::decode_fixed(&block[start_point..end_point]).unwrap();
 		}
 
-		let internal_comparator = Arc::new(InternalKeyComparator::new(options.comparator.clone()));
+		let internal_comparator =
+			Arc::new(InternalKeyComparator::<K>::new(options.comparator.clone()));
 
 		BlockIterator {
 			block,
@@ -313,6 +321,7 @@ impl BlockIterator {
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
 			internal_cmp: internal_comparator,
+			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -375,7 +384,7 @@ impl BlockIterator {
 	}
 }
 
-impl Iterator for BlockIterator {
+impl<K: InternalKeyTrait> Iterator for BlockIterator<K> {
 	type Item = (Key, Value);
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.advance() {
@@ -388,7 +397,7 @@ impl Iterator for BlockIterator {
 	}
 }
 
-impl DoubleEndedIterator for BlockIterator {
+impl<K: InternalKeyTrait> DoubleEndedIterator for BlockIterator<K> {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.prev() {
 			return None;
@@ -401,7 +410,7 @@ impl DoubleEndedIterator for BlockIterator {
 	}
 }
 
-impl LSMIterator for BlockIterator {
+impl<K: InternalKeyTrait> LSMIterator<K> for BlockIterator<K> {
 	// Checks if the iterator is valid (has a current entry)
 	fn valid(&self) -> bool {
 		!self.current_key.is_empty()
@@ -503,8 +512,8 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Get the current key
-	fn key(&self) -> Arc<InternalKey> {
-		Arc::new(InternalKey::decode(&self.current_key))
+	fn key(&self) -> Arc<K> {
+		Arc::new(K::decode(&self.current_key))
 	}
 
 	// Get the current value

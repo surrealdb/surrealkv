@@ -8,7 +8,7 @@ use crate::iter::BoxedIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
+use crate::sstable::{meta::KeyRange, InternalKeyKind, InternalKeyTrait};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
 
@@ -16,22 +16,22 @@ use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use interval_heap::IntervalHeap;
 
 #[derive(Eq)]
-struct HeapItem {
-	key: Arc<InternalKey>,
+struct HeapItem<K: InternalKeyTrait> {
+	key: Arc<K>,
 	value: Value,
 	iterator_index: usize,
 }
 
-impl PartialEq for HeapItem {
+impl<K: InternalKeyTrait> PartialEq for HeapItem<K> {
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
 }
 
-impl Ord for HeapItem {
+impl<K: InternalKeyTrait> Ord for HeapItem<K> {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// First compare by user key
-		match self.key.user_key.cmp(&other.key.user_key) {
+		match self.key.user_key().cmp(other.key.user_key()) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
@@ -45,7 +45,7 @@ impl Ord for HeapItem {
 	}
 }
 
-impl PartialOrd for HeapItem {
+impl<K: InternalKeyTrait> PartialOrd for HeapItem<K> {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
@@ -84,13 +84,13 @@ impl Counter {
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
-pub(crate) struct IterState {
+pub(crate) struct IterState<K: InternalKeyTrait> {
 	/// The active memtable receiving current writes
-	pub active: Arc<MemTable>,
+	pub active: Arc<MemTable<K>>,
 	/// Immutable memtables waiting to be flushed
-	pub immutable: Vec<Arc<MemTable>>,
+	pub immutable: Vec<Arc<MemTable<K>>>,
 	/// All levels containing SSTables
-	pub levels: Levels,
+	pub levels: Levels<K>,
 }
 
 // ===== Snapshot Implementation =====
@@ -102,18 +102,18 @@ pub(crate) struct IterState {
 /// All reads through the snapshot only see data with sequence numbers less than
 /// or equal to the snapshot's sequence number.
 #[derive(Clone)]
-pub(crate) struct Snapshot {
+pub(crate) struct Snapshot<K: InternalKeyTrait> {
 	/// Reference to the LSM tree core
-	core: Arc<Core>,
+	core: Arc<Core<K>>,
 
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
 	seq_num: u64,
 }
 
-impl Snapshot {
+impl<K: InternalKeyTrait> Snapshot<K> {
 	/// Creates a new snapshot at the current sequence number
-	pub(crate) fn new(core: Arc<Core>, seq_num: u64) -> Self {
+	pub(crate) fn new(core: Arc<Core<K>>, seq_num: u64) -> Self {
 		// Increment counter so compaction knows to preserve old versions
 		core.snapshot_counter.increment();
 		Self {
@@ -167,8 +167,7 @@ impl Snapshot {
 			// Check the tables in each level for the key
 			for level in &level_manifest.levels {
 				for table in level.tables.iter() {
-					let ikey =
-						InternalKey::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set);
+					let ikey = K::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set);
 
 					if !table.is_key_in_key_range(&ikey) {
 						continue; // Skip this table if the key is not in its range
@@ -191,10 +190,10 @@ impl Snapshot {
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
-	pub(crate) fn range<K: AsRef<[u8]>>(
+	pub(crate) fn range<Key: AsRef<[u8]>>(
 		&self,
-		start: K,
-		end: K,
+		start: Key,
+		end: Key,
 		keys_only: bool,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
 		// Create a range from start (inclusive) to end (inclusive)
@@ -203,7 +202,7 @@ impl Snapshot {
 	}
 }
 
-impl Drop for Snapshot {
+impl<K: InternalKeyTrait> Drop for Snapshot<K> {
 	fn drop(&mut self) {
 		// Decrement counter so compaction can clean up old versions
 		self.core.snapshot_counter.decrement();
@@ -211,15 +210,15 @@ impl Drop for Snapshot {
 }
 
 /// A merge iterator that sorts by key+seqno.
-pub(crate) struct KMergeIterator<'a> {
+pub(crate) struct KMergeIterator<'a, K: InternalKeyTrait> {
 	// Owned state
-	_iter_state: Box<IterState>,
+	_iter_state: Box<IterState<K>>,
 
 	/// Array of iterators to merge over
-	iterators: NonNull<Vec<BoxedIterator<'a>>>,
+	iterators: NonNull<Vec<BoxedIterator<'a, K>>>,
 
 	/// Interval heap of items ordered by their current key
-	heap: IntervalHeap<HeapItem>,
+	heap: IntervalHeap<HeapItem<K>>,
 
 	/// Range bounds for filtering
 	range_end: Bound<Vec<u8>>,
@@ -231,17 +230,17 @@ pub(crate) struct KMergeIterator<'a> {
 	initialized_hi: bool,
 }
 
-impl<'a> KMergeIterator<'a> {
+impl<'a, K: InternalKeyTrait> KMergeIterator<'a, K> {
 	fn new_from(
-		iter_state: IterState,
+		iter_state: IterState<K>,
 		snapshot_seq_num: u64,
 		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
 	) -> Self {
 		let boxed_state = Box::new(iter_state);
-		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
+		let mut iterators: Vec<BoxedIterator<'a, K>> = Vec::new();
 
 		unsafe {
-			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
+			let state_ref: &'a IterState<K> = &*(&*boxed_state as *const IterState<K>);
 			// Compute query key range for table overlap checks
 			let query_range = {
 				let low = match &range.0 {
@@ -281,20 +280,17 @@ impl<'a> KMergeIterator<'a> {
 					// Seek to start if bounded
 					match &range.0 {
 						Bound::Included(key) => {
-							let ikey = InternalKey::new(
-								key.clone(),
-								INTERNAL_KEY_SEQ_NUM_MAX,
-								InternalKeyKind::Max,
-							);
+							let ikey =
+								K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max);
 							table_iter.seek(&ikey.encode());
 						}
 						Bound::Excluded(key) => {
-							let ikey = InternalKey::new(key.clone(), 0, InternalKeyKind::Set);
+							let ikey = K::new(key.clone(), 0, InternalKeyKind::Set);
 							table_iter.seek(&ikey.encode());
 							// If we're at the excluded key, advance once
 							if table_iter.valid() {
 								let current = &table_iter.key();
-								if current.user_key.as_ref() == key.as_slice() {
+								if current.user_key().as_ref() == key.as_slice() {
 									table_iter.advance();
 								}
 							}
@@ -366,7 +362,7 @@ impl<'a> KMergeIterator<'a> {
 	}
 }
 
-impl Drop for KMergeIterator<'_> {
+impl<K: InternalKeyTrait> Drop for KMergeIterator<'_, K> {
 	fn drop(&mut self) {
 		// Must drop the iterators before iter_state
 		// because the iterators contain references to iter_state
@@ -377,8 +373,8 @@ impl Drop for KMergeIterator<'_> {
 	}
 }
 
-impl Iterator for KMergeIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
+impl<K: InternalKeyTrait> Iterator for KMergeIterator<'_, K> {
+	type Item = (Arc<K>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
@@ -406,7 +402,7 @@ impl Iterator for KMergeIterator<'_> {
 			}
 
 			// Check if the key exceeds the range end
-			let user_key = &heap_item.key.user_key;
+			let user_key = heap_item.key.user_key();
 			match &self.range_end {
 				Bound::Included(end) => {
 					if user_key.as_ref() > end.as_slice() {
@@ -429,7 +425,7 @@ impl Iterator for KMergeIterator<'_> {
 	}
 }
 
-impl DoubleEndedIterator for KMergeIterator<'_> {
+impl<K: InternalKeyTrait> DoubleEndedIterator for KMergeIterator<'_, K> {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.initialized_hi {
 			self.initialize_hi();
@@ -456,7 +452,7 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 			}
 
 			// Check if the key exceeds the range end
-			let user_key = &heap_item.key.user_key;
+			let user_key = heap_item.key.user_key();
 			match &self.range_end {
 				Bound::Included(end) => {
 					if user_key.as_ref() > end.as_slice() {
@@ -480,11 +476,17 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 }
 
 /// Consumes a stream of KVs and emits a new stream to the filter rules
-pub struct FilterIter<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> {
+pub struct FilterIter<I, K: InternalKeyTrait>
+where
+	I: DoubleEndedIterator<Item = (Arc<K>, Value)>,
+{
 	inner: DoubleEndedPeekable<I>,
 }
 
-impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> FilterIter<I> {
+impl<I, K: InternalKeyTrait> FilterIter<I, K>
+where
+	I: DoubleEndedIterator<Item = (Arc<K>, Value)>,
+{
 	pub fn new(iter: I) -> Self {
 		let iter = iter.double_ended_peekable();
 		Self {
@@ -499,7 +501,7 @@ impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> FilterIter<I> {
 			};
 
 			// Consume version
-			if next.0.user_key == *key {
+			if next.0.user_key() == key {
 				self.inner.next().expect("should not be empty");
 			} else {
 				return Ok(());
@@ -508,21 +510,25 @@ impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> FilterIter<I> {
 	}
 }
 
-impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> Iterator for FilterIter<I> {
-	type Item = (Arc<InternalKey>, Value);
+impl<I, K: InternalKeyTrait> Iterator for FilterIter<I, K>
+where
+	I: DoubleEndedIterator<Item = (Arc<K>, Value)>,
+{
+	type Item = (Arc<K>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let head = self.inner.next()?;
 
 		// Keep only latest version of the key
-		let _ = self.skip_to_latest(&head.0.user_key);
+		let _ = self.skip_to_latest(head.0.user_key());
 
 		Some(head)
 	}
 }
 
-impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> DoubleEndedIterator
-	for FilterIter<I>
+impl<I, K: InternalKeyTrait> DoubleEndedIterator for FilterIter<I, K>
+where
+	I: DoubleEndedIterator<Item = (Arc<K>, Value)>,
 {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		loop {
@@ -535,24 +541,24 @@ impl<I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>> DoubleEndedIterat
 				}
 			};
 
-			if prev.0.user_key < tail.0.user_key {
+			if prev.0.user_key() < tail.0.user_key() {
 				return Some(tail);
 			}
 		}
 	}
 }
 
-pub(crate) struct SnapshotIterator<'a> {
+pub(crate) struct SnapshotIterator<'a, K: InternalKeyTrait> {
 	// The complete pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
-	pipeline: Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>,
-	core: Arc<Core>,
+	pipeline: Box<dyn DoubleEndedIterator<Item = (Arc<K>, Value)> + 'a>,
+	core: Arc<Core<K>>,
 	/// When true, only return keys without resolving values
 	keys_only: bool,
 }
 
-impl SnapshotIterator<'_> {
+impl<K: InternalKeyTrait> SnapshotIterator<'_, K> {
 	/// Creates a new iterator over a specific key range
-	fn new_from<R>(core: Arc<Core>, seq_num: u64, range: R, keys_only: bool) -> Result<Self>
+	fn new_from<R>(core: Arc<Core<K>>, seq_num: u64, range: R, keys_only: bool) -> Result<Self>
 	where
 		R: RangeBounds<Vec<u8>>,
 	{
@@ -564,7 +570,7 @@ impl SnapshotIterator<'_> {
 			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
 
 		// Collect iterators from all tables in all levels
-		let iter_state = if let Some(ref level_manifest) = core.level_manifest {
+		let iter_state: IterState<K> = if let Some(ref level_manifest) = core.level_manifest {
 			let manifest = guardian::ArcRwLockReadGuardian::take(level_manifest.clone()).unwrap();
 			IterState {
 				active: active.clone(),
@@ -576,7 +582,7 @@ impl SnapshotIterator<'_> {
 			IterState {
 				active: active.clone(),
 				immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
-				levels: Levels(vec![]), // Empty levels
+				levels: Levels::<K>(vec![]), // Empty levels
 			}
 		};
 
@@ -590,7 +596,8 @@ impl SnapshotIterator<'_> {
 		}
 
 		// Build the pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
-		let merge_iter = KMergeIterator::new_from(iter_state, seq_num, (start, end));
+		let merge_iter: KMergeIterator<'_, K> =
+			KMergeIterator::new_from(iter_state, seq_num, (start, end));
 		let filter_iter = FilterIter::new(merge_iter);
 		let pipeline =
 			Box::new(filter_iter.filter(|(key, _value)| key.kind() != InternalKeyKind::Delete));
@@ -603,18 +610,18 @@ impl SnapshotIterator<'_> {
 	}
 }
 
-impl Iterator for SnapshotIterator<'_> {
+impl<K: InternalKeyTrait> Iterator for SnapshotIterator<'_, K> {
 	type Item = IterResult;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if let Some((key, value)) = self.pipeline.next() {
 			if self.keys_only {
 				// For keys-only mode, return None for the value to avoid allocations
-				Some(Ok((key.user_key.clone(), None)))
+				Some(Ok((key.user_key().clone(), None)))
 			} else {
 				// Resolve value pointers to actual values
 				match self.core.resolve_value(&value) {
-					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
+					Ok(resolved_value) => Some(Ok((key.user_key().clone(), Some(resolved_value)))),
 					Err(e) => Some(Err(e)),
 				}
 			}
@@ -624,16 +631,16 @@ impl Iterator for SnapshotIterator<'_> {
 	}
 }
 
-impl DoubleEndedIterator for SnapshotIterator<'_> {
+impl<K: InternalKeyTrait> DoubleEndedIterator for SnapshotIterator<'_, K> {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if let Some((key, value)) = self.pipeline.next_back() {
 			if self.keys_only {
 				// For keys-only mode, return None for the value to avoid allocations
-				Some(Ok((key.user_key.clone(), None)))
+				Some(Ok((key.user_key().clone(), None)))
 			} else {
 				// Resolve value pointers to actual values
 				match self.core.resolve_value(&value) {
-					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
+					Ok(resolved_value) => Some(Ok((key.user_key().clone(), Some(resolved_value)))),
 					Err(e) => Some(Err(e)),
 				}
 			}
@@ -643,7 +650,7 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 	}
 }
 
-impl Drop for SnapshotIterator<'_> {
+impl<K: InternalKeyTrait> Drop for SnapshotIterator<'_, K> {
 	fn drop(&mut self) {
 		// Decrement VLog iterator count when iterator is dropped
 		if let Some(ref vlog) = self.core.vlog {
@@ -1105,7 +1112,7 @@ mod tests {
 
 	#[test]
 	fn test_range_skips_non_overlapping_tables() {
-		fn build_table(data: Vec<(&'static [u8], &'static [u8])>) -> Arc<Table> {
+		fn build_table(data: Vec<(&'static [u8], &'static [u8])>) -> Arc<Table<InternalKey>> {
 			let opts = Arc::new(Options::new());
 			let mut buf = Vec::new();
 			{
@@ -1132,7 +1139,7 @@ mod tests {
 		let levels = Levels(vec![Arc::new(level0)]);
 
 		let iter_state = IterState {
-			active: Arc::new(MemTable::new()),
+			active: Arc::new(MemTable::<InternalKey>::new()),
 			immutable: Vec::new(),
 			levels,
 		};

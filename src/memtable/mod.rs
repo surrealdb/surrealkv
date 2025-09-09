@@ -14,7 +14,7 @@ use crate::{
 	iter::MergeIterator,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
+		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
 	vlog::{VLog, ValueLocation},
@@ -22,10 +22,10 @@ use crate::{
 };
 
 #[derive(Default)]
-pub(crate) struct ImmutableMemtables(Vec<(u64, Arc<MemTable>)>);
+pub(crate) struct ImmutableMemtables<K: InternalKeyTrait>(Vec<(u64, Arc<MemTable<K>>)>);
 
-impl ImmutableMemtables {
-	pub(crate) fn add(&mut self, id: u64, memtable: Arc<MemTable>) {
+impl<K: InternalKeyTrait> ImmutableMemtables<K> {
+	pub(crate) fn add(&mut self, id: u64, memtable: Arc<MemTable<K>>) {
 		self.0.push((id, memtable));
 		self.0.sort_by_key(|(id, _)| *id); // Maintain sorted order by ID
 	}
@@ -36,7 +36,7 @@ impl ImmutableMemtables {
 		}
 	}
 
-	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &(u64, Arc<MemTable>)> {
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &(u64, Arc<MemTable<K>>)> {
 		self.0.iter()
 	}
 
@@ -45,14 +45,19 @@ impl ImmutableMemtables {
 	}
 }
 
-#[derive(Default)]
-pub(crate) struct MemTable {
-	map: SkipMap<InternalKey, Value>,
+pub(crate) struct MemTable<K: InternalKeyTrait> {
+	map: SkipMap<K, Value>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
 }
 
-impl MemTable {
+impl<K: InternalKeyTrait> Default for MemTable<K> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl<K: InternalKeyTrait> MemTable<K> {
 	#[allow(unused)]
 	pub(crate) fn new() -> Self {
 		MemTable {
@@ -62,11 +67,11 @@ impl MemTable {
 		}
 	}
 
-	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(K, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = InternalKey::new(key.to_vec(), seq_no, InternalKeyKind::Max)..;
+		let range = K::new(key.to_vec(), seq_no, InternalKeyKind::Max)..;
 
-		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
+		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key()[..] == key);
 		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
 	}
 
@@ -102,7 +107,7 @@ impl MemTable {
 
 		for record in batch.iter() {
 			let (kind, key, value) = record?;
-			let ikey = InternalKey::new(key.to_vec(), current_seq_num, kind);
+			let ikey = K::new(key.to_vec(), current_seq_num, kind);
 			let val_slice = value.unwrap_or(&[]);
 			let val =
 				ValueLocation::with_inline_value(Arc::from(val_slice.to_vec().into_boxed_slice()))
@@ -123,7 +128,7 @@ impl MemTable {
 	}
 
 	/// Inserts a key-value pair into the memtable.
-	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
+	fn insert_into_memtable(&self, key: &K, value: &Value) -> u32 {
 		self.map.insert(key.clone(), value.clone());
 		key.size() as u32 + value.len() as u32
 	}
@@ -158,9 +163,9 @@ impl MemTable {
 	pub(crate) fn flush(
 		&self,
 		table_id: u64,
-		lsm_opts: Arc<Options>,
-		vlog: Option<Arc<VLog>>,
-	) -> Result<Arc<Table>> {
+		lsm_opts: Arc<Options<K>>,
+		vlog: Option<Arc<VLog<K>>>,
+	) -> Result<Arc<Table<K>>> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
 		{
 			let file = SysFile::create(&table_file_path)?;
@@ -213,11 +218,11 @@ impl MemTable {
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		let created_table = Arc::new(Table::new(table_id, lsm_opts.clone(), file, file_size)?);
+		let created_table = Arc::new(Table::<K>::new(table_id, lsm_opts.clone(), file, file_size)?);
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (Arc<K>, Value)> + '_ {
 		self.map.iter().map(|entry| {
 			let key = entry.key().clone();
 			let value = entry.value().clone();
@@ -225,10 +230,7 @@ impl MemTable {
 		})
 	}
 
-	pub(crate) fn range<R>(
-		&self,
-		range: R,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_
+	pub(crate) fn range<R>(&self, range: R) -> impl DoubleEndedIterator<Item = (Arc<K>, Value)> + '_
 	where
 		R: RangeBounds<Vec<u8>>,
 	{
@@ -237,16 +239,12 @@ impl MemTable {
 				// For inclusive start, we want the earliest internal key for this user key
 				// Since internal keys are sorted as (user_key asc, seq_num desc),
 				// we use the highest possible sequence number to get the first entry
-				Bound::Included(InternalKey::new(
-					key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-				))
+				Bound::Included(K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive start, we want to skip all versions of this user key
 				// We use the lowest sequence number to position after all real entries
-				Bound::Excluded(InternalKey::new(key.clone(), 0, InternalKeyKind::Set))
+				Bound::Excluded(K::new(key.clone(), 0, InternalKeyKind::Set))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -255,16 +253,12 @@ impl MemTable {
 			Bound::Included(key) => {
 				// For inclusive end, we want to include all versions of this user key
 				// We use the lowest sequence number to include the last entry
-				Bound::Included(InternalKey::new(key.clone(), 0, InternalKeyKind::Set))
+				Bound::Included(K::new(key.clone(), 0, InternalKeyKind::Set))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive end, we want to exclude all versions of this user key
 				// We use the highest sequence number to stop before any real entries
-				Bound::Excluded(InternalKey::new(
-					key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-				))
+				Bound::Excluded(K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -279,6 +273,8 @@ impl MemTable {
 
 #[cfg(test)]
 mod tests {
+	use crate::sstable::InternalKey;
+
 	use super::*;
 	use std::{collections::HashMap, sync::Arc};
 
@@ -293,7 +289,7 @@ mod tests {
 
 	#[test]
 	fn memtable_get() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key = b"foo".to_vec();
 		let value = b"value";
 
@@ -308,7 +304,7 @@ mod tests {
 
 	#[test]
 	fn memtable_size() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key = b"foo".to_vec();
 		let value = b"value";
 
@@ -322,7 +318,7 @@ mod tests {
 
 	#[test]
 	fn memtable_lsn() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key = b"foo".to_vec();
 		let value = b"value";
 		let seq_num = 100;
@@ -337,14 +333,13 @@ mod tests {
 
 	#[test]
 	fn memtable_add_and_get() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key1 = b"key1".to_vec();
 		let value1 = b"value1";
 
 		let mut batch1 = Batch::new();
 		batch1.set(&key1, value1).unwrap();
 
-		// let ikey1 = InternalKey::new(key1, 1, InternalKeyKind::Set);
 		memtable.add(&batch1, 1).unwrap();
 
 		let key2 = b"key2".to_vec();
@@ -353,7 +348,6 @@ mod tests {
 		let mut batch2 = Batch::new();
 		batch2.set(&key2, value2).unwrap();
 
-		// let ikey2 = InternalKey::new(key2, 2, InternalKeyKind::Set);
 		memtable.add(&batch2, 2).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
@@ -365,7 +359,7 @@ mod tests {
 
 	#[test]
 	fn memtable_get_latest_seq_no() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key1 = b"key1".to_vec();
 		let value1 = &b"value1"[..];
 		let value2 = &b"value2"[..];
@@ -389,7 +383,7 @@ mod tests {
 
 	#[test]
 	fn memtable_prefix() {
-		let memtable = MemTable::new();
+		let memtable = MemTable::<InternalKey>::new();
 		let key1 = b"foo".to_vec();
 		let value1 = &b"value1"[..];
 
@@ -413,8 +407,8 @@ mod tests {
 
 	type TestEntry = (Vec<u8>, Vec<u8>, InternalKeyKind, Option<u64>);
 
-	fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
-		let memtable = Arc::new(MemTable::new());
+	fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable<InternalKey>>, u64) {
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
 
 		let mut last_seq = 0;
 
@@ -457,7 +451,7 @@ mod tests {
 
 	#[test]
 	fn test_empty_memtable() {
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
 
 		// Test that iterator is empty
 		let entries: Vec<_> = memtable.iter().collect();
@@ -831,7 +825,7 @@ mod tests {
 
 	#[test]
 	fn test_memtable_size_tracking() {
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
 
 		// Initially empty
 		assert_eq!(memtable.size(), 0);
@@ -858,7 +852,7 @@ mod tests {
 
 	#[test]
 	fn test_latest_sequence_number() {
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
 
 		// Initially 0
 		assert_eq!(memtable.lsn(), 0);
