@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -160,16 +160,31 @@ pub struct Transaction<K: InternalKeyTrait> {
 	pub(crate) core: Arc<Core<K>>,
 
 	/// `write_set` is a map of keys to entries.
-	pub(crate) write_set: BTreeMap<Bytes, Option<Entry>>,
+	/// These are the changes that the transaction intends to make to the data.
+	/// The entries vec is used to keep different values for the same key for
+	/// savepoints and rollbacks.
+	pub(crate) write_set: BTreeMap<Bytes, Vec<Entry>>,
 
 	/// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
 	closed: bool,
 
 	/// Tracks when this transaction started for deadlock detection
 	pub(crate) start_commit_id: u64,
+
+	/// `savepoints` indicates the current number of stacked savepoints; zero means none.
+	savepoints: u32,
+
+	/// write sequence number is used for real-time ordering of writes within a transaction.
+	write_seqno: u32,
 }
 
 impl<K: InternalKeyTrait> Transaction<K> {
+	/// Bump the write sequence number and return it.
+	fn next_write_seqno(&mut self) -> u32 {
+		self.write_seqno += 1;
+		self.write_seqno
+	}
+
 	/// Prepare a new transaction in the given mode.
 	pub(crate) fn new(core: Arc<Core<K>>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
@@ -196,6 +211,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 			durability: Durability::Eventual,
 			closed: false,
 			start_commit_id,
+			savepoints: 0,
+			write_seqno: 0,
 		})
 	}
 
@@ -211,7 +228,9 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		value: &[u8],
 		options: &WriteOptions,
 	) -> Result<()> {
-		let entry = Entry::new(key, Some(value), InternalKeyKind::Set);
+		let write_seqno = self.next_write_seqno();
+		let entry =
+			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno);
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -223,7 +242,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
 	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
-		let entry = Entry::new(key, None, InternalKeyKind::Delete);
+		let write_seqno = self.next_write_seqno();
+		let entry = Entry::new(key, None, InternalKeyKind::Delete, self.savepoints, write_seqno);
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -250,22 +270,16 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		}
 
 		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
-		match self.write_set.get(key) {
-			Some(Some(val)) => {
-				// If the entry is a tombstone, return None.
-				if val.is_tombstone() {
-					return Ok(None);
-				}
-				let v = val.value.clone().unwrap();
-				// Otherwise, return the value.
-				return Ok(Some(Arc::from(v.to_vec())));
-			}
-			// TODO: Check if this is correct.
-			Some(None) => {
-				// If the entry is None, it means the key was deleted in this transaction.
+		if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
+			// If the entry is a tombstone, return None.
+			if last_entry.is_tombstone() {
 				return Ok(None);
 			}
-			None => {}
+			if let Some(v) = &last_entry.value {
+				return Ok(Some(Arc::from(v.to_vec())));
+			}
+			// If the entry has no value, it means the key was deleted in this transaction.
+			return Ok(None);
 		}
 
 		// The value is not in the write set, so attempt to get it from the snapshot.
@@ -297,10 +311,29 @@ impl<K: InternalKeyTrait> Transaction<K> {
 
 		self.durability = options.durability;
 
-		// Set the transaction's latest savepoint number and add it to the write set.
+		// Add the entry to the write set
 		let key = e.key.clone();
 
-		self.write_set.insert(key, Some(e));
+		match self.write_set.entry(key) {
+			BTreeEntry::Occupied(mut oe) => {
+				let entries = oe.get_mut();
+				// If the latest existing value for this key belongs to the same
+				// savepoint as the value we are about to write, then we can
+				// overwrite it with the new value.
+				if let Some(last_entry) = entries.last_mut() {
+					if last_entry.savepoint_no == e.savepoint_no {
+						*last_entry = e;
+					} else {
+						entries.push(e);
+					}
+				} else {
+					entries.push(e);
+				}
+			}
+			BTreeEntry::Vacant(ve) => {
+				ve.insert(vec![e]);
+			}
+		}
 
 		Ok(())
 	}
@@ -385,6 +418,7 @@ impl<K: InternalKeyTrait> Transaction<K> {
 
 		// If there are no pending writes, there's nothing to commit, so return early.
 		if self.write_set.is_empty() {
+			self.closed = true;
 			return Ok(());
 		}
 
@@ -397,8 +431,14 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		// Create and prepare batch directly
 		let mut batch = Batch::new();
 
+		// Extract the vector of entries for the current transaction,
+		// respecting the insertion order recorded with Entry::seqno.
+		let mut latest_writes: Vec<Entry> =
+			std::mem::take(&mut self.write_set).into_values().flatten().collect();
+		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+
 		// Add all entries to the batch
-		for entry in self.write_set.values().flatten() {
+		for entry in latest_writes {
 			batch.add_record(
 				entry.kind,
 				&entry.key,
@@ -415,6 +455,64 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		Ok(())
 	}
 
+	/// After calling this method the subsequent modifications within this
+	/// transaction can be rolled back by calling [`rollback_to_savepoint`].
+	///
+	/// This method is stackable and can be called multiple times with the
+	/// corresponding calls to [`rollback_to_savepoint`].
+	///
+	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
+	pub fn set_savepoint(&mut self) -> Result<()> {
+		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		if !self.mode.mutable() {
+			return Err(Error::TransactionReadOnly);
+		}
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+
+		// Bump the latest savepoint number.
+		self.savepoints += 1;
+
+		Ok(())
+	}
+
+	/// Rollback the state of the transaction to the latest savepoint set by
+	/// calling [`set_savepoint`].
+	///
+	/// [`set_savepoint`]: Transaction::set_savepoint
+	pub fn rollback_to_savepoint(&mut self) -> Result<()> {
+		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		if !self.mode.mutable() {
+			return Err(Error::TransactionReadOnly);
+		}
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		// Check that the savepoint is set
+		if self.savepoints == 0 {
+			return Err(Error::TransactionWithoutSavepoint);
+		}
+
+		// For every key in the write set, remove entries marked
+		// for rollback since the last call to set_savepoint()
+		// from its vec.
+		for entries in self.write_set.values_mut() {
+			entries.retain(|entry| entry.savepoint_no != self.savepoints);
+		}
+
+		// Remove keys with no entries left after the rollback above.
+		self.write_set.retain(|_, entries| !entries.is_empty());
+
+		// Decrement the latest savepoint number unless it's zero.
+		// Cannot undeflow due to the zero check above.
+		self.savepoints -= 1;
+
+		Ok(())
+	}
+
 	/// Rolls back the transaction by removing all updated entries.
 	pub fn rollback(&mut self) {
 		// Only unregister mutable transactions since only they get registered
@@ -425,6 +523,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		self.closed = true;
 		self.write_set.clear();
 		self.snapshot.take();
+		self.savepoints = 0;
+		self.write_seqno = 0;
 	}
 }
 
@@ -445,14 +545,28 @@ pub(crate) struct Entry {
 
 	/// Type of operation (Set, Delete, etc.)
 	pub(crate) kind: InternalKeyKind,
+
+	/// Savepoint number when this entry was created
+	pub(crate) savepoint_no: u32,
+
+	/// Sequence number for ordering writes within a transaction
+	pub(crate) seqno: u32,
 }
 
 impl Entry {
-	fn new(key: &[u8], value: Option<&[u8]>, kind: InternalKeyKind) -> Entry {
+	fn new(
+		key: &[u8],
+		value: Option<&[u8]>,
+		kind: InternalKeyKind,
+		savepoint_no: u32,
+		seqno: u32,
+	) -> Entry {
 		Entry {
 			key: Bytes::copy_from_slice(key),
 			value: value.map(Bytes::copy_from_slice),
 			kind,
+			savepoint_no,
+			seqno,
 		}
 	}
 
@@ -473,7 +587,7 @@ pub(crate) struct TransactionRangeIterator<'a, K: InternalKeyTrait> {
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
-	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Option<Entry>>>,
+	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<Entry>>>,
 
 	/// Maximum number of items to return (usize::MAX for unlimited)
 	limit: usize,
@@ -535,17 +649,19 @@ impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
 
 	/// Reads from the write set and skips deleted entries
 	fn read_from_write_set(&mut self) -> Option<IterResult> {
-		if let Some((ws_key, Some(e))) = self.write_set_iter.next() {
-			if e.is_tombstone() {
-				// Deleted key, skip it by recursively getting the next entry
-				return self.next();
-			}
+		if let Some((ws_key, entries)) = self.write_set_iter.next() {
+			if let Some(last_entry) = entries.last() {
+				if last_entry.is_tombstone() {
+					// Deleted key, skip it by recursively getting the next entry
+					return self.next();
+				}
 
-			if self.keys_only {
-				// For keys-only mode, return None for the value to avoid allocations
-				return Some(Ok((ws_key.to_vec().into(), None)));
-			} else if let Some(value) = &e.value {
-				return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+				if self.keys_only {
+					// For keys-only mode, return None for the value to avoid allocations
+					return Some(Ok((ws_key.to_vec().into(), None)));
+				} else if let Some(value) = &last_entry.value {
+					return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+				}
 			}
 		}
 		None
@@ -553,17 +669,19 @@ impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
 
 	/// Reads from the write set in reverse order and skips deleted entries
 	fn read_from_write_set_back(&mut self) -> Option<IterResult> {
-		if let Some((ws_key, Some(e))) = self.write_set_iter.next_back() {
-			if e.is_tombstone() {
-				// Deleted key, skip it by recursively getting the next entry
-				return self.next_back();
-			}
+		if let Some((ws_key, entries)) = self.write_set_iter.next_back() {
+			if let Some(last_entry) = entries.last() {
+				if last_entry.is_tombstone() {
+					// Deleted key, skip it by recursively getting the next entry
+					return self.next_back();
+				}
 
-			if self.keys_only {
-				// For keys-only mode, return None for the value to avoid allocations
-				return Some(Ok((ws_key.to_vec().into(), None)));
-			} else if let Some(value) = &e.value {
-				return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+				if self.keys_only {
+					// For keys-only mode, return None for the value to avoid allocations
+					return Some(Ok((ws_key.to_vec().into(), None)));
+				} else if let Some(value) = &last_entry.value {
+					return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+				}
 			}
 		}
 		None
@@ -1756,6 +1874,187 @@ mod tests {
 					expected_value.len(),
 				);
 			}
+		}
+	}
+
+	// Savepoint tests
+	mod savepoint_tests {
+		use super::*;
+
+		#[tokio::test]
+		async fn multiple_savepoints() {
+			let (store, _) = create_store();
+
+			// Key-value pair for the test
+			let key1 = Bytes::from("test_key1");
+			let value1 = Bytes::from("test_value1");
+			let key2 = Bytes::from("test_key2");
+			let value2 = Bytes::from("test_value2");
+			let key3 = Bytes::from("test_key3");
+			let value3 = Bytes::from("test_value3");
+
+			// Start the transaction and write key1.
+			let mut txn1 = store.begin().unwrap();
+			txn1.set(&key1, &value1).unwrap();
+
+			// Set the first savepoint.
+			txn1.set_savepoint().unwrap();
+
+			// Write key2 after the savepoint.
+			txn1.set(&key2, &value2).unwrap();
+
+			// Set another savepoint, stacking it onto the first one.
+			txn1.set_savepoint().unwrap();
+
+			txn1.set(&key3, &value3).unwrap();
+
+			// Just a sanity check that all three keys are present.
+			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(txn1.get(&key3).unwrap().unwrap().as_ref(), value3.as_ref());
+
+			// Rollback to the latest (second) savepoint. This should make key3
+			// go away while keeping key1 and key2.
+			txn1.rollback_to_savepoint().unwrap();
+			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert!(txn1.get(&key3).unwrap().is_none());
+
+			// Now roll back to the first savepoint. This should only
+			// keep key1 around.
+			txn1.rollback_to_savepoint().unwrap();
+			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert!(txn1.get(&key2).unwrap().is_none());
+			assert!(txn1.get(&key3).unwrap().is_none());
+
+			// Check that without any savepoints set the error is returned.
+			assert!(matches!(
+				txn1.rollback_to_savepoint(),
+				Err(Error::TransactionWithoutSavepoint)
+			));
+
+			// Commit the transaction.
+			txn1.commit().await.unwrap();
+			drop(txn1);
+
+			// Start another transaction and check again for the keys.
+			let txn2 = store.begin().unwrap();
+			assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert!(txn2.get(&key2).unwrap().is_none());
+			assert!(txn2.get(&key3).unwrap().is_none());
+		}
+
+		#[tokio::test]
+		async fn savepoint_rollback_on_updated_key() {
+			let (store, _) = create_store();
+
+			let k1 = Bytes::from("k1");
+			let value1 = Bytes::from("value1");
+			let value2 = Bytes::from("value2");
+			let value3 = Bytes::from("value3");
+
+			let mut txn1 = store.begin().unwrap();
+			txn1.set(&k1, &value1).unwrap();
+			txn1.set(&k1, &value2).unwrap();
+			txn1.set_savepoint().unwrap();
+			txn1.set(&k1, &value3).unwrap();
+			txn1.rollback_to_savepoint().unwrap();
+
+			// The read value should be the one before the savepoint.
+			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value2.as_ref());
+		}
+
+		#[tokio::test]
+		async fn savepoint_rollback_with_range_scan() {
+			let (store, _) = create_store();
+
+			let k1 = Bytes::from("k1");
+			let value = Bytes::from("value1");
+			let value2 = Bytes::from("value2");
+
+			let mut txn1 = store.begin().unwrap();
+			txn1.set(&k1, &value).unwrap();
+			txn1.set_savepoint().unwrap();
+			txn1.set(&k1, &value2).unwrap();
+			txn1.rollback_to_savepoint().unwrap();
+
+			// The scanned value should be the one before the savepoint.
+			let range: Vec<_> =
+				txn1.range(b"k1", b"k3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 1);
+			assert_eq!(range[0].0.as_ref(), k1.as_ref());
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), value.as_ref());
+		}
+
+		#[tokio::test]
+		async fn savepoint_with_deletes() {
+			let (store, _) = create_store();
+
+			let k1 = Bytes::from("k1");
+			let k2 = Bytes::from("k2");
+			let value1 = Bytes::from("value1");
+			let value2 = Bytes::from("value2");
+
+			let mut txn1 = store.begin().unwrap();
+			txn1.set(&k1, &value1).unwrap();
+			txn1.set(&k2, &value2).unwrap();
+			txn1.set_savepoint().unwrap();
+
+			// Delete k1 and modify k2
+			txn1.delete(&k1).unwrap();
+			txn1.set(&k2, b"modified").unwrap();
+
+			// Verify the changes
+			assert!(txn1.get(&k1).unwrap().is_none());
+			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), b"modified");
+
+			// Rollback to savepoint
+			txn1.rollback_to_savepoint().unwrap();
+
+			// Verify original values are restored
+			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+		}
+
+		#[tokio::test]
+		async fn savepoint_nested_operations() {
+			let (store, _) = create_store();
+
+			let k1 = Bytes::from("k1");
+			let k2 = Bytes::from("k2");
+			let k3 = Bytes::from("k3");
+			let value1 = Bytes::from("value1");
+			let value2 = Bytes::from("value2");
+			let value3 = Bytes::from("value3");
+
+			let mut txn1 = store.begin().unwrap();
+			txn1.set(&k1, &value1).unwrap();
+
+			// First savepoint
+			txn1.set_savepoint().unwrap();
+			txn1.set(&k2, &value2).unwrap();
+
+			// Second savepoint
+			txn1.set_savepoint().unwrap();
+			txn1.set(&k3, &value3).unwrap();
+
+			// Rollback to second savepoint (should remove k3)
+			txn1.rollback_to_savepoint().unwrap();
+			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert!(txn1.get(&k3).unwrap().is_none());
+
+			// Rollback to first savepoint (should remove k2)
+			txn1.rollback_to_savepoint().unwrap();
+			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert!(txn1.get(&k2).unwrap().is_none());
+			assert!(txn1.get(&k3).unwrap().is_none());
+
+			// Final rollback should fail
+			assert!(matches!(
+				txn1.rollback_to_savepoint(),
+				Err(Error::TransactionWithoutSavepoint)
+			));
 		}
 	}
 }

@@ -20,9 +20,10 @@ mod wal;
 
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
+pub use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
-use sstable::{bloom::LevelDBBloomFilter, InternalKey, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
+use sstable::{bloom::LevelDBBloomFilter, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};
 
 /// Type alias for iterator results containing key-value pairs

@@ -93,8 +93,9 @@ impl Oracle {
 	pub(crate) fn prepare_commit<K: InternalKeyTrait>(&self, txn: &Transaction<K>) -> Result<u64> {
 		// Convert transaction writeset to BTreeMap<Bytes, Option<Bytes>>
 		let mut writeset = BTreeMap::new();
-		for (key, entry_opt) in &txn.write_set {
-			let value = entry_opt.as_ref().and_then(|e| e.value.clone());
+		for (key, entries) in &txn.write_set {
+			// Get the latest entry (last in the vector)
+			let value = entries.last().and_then(|e| e.value.clone());
 			writeset.insert(key.clone(), value);
 		}
 
