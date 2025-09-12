@@ -277,7 +277,7 @@ impl<'a, K: InternalKeyTrait> KMergeIterator<'a, K> {
 						continue;
 					}
 					let mut table_iter = table.iter();
-					// Seek to start if bounded
+					// Seek to start if unbounded
 					match &range.0 {
 						Bound::Included(key) => {
 							let ikey =
@@ -285,7 +285,7 @@ impl<'a, K: InternalKeyTrait> KMergeIterator<'a, K> {
 							table_iter.seek(&ikey.encode());
 						}
 						Bound::Excluded(key) => {
-							let ikey = K::new(key.clone(), 0, InternalKeyKind::Set);
+							let ikey = K::new(key.clone(), 0, InternalKeyKind::Delete);
 							table_iter.seek(&ikey.encode());
 							// If we're at the excluded key, advance once
 							if table_iter.valid() {
@@ -599,8 +599,9 @@ impl<K: InternalKeyTrait> SnapshotIterator<'_, K> {
 		let merge_iter: KMergeIterator<'_, K> =
 			KMergeIterator::new_from(iter_state, seq_num, (start, end));
 		let filter_iter = FilterIter::new(merge_iter);
-		let pipeline =
-			Box::new(filter_iter.filter(|(key, _value)| key.kind() != InternalKeyKind::Delete));
+		let pipeline = Box::new(filter_iter.filter(|(key, _value)| {
+			key.kind() != InternalKeyKind::Delete && key.kind() != InternalKeyKind::SoftDelete
+		}));
 
 		Ok(Self {
 			pipeline,
@@ -832,7 +833,7 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot1 = store.begin().unwrap();
+		let tx1 = store.begin().unwrap();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -840,7 +841,7 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot2 = store.begin().unwrap();
+		let tx2 = store.begin().unwrap();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -848,16 +849,16 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot3 = store.begin().unwrap();
+		let tx3 = store.begin().unwrap();
 
 		// Each snapshot should see its corresponding version
-		let value1 = snapshot1.get(b"key1").unwrap().unwrap();
+		let value1 = tx1.get(b"key1").unwrap().unwrap();
 		assert_eq!(value1.as_ref(), b"version1");
 
-		let value2 = snapshot2.get(b"key1").unwrap().unwrap();
+		let value2 = tx2.get(b"key1").unwrap().unwrap();
 		assert_eq!(value2.as_ref(), b"version2");
 
-		let value3 = snapshot3.get(b"key1").unwrap().unwrap();
+		let value3 = tx3.get(b"key1").unwrap().unwrap();
 		assert_eq!(value3.as_ref(), b"version3");
 	}
 
@@ -876,7 +877,7 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot1 = store.begin().unwrap();
+		let tx1 = store.begin().unwrap();
 
 		// Update some keys and delete others
 		{
@@ -894,14 +895,11 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot2 = store.begin().unwrap();
+		let tx2 = store.begin().unwrap();
 
-		// Snapshot1 should see all original data
-		let range1: Vec<_> = snapshot1
-			.range(b"key00", b"key99", None)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		// tx1 should see all original data
+		let range1: Vec<_> =
+			tx1.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range1.len(), 10);
 		for (i, item) in range1.iter().enumerate() {
@@ -912,12 +910,9 @@ mod tests {
 			assert_eq!(value.as_ref().unwrap().as_ref(), expected_value.as_bytes());
 		}
 
-		// Snapshot2 should see updated data with deletions
-		let range2: Vec<_> = snapshot2
-			.range(b"key00", b"key99", None)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		// tx2 should see updated data with deletions
+		let range2: Vec<_> =
+			tx2.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -998,17 +993,16 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot = store.begin().unwrap();
+		let tx = store.begin().unwrap();
 
 		// Test different range queries
-		let numeric_range: Vec<_> =
-			snapshot.range(b"000", b"999", None).unwrap().collect::<Vec<_>>();
+		let numeric_range: Vec<_> = tx.range(b"000", b"999", None).unwrap().collect::<Vec<_>>();
 		assert_eq!(numeric_range.len(), 10);
 
-		let alpha_range: Vec<_> = snapshot.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
+		let alpha_range: Vec<_> = tx.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
 		assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-		let mixed_range: Vec<_> = snapshot.range(b"mix", b"miy", None).unwrap().collect::<Vec<_>>();
+		let mixed_range: Vec<_> = tx.range(b"mix", b"miy", None).unwrap().collect::<Vec<_>>();
 		assert_eq!(mixed_range.len(), 5);
 	}
 
@@ -1028,14 +1022,11 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		let snapshot = store.begin().unwrap();
+		let tx = store.begin().unwrap();
 
 		// Range scan should return keys in sorted order
-		let range: Vec<_> = snapshot
-			.range(b"key00", b"key99", None)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let range: Vec<_> =
+			tx.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 9);
 
@@ -1066,10 +1057,10 @@ mod tests {
 
 		// Create snapshot via transaction
 		let tx = store.begin().unwrap();
-		let snapshot = tx.snapshot.as_ref().unwrap();
+		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Get keys only
-		let keys_only_iter = snapshot.range(b"key1", b"key5", true).unwrap();
+		let keys_only_iter = tx.range(b"key1", b"key5", true).unwrap();
 		let keys_only: Vec<_> = keys_only_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Verify we got all 5 keys
@@ -1085,7 +1076,7 @@ mod tests {
 		}
 
 		// Compare with regular range scan
-		let regular_range_iter = snapshot.range(b"key1", b"key5", false).unwrap();
+		let regular_range_iter = tx.range(b"key1", b"key5", false).unwrap();
 		let regular_range: Vec<_> = regular_range_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(regular_range.len(), keys_only.len());
@@ -1168,10 +1159,10 @@ mod tests {
 
 		// Create snapshot via transaction
 		let tx = store.begin().unwrap();
-		let snapshot = tx.snapshot.as_ref().unwrap();
+		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Test forward iteration
-		let forward_iter = snapshot.range(b"key1", b"key5", false).unwrap();
+		let forward_iter = tx.range(b"key1", b"key5", false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(forward_items.len(), 5);
@@ -1179,7 +1170,7 @@ mod tests {
 		assert_eq!(forward_items[4].0.as_ref(), b"key5");
 
 		// Test backward iteration
-		let backward_iter = snapshot.range(b"key1", b"key5", false).unwrap();
+		let backward_iter = tx.range(b"key1", b"key5", false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(backward_items.len(), 5);
@@ -1206,7 +1197,7 @@ mod tests {
 		}
 
 		// Take a snapshot before deletion
-		let snapshot1 = store.begin().unwrap();
+		let tx1 = store.begin().unwrap();
 
 		// Delete key2
 		{
@@ -1216,33 +1207,176 @@ mod tests {
 		}
 
 		// Take another snapshot after deletion
-		let snapshot2 = store.begin().unwrap();
+		let tx2 = store.begin().unwrap();
 
 		// Test forward iteration on first snapshot (should see all keys)
-		let snapshot1_ref = snapshot1.snapshot.as_ref().unwrap();
-		let forward_iter1 = snapshot1_ref.range(b"key1", b"key3", false).unwrap();
+		let tx1_ref = tx1.snapshot.as_ref().unwrap();
+		let forward_iter1 = tx1_ref.range(b"key1", b"key3", false).unwrap();
 		let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items1.len(), 3);
 
 		// Test backward iteration on first snapshot
-		let backward_iter1 = snapshot1_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_iter1 = tx1_ref.range(b"key1", b"key3", false).unwrap();
 		let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items1.len(), 3);
 
 		// Test forward iteration on second snapshot (should not see deleted key)
-		let snapshot2_ref = snapshot2.snapshot.as_ref().unwrap();
-		let forward_iter2 = snapshot2_ref.range(b"key1", b"key3", false).unwrap();
+		let tx2_ref = tx2.snapshot.as_ref().unwrap();
+		let forward_iter2 = tx2_ref.range(b"key1", b"key3", false).unwrap();
 		let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items2.len(), 2);
 
 		// Test backward iteration on second snapshot
-		let backward_iter2 = snapshot2_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_iter2 = tx2_ref.range(b"key1", b"key3", false).unwrap();
 		let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items2.len(), 2);
 
 		// Verify both iterations produce the same items in reverse order
 		for i in 0..forward_items2.len() {
 			assert_eq!(forward_items2[i].0, backward_items2[forward_items2.len() - 1 - i].0);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_snapshot_individual_get() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take a snapshot before soft delete
+		let tx1 = store.begin().unwrap();
+
+		// Soft delete key2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take another snapshot after soft delete
+		let tx2 = store.begin().unwrap();
+
+		// First snapshot should see both keys
+		{
+			assert_eq!(tx1.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx1.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		}
+
+		// Second snapshot should not see the soft deleted key
+		{
+			assert_eq!(tx2.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert!(tx2.get(b"key2").unwrap().is_none());
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_snapshot_double_ended_iteration() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=5 {
+				let key = format!("key{i}");
+				let value = format!("value{i}");
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Soft delete key2 and key4
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key2").unwrap();
+			tx.soft_delete(b"key4").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take snapshot after soft delete
+		let tx = store.begin().unwrap();
+
+		// Test forward iteration
+		{
+			let snapshot_ref = tx.snapshot.as_ref().unwrap();
+			let forward_iter = snapshot_ref.range(b"key1", b"key5", false).unwrap();
+			let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+
+			assert_eq!(forward_items.len(), 3); // key1, key3, key5
+			assert_eq!(forward_items[0].0.as_ref(), b"key1");
+			assert_eq!(forward_items[1].0.as_ref(), b"key3");
+			assert_eq!(forward_items[2].0.as_ref(), b"key5");
+		}
+
+		// Test backward iteration
+		{
+			let snapshot_ref = tx.snapshot.as_ref().unwrap();
+			let backward_iter = snapshot_ref.range(b"key1", b"key5", false).unwrap();
+			let backward_items: Vec<_> =
+				backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+
+			assert_eq!(backward_items.len(), 3); // key5, key3, key1
+			assert_eq!(backward_items[0].0.as_ref(), b"key5");
+			assert_eq!(backward_items[1].0.as_ref(), b"key3");
+			assert_eq!(backward_items[2].0.as_ref(), b"key1");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Take snapshot before any deletes
+		let tx1 = store.begin().unwrap();
+
+		// Mix of soft delete and hard delete
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key1").unwrap(); // Soft delete
+			tx.delete(b"key2").unwrap(); // Hard delete
+			tx.commit().await.unwrap();
+		}
+
+		// Take snapshot after deletes
+		let tx2 = store.begin().unwrap();
+
+		// First snapshot should see all keys
+		{
+			let tx1_ref = tx1.snapshot.as_ref().unwrap();
+			let range: Vec<_> = tx1_ref
+				.range(b"key1", b"key4", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+			assert_eq!(range.len(), 4);
+		}
+
+		// Second snapshot should not see either deleted key
+		{
+			let tx2_ref = tx2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = tx2_ref
+				.range(b"key1", b"key4", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+			assert_eq!(range.len(), 2); // Only key3 and key4
+			assert_eq!(range[0].0.as_ref(), b"key3");
+			assert_eq!(range[1].0.as_ref(), b"key4");
 		}
 	}
 
@@ -1262,10 +1396,10 @@ mod tests {
 		}
 
 		// Take a snapshot
-		let snapshot = store.begin().unwrap();
+		let tx = store.begin().unwrap();
 
 		// Test forward iteration
-		let snapshot_ref = snapshot.snapshot.as_ref().unwrap();
+		let snapshot_ref = tx.snapshot.as_ref().unwrap();
 		let forward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 

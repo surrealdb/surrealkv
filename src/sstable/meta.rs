@@ -51,6 +51,7 @@ pub(crate) struct Properties {
 	pub(crate) item_count: u64,
 	pub(crate) key_count: u64,
 	pub(crate) tombstone_count: u64,
+	pub(crate) num_soft_deletes: u64,
 	pub(crate) file_size: u64,
 	pub(crate) block_size: u32,
 	pub(crate) block_count: u32,
@@ -74,6 +75,7 @@ impl Properties {
 			item_count: 0,
 			key_count: 0,
 			tombstone_count: 0,
+			num_soft_deletes: 0,
 			file_size: 0,
 			block_size: 0,
 			block_count: 0,
@@ -97,6 +99,7 @@ impl Properties {
 		buf.put_u64(self.item_count);
 		buf.put_u64(self.key_count);
 		buf.put_u64(self.tombstone_count);
+		buf.put_u64(self.num_soft_deletes);
 		buf.put_u64(self.file_size);
 		buf.put_u32(self.block_size);
 		buf.put_u32(self.block_count);
@@ -130,6 +133,7 @@ impl Properties {
 		let item_count = buf.get_u64();
 		let key_count = buf.get_u64();
 		let tombstone_count = buf.get_u64();
+		let num_soft_deletes = buf.get_u64();
 		let file_size = buf.get_u64();
 		let block_size = buf.get_u32();
 		let block_count = buf.get_u32();
@@ -160,6 +164,7 @@ impl Properties {
 			item_count,
 			key_count,
 			tombstone_count,
+			num_soft_deletes,
 			file_size,
 			block_size,
 			block_count,

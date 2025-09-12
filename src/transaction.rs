@@ -237,13 +237,23 @@ impl<K: InternalKeyTrait> Transaction<K> {
 
 	// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-		self.delete_with_options(key, &WriteOptions::default())
+		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
+	}
+
+	/// Soft delete a key. The key will exist on disk but never be shown in queries.
+	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
+		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
 	}
 
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+	pub fn delete_with_options(
+		&mut self,
+		key: &[u8],
+		kind: InternalKeyKind,
+		options: &WriteOptions,
+	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry = Entry::new(key, None, InternalKeyKind::Delete, self.savepoints, write_seqno);
+		let entry = Entry::new(key, None, kind, self.savepoints, write_seqno);
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -573,7 +583,10 @@ impl Entry {
 	/// Checks if this entry represents a deletion (tombstone)
 	fn is_tombstone(&self) -> bool {
 		let kind = self.kind;
-		if kind == InternalKeyKind::Delete || kind == InternalKeyKind::RangeDelete {
+		if kind == InternalKeyKind::Delete
+			|| kind == InternalKeyKind::SoftDelete
+			|| kind == InternalKeyKind::RangeDelete
+		{
 			return true;
 		}
 
@@ -2055,6 +2068,293 @@ mod tests {
 				txn1.rollback_to_savepoint(),
 				Err(Error::TransactionWithoutSavepoint)
 			));
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_basic_functionality() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Verify data is visible
+		{
+			let tx = store.begin().unwrap();
+			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+		}
+
+		// Soft delete key2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Verify soft deleted key is not visible in reads
+		{
+			let tx = store.begin().unwrap();
+			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert!(tx.get(b"key2").unwrap().is_none()); // Should be None after soft delete
+			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+		}
+
+		// Verify soft deleted key is not visible in range scans
+		{
+			let tx = store.begin().unwrap();
+			let range: Vec<_> =
+				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key3");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_vs_hard_delete() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Soft delete key1, hard delete key2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key1").unwrap();
+			tx.delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Both should be invisible to reads
+		{
+			let tx = store.begin().unwrap();
+			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
+			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
+			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+		}
+
+		// Both should be invisible to range scans
+		{
+			let tx = store.begin().unwrap();
+			let range: Vec<_> =
+				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 1); // Only key3
+			assert_eq!(range[0].0.as_ref(), b"key3");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_in_transaction_write_set() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Start a transaction and soft delete within it
+		{
+			let mut tx = store.begin().unwrap();
+
+			// Soft delete key1 within the transaction
+			tx.soft_delete(b"key1").unwrap();
+
+			// Within the same transaction, the soft delete should NOT be visible
+			// The key should appear as if it doesn't exist
+			assert!(tx.get(b"key1").unwrap().is_none());
+
+			// Range scan within transaction should not see soft deleted key
+			let range: Vec<_> =
+				tx.range(b"key1", b"key2", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 1); // Only key2
+			assert_eq!(range[0].0.as_ref(), b"key2");
+
+			tx.commit().await.unwrap();
+		}
+
+		// After commit, soft deleted key should still be invisible
+		{
+			let tx = store.begin().unwrap();
+			assert!(tx.get(b"key1").unwrap().is_none());
+			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_then_reinsert() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Soft delete the key
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Verify it's not visible
+		{
+			let tx = store.begin().unwrap();
+			assert!(tx.get(b"key1").unwrap().is_none());
+		}
+
+		// Re-insert the same key with a new value
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1_new").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Verify the new value is visible
+		{
+			let tx = store.begin().unwrap();
+			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1_new");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_range_scan_filtering() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert multiple keys
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=10 {
+				let key = format!("key{i:02}");
+				let value = format!("value{i}");
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Soft delete some keys
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key02").unwrap();
+			tx.soft_delete(b"key05").unwrap();
+			tx.soft_delete(b"key08").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Range scan should not include soft deleted keys
+		{
+			let tx = store.begin().unwrap();
+			let range: Vec<_> =
+				tx.range(b"key01", b"key10", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+
+			// Should have 7 keys (10 - 3 soft deleted)
+			assert_eq!(range.len(), 7);
+
+			// Verify specific keys are present/absent
+			let keys: std::collections::HashSet<_> =
+				range.iter().map(|(k, _)| k.as_ref()).collect();
+			assert!(keys.contains(&b"key01".as_ref()));
+			assert!(!keys.contains(&b"key02".as_ref())); // Soft deleted
+			assert!(keys.contains(&b"key03".as_ref()));
+			assert!(keys.contains(&b"key04".as_ref()));
+			assert!(!keys.contains(&b"key05".as_ref())); // Soft deleted
+			assert!(keys.contains(&b"key06".as_ref()));
+			assert!(keys.contains(&b"key07".as_ref()));
+			assert!(!keys.contains(&b"key08".as_ref())); // Soft deleted
+			assert!(keys.contains(&b"key09".as_ref()));
+			assert!(keys.contains(&b"key10".as_ref()));
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_mixed_with_other_operations() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Mix of operations in one transaction
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key1").unwrap(); // Soft delete
+			tx.delete(b"key2").unwrap(); // Hard delete
+			tx.set(b"key3", b"value3_updated").unwrap(); // Update
+												// key4 remains unchanged
+			tx.commit().await.unwrap();
+		}
+
+		// Verify results
+		{
+			let tx = store.begin().unwrap();
+			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
+			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
+			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3_updated"); // Updated
+			assert_eq!(tx.get(b"key4").unwrap().unwrap().as_ref(), b"value4"); // Unchanged
+		}
+
+		// Range scan should only see updated and unchanged keys
+		{
+			let tx = store.begin().unwrap();
+			let range: Vec<_> =
+				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 2); // Only key3 and key4
+			assert_eq!(range[0].0.as_ref(), b"key3");
+			assert_eq!(range[1].0.as_ref(), b"key4");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_rollback() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Start transaction and soft delete, then rollback
+		{
+			let mut tx = store.begin().unwrap();
+			tx.soft_delete(b"key1").unwrap();
+
+			// Within transaction, key should be invisible
+			assert!(tx.get(b"key1").unwrap().is_none());
+
+			// Rollback the transaction
+			tx.rollback();
+		}
+
+		// After rollback, key should be visible again
+		{
+			let tx = store.begin().unwrap();
+			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
 		}
 	}
 }

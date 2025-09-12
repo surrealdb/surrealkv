@@ -377,13 +377,17 @@ mod tests {
 
 	impl TestEnv {
 		fn new() -> Self {
+			Self::new_with_levels(4) // Default to 4 levels
+		}
+
+		fn new_with_levels(level_count: u8) -> Self {
 			let temp_dir = TempDir::new().unwrap();
 			let table_dir = temp_dir.path().join("sstables");
 			std::fs::create_dir_all(&table_dir).unwrap();
 
 			let options = Arc::new(LSMOptions {
 				path: temp_dir.path().to_path_buf(),
-				level_count: 4,                 // 4 levels for testing
+				level_count,
 				max_memtable_size: 1024 * 1024, // 1MB
 				..Default::default()
 			});
@@ -2131,5 +2135,148 @@ mod tests {
 
 		let selected = strategy.select_by_compensated_size(&test_level);
 		assert_eq!(selected, Some(table_id));
+	}
+
+	#[tokio::test]
+	async fn test_soft_delete_compaction_behavior() {
+		let env = TestEnv::new_with_levels(2); // Only 2 levels: L0 and L1
+		let mut levels = Levels::new(2, 10);
+
+		// Create L0 tables: 2 tables to exceed L0 limit (1) and trigger L0→L1 compaction
+		for table_idx in 0..2 {
+			let mut l0_entries = Vec::new();
+			for i in (table_idx * 6)..((table_idx + 1) * 6) {
+				let key = format!("key-{i:03}").into_bytes();
+				let (seq, kind, value) = if i % 3 == 0 {
+					// Every 3rd key = soft delete
+					(200 + i, InternalKeyKind::SoftDelete, vec![])
+				} else if i % 3 == 1 {
+					// Every 3rd+1 key = regular delete
+					(200 + i, InternalKeyKind::Delete, vec![])
+				} else {
+					// Every 3rd+2 key = set value
+					let raw_value = format!("l0-value-{i}").into_bytes();
+					let encoded_value = create_inline_value(&raw_value);
+					(200 + i, InternalKeyKind::Set, encoded_value)
+				};
+				l0_entries.push((InternalKey::new(key, seq, kind), value));
+			}
+			let table = env.create_test_table(100 + table_idx, l0_entries.clone()).unwrap();
+			Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
+		}
+
+		// Create L1 (last level) with older values for all keys
+		let mut l1_entries = Vec::new();
+		for i in 0..12 {
+			let key = format!("key-{i:03}").into_bytes();
+			let raw_value = format!("l1-old-value-{i}").into_bytes();
+			let encoded_value = create_inline_value(&raw_value);
+
+			l1_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), encoded_value));
+		}
+		let l1_table = env.create_test_table(200, l1_entries.clone()).unwrap();
+		Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(l1_table);
+
+		// Create manifest and run L0→L1 compaction
+		let manifest_path = env.options.path.join("test_manifest_soft_delete");
+		let manifest = LevelManifest {
+			path: manifest_path.clone(),
+			levels,
+			hidden_set: HashSet::new(),
+			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			snapshots: Vec::new(),
+		};
+		write_manifest_to_disk(&manifest).unwrap();
+		let manifest = Arc::new(RwLock::new(manifest));
+
+		let strategy = Arc::new(Strategy::new(1, 1)); // base_level_size=1, multiplier=1
+		let mut compaction_options =
+			create_compaction_options(env.options.clone(), manifest.clone());
+		compaction_options.vlog = None;
+		let compactor = Compactor::new(compaction_options, strategy.clone());
+
+		compactor.compact().unwrap();
+
+		// Verify that soft deletes flow through compaction normally (like any other key)
+		let manifest_guard = manifest.read().unwrap();
+		let levels = manifest_guard.levels.get_levels();
+
+		let mut soft_deletes = 0;
+		let mut regular_deletes = 0;
+		let mut values = 0;
+
+		// Count entries in L1 (bottom level) after compaction
+		for table in &levels[1].tables {
+			for (key, _) in table.iter() {
+				match key.kind() {
+					InternalKeyKind::SoftDelete => soft_deletes += 1,
+					InternalKeyKind::Delete => regular_deletes += 1,
+					InternalKeyKind::Set => values += 1,
+					_ => {}
+				}
+			}
+		}
+
+		// Verify exact counts
+		assert_eq!(soft_deletes, 4, "Should have exactly 4 soft deletes (keys 0, 3, 6, 9)");
+		assert_eq!(
+			regular_deletes, 0,
+			"Regular deletes should be filtered out at the bottom level"
+		);
+		assert_eq!(values, 4, "Should have exactly 4 values (keys 2, 5, 8, 11)");
+
+		// Verify that values are the latest and correct
+		let mut found_keys = HashSet::new();
+		for table in &levels[1].tables {
+			for (key, value) in table.iter() {
+				match key.kind() {
+					InternalKeyKind::Set => {
+						let key_str = String::from_utf8(key.user_key.to_vec()).unwrap();
+
+						// Decode the ValueLocation to get the actual value
+						let location = crate::vlog::ValueLocation::decode(&value).unwrap();
+						let actual_value = if location.is_value_pointer() {
+							panic!("Unexpected VLog pointer in test");
+						} else {
+							(*location.value).to_vec()
+						};
+						let value_str = String::from_utf8(actual_value).unwrap();
+
+						// Verify we get the latest L0 values, not the old L1 values
+						if key_str.starts_with("key-") {
+							let key_num: usize =
+								key_str.split('-').nth(1).unwrap().parse().unwrap();
+							if key_num % 3 == 2 {
+								// These should be Set values
+								assert!(
+									value_str.starts_with("l0-value-"),
+									"Key {} should have L0 value, got: {}",
+									key_str,
+									value_str
+								);
+								found_keys.insert(key_str);
+							}
+						}
+					}
+					InternalKeyKind::SoftDelete => {
+						let key_str = String::from_utf8(key.user_key.to_vec()).unwrap();
+						if key_str.starts_with("key-") {
+							let key_num: usize =
+								key_str.split('-').nth(1).unwrap().parse().unwrap();
+							assert_eq!(key_num % 3, 0, "Soft delete should be on keys 0, 3, 6, 9");
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+
+		// Verify we found all expected Set keys
+		assert_eq!(found_keys.len(), 4, "Should have found all 4 Set keys");
+		for i in [2, 5, 8, 11] {
+			let expected_key = format!("key-{:03}", i);
+			assert!(found_keys.contains(&expected_key), "Missing expected key: {}", expected_key);
+		}
 	}
 }
