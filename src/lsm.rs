@@ -3113,4 +3113,112 @@ mod tests {
 		let result = txn.get(b"key2").unwrap().unwrap();
 		assert_eq!(result, Arc::from(b"value2".as_slice()));
 	}
+
+	#[tokio::test]
+	async fn test_soft_delete() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 64 * 1024; // Small memtable to force flushes
+		});
+
+		// Step 1: Create multiple versions of a key across separate transactions
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Create 5 different versions of the same key
+			for version in 1..=5 {
+				let value = format!("value_v{}", version);
+				let mut txn = tree.begin().unwrap();
+				txn.set(b"test_key", value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Verify the latest version exists
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"value_v5");
+
+			// Soft delete the key
+			let mut txn = tree.begin().unwrap();
+			txn.soft_delete(b"test_key").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the key is now invisible (soft deleted)
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap();
+			assert!(result.is_none(), "Soft deleted key should not be visible");
+
+			// Add a new different key
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"other_key", b"other_value").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the new key exists
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"other_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"other_value");
+
+			// Force flush to persist all changes to disk
+			tree.flush().unwrap();
+
+			// Close the database
+			tree.close().await.unwrap();
+		}
+
+		// Step 2: Reopen the database and verify soft deleted key is still invisible
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Verify the soft deleted key is still invisible after restart
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap();
+			assert!(
+				result.is_none(),
+				"Soft deleted key should remain invisible after database restart"
+			);
+
+			// Verify the other key still exists
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"other_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"other_value");
+
+			// Test range scan to ensure soft deleted key doesn't appear
+			let txn = tree.begin().unwrap();
+			let range_result: Vec<_> = txn
+				.range(b"test".as_slice(), b"testz".as_slice(), None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
+
+			// Should be empty since test_key is soft deleted
+			assert!(range_result.is_empty(), "Range scan should not include soft deleted keys");
+
+			// Test range scan that includes the other key
+			let txn = tree.begin().unwrap();
+			let range_result: Vec<_> = txn
+				.range(b"other".as_slice(), b"otherz".as_slice(), None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
+
+			// Should contain the other key
+			assert_eq!(range_result.len(), 1);
+			assert_eq!(range_result[0].0.as_ref(), b"other_key");
+			assert_eq!(range_result[0].1.as_ref().unwrap().as_ref(), b"other_value");
+
+			// Test that we can reinsert the same key after soft delete
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"test_key", b"new_value_after_soft_delete").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the new value is visible
+			let txn = tree.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"new_value_after_soft_delete");
+
+			tree.close().await.unwrap();
+		}
+	}
 }

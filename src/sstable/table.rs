@@ -423,6 +423,11 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		if key.is_tombstone() {
 			props.num_deletions += 1;
 			props.tombstone_count += 1;
+
+			// Count soft deletes specifically
+			if key.kind() == InternalKeyKind::SoftDelete {
+				props.num_soft_deletes += 1;
+			}
 		}
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
@@ -1325,7 +1330,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(588, actual);
+		assert_eq!(596, actual);
 	}
 
 	#[test]

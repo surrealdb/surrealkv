@@ -5,7 +5,7 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -53,26 +53,28 @@ pub trait InternalKeyTrait:
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InternalKeyKind {
 	Delete = 0,
-	Set = 1,
-	Merge = 2,
-	LogData = 3,
-	RangeDelete = 4,
-	Separator = 5,
-	Max = 6,
-	Invalid = 7,
+	SoftDelete = 1,
+	Set = 2,
+	Merge = 3,
+	LogData = 4,
+	RangeDelete = 5,
+	Separator = 6,
+	Max = 7,
+	Invalid = 8,
 }
 
 impl From<u8> for InternalKeyKind {
 	fn from(value: u8) -> Self {
 		match value {
 			0 => InternalKeyKind::Delete,
-			1 => InternalKeyKind::Set,
-			2 => InternalKeyKind::Merge,
-			3 => InternalKeyKind::LogData,
-			4 => InternalKeyKind::RangeDelete,
-			5 => InternalKeyKind::Separator,
-			6 => InternalKeyKind::Max,
-			7 => InternalKeyKind::Invalid,
+			1 => InternalKeyKind::SoftDelete,
+			2 => InternalKeyKind::Set,
+			3 => InternalKeyKind::Merge,
+			4 => InternalKeyKind::LogData,
+			5 => InternalKeyKind::RangeDelete,
+			6 => InternalKeyKind::Separator,
+			7 => InternalKeyKind::Max,
+			8 => InternalKeyKind::Invalid,
 			_ => InternalKeyKind::Invalid, // Default to Invalid for unknown values
 		}
 	}
@@ -138,19 +140,24 @@ impl InternalKey {
 		let kind_byte = self.trailer as u8; // Extract the last byte
 		match kind_byte {
 			0 => InternalKeyKind::Delete,
-			1 => InternalKeyKind::Set,
-			2 => InternalKeyKind::Merge,
-			3 => InternalKeyKind::LogData,
-			4 => InternalKeyKind::RangeDelete,
-			5 => InternalKeyKind::Separator,
-			6 => InternalKeyKind::Max,
+			1 => InternalKeyKind::SoftDelete,
+			2 => InternalKeyKind::Set,
+			3 => InternalKeyKind::Merge,
+			4 => InternalKeyKind::LogData,
+			5 => InternalKeyKind::RangeDelete,
+			6 => InternalKeyKind::Separator,
+			7 => InternalKeyKind::Max,
+			8 => InternalKeyKind::Invalid,
 			_ => InternalKeyKind::Invalid,
 		}
 	}
 
 	pub(crate) fn is_tombstone(&self) -> bool {
 		let kind = self.kind();
-		if kind == InternalKeyKind::Delete || kind == InternalKeyKind::RangeDelete {
+		if kind == InternalKeyKind::Delete
+			|| kind == InternalKeyKind::SoftDelete
+			|| kind == InternalKeyKind::RangeDelete
+		{
 			return true;
 		}
 
@@ -199,7 +206,12 @@ impl InternalKeyTrait for InternalKey {
 // Reverse order is used for trailer (seq_num) comparison.
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-		(&self.user_key, Reverse(self.seq_num())).cmp(&(&other.user_key, Reverse(other.seq_num())))
+		match (&self.user_key, Reverse(self.seq_num()))
+			.cmp(&(&other.user_key, Reverse(other.seq_num())))
+		{
+			Ordering::Equal => Reverse(self.kind() as u8).cmp(&Reverse(other.kind() as u8)),
+			ordering => ordering,
+		}
 	}
 }
 
