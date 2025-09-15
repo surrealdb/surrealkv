@@ -185,6 +185,10 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		self.write_seqno
 	}
 
+	pub fn set_durability(&mut self, durability: Durability) {
+		self.durability = durability;
+	}
+
 	/// Prepare a new transaction in the given mode.
 	pub(crate) fn new(core: Arc<Core<K>>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
