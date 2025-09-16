@@ -19,15 +19,14 @@ surrealkv is a versioned, low-level, persistent, embedded key-value database imp
 ## Quick Start
 
 ```rust
-use surrealkv::{Tree, Options};
-use std::sync::Arc;
+use surrealkv::{Tree, TreeBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a new LSM tree
-    let mut opts = Options::new();
-    opts.path = "path/to/db".into();
-    let tree = Tree::new(Arc::new(opts))?;
+    // Create a new LSM tree using TreeBuilder
+    let tree = TreeBuilder::new()
+        .with_path("path/to/db".into())
+        .build()?;
 
     // Start a read-write transaction
     let mut txn = tree.begin()?;
@@ -49,19 +48,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 SurrealKV can be configured through various options when creating a new LSM tree:
 
 ```rust
-use surrealkv::{Tree, Options};
-use std::sync::Arc;
+use surrealkv::{Tree, TreeBuilder};
 
-let opts = Options::new()
-    .with_path("path/to/db")                    // Database directory path
-    .with_max_memtable_size(100 * 1024 * 1024)  // 100MB memtable size
-    .with_block_size(4096)                      // 4KB block size
-    .with_level_count(7)                        // Number of levels in LSM tree
-    .with_vlog_value_threshold(4096)            // Values smaller than this stored inline
-    .with_vlog_max_file_size(128 * 1024 * 1024) // 128MB VLog file size
-    .with_disable_vlog(false);                  // Enable/disable VLog
-
-let tree = Tree::new(Arc::new(opts))?;
+let tree = TreeBuilder::new()
+    .with_path("path/to/db".into())                    // Database directory path
+    .with_max_memtable_size(100 * 1024 * 1024)         // 100MB memtable size
+    .with_block_size(4096)                             // 4KB block size
+    .with_level_count(1)                               // Number of levels in LSM tree
+    .with_vlog_value_threshold(4096)                   // Values smaller than this stored inline
+    .with_vlog_max_file_size(128 * 1024 * 1024)        // 128MB VLog file size
+    .with_enable_vlog(true)                            // Enable/disable VLog
+    .build()?
 ```
 
 ### Storage Options
@@ -75,7 +72,7 @@ let tree = Tree::new(Arc::new(opts))?;
 
 - `vlog_value_threshold`: Values smaller than this are stored inline in SSTables
 - `vlog_max_file_size`: Maximum size of VLog files before rotation
-- `disable_vlog`: Enable/disable Value Log for large value storage
+- `with_enable_vlog()`: Enable/disable Value Log for large value storage
 - `vlog_gc_discard_ratio`: Threshold for triggering VLog garbage collection
 
 ### Performance Options
@@ -88,15 +85,14 @@ let tree = Tree::new(Arc::new(opts))?;
 ### Basic Operations
 
 ```rust
-use surrealkv::{Tree, Options};
-use std::sync::Arc;
+use surrealkv::{Tree, TreeBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the LSM tree
-    let mut opts = Options::new();
-    opts.path = "path/to/db".into();
-    let tree = Tree::new(Arc::new(opts))?;
+    // Initialize the LSM tree using TreeBuilder
+    let tree = TreeBuilder::new()
+        .with_path("path/to/db".into())
+        .build()?;
 
     // Write Transaction
     {

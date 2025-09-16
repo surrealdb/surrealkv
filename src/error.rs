@@ -85,6 +85,7 @@ impl fmt::Display for Error {
             Self::VlogGCAlreadyInProgress => write!(f, "Vlog garbage collection already in progress"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
+
         }
 	}
 }

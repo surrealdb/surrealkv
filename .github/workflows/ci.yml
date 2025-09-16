@@ -88,3 +88,8 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      - name: Build WASM
+        run: |
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS="-A warnings" cargo build --target wasm32-unknown-unknown
