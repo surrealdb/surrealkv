@@ -18,6 +18,7 @@ use crate::{
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
+	spawn::spawn_detached,
 	snapshot::Counter as SnapshotCounter,
 	sstable::{table::Table, InternalKey, InternalKeyTrait},
 	task::TaskManager,
@@ -185,7 +186,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		// Done asynchronously to avoid blocking the flush operation
 		let wal_guard = self.wal.as_ref().unwrap().read();
 		let wal_dir = wal_guard.get_dir_path().to_path_buf();
-		tokio::spawn(async move {
+		spawn_detached(async move {
 			if let Err(e) = cleanup_old_segments(&wal_dir) {
 				eprintln!("Failed to clean up old WAL segments: {e}");
 			}
@@ -955,6 +956,7 @@ mod tests {
 	use std::{collections::HashMap, path::PathBuf};
 
 	use crate::compaction::leveled::Strategy;
+	use crate::spawn::spawn;
 
 	use super::*;
 
@@ -2140,7 +2142,7 @@ mod tests {
 			.map(|reader_id| {
 				let tree = tree.clone();
 				let expected_values = expected_values.clone();
-				tokio::spawn(async move {
+				spawn(async move {
 					for (key, expected_value) in expected_values {
 						let txn = tree.begin().unwrap();
 						let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();

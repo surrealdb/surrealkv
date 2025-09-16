@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 use crate::{
 	compaction::{leveled::Strategy, CompactionStrategy},
 	lsm::CompactionOperations,
+	spawn::{spawn, TaskHandle},
 	sstable::InternalKeyTrait,
 };
 
@@ -32,7 +33,7 @@ pub(crate) struct TaskManager {
 	level_running: Arc<AtomicBool>,
 
 	/// Task handles for cleanup
-	task_handles: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+	task_handles: Mutex<Option<Vec<TaskHandle<()>>>>,
 }
 
 impl fmt::Debug for TaskManager {
@@ -61,7 +62,7 @@ impl TaskManager {
 			let running = memtable_running.clone();
 			let level_notify = level_notify.clone();
 
-			let handle = tokio::spawn(async move {
+			let handle = spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;
@@ -91,7 +92,7 @@ impl TaskManager {
 			let notify = level_notify.clone();
 			let running = level_running.clone();
 
-			let handle = tokio::spawn(async move {
+			let handle = spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;
@@ -176,6 +177,7 @@ mod tests {
 
 	use crate::compaction::CompactionStrategy;
 	use crate::lsm::CompactionOperations;
+	use crate::spawn::spawn;
 	use crate::task::TaskManager;
 
 	// Mock CoreInner for testing
@@ -377,7 +379,7 @@ mod tests {
 		let mut handles = vec![];
 		for _ in 0..10 {
 			let tm = task_manager.clone();
-			handles.push(tokio::spawn(async move {
+			handles.push(spawn(async move {
 				tm.wake_up_memtable();
 			}));
 			// Small sleep to ensure some interleaving
@@ -405,7 +407,7 @@ mod tests {
 		let mut handles = vec![];
 		for _ in 0..5 {
 			let tm = task_manager.clone();
-			handles.push(tokio::spawn(async move {
+			handles.push(spawn(async move {
 				tm.wake_up_level();
 				// Small sleep to ensure some interleaving
 				time::sleep(Duration::from_millis(5)).await;

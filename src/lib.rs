@@ -11,6 +11,7 @@ mod lsm;
 pub mod memtable;
 mod oracle;
 mod snapshot;
+mod spawn;
 pub mod sstable;
 mod task;
 mod transaction;

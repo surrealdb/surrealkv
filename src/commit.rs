@@ -372,6 +372,7 @@ mod tests {
 	use std::time::Duration;
 
 	use crate::sstable::InternalKeyKind;
+	use crate::spawn::spawn;
 
 	use super::*;
 
@@ -438,7 +439,7 @@ mod tests {
 		let mut handles = vec![];
 		for i in 0..10 {
 			let pipeline = pipeline.clone();
-			let handle = tokio::spawn(async move {
+			let handle = spawn(async move {
 				let mut batch = Batch::new();
 				batch
 					.add_record(
@@ -497,7 +498,7 @@ mod tests {
 		let mut handles = vec![];
 		for i in 0..5 {
 			let pipeline = pipeline.clone();
-			let handle = tokio::spawn(async move {
+			let handle = spawn(async move {
 				let mut batch = Batch::new();
 				batch
 					.add_record(

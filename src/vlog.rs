@@ -11,7 +11,7 @@ use std::{
 
 use crate::{batch::Batch, discard::DiscardStats, Value};
 use crate::{cache::VLogCache, TreeBuilder};
-use crate::{sstable::InternalKeyTrait, vfs, Options, Tree, VLogChecksumLevel};
+use crate::{sstable::InternalKeyTrait, spawn::{spawn, TaskHandle}, vfs, Options, Tree, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -1251,7 +1251,7 @@ pub(crate) struct VLogGCManager<K: InternalKeyTrait> {
 	notify: Arc<tokio::sync::Notify>,
 
 	/// Task handle for cleanup
-	task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	task_handle: Mutex<Option<TaskHandle<()>>>,
 }
 
 impl<K: InternalKeyTrait> VLogGCManager<K> {
@@ -1280,7 +1280,7 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 		let notify = self.notify.clone();
 		let running = self.running.clone();
 
-		let handle = tokio::spawn(async move {
+		let handle = spawn(async move {
 			loop {
 				// Wait for notification OR timeout for periodic checks (every 5 minutes)
 				tokio::select! {
