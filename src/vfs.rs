@@ -6,7 +6,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 
-use fs4::FileExt as LockFileExt;
+#[cfg(not(target_arch = "wasm32"))]
+use fs2::FileExt as LockFileExt;
 
 use std::fs::File as SysFile;
 
@@ -111,11 +112,27 @@ impl File for SysFile {
 	}
 
 	fn lock(&self) -> Result<()> {
-		SysFile::try_lock_exclusive(self).map_err(|e| Error::Io(e.into()))
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			SysFile::try_lock_exclusive(self).map_err(|e| Error::Io(e.into()))
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			// File locking is not supported on WASM
+			Ok(())
+		}
 	}
 
 	fn unlock(&self) -> Result<()> {
-		LockFileExt::unlock(self).map_err(|e| Error::Io(e.into()))
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			LockFileExt::unlock(self).map_err(|e| Error::Io(e.into()))
+		}
+		#[cfg(target_arch = "wasm32")]
+		{
+			// File unlocking is not supported on WASM
+			Ok(())
+		}
 	}
 
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -129,6 +146,18 @@ impl File for SysFile {
 		{
 			std::os::windows::prelude::FileExt::seek_read(self, buf, offset)
 				.map_err(|e| Error::Io(e.into()))
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		{
+			// read_at is not supported on WASM, return an error
+			Err(Error::Io(
+				std::io::Error::new(
+					std::io::ErrorKind::Unsupported,
+					"read_at is not supported on WASM",
+				)
+				.into(),
+			))
 		}
 	}
 

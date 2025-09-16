@@ -7,6 +7,7 @@ use std::{
 		atomic::{AtomicU64, Ordering},
 		Arc,
 	},
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
 };
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use rand::Rng;
 
 use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
@@ -354,13 +356,36 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		.parent()
 		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
 
-	// Create a temporary file in the same directory to ensure it's on the same filesystem.
-	let mut temp_file = tempfile::Builder::new().tempfile_in(directory)?;
-	temp_file.write_all(new_content)?;
+	// Generate a unique temporary filename
+	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::thread_rng().gen::<u64>());
+	let temp_path = directory.join(temp_filename);
 
-	// Attempt to persist the temporary file to the target path.
-	// This operation replaces the target file with the temporary file in an atomic operation on most platforms.
-	temp_file.persist(target_path).map_err(|e| e.error)?;
+	// Get original file permissions if the file exists
+	let original_permissions = std::fs::metadata(target_path).ok().map(|m| m.permissions());
+
+	// Create and write to the temporary file
+	{
+		let mut temp_file = SysFile::create(&temp_path)?;
+		temp_file.write_all(new_content)?;
+		temp_file.sync_all()?;
+	}
+
+	// Apply original permissions to temp file if they exist
+	if let Some(permissions) = original_permissions {
+		if let Err(e) = std::fs::set_permissions(&temp_path, permissions) {
+			// Clean up temp file on permission error
+			let _ = std::fs::remove_file(&temp_path);
+			return Err(e);
+		}
+	}
+
+	// Atomically replace the target file with the temporary file
+	if let Err(e) = std::fs::rename(&temp_path, target_path) {
+		// Clean up temp file on rename failure
+		let _ = std::fs::remove_file(&temp_path);
+		return Err(e);
+	}
 
 	// Optionally, open and sync the updated file to ensure all changes are flushed to disk.
 	let updated_file = SysFile::open(target_path)?;
