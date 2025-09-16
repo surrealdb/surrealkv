@@ -6,14 +6,17 @@ use crate::wal::segment::{
 	RecordType, Result, BLOCK_SIZE, WAL_RECORD_HEADER_SIZE,
 };
 
-// Reader reads records from a MultiSegmentReader. The records are returned in the order they were written.
-// The current implementation of Reader is inspired by levelDB and prometheus implementation for WAL.
-// Since the WAL is append-only, the records are written in frames of BLOCK_SIZE bytes. The first byte of
-// each frame is the record type, followed by a reserved byte, followed by the record length (2 bytes) and
-// the CRC32 checksum (4 bytes). The record data follows the checksum.
+// Reader reads records from a MultiSegmentReader. The records are returned in
+// the order they were written. The current implementation of Reader is inspired
+// by levelDB and prometheus implementation for WAL. Since the WAL is
+// append-only, the records are written in frames of BLOCK_SIZE bytes. The first
+// byte of each frame is the record type, followed by a reserved byte, followed
+// by the record length (2 bytes) and the CRC32 checksum (4 bytes). The record
+// data follows the checksum.
 //
-// No partial writes are allowed. If the segment is not full, and the record can't fit in the remaining space, the
-// segment is padded with zeros. This is important for the reader to be able to read the records in BLOCK_SIZE chunks.
+// No partial writes are allowed. If the segment is not full, and the record
+// can't fit in the remaining space, the segment is padded with zeros. This is
+// important for the reader to be able to read the records in BLOCK_SIZE chunks.
 pub(crate) struct Reader {
 	rdr: MultiSegmentReader,
 	rec: Vec<u8>,
@@ -214,15 +217,15 @@ impl Reader {
 mod tests {
 	use super::*;
 	use std::fs::File;
-	use std::io::BufReader;
-	use std::io::{Read, Write};
+	use std::io::{BufReader, Read, Write};
 	use std::vec::Vec;
 
 	use crate::wal::segment::{Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE};
 	use crate::wal::writer::Wal;
 	use tempdir::TempDir;
 
-	// BufferReader does not return EOF when the underlying reader returns 0 bytes read.
+	// BufferReader does not return EOF when the underlying reader returns 0 bytes
+	// read.
 	#[test]
 	fn bufreader_eof_and_error() {
 		// Create a temporary directory to hold the file

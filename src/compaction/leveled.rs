@@ -1,27 +1,26 @@
-use std::{
-	collections::HashSet,
-	sync::atomic::{AtomicUsize, Ordering},
-};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{
-	levels::{Level, LevelManifest},
-	sstable::InternalKeyTrait,
-};
+use crate::levels::{Level, LevelManifest};
+use crate::sstable::InternalKeyTrait;
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 
-/// Compaction priority strategy similar to RocksDB's compaction_priority options
+/// Compaction priority strategy similar to RocksDB's compaction_priority
+/// options
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactionPriority {
 	#[allow(unused)]
-	/// Files whose range hasn't been compacted for the longest (RocksDB's kOldestSmallestSeqFirst)
+	/// Files whose range hasn't been compacted for the longest (RocksDB's
+	/// kOldestSmallestSeqFirst)
 	OldestSmallestSeqFirst,
 
 	/// Files whose latest update is oldest (RocksDB's kOldestLargestSeqFirst)
 	#[allow(unused)]
 	OldestLargestSeqFirst,
 
-	/// Larger files compensated by deletes (RocksDB's kByCompensatedSize - default)
+	/// Larger files compensated by deletes (RocksDB's kByCompensatedSize -
+	/// default)
 	#[default]
 	ByCompensatedSize,
 }
@@ -141,7 +140,8 @@ impl Strategy {
 		}
 	}
 
-	/// RocksDB's kOldestSmallestSeqFirst: ranges that haven't been compacted for longest
+	/// RocksDB's kOldestSmallestSeqFirst: ranges that haven't been compacted
+	/// for longest
 	fn select_oldest_smallest_seq_first<K: InternalKeyTrait>(
 		&self,
 		source_level: &Level<K>,
@@ -170,7 +170,8 @@ impl Strategy {
 			});
 		}
 
-		// Sort by oldest smallest sequence number first, then by file size (larger first)
+		// Sort by oldest smallest sequence number first, then by file size (larger
+		// first)
 		choices.sort_by(|a, b| match a.smallest_seq.cmp(&b.smallest_seq) {
 			std::cmp::Ordering::Equal => b.file_size.cmp(&a.file_size),
 			ordering => ordering,
@@ -179,7 +180,8 @@ impl Strategy {
 		choices.first().map(|choice| choice.table_id)
 	}
 
-	/// RocksDB's kOldestLargestSeqFirst: files whose latest update is oldest (cold data)
+	/// RocksDB's kOldestLargestSeqFirst: files whose latest update is oldest
+	/// (cold data)
 	fn select_oldest_largest_seq_first<K: InternalKeyTrait>(
 		&self,
 		source_level: &Level<K>,
@@ -208,7 +210,8 @@ impl Strategy {
 			});
 		}
 
-		// Sort by oldest largest sequence number first (coldest ranges), then by file size
+		// Sort by oldest largest sequence number first (coldest ranges), then by file
+		// size
 		choices.sort_by(|a, b| match a.largest_seq.cmp(&b.largest_seq) {
 			std::cmp::Ordering::Equal => b.file_size.cmp(&a.file_size),
 			ordering => ordering,
@@ -294,7 +297,8 @@ impl Strategy {
 			return None;
 		}
 
-		// Round-robin selection: pick the first candidate after our last compacted level
+		// Round-robin selection: pick the first candidate after our last compacted
+		// level
 		for level in &candidates {
 			if *level as usize > start {
 				self.last_compacted_level.store(*level as usize, Ordering::Relaxed);
@@ -342,31 +346,24 @@ impl<K: InternalKeyTrait> CompactionStrategy<K> for Strategy {
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		collections::{HashMap, HashSet},
-		fs::File,
-		sync::{atomic::AtomicU64, Arc, RwLock},
-	};
+	use std::collections::{HashMap, HashSet};
+	use std::fs::File;
+	use std::sync::atomic::AtomicU64;
+	use std::sync::{Arc, RwLock};
 
 	use tempfile::TempDir;
 
-	use crate::{
-		compaction::{
-			compactor::{CompactionOptions, Compactor},
-			leveled::Strategy,
-			CompactionChoice, CompactionStrategy,
-		},
-		error::Result,
-		iter::MergeIterator,
-		levels::{write_manifest_to_disk, Level, LevelManifest, Levels},
-		memtable::ImmutableMemtables,
-		sstable::{
-			table::{Table, TableFormat, TableWriter},
-			InternalKey, InternalKeyKind,
-		},
-		vlog::ValueLocation,
-		CompressionType, Options as LSMOptions,
-	};
+	use crate::compaction::compactor::{CompactionOptions, Compactor};
+	use crate::compaction::leveled::Strategy;
+	use crate::compaction::{CompactionChoice, CompactionStrategy};
+	use crate::error::Result;
+	use crate::iter::MergeIterator;
+	use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
+	use crate::memtable::ImmutableMemtables;
+	use crate::sstable::table::{Table, TableFormat, TableWriter};
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::vlog::ValueLocation;
+	use crate::{CompressionType, Options as LSMOptions};
 
 	/// Test environment setup helpers
 	struct TestEnv {
@@ -976,7 +973,8 @@ mod tests {
 			let l0_tables = &updated_manifest.levels.get_levels()[0].tables;
 			assert!(l0_tables.len() < 4, "L0 should be under its limit after compaction");
 
-			// All original L0 tables should be removed by compaction since ALL L0 tables are selected for L0→L1 compaction
+			// All original L0 tables should be removed by compaction since ALL L0 tables
+			// are selected for L0→L1 compaction
 			let original_table_ids: Vec<u64> = (1..=TABLE_COUNT as u64).collect();
 			let all_tables = updated_manifest.get_all_tables();
 			let remaining_original_count =
@@ -1116,7 +1114,8 @@ mod tests {
 		let manifest_path = env.options.path.join("test_manifest");
 		let next_table_id = 1000; // Start well above existing IDs
 
-		// Create a shared table ID counter that will be used by both the test and compactor
+		// Create a shared table ID counter that will be used by both the test and
+		// compactor
 		let shared_table_id_counter = Arc::new(AtomicU64::new(next_table_id));
 
 		let manifest = LevelManifest {
@@ -1230,7 +1229,8 @@ mod tests {
 		let env = TestEnv::new();
 		let strategy = Strategy::new(4, 10);
 
-		// Create source level (L0) with tables with different but overlapping key ranges
+		// Create source level (L0) with tables with different but overlapping key
+		// ranges
 		let mut source_level = Level::with_capacity(10);
 
 		// Create 3 tables for source level
@@ -1259,35 +1259,40 @@ mod tests {
 		source_level.insert(table2);
 		source_level.insert(table3);
 
-		// Create next level (L1) with tables that have overlapping key ranges with source
+		// Create next level (L1) with tables that have overlapping key ranges with
+		// source
 		let mut next_level = Level::with_capacity(10);
 
 		let table10 = env
 			.create_test_table(
 				10,
-				create_ordered_entries("a", 5, 10, 50, None), // a-00005 to a-00014 (overlaps with table1)
+				create_ordered_entries("a", 5, 10, 50, None), /* a-00005 to a-00014 (overlaps
+				                                               * with table1) */
 			)
 			.unwrap();
 
 		let table11 = env
 			.create_test_table(
 				11,
-				create_ordered_entries("b", 10, 10, 120, None), // b-00010 to b-00019 (overlaps with table2)
+				create_ordered_entries("b", 10, 10, 120, None), /* b-00010 to b-00019 (overlaps
+				                                                 * with table2) */
 			)
 			.unwrap();
 
 		let table12 = env
 			.create_test_table(
 				12,
-				create_ordered_entries("c", 15, 10, 180, None), // c-00015 to c-00024 (overlaps with table3)
+				create_ordered_entries("c", 15, 10, 180, None), /* c-00015 to c-00024 (overlaps
+				                                                 * with table3) */
 			)
 			.unwrap();
 
 		// Create a table with the same ID as one in source level to trigger the bug
 		let table_dup = env
 			.create_test_table(
-				1,                                           // Same ID as table1 in source_level
-				create_ordered_entries("a", 5, 8, 90, None), // a-00005 to a-00012 (overlaps with table1)
+				1, // Same ID as table1 in source_level
+				create_ordered_entries("a", 5, 8, 90, None), /* a-00005 to a-00012 (overlaps
+				    * with table1) */
 			)
 			.unwrap();
 
@@ -1375,7 +1380,8 @@ mod tests {
 		let table10 = env
 			.create_test_table(
 				10,
-				create_ordered_entries("a", 5, 15, 50, None), // a-00005 to a-00019 (overlaps with table1)
+				create_ordered_entries("a", 5, 15, 50, None), /* a-00005 to a-00019 (overlaps
+				                                               * with table1) */
 			)
 			.unwrap();
 
@@ -2142,7 +2148,8 @@ mod tests {
 		let env = TestEnv::new_with_levels(2); // Only 2 levels: L0 and L1
 		let mut levels = Levels::new(2, 10);
 
-		// Create L0 tables: 2 tables to exceed L0 limit (1) and trigger L0→L1 compaction
+		// Create L0 tables: 2 tables to exceed L0 limit (1) and trigger L0→L1
+		// compaction
 		for table_idx in 0..2 {
 			let mut l0_entries = Vec::new();
 			for i in (table_idx * 6)..((table_idx + 1) * 6) {
@@ -2198,7 +2205,8 @@ mod tests {
 
 		compactor.compact().unwrap();
 
-		// Verify that soft deletes flow through compaction normally (like any other key)
+		// Verify that soft deletes flow through compaction normally (like any other
+		// key)
 		let manifest_guard = manifest.read().unwrap();
 		let levels = manifest_guard.levels.get_levels();
 

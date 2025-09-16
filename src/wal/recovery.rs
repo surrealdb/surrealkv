@@ -1,16 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::wal::segment::list_segment_ids;
-use crate::{
-	batch::{Batch, BatchReader},
-	error::Result,
-	memtable::MemTable,
-	sstable::InternalKeyTrait,
-	wal::{
-		reader::Reader,
-		segment::{get_segment_range, Error, MultiSegmentReader, SegmentRef},
-	},
+use crate::batch::{Batch, BatchReader};
+use crate::error::Result;
+use crate::memtable::MemTable;
+use crate::sstable::InternalKeyTrait;
+use crate::wal::reader::Reader;
+use crate::wal::segment::{
+	get_segment_range, list_segment_ids, Error, MultiSegmentReader, SegmentRef,
 };
 
 /// Replays the Write-Ahead Log (WAL) to recover recent writes.
@@ -24,10 +21,12 @@ use crate::{
 /// * `memtable` - The memtable to apply recovered operations to
 ///
 /// # Returns
-/// * `Result<(u64, Option<(usize, usize)>)>` - Tuple of (max_seq_num, optional tuple of (segment_id, last_valid_offset))
+/// * `Result<(u64, Option<(usize, usize)>)>` - Tuple of (max_seq_num, optional
+///   tuple of (segment_id, last_valid_offset))
 ///
 /// If no corruption is found, the second element will be None.
-/// If corruption is found, the second element contains (segment_id, last_valid_offset) for repair.
+/// If corruption is found, the second element contains (segment_id,
+/// last_valid_offset) for repair.
 pub(crate) fn replay_wal<K: InternalKeyTrait>(
 	wal_dir: &Path,
 	memtable: &Arc<MemTable<K>>,

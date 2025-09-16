@@ -1,37 +1,30 @@
 #[cfg(test)]
 use std::collections::HashMap;
-use std::{
-	fs::{create_dir_all, File},
-	path::Path,
-	sync::{Arc, Mutex, RwLock},
-};
+use std::fs::{create_dir_all, File};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{
-	batch::Batch,
-	checkpoint::{CheckpointMetadata, DatabaseCheckpoint},
-	commit::{CommitEnv, CommitPipeline},
-	compaction::{
-		compactor::{CompactionOptions, Compactor},
-		CompactionStrategy,
-	},
-	error::Result,
-	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
-	memtable::{ImmutableMemtables, MemTable},
-	oracle::Oracle,
-	spawn::spawn_detached,
-	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, InternalKeyTrait},
-	task::TaskManager,
-	transaction::{Mode, Transaction},
-	vlog::{VLog, VLogGCManager, ValueLocation},
-	wal::{
-		self,
-		cleanup::cleanup_old_segments,
-		recovery::{repair_corrupted_wal_segment, replay_wal},
-		writer::Wal,
-	},
-	Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value,
-};
+use crate::batch::Batch;
+use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
+use crate::commit::{CommitEnv, CommitPipeline};
+use crate::compaction::compactor::{CompactionOptions, Compactor};
+use crate::compaction::CompactionStrategy;
+use crate::error::Result;
+use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::memtable::{ImmutableMemtables, MemTable};
+use crate::oracle::Oracle;
+use crate::snapshot::Counter as SnapshotCounter;
+use crate::sstable::table::Table;
+use crate::sstable::{InternalKey, InternalKeyTrait};
+use crate::task::TaskManager;
+use crate::transaction::{Mode, Transaction};
+use crate::util::spawn;
+use crate::vlog::{VLog, VLogGCManager, ValueLocation};
+use crate::wal::cleanup::cleanup_old_segments;
+use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
+use crate::wal::writer::Wal;
+use crate::wal::{self};
+use crate::{Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value};
 
 use async_trait::async_trait;
 
@@ -44,12 +37,13 @@ pub const TABLE_FOLDER: &str = "sstables";
 /// overlapping SSTables and removing deleted entries.
 #[async_trait]
 pub trait CompactionOperations<K: InternalKeyTrait>: Send + Sync {
-	/// Flushes the active memtable to disk, converting it into an immutable SSTable.
-	/// This is the first step in the LSM tree's write path.
+	/// Flushes the active memtable to disk, converting it into an immutable
+	/// SSTable. This is the first step in the LSM tree's write path.
 	fn compact_memtable(&self) -> Result<()>;
 
 	/// Performs compaction according to the specified strategy.
-	/// Compaction merges SSTables to reduce read amplification and remove tombstones.
+	/// Compaction merges SSTables to reduce read amplification and remove
+	/// tombstones.
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy<K>>) -> Result<()>;
 }
 
@@ -58,41 +52,45 @@ pub trait CompactionOperations<K: InternalKeyTrait>: Send + Sync {
 ///
 /// # LSM Tree Overview
 /// An LSM tree optimizes for write performance by buffering writes in memory
-/// and periodically flushing them to disk as sorted, immutable files (SSTables).
-/// Reads must check multiple locations: the active memtable, immutable memtables,
-/// and multiple levels of SSTables.
+/// and periodically flushing them to disk as sorted, immutable files
+/// (SSTables). Reads must check multiple locations: the active memtable,
+/// immutable memtables, and multiple levels of SSTables.
 ///
 /// # Components
-/// - **Active Memtable**: An in-memory, mutable data structure (usually a skip list
-///   or B-tree) that receives all new writes.
-/// - **Immutable Memtables**: Former active memtables that are full and awaiting
-///   flush to disk. They serve reads but accept no new writes.
-/// - **SSTables**: Sorted String Tables on disk, organized into levels. Each level
-///   has progressively larger SSTables with non-overlapping key ranges (except L0).
+/// - **Active Memtable**: An in-memory, mutable data structure (usually a skip
+///   list or B-tree) that receives all new writes.
+/// - **Immutable Memtables**: Former active memtables that are full and
+///   awaiting flush to disk. They serve reads but accept no new writes.
+/// - **SSTables**: Sorted String Tables on disk, organized into levels. Each
+///   level has progressively larger SSTables with non-overlapping key ranges
+///   (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
 pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
-	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
-	/// This memtable is typically implemented as a skip list or balanced tree to
-	/// maintain sorted order while supporting concurrent access.
+	/// In LSM trees, all writes first go to an in-memory structure for fast
+	/// insertion. This memtable is typically implemented as a skip list or
+	/// balanced tree to maintain sorted order while supporting concurrent
+	/// access.
 	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable<K>>>>,
 
 	/// Collection of immutable memtables waiting to be flushed to disk.
 	///
-	/// When the active memtable fills up (reaches max_memtable_size), it becomes
-	/// immutable and a new active memtable is created. These immutable memtables
-	/// continue serving reads while waiting for background threads to flush them
-	/// to disk as SSTables.
+	/// When the active memtable fills up (reaches max_memtable_size), it
+	/// becomes immutable and a new active memtable is created. These immutable
+	/// memtables continue serving reads while waiting for background threads
+	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
 	/// LSM trees organize SSTables into levels:
-	/// - L0: Contains SSTables flushed directly from memtables. May have overlapping key ranges.
-	/// - L1+: Each level is larger than the previous. SSTables have non-overlapping
-	///   key ranges within a level, enabling efficient binary search.
+	/// - L0: Contains SSTables flushed directly from memtables. May have
+	///   overlapping key ranges.
+	/// - L1+: Each level is larger than the previous. SSTables have
+	///   non-overlapping key ranges within a level, enabling efficient binary
+	///   search.
 	///
 	/// In memory-only mode, this is None since we don't persist to disk.
 	pub level_manifest: Option<Arc<RwLock<LevelManifest<K>>>>,
@@ -100,12 +98,13 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options<K>>,
 
-	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency Control).
-	/// Snapshots provide consistent point-in-time views of the data.
+	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency
+	/// Control). Snapshots provide consistent point-in-time views of the data.
 	pub(crate) snapshot_counter: SnapshotCounter,
 
 	/// Oracle managing transaction timestamps for MVCC.
-	/// Provides monotonic timestamps for transaction ordering and conflict resolution.
+	/// Provides monotonic timestamps for transaction ordering and conflict
+	/// resolution.
 	pub(crate) oracle: Arc<Oracle>,
 
 	/// Value Log (VLog)
@@ -130,7 +129,8 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 
 		// Initialize WAL and level manifest only if not in memory-only mode
 		let (wal, level_manifest) = if opts.in_memory_only {
-			// In memory-only mode, we don't need WAL or level manifest since we don't persist to disk
+			// In memory-only mode, we don't need WAL or level manifest since we don't
+			// persist to disk
 			(None, None)
 		} else {
 			let wal_path = opts.wal_dir();
@@ -179,14 +179,15 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		let table = flushed_memtable.flush(table_id, self.opts.clone(), self.vlog.clone())?;
 
 		// Add the new SSTable to Level 0
-		// L0 is special: it contains recently flushed SSTables that may have overlapping keys
+		// L0 is special: it contains recently flushed SSTables that may have
+		// overlapping keys
 		self.add_table_to_l0(table)?;
 
 		// Clean up old WAL segments since the memtable has been successfully flushed
 		// Done asynchronously to avoid blocking the flush operation
 		let wal_guard = self.wal.as_ref().unwrap().read();
 		let wal_dir = wal_guard.get_dir_path().to_path_buf();
-		spawn_detached(async move {
+		spawn(async move {
 			if let Err(e) = cleanup_old_segments(&wal_dir) {
 				eprintln!("Failed to clean up old WAL segments: {e}");
 			}
@@ -256,7 +257,8 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		Ok(())
 	}
 
-	/// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
+	/// Resolves a value, checking if it's a VLog pointer and retrieving from
+	/// VLog if needed
 	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
 		let location = ValueLocation::decode(value)?;
 		location.resolve_value(self.vlog.as_ref())
@@ -304,7 +306,8 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 		})
 	}
 
-	/// Creates a new commit environment for in-memory mode (without task manager)
+	/// Creates a new commit environment for in-memory mode (without task
+	/// manager)
 	pub(crate) fn new_in_memory(core: Arc<CoreInner<K>>) -> Result<Self> {
 		Ok(Self {
 			core,
@@ -370,7 +373,8 @@ pub(crate) struct Core<K: InternalKeyTrait> {
 	/// The commit pipeline that handles write batches
 	commit_pipeline: Arc<CommitPipeline>,
 
-	/// Task manager for background operations (stored in Option so we can take it for shutdown)
+	/// Task manager for background operations (stored in Option so we can take
+	/// it for shutdown)
 	task_manager: Mutex<Option<Arc<TaskManager>>>,
 
 	/// VLog garbage collection manager
@@ -387,7 +391,6 @@ impl<K: InternalKeyTrait> std::ops::Deref for Core<K> {
 
 impl<K: InternalKeyTrait> Core<K> {
 	/// Function to replay WAL with automatic repair on corruption.
-	///
 	fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		context: &str, // "Database startup" or "Database reload"
@@ -497,7 +500,8 @@ impl<K: InternalKeyTrait> Core<K> {
 			let current_seq_num = inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
 			let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
-			// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
+			// Set visible sequence number ts to highest of lsn from Wal, or latest table in
+			// manifest
 			commit_pipeline.set_seq_num(max_seq_num);
 
 			let core = Self {
@@ -533,7 +537,8 @@ impl<K: InternalKeyTrait> Core<K> {
 		self.commit_pipeline.get_visible_seq_num()
 	}
 
-	/// Safely closes the LSM tree by shutting down all components in the correct order.
+	/// Safely closes the LSM tree by shutting down all components in the
+	/// correct order.
 	///
 	/// 1. The commit pipeline is shut down and all pending operations complete
 	/// 2. Background tasks (memtable flushing, compaction) are stopped safely
@@ -565,7 +570,8 @@ impl<K: InternalKeyTrait> Core<K> {
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
-		// This is safe now because all background tasks that could write to WAL are stopped
+		// This is safe now because all background tasks that could write to WAL are
+		// stopped
 		if let Some(ref wal) = self.inner.wal {
 			let mut wal_guard = wal.write();
 			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {e}")))?;
@@ -719,7 +725,8 @@ impl<K: InternalKeyTrait> Tree<K> {
 			self.core.inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
 		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
-		// Set visible sequence number to highest of lsn from WAL or latest table in manifest
+		// Set visible sequence number to highest of lsn from WAL or latest table in
+		// manifest
 		self.core.commit_pipeline.set_seq_num(max_seq_num);
 
 		Ok(metadata)
@@ -765,7 +772,8 @@ pub struct TreeBuilder<K: InternalKeyTrait> {
 }
 
 impl<K: InternalKeyTrait> TreeBuilder<K> {
-	/// Creates a new TreeBuilder with default options for the specified key type.
+	/// Creates a new TreeBuilder with default options for the specified key
+	/// type.
 	pub fn new() -> Self {
 		Self {
 			opts: Options::<K>::default(),
@@ -774,7 +782,8 @@ impl<K: InternalKeyTrait> TreeBuilder<K> {
 
 	/// Creates a new TreeBuilder with the specified options.
 	///
-	/// This method ensures type safety by requiring the options to use the same key type.
+	/// This method ensures type safety by requiring the options to use the same
+	/// key type.
 	pub fn with_options(opts: Options<K>) -> Self {
 		Self {
 			opts,
@@ -953,10 +962,11 @@ fn sync_directory_structure<K: InternalKeyTrait>(opts: &Options<K>) -> Result<()
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, path::PathBuf};
+	use std::collections::HashMap;
+	use std::path::PathBuf;
 
 	use crate::compaction::leveled::Strategy;
-	use crate::spawn::spawn;
+	use crate::util::spawn;
 
 	use super::*;
 
@@ -966,7 +976,8 @@ mod tests {
 		TempDir::new("test").unwrap()
 	}
 
-	/// Creates test options with common defaults, allowing customization of specific fields
+	/// Creates test options with common defaults, allowing customization of
+	/// specific fields
 	fn create_test_options(
 		path: PathBuf,
 		customizations: impl FnOnce(&mut Options),
@@ -980,7 +991,8 @@ mod tests {
 		Arc::new(opts)
 	}
 
-	/// Creates test options optimized for small memtable testing (triggers frequent flushes)
+	/// Creates test options optimized for small memtable testing (triggers
+	/// frequent flushes)
 	fn create_small_memtable_options(path: PathBuf) -> Arc<Options> {
 		create_test_options(path, |opts| {
 			opts.max_memtable_size = 64 * 1024; // 64KB
@@ -2137,28 +2149,31 @@ mod tests {
 
 		let tree = Arc::new(tree);
 
-		// Concurrent reads
-		let read_handles: Vec<_> = (0..5)
-			.map(|reader_id| {
-				let tree = tree.clone();
-				let expected_values = expected_values.clone();
-				spawn(async move {
-					for (key, expected_value) in expected_values {
-						let txn = tree.begin().unwrap();
-						let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
-						assert_eq!(
-							retrieved,
-							expected_value.as_bytes().into(),
-							"Reader {reader_id} failed to get correct value for key {key}"
-						);
-					}
-				})
-			})
-			.collect();
+		// Concurrent reads using channels
+		let (completion_sender, completion_receiver) = async_channel::bounded(5);
+
+		for reader_id in 0..5 {
+			let tree = tree.clone();
+			let expected_values = expected_values.clone();
+			let sender = completion_sender.clone();
+			spawn(async move {
+				for (key, expected_value) in expected_values {
+					let txn = tree.begin().unwrap();
+					let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
+					assert_eq!(
+						retrieved,
+						expected_value.as_bytes().into(),
+						"Reader {reader_id} failed to get correct value for key {key}"
+					);
+				}
+				// Signal completion
+				let _ = sender.send(reader_id).await;
+			});
+		}
 
 		// Wait for all reads to complete
-		for handle in read_handles {
-			handle.await.unwrap();
+		for _ in 0..5 {
+			let _ = completion_receiver.recv().await.unwrap();
 		}
 	}
 
@@ -2377,7 +2392,8 @@ mod tests {
 		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
-		// only one should remain because the active VLog file does not get garbage collected
+		// only one should remain because the active VLog file does not get garbage
+		// collected
 		for _ in 0..6 {
 			tree.garbage_collect_vlog().await.unwrap();
 		}
@@ -2488,7 +2504,8 @@ mod tests {
 		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
-		// only one should remain because the active VLog file does not get garbage collected
+		// only one should remain because the active VLog file does not get garbage
+		// collected
 		for _ in 0..6 {
 			tree.garbage_collect_vlog().await.unwrap();
 		}
@@ -2562,7 +2579,8 @@ mod tests {
 			tree.flush().unwrap();
 		}
 
-		// --- Step 3: Validate current value of key1 (should be last inserted version) ---
+		// --- Step 3: Validate current value of key1 (should be last inserted version)
+		// ---
 		{
 			let tx = tree.begin().unwrap();
 			let current_value = tx.get(&key1).unwrap().unwrap();
@@ -2600,10 +2618,12 @@ mod tests {
 		let strategy = Arc::new(Strategy::default());
 		tree.core.compact(strategy).unwrap();
 
-		// --- Step 8: Run VLog garbage collection (which internally can trigger file compaction) ---
+		// --- Step 8: Run VLog garbage collection (which internally can trigger file
+		// compaction) ---
 		tree.garbage_collect_vlog().await.unwrap();
 
-		// --- Step 9: Verify key1 still returns the correct latest value after compaction ---
+		// --- Step 9: Verify key1 still returns the correct latest value after
+		// compaction ---
 		{
 			let tx = tree.begin().unwrap();
 			let value = tx.get(&key1).unwrap().unwrap();
@@ -2753,8 +2773,8 @@ mod tests {
 				(table1_id, table2_id, next_table_id)
 			};
 
-			// Verify table IDs are increasing (note: tables are stored in reverse order by sequence number)
-			// So the first table in the vector has the higher ID
+			// Verify table IDs are increasing (note: tables are stored in reverse order by
+			// sequence number) So the first table in the vector has the higher ID
 			assert!(
 				table1_id > table2_id,
 				"Table 1 ID should be greater than table 2 ID (newer table first)"

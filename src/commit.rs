@@ -1,16 +1,12 @@
 // This commit pipeline is inspired by Pebble's commit pipeline.
 
-use std::sync::{
-	atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-	Arc, Mutex,
-};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{oneshot, Semaphore};
 
-use crate::{
-	batch::Batch,
-	error::{Error, Result},
-};
+use crate::batch::Batch;
+use crate::error::{Error, Result};
 
 const MAX_CONCURRENT_COMMITS: usize = 16;
 const DEQUEUE_BITS: u32 = 32;
@@ -132,7 +128,8 @@ impl CommitQueue {
 		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
 	}
 
-	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is applied
+	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is
+	// applied
 	fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
 		loop {
 			let ptrs = self.head_tail.load(Ordering::Acquire);
@@ -210,8 +207,8 @@ impl CommitPipeline {
 	}
 
 	/// Synchronous commit that bypasses the async pipeline machinery.
-	/// This is suitable for cases where no flow control or async coordination is needed,
-	/// such as delete list updates during compaction.
+	/// This is suitable for cases where no flow control or async coordination
+	/// is needed, such as delete list updates during compaction.
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
@@ -372,7 +369,7 @@ mod tests {
 	use std::time::Duration;
 
 	use crate::sstable::InternalKeyKind;
-	use crate::spawn::spawn;
+	use crate::util::spawn;
 
 	use super::*;
 
@@ -435,11 +432,14 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 	async fn test_concurrent_commits() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let num_tasks = 10;
+		let (result_sender, result_receiver) = async_channel::bounded(num_tasks);
 
-		let mut handles = vec![];
-		for i in 0..10 {
+		// Spawn concurrent commit tasks
+		for i in 0..num_tasks {
 			let pipeline = pipeline.clone();
-			let handle = spawn(async move {
+			let sender = result_sender.clone();
+			spawn(async move {
 				let mut batch = Batch::new();
 				batch
 					.add_record(
@@ -448,13 +448,20 @@ mod tests {
 						Some(&[1, 2, 3]),
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				let result = pipeline.commit(batch, false).await;
+				let _ = sender.send((i, result)).await;
 			});
-			handles.push(handle);
 		}
 
-		for (i, handle) in handles.into_iter().enumerate() {
-			let result = handle.await.unwrap();
+		// Collect all results
+		let mut results = Vec::new();
+		for _ in 0..num_tasks {
+			let (i, result) = result_receiver.recv().await.unwrap();
+			results.push((i, result));
+		}
+
+		// Verify all commits succeeded
+		for (i, result) in results {
 			assert!(result.is_ok(), "Commit {i} failed: {result:?}");
 		}
 
@@ -494,11 +501,14 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_concurrent_commits_with_delays() {
 		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv));
+		let num_tasks = 5;
+		let (result_sender, result_receiver) = async_channel::bounded(5);
 
-		let mut handles = vec![];
-		for i in 0..5 {
+		// Spawn concurrent commit tasks
+		for i in 0..num_tasks {
 			let pipeline = pipeline.clone();
-			let handle = spawn(async move {
+			let sender = result_sender.clone();
+			spawn(async move {
 				let mut batch = Batch::new();
 				batch
 					.add_record(
@@ -507,17 +517,19 @@ mod tests {
 						Some(&[1, 2, 3]),
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				let result = pipeline.commit(batch, false).await;
+				let _ = sender.send(result).await;
 			});
-			handles.push(handle);
 		}
 
-		for handle in handles {
-			assert!(handle.await.unwrap().is_ok());
+		// Collect all results
+		for _ in 0..num_tasks {
+			let res = result_receiver.recv().await.unwrap();
+			assert!(res.is_ok());
 		}
 
 		// Verify sequence numbers are published correctly
-		assert_eq!(pipeline.get_visible_seq_num(), 5);
+		assert_eq!(pipeline.get_visible_seq_num(), num_tasks);
 
 		// Shutdown the pipeline
 		pipeline.shutdown();

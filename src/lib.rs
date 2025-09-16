@@ -11,10 +11,10 @@ mod lsm;
 pub mod memtable;
 mod oracle;
 mod snapshot;
-mod spawn;
 pub mod sstable;
 mod task;
 mod transaction;
+mod util;
 mod vfs;
 pub mod vlog;
 mod wal;
@@ -24,11 +24,15 @@ pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
-use sstable::{bloom::LevelDBBloomFilter, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
-use std::{cmp::Ordering, path::PathBuf, sync::Arc};
+use sstable::bloom::LevelDBBloomFilter;
+use sstable::{InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
+use std::cmp::Ordering;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Type alias for iterator results containing key-value pairs
-/// Value is optional to support keys-only iteration without allocating empty values
+/// Value is optional to support keys-only iteration without allocating empty
+/// values
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
@@ -65,8 +69,8 @@ pub struct Options<K: InternalKeyTrait = InternalKey> {
 	pub vlog_checksum_verification: VLogChecksumLevel,
 	/// If true, disables `VLog` creation entirely
 	pub enable_vlog: bool,
-	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 - 1.0)
-	/// Default: 0.5 (50% discardable data triggers GC)
+	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 -
+	/// 1.0) Default: 0.5 (50% discardable data triggers GC)
 	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
@@ -287,22 +291,23 @@ impl From<u8> for CompressionType {
 
 /// A trait for comparing keys in a key-value store.
 ///
-/// This trait defines methods for comparing keys, generating separator keys, generating successor keys,
-/// and retrieving the name of the comparator.
+/// This trait defines methods for comparing keys, generating separator keys,
+/// generating successor keys, and retrieving the name of the comparator.
 pub trait Comparator: Send + Sync {
 	/// Compares two keys `a` and `b`.
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
 
 	/// Generates a separator key between two keys `from` and `to`.
 	///
-	/// This method should return a key that is greater than or equal to `from` and less than `to`.
-	/// It is used to optimize the storage layout by finding a midpoint key.
+	/// This method should return a key that is greater than or equal to `from`
+	/// and less than `to`. It is used to optimize the storage layout by
+	/// finding a midpoint key.
 	fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8>;
 
 	/// Generates the successor key of a given key.
 	///
-	/// This method should return a key that is lexicographically greater than the given key.
-	/// It is used to find the next key in the key space.
+	/// This method should return a key that is lexicographically greater than
+	/// the given key. It is used to find the next key in the key space.
 	fn successor(&self, key: &[u8]) -> Vec<u8>;
 
 	/// Retrieves the name of the comparator.
@@ -344,13 +349,13 @@ pub trait Iterator<K: InternalKeyTrait> {
 	fn seek(&mut self, target: &[u8]) -> Option<()>;
 
 	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the source.
-	/// REQUIRES: `valid()`
+	/// valid iff the iterator was not positioned at the last entry in the
+	/// source. REQUIRES: `valid()`
 	fn advance(&mut self) -> bool;
 
-	/// Moves to the previous entry in the source.  After this call, the iterator
-	/// is valid iff the iterator was not positioned at the first entry in source.
-	/// REQUIRES: `valid()`
+	/// Moves to the previous entry in the source.  After this call, the
+	/// iterator is valid iff the iterator was not positioned at the first
+	/// entry in source. REQUIRES: `valid()`
 	fn prev(&mut self) -> bool;
 
 	/// Return the key for the current entry.  The underlying storage for
@@ -387,7 +392,8 @@ impl Comparator for BytewiseComparator {
 	///
 	/// This function uses a three-tier approach like `LevelDB`:
 	/// 1. Find first differing byte and try to increment
-	/// 2. If that fails, work backwards from end of `a` trying to increment non-0xff bytes
+	/// 2. If that fails, work backwards from end of `a` trying to increment
+	///    non-0xff bytes
 	/// 3. Final fallback: append a 0 byte to make it longer than `a`
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
@@ -440,8 +446,8 @@ impl Comparator for BytewiseComparator {
 	#[inline]
 	/// Generates the successor key of a given byte slice `key`.
 	///
-	/// This function finds the first non-0xff byte, increments it, and truncates the result.
-	/// If all bytes are 0xff, it appends a 0xff byte.
+	/// This function finds the first non-0xff byte, increments it, and
+	/// truncates the result. If all bytes are 0xff, it appends a 0xff byte.
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
 		let mut result = key.to_vec();
 		for i in 0..key.len() {
@@ -530,7 +536,8 @@ impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 		let internal_key = K::decode(key);
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key().as_ref());
 
-		// Create a new internal key with the successor user key and original sequence/kind
+		// Create a new internal key with the successor user key and original
+		// sequence/kind
 		let result = K::new(user_key_succ, internal_key.seq_num(), internal_key.kind());
 		result.encode()
 	}

@@ -39,7 +39,6 @@ guardian = "1.3.0"
 scopeguard = "1.2.0"
 memmap2 = "0.9.5"
 interval-heap = "0.0.5"
-thiserror = "1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fs2 = "0.4.3"

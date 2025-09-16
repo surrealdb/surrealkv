@@ -1,21 +1,16 @@
-use std::{
-	collections::{HashMap, HashSet},
-	fs::File as SysFile,
-	io::{Cursor, Read, Write},
-	path::{Path, PathBuf},
-	sync::{
-		atomic::{AtomicU64, Ordering},
-		Arc,
-	},
-	time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{HashMap, HashSet};
+use std::fs::File as SysFile;
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{
-	error::Error,
-	sstable::{table::Table, InternalKeyTrait},
-	vfs::File,
-	Options, Result,
-};
+use crate::error::Error;
+use crate::sstable::table::Table;
+use crate::sstable::InternalKeyTrait;
+use crate::vfs::File;
+use crate::{Options, Result};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use rand::Rng;
@@ -183,7 +178,8 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 		}
 
 		// Now convert the level data into actual Level objects with Table instances
-		// Use the actual number of levels from the manifest, not the configured level count
+		// Use the actual number of levels from the manifest, not the configured level
+		// count
 		let mut levels_vec = Vec::with_capacity(level_data.len());
 
 		// Load all levels that exist in the manifest
@@ -387,7 +383,8 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// Optionally, open and sync the updated file to ensure all changes are flushed to disk.
+	// Optionally, open and sync the updated file to ensure all changes are flushed
+	// to disk.
 	let updated_file = SysFile::open(target_path)?;
 	updated_file.sync_all()?;
 
@@ -421,16 +418,13 @@ pub(crate) fn write_manifest_to_disk<K: InternalKeyTrait>(
 
 #[cfg(test)]
 mod tests {
-	use crate::{
-		lsm::TABLE_FOLDER,
-		sstable::{table::TableWriter, InternalKey, InternalKeyKind},
-	};
+	use crate::lsm::TABLE_FOLDER;
+	use crate::sstable::table::TableWriter;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	use super::*;
-	use std::{
-		fs::{self, File as SysFile},
-		sync::atomic::Ordering,
-	};
+	use std::fs::{self, File as SysFile};
+	use std::sync::atomic::Ordering;
 
 	// Helper function to create a test table with direct file IO
 	fn create_test_table(
@@ -896,7 +890,8 @@ mod tests {
 
 		assert_eq!(manifest.lsn(), 30, "Should return highest LSN after adding new table");
 
-		// Test 5: Verify table ordering - tables should be sorted by largest_seq_num descending
+		// Test 5: Verify table ordering - tables should be sorted by largest_seq_num
+		// descending
 		{
 			let level0 = &manifest.levels.get_levels()[0];
 			assert_eq!(level0.tables.len(), 3, "Should have 3 tables in L0");
@@ -916,8 +911,8 @@ mod tests {
 			);
 		}
 
-		// Test 6: Add table with lower sequence numbers (simulating out-of-order insertion)
-		// Create table with sequence numbers 5-8 (largest_seq_num = 8)
+		// Test 6: Add table with lower sequence numbers (simulating out-of-order
+		// insertion) Create table with sequence numbers 5-8 (largest_seq_num = 8)
 		let table4 = create_test_table_with_seq_nums(4, 5, 8, opts.clone())
 			.expect("Failed to create table 4");
 
@@ -958,7 +953,8 @@ mod tests {
 		}
 
 		// Test 7: Test with overlapping sequence ranges
-		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with table3)
+		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with
+		// table3)
 		let table5 = create_test_table_with_seq_nums(5, 25, 35, opts.clone())
 			.expect("Failed to create table 5");
 

@@ -1,25 +1,19 @@
-use crate::{
-	compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
-	error::Result,
-	iter::{BoxedIterator, CompactionIterator},
-	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
-	lsm::CoreInner,
-	memtable::ImmutableMemtables,
-	sstable::{
-		table::{Table, TableWriter},
-		InternalKeyTrait,
-	},
-	vfs::File,
-	vlog::VLog,
-	Options as LSMOptions,
-};
+use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
+use crate::error::Result;
+use crate::iter::{BoxedIterator, CompactionIterator};
+use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::lsm::CoreInner;
+use crate::memtable::ImmutableMemtables;
+use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::InternalKeyTrait;
+use crate::vfs::File;
+use crate::vlog::VLog;
+use crate::Options as LSMOptions;
 
-use std::{
-	collections::HashMap,
-	fs::File as SysFile,
-	path::{Path, PathBuf},
-	sync::{Arc, RwLock, RwLockWriteGuard},
-};
+use std::collections::HashMap;
+use std::fs::File as SysFile;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 /// Compaction options
 pub(crate) struct CompactionOptions<K: InternalKeyTrait> {
@@ -175,7 +169,8 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		// Create a changeset for the compaction
 		let mut changeset = ManifestChangeSet::<K>::default();
 
-		// Add tables to delete (the ones being merged) - use the same efficient approach as original
+		// Add tables to delete (the ones being merged) - use the same efficient
+		// approach as original
 		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
 			for &table_id in &input.tables_to_merge {
 				if level.tables.iter().any(|t| t.id == table_id) {

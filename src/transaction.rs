@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
+use std::collections::btree_map::Entry as BTreeEntry;
+use std::collections::{btree_map, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -10,11 +11,11 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
-use crate::sstable::InternalKeyKind;
-use crate::sstable::InternalKeyTrait;
+use crate::sstable::{InternalKeyKind, InternalKeyTrait};
 use crate::{IterResult, Value};
 
-/// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
+/// `Mode` is an enumeration representing the different modes a transaction can
+/// have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
 	/// `ReadWrite` mode allows the transaction to both read and write data.
@@ -97,9 +98,11 @@ pub struct ReadOptions {
 	pub keys_only: bool,
 	/// Maximum number of items to return (for range operations)
 	pub limit: Option<usize>,
-	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
+	/// Lower bound for iteration (inclusive). If set, iteration will start from
+	/// this key or later.
 	pub iterate_lower_bound: Option<Vec<u8>>,
-	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
+	/// Upper bound for iteration (exclusive). If set, iteration will stop
+	/// before this key.
 	pub iterate_upper_bound: Option<Vec<u8>>,
 }
 
@@ -147,16 +150,20 @@ impl ReadOptions {
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction<K: InternalKeyTrait> {
-	/// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
+	/// `mode` is the transaction mode. This can be either `ReadWrite`,
+	/// `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
 
-	/// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
+	/// `durability` is the durability level of the transaction. This is used to
+	/// determine how the transaction is committed.
 	durability: Durability,
 
-	/// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
+	/// `snapshot` is the snapshot that the transaction is running in. This is a
+	/// consistent view of the data at the time the transaction started.
 	pub(crate) snapshot: Option<Snapshot<K>>,
 
-	/// `core` is the underlying core for the transaction. This is shared between transactions.
+	/// `core` is the underlying core for the transaction. This is shared
+	/// between transactions.
 	pub(crate) core: Arc<Core<K>>,
 
 	/// `write_set` is a map of keys to entries.
@@ -165,16 +172,19 @@ pub struct Transaction<K: InternalKeyTrait> {
 	/// savepoints and rollbacks.
 	pub(crate) write_set: BTreeMap<Bytes, Vec<Entry>>,
 
-	/// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
+	/// `closed` indicates if the transaction is closed. A closed transaction
+	/// cannot make any more changes to the data.
 	closed: bool,
 
 	/// Tracks when this transaction started for deadlock detection
 	pub(crate) start_commit_id: u64,
 
-	/// `savepoints` indicates the current number of stacked savepoints; zero means none.
+	/// `savepoints` indicates the current number of stacked savepoints; zero
+	/// means none.
 	savepoints: u32,
 
-	/// write sequence number is used for real-time ordering of writes within a transaction.
+	/// write sequence number is used for real-time ordering of writes within a
+	/// transaction.
 	write_seqno: u32,
 }
 
@@ -244,12 +254,14 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
 	}
 
-	/// Soft delete a key. The key will exist on disk but never be shown in queries.
+	/// Soft delete a key. The key will exist on disk but never be shown in
+	/// queries.
 	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
 	}
 
-	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	/// Delete all the versions of a key with custom write options. This is a
+	/// hard delete.
 	pub fn delete_with_options(
 		&mut self,
 		key: &[u8],
@@ -283,7 +295,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 			return Err(Error::TransactionWriteOnly);
 		}
 
-		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
+		// RYOW semantics: Read your own writes. If the value is in the write set,
+		// return it.
 		if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
 			// If the entry is a tombstone, return None.
 			if last_entry.is_tombstone() {
@@ -308,9 +321,11 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 
 	/// Writes a value for a key. None is used for deletion.
-	/// Writes a value for a key with custom write options. None is used for deletion.
+	/// Writes a value for a key with custom write options. None is used for
+	/// deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -352,7 +367,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		Ok(())
 	}
 
-	/// Creates an iterator for a range scan between start and end keys (inclusive).
+	/// Creates an iterator for a range scan between start and end keys
+	/// (inclusive).
 	pub fn range<Key: AsRef<[u8]>>(
 		&self,
 		start: Key,
@@ -366,7 +382,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 
 	/// Creates an iterator for a range scan with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and
+	/// iterate_upper_bound).
 	pub fn range_with_options(
 		&self,
 		options: &ReadOptions,
@@ -378,7 +395,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 
 	/// Creates an iterator that returns only keys in the given range.
-	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
+	/// This is faster than `range()` as it doesn't fetch or resolve values from
+	/// disk.
 	pub fn keys<Key: AsRef<[u8]>>(
 		&self,
 		start: Key,
@@ -392,7 +410,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 
 	/// Creates an iterator that returns only keys with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and
+	/// iterate_upper_bound).
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
@@ -466,7 +485,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	///
 	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
 	pub fn set_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -486,7 +506,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	///
 	/// [`set_savepoint`]: Transaction::set_savepoint
 	pub fn rollback_to_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -587,7 +608,8 @@ impl Entry {
 	}
 }
 
-/// An iterator that performs a merging scan over a transaction's snapshot and write set.
+/// An iterator that performs a merging scan over a transaction's snapshot and
+/// write set.
 pub(crate) struct TransactionRangeIterator<'a, K: InternalKeyTrait> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
@@ -832,7 +854,9 @@ mod tests {
 
 	use bytes::Bytes;
 
-	use crate::{lsm::Tree, sstable::InternalKey, TreeBuilder};
+	use crate::lsm::Tree;
+	use crate::sstable::InternalKey;
+	use crate::TreeBuilder;
 
 	use super::*;
 

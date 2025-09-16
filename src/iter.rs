@@ -1,14 +1,12 @@
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
-use crate::{
-	sstable::{InternalKeyKind, InternalKeyTrait},
-	Key, Value,
-};
+use crate::sstable::{InternalKeyKind, InternalKeyTrait};
+use crate::{Key, Value};
 
 pub type BoxedIterator<'a, K> = Box<dyn DoubleEndedIterator<Item = (Arc<K>, Value)> + 'a>;
 
@@ -173,7 +171,8 @@ pub(crate) struct CompactionIterator<'a, K: InternalKeyTrait> {
 	/// Reference to VLog for populating delete-list
 	vlog: Option<Arc<VLog<K>>>,
 
-	/// Batch of stale entries to add to delete-list: (sequence_number, value_size)
+	/// Batch of stale entries to add to delete-list: (sequence_number,
+	/// value_size)
 	delete_list_batch: Vec<(u64, u64)>,
 
 	initialized: bool,
@@ -224,7 +223,8 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 		Ok(())
 	}
 
-	/// Process all collected versions of the current key and return the one to output
+	/// Process all collected versions of the current key and return the one to
+	/// output
 	fn process_current_key_versions(&mut self) -> Option<(Arc<K>, Value)> {
 		if self.current_key_versions.is_empty() {
 			return None;
@@ -344,10 +344,8 @@ impl<K: InternalKeyTrait> Iterator for CompactionIterator<'_, K> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{
-		sstable::{InternalKey, InternalKeyKind},
-		Options, VLogChecksumLevel, Value,
-	};
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::{Options, VLogChecksumLevel, Value};
 	use std::sync::Arc;
 	use tempfile::TempDir;
 
@@ -484,7 +482,8 @@ mod tests {
 		}
 
 		// 3. Check that we have the correct total number of entries
-		// All keys (20) because we get 5 keys with tombstones from items1 and 15 other keys from items2
+		// All keys (20) because we get 5 keys with tombstones from items1 and 15 other
+		// keys from items2
 		assert_eq!(result.len(), 20, "Wrong number of entries");
 	}
 
@@ -749,7 +748,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Both tombstone and older value should be added to delete list
-		// At bottom level, both the tombstone and the older value should be marked as stale
+		// At bottom level, both the tombstone and the older value should be marked as
+		// stale
 		assert!(
 			vlog.is_stale(200).unwrap(),
 			"Tombstone (seq=200) should be marked as stale at bottom level"
@@ -797,7 +797,8 @@ mod tests {
 		// Only the older value should be added to delete list (not the tombstone)
 		// Check that the older value (seq=100) is marked as stale
 		assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
-		// Check that the tombstone (seq=200) is NOT marked as stale (since it was returned)
+		// Check that the tombstone (seq=200) is NOT marked as stale (since it was
+		// returned)
 		assert!(
 			!vlog.is_stale(200).unwrap(),
 			"Tombstone (seq=200) should NOT be marked as stale since it was returned"
@@ -869,7 +870,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Verify delete list behavior for complex scenario:
-		// Key1: seq=100 should be stale (older version), seq=200 should NOT be stale (latest, returned)
+		// Key1: seq=100 should be stale (older version), seq=200 should NOT be stale
+		// (latest, returned)
 		assert!(
 			vlog.is_stale(100).unwrap(),
 			"Key1 older version (seq=100) should be marked as stale"
@@ -879,7 +881,8 @@ mod tests {
 			"Key1 latest version (seq=200) should NOT be marked as stale since it was returned"
 		);
 
-		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale (latest tombstone, returned)
+		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale
+		// (latest tombstone, returned)
 		assert!(
 			vlog.is_stale(110).unwrap(),
 			"Key2 older version (seq=110) should be marked as stale"
@@ -1019,7 +1022,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Verify delete list behavior for sequence ordering test:
-		// key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be stale (latest, returned)
+		// key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be
+		// stale (latest, returned)
 		assert!(
 			vlog.is_stale(100).unwrap(),
 			"key_a oldest version (seq=100) should be marked as stale"
@@ -1039,7 +1043,8 @@ mod tests {
 			"key_b only version (seq=250) should NOT be marked as stale since it was returned"
 		);
 
-		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be stale (latest tombstone, returned)
+		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be
+		// stale (latest tombstone, returned)
 		assert!(
 			vlog.is_stale(120).unwrap(),
 			"key_c oldest version (seq=120) should be marked as stale"

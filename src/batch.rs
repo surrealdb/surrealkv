@@ -628,7 +628,8 @@ mod tests {
 		// Now they should encode identically (both write value_len=0)
 		assert_eq!(encoded_none, encoded_empty, "None and Some(&[]) should now encode identically");
 
-		// Test reading them back - both should return None (since both encode as value_len=0)
+		// Test reading them back - both should return None (since both encode as
+		// value_len=0)
 		let mut reader_none = BatchReader::new(&encoded_none).unwrap();
 		let (kind1, key1, value1) = reader_none.read_record().unwrap().unwrap();
 		assert_eq!(kind1, InternalKeyKind::Delete);

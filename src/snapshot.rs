@@ -1,16 +1,17 @@
 use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
-use std::sync::{atomic::AtomicU32, Arc};
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::{meta::KeyRange, InternalKeyKind, InternalKeyTrait};
-use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
-use crate::{Key, Value};
+use crate::sstable::meta::KeyRange;
+use crate::sstable::{InternalKeyKind, InternalKeyTrait};
+use crate::{IterResult, Iterator as LSMIterator, Key, Value, INTERNAL_KEY_SEQ_NUM_MAX};
 
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use interval_heap::IntervalHeap;
@@ -98,9 +99,9 @@ pub(crate) struct IterState<K: InternalKeyTrait> {
 ///
 /// # Snapshot Isolation in LSM Trees
 ///
-/// Snapshots provide consistent reads by fixing a sequence number at creation time.
-/// All reads through the snapshot only see data with sequence numbers less than
-/// or equal to the snapshot's sequence number.
+/// Snapshots provide consistent reads by fixing a sequence number at creation
+/// time. All reads through the snapshot only see data with sequence numbers
+/// less than or equal to the snapshot's sequence number.
 #[derive(Clone)]
 pub(crate) struct Snapshot<K: InternalKeyTrait> {
 	/// Reference to the LSM tree core
@@ -131,7 +132,8 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 	/// 2. **Immutable Memtables**: Recent writes being flushed
 	/// 3. **Level**: From SSTables
 	///
-	/// The search stops at the first version found with seq_num <= snapshot seq_num.
+	/// The search stops at the first version found with seq_num <= snapshot
+	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
@@ -664,14 +666,12 @@ impl<K: InternalKeyTrait> Drop for SnapshotIterator<'_, K> {
 
 #[cfg(test)]
 mod tests {
-	use crate::TreeBuilder;
-	use crate::{Options, Tree};
+	use crate::{Options, Tree, TreeBuilder};
 	use std::collections::HashSet;
 	use std::sync::Arc;
 
 	use super::{IterState, KMergeIterator};
-	use crate::levels::Level;
-	use crate::levels::Levels;
+	use crate::levels::{Level, Levels};
 	use crate::memtable::MemTable;
 	use crate::sstable::table::{Table, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};

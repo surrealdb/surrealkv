@@ -7,5 +7,4 @@ pub mod writer;
 #[cfg(test)]
 mod tests;
 
-pub use segment::Error;
-pub use segment::Options;
+pub use segment::{Error, Options};

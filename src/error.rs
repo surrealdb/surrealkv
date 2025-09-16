@@ -1,10 +1,12 @@
-use std::{fmt, io, sync::Arc};
+use std::sync::Arc;
+use std::{fmt, io};
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// `Error` is a custom error type for the storage module.
-/// It includes various variants to represent different types of errors that can occur.
+/// It includes various variants to represent different types of errors that can
+/// occur.
 #[derive(Clone, Debug)]
 pub enum Error {
 	Abort,              // The operation was aborted

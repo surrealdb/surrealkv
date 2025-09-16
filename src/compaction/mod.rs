@@ -3,7 +3,8 @@
 pub(crate) mod compactor;
 pub(crate) mod leveled;
 
-use crate::{levels::LevelManifest, sstable::InternalKeyTrait};
+use crate::levels::LevelManifest;
+use crate::sstable::InternalKeyTrait;
 
 /// Represents the input for a compaction operation
 #[derive(Debug, Eq, PartialEq, Clone)]

@@ -6,8 +6,9 @@ use crate::wal::segment::{get_segment_range, list_segment_ids, Result};
 /// Cleans up old WAL segments, keeping only the latest segment.
 ///
 /// This function removes all WAL segments except the latest one, since we use
-/// one segment per memtable and only the latest segment contains unflushed data.
-/// All older segments have been flushed to SSTables and are no longer needed.
+/// one segment per memtable and only the latest segment contains unflushed
+/// data. All older segments have been flushed to SSTables and are no longer
+/// needed.
 ///
 /// # Arguments
 ///

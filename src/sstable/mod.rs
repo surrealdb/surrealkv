@@ -18,9 +18,9 @@ pub trait FilterPolicy: Send + Sync {
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
 
-/// Trait for internal key implementations that provide key format and operations
-/// for the LSM tree. This allows different internal key formats to be used
-/// in different scenarios while maintaining a consistent interface.
+/// Trait for internal key implementations that provide key format and
+/// operations for the LSM tree. This allows different internal key formats to
+/// be used in different scenarios while maintaining a consistent interface.
 pub trait InternalKeyTrait:
 	Clone + Debug + PartialEq + Eq + PartialOrd + Ord + Send + Sync + Default + 'static
 {
@@ -80,9 +80,10 @@ impl From<u8> for InternalKeyKind {
 	}
 }
 
-// This is the maximum valid sequence number that can be stored in the upper 56 bits of a 64-bit integer.
-// 1 << 56 shifts the number 1 left by 56 bits, resulting in a binary number with a 1 followed by 56 zeros.
-// Subtracting 1 gives a binary number with 56 ones, which is the maximum value for 56 bits.
+// This is the maximum valid sequence number that can be stored in the upper 56
+// bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
+// resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
+// gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
