@@ -372,14 +372,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		options: &ReadOptions,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
-		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
-
-		// Check if keys are empty
-		if start_key.is_empty() || end_key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
 		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
 	}
 
@@ -404,13 +398,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		options: &ReadOptions,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().ok_or(Error::EmptyKey)?;
-		let end_key = options.iterate_upper_bound.clone().ok_or(Error::EmptyKey)?;
-
-		// Check if keys are empty
-		if start_key.is_empty() || end_key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
 
 		// Force keys_only to true for this method
 		let mut options = options.clone();
@@ -1470,6 +1459,45 @@ mod tests {
 			assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value3");
 			assert_eq!(range[2].0.as_ref(), b"key4");
 			assert_eq!(range[2].1.as_ref().unwrap().as_ref(), b"value4");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_range_with_bounds() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert some initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test range with start bound as empty
+		{
+			let tx = store.begin().unwrap();
+			let beg = b"".as_slice();
+			let range: Vec<_> =
+				tx.range(beg, b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 4);
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(range[3].0.as_ref(), b"key4");
+		}
+
+		// Test range with both bounds as empty
+		{
+			let tx = store.begin().unwrap();
+			let beg = b"".as_slice();
+			let end = b"".as_slice();
+			let range: Vec<_> =
+				tx.range(beg, end, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			assert_eq!(range.len(), 0);
 		}
 	}
 
