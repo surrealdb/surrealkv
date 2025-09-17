@@ -70,6 +70,8 @@ pub(crate) type Result<T> = std::result::Result<T, BPlusTreeError>;
 const PAGE_SIZE: usize = 4096;
 const VERSION: u32 = 1;
 const MAGIC: [u8; 8] = *b"BPTREE01";
+
+// Page constants
 const CACHE_CAPACITY: u64 = 256 * 1024 * 1024; // 256 MiB
 const NODE_TYPE_INTERNAL: u8 = 0;
 const NODE_TYPE_LEAF: u8 = 1;
@@ -80,7 +82,7 @@ const TRUNK_PAGE_HEADER_SIZE: usize = 13; // 1 byte type + 8 bytes next + 4 byte
 const TRUNK_PAGE_ENTRY_SIZE: usize = 4; // 4-byte entries
 const TRUNK_RESERVED_ENTRIES: usize = 6; // Reserve last 6 entries
 const TRUNK_PAGE_MAX_ENTRIES: usize =
-	(PAGE_SIZE - 4 - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE - TRUNK_RESERVED_ENTRIES;
+	(PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE - TRUNK_RESERVED_ENTRIES;
 
 // Constants for size calculation
 // const NODE_TYPE_SIZE: usize = 1; // 1 byte for node type
@@ -156,7 +158,7 @@ trait Node {
 	fn current_size(&self) -> usize;
 	fn would_fit(&self, key: &[u8], value: Option<&[u8]>) -> bool;
 	fn max_size() -> usize {
-		PAGE_SIZE - 4 // Reserve 4 bytes for length prefix
+		PAGE_SIZE
 	}
 
 	// Check if this node could merge with another node
@@ -180,11 +182,11 @@ impl InternalNode {
 	}
 
 	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
-		if buffer.len() != PAGE_SIZE - 4 {
+		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Invalid node size {} (expected {})",
 				buffer.len(),
-				PAGE_SIZE - 4
+				PAGE_SIZE
 			)));
 		}
 
@@ -371,7 +373,7 @@ impl InternalNode {
 
 impl Node for InternalNode {
 	fn serialize(&self) -> Result<Vec<u8>> {
-		let mut buffer = Vec::with_capacity(PAGE_SIZE - 4);
+		let mut buffer = Vec::with_capacity(PAGE_SIZE);
 
 		// 1. Node type (1 byte)
 		buffer.push(NODE_TYPE_INTERNAL);
@@ -396,18 +398,17 @@ impl Node for InternalNode {
 
 		// 6. Calculate total space used
 		let total_used = buffer.len();
-		let available_space = PAGE_SIZE - 4; // Reserve 4 bytes for length prefix
 
 		// 7. Validate size before padding
-		if total_used > available_space {
+		if total_used > PAGE_SIZE {
 			return Err(BPlusTreeError::Serialization(format!(
 				"Internal node requires {} bytes (max {})",
-				total_used, available_space
+				total_used, PAGE_SIZE
 			)));
 		}
 
-		// 8. Pad to fill page
-		buffer.resize(available_space, 0);
+		// 8. Pad to fill available space
+		buffer.resize(PAGE_SIZE, 0);
 		Ok(buffer)
 	}
 
@@ -473,11 +474,11 @@ impl LeafNode {
 	}
 
 	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
-		if buffer.len() != PAGE_SIZE - 4 {
+		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Invalid node size {} (expected {})",
 				buffer.len(),
-				PAGE_SIZE - 4
+				PAGE_SIZE
 			)));
 		}
 
@@ -687,7 +688,7 @@ impl LeafNode {
 
 impl Node for LeafNode {
 	fn serialize(&self) -> Result<Vec<u8>> {
-		let mut buffer = Vec::with_capacity(PAGE_SIZE - 4);
+		let mut buffer = Vec::with_capacity(PAGE_SIZE);
 
 		// 1. Node type (1 byte)
 		buffer.push(NODE_TYPE_LEAF);
@@ -714,18 +715,17 @@ impl Node for LeafNode {
 
 		// 6. Calculate total space used
 		let total_used = buffer.len();
-		let available_space = PAGE_SIZE - 4; // Reserve 4 bytes for length prefix
 
 		// 7. Validate size before padding
-		if total_used > available_space {
+		if total_used > PAGE_SIZE {
 			return Err(BPlusTreeError::Serialization(format!(
 				"Leaf node requires {} bytes (max {})",
-				total_used, available_space
+				total_used, PAGE_SIZE
 			)));
 		}
 
-		// 8. Pad to fill page
-		buffer.resize(available_space, 0);
+		// 8. Pad to fill available space
+		buffer.resize(PAGE_SIZE, 0);
 		Ok(buffer)
 	}
 
@@ -809,7 +809,7 @@ impl TrunkPage {
 	}
 
 	fn serialize(&self) -> Result<Vec<u8>> {
-		let mut buffer = Vec::with_capacity(PAGE_SIZE - 4);
+		let mut buffer = Vec::with_capacity(PAGE_SIZE);
 
 		// 1. Page type (1 byte)
 		buffer.push(TRUNK_PAGE_TYPE);
@@ -825,8 +825,8 @@ impl TrunkPage {
 			buffer.extend_from_slice(&page.to_le_bytes());
 		}
 
-		// 5. Pad to fill page
-		let available_space = PAGE_SIZE - 4;
+		// 5. Pad to fill available space
+		let available_space = PAGE_SIZE;
 		if buffer.len() > available_space {
 			return Err(BPlusTreeError::Serialization("Trunk page overflow".into()));
 		}
@@ -836,7 +836,7 @@ impl TrunkPage {
 	}
 
 	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
-		if buffer.len() != PAGE_SIZE - 4 {
+		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization("Invalid trunk page size".into()));
 		}
 
@@ -901,6 +901,7 @@ impl NodeType {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum Durability {
 	/// Sync after every write (safe but slow)
 	Always,
@@ -1991,16 +1992,8 @@ impl<S: Storage> BPlusTree<S> {
 		let mut buffer = vec![0; PAGE_SIZE];
 		self.storage.read_at(&mut buffer, offset)?;
 
-		// Validate length prefix
-		let len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
-		if len > PAGE_SIZE - 4 {
-			return Err(BPlusTreeError::Deserialization(format!(
-				"Invalid trunk page length {}",
-				len
-			)));
-		}
-
-		let trunk = TrunkPage::deserialize(&buffer[4..], offset)?;
+		// Deserialize the full page
+		let trunk = TrunkPage::deserialize(&buffer, offset)?;
 
 		Ok(trunk)
 	}
@@ -2008,12 +2001,8 @@ impl<S: Storage> BPlusTree<S> {
 	fn write_trunk_page(&mut self, trunk: &TrunkPage) -> Result<()> {
 		let data = trunk.serialize()?;
 
-		let mut buffer = Vec::with_capacity(PAGE_SIZE);
-		buffer.extend_from_slice(&(data.len() as u32).to_le_bytes());
-		buffer.extend_from_slice(&data);
-		buffer.resize(PAGE_SIZE, 0);
-
-		self.storage.write_at(&buffer, trunk.offset)?;
+		// Write data directly to storage
+		self.storage.write_at(&data, trunk.offset)?;
 
 		self.maybe_sync()?;
 
@@ -2030,13 +2019,8 @@ impl<S: Storage> BPlusTree<S> {
 		let mut buffer = vec![0; PAGE_SIZE];
 		self.storage.read_at(&mut buffer, offset)?;
 
-		// Validate length prefix
-		let len = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
-		if len > PAGE_SIZE - 4 {
-			return Err(BPlusTreeError::Deserialization(format!("Invalid node length {}", len)));
-		}
-
-		let node = NodeType::deserialize(&buffer[4..], offset)?;
+		// Deserialize directly from the full page
+		let node = NodeType::deserialize(&buffer, offset)?;
 		self.cache.insert(offset, node.clone());
 
 		Ok(node)
@@ -2048,17 +2032,13 @@ impl<S: Storage> BPlusTree<S> {
 			NodeType::Leaf(leaf) => leaf.serialize()?,
 		};
 
-		let mut buffer = Vec::with_capacity(PAGE_SIZE);
-		buffer.extend_from_slice(&(data.len() as u32).to_le_bytes());
-		buffer.extend_from_slice(&data);
-		buffer.resize(PAGE_SIZE, 0);
-
 		let offset = match node {
 			NodeType::Internal(internal) => internal.offset,
 			NodeType::Leaf(leaf) => leaf.offset,
 		};
 
-		self.storage.write_at(&buffer, offset)?;
+		// Write data directly to storage
+		self.storage.write_at(&data, offset)?;
 
 		self.maybe_sync()?;
 
