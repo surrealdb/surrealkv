@@ -3,11 +3,10 @@ use std::mem::size_of;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{
-	error::Error,
-	sstable::{table::TableFormat, InternalKeyTrait},
-	CompressionType, Result, Value,
-};
+use crate::error::Error;
+use crate::sstable::table::TableFormat;
+use crate::sstable::InternalKeyTrait;
+use crate::{CompressionType, Result, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyRange {

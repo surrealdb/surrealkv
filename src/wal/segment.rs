@@ -1,8 +1,6 @@
 use std::fmt;
-use std::fs::File;
-use std::fs::{read_dir, OpenOptions};
-use std::io::BufReader;
-use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::fs::{read_dir, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
@@ -11,30 +9,33 @@ use crc32fast::Hasher;
 
 /// The size of a single block in bytes.
 ///
-/// The `BLOCK_SIZE` constant represents the size of a block used for buffering disk writes in the
-/// write-ahead log. It determines the maximum amount of data that can be held in memory before
-/// flushing to disk. Larger block sizes can improve write performance but might use more memory.
+/// The `BLOCK_SIZE` constant represents the size of a block used for buffering
+/// disk writes in the write-ahead log. It determines the maximum amount of data
+/// that can be held in memory before flushing to disk. Larger block sizes can
+/// improve write performance but might use more memory.
 pub(crate) const BLOCK_SIZE: usize = 32 * 1024;
 
 /// Length of the record header in bytes.
 ///
-/// This constant represents the length, in bytes, of the record header structure
-/// used in the write-ahead log. The record header contains information
-/// about the type of the record, the length of the payload, and a checksum value.
-/// The constant is set to 7, reflecting the size of the record header structure.
+/// This constant represents the length, in bytes, of the record header
+/// structure used in the write-ahead log. The record header contains
+/// information about the type of the record, the length of the payload, and a
+/// checksum value. The constant is set to 7, reflecting the size of the record
+/// header structure.
 pub const WAL_RECORD_HEADER_SIZE: usize = 7;
 
 /// The magic value for identifying file headers.
 ///
-/// The `MAGIC` constant represents a magic value used in file headers to uniquely identify the
-/// format or purpose of the file. It's a hexadecimal value that serves as a signature for file
-/// identification and verification.
+/// The `MAGIC` constant represents a magic value used in file headers to
+/// uniquely identify the format or purpose of the file. It's a hexadecimal
+/// value that serves as a signature for file identification and verification.
 const MAGIC: u64 = 0xFB98_F92D;
 
 /// The version number of the file format.
 ///
-/// The `VERSION` constant represents the version number of the file format used in write-ahead log
-/// segments. It provides information about the structure and layout of the data within the segment.
+/// The `VERSION` constant represents the version number of the file format used
+/// in write-ahead log segments. It provides information about the structure and
+/// layout of the data within the segment.
 const VERSION: u64 = 1;
 
 /// Default file mode for newly created files, represented in octal format.
@@ -90,11 +91,13 @@ impl CompressionLevel {
 	}
 }
 
-/// A `Block` is an in-memory buffer that stores data before it is flushed to disk. It is used to
-/// batch writes to improve performance by reducing the number of individual disk writes. If the
-/// data to be written exceeds the `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
-/// keeps track of the allocated space, flushed data, and other details related to the write process.
-/// It can also be used to align data to the size of a direct I/O block, if applicable.
+/// A `Block` is an in-memory buffer that stores data before it is flushed to
+/// disk. It is used to batch writes to improve performance by reducing the
+/// number of individual disk writes. If the data to be written exceeds the
+/// `BLOCK_SIZE`, it will be split and flushed separately. The `Block`
+/// keeps track of the allocated space, flushed data, and other details related
+/// to the write process. It can also be used to align data to the size of a
+/// direct I/O block, if applicable.
 ///
 /// # Type Parameters
 ///
@@ -143,56 +146,64 @@ impl<const BLOCK_SIZE: usize, const RECORD_HEADER_SIZE: usize>
 
 /// Represents options for configuring a segment in a write-ahead log.
 ///
-/// The `Options` struct provides a way to customize various aspects of a write-ahead log segment,
-/// such as the file mode, compression settings, metadata, and extension. These options are used
-/// when creating a new segment to tailor its behavior according to application requirements.
+/// The `Options` struct provides a way to customize various aspects of a
+/// write-ahead log segment, such as the file mode, compression settings,
+/// metadata, and extension. These options are used when creating a new segment
+/// to tailor its behavior according to application requirements.
 #[derive(Clone)]
 pub struct Options {
 	/// The permission mode for creating directories.
 	///
-	/// If specified, this option sets the permission mode for creating directories. It determines
-	/// the access rights for creating new directories. If not specified, the default directory
-	/// creation mode will be used.
+	/// If specified, this option sets the permission mode for creating
+	/// directories. It determines the access rights for creating new
+	/// directories. If not specified, the default directory creation mode will
+	/// be used.
 	pub(crate) dir_mode: Option<u32>,
 
 	/// The file mode to set for the segment file.
 	///
-	/// If specified, this option sets the permission mode for the segment file. It determines who
-	/// can read, write, and execute the file. If not specified, the default file mode will be used.
+	/// If specified, this option sets the permission mode for the segment file.
+	/// It determines who can read, write, and execute the file. If not
+	/// specified, the default file mode will be used.
 	pub(crate) file_mode: Option<u32>,
 
 	/// The compression format to apply to the segment's data.
 	///
-	/// If specified, this option sets the compression format that will be used to compress the
-	/// data written to the segment. Compression can help save storage space but might introduce
-	/// some overhead in terms of CPU usage during read and write operations.
+	/// If specified, this option sets the compression format that will be used
+	/// to compress the data written to the segment. Compression can help save
+	/// storage space but might introduce some overhead in terms of CPU usage
+	/// during read and write operations.
 	pub(crate) compression_format: Option<CompressionFormat>,
 
 	/// The compression level to use with the selected compression format.
 	///
-	/// This option specifies the compression level that will be applied when compressing the data.
-	/// Higher levels usually provide better compression ratios but require more computational
-	/// resources. If not specified, a default compression level will be used.
+	/// This option specifies the compression level that will be applied when
+	/// compressing the data. Higher levels usually provide better compression
+	/// ratios but require more computational resources. If not specified, a
+	/// default compression level will be used.
 	pub(crate) compression_level: Option<CompressionLevel>,
 
 	/// The metadata associated with the segment.
 	///
-	/// This option allows you to attach metadata to the segment. Metadata can be useful for storing
-	/// additional information about the segment's contents or usage. If not specified, no metadata
-	/// will be associated with the segment.
+	/// This option allows you to attach metadata to the segment. Metadata can
+	/// be useful for storing additional information about the segment's
+	/// contents or usage. If not specified, no metadata will be associated
+	/// with the segment.
 	pub(crate) metadata: Option<Metadata>,
 
 	/// The extension to use for the segment file.
 	///
-	/// If specified, this option sets the extension for the segment file. The extension is used
-	/// when creating the segment file on disk. If not specified, a default extension might be used.
+	/// If specified, this option sets the extension for the segment file. The
+	/// extension is used when creating the segment file on disk. If not
+	/// specified, a default extension might be used.
 	pub(crate) file_extension: Option<String>,
 
 	/// The maximum size of the segment file.
 	///
-	/// If specified, this option sets the maximum size that the segment file is allowed to reach.
-	/// Once the file reaches this size, additional writes will be prevented. If not specified,
-	/// there is no maximum size limit for the file.
+	/// If specified, this option sets the maximum size that the segment file is
+	/// allowed to reach. Once the file reaches this size, additional writes
+	/// will be prevented. If not specified, there is no maximum size limit for
+	/// the file.
 	///
 	/// This is used to cycle segments when the max file size is reached.
 	pub(crate) max_file_size: u64,
@@ -233,15 +244,17 @@ impl Options {
 
 /// Represents metadata associated with a file.
 ///
-/// The `Metadata` struct defines a container for storing key-value pairs of metadata. This metadata
-/// can be used to hold additional information about a file. The data is stored in a hash map where
-/// each key is a string and each value is a vector of bytes.
+/// The `Metadata` struct defines a container for storing key-value pairs of
+/// metadata. This metadata can be used to hold additional information about a
+/// file. The data is stored in a hash map where each key is a string and each
+/// value is a vector of bytes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Metadata {
 	/// The map holding key-value pairs of metadata.
 	///
-	/// The `data` field is a hash map that allows associating arbitrary data with descriptive keys.
-	/// This can be used, for example, to store additional information about the file as a header.
+	/// The `data` field is a hash map that allows associating arbitrary data
+	/// with descriptive keys. This can be used, for example, to store
+	/// additional information about the file as a header.
 	data: HashMap<String, Vec<u8>>,
 }
 
@@ -262,9 +275,9 @@ impl Metadata {
 
 	/// Creates a new `Metadata` instance with file header information.
 	///
-	/// This method creates a new `Metadata` instance and sets the key-value pairs corresponding to
-	/// the file header information, such as magic number, version, segment ID, compression format,
-	/// and compression level.
+	/// This method creates a new `Metadata` instance and sets the key-value
+	/// pairs corresponding to the file header information, such as magic
+	/// number, version, segment ID, compression format, and compression level.
 	///
 	/// # Parameters
 	///
@@ -368,9 +381,10 @@ impl Metadata {
 
 /// Enum representing different types of records in a write-ahead log.
 ///
-/// This enumeration defines different types of records that can be used in a write-ahead log.
-/// Each record type indicates a particular state of a record in the log. The enum variants
-/// represent various stages of a record, including full records, fragments, and special cases.
+/// This enumeration defines different types of records that can be used in a
+/// write-ahead log. Each record type indicates a particular state of a record
+/// in the log. The enum variants represent various stages of a record,
+/// including full records, fragments, and special cases.
 ///
 /// # Variants
 ///
@@ -404,18 +418,16 @@ impl RecordType {
 	}
 }
 
-/*
-	Encodes a record with the provided information into the given buffer.
-
-	It has the following format:
-
-	Record Header
-
-		0      1      2      3      4      5      6      7
-		+------+------+------+------+------+------+------+------+------+------+
-		| Type |    Length   |         CRC32             |       Payload      |
-		+------+------+------+------+------+------+------+------+------+------+
-*/
+// Encodes a record with the provided information into the given buffer.
+//
+// It has the following format:
+//
+// Record Header
+//
+// 0      1      2      3      4      5      6      7
+// +------+------+------+------+------+------+------+------+------+------+
+// | Type |    Length   |         CRC32             |       Payload      |
+// +------+------+------+------+------+------+------+------+------+------+
 fn encode_record_header(buf: &mut [u8], rec_len: usize, part: &[u8], i: usize) {
 	let typ = if i == 0 && part.len() == rec_len {
 		RecordType::Full
@@ -605,8 +617,8 @@ pub(crate) fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
 	hasher.finalize()
 }
 
-/// Copies elements from `src` into `dest` until either `dest` is full or all elements in `src` have been copied.
-/// Returns the number of elements copied.
+/// Copies elements from `src` into `dest` until either `dest` is full or all
+/// elements in `src` have been copied. Returns the number of elements copied.
 fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
 	let min_len = dest.len().min(src.len());
 
@@ -617,8 +629,8 @@ fn copy_slice(dest: &mut [u8], src: &[u8]) -> usize {
 	min_len
 }
 
-/// Tries to copy `dest.len()` bytes from `src`, starting at `dest_len`, but not more than `src_len`.
-/// Returns the length of `dest`.
+/// Tries to copy `dest.len()` bytes from `src`, starting at `dest_len`, but not
+/// more than `src_len`. Returns the length of `dest`.
 #[cfg(test)]
 fn copy_into_dest_from_src(dest: &mut [u8], dest_len: usize, src: &[u8], src_len: usize) -> usize {
 	let min_len = std::cmp::min(dest.len() - dest_len, src_len);
@@ -659,7 +671,8 @@ pub(crate) fn segment_name(index: u64, ext: &str) -> String {
 /// Gets the range of segment IDs present in the specified directory.
 ///
 /// This function returns a tuple containing the minimum and maximum segment IDs
-/// found in the directory. If no segments are found, the tuple will contain (0, 0).
+/// found in the directory. If no segments are found, the tuple will contain (0,
+/// 0).
 pub(crate) fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 	let refs = list_segment_ids(dir)?;
 	if refs.is_empty() {
@@ -670,9 +683,9 @@ pub(crate) fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 
 /// Lists the segment IDs found in the specified directory.
 ///
-/// This function reads the names of segment files in the directory and extracts the segment IDs.
-/// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
-/// vector is returned.
+/// This function reads the names of segment files in the directory and extracts
+/// the segment IDs. The segment IDs are returned as a sorted vector. If no
+/// segment files are found, an empty vector is returned.
 pub(crate) fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 	let mut refs: Vec<u64> = Vec::new();
 	let entries = read_dir(dir)?;
@@ -705,7 +718,8 @@ pub(crate) struct SegmentRef {
 }
 
 impl SegmentRef {
-	/// Creates a vector of SegmentRef instances by reading segments in the specified directory.
+	/// Creates a vector of SegmentRef instances by reading segments in the
+	/// specified directory.
 	pub(crate) fn read_segments_from_directory(directory_path: &Path) -> Result<Vec<SegmentRef>> {
 		let mut segment_refs = Vec::new();
 
@@ -727,7 +741,8 @@ impl SegmentRef {
 				// Create a SegmentRef instance
 				let segment_ref = SegmentRef {
 					file_path,
-					file_header_offset: (4 + header.len()) as u64, // You need to set the correct offset here
+					file_header_offset: (4 + header.len()) as u64, /* You need to set the correct
+					                                                * offset here */
 					id: index,
 				};
 
@@ -741,34 +756,34 @@ impl SegmentRef {
 	}
 }
 
-/*
-	Represents a segment in aan append-only (or write-ahead) log.
-
-	A `Segment` represents a portion of thean append-only (or write-ahead) log. It holds information about the file
-	that stores the log entries, as well as details related to the segment's data and state.
-
-	A segment header is stored at the beginning of the segment file. It has the following format:
-
-	File Header
-
-	 0      1      2      3      4      5      6      7      8
-	 +------+------+------+------+------+------+------+------+
-	 | Magic                                                 |
-	 +------+------+------+------+------+------+------+------+
-	 | Version                                               |
-	 +------+------+------+------+------+------+------+------+
-	 | SegmentID                                             |
-	 +------+------+------+------+------+------+------+------+
-	 | Compression                                           |
-	 +------+------+------+------+------+------+------+------+
-	 | Compression Level                                     |
-	 +------+------+------+------+------+------+------+------+
-	 | Metadata                                              |
-	 .                                                       |
-	 .                                                       |
-	 .                                                       |
-	 +------+------+------+------+------+------+------+------+
-*/
+// Represents a segment in aan append-only (or write-ahead) log.
+//
+// A `Segment` represents a portion of thean append-only (or write-ahead) log.
+// It holds information about the file that stores the log entries, as well as
+// details related to the segment's data and state.
+//
+// A segment header is stored at the beginning of the segment file. It has the
+// following format:
+//
+// File Header
+//
+// 0      1      2      3      4      5      6      7      8
+// +------+------+------+------+------+------+------+------+
+// | Magic                                                 |
+// +------+------+------+------+------+------+------+------+
+// | Version                                               |
+// +------+------+------+------+------+------+------+------+
+// | SegmentID                                             |
+// +------+------+------+------+------+------+------+------+
+// | Compression                                           |
+// +------+------+------+------+------+------+------+------+
+// | Compression Level                                     |
+// +------+------+------+------+------+------+------+------+
+// | Metadata                                              |
+// .                                                       |
+// .                                                       |
+// .                                                       |
+// +------+------+------+------+------+------+------+------+
 pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	/// The unique identifier of the segment.
 	#[allow(unused)]
@@ -946,8 +961,9 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 
 	/// Appends data to the segment.
 	///
-	/// This method appends the given data to the segment. If the block is full, it is flushed
-	/// to disk. The data is written in chunks to the current block until the block is full.
+	/// This method appends the given data to the segment. If the block is full,
+	/// it is flushed to disk. The data is written in chunks to the current
+	/// block until the block is full.
 	///
 	/// # Parameters
 	///
@@ -989,7 +1005,8 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 		let buf = &mut active_block.buf[active_block.written..];
 
 		encode_record_header(buf, rec.len(), partial_record, i);
-		// Copy the 'partial_record' into the buffer starting from the WAL_RECORD_HEADER_SIZE offset
+		// Copy the 'partial_record' into the buffer starting from the
+		// WAL_RECORD_HEADER_SIZE offset
 		copy_slice(&mut buf[WAL_RECORD_HEADER_SIZE..], partial_record);
 		active_block.written += partial_record.len() + WAL_RECORD_HEADER_SIZE;
 
@@ -1168,10 +1185,10 @@ impl fmt::Display for CorruptionError {
 // Implementation of Error trait for CorruptionError
 impl std::error::Error for CorruptionError {}
 
-// MultiSegmentReader is a buffered reader that reads in multiples of BLOCK_SIZE.
-// It is used by Reader to read from multiple segments. It is used by WAL to
-// track multiple segment and offset for corruption detection. Since data is
-// written to WAL in multiples of BLOCK_SIZE, non-block aligned segments
+// MultiSegmentReader is a buffered reader that reads in multiples of
+// BLOCK_SIZE. It is used by Reader to read from multiple segments. It is used
+// by WAL to track multiple segment and offset for corruption detection. Since
+// data is written to WAL in multiples of BLOCK_SIZE, non-block aligned segments
 // are padded with zeros. This is done to avoid partial reads from the WAL.
 pub(crate) struct MultiSegmentReader {
 	buf: BufReader<File>,      // Buffer for reading from the current segment.
@@ -1212,9 +1229,10 @@ impl MultiSegmentReader {
 		let bytes_read = self.buf.read(buf)?;
 		self.off += bytes_read;
 
-		// If we read less than the buffer size, we've reached the end of the current segment.
-		// If the offset is not block aligned, we need to fill the rest of the buffer with zeros.
-		// This is to avoid detecting the wrong segment as corrupt.
+		// If we read less than the buffer size, we've reached the end of the current
+		// segment. If the offset is not block aligned, we need to fill the rest of
+		// the buffer with zeros. This is to avoid detecting the wrong segment as
+		// corrupt.
 		if self.off % BLOCK_SIZE != 0 {
 			// Fill the rest of the buffer with zeros.
 			let i = self.fill_with_zeros(buf, bytes_read);
@@ -1282,11 +1300,8 @@ impl Read for MultiSegmentReader {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::fs::File;
-	use std::fs::OpenOptions;
-	use std::io::Cursor;
-	use std::io::Seek;
-	use std::io::{Read, SeekFrom, Write};
+	use std::fs::{File, OpenOptions};
+	use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 	use tempdir::TempDir;
 
 	#[test]
@@ -1328,7 +1343,8 @@ mod tests {
 		let mut output = Vec::new();
 		let data = b"XYZ";
 		write_field(data, &mut output).unwrap();
-		assert_eq!(&output, &[0, 0, 0, 3, 88, 89, 90]); // [0, 0, 0, 3] for big-endian length and "XYZ" bytes
+		assert_eq!(&output, &[0, 0, 0, 3, 88, 89, 90]); // [0, 0, 0, 3] for big-endian
+		                                          // length and "XYZ" bytes
 	}
 
 	#[test]
@@ -1430,7 +1446,8 @@ mod tests {
 		// Modify the metadata to an unexpected value
 		opts.metadata = Some(Metadata::new(None)); // This doesn't match the default metadata
 
-		// Validate the file header, expecting an error due to mismatched compression level
+		// Validate the file header, expecting an error due to mismatched compression
+		// level
 		let result = validate_file_header(&header, id, &opts);
 		assert!(result.is_err()); // Header validation should throw an error
 	}
@@ -2098,7 +2115,8 @@ mod tests {
 		assert!(r.is_ok());
 		assert_eq!(3, r.unwrap().1);
 
-		// Validate offset after appending (4 bytes + 7 bytes header + 3 bytes + 7 bytes header = 21)
+		// Validate offset after appending (4 bytes + 7 bytes header + 3 bytes + 7 bytes
+		// header = 21)
 		assert_eq!(segment.offset(), 21);
 
 		// Test syncing segment - WAL always pads to full block size
@@ -2166,13 +2184,15 @@ mod tests {
 		// Extract just the data part (skip WAL header)
 		assert_eq!(&[0, 1, 2, 3], &block1[WAL_RECORD_HEADER_SIZE..WAL_RECORD_HEADER_SIZE + 4]);
 
-		// Read second block (contains WAL header + [4,5,6,7] + WAL header + [8,9] + padding)
+		// Read second block (contains WAL header + [4,5,6,7] + WAL header + [8,9] +
+		// padding)
 		let mut block2 = [0u8; BLOCK_SIZE];
 		let bytes_read = buf_reader.read(&mut block2).expect("should read");
 		assert_eq!(bytes_read, BLOCK_SIZE);
 		// Extract the first record's data (skip first WAL header)
 		assert_eq!(&[4, 5, 6, 7], &block2[WAL_RECORD_HEADER_SIZE..WAL_RECORD_HEADER_SIZE + 4]);
-		// Extract the second record's data (skip first record + its header + second WAL header)
+		// Extract the second record's data (skip first record + its header + second WAL
+		// header)
 		let second_record_start = WAL_RECORD_HEADER_SIZE + 4 + WAL_RECORD_HEADER_SIZE;
 		assert_eq!(&[8, 9], &block2[second_record_start..second_record_start + 2]);
 	}
@@ -2347,7 +2367,8 @@ mod tests {
 		// Attempt to reopen the segment with corrupted metadata
 		let reopened_segment: std::result::Result<Segment<0>, Error> =
 			Segment::open(temp_dir.path(), 0, &opts);
-		assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
+		assert!(reopened_segment.is_err()); // Opening should fail due to corrupted
+		                              // metadata
 	}
 
 	#[test]

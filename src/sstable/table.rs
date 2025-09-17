@@ -1,24 +1,22 @@
+use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
-use std::{cmp::Ordering, time::SystemTime};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
+use crate::cache::{self, Item};
+use crate::error::{Error, Result};
+use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
+use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::meta::{size_of_writer_metadata, TableMetadata};
+use crate::sstable::{InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::vfs::File;
 use crate::{
-	cache::{self, Item},
-	error::{Error, Result},
-	sstable::{
-		block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter},
-		filter_block::{FilterBlockReader, FilterBlockWriter},
-		index_block::{TopLevelIndex, TopLevelIndexWriter},
-		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
-	},
-	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
 	Options, Value,
 };
@@ -160,7 +158,8 @@ impl Footer {
 	}
 }
 
-// Defines a writer for constructing and writing table structures to a storage medium.
+// Defines a writer for constructing and writing table structures to a storage
+// medium.
 pub(crate) struct TableWriter<W: Write, K: InternalKeyTrait> {
 	writer: W,             // Underlying writer to write data to.
 	opts: Arc<Options<K>>, // Shared table options.
@@ -308,7 +307,8 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		Ok(())
 	}
 
-	// Finalizes the table writing process, writing any pending blocks and the footer.
+	// Finalizes the table writing process, writing any pending blocks and the
+	// footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
 		self.meta.properties.file_size = self.size_estimate() as u64;
@@ -344,7 +344,8 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
-				// TODO: Add this as part of property as the current trailer will mark it as deleted
+				// TODO: Add this as part of property as the current trailer will mark it as
+				// deleted
 				let filter_key = K::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set);
 
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
@@ -607,7 +608,8 @@ pub struct Table<K: InternalKeyTrait> {
 	index_block: IndexType<K>,
 	filter_reader: Option<FilterBlockReader>,
 
-	pub(crate) internal_cmp: Arc<InternalKeyComparator<K>>, // Internal key comparator for the table.
+	pub(crate) internal_cmp: Arc<InternalKeyComparator<K>>, /* Internal key comparator for the
+	                                                         * table. */
 }
 
 impl<K: InternalKeyTrait> Table<K> {
@@ -1163,7 +1165,8 @@ impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 								// Try to advance to next block
 								match self.skip_to_next_entry() {
 									Ok(true) => {
-										// Successfully loaded next block and positioned at first entry
+										// Successfully loaded next block and positioned at first
+										// entry
 										return Some(());
 									}
 									Ok(false) => {
@@ -1369,8 +1372,9 @@ mod tests {
 		]
 	}
 
-	// Build a table containing raw keys (no format). It returns (vector, length) for convenience
-	// reason, a call f(v, v.len()) doesn't work for borrowing reasons.
+	// Build a table containing raw keys (no format). It returns (vector, length)
+	// for convenience reason, a call f(v, v.len()) doesn't work for borrowing
+	// reasons.
 	fn build_table(data: Vec<(&str, &str)>) -> (Vec<u8>, usize) {
 		let mut d = Vec::with_capacity(512);
 		let mut opts = default_opts_mut();
@@ -1986,7 +1990,8 @@ mod tests {
 		assert_eq!(&key_range.low[..], expected_low);
 		assert_eq!(&key_range.high[..], expected_high);
 
-		// Test keys in the gaps to ensure the is_key_in_key_range function works properly
+		// Test keys in the gaps to ensure the is_key_in_key_range function works
+		// properly
 		let in_first_gap = "ccc".as_bytes(); // Between bbb and ppp
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			in_first_gap.to_vec(),

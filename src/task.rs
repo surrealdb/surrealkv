@@ -1,18 +1,15 @@
-use std::{
-	fmt,
-	sync::{
-		atomic::{AtomicBool, Ordering},
-		Arc, Mutex,
-	},
-};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use async_channel::Receiver;
 use tokio::sync::Notify;
 
-use crate::{
-	compaction::{leveled::Strategy, CompactionStrategy},
-	lsm::CompactionOperations,
-	sstable::InternalKeyTrait,
-};
+use crate::compaction::leveled::Strategy;
+use crate::compaction::CompactionStrategy;
+use crate::lsm::CompactionOperations;
+use crate::sstable::InternalKeyTrait;
+use crate::util::spawn;
 
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {
@@ -31,8 +28,8 @@ pub(crate) struct TaskManager {
 	/// Flag indicating if level compaction is running
 	level_running: Arc<AtomicBool>,
 
-	/// Task handles for cleanup
-	task_handles: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+	/// Channel to receive task completion signals
+	task_completion_receiver: Receiver<()>,
 }
 
 impl fmt::Debug for TaskManager {
@@ -51,7 +48,9 @@ impl TaskManager {
 		let level_notify = Arc::new(Notify::new());
 		let memtable_running = Arc::new(AtomicBool::new(false));
 		let level_running = Arc::new(AtomicBool::new(false));
-		let task_handles = Mutex::new(Some(Vec::new()));
+
+		// Create channels for task completion signaling
+		let (task_completion_sender, task_completion_receiver) = async_channel::bounded(2);
 
 		// Spawn memtable compaction task
 		{
@@ -60,8 +59,9 @@ impl TaskManager {
 			let notify = memtable_notify.clone();
 			let running = memtable_running.clone();
 			let level_notify = level_notify.clone();
+			let completion_sender = task_completion_sender.clone();
 
-			let handle = tokio::spawn(async move {
+			spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;
@@ -80,8 +80,9 @@ impl TaskManager {
 					}
 					running.store(false, Ordering::SeqCst);
 				}
+				// Signal task completion
+				let _ = completion_sender.send(()).await;
 			});
-			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
 		// Spawn level compaction task
@@ -90,8 +91,9 @@ impl TaskManager {
 			let stop_flag = stop_flag.clone();
 			let notify = level_notify.clone();
 			let running = level_running.clone();
+			let completion_sender = task_completion_sender.clone();
 
-			let handle = tokio::spawn(async move {
+			spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;
@@ -109,8 +111,9 @@ impl TaskManager {
 					}
 					running.store(false, Ordering::SeqCst);
 				}
+				// Signal task completion
+				let _ = completion_sender.send(()).await;
 			});
-			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
 		Self {
@@ -119,7 +122,7 @@ impl TaskManager {
 			level_notify,
 			memtable_running,
 			level_running,
-			task_handles,
+			task_completion_receiver,
 		}
 	}
 
@@ -146,7 +149,8 @@ impl TaskManager {
 		self.memtable_notify.notify_one();
 		self.level_notify.notify_one();
 
-		// Wait for any in-progress compactions to complete (no timeout - wait indefinitely)
+		// Wait for any in-progress compactions to complete (no timeout - wait
+		// indefinitely)
 		while self.memtable_running.load(Ordering::Acquire)
 			|| self.level_running.load(Ordering::Acquire)
 		{
@@ -154,11 +158,11 @@ impl TaskManager {
 			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 		}
 
-		// Now it's safe to wait for all tasks to complete
-		let task_handles = self.task_handles.lock().unwrap().take().unwrap();
-		for handle in task_handles {
-			if let Err(e) = handle.await {
-				eprintln!("Error shutting down task: {e:?}");
+		// Wait for both tasks to signal completion
+		for _ in 0..2 {
+			if let Err(e) = self.task_completion_receiver.recv().await {
+				eprintln!("Error receiving task completion signal on task manager: {e:?}");
+				break;
 			}
 		}
 	}
@@ -177,6 +181,7 @@ mod tests {
 	use crate::compaction::CompactionStrategy;
 	use crate::lsm::CompactionOperations;
 	use crate::task::TaskManager;
+	use crate::util::spawn;
 
 	// Mock CoreInner for testing
 	struct MockCoreInner {
@@ -268,7 +273,8 @@ mod tests {
 
 		for _ in 0..3 {
 			task_manager.wake_up_memtable();
-			time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for task to
+			                                      // complete
 		}
 
 		// Wait for all operations to complete
@@ -301,7 +307,8 @@ mod tests {
 
 		for _ in 0..3 {
 			task_manager.wake_up_level();
-			time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for task to
+			                                      // complete
 		}
 
 		// Wait for all operations to complete
@@ -341,7 +348,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_already_running_tasks() {
-		// Create core with longer delays to ensure tasks are still running when we try to wake them again
+		// Create core with longer delays to ensure tasks are still running when we try
+		// to wake them again
 		let core = Arc::new(MockCoreInner::with_delays(100, 100));
 		let task_manager = TaskManager::new(core.clone());
 
@@ -374,19 +382,17 @@ mod tests {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = Arc::new(TaskManager::new(core.clone()));
 
-		let mut handles = vec![];
 		for _ in 0..10 {
 			let tm = task_manager.clone();
-			handles.push(tokio::spawn(async move {
+			spawn(async move {
 				tm.wake_up_memtable();
-			}));
+			});
 			// Small sleep to ensure some interleaving
-			time::sleep(Duration::from_millis(100)).await; // Allow time for all tasks to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for all tasks to
+			                                      // complete
 		}
 
-		for handle in handles {
-			handle.await.unwrap();
-		}
+		task_manager.stop().await;
 
 		// Allow time for all tasks to complete
 		time::sleep(Duration::from_millis(1000)).await;
@@ -402,22 +408,20 @@ mod tests {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = Arc::new(TaskManager::new(core.clone()));
 
-		let mut handles = vec![];
 		for _ in 0..5 {
 			let tm = task_manager.clone();
-			handles.push(tokio::spawn(async move {
+			spawn(async move {
 				tm.wake_up_level();
 				// Small sleep to ensure some interleaving
 				time::sleep(Duration::from_millis(5)).await;
-			}));
-		}
-
-		for handle in handles {
-			handle.await.unwrap();
+			});
 		}
 
 		// Allow time for all tasks to complete
 		time::sleep(Duration::from_millis(500)).await;
+
+		// Stop the task manager to ensure all background tasks complete
+		task_manager.stop().await;
 
 		// Due to the running flag mechanism, we expect fewer compactions than wake-ups
 		let level_count = core.level_compactions.load(Ordering::SeqCst);
@@ -426,8 +430,6 @@ mod tests {
 			level_count > 0 && level_count <= 5,
 			"Expected between 1-5 level compactions, got {level_count}"
 		);
-
-		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop().await;
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -437,7 +439,8 @@ mod tests {
 		// Create a mock with error simulation capability
 		let core = Arc::new(MockCoreInner::new());
 
-		// First, check how the mock behaves with a direct call to verify our understanding
+		// First, check how the mock behaves with a direct call to verify our
+		// understanding
 		core.fail_memtable.store(true, Ordering::SeqCst);
 		let direct_result = core.compact_memtable();
 		assert!(direct_result.is_err(), "Should return an error when fail_memtable is true");
@@ -503,7 +506,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_task_from_fail() {
-		// Create a core that will fail on the first attempt but succeed on subsequent attempts
+		// Create a core that will fail on the first attempt but succeed on subsequent
+		// attempts
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
 

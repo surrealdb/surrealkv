@@ -45,6 +45,7 @@ fs2 = "0.4.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }
+wasm-bindgen-futures = "0.4.40"
 
 [dev-dependencies]
 tempdir = "0.3"

@@ -1,5 +1,6 @@
 use super::LevelManifest;
-use crate::sstable::{table::Table, InternalKeyTrait};
+use crate::sstable::table::Table;
+use crate::sstable::InternalKeyTrait;
 use std::sync::Arc;
 
 /// Iterates through all levels

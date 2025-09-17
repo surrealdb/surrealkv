@@ -1,25 +1,17 @@
 use crossbeam_skiplist::SkipMap;
-use std::{
-	fs::File as SysFile,
-	ops::{Bound, RangeBounds},
-	sync::{
-		atomic::{AtomicU32, AtomicU64, Ordering},
-		Arc,
-	},
-};
+use std::fs::File as SysFile;
+use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::{
-	batch::Batch,
-	error::Result,
-	iter::MergeIterator,
-	sstable::{
-		table::{Table, TableWriter},
-		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
-	},
-	vfs::File,
-	vlog::{VLog, ValueLocation},
-	Error, Options, Value,
-};
+use crate::batch::Batch;
+use crate::error::Result;
+use crate::iter::MergeIterator;
+use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::{InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::vfs::File;
+use crate::vlog::{VLog, ValueLocation};
+use crate::{Error, Options, Value};
 
 #[derive(Default)]
 pub(crate) struct ImmutableMemtables<K: InternalKeyTrait>(Vec<(u64, Arc<MemTable<K>>)>);
@@ -85,11 +77,13 @@ impl<K: InternalKeyTrait> MemTable<K> {
 
 	/// Adds a batch of operations to the memtable.
 	/// This includes appending the batch to the Write-Ahead Log (WAL),
-	/// applying the batch to the in-memory table, and updating the memtable size and latest sequence number.
+	/// applying the batch to the in-memory table, and updating the memtable
+	/// size and latest sequence number.
 	///
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
-	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive numbers)
+	/// * `starting_seq_num` - The starting sequence number for this batch
+	///   (records get consecutive numbers)
 	pub(crate) fn add(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u32)> {
 		let (record_size, highest_seq_num) =
 			self.apply_batch_to_memtable(batch, starting_seq_num)?;
@@ -99,8 +93,8 @@ impl<K: InternalKeyTrait> MemTable<K> {
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
-	/// Records in the batch get consecutive sequence numbers starting from `starting_seq_num`.
-	/// Returns (total_record_size, highest_seq_num_used).
+	/// Records in the batch get consecutive sequence numbers starting from
+	/// `starting_seq_num`. Returns (total_record_size, highest_seq_num_used).
 	fn apply_batch_to_memtable(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u64)> {
 		let mut record_size = 0;
 		let mut current_seq_num = starting_seq_num;
@@ -133,13 +127,15 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		key.size() as u32 + value.len() as u32
 	}
 
-	/// Updates the size of the memtable by adding the size of the newly added records.
+	/// Updates the size of the memtable by adding the size of the newly added
+	/// records.
 	fn update_memtable_size(&self, record_size: u32) -> u32 {
 		self.map_size.fetch_add(record_size, std::sync::atomic::Ordering::AcqRel)
 	}
 
 	/// Updates the latest sequence number in the memtable.
-	/// This ensures that the memtable always has the highest sequence number of the operations it contains.
+	/// This ensures that the memtable always has the highest sequence number of
+	/// the operations it contains.
 	fn update_latest_sequence_number(&self, current_seq_num: u64) {
 		let mut prev_seq_num = self.latest_seq_num.load(Ordering::Acquire);
 		while current_seq_num > prev_seq_num {
@@ -276,7 +272,8 @@ mod tests {
 	use crate::sstable::InternalKey;
 
 	use super::*;
-	use std::{collections::HashMap, sync::Arc};
+	use std::collections::HashMap;
+	use std::sync::Arc;
 
 	/// Helper function to decode and assert inline values match expected values
 	fn assert_inline_value_matches(encoded_value: &Value, expected_value: &[u8]) {
@@ -413,14 +410,16 @@ mod tests {
 		let mut last_seq = 0;
 
 		// For test purposes, if custom sequence numbers are provided, we need to add
-		// each entry individually to ensure they get the exact sequence number specified
+		// each entry individually to ensure they get the exact sequence number
+		// specified
 		for (key, value, kind, custom_seq) in entries {
 			let seq_num = custom_seq.unwrap_or_else(|| {
 				last_seq += 1;
 				last_seq
 			});
 
-			// Create a single-entry batch for each record to ensure exact sequence number assignment
+			// Create a single-entry batch for each record to ensure exact sequence number
+			// assignment
 			let mut batch = Batch::new();
 			match kind {
 				InternalKeyKind::Set => {
@@ -583,7 +582,9 @@ mod tests {
 		let result = memtable.get(b"key1", Some(8));
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"old_value"); // Should get the value with seq_num <= 8
+		assert_inline_value_matches(&encoded_val, b"old_value"); // Should get the
+		                                                   // value with seq_num
+		                                                   // <= 8
 	}
 
 	#[test]
@@ -630,7 +631,8 @@ mod tests {
 		for (key, encoded_value) in &entries {
 			let (user_key, seq_num, kind) = (key.user_key.clone(), key.seq_num(), key.kind());
 			// All values are now ValueLocation encoded, even empty ones for Delete
-			// For ValueLocation::Inline with empty content, length will be TAG_INLINE (1 byte) + 0
+			// For ValueLocation::Inline with empty content, length will be TAG_INLINE (1
+			// byte) + 0
 			let location = ValueLocation::decode(encoded_value).unwrap();
 			if location.is_value_pointer() {
 				panic!("Expected inline value");

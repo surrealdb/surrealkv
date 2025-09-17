@@ -1,17 +1,17 @@
-use std::{
-	collections::HashMap,
-	fs::{File, OpenOptions},
-	io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
-	path::{Path, PathBuf},
-	sync::{
-		atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
-		Arc, Mutex, RwLock,
-	},
-};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{batch::Batch, discard::DiscardStats, Value};
-use crate::{cache::VLogCache, TreeBuilder};
-use crate::{sstable::InternalKeyTrait, vfs, Options, Tree, VLogChecksumLevel};
+use crate::batch::Batch;
+use crate::cache::VLogCache;
+use crate::discard::DiscardStats;
+use crate::sstable::InternalKeyTrait;
+use crate::util::spawn;
+use crate::{vfs, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
+use async_channel::{Receiver, Sender};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -43,8 +43,11 @@ pub(crate) struct VLogFileHeader {
 }
 
 impl VLogFileHeader {
-	const MAGIC: u32 = 0x564C_4F47; // "VLOG" in hex
-	const SIZE: usize = 31; // 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
+	const MAGIC: u32 = 0x564C_4F47;
+	// "VLOG" in hex
+	const SIZE: usize = 31;
+
+	// 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
 
 	pub(crate) fn new(file_id: u32, max_file_size: u64, compression: u8) -> Self {
 		Self {
@@ -192,8 +195,8 @@ impl VLogFileHeader {
 		Ok(())
 	}
 }
-/// ValueLocation represents the value info that can be associated with a key, including the internal
-/// Meta field for various flags and operations.
+/// ValueLocation represents the value info that can be associated with a key,
+/// including the internal Meta field for various flags and operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValueLocation {
 	/// Meta flags for various operations (value pointer etc.)
@@ -532,7 +535,8 @@ pub(crate) struct VLog<K: InternalKeyTrait> {
 	/// Discard statistics for GC candidate selection
 	discard_stats: Mutex<DiscardStats>,
 
-	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
+	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs
+	/// across all segments
 	pub(crate) delete_list: Arc<DeleteList<K>>,
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
@@ -686,7 +690,8 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 		// Set next_file_id based on whether we found existing files
 		if let Some(highest_file_id) = max_file_id {
-			// Found existing files, set next_file_id to one past the highest existing file ID
+			// Found existing files, set next_file_id to one past the highest existing file
+			// ID
 			self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
 
 			// Set the last file up as the active writer
@@ -842,7 +847,8 @@ impl<K: InternalKeyTrait> VLog<K> {
 		self.num_active_iterators.load(Ordering::SeqCst)
 	}
 
-	/// Deletes files that were marked for deletion when no iterators were active
+	/// Deletes files that were marked for deletion when no iterators were
+	/// active
 	fn delete_pending_files(&self) -> Result<()> {
 		let mut files_to_delete = self.files_to_be_deleted.write().unwrap();
 		let mut files_map = self.files_map.write().unwrap();
@@ -862,7 +868,8 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 	/// Selects files based on discard statistics and compacts them
 	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u32>> {
-		// Try to set the gc_in_progress flag to true, if it's already true, return error
+		// Try to set the gc_in_progress flag to true, if it's already true, return
+		// error
 		if self
 			.gc_in_progress
 			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -936,7 +943,8 @@ impl<K: InternalKeyTrait> VLog<K> {
 			}
 		}
 
-		// Check if this is the currently open file for writing - we shouldn't compact/delete it
+		// Check if this is the currently open file for writing - we shouldn't
+		// compact/delete it
 		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
 		if file_id == active_writer_id {
 			// Skip compacting the active file as it is currently open for writing
@@ -1186,7 +1194,8 @@ impl<K: InternalKeyTrait> VLog<K> {
 	}
 
 	/// Updates discard statistics for a file
-	/// This should be called during LSM compaction when outdated VLog pointers are found
+	/// This should be called during LSM compaction when outdated VLog pointers
+	/// are found
 	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		let mut discard_stats = self.discard_stats.lock().unwrap();
 
@@ -1250,8 +1259,11 @@ pub(crate) struct VLogGCManager<K: InternalKeyTrait> {
 	/// Notification for GC task
 	notify: Arc<tokio::sync::Notify>,
 
-	/// Task handle for cleanup
-	task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	/// Channel to receive task completion signal
+	task_completion_receiver: Receiver<()>,
+
+	/// Channel to send task completion signal (stored for start method)
+	task_completion_sender: Sender<()>,
 }
 
 impl<K: InternalKeyTrait> VLogGCManager<K> {
@@ -1260,7 +1272,9 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let notify = Arc::new(tokio::sync::Notify::new());
-		let task_handle = Mutex::new(None);
+
+		// Create channel for task completion signaling
+		let (task_completion_sender, task_completion_receiver) = async_channel::bounded(1);
 
 		Self {
 			vlog,
@@ -1268,7 +1282,8 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 			stop_flag,
 			running,
 			notify,
-			task_handle,
+			task_completion_receiver,
+			task_completion_sender,
 		}
 	}
 
@@ -1279,8 +1294,9 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 		let stop_flag = self.stop_flag.clone();
 		let notify = self.notify.clone();
 		let running = self.running.clone();
+		let completion_sender = self.task_completion_sender.clone();
 
-		let handle = tokio::spawn(async move {
+		spawn(async move {
 			loop {
 				// Wait for notification OR timeout for periodic checks (every 5 minutes)
 				tokio::select! {
@@ -1300,9 +1316,9 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 				}
 				running.store(false, Ordering::SeqCst);
 			}
+			// Signal task completion
+			let _ = completion_sender.send(()).await;
 		});
-
-		*self.task_handle.lock().unwrap() = Some(handle);
 	}
 
 	/// Stops the VLog GC background task
@@ -1319,24 +1335,17 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 		}
 
-		// Now it's safe to wait for the task to complete
-		// Get the handle outside the await to avoid holding the lock across await
-		let handle_opt = {
-			let mut lock = self.task_handle.lock().unwrap();
-			lock.take()
-		};
-
-		if let Some(handle) = handle_opt {
-			if let Err(e) = handle.await {
-				eprintln!("Error shutting down VLog GC task: {e:?}");
-			}
+		// Wait for the task to signal completion
+		if let Err(e) = self.task_completion_receiver.recv().await {
+			eprintln!("Error receiving VLog GC task completion signal: {e:?}");
 		}
 	}
 }
 
 /// Global Delete List using LSM Tree
 /// Uses a dedicated LSM tree for tracking stale user keys.
-/// This provides better performance and consistency with the main LSM tree design.
+/// This provides better performance and consistency with the main LSM tree
+/// design.
 pub(crate) struct DeleteList<K: InternalKeyTrait> {
 	/// LSM tree for storing delete list entries (user_key -> value_size)
 	tree: Arc<Tree<K>>,
@@ -1632,7 +1641,8 @@ mod tests {
 			assert_eq!(*retrieved, expected_value);
 		}
 
-		// Check that the next_file_id is set correctly (should be one past the highest file ID)
+		// Check that the next_file_id is set correctly (should be one past the highest
+		// file ID)
 		let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
 		let max_file_id = unique_file_ids.iter().max().unwrap();
 		assert_eq!(
@@ -1952,7 +1962,8 @@ mod tests {
 
 		let mut pointers = Vec::new();
 
-		// Phase 1: Create initial VLog and add some data (but not enough to fill the file)
+		// Phase 1: Create initial VLog and add some data (but not enough to fill the
+		// file)
 		{
 			let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
 
@@ -2169,7 +2180,8 @@ mod tests {
 			let new_pointer = vlog2.append(new_key, &new_value).unwrap();
 			vlog2.sync().unwrap();
 
-			// New data should go to the highest file ID (since we set it up as active writer)
+			// New data should go to the highest file ID (since we set it up as active
+			// writer)
 			assert_eq!(
 				new_pointer.file_id, highest_file_id,
 				"New data after restart should go to the last existing file"
@@ -2340,7 +2352,8 @@ mod tests {
 			);
 		} // writer2 is dropped here
 
-		// Phase 3: Verification - Read all data back using VLog to ensure no corruption/overwriting
+		// Phase 3: Verification - Read all data back using VLog to ensure no
+		// corruption/overwriting
 		{
 			// Create a VLog instance that can read from our test file
 			let vlog_dir = temp_dir.path().join("vlog");
@@ -2379,7 +2392,8 @@ mod tests {
 			);
 		}
 
-		// Phase 4: Additional verification - Test a third reopen to ensure pattern continues
+		// Phase 4: Additional verification - Test a third reopen to ensure pattern
+		// continues
 		{
 			let mut writer3 = VLogWriter::new(
 				&test_file_path,

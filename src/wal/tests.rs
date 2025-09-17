@@ -6,9 +6,8 @@ use crate::sstable::InternalKey;
 use crate::wal::cleanup::cleanup_old_segments;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
-use crate::wal::segment::list_segment_ids;
 use crate::wal::segment::{
-	MultiSegmentReader, Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE,
+	list_segment_ids, MultiSegmentReader, Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE,
 };
 use crate::wal::writer::Wal;
 use std::sync::Arc;

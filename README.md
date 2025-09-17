@@ -55,7 +55,6 @@ let tree = TreeBuilder::new()
     .with_max_memtable_size(100 * 1024 * 1024)         // 100MB memtable size
     .with_block_size(4096)                             // 4KB block size
     .with_level_count(1)                               // Number of levels in LSM tree
-    .with_vlog_value_threshold(4096)                   // Values smaller than this stored inline
     .with_vlog_max_file_size(128 * 1024 * 1024)        // 128MB VLog file size
     .with_enable_vlog(true)                            // Enable/disable VLog
     .build()?
@@ -70,7 +69,6 @@ let tree = TreeBuilder::new()
 
 ### VLog Options
 
-- `vlog_value_threshold`: Values smaller than this are stored inline in SSTables
 - `vlog_max_file_size`: Maximum size of VLog files before rotation
 - `with_enable_vlog()`: Enable/disable Value Log for large value storage
 - `vlog_gc_discard_ratio`: Threshold for triggering VLog garbage collection

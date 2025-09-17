@@ -3,17 +3,13 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::{
-	cache::Item,
-	error::{Error, Result},
-	sstable::{
-		block::{Block, BlockData, BlockHandle, BlockWriter},
-		table::{compress_block, read_table_block, write_block_at_offset},
-		InternalKeyTrait,
-	},
-	vfs::File,
-	CompressionType, Options,
-};
+use crate::cache::Item;
+use crate::error::{Error, Result};
+use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
+use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
+use crate::sstable::InternalKeyTrait;
+use crate::vfs::File;
+use crate::{CompressionType, Options};
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
@@ -39,8 +35,8 @@ impl BlockHandleWithKey {
 	}
 }
 
-// Represents a top-level index block that contains pointers to other index blocks
-// Link: https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+// Represents a top-level index block that contains pointers to other index
+// blocks Link: https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
 //
 // [index block - partition 1]
 // [index block - partition 2]
@@ -149,7 +145,8 @@ pub(crate) struct TopLevelIndex<K: InternalKeyTrait> {
 	id: u64,
 	opts: Arc<Options<K>>,
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
-	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
+	// TODO: Fix this, as this could be problematic if the file is being shared across without any
+	// mutex
 	file: Arc<dyn File>,
 	_phantom: std::marker::PhantomData<K>,
 }
@@ -286,8 +283,8 @@ mod tests {
 
 	//     let top_level_block = writer.finish().unwrap();
 	//     assert_eq!(index_blocks.len(), 0);
-	//     assert!(!top_level_block.is_empty()); // Top-level block should still be created
-	// }
+	//     assert!(!top_level_block.is_empty()); // Top-level block should still be
+	// created }
 
 	#[test]
 	fn test_top_level_index_writer_large_entries() {
@@ -331,14 +328,14 @@ mod tests {
 	//     writer.add(&key1, &handle1).unwrap();
 
 	//     let mut d = Vec::new();
-	//     let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	//     assert!(!top_level_block.0.offset > 0);
+	//     let top_level_block = writer.finish(&mut d, CompressionType::None,
+	// 0).unwrap();     assert!(!top_level_block.0.offset > 0);
 
 	//     let f = wrap_buffer(d);
-	//     let top_level_index = TopLevelIndex::new(0, opts, f, &top_level_block.0).unwrap();
-	//     let block = top_level_index.get(&key1).unwrap();
-	//     // println!("block: {:?}", block.block);
-	// }
+	//     let top_level_index = TopLevelIndex::new(0, opts, f,
+	// &top_level_block.0).unwrap();     let block =
+	// top_level_index.get(&key1).unwrap();     // println!("block: {:?}",
+	// block.block); }
 
 	#[test]
 	fn test_find_block_handle_by_key() {

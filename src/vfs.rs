@@ -1,10 +1,6 @@
 use crate::error::{Error, Result};
 
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt as LockFileExt;

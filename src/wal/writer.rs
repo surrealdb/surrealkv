@@ -1,7 +1,5 @@
-use std::fs;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use parking_lot::RwLock;
 
@@ -27,15 +25,18 @@ pub(crate) struct Wal {
 	/// A flag indicating whether the WAL instance is closed or not.
 	closed: bool,
 
-	/// A read-write lock used to synchronize concurrent access to the WAL instance.
+	/// A read-write lock used to synchronize concurrent access to the WAL
+	/// instance.
 	mutex: RwLock<()>, // TODO: Lock only the active segment
 }
 
 impl Wal {
-	/// Opens or creates a new WAL instance associated with the specified directory and segment ID.
+	/// Opens or creates a new WAL instance associated with the specified
+	/// directory and segment ID.
 	///
-	/// This function prepares the WAL instance by creating the necessary directory,
-	/// determining the active segment ID, and initializing the active segment.
+	/// This function prepares the WAL instance by creating the necessary
+	/// directory, determining the active segment ID, and initializing the
+	/// active segment.
 	///
 	/// # Parameters
 	///
@@ -98,24 +99,28 @@ impl Wal {
 
 	/// Appends a record to the active segment.
 	///
-	/// This function appends the record to the active segment. If the active segment is
-	/// full, a new segment will be created and the record will be appended to it.
+	/// This function appends the record to the active segment. If the active
+	/// segment is full, a new segment will be created and the record will be
+	/// appended to it.
 	///
-	/// The function returns a tuple containing the offset at which the record was appended
-	/// and the number of bytes written.
+	/// The function returns a tuple containing the offset at which the record
+	/// was appended and the number of bytes written.
 	///
 	/// # Arguments
 	///
-	/// * `rec` - A reference to the byte slice containing the record to be appended.
+	/// * `rec` - A reference to the byte slice containing the record to be
+	///   appended.
 	///
 	/// # Returns
 	///
-	/// A result containing the tuple `(offset, bytes_written)` or an `io::Error` in case of failure.
+	/// A result containing the tuple `(offset, bytes_written)` or an
+	/// `io::Error` in case of failure.
 	///
 	/// # Errors
 	///
-	/// This function may return an error if the active segment is closed, the provided record
-	/// is empty, or any I/O error occurs during the appending process.
+	/// This function may return an error if the active segment is closed, the
+	/// provided record is empty, or any I/O error occurs during the appending
+	/// process.
 	pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
@@ -197,7 +202,8 @@ impl Wal {
 	///
 	/// # Returns
 	///
-	/// The ID of the newly created segment, or an error if something went wrong.
+	/// The ID of the newly created segment, or an error if something went
+	/// wrong.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let _lock = self.mutex.write();
 

@@ -1,18 +1,17 @@
-use crate::{
-	sstable::{meta::KeyRange, table::Table, InternalKeyTrait},
-	Result,
-};
+use crate::sstable::meta::KeyRange;
+use crate::sstable::table::Table;
+use crate::sstable::InternalKeyTrait;
+use crate::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::{
-	io::{Read, Write},
-	sync::Arc,
-};
+use std::io::{Read, Write};
+use std::sync::Arc;
 
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.
 #[derive(Clone)]
 pub(crate) struct Level<K: InternalKeyTrait> {
-	/// Vector of tables in this level, sorted by sequence numbers in descending order
+	/// Vector of tables in this level, sorted by sequence numbers in descending
+	/// order
 	pub(crate) tables: Vec<Arc<Table<K>>>,
 }
 
@@ -72,7 +71,8 @@ impl<K: InternalKeyTrait> Level<K> {
 pub(crate) struct Levels<K: InternalKeyTrait>(pub(crate) Vec<Arc<Level<K>>>);
 
 impl<K: InternalKeyTrait> Levels<K> {
-	/// Creates a new Levels structure with specified number of levels and capacity per level
+	/// Creates a new Levels structure with specified number of levels and
+	/// capacity per level
 	#[allow(unused)]
 	pub(crate) fn new(level_count: usize, capacity_per_level: usize) -> Self {
 		Self((0..level_count).map(|_| Arc::new(Level::with_capacity(capacity_per_level))).collect())
@@ -139,8 +139,8 @@ impl<K: InternalKeyTrait> Levels<K> {
 }
 
 impl<K: InternalKeyTrait> IntoIterator for Levels<K> {
-	type Item = Arc<Level<K>>;
 	type IntoIter = std::vec::IntoIter<Arc<Level<K>>>;
+	type Item = Arc<Level<K>>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
@@ -148,8 +148,8 @@ impl<K: InternalKeyTrait> IntoIterator for Levels<K> {
 }
 
 impl<'a, K: InternalKeyTrait> IntoIterator for &'a Levels<K> {
-	type Item = &'a Arc<Level<K>>;
 	type IntoIter = std::slice::Iter<'a, Arc<Level<K>>>;
+	type Item = &'a Arc<Level<K>>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.iter()

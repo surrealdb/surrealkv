@@ -1,8 +1,6 @@
-use std::{
-	fs::{File, OpenOptions},
-	path::Path,
-	sync::Mutex,
-};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+use std::sync::Mutex;
 
 use memmap2::{MmapMut, MmapOptions};
 
