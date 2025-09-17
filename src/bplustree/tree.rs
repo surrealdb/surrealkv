@@ -1,10 +1,12 @@
 use std::cmp::Ordering;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use quick_cache::{sync::Cache, Weighter};
 
 use super::{DiskStorage, MemoryStorage, Storage};
+use crate::Comparator;
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<DiskStorage>;
@@ -21,8 +23,6 @@ impl Weighter<u64, NodeType> for NodeWeighter {
 		}
 	}
 }
-
-pub type CompareFunction = dyn Fn(&[u8], &[u8]) -> Ordering;
 
 #[derive(Debug)]
 pub enum BPlusTreeError {
@@ -244,14 +244,14 @@ impl InternalNode {
 	}
 
 	// Find the appropriate child index for a key
-	fn find_child_index(&self, key: &[u8], compare: &CompareFunction) -> usize {
+	fn find_child_index(&self, key: &[u8], compare: &dyn Comparator) -> usize {
 		// Binary search implementation
 		let mut low = 0;
 		let mut high = self.keys.len();
 
 		while low < high {
 			let mid = low + (high - low) / 2;
-			match compare(key, &self.keys[mid]) {
+			match compare.compare(key, &self.keys[mid]) {
 				Ordering::Less => high = mid,
 				Ordering::Equal => {
 					// When equal, we want the next child
@@ -265,9 +265,9 @@ impl InternalNode {
 	}
 
 	// Insert a key and child pointer at the correct position
-	fn insert_key_child(&mut self, key: &[u8], child_offset: u64, compare: &CompareFunction) {
+	fn insert_key_child(&mut self, key: &[u8], child_offset: u64, compare: &dyn Comparator) {
 		let mut idx = 0;
-		while idx < self.keys.len() && compare(key, &self.keys[idx]) == Ordering::Greater {
+		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
 
@@ -324,11 +324,11 @@ impl InternalNode {
 		self.would_fit(key, None)
 	}
 
-	fn find_split_point(&self, new_key: &[u8], compare: &CompareFunction) -> usize {
+	fn find_split_point(&self, new_key: &[u8], compare: &dyn Comparator) -> usize {
 		// Find where the new key would go
 		let mut insert_idx = 0;
 		while insert_idx < self.keys.len()
-			&& (compare)(new_key, &self.keys[insert_idx]) == Ordering::Greater
+			&& compare.compare(new_key, &self.keys[insert_idx]) == Ordering::Greater
 		{
 			insert_idx += 1;
 		}
@@ -545,9 +545,9 @@ impl LeafNode {
 	}
 
 	// insert a key-value pair into a leaf node at the correct position
-	fn insert(&mut self, key: &[u8], value: &[u8], compare: &CompareFunction) -> usize {
+	fn insert(&mut self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
 		let mut idx = 0;
-		while idx < self.keys.len() && compare(key, &self.keys[idx]) == Ordering::Greater {
+		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
 
@@ -557,22 +557,22 @@ impl LeafNode {
 	}
 
 	// delete a key-value pair from a leaf node
-	fn delete(&mut self, key: &[u8], compare: &CompareFunction) -> Option<(usize, Vec<u8>)> {
-		let idx = self.keys.iter().position(|k| compare(key, k) == Ordering::Equal)?;
+	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Vec<u8>)> {
+		let idx = self.keys.iter().position(|k| compare.compare(key, k) == Ordering::Equal)?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
 		Some((idx, value))
 	}
 
 	// Find a key's position in the leaf
-	fn find_key(&self, key: &[u8], compare: &CompareFunction) -> Option<usize> {
+	fn find_key(&self, key: &[u8], compare: &dyn Comparator) -> Option<usize> {
 		// Binary search to find exact match
 		let mut low = 0;
 		let mut high = self.keys.len();
 
 		while low < high {
 			let mid = low + (high - low) / 2;
-			match compare(key, &self.keys[mid]) {
+			match compare.compare(key, &self.keys[mid]) {
 				Ordering::Less => high = mid,
 				Ordering::Equal => return Some(mid),
 				Ordering::Greater => low = mid + 1,
@@ -623,11 +623,11 @@ impl LeafNode {
 	}
 
 	// Find optimal split point based on size
-	fn find_split_point(&self, key: &[u8], value: &[u8], compare: &CompareFunction) -> usize {
+	fn find_split_point(&self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
 		// Find where the new key would go
 		let mut insert_idx = 0;
 		while insert_idx < self.keys.len()
-			&& (compare)(key, &self.keys[insert_idx]) == Ordering::Greater
+			&& compare.compare(key, &self.keys[insert_idx]) == Ordering::Greater
 		{
 			insert_idx += 1;
 		}
@@ -908,7 +908,7 @@ pub struct BPlusTree<S: Storage> {
 	storage: S,
 	header: Header,
 	cache: Cache<u64, NodeType, NodeWeighter>,
-	compare: Box<CompareFunction>,
+	compare: Arc<dyn Comparator>,
 	durability: Durability,
 }
 
@@ -920,14 +920,14 @@ impl<S: Storage> Drop for BPlusTree<S> {
 	}
 }
 impl BPlusTree<DiskStorage> {
-	pub fn disk<P: AsRef<Path>>(path: P, compare: Box<CompareFunction>) -> Result<Self> {
+	pub fn disk<P: AsRef<Path>>(path: P, compare: Arc<dyn Comparator>) -> Result<Self> {
 		let storage = DiskStorage::new(path)?;
 		Self::with_storage(storage, compare)
 	}
 }
 
 impl BPlusTree<MemoryStorage> {
-	pub fn memory(compare: Box<CompareFunction>) -> Result<Self> {
+	pub fn memory(compare: Arc<dyn Comparator>) -> Result<Self> {
 		let storage = MemoryStorage::new();
 		Self::with_storage(storage, compare)
 	}
@@ -935,17 +935,17 @@ impl BPlusTree<MemoryStorage> {
 
 pub fn new_disk_tree<P: AsRef<Path>>(
 	path: P,
-	compare: Box<CompareFunction>,
+	compare: Arc<dyn Comparator>,
 ) -> Result<DiskBPlusTree> {
 	DiskBPlusTree::disk(path, compare)
 }
 
-pub fn new_memory_tree(compare: Box<CompareFunction>) -> Result<MemoryBPlusTree> {
+pub fn new_memory_tree(compare: Arc<dyn Comparator>) -> Result<MemoryBPlusTree> {
 	MemoryBPlusTree::memory(compare)
 }
 
 impl<S: Storage> BPlusTree<S> {
-	pub fn with_storage(storage: S, compare: Box<CompareFunction>) -> Result<Self> {
+	pub fn with_storage(storage: S, compare: Arc<dyn Comparator>) -> Result<Self> {
 		let storage_size = storage.len()?;
 
 		let (header, cache) = if storage_size == 0 {
@@ -1033,11 +1033,11 @@ impl<S: Storage> BPlusTree<S> {
 			return Err(BPlusTreeError::KeyValueTooLarge);
 		}
 
-		// TODO: Remove check for duplicate key and treat as an update
-		// Check for duplicate key
-		if self.search(key)?.is_some() {
-			return Err(BPlusTreeError::DuplicateKey);
-		}
+		// // TODO: Remove check for duplicate key and treat as an update
+		// // Check for duplicate key
+		// if self.get(key)?.is_some() {
+		// 	return Err(BPlusTreeError::DuplicateKey);
+		// }
 
 		// Using a stack to track the path from root to leaf
 		// Each entry contains (node_offset, parent_offset)
@@ -1059,7 +1059,7 @@ impl<S: Storage> BPlusTree<S> {
 					path.push((current_offset, parent_offset));
 
 					// Find the appropriate child
-					let child_idx = internal.find_child_index(key, &self.compare);
+					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					parent_offset = Some(current_offset);
 					current_offset = internal.children[child_idx];
 
@@ -1131,7 +1131,11 @@ impl<S: Storage> BPlusTree<S> {
 
 					if parent.can_fit_entry(&promoted_key) {
 						// Parent has space, insert the new key and child
-						parent.insert_key_child(&promoted_key, new_node_offset, &self.compare);
+						parent.insert_key_child(
+							&promoted_key,
+							new_node_offset,
+							self.compare.as_ref(),
+						);
 						self.write_node(&NodeType::Internal(parent))?;
 
 						// Done when we find a parent with enough space
@@ -1161,7 +1165,7 @@ impl<S: Storage> BPlusTree<S> {
 	}
 
 	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: &[u8], value: &[u8]) -> Result<()> {
-		leaf.insert(key, value, &self.compare);
+		leaf.insert(key, value, self.compare.as_ref());
 		self.write_node(&NodeType::Leaf(leaf.clone()))?;
 		Ok(())
 	}
@@ -1173,7 +1177,7 @@ impl<S: Storage> BPlusTree<S> {
 		value: &[u8],
 	) -> Result<(Vec<u8>, u64)> {
 		// Find optimal split point
-		let split_idx = leaf.find_split_point(key, value, &self.compare);
+		let split_idx = leaf.find_split_point(key, value, self.compare.as_ref());
 
 		// Create new leaf
 		let new_leaf_offset = self.allocate_page()?;
@@ -1181,7 +1185,9 @@ impl<S: Storage> BPlusTree<S> {
 
 		// Find insertion point for the new key-value
 		let mut idx = 0;
-		while idx < leaf.keys.len() && (self.compare)(key, &leaf.keys[idx]) == Ordering::Greater {
+		while idx < leaf.keys.len()
+			&& self.compare.compare(key, &leaf.keys[idx]) == Ordering::Greater
+		{
 			idx += 1;
 		}
 
@@ -1248,7 +1254,7 @@ impl<S: Storage> BPlusTree<S> {
 		extra_child: u64,
 	) -> Result<(Vec<u8>, u64)> {
 		// Insert the extra key and child into the node temporarily
-		node.insert_key_child(extra_key, extra_child, &self.compare);
+		node.insert_key_child(extra_key, extra_child, self.compare.as_ref());
 
 		// Now split the node
 		let (promoted_key, new_node_offset) = self.split_internal(node, None)?;
@@ -1263,7 +1269,7 @@ impl<S: Storage> BPlusTree<S> {
 	) -> Result<(Vec<u8>, u64)> {
 		let split_idx = if let Some(key) = new_key {
 			// If we're splitting due to a specific key, find optimal split point
-			node.find_split_point(key, &self.compare)
+			node.find_split_point(key, self.compare.as_ref())
 		} else {
 			// Otherwise use a simple middle split
 			node.keys.len() / 2
@@ -1290,22 +1296,22 @@ impl<S: Storage> BPlusTree<S> {
 		Ok((promoted_key, new_node_offset))
 	}
 
-	pub fn search(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		self.search_tree(self.header.root_offset, key)
+	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+		self.get_internal(self.header.root_offset, key)
 	}
 
-	fn search_tree(&self, node_offset: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+	fn get_internal(&self, node_offset: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
 		match self.read_node(node_offset)? {
 			NodeType::Internal(internal) => {
 				// Find appropriate child
-				let child_idx = internal.find_child_index(key, &self.compare);
+				let child_idx = internal.find_child_index(key, self.compare.as_ref());
 
 				// Search in the appropriate child
-				self.search_tree(internal.children[child_idx], key)
+				self.get_internal(internal.children[child_idx], key)
 			}
 			NodeType::Leaf(leaf) => {
 				// Search for the key in the leaf
-				match leaf.find_key(key, &self.compare) {
+				match leaf.find_key(key, self.compare.as_ref()) {
 					Some(idx) => Ok(Some(leaf.values[idx].clone())),
 					None => Ok(None),
 				}
@@ -1329,13 +1335,13 @@ impl<S: Storage> BPlusTree<S> {
 			match node_type {
 				NodeType::Internal(internal) => {
 					// Find child index and push current node to path
-					let child_idx = internal.find_child_index(key, &self.compare);
+					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					path.push((node_offset, child_idx));
 					node_offset = internal.children[child_idx];
 				}
 				NodeType::Leaf(mut leaf) => {
 					// Found the leaf node, attempt to delete
-					match leaf.delete(key, &self.compare) {
+					match leaf.delete(key, self.compare.as_ref()) {
 						Some((_, value)) => {
 							// Write updated leaf first
 							self.write_node(&NodeType::Leaf(leaf.clone()))?;
@@ -2166,7 +2172,7 @@ impl<'a, S: Storage> RangeScanIterator<'a, S> {
 					// Find the child that would contain the key
 					let mut idx = 0;
 					while idx < internal.keys.len()
-						&& (tree.compare)(start_key, &internal.keys[idx]) >= Ordering::Equal
+						&& tree.compare.compare(start_key, &internal.keys[idx]) >= Ordering::Equal
 					{
 						idx += 1;
 					}
@@ -2180,7 +2186,7 @@ impl<'a, S: Storage> RangeScanIterator<'a, S> {
 
 		// Find the first key >= start_key in the leaf
 		let current_idx =
-			leaf.keys.partition_point(|k| (tree.compare)(k, start_key) == Ordering::Less);
+			leaf.keys.partition_point(|k| tree.compare.compare(k, start_key) == Ordering::Less);
 
 		Ok(RangeScanIterator {
 			tree,
@@ -2224,7 +2230,7 @@ impl<S: Storage> Iterator for RangeScanIterator<'_, S> {
 
 			// Check if the current key is within range
 			let key = &leaf.keys[self.current_idx];
-			if (self.tree.compare)(key, &self.end_key) == Ordering::Greater {
+			if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
 				self.reached_end = true;
 				return None;
 			}
@@ -2260,7 +2266,7 @@ impl<'a, S: Storage> PrefixScanIterator<'a, S> {
 					// Find the child that would contain the key
 					let mut idx = 0;
 					while idx < internal.keys.len()
-						&& (tree.compare)(prefix, &internal.keys[idx]) >= Ordering::Equal
+						&& tree.compare.compare(prefix, &internal.keys[idx]) >= Ordering::Equal
 					{
 						idx += 1;
 					}
@@ -2274,7 +2280,7 @@ impl<'a, S: Storage> PrefixScanIterator<'a, S> {
 
 		// Find the first key >= prefix in the leaf
 		let current_idx =
-			leaf.keys.partition_point(|k| (tree.compare)(k, prefix) == Ordering::Less);
+			leaf.keys.partition_point(|k| tree.compare.compare(k, prefix) == Ordering::Less);
 
 		Ok(PrefixScanIterator {
 			tree,
@@ -2351,9 +2357,95 @@ mod tests {
 	use rand::{rngs::StdRng, Rng, SeedableRng};
 	use tempfile::NamedTempFile;
 
+	#[derive(Clone)]
+	struct TestComparator;
+
+	impl Comparator for TestComparator {
+		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+			a.cmp(b)
+		}
+
+		fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
+			// Simple separator implementation for tests
+			if from.len() < to.len() {
+				from.to_vec()
+			} else {
+				to.to_vec()
+			}
+		}
+
+		fn successor(&self, key: &[u8]) -> Vec<u8> {
+			let mut result = key.to_vec();
+			result.push(0);
+			result
+		}
+
+		fn name(&self) -> &str {
+			"TestComparator"
+		}
+	}
+
+	#[derive(Clone)]
+	struct U32Comparator;
+
+	impl Comparator for U32Comparator {
+		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+			let a_num = u32::from_le_bytes(a.try_into().unwrap());
+			let b_num = u32::from_le_bytes(b.try_into().unwrap());
+			a_num.cmp(&b_num)
+		}
+
+		fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
+			let from_num = u32::from_le_bytes(from.try_into().unwrap());
+			let to_num = u32::from_le_bytes(to.try_into().unwrap());
+			if from_num < to_num {
+				((from_num + to_num) / 2).to_le_bytes().to_vec()
+			} else {
+				from.to_vec()
+			}
+		}
+
+		fn successor(&self, key: &[u8]) -> Vec<u8> {
+			let key_num = u32::from_le_bytes(key.try_into().unwrap());
+			(key_num + 1).to_le_bytes().to_vec()
+		}
+
+		fn name(&self) -> &str {
+			"U32Comparator"
+		}
+	}
+
+	#[derive(Clone)]
+	struct BinaryComparator;
+
+	impl Comparator for BinaryComparator {
+		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+			a.cmp(b)
+		}
+
+		fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
+			// Simple separator implementation for tests
+			if from.len() < to.len() {
+				from.to_vec()
+			} else {
+				to.to_vec()
+			}
+		}
+
+		fn successor(&self, key: &[u8]) -> Vec<u8> {
+			let mut result = key.to_vec();
+			result.push(0);
+			result
+		}
+
+		fn name(&self) -> &str {
+			"BinaryComparator"
+		}
+	}
+
 	fn create_test_tree() -> BPlusTree<DiskStorage> {
 		let file = NamedTempFile::new().unwrap();
-		BPlusTree::disk(file.path(), Box::new(|a, b| a.cmp(b))).unwrap()
+		BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap()
 	}
 
 	#[test]
@@ -2366,16 +2458,16 @@ mod tests {
 		tree.insert(b"key3", b"value3").unwrap();
 
 		// Test retrievals
-		assert_eq!(tree.search(b"key1").unwrap().unwrap(), b"value1");
-		assert_eq!(tree.search(b"key2").unwrap().unwrap(), b"value2");
-		assert_eq!(tree.search(b"key3").unwrap().unwrap(), b"value3");
+		assert_eq!(tree.get(b"key1").unwrap().unwrap(), b"value1");
+		assert_eq!(tree.get(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tree.get(b"key3").unwrap().unwrap(), b"value3");
 
 		// Test non-existent key
-		assert!(tree.search(b"nonexistent").unwrap().is_none());
+		assert!(tree.get(b"nonexistent").unwrap().is_none());
 
 		// Test deletions
 		assert_eq!(tree.delete(b"key2").unwrap().unwrap(), b"value2");
-		assert!(tree.search(b"key2").unwrap().is_none());
+		assert!(tree.get(b"key2").unwrap().is_none());
 	}
 
 	#[test]
@@ -2394,13 +2486,13 @@ mod tests {
 			let key = format!("key{:03}", i).into_bytes();
 
 			// Verify key exists before deletion
-			let _ = tree.search(&key).unwrap();
+			let _ = tree.get(&key).unwrap();
 
 			// Attempt deletion
 			let _ = tree.delete(&key).unwrap();
 
 			// Verify key no longer exists
-			let after_delete = tree.search(&key).unwrap();
+			let after_delete = tree.get(&key).unwrap();
 			assert!(
 				after_delete.is_none(),
 				"Key still exists after deletion: {:?}",
@@ -2413,7 +2505,7 @@ mod tests {
 			let key = format!("key{:03}", i).into_bytes();
 			let value = format!("value{:03}", i).into_bytes();
 
-			let result = tree.search(&key).unwrap();
+			let result = tree.get(&key).unwrap();
 
 			assert!(
 				result.is_some(),
@@ -2440,10 +2532,10 @@ mod tests {
 
 		// Insert and immediately verify each key-value pair
 		for i in 0..TEST_SIZE {
-			println!("Inserting key {}", i);
+			// println!("Inserting key {}", i);
 			tree.insert(&keys[i], &values[i]).unwrap();
 
-			let retrieved = tree.search(&keys[i]).unwrap();
+			let retrieved = tree.get(&keys[i]).unwrap();
 			assert!(retrieved.is_some(), "Failed to retrieve just-inserted key at index {}", i);
 			assert_eq!(
 				retrieved.unwrap(),
@@ -2456,7 +2548,7 @@ mod tests {
 		// Delete even-indexed entries and verify after each deletion
 		for i in (0..TEST_SIZE).step_by(2) {
 			// Verify the key exists before deletion
-			let exists = tree.search(&keys[i]).unwrap();
+			let exists = tree.get(&keys[i]).unwrap();
 			assert!(exists.is_some(), "Key {} not found before deletion attempt", i);
 
 			// Attempt deletion
@@ -2469,7 +2561,7 @@ mod tests {
 			);
 
 			// Verify the deletion
-			let after_delete = tree.search(&keys[i]).unwrap();
+			let after_delete = tree.get(&keys[i]).unwrap();
 			assert!(
 				after_delete.is_none(),
 				"Key still exists after deletion at index {} (key: {:?})",
@@ -2479,7 +2571,7 @@ mod tests {
 
 			// Verify adjacent keys weren't affected
 			if i > 0 {
-				let prev = tree.search(&keys[i - 1]).unwrap();
+				let prev = tree.get(&keys[i - 1]).unwrap();
 				assert_eq!(
 					prev.unwrap(),
 					values[i - 1],
@@ -2488,7 +2580,7 @@ mod tests {
 				);
 			}
 			if i < TEST_SIZE - 1 {
-				let next = tree.search(&keys[i + 1]).unwrap();
+				let next = tree.get(&keys[i + 1]).unwrap();
 				assert_eq!(next.unwrap(), values[i + 1], "Next value corrupted at index {}", i + 1);
 			}
 		}
@@ -2496,7 +2588,7 @@ mod tests {
 		// Final verification of all keys
 		println!("\nFinal verification:");
 		for i in 0..TEST_SIZE {
-			let retrieved = tree.search(&keys[i]).unwrap();
+			let retrieved = tree.get(&keys[i]).unwrap();
 			if i % 2 == 0 {
 				assert!(retrieved.is_none(), "Value at index {} should have been deleted", i);
 			} else {
@@ -2544,7 +2636,7 @@ mod tests {
 		// Delete items sequentially
 		for (i, (key, expected_value)) in data.iter().enumerate() {
 			// Verify key exists before deletion
-			let exists = tree.search(key).unwrap();
+			let exists = tree.get(key).unwrap();
 			assert!(
 				exists.is_some(),
 				"Key should exist before deletion: {:?}",
@@ -2569,7 +2661,7 @@ mod tests {
 			}
 
 			// Verify key no longer exists
-			let after_delete = tree.search(key).unwrap();
+			let after_delete = tree.get(key).unwrap();
 			assert!(
 				after_delete.is_none(),
 				"Key still exists after deletion: {:?}",
@@ -2586,7 +2678,7 @@ mod tests {
 					let idx = i + 1 + (j * remaining / sample_size);
 					let (remain_key, remain_value) = &data[idx];
 
-					match tree.search(remain_key).unwrap() {
+					match tree.get(remain_key).unwrap() {
 						Some(v) => {
 							assert_eq!(
 								&v,
@@ -2605,95 +2697,90 @@ mod tests {
 		}
 	}
 
-	// #[test]
-	// fn test_sequential_delete_all() {
-	//     let mut tree = create_test_tree();
+	#[test]
+	#[ignore]
+	fn test_sequential_delete_all() {
+		let mut tree = create_test_tree();
 
-	//     let mut data = Vec::new();
-	//     for i in 0..TEST_SIZE {
-	//         let key = format!("key{:03}", i).into_bytes();
-	//         let value = format!("value{:03}", i).into_bytes();
-	//         data.push((key, value));
-	//     }
+		let mut data = Vec::new();
+		for i in 0..TEST_SIZE {
+			let key = format!("key{:03}", i).into_bytes();
+			let value = format!("value{:03}", i).into_bytes();
+			data.push((key, value));
+		}
 
-	//     // Insert all items
-	//     for (key, value) in data.iter() {
-	//         tree.insert(key, value).unwrap();
-	//     }
+		// Insert all items
+		for (key, value) in data.iter() {
+			tree.insert(key, value).unwrap();
+		}
 
-	//     tree.print_tree_stats().unwrap();
-	//     println!("Tree height: {}", tree.calculate_tree_height().unwrap());
+		tree.print_tree_stats().unwrap();
 
-	//     // Delete items sequentially
-	//     for (i, (key, expected_value)) in data.iter().enumerate() {
-	//         // Verify key exists before deletion
-	//         let exists = tree.search(key).unwrap();
-	//         assert!(
-	//             exists.is_some(),
-	//             "Key should exist before deletion: {:?}",
-	//             String::from_utf8_lossy(key)
-	//         );
+		// Delete items sequentially
+		for (i, (key, expected_value)) in data.iter().enumerate() {
+			// Verify key exists before deletion
+			let exists = tree.get(key).unwrap();
+			assert!(
+				exists.is_some(),
+				"Key should exist before deletion: {:?}",
+				String::from_utf8_lossy(key)
+			);
 
-	//         // Perform deletion
-	//         match tree.delete(key) {
-	//             Ok(Some(value)) => {
-	//                 assert_eq!(
-	//                     &value,
-	//                     expected_value,
-	//                     "Deleted value doesn't match for key: {:?}",
-	//                     String::from_utf8_lossy(key)
-	//                 );
-	//             }
-	//             Ok(None) => panic!(
-	//                 "Key reported as not found during deletion: {:?}",
-	//                 String::from_utf8_lossy(key)
-	//             ),
-	//             Err(e) => panic!(
-	//                 "Error deleting key {:?}: {}",
-	//                 String::from_utf8_lossy(key),
-	//                 e
-	//             ),
-	//         }
+			// Perform deletion
+			match tree.delete(key) {
+				Ok(Some(value)) => {
+					assert_eq!(
+						&value,
+						expected_value,
+						"Deleted value doesn't match for key: {:?}",
+						String::from_utf8_lossy(key)
+					);
+				}
+				Ok(None) => panic!(
+					"Key reported as not found during deletion: {:?}",
+					String::from_utf8_lossy(key)
+				),
+				Err(e) => panic!("Error deleting key {:?}: {}", String::from_utf8_lossy(key), e),
+			}
 
-	//         // Verify key no longer exists
-	//         let after_delete = tree.search(key).unwrap();
-	//         assert!(
-	//             after_delete.is_none(),
-	//             "Key still exists after deletion: {:?}",
-	//             String::from_utf8_lossy(key)
-	//         );
+			// Verify key no longer exists
+			let after_delete = tree.get(key).unwrap();
+			assert!(
+				after_delete.is_none(),
+				"Key still exists after deletion: {:?}",
+				String::from_utf8_lossy(key)
+			);
 
-	//         // Verify remaining keys
-	//         for (remain_key, remain_value) in data.iter().take(TEST_SIZE).skip(i + 1) {
-	//             match tree.search(remain_key).unwrap() {
-	//                 Some(v) => {
-	//                     assert_eq!(
-	//                         &v,
-	//                         remain_value,
-	//                         "Value mismatch for remaining key: {:?}",
-	//                         String::from_utf8_lossy(remain_key)
-	//                     );
-	//                 }
-	//                 None => panic!(
-	//                     "Remaining key not found: {:?}",
-	//                     String::from_utf8_lossy(remain_key)
-	//                 ),
-	//             }
-	//         }
-	//     }
-	// }
+			// Verify remaining keys
+			for (remain_key, remain_value) in data.iter().take(TEST_SIZE).skip(i + 1) {
+				match tree.get(remain_key).unwrap() {
+					Some(v) => {
+						assert_eq!(
+							&v,
+							remain_value,
+							"Value mismatch for remaining key: {:?}",
+							String::from_utf8_lossy(remain_key)
+						);
+					}
+					None => {
+						panic!("Remaining key not found: {:?}", String::from_utf8_lossy(remain_key))
+					}
+				}
+			}
+		}
+	}
 
 	#[test]
 	fn test_empty_tree() {
 		let tree = create_test_tree();
-		assert_eq!(tree.search(b"key").unwrap(), None);
+		assert_eq!(tree.get(b"key").unwrap(), None);
 	}
 
 	#[test]
 	fn test_single_insert_search() {
 		let mut tree = create_test_tree();
 		tree.insert(b"key1", b"value1").unwrap();
-		assert_eq!(tree.search(b"key1").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 	}
 
 	#[test]
@@ -2722,76 +2809,22 @@ mod tests {
 		// Verify all exist
 		for i in 0..(max_keys * 3) {
 			let key = format!("key{}", i).into_bytes();
-			assert!(tree.search(&key).unwrap().is_some());
+			assert!(tree.get(&key).unwrap().is_some());
 		}
 
 		// Delete all in reverse order
 		for i in (0..(max_keys * 3)).rev() {
 			let key = format!("key{}", i).into_bytes();
-			println!("Deleting key: {:?}", String::from_utf8_lossy(&key));
+			// println!("Deleting key: {:?}", String::from_utf8_lossy(&key));
 			assert!(tree.delete(&key).unwrap().is_some());
 		}
 
 		// Verify all deleted
 		for i in 0..(max_keys * 3) {
 			let key = format!("key{}", i).into_bytes();
-			assert!(tree.search(&key).unwrap().is_none());
+			assert!(tree.get(&key).unwrap().is_none());
 		}
 	}
-
-	// #[test]
-	// fn test_node_splits() {
-	//     let mut tree = create_test_tree();
-
-	//     // Insert MAX_KEYS + 1 to force root split
-	//     for i in 0..=MAX_KEYS {
-	//         // Changed to inclusive range
-	//         let key = format!("key{:04}", i).into_bytes();
-	//         tree.insert(&key, b"value").unwrap();
-	//     }
-
-	//     // Verify root split into internal node
-	//     let root = tree.read_node(tree.header.root_offset).unwrap();
-	//     assert!(
-	//         !root.is_leaf,
-	//         "Root should have split into internal node (was leaf: {})",
-	//         root.is_leaf
-	//     );
-	//     assert_eq!(
-	//         root.keys.len(),
-	//         1,
-	//         "Root should have 1 key after split (had {} keys)",
-	//         root.keys.len()
-	//     );
-	//     assert_eq!(
-	//         root.children.len(),
-	//         2,
-	//         "Root should have 2 children after split (had {} children)",
-	//         root.children.len()
-	//     );
-	// }
-
-	// #[test]
-	// fn test_node_merges() {
-	//     let mut tree = create_test_tree();
-	//     // Insert enough to create multiple nodes
-	//     let count = MAX_KEYS * 3;
-	//     for i in 0..count {
-	//         let key = format!("key{:04}", i).into_bytes();
-	//         tree.insert(&key, b"value").unwrap();
-	//     }
-
-	//     // Delete all keys to force merges
-	//     for i in 0..count {
-	//         let key = format!("key{:04}", i).into_bytes();
-	//         assert!(tree.delete(&key).unwrap().is_some());
-	//     }
-
-	//     // Verify root is empty and reset to leaf
-	//     let root = tree.read_node(tree.header.root_offset).unwrap();
-	//     assert!(root.is_leaf, "Root should be leaf after all deletions");
-	//     assert!(root.keys.is_empty(), "Root should be empty");
-	// }
 
 	#[test]
 	fn test_predecessor_successor_operations() {
@@ -2807,10 +2840,10 @@ mod tests {
 		assert!(tree.delete(b"f").unwrap().is_some());
 
 		// Verify remaining keys
-		assert!(tree.search(b"b").unwrap().is_some());
-		assert!(tree.search(b"d").unwrap().is_some());
-		assert!(tree.search(b"h").unwrap().is_some());
-		assert!(tree.search(b"j").unwrap().is_some());
+		assert!(tree.get(b"b").unwrap().is_some());
+		assert!(tree.get(b"d").unwrap().is_some());
+		assert!(tree.get(b"h").unwrap().is_some());
+		assert!(tree.get(b"j").unwrap().is_some());
 	}
 
 	#[test]
@@ -2832,8 +2865,8 @@ mod tests {
 		tree.delete(&keys[keys.len() - 1]).unwrap();
 
 		// Verify deletions
-		assert!(tree.search(&keys[0]).unwrap().is_none());
-		assert!(tree.search(&keys[keys.len() - 1]).unwrap().is_none());
+		assert!(tree.get(&keys[0]).unwrap().is_none());
+		assert!(tree.get(&keys[keys.len() - 1]).unwrap().is_none());
 	}
 
 	#[test]
@@ -2851,7 +2884,7 @@ mod tests {
 
 		// Insert data and close
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			for (key, value) in &test_data {
 				tree.insert(key, value)?;
 			}
@@ -2859,12 +2892,12 @@ mod tests {
 
 		// Reopen and verify
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 
 			// Verify existing data
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.search(key)?,
+					tree.get(key)?,
 					Some(value.clone()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
@@ -2872,12 +2905,12 @@ mod tests {
 			}
 
 			// Verify non-existent key
-			assert_eq!(tree.search(b"mango")?, None, "Non-existent key found unexpectedly");
+			assert_eq!(tree.get(b"mango")?, None, "Non-existent key found unexpectedly");
 
 			// Add new data and verify
 			tree.insert(b"mango", b"orange")?;
 			assert_eq!(
-				tree.search(b"mango")?,
+				tree.get(b"mango")?,
 				Some(b"orange".to_vec()),
 				"New insertion failed after reopening"
 			);
@@ -2885,9 +2918,9 @@ mod tests {
 
 		// Reopen again to verify new data persisted
 		{
-			let tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
+			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(
-				tree.search(b"mango")?,
+				tree.get(b"mango")?,
 				Some(b"orange".to_vec()),
 				"New data didn't persist across openings"
 			);
@@ -2903,7 +2936,7 @@ mod tests {
 
 		// Insert test data
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			tree.insert(b"one", b"1")?;
 			tree.insert(b"two", b"2")?;
 			tree.insert(b"three", b"3")?;
@@ -2911,17 +2944,17 @@ mod tests {
 
 		// Delete and verify
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(tree.delete(b"two")?, Some(b"2".to_vec()));
-			assert_eq!(tree.search(b"two")?, None);
+			assert_eq!(tree.get(b"two")?, None);
 		}
 
 		// Reopen and verify deletion persisted
 		{
-			let tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b)))?;
-			assert_eq!(tree.search(b"two")?, None, "Deleted key still exists after reopening");
+			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
+			assert_eq!(tree.get(b"two")?, None, "Deleted key still exists after reopening");
 			assert_eq!(
-				tree.search(b"one")?,
+				tree.get(b"one")?,
 				Some(b"1".to_vec()),
 				"Existing key missing after deletion"
 			);
@@ -2937,123 +2970,8 @@ mod tests {
 		tree.insert(b"key", b"v1").unwrap();
 		tree.delete(b"key").unwrap();
 		tree.insert(b"key", b"v2").unwrap();
-		assert_eq!(tree.search(b"key").unwrap(), Some(b"v2".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"v2".to_vec()));
 	}
-
-	// #[test]
-	// fn node_serialize_deserialize() {
-	//     // Test empty leaf node
-	//     let node = Node::new(true, 4096);
-	//     let serialized = node.serialize().unwrap();
-	//     let deserialized = Node::deserialize(&serialized).unwrap();
-	//     assert_nodes_equal(&node, &deserialized);
-
-	//     // Test leaf node with data
-	//     let mut leaf = Node::new(true, 8192);
-	//     leaf.keys.push(vec![1, 2, 3]);
-	//     leaf.values.push(vec![4]);
-	//     leaf.keys.push(vec![5]);
-	//     leaf.values.push(vec![6, 7, 8]);
-	//     let serialized = leaf.serialize().unwrap();
-	//     let deserialized = Node::deserialize(&serialized).unwrap();
-	//     assert_nodes_equal(&leaf, &deserialized);
-
-	//     // Test internal node with children
-	//     let mut internal = Node::new(false, 12288);
-	//     internal.keys.push(vec![9]);
-	//     internal.values.push(vec![10]);
-	//     internal.children.extend(&[1234, 5678, 9012]);
-	//     let serialized = internal.serialize().unwrap();
-	//     let deserialized = Node::deserialize(&serialized).unwrap();
-	//     assert_nodes_equal(&internal, &deserialized);
-
-	//     // Test maximum capacity node
-	//     let mut max_node = Node::new(true, 16384);
-	//     let max_per_entry = 255; // From previous calculations
-	//     for i in 0..MAX_KEYS {
-	//         max_node.keys.push(vec![i as u8]);
-	//         max_node.values.push(vec![i as u8; max_per_entry - 1]);
-	//     }
-	//     let serialized = max_node.serialize().unwrap();
-	//     let deserialized = Node::deserialize(&serialized).unwrap();
-	//     assert_nodes_equal(&max_node, &deserialized);
-
-	//     // Test edge cases
-	//     let mut edge_cases = Node::new(true, 20480);
-	//     edge_cases.keys.push(vec![]); // Empty key
-	//     edge_cases.values.push(vec![1]);
-	//     edge_cases.keys.push(vec![2]);
-	//     edge_cases.values.push(vec![]); // Empty value
-	//     let serialized = edge_cases.serialize().unwrap();
-	//     let deserialized = Node::deserialize(&serialized).unwrap();
-	//     assert_nodes_equal(&edge_cases, &deserialized);
-	// }
-
-	// fn assert_nodes_equal(original: &Node, deserialized: &Node) {
-	//     // Compare metadata
-	//     assert_eq!(
-	//         original.is_leaf, deserialized.is_leaf,
-	//         "is_leaf mismatch: {} vs {}",
-	//         original.is_leaf, deserialized.is_leaf
-	//     );
-
-	//     // Compare keys
-	//     assert_eq!(
-	//         original.keys.len(),
-	//         deserialized.keys.len(),
-	//         "Key count mismatch: {} vs {}",
-	//         original.keys.len(),
-	//         deserialized.keys.len()
-	//     );
-	//     for (i, (orig_key, deser_key)) in original.keys.iter().zip(&deserialized.keys).enumerate() {
-	//         assert_eq!(
-	//             orig_key, deser_key,
-	//             "Key {} mismatch: {:?} vs {:?}",
-	//             i, orig_key, deser_key
-	//         );
-	//     }
-
-	//     // Compare values
-	//     assert_eq!(
-	//         original.values.len(),
-	//         deserialized.values.len(),
-	//         "Value count mismatch: {} vs {}",
-	//         original.values.len(),
-	//         deserialized.values.len()
-	//     );
-	//     for (i, (orig_val, deser_val)) in
-	//         original.values.iter().zip(&deserialized.values).enumerate()
-	//     {
-	//         assert_eq!(
-	//             orig_val, deser_val,
-	//             "Value {} mismatch: {:?} vs {:?}",
-	//             i, orig_val, deser_val
-	//         );
-	//     }
-
-	//     // Compare children for internal nodes
-	//     if !original.is_leaf {
-	//         assert_eq!(
-	//             original.children.len(),
-	//             deserialized.children.len(),
-	//             "Child count mismatch: {} vs {}",
-	//             original.children.len(),
-	//             deserialized.children.len()
-	//         );
-	//         for (i, (orig_child, deser_child)) in original
-	//             .children
-	//             .iter()
-	//             .zip(&deserialized.children)
-	//             .enumerate()
-	//         {
-	//             assert_eq!(
-	//                 orig_child, deser_child,
-	//                 "Child {} mismatch: {} vs {}",
-	//                 i, orig_child, deser_child
-	//             );
-	//         }
-	//     }
-	// }
 
 	#[test]
 	fn test_drop_behavior() {
@@ -3062,7 +2980,7 @@ mod tests {
 
 		// Create and immediately drop
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			tree.insert(b"test", b"value").unwrap();
 			// Explicit drop before end of scope
 			drop(tree);
@@ -3070,8 +2988,8 @@ mod tests {
 
 		// Verify data post drop
 		{
-			let tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
-			assert_eq!(tree.search(b"test").unwrap(), Some(b"value".to_vec()));
+			let tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
+			assert_eq!(tree.get(b"test").unwrap(), Some(b"value".to_vec()));
 		}
 	}
 
@@ -3080,33 +2998,10 @@ mod tests {
 		let file = NamedTempFile::new().unwrap();
 		let path = file.path();
 
-		let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
+		let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 		tree.insert(b"close", b"test").unwrap();
 		tree.close().unwrap(); // Explicit close
 	}
-
-	// #[test]
-	// fn header_serialization_roundtrip() {
-	//     let original = Header {
-	//         magic: MAGIC,
-	//         version: 1,
-	//         root_offset: 4096,
-	//         free_list_head: 0,
-	//         total_pages: 2,
-	//     };
-
-	//     // Test serialization
-	//     let serialized = original.serialize();
-
-	//     // Test deserialization
-	//     let deserialized = Header::deserialize(&serialized).unwrap();
-
-	//     assert_eq!(deserialized.magic, original.magic);
-	//     assert_eq!(deserialized.version, original.version);
-	//     assert_eq!(deserialized.root_offset, original.root_offset);
-	//     assert_eq!(deserialized.free_list_head, original.free_list_head);
-	//     assert_eq!(deserialized.total_pages, original.total_pages);
-	// }
 
 	#[test]
 	fn new_file_initializes_correct_header() {
@@ -3114,7 +3009,7 @@ mod tests {
 		let path = temp_file.path();
 
 		// Create new BPlusTree
-		let _tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
+		let _tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 
 		// Read header directly from file
 		let mut file = File::open(path).unwrap();
@@ -3187,7 +3082,7 @@ mod tests {
 
 		// Insert data and close
 		{
-			let mut tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
+			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			for (key, value) in &test_data {
 				tree.insert(key, value).unwrap();
 			}
@@ -3196,22 +3091,16 @@ mod tests {
 
 		// Reopen and verify all items
 		{
-			let tree = BPlusTree::disk(path, Box::new(|a, b| a.cmp(b))).unwrap();
+			let tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.search(key).unwrap(),
+					tree.get(key).unwrap(),
 					Some(value.clone()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
 			}
 		}
-	}
-
-	fn u32_compare(a: &[u8], b: &[u8]) -> Ordering {
-		let a_num = u32::from_le_bytes(a.try_into().unwrap());
-		let b_num = u32::from_le_bytes(b.try_into().unwrap());
-		a_num.cmp(&b_num)
 	}
 
 	fn serialize_u32(n: u32) -> Vec<u8> {
@@ -3228,7 +3117,7 @@ mod tests {
 	#[test]
 	fn test_range_basic() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		// Insert test data
 		for i in 1..=10 {
@@ -3247,7 +3136,7 @@ mod tests {
 	#[test]
 	fn test_range_spanning_leaves() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		// Insert enough data to create multiple levels
 		for i in 1..=20 {
@@ -3266,7 +3155,7 @@ mod tests {
 	#[test]
 	fn test_full_range() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		for i in 1..=10 {
 			tree.insert(&serialize_u32(i), &serialize_u32(i * 10)).unwrap();
@@ -3280,7 +3169,7 @@ mod tests {
 	#[test]
 	fn test_invalid_range() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		for i in 1..=5 {
 			tree.insert(&serialize_u32(i), &[]).unwrap();
@@ -3294,7 +3183,7 @@ mod tests {
 	#[test]
 	fn test_missing_boundaries() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		// Insert sparse keys
 		for i in (1..=10).step_by(2) {
@@ -3318,7 +3207,7 @@ mod tests {
 	#[test]
 	fn test_exact_match_range() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		tree.insert(&serialize_u32(5), &[]).unwrap();
 
@@ -3334,7 +3223,7 @@ mod tests {
 	#[test]
 	fn test_range_after_modifications() {
 		let file = NamedTempFile::new().unwrap();
-		let mut tree = BPlusTree::disk(file.path(), Box::new(u32_compare)).unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		// Insert initial data
 		for i in 1..=10 {
@@ -3455,10 +3344,6 @@ mod tests {
 		assert!(iter.next().is_none());
 	}
 
-	fn binary_compare(a: &[u8], b: &[u8]) -> Ordering {
-		a.cmp(b)
-	}
-
 	fn key(i: u32) -> Vec<u8> {
 		format!("key{:010}", i).into_bytes()
 	}
@@ -3474,7 +3359,7 @@ mod tests {
 		let insert_count = 20000;
 
 		{
-			let mut tree = BPlusTree::disk(&file, Box::new(binary_compare)).unwrap();
+			let mut tree = BPlusTree::disk(&file, Arc::new(BinaryComparator)).unwrap();
 
 			// First, insert 1026+ keys to ensure we have at least 3 levels
 			for i in 0..insert_count {
@@ -3488,16 +3373,12 @@ mod tests {
 
 			// Check deleted items
 			for i in (0..insert_count).step_by(2) {
-				assert!(
-					tree.search(&key(i)).unwrap().is_none(),
-					"Deleted key {} should not exist",
-					i
-				);
+				assert!(tree.get(&key(i)).unwrap().is_none(), "Deleted key {} should not exist", i);
 			}
 
 			// Check items that weren't deleted
 			for i in (1..insert_count).step_by(2) {
-				let result = tree.search(&key(i)).unwrap();
+				let result = tree.get(&key(i)).unwrap();
 				assert!(result.is_some(), "Non-deleted key {} should exist", i);
 				assert_eq!(result.unwrap(), value(i), "Value for key {} is incorrect", i);
 			}
@@ -3513,7 +3394,7 @@ mod tests {
 
 		// Create a new B+ tree
 		{
-			let mut tree = BPlusTree::disk(&file, Box::new(binary_compare)).unwrap();
+			let mut tree = BPlusTree::disk(&file, Arc::new(BinaryComparator)).unwrap();
 
 			// Step 1: Insert data
 			for i in 0..insert_count {
@@ -3579,23 +3460,19 @@ mod tests {
 
 			// Check deleted items
 			for i in (0..insert_count).step_by(2) {
-				assert!(
-					tree.search(&key(i)).unwrap().is_none(),
-					"Deleted key {} should not exist",
-					i
-				);
+				assert!(tree.get(&key(i)).unwrap().is_none(), "Deleted key {} should not exist", i);
 			}
 
 			// Check items that weren't deleted
 			for i in (1..insert_count).step_by(2) {
-				let result = tree.search(&key(i)).unwrap();
+				let result = tree.get(&key(i)).unwrap();
 				assert!(result.is_some(), "Non-deleted key {} should exist", i);
 				assert_eq!(result.unwrap(), value(i), "Value for key {} is incorrect", i);
 			}
 
 			// Check newly inserted items
 			for i in insert_count..(insert_count + 100) {
-				let result = tree.search(&key(i)).unwrap();
+				let result = tree.get(&key(i)).unwrap();
 				assert!(result.is_some(), "Newly inserted key {} should exist", i);
 				assert_eq!(result.unwrap(), value(i), "Value for key {} is incorrect", i);
 			}
@@ -3635,7 +3512,7 @@ mod tests {
 
 		// Step 8: Reopen and verify trunk pages are preserved
 		{
-			let mut tree = BPlusTree::disk(&file, Box::new(binary_compare)).unwrap();
+			let mut tree = BPlusTree::disk(&file, Arc::new(BinaryComparator)).unwrap();
 
 			// Verify free page count was preserved
 			assert!(tree.header.free_page_count > 0, "Free pages should be preserved after reopen");
@@ -3755,7 +3632,7 @@ mod tests {
 				tree.insert(&unique_key, &fixed_value).unwrap();
 
 				// Verify the key was inserted correctly
-				let result = tree.search(&unique_key).unwrap();
+				let result = tree.get(&unique_key).unwrap();
 				assert!(
 					result.is_some(),
 					"Failed to retrieve just-inserted key of size {}",
@@ -3781,7 +3658,7 @@ mod tests {
 
 					// Verify the key no longer exists
 					assert!(
-						tree.search(key).unwrap().is_none(),
+						tree.get(key).unwrap().is_none(),
 						"Key of size {} still exists after deletion",
 						key_size
 					);
@@ -3791,7 +3668,7 @@ mod tests {
 			// Verify remaining odd-indexed keys still exist
 			for (idx, key) in all_keys.iter().enumerate() {
 				if idx % 2 == 1 {
-					let result = tree.search(key).unwrap();
+					let result = tree.get(key).unwrap();
 					assert!(
 						result.is_some(),
 						"Odd-indexed key of size {} missing after deletion of even keys",
@@ -3856,7 +3733,7 @@ mod tests {
 			let idx = rng.gen_range(0..keys_to_delete.len());
 			let key = keys_to_delete.swap_remove(idx);
 
-			println!("Deleting key of size {}", key.len());
+			// println!("Deleting key of size {}", key.len());
 			tree.delete(&key).unwrap();
 			active_keys.remove(&key);
 
@@ -3906,7 +3783,7 @@ mod tests {
 			let expected_value =
 				all_keys.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap();
 
-			let retrieved = tree.search(key).unwrap();
+			let retrieved = tree.get(key).unwrap();
 			assert!(retrieved.is_some(), "Active key of size {} not found", key.len());
 			assert_eq!(retrieved.unwrap(), expected_value);
 		}
@@ -3915,7 +3792,7 @@ mod tests {
 		for (key, _) in &all_keys {
 			if !active_keys.contains(key) {
 				assert!(
-					tree.search(key).unwrap().is_none(),
+					tree.get(key).unwrap().is_none(),
 					"Deleted key of size {} still exists",
 					key.len()
 				);
