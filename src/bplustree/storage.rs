@@ -20,11 +20,6 @@ pub trait Storage: Send + Sync {
 
 	/// Get the current length of the storage
 	fn len(&self) -> Result<u64>;
-
-	/// Check if the storage is empty
-	fn is_empty(&self) -> Result<bool> {
-		Ok(self.len()? == 0)
-	}
 }
 
 /// Disk-based storage implementation
@@ -62,65 +57,5 @@ impl Storage for DiskStorage {
 
 	fn len(&self) -> Result<u64> {
 		Ok(self.file.metadata()?.len())
-	}
-}
-
-/// In-memory storage implementation
-pub struct MemoryStorage {
-	data: Vec<u8>,
-}
-
-impl MemoryStorage {
-	pub fn new() -> Self {
-		MemoryStorage {
-			data: Vec::new(),
-		}
-	}
-}
-
-impl Default for MemoryStorage {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl Storage for MemoryStorage {
-	fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<()> {
-		let start = offset as usize;
-		let end = start + buffer.len();
-
-		if end > self.data.len() {
-			return Err(super::tree::BPlusTreeError::InvalidOffset);
-		}
-
-		buffer.copy_from_slice(&self.data[start..end]);
-		Ok(())
-	}
-
-	fn write_at(&mut self, buffer: &[u8], offset: u64) -> Result<()> {
-		let start = offset as usize;
-		let end = start + buffer.len();
-
-		// Ensure data vector is large enough
-		if end > self.data.len() {
-			self.data.resize(end, 0);
-		}
-
-		self.data[start..end].copy_from_slice(buffer);
-		Ok(())
-	}
-
-	fn sync(&self) -> Result<()> {
-		// No-op for in-memory storage
-		Ok(())
-	}
-
-	fn sync_data(&self) -> Result<()> {
-		// No-op for in-memory storage
-		Ok(())
-	}
-
-	fn len(&self) -> Result<u64> {
-		Ok(self.data.len() as u64)
 	}
 }

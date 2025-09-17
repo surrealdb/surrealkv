@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use quick_cache::{sync::Cache, Weighter};
 
-use super::{DiskStorage, MemoryStorage, Storage};
+use super::{DiskStorage, Storage};
 use crate::Comparator;
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<DiskStorage>;
-pub type MemoryBPlusTree = BPlusTree<MemoryStorage>;
 
 #[derive(Clone)]
 struct NodeWeighter;
@@ -926,22 +925,11 @@ impl BPlusTree<DiskStorage> {
 	}
 }
 
-impl BPlusTree<MemoryStorage> {
-	pub fn memory(compare: Arc<dyn Comparator>) -> Result<Self> {
-		let storage = MemoryStorage::new();
-		Self::with_storage(storage, compare)
-	}
-}
-
 pub fn new_disk_tree<P: AsRef<Path>>(
 	path: P,
 	compare: Arc<dyn Comparator>,
 ) -> Result<DiskBPlusTree> {
 	DiskBPlusTree::disk(path, compare)
-}
-
-pub fn new_memory_tree(compare: Arc<dyn Comparator>) -> Result<MemoryBPlusTree> {
-	MemoryBPlusTree::memory(compare)
 }
 
 impl<S: Storage> BPlusTree<S> {
@@ -1014,7 +1002,7 @@ impl<S: Storage> BPlusTree<S> {
 		Ok(())
 	}
 
-	pub fn close(self) -> Result<()> {
+	pub fn close(&self) -> Result<()> {
 		self.storage.sync()?;
 		Ok(())
 	}
@@ -2083,16 +2071,17 @@ impl<S: Storage> BPlusTree<S> {
 		Ok(())
 	}
 
-	pub fn range(&mut self, start_key: &[u8], end_key: &[u8]) -> Result<RangeScanIterator<S>> {
+	pub fn range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeScanIterator<S>> {
 		RangeScanIterator::new(self, start_key, end_key)
 	}
 
-	pub fn prefix(&mut self, prefix: &[u8]) -> Result<PrefixScanIterator<S>> {
+	pub fn prefix(&self, prefix: &[u8]) -> Result<PrefixScanIterator<S>> {
 		PrefixScanIterator::new(self, prefix)
 	}
 
 	/// Calculate the height of the B+ tree.
-	pub fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
+	#[cfg(test)]
+	fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
 		let root_offset = self.header.root_offset;
 		let (height, node_count, total_keys, leaf_nodes) =
 			self.calculate_subtree_stats(root_offset, 1)?;
@@ -2100,6 +2089,7 @@ impl<S: Storage> BPlusTree<S> {
 		Ok((height, node_count, total_keys, leaf_nodes))
 	}
 
+	#[cfg(test)]
 	fn calculate_subtree_stats(
 		&mut self,
 		node_offset: u64,
@@ -2136,7 +2126,8 @@ impl<S: Storage> BPlusTree<S> {
 	}
 
 	// Print basic tree statistics
-	pub fn print_tree_stats(&mut self) -> Result<()> {
+	#[cfg(test)]
+	fn print_tree_stats(&mut self) -> Result<()> {
 		let (height, node_count, total_keys, leaf_nodes) = self.calculate_tree_stats()?;
 
 		println!("B+ Tree Statistics:");
@@ -2153,7 +2144,7 @@ impl<S: Storage> BPlusTree<S> {
 }
 
 pub struct RangeScanIterator<'a, S: Storage> {
-	tree: &'a mut BPlusTree<S>,
+	tree: &'a BPlusTree<S>,
 	current_leaf: Option<LeafNode>,
 	end_key: Vec<u8>,
 	current_idx: usize,
@@ -2161,7 +2152,7 @@ pub struct RangeScanIterator<'a, S: Storage> {
 }
 
 impl<'a, S: Storage> RangeScanIterator<'a, S> {
-	pub fn new(tree: &'a mut BPlusTree<S>, start_key: &[u8], end_key: &[u8]) -> Result<Self> {
+	pub fn new(tree: &'a BPlusTree<S>, start_key: &[u8], end_key: &[u8]) -> Result<Self> {
 		// Find the leaf containing the start key
 		let mut node_offset = tree.header.root_offset;
 
@@ -2247,7 +2238,7 @@ impl<S: Storage> Iterator for RangeScanIterator<'_, S> {
 }
 
 pub struct PrefixScanIterator<'a, S: Storage> {
-	tree: &'a mut BPlusTree<S>,
+	tree: &'a BPlusTree<S>,
 	current_leaf: Option<LeafNode>,
 	prefix: Vec<u8>,
 	current_idx: usize,
@@ -2255,7 +2246,7 @@ pub struct PrefixScanIterator<'a, S: Storage> {
 }
 
 impl<'a, S: Storage> PrefixScanIterator<'a, S> {
-	pub fn new(tree: &'a mut BPlusTree<S>, prefix: &[u8]) -> Result<Self> {
+	pub fn new(tree: &'a BPlusTree<S>, prefix: &[u8]) -> Result<Self> {
 		// Find the leaf containing the first key >= prefix
 		let mut node_offset = tree.header.root_offset;
 
