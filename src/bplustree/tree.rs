@@ -26,7 +26,6 @@ impl Weighter<u64, NodeType> for NodeWeighter {
 #[derive(Debug)]
 pub enum BPlusTreeError {
 	Io(io::Error),
-	DuplicateKey,
 	Serialization(String),
 	Deserialization(String),
 	InvalidOffset,
@@ -41,7 +40,6 @@ impl std::fmt::Display for BPlusTreeError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			BPlusTreeError::Io(e) => write!(f, "IO error: {}", e),
-			BPlusTreeError::DuplicateKey => write!(f, "Duplicate key"),
 			BPlusTreeError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
 			BPlusTreeError::Deserialization(msg) => write!(f, "Deserialization error: {}", msg),
 			BPlusTreeError::InvalidOffset => write!(f, "Invalid offset"),
@@ -544,14 +542,22 @@ impl LeafNode {
 	}
 
 	// insert a key-value pair into a leaf node at the correct position
+	// If key already exists, update the value (treat as update)
 	fn insert(&mut self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
 		let mut idx = 0;
 		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
 
-		self.keys.insert(idx, key.to_vec());
-		self.values.insert(idx, value.to_vec());
+		// Check if key already exists at this position
+		if idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Equal {
+			// Key exists, update the value
+			self.values[idx] = value.to_vec();
+		} else {
+			// Key doesn't exist, insert new entry
+			self.keys.insert(idx, key.to_vec());
+			self.values.insert(idx, value.to_vec());
+		}
 		idx
 	}
 
@@ -1179,15 +1185,24 @@ impl<S: Storage> BPlusTree<S> {
 			idx += 1;
 		}
 
+		// Check if key already exists
+		let is_duplicate =
+			idx < leaf.keys.len() && self.compare.compare(key, &leaf.keys[idx]) == Ordering::Equal;
+
 		if idx < split_idx {
 			// New entry belongs in the left node
 			// Move entries after split_idx to new leaf
 			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
 			new_leaf.values = leaf.values.drain(split_idx..).collect();
 
-			// Insert the new key-value into leaf
-			leaf.keys.insert(idx, key.to_vec());
-			leaf.values.insert(idx, value.to_vec());
+			if is_duplicate {
+				// Update existing key-value in left node
+				leaf.values[idx] = value.to_vec();
+			} else {
+				// Insert the new key-value into leaf
+				leaf.keys.insert(idx, key.to_vec());
+				leaf.values.insert(idx, value.to_vec());
+			}
 		} else {
 			// New entry belongs in the right node
 			// Adjust index for the right node
@@ -1197,9 +1212,14 @@ impl<S: Storage> BPlusTree<S> {
 			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
 			new_leaf.values = leaf.values.drain(split_idx..).collect();
 
-			// Insert the new key-value into new leaf
-			new_leaf.keys.insert(right_idx, key.to_vec());
-			new_leaf.values.insert(right_idx, value.to_vec());
+			if is_duplicate {
+				// Update existing key-value in right node
+				new_leaf.values[right_idx] = value.to_vec();
+			} else {
+				// Insert the new key-value into new leaf
+				new_leaf.keys.insert(right_idx, key.to_vec());
+				new_leaf.values.insert(right_idx, value.to_vec());
+			}
 		}
 
 		// Update leaf pointers for linked list
@@ -2081,7 +2101,7 @@ impl<S: Storage> BPlusTree<S> {
 
 	/// Calculate the height of the B+ tree.
 	#[cfg(test)]
-	fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
+	pub fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
 		let root_offset = self.header.root_offset;
 		let (height, node_count, total_keys, leaf_nodes) =
 			self.calculate_subtree_stats(root_offset, 1)?;
@@ -2434,14 +2454,20 @@ mod tests {
 		}
 	}
 
-	fn create_test_tree() -> BPlusTree<DiskStorage> {
+	fn create_test_tree(sync: bool) -> BPlusTree<DiskStorage> {
 		let file = NamedTempFile::new().unwrap();
-		BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap()
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap();
+		tree.set_durability(if sync {
+			Durability::Always
+		} else {
+			Durability::Manual
+		});
+		tree
 	}
 
 	#[test]
 	fn test_basic_operations() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 
 		// Test insertions
 		tree.insert(b"key1", b"value1").unwrap();
@@ -2463,7 +2489,7 @@ mod tests {
 
 	#[test]
 	fn test_sequential_small() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 
 		// Insert 10 items
 		for i in 0..10 {
@@ -2516,7 +2542,7 @@ mod tests {
 
 	#[test]
 	fn test_sequential_insert() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 
 		let keys = generate_sequential_keys(TEST_SIZE);
 		let values = generate_random_values(TEST_SIZE, 100);
@@ -2605,7 +2631,7 @@ mod tests {
 
 	#[test]
 	fn test_sequential_delete_samples() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 
 		let mut data = Vec::new();
 		for i in 0..TEST_SIZE {
@@ -2691,7 +2717,7 @@ mod tests {
 	#[test]
 	#[ignore]
 	fn test_sequential_delete_all() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 
 		let mut data = Vec::new();
 		for i in 0..TEST_SIZE {
@@ -2763,33 +2789,92 @@ mod tests {
 
 	#[test]
 	fn test_empty_tree() {
-		let tree = create_test_tree();
+		let tree = create_test_tree(true);
 		assert_eq!(tree.get(b"key").unwrap(), None);
 	}
 
 	#[test]
 	fn test_single_insert_search() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		tree.insert(b"key1", b"value1").unwrap();
 		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 	}
 
 	#[test]
-	fn test_insert_duplicate_key() {
-		let mut tree = create_test_tree();
+	fn test_update() {
+		let mut tree = create_test_tree(true);
+
+		// Insert multiple keys to ensure we're working with a leaf node
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
+
+		// Update existing key in the same leaf
+		tree.insert(b"key2", b"updated_value2").unwrap();
+
+		// Verify the update
+		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key2").unwrap(), Some(b"updated_value2".to_vec()));
+		assert_eq!(tree.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+	}
+
+	#[test]
+	fn test_multiple_updates_same_key() {
+		let mut tree = create_test_tree(true);
+
+		// Insert initial key
 		tree.insert(b"key", b"value1").unwrap();
-		let result = tree.insert(b"key", b"value2");
-		assert!(
-			matches!(result, Err(BPlusTreeError::DuplicateKey)),
-			"Expected DuplicateKey error, got {:?}",
-			result
-		);
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"value1".to_vec()));
+
+		// Update multiple times
+		tree.insert(b"key", b"value2").unwrap();
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"value2".to_vec()));
+
+		tree.insert(b"key", b"value3").unwrap();
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"value3".to_vec()));
+
+		tree.insert(b"key", b"final_value").unwrap();
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"final_value".to_vec()));
+	}
+
+	#[test]
+	fn test_update_no_new_nodes_created() {
+		let mut tree = create_test_tree(true);
+
+		// Insert initial keys to create some tree structure
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
+
+		// Get initial tree stats
+		let (height_before, nodes_before, keys_before, leaves_before) =
+			tree.calculate_tree_stats().unwrap();
+
+		// Update existing keys - should not create new nodes
+		tree.insert(b"key1", b"updated_value1").unwrap();
+		tree.insert(b"key2", b"updated_value2").unwrap();
+		tree.insert(b"key3", b"updated_value3").unwrap();
+
+		// Get stats after updates
+		let (height_after, nodes_after, keys_after, leaves_after) =
+			tree.calculate_tree_stats().unwrap();
+
+		// Verify no new nodes were created
+		assert_eq!(height_before, height_after, "Tree height should not change");
+		assert_eq!(nodes_before, nodes_after, "Node count should not change");
+		assert_eq!(leaves_before, leaves_after, "Leaf count should not change");
+		assert_eq!(keys_before, keys_after, "Key count should not change");
+
+		// Verify values were actually updated
+		assert_eq!(tree.get(b"key1").unwrap(), Some(b"updated_value1".to_vec()));
+		assert_eq!(tree.get(b"key2").unwrap(), Some(b"updated_value2".to_vec()));
+		assert_eq!(tree.get(b"key3").unwrap(), Some(b"updated_value3".to_vec()));
 	}
 
 	#[test]
 	fn test_sequential_inserts_and_deletes() {
-		let max_keys = 100; // Adjust as needed for your test
-		let mut tree = create_test_tree();
+		let max_keys = 100;
+		let mut tree = create_test_tree(true);
 		// Insert enough to cause multiple splits
 		for i in 0..(max_keys * 3) {
 			let key = format!("key{}", i).into_bytes();
@@ -2819,7 +2904,7 @@ mod tests {
 
 	#[test]
 	fn test_predecessor_successor_operations() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 
 		let keys = vec![b"b".to_vec(), b"d".to_vec(), b"f".to_vec(), b"h".to_vec(), b"j".to_vec()];
 
@@ -2839,8 +2924,8 @@ mod tests {
 
 	#[test]
 	fn test_edge_key_positions() {
-		let max_keys = 100; // Adjust as needed for your test
-		let mut tree = create_test_tree();
+		let max_keys = 100;
+		let mut tree = create_test_tree(true);
 		// Test first and last positions in nodes
 		let mut keys = Vec::new();
 		for i in 0..max_keys * 2 {
@@ -2956,7 +3041,7 @@ mod tests {
 
 	#[test]
 	fn test_concurrent_operations() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		// Insert and delete same key repeatedly
 		tree.insert(b"key", b"v1").unwrap();
 		tree.delete(b"key").unwrap();
@@ -3245,7 +3330,7 @@ mod tests {
 
 	#[test]
 	fn test_range() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		tree.insert(b"key1", b"value1").unwrap();
 		tree.insert(b"key3", b"value3").unwrap();
 		tree.insert(b"key2", b"value2").unwrap();
@@ -3258,7 +3343,7 @@ mod tests {
 
 	#[test]
 	fn test_range_empty() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		tree.insert(b"a", b"1").unwrap();
 		tree.insert(b"c", b"3").unwrap();
 		let mut iter = tree.range(b"b", b"b").unwrap();
@@ -3267,7 +3352,7 @@ mod tests {
 
 	#[test]
 	fn test_prefix_scan_basic() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		tree.insert(b"apple", b"fruit").unwrap();
 		tree.insert(b"app", b"short").unwrap();
 		tree.insert(b"application", b"long").unwrap();
@@ -3283,7 +3368,7 @@ mod tests {
 
 	#[test]
 	fn test_prefix_scan_no_match() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(true);
 		tree.insert(b"apple", b"1").unwrap();
 		tree.insert(b"app", b"2").unwrap();
 		let mut iter = tree.prefix(b"application").unwrap();
@@ -3292,7 +3377,7 @@ mod tests {
 
 	#[test]
 	fn test_large_dataset_range() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 		// Insert 10000 keys
 		for i in 0..10000 {
 			let key = format!("key_{:05}", i).into_bytes();
@@ -3314,7 +3399,7 @@ mod tests {
 
 	#[test]
 	fn test_large_dataset_prefix() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 		// Insert keys with prefix "pre_"
 		for i in 0..1000 {
 			let key = format!("pre_{:04}", i).into_bytes();
@@ -3542,7 +3627,7 @@ mod tests {
 		// Create key-value pairs with varying key sizes and fixed value size
 		for key_size in &key_sizes {
 			// Create a new tree for each run
-			let mut tree = create_test_tree();
+			let mut tree = create_test_tree(false);
 
 			// Insert the key-value pair `key_size` times with unique keys
 			for i in 0..*key_size {
@@ -3589,7 +3674,7 @@ mod tests {
 		// Create key-value pairs with varying key sizes and fixed value size
 		for key_size in &key_sizes {
 			// Create a new tree for each run
-			let mut tree = create_test_tree();
+			let mut tree = create_test_tree(false);
 
 			// Track all keys for deletion testing
 			let mut all_keys = Vec::with_capacity(*key_size);
@@ -3678,7 +3763,7 @@ mod tests {
 	// Long sequence of insertions and deletions to stress test size handling
 	#[test]
 	fn test_insertion_deletion_sequence() {
-		let mut tree = create_test_tree();
+		let mut tree = create_test_tree(false);
 
 		// Use deterministic random for reproducibility
 		let mut rng = StdRng::seed_from_u64(123);
@@ -3793,7 +3878,7 @@ mod tests {
 
 	#[test]
 	fn test_allocate_new_page_when_no_free_pages() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Set up initial state with no free pages
 		btree.header.trunk_page_head = 0;
@@ -3812,7 +3897,7 @@ mod tests {
 
 	#[test]
 	fn test_allocate_page_from_trunk() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Set up initial state with one trunk page containing free pages
 		let trunk_offset = PAGE_SIZE as u64; // Trunk at page 1
@@ -3858,7 +3943,7 @@ mod tests {
 
 	#[test]
 	fn test_repurpose_empty_trunk() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Set up initial state with two trunk pages
 		// The first trunk is empty, the second has free pages
@@ -3900,7 +3985,7 @@ mod tests {
 
 	#[test]
 	fn test_multiple_trunk_pages_chain() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Set up a chain of 3 trunk pages, each with one free page
 		let trunk1_offset = PAGE_SIZE as u64; // Trunk1 at page 1
@@ -3942,7 +4027,7 @@ mod tests {
 
 	#[test]
 	fn test_free_page_basic() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Start with no free pages
 		btree.header.trunk_page_head = 0;
@@ -3970,7 +4055,7 @@ mod tests {
 
 	#[test]
 	fn test_free_page_multiple() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Start with no free pages
 		btree.header.trunk_page_head = 0;
@@ -4007,7 +4092,7 @@ mod tests {
 
 	#[test]
 	fn test_allocate_with_inconsistent_count() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Create inconsistent state - free_page_count > 0 but no actual free pages
 		btree.header.trunk_page_head = PAGE_SIZE as u64; // Trunk at page 1
@@ -4031,7 +4116,7 @@ mod tests {
 
 	#[test]
 	fn test_free_then_allocate_cycle() {
-		let mut btree = create_test_tree();
+		let mut btree = create_test_tree(true);
 
 		// Start with 5 pages (header + 4 data pages)
 		btree.header.trunk_page_head = 0;
