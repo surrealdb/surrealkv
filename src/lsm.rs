@@ -523,11 +523,6 @@ impl<K: InternalKeyTrait> Core<K> {
 		self.commit_pipeline.commit(batch, sync_wal).await
 	}
 
-	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
-		// Use the synchronous commit path
-		self.commit_pipeline.sync_commit(batch, sync_wal)
-	}
-
 	pub(crate) fn seq_num(&self) -> u64 {
 		self.commit_pipeline.get_visible_seq_num()
 	}

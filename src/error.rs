@@ -43,6 +43,7 @@ pub enum Error {
 	VlogGCAlreadyInProgress,
 	InvalidArgument(String),
 	InvalidTag(String),
+	BPlusTree(String), // B+ tree specific errors
 }
 
 // Implementation of Display trait for Error
@@ -85,6 +86,7 @@ impl fmt::Display for Error {
             Self::VlogGCAlreadyInProgress => write!(f, "Vlog garbage collection already in progress"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
+            Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
 
         }
 	}
@@ -115,5 +117,11 @@ impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
 impl From<async_channel::RecvError> for Error {
 	fn from(error: async_channel::RecvError) -> Self {
 		Error::Receive(format!("Async channel receive error: {error}"))
+	}
+}
+
+impl From<crate::bplustree::tree::BPlusTreeError> for Error {
+	fn from(err: crate::bplustree::tree::BPlusTreeError) -> Self {
+		Error::BPlusTree(err.to_string())
 	}
 }

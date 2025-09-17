@@ -29,6 +29,12 @@ pub trait File: Send + Sync {
 	#[allow(unused)]
 	fn unlock(&self) -> Result<()>;
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+	#[allow(unused)]
+	fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize>;
+	#[allow(unused)]
+	fn sync(&self) -> Result<()>;
+	#[allow(unused)]
+	fn sync_data(&self) -> Result<()>;
 	fn size(&self) -> Result<u64>;
 }
 
@@ -79,6 +85,28 @@ impl File for InMemoryFile {
 		let bytes_read = end - start;
 		buf[..bytes_read].copy_from_slice(&self[start..end]);
 		Ok(bytes_read)
+	}
+
+	fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+		let start = offset as usize;
+		let end = start + buf.len();
+
+		// Ensure the vector is large enough
+		if end > self.len() {
+			self.resize(end, 0);
+		}
+
+		// Write the data
+		self[start..end].copy_from_slice(buf);
+		Ok(buf.len())
+	}
+
+	fn sync(&self) -> Result<()> {
+		Ok(()) // In-memory file doesn't need syncing
+	}
+
+	fn sync_data(&self) -> Result<()> {
+		Ok(()) // In-memory file doesn't need syncing
 	}
 
 	fn size(&self) -> Result<u64> {
@@ -159,6 +187,37 @@ impl File for SysFile {
 				.into(),
 			))
 		}
+	}
+
+	fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+		#[cfg(unix)]
+		{
+			std::os::unix::prelude::FileExt::write_all_at(self, buf, offset)
+				.map_err(|e| Error::Io(e.into()))?;
+			Ok(buf.len())
+		}
+
+		#[cfg(windows)]
+		{
+			std::os::windows::prelude::FileExt::seek_write(self, buf, offset)
+				.map_err(|e| Error::Io(e.into()))
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		{
+			// write_at is not supported on WASM, use seek + write
+			self.seek(SeekFrom::Start(offset))?;
+			self.write_all(buf)?;
+			Ok(buf.len())
+		}
+	}
+
+	fn sync(&self) -> Result<()> {
+		SysFile::sync_all(self).map_err(|e| Error::Io(e.into()))
+	}
+
+	fn sync_data(&self) -> Result<()> {
+		SysFile::sync_data(self).map_err(|e| Error::Io(e.into()))
 	}
 
 	fn size(&self) -> Result<u64> {

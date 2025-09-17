@@ -9,9 +9,11 @@ use std::{
 	},
 };
 
+use crate::bplustree::tree::{new_disk_tree, DiskBPlusTree, Durability};
+use crate::cache::VLogCache;
+use crate::BytewiseComparator;
 use crate::{batch::Batch, discard::DiscardStats, Value};
-use crate::{cache::VLogCache, TreeBuilder};
-use crate::{sstable::InternalKeyTrait, vfs, Options, Tree, VLogChecksumLevel};
+use crate::{sstable::InternalKeyTrait, vfs, Options, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -533,7 +535,7 @@ pub(crate) struct VLog<K: InternalKeyTrait> {
 	discard_stats: Mutex<DiscardStats>,
 
 	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
-	pub(crate) delete_list: Arc<DeleteList<K>>,
+	pub(crate) delete_list: Arc<DeleteList>,
 
 	/// Dedicated cache for VLog values to avoid repeated disk reads
 	cache: Arc<VLogCache>,
@@ -560,7 +562,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 		// Initialize the global delete list LSM tree
 		// TODO: Make this internalkey
-		let delete_list = Arc::new(DeleteList::<K>::new(dir.clone())?);
+		let delete_list = Arc::new(DeleteList::new(dir.clone())?);
 
 		let vlog = Self {
 			path: dir.clone(),
@@ -1230,6 +1232,12 @@ impl<K: InternalKeyTrait> VLog<K> {
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
 		self.delete_list.is_stale(seq_num)
 	}
+
+	pub(crate) fn close(&self) -> Result<()> {
+		self.sync()?;
+		self.delete_list.close()?;
+		Ok(())
+	}
 }
 
 // ===== VLog GC Manager =====
@@ -1331,34 +1339,33 @@ impl<K: InternalKeyTrait> VLogGCManager<K> {
 				eprintln!("Error shutting down VLog GC task: {e:?}");
 			}
 		}
+
+		// Close the VLog
+		self.vlog.close().unwrap();
 	}
 }
 
-/// Global Delete List using LSM Tree
-/// Uses a dedicated LSM tree for tracking stale user keys.
+/// Global Delete List using B+ Tree
+/// Uses a dedicated B+ tree for tracking stale user keys.
 /// This provides better performance and consistency with the main LSM tree design.
-pub(crate) struct DeleteList<K: InternalKeyTrait> {
-	/// LSM tree for storing delete list entries (user_key -> value_size)
-	tree: Arc<Tree<K>>,
+pub(crate) struct DeleteList {
+	/// B+ tree for storing delete list entries (user_key -> value_size)
+	tree: Arc<RwLock<DiskBPlusTree>>,
 }
 
-impl<K: InternalKeyTrait> DeleteList<K> {
+impl DeleteList {
 	pub(crate) fn new(base_path: PathBuf) -> Result<Self> {
-		let delete_list_path = base_path.join("delete_list");
+		// Create the delete_list directory if it doesn't exist
+		let delete_list_dir = base_path.join("delete_list");
+		std::fs::create_dir_all(&delete_list_dir)?;
 
-		// Disable VLog for the delete list to avoid circular dependency
-		let tree = Arc::new(
-			TreeBuilder::new()
-				.with_path(delete_list_path)
-				.with_enable_vlog(false)
-				.build()
-				.map_err(|e| {
-					Error::Other(format!("Failed to create global delete list LSM: {e}"))
-				})?,
-		);
+		// Create B+ tree for the delete list with a specific file name
+		let delete_list_file = delete_list_dir.join("delete_list.bpt");
+		let comparator = Arc::new(BytewiseComparator {});
+		let tree = new_disk_tree(delete_list_file, comparator)?;
 
 		Ok(Self {
-			tree,
+			tree: Arc::new(RwLock::new(tree)),
 		})
 	}
 
@@ -1369,36 +1376,32 @@ impl<K: InternalKeyTrait> DeleteList<K> {
 			return Ok(());
 		}
 
-		let mut batch = Batch::new();
+		let mut tree = self.tree.write().unwrap();
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
 			let seq_key = seq_num.to_be_bytes().to_vec();
 			// Store sequence number -> value_size mapping
-			batch.set(&seq_key, &value_size.to_be_bytes())?;
+			tree.insert(&seq_key, &value_size.to_be_bytes())?;
 		}
 
-		// Commit the batch to the LSM tree using sync commit
-		self.tree
-			.core
-			.sync_commit(batch, true)
-			.map_err(|e| Error::Other(format!("Failed to insert into delete list: {e}")))
+		// Sync the B+ tree to ensure durability
+		tree.sync()?;
+
+		Ok(())
 	}
 
 	/// Checks if a sequence number is in the delete list (stale)
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		let tx = self
-			.tree
-			.begin()
-			.map_err(|e| Error::Other(format!("Failed to begin transaction: {e}")))?;
+		let tree = self.tree.read().unwrap();
 
 		// Convert sequence number to bytes for lookup
 		let seq_key = seq_num.to_be_bytes().to_vec();
 
-		match tx.get(&seq_key) {
+		match tree.get(&seq_key) {
 			Ok(Some(_)) => Ok(true),
 			Ok(None) => Ok(false),
-			Err(e) => Err(Error::Other(format!("Failed to search delete list: {e}"))),
+			Err(e) => Err(Error::BPlusTree(format!("Failed to search delete list: {e}"))),
 		}
 	}
 
@@ -1409,19 +1412,25 @@ impl<K: InternalKeyTrait> DeleteList<K> {
 			return Ok(());
 		}
 
-		let mut batch = Batch::new();
+		let mut tree = self.tree.write().unwrap();
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.delete(&seq_key)?;
+			tree.delete(&seq_key)?;
 		}
 
-		// Commit the batch to the LSM tree using sync commit
-		self.tree
-			.core
-			.sync_commit(batch, true)
-			.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
+		// Sync the B+ tree to ensure durability
+		tree.sync()?;
+
+		Ok(())
+	}
+
+	fn close(&self) -> Result<()> {
+		let mut tree = self.tree.write().unwrap();
+		tree.sync()?;
+		tree.close()?;
+		Ok(())
 	}
 }
 #[cfg(test)]

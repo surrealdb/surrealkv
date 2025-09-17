@@ -59,10 +59,12 @@ impl Batch {
 		Ok(encoded)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.add_record(InternalKeyKind::Set, key, Some(value))
 	}
 
+	#[cfg(test)]
 	pub(crate) fn delete(&mut self, key: &[u8]) -> Result<()> {
 		self.add_record(InternalKeyKind::Delete, key, None)
 	}
