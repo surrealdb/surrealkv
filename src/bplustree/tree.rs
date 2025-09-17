@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use quick_cache::{sync::Cache, Weighter};
 
-use super::{DiskStorage, Storage};
+use crate::vfs::File as VfsFile;
 use crate::Comparator;
 
 // These are type aliases for convenience
-pub type DiskBPlusTree = BPlusTree<DiskStorage>;
+pub type DiskBPlusTree = BPlusTree<std::fs::File>;
 
 #[derive(Clone)]
 struct NodeWeighter;
@@ -34,6 +34,12 @@ pub enum BPlusTreeError {
 	CorruptedTrunkPage(u64),
 	KeyValueTooLarge,
 	Corruption(String),
+}
+
+impl From<crate::error::Error> for BPlusTreeError {
+	fn from(err: crate::error::Error) -> Self {
+		BPlusTreeError::Io(std::io::Error::other(format!("VFS error: {}", err)))
+	}
 }
 
 impl std::fmt::Display for BPlusTreeError {
@@ -910,25 +916,27 @@ pub enum Durability {
 	Manual,
 }
 
-pub struct BPlusTree<S: Storage> {
-	storage: S,
+pub struct BPlusTree<F: VfsFile> {
+	file: F,
 	header: Header,
 	cache: Cache<u64, NodeType, NodeWeighter>,
 	compare: Arc<dyn Comparator>,
 	durability: Durability,
 }
 
-impl<S: Storage> Drop for BPlusTree<S> {
+impl<F: VfsFile> Drop for BPlusTree<F> {
 	fn drop(&mut self) {
 		if let Err(e) = self.flush() {
 			eprintln!("Error during BPlusTree drop: {}", e);
 		}
 	}
 }
-impl BPlusTree<DiskStorage> {
+impl BPlusTree<std::fs::File> {
 	pub fn disk<P: AsRef<Path>>(path: P, compare: Arc<dyn Comparator>) -> Result<Self> {
-		let storage = DiskStorage::new(path)?;
-		Self::with_storage(storage, compare)
+		use std::fs::OpenOptions;
+		let file =
+			OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+		Self::with_file(file, compare)
 	}
 }
 
@@ -939,9 +947,9 @@ pub fn new_disk_tree<P: AsRef<Path>>(
 	DiskBPlusTree::disk(path, compare)
 }
 
-impl<S: Storage> BPlusTree<S> {
-	pub fn with_storage(storage: S, compare: Arc<dyn Comparator>) -> Result<Self> {
-		let storage_size = storage.len()?;
+impl<F: VfsFile> BPlusTree<F> {
+	pub fn with_file(file: F, compare: Arc<dyn Comparator>) -> Result<Self> {
+		let storage_size = file.size()?;
 
 		let (header, cache) = if storage_size == 0 {
 			// Initialize a new B+Tree
@@ -964,7 +972,7 @@ impl<S: Storage> BPlusTree<S> {
 		} else {
 			// Read existing header
 			let mut buffer = [0u8; 48];
-			storage.read_at(&mut buffer, 0)?;
+			file.read_at(0, &mut buffer)?;
 			let header = Header::deserialize(&buffer)?;
 
 			let cache = Cache::with_weighter(CACHE_CAPACITY as usize, CACHE_CAPACITY, NodeWeighter);
@@ -973,7 +981,7 @@ impl<S: Storage> BPlusTree<S> {
 		};
 
 		let mut tree = BPlusTree {
-			storage,
+			file,
 			header,
 			cache,
 			compare,
@@ -986,12 +994,12 @@ impl<S: Storage> BPlusTree<S> {
 			let mut buffer = vec![0u8; PAGE_SIZE];
 			buffer[..header_bytes.len()].copy_from_slice(&header_bytes);
 
-			tree.storage.write_at(&buffer, 0)?;
+			tree.file.write_at(0, &buffer)?;
 
 			// Create initial root node
 			let root = LeafNode::new(tree.header.root_offset);
 			tree.write_node(&NodeType::Leaf(root))?;
-			tree.storage.sync()?;
+			tree.file.sync()?;
 		} else {
 			// Read root node into cache
 			tree.read_node(tree.header.root_offset)?;
@@ -1005,12 +1013,12 @@ impl<S: Storage> BPlusTree<S> {
 	}
 
 	pub fn sync(&mut self) -> Result<()> {
-		self.storage.sync_data()?;
+		self.file.sync_data()?;
 		Ok(())
 	}
 
 	pub fn close(&self) -> Result<()> {
-		self.storage.sync()?;
+		self.file.sync()?;
 		Ok(())
 	}
 
@@ -1027,12 +1035,6 @@ impl<S: Storage> BPlusTree<S> {
 		if min_entry_size > LeafNode::max_size() - LEAF_HEADER_SIZE {
 			return Err(BPlusTreeError::KeyValueTooLarge);
 		}
-
-		// // TODO: Remove check for duplicate key and treat as an update
-		// // Check for duplicate key
-		// if self.get(key)?.is_some() {
-		// 	return Err(BPlusTreeError::DuplicateKey);
-		// }
 
 		// Using a stack to track the path from root to leaf
 		// Each entry contains (node_offset, parent_offset)
@@ -1990,7 +1992,7 @@ impl<S: Storage> BPlusTree<S> {
 	fn read_trunk_page(&mut self, offset: u64) -> Result<TrunkPage> {
 		// Read directly from disk
 		let mut buffer = vec![0; PAGE_SIZE];
-		self.storage.read_at(&mut buffer, offset)?;
+		self.file.read_at(offset, &mut buffer)?;
 
 		// Deserialize the full page
 		let trunk = TrunkPage::deserialize(&buffer, offset)?;
@@ -2002,7 +2004,7 @@ impl<S: Storage> BPlusTree<S> {
 		let data = trunk.serialize()?;
 
 		// Write data directly to storage
-		self.storage.write_at(&data, trunk.offset)?;
+		self.file.write_at(trunk.offset, &data)?;
 
 		self.maybe_sync()?;
 
@@ -2017,7 +2019,7 @@ impl<S: Storage> BPlusTree<S> {
 
 		// Read from disk
 		let mut buffer = vec![0; PAGE_SIZE];
-		self.storage.read_at(&mut buffer, offset)?;
+		self.file.read_at(offset, &mut buffer)?;
 
 		// Deserialize directly from the full page
 		let node = NodeType::deserialize(&buffer, offset)?;
@@ -2038,7 +2040,7 @@ impl<S: Storage> BPlusTree<S> {
 		};
 
 		// Write data directly to storage
-		self.storage.write_at(&data, offset)?;
+		self.file.write_at(offset, &data)?;
 
 		self.maybe_sync()?;
 
@@ -2055,7 +2057,7 @@ impl<S: Storage> BPlusTree<S> {
 		buffer[..header_bytes.len()].copy_from_slice(&header_bytes);
 
 		// Write the entire page at once
-		self.storage.write_at(&buffer, 0)?;
+		self.file.write_at(0, &buffer)?;
 
 		self.maybe_sync()?;
 
@@ -2064,18 +2066,18 @@ impl<S: Storage> BPlusTree<S> {
 
 	fn maybe_sync(&mut self) -> Result<()> {
 		match self.durability {
-			Durability::Always => self.storage.sync()?,
+			Durability::Always => self.file.sync()?,
 			Durability::Manual => { // Don't sync - only sync on flush() or close()
 			}
 		}
 		Ok(())
 	}
 
-	pub fn range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeScanIterator<S>> {
+	pub fn range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeScanIterator<'_, F>> {
 		RangeScanIterator::new(self, start_key, end_key)
 	}
 
-	pub fn prefix(&self, prefix: &[u8]) -> Result<PrefixScanIterator<S>> {
+	pub fn prefix(&self, prefix: &[u8]) -> Result<PrefixScanIterator<'_, F>> {
 		PrefixScanIterator::new(self, prefix)
 	}
 
@@ -2143,16 +2145,16 @@ impl<S: Storage> BPlusTree<S> {
 	}
 }
 
-pub struct RangeScanIterator<'a, S: Storage> {
-	tree: &'a BPlusTree<S>,
+pub(crate) struct RangeScanIterator<'a, F: VfsFile> {
+	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
 	end_key: Vec<u8>,
 	current_idx: usize,
 	reached_end: bool,
 }
 
-impl<'a, S: Storage> RangeScanIterator<'a, S> {
-	pub fn new(tree: &'a BPlusTree<S>, start_key: &[u8], end_key: &[u8]) -> Result<Self> {
+impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
+	pub(crate) fn new(tree: &'a BPlusTree<F>, start_key: &[u8], end_key: &[u8]) -> Result<Self> {
 		// Find the leaf containing the start key
 		let mut node_offset = tree.header.root_offset;
 
@@ -2189,7 +2191,7 @@ impl<'a, S: Storage> RangeScanIterator<'a, S> {
 	}
 }
 
-impl<S: Storage> Iterator for RangeScanIterator<'_, S> {
+impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 	type Item = Result<(Vec<u8>, Vec<u8>)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
@@ -2237,16 +2239,16 @@ impl<S: Storage> Iterator for RangeScanIterator<'_, S> {
 	}
 }
 
-pub struct PrefixScanIterator<'a, S: Storage> {
-	tree: &'a BPlusTree<S>,
+pub(crate) struct PrefixScanIterator<'a, F: VfsFile> {
+	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
 	prefix: Vec<u8>,
 	current_idx: usize,
 	reached_end: bool,
 }
 
-impl<'a, S: Storage> PrefixScanIterator<'a, S> {
-	pub fn new(tree: &'a BPlusTree<S>, prefix: &[u8]) -> Result<Self> {
+impl<'a, F: VfsFile> PrefixScanIterator<'a, F> {
+	pub(crate) fn new(tree: &'a BPlusTree<F>, prefix: &[u8]) -> Result<Self> {
 		// Find the leaf containing the first key >= prefix
 		let mut node_offset = tree.header.root_offset;
 
@@ -2291,7 +2293,7 @@ impl<'a, S: Storage> PrefixScanIterator<'a, S> {
 	}
 }
 
-impl<S: Storage> Iterator for PrefixScanIterator<'_, S> {
+impl<F: VfsFile> Iterator for PrefixScanIterator<'_, F> {
 	type Item = Result<(Vec<u8>, Vec<u8>)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
@@ -2434,7 +2436,7 @@ mod tests {
 		}
 	}
 
-	fn create_test_tree(sync: bool) -> BPlusTree<DiskStorage> {
+	fn create_test_tree(sync: bool) -> BPlusTree<std::fs::File> {
 		let file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap();
 		tree.set_durability(if sync {

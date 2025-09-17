@@ -1357,15 +1357,12 @@ impl DeleteList {
 	pub(crate) fn new(base_path: PathBuf) -> Result<Self> {
 		// Create the delete_list directory if it doesn't exist
 		let delete_list_dir = base_path.join("delete_list");
-		std::fs::create_dir_all(&delete_list_dir).map_err(|e| {
-			Error::BPlusTree(format!("Failed to create delete list directory: {e}"))
-		})?;
+		std::fs::create_dir_all(&delete_list_dir)?;
 
 		// Create B+ tree for the delete list with a specific file name
-		let delete_list_file = delete_list_dir.join("tree.bpt");
+		let delete_list_file = delete_list_dir.join("delete_list.bpt");
 		let comparator = Arc::new(BytewiseComparator {});
-		let mut tree = new_disk_tree(delete_list_file, comparator)?;
-		tree.set_durability(Durability::Manual);
+		let tree = new_disk_tree(delete_list_file, comparator)?;
 
 		Ok(Self {
 			tree: Arc::new(RwLock::new(tree)),
@@ -1420,8 +1417,7 @@ impl DeleteList {
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			tree.delete(&seq_key)
-				.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))?;
+			tree.delete(&seq_key)?;
 		}
 
 		// Sync the B+ tree to ensure durability
