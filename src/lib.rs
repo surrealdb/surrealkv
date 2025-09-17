@@ -1,4 +1,5 @@
-pub mod batch;
+mod batch;
+mod bplustree;
 mod cache;
 mod checkpoint;
 mod commit;
@@ -8,14 +9,14 @@ mod error;
 mod iter;
 mod levels;
 mod lsm;
-pub mod memtable;
+mod memtable;
 mod oracle;
 mod snapshot;
-pub mod sstable;
+mod sstable;
 mod task;
 mod transaction;
 mod vfs;
-pub mod vlog;
+mod vlog;
 mod wal;
 
 pub use crate::error::{Error, Result};

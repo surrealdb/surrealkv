@@ -9,15 +9,6 @@ use std::cmp::{Ordering, Reverse};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-// FilterPolicy is an algorithm for probabilistically encoding a set of keys.
-// It is used to create a filter block that can be stored in a block-based
-// file format.
-pub trait FilterPolicy: Send + Sync {
-	fn name(&self) -> &str;
-	fn may_contain(&self, filter: &[u8], key: &[u8]) -> bool;
-	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
-}
-
 /// Trait for internal key implementations that provide key format and operations
 /// for the LSM tree. This allows different internal key formats to be used
 /// in different scenarios while maintaining a consistent interface.
