@@ -29,12 +29,12 @@ impl Default for Batch {
 }
 
 impl Batch {
-	pub(crate) fn new(seq_num: u64) -> Self {
+	pub(crate) fn new(starting_seq_num: u64) -> Self {
 		Self {
 			entries: Vec::new(),
 			valueptrs: Vec::new(),
 			version: BATCH_VERSION,
-			starting_seq_num: seq_num,
+			starting_seq_num,
 		}
 	}
 
@@ -135,11 +135,6 @@ impl Batch {
 	/// Get entries for VLog processing
 	pub(crate) fn entries(&self) -> &[BatchEntry] {
 		&self.entries
-	}
-
-	/// Get value pointers
-	pub(crate) fn valueptrs(&self) -> &[Option<ValuePointer>] {
-		&self.valueptrs
 	}
 
 	/// Set a value pointer for a specific entry index

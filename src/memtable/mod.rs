@@ -17,7 +17,7 @@ use crate::{
 		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
-	vlog::{VLog, ValueLocation},
+	vlog::VLog,
 	Options, Value,
 };
 
@@ -103,24 +103,16 @@ impl<K: InternalKeyTrait> MemTable<K> {
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
 
-		// Process entries and their corresponding value pointers using unified sequence number management
-		for (i, entry, current_seq_num) in batch.entries_with_seq_nums()? {
+		// Process entries with pre-encoded ValueLocations
+		for (_i, entry, current_seq_num) in batch.entries_with_seq_nums()? {
 			let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
 
-			// Determine how to store the value based on value pointer
-			let val = if let Some(valueptr) = batch.valueptrs().get(i).and_then(|vp| vp.as_ref()) {
-				// Value is in VLog, create ValueLocation with pointer
-				ValueLocation::with_pointer(valueptr.clone()).encode().into()
-			} else if let Some(value) = &entry.value {
-				// Value is inline, create ValueLocation with inline value
-				ValueLocation::with_inline_value(Arc::from(value.clone().into_boxed_slice()))
-					.encode()
-					.into()
+			// Use the pre-encoded value directly, or create empty ValueLocation for deletes
+			let val = if let Some(encoded_value) = &entry.value {
+				Arc::from(encoded_value.clone().into_boxed_slice())
 			} else {
-				// No value (delete operation), create empty inline ValueLocation
-				ValueLocation::with_inline_value(Arc::from(vec![].into_boxed_slice()))
-					.encode()
-					.into()
+				// For delete operations, no value
+				Arc::from(vec![].into_boxed_slice())
 			};
 
 			let entry_size = self.insert_into_memtable(&ikey, &val);
@@ -258,15 +250,12 @@ mod tests {
 	use crate::sstable::InternalKey;
 
 	use super::*;
-	use std::{collections::HashMap, sync::Arc};
+	use std::collections::HashMap;
 
-	/// Helper function to decode and assert inline values match expected values
-	fn assert_inline_value_matches(encoded_value: &Value, expected_value: &[u8]) {
-		let location = ValueLocation::decode(encoded_value).unwrap();
-		if location.is_value_pointer() {
-			panic!("Expected inline value, got VLog pointer");
-		}
-		assert_eq!(Arc::from(expected_value), location.value);
+	fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
+		// Skip the tag byte (first byte) and compare the actual value content
+		let value_content = &encoded_value[..];
+		assert_eq!(value_content, expected_value);
 	}
 
 	#[test]
@@ -281,7 +270,7 @@ mod tests {
 		memtable.add(&batch).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
-		assert_inline_value_matches(&res.1, value);
+		assert_value(&res.1, value);
 	}
 
 	#[test]
@@ -333,10 +322,10 @@ mod tests {
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
-		assert_inline_value_matches(&res.1, value1);
+		assert_value(&res.1, value1);
 
 		let res = memtable.get(b"key2", None).unwrap();
-		assert_inline_value_matches(&res.1, value2);
+		assert_value(&res.1, value2);
 	}
 
 	#[test]
@@ -360,7 +349,7 @@ mod tests {
 		memtable.add(&batch3).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
-		assert_inline_value_matches(&res.1, value3);
+		assert_value(&res.1, value3);
 	}
 
 	#[test]
@@ -381,10 +370,10 @@ mod tests {
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
-		assert_inline_value_matches(&res.1, value1);
+		assert_value(&res.1, value1);
 
 		let res = memtable.get(b"foo1", None).unwrap();
-		assert_inline_value_matches(&res.1, value2);
+		assert_value(&res.1, value2);
 	}
 
 	type TestEntry = (Vec<u8>, Vec<u8>, InternalKeyKind, Option<u64>);
@@ -459,7 +448,7 @@ mod tests {
 		let user_key = &key.user_key;
 		assert_eq!(user_key.as_ref(), b"key1");
 
-		assert_inline_value_matches(encoded_value, b"value1");
+		assert_value(encoded_value, b"value1");
 
 		// Test get method
 		let result = memtable.get(b"key1", None);
@@ -467,7 +456,7 @@ mod tests {
 		let (ikey, encoded_val) = result.unwrap();
 		assert_eq!(ikey.user_key.as_ref(), b"key1");
 
-		assert_inline_value_matches(&encoded_val, b"value1");
+		assert_value(&encoded_val, b"value1");
 	}
 
 	#[test]
@@ -516,34 +505,25 @@ mod tests {
 		for (key, encoded_value) in &entries {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
 			if user_key.as_ref() == b"key1" {
-				let location = ValueLocation::decode(encoded_value).unwrap();
-				if location.is_value_pointer() {
-					panic!("Expected inline value");
-				}
-				key1_entries.push((seq_num, location.value));
+				key1_entries.push((seq_num, encoded_value));
 			}
 		}
 
 		// Verify ordering - higher sequence numbers should come first
 		assert_eq!(key1_entries.len(), 3);
 		assert_eq!(key1_entries[0].0, 20);
-		assert_eq!(&*key1_entries[0].1, b"value2");
+		assert_eq!(&*key1_entries[0].1.as_ref(), b"value2");
 		assert_eq!(key1_entries[1].0, 10);
-		assert_eq!(&*key1_entries[1].1, b"value1");
+		assert_eq!(&*key1_entries[1].1.as_ref(), b"value1");
 		assert_eq!(key1_entries[2].0, 5);
-		assert_eq!(&*key1_entries[2].1, b"value3");
+		assert_eq!(&*key1_entries[2].1.as_ref(), b"value3");
 
 		// Test get method - should return the highest sequence number
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
 		assert_eq!(ikey.seq_num(), 20);
-
-		let location = ValueLocation::decode(&encoded_val).unwrap();
-		if location.is_value_pointer() {
-			panic!("Expected inline value");
-		}
-		assert_eq!(&*location.value, b"value2");
+		assert_eq!(encoded_val.as_ref(), b"value2");
 	}
 
 	#[test]
@@ -559,13 +539,13 @@ mod tests {
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"new_value");
+		assert_value(&encoded_val, b"new_value");
 
 		// Test get with specific sequence number
 		let result = memtable.get(b"key1", Some(8));
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"old_value"); // Should get the value with seq_num <= 8
+		assert_value(&encoded_val, b"old_value"); // Should get the value with seq_num <= 8
 	}
 
 	#[test]
@@ -611,13 +591,7 @@ mod tests {
 		let mut key_info = Vec::new();
 		for (key, encoded_value) in &entries {
 			let (user_key, seq_num, kind) = (key.user_key.clone(), key.seq_num(), key.kind());
-			// All values are now ValueLocation encoded, even empty ones for Delete
-			// For ValueLocation::Inline with empty content, length will be TAG_INLINE (1 byte) + 0
-			let location = ValueLocation::decode(encoded_value).unwrap();
-			if location.is_value_pointer() {
-				panic!("Expected inline value");
-			}
-			key_info.push((user_key, seq_num, kind, location.value.len()));
+			key_info.push((user_key, seq_num, kind, encoded_value.len()));
 		}
 
 		// Verify all keys are present with correct kinds
@@ -647,13 +621,7 @@ mod tests {
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
 		assert_eq!(ikey.kind(), InternalKeyKind::Delete);
-
-		// Decode the value and verify it's empty for delete
-		let location = ValueLocation::decode(&encoded_val).unwrap();
-		if location.is_value_pointer() {
-			panic!("Expected inline value");
-		}
-		assert_eq!(location.value.len(), 0); // Delete tombstone has empty value
+		assert_eq!(encoded_val.len(), 0);
 	}
 
 	#[test]
@@ -711,12 +679,7 @@ mod tests {
 		let mut entries_info = Vec::new();
 		for (key, encoded_value) in &range_entries {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
-
-			let location = ValueLocation::decode(encoded_value).unwrap();
-			if location.is_value_pointer() {
-				panic!("Expected inline value");
-			}
-			entries_info.push((user_key, seq_num, location.value));
+			entries_info.push((user_key, seq_num, encoded_value));
 		}
 
 		// Verify we get keys in order, with highest sequence numbers first for each key
@@ -725,25 +688,25 @@ mod tests {
 		// Key "a" entries (seq 20 then seq 10)
 		assert_eq!(entries_info[0].0.as_ref(), b"a");
 		assert_eq!(entries_info[0].1, 20);
-		assert_eq!(&*entries_info[0].2, b"value-a2");
+		assert_eq!(&*entries_info[0].2.as_ref(), b"value-a2");
 
 		assert_eq!(entries_info[1].0.as_ref(), b"a");
 		assert_eq!(entries_info[1].1, 10);
-		assert_eq!(&*entries_info[1].2, b"value-a1");
+		assert_eq!(&*entries_info[1].2.as_ref(), b"value-a1");
 
 		// Key "c" entry
 		assert_eq!(entries_info[2].0.as_ref(), b"c");
 		assert_eq!(entries_info[2].1, 15);
-		assert_eq!(&*entries_info[2].2, b"value-c1");
+		assert_eq!(&*entries_info[2].2.as_ref(), b"value-c1");
 
 		// Key "e" entries (seq 25 then seq 15)
 		assert_eq!(entries_info[3].0.as_ref(), b"e");
 		assert_eq!(entries_info[3].1, 25);
-		assert_eq!(&*entries_info[3].2, b"value-e1");
+		assert_eq!(&*entries_info[3].2.as_ref(), b"value-e1");
 
 		assert_eq!(entries_info[4].0.as_ref(), b"e");
 		assert_eq!(entries_info[4].1, 15);
-		assert_eq!(&*entries_info[4].2, b"value-e2");
+		assert_eq!(&*entries_info[4].2.as_ref(), b"value-e2");
 	}
 
 	#[test]
@@ -788,17 +751,17 @@ mod tests {
 		let result = memtable.get(b"key0000", None);
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"value0000");
+		assert_value(&encoded_val, b"value0000");
 
 		let result = memtable.get(b"key0500", None);
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"value0500");
+		assert_value(&encoded_val, b"value0500");
 
 		let result = memtable.get(b"key0999", None);
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_inline_value_matches(&encoded_val, b"value0999");
+		assert_value(&encoded_val, b"value0999");
 
 		// Test non-existent key
 		let result = memtable.get(b"key1000", None);
@@ -856,5 +819,18 @@ mod tests {
 		batch3.set(b"key3", b"value3").unwrap();
 		memtable.add(&batch3).unwrap();
 		assert_eq!(memtable.lsn(), 20);
+	}
+
+	#[test]
+	fn test_get_highest_seq_num() {
+		// Add a batch with 5 entries
+		let mut batch = Batch::new(10);
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		batch.set(b"key5", b"value5").unwrap();
+
+		assert_eq!(batch.get_highest_seq_num().unwrap(), 14);
 	}
 }
