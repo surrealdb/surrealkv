@@ -18,7 +18,7 @@ use crate::{
 	},
 	vfs::File,
 	vlog::{VLog, ValueLocation},
-	Error, Options, Value,
+	Options, Value,
 };
 
 #[derive(Default)]
@@ -105,14 +105,26 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		let mut record_size = 0;
 		let mut current_seq_num = starting_seq_num;
 
-		for record in batch.iter() {
-			let (kind, key, value) = record?;
-			let ikey = K::new(key.to_vec(), current_seq_num, kind);
-			let val_slice = value.unwrap_or(&[]);
-			let val =
-				ValueLocation::with_inline_value(Arc::from(val_slice.to_vec().into_boxed_slice()))
+		// Process entries and their corresponding value pointers
+		for (i, entry) in batch.entries().iter().enumerate() {
+			let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
+
+			// Determine how to store the value based on value pointer
+			let val = if let Some(valueptr) = batch.valueptrs().get(i).and_then(|vp| vp.as_ref()) {
+				// Value is in VLog, create ValueLocation with pointer
+				ValueLocation::with_pointer(valueptr.clone()).encode().into()
+			} else if let Some(value) = &entry.value {
+				// Value is inline, create ValueLocation with inline value
+				ValueLocation::with_inline_value(Arc::from(value.clone().into_boxed_slice()))
 					.encode()
-					.into();
+					.into()
+			} else {
+				// No value (delete operation), create empty inline ValueLocation
+				ValueLocation::with_inline_value(Arc::from(vec![].into_boxed_slice()))
+					.encode()
+					.into()
+			};
+
 			record_size += self.insert_into_memtable(&ikey, &val);
 			current_seq_num += 1;
 		}
@@ -175,37 +187,12 @@ impl<K: InternalKeyTrait> MemTable<K> {
 			let iter = Box::new(iter);
 			let merge_iter = MergeIterator::new(vec![iter], false);
 			for (key, encoded_val) in merge_iter {
-				// First decode the value from memtable to get raw data
-				let location = ValueLocation::decode(&encoded_val)?;
-				if location.is_value_pointer() {
-					// This shouldn't happen in memtable
-					return Err(Error::Other(
-						"Found VLog pointer in memtable during flush".to_string(),
-					));
-				}
-				let raw_value = location.value;
-
-				// Now process the raw value and encode based on VLog threshold
-				let processed_value = if let Some(ref vlog) = vlog {
-					if raw_value.len() <= lsm_opts.vlog_value_threshold {
-						let location = ValueLocation::with_inline_value(raw_value);
-						Arc::from(location.encode())
-					} else {
-						// Store large values in VLog
-						let pointer = vlog.append(&key.encode(), &raw_value)?;
-						let location = ValueLocation::with_pointer(pointer);
-						Arc::from(location.encode())
-					}
-				} else {
-					// VLog disabled, store all values inline
-					let location = ValueLocation::with_inline_value(raw_value);
-					Arc::from(location.encode())
-				};
-
-				// Add the key-value pair to the table writer
-				table_writer.add(key, &processed_value)?;
+				// The memtable already contains the correct ValueLocation encoding
+				// (either inline or with VLog pointer), so we can use it directly
+				table_writer.add(key, &encoded_val)?;
 			}
 
+			// Sync VLog if it exists (values were already written during commit)
 			if let Some(ref vlog) = vlog {
 				vlog.sync()?;
 			}

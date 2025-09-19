@@ -18,7 +18,7 @@ const DEQUEUE_BITS: u32 = 32;
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
 	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<()>;
+	fn write(&self, batch: &mut Batch, seq_num: u64, sync_wal: bool) -> Result<()>;
 
 	// Apply batch to memtable (can be called concurrently)
 	fn apply(&self, batch: &Batch, seq_num: u64) -> Result<()>;
@@ -261,8 +261,9 @@ impl CommitPipeline {
 		// Enqueue in pending queue (single producer operation)
 		self.pending.enqueue(commit_batch.clone());
 
-		// Write to WAL (must be serialized)
-		self.env.write(&commit_batch.batch, seq_num, commit_batch.sync_wal)?;
+		// Write to WAL (must be serialized) - clone batch for VLog processing
+		let mut batch_copy = commit_batch.batch.clone();
+		self.env.write(&mut batch_copy, seq_num, commit_batch.sync_wal)?;
 
 		Ok(seq_num)
 	}
@@ -335,7 +336,7 @@ mod tests {
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, _batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
+		fn write(&self, _batch: &mut Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
 			Ok(())
 		}
 
@@ -430,7 +431,7 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, _batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
+		fn write(&self, _batch: &mut Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();

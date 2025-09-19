@@ -310,7 +310,35 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 
 impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
+	fn write(&self, batch: &mut Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
+		// First, write large values to VLog and update batch with pointers
+		if let Some(ref vlog) = self.core.vlog {
+			let entries = batch.entries().to_vec(); // Clone to avoid borrowing issues
+			for (i, entry) in entries.iter().enumerate() {
+				if let Some(value) = &entry.value {
+					// Check if value should go to VLog based on threshold
+					if value.len() > self.core.opts.vlog_value_threshold {
+						// Write to VLog and get pointer
+						let key_bytes = entry.key.as_slice();
+						let pointer = vlog.append(key_bytes, value)?;
+						batch.set_valueptr(i, Some(pointer))?;
+					} else {
+						// Small value, keep inline
+						batch.set_valueptr(i, None)?;
+					}
+				} else {
+					// No value (delete operation), keep inline
+					batch.set_valueptr(i, None)?;
+				}
+			}
+		} else {
+			// No VLog, all values stay inline
+			for i in 0..batch.entries().len() {
+				batch.set_valueptr(i, None)?;
+			}
+		}
+
+		// Then write to WAL
 		if let Some(ref wal) = self.core.wal {
 			let mut wal_guard = wal.write();
 			let enc_bytes = batch.encode(seq_num)?;
@@ -318,11 +346,9 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 			if sync_wal {
 				wal_guard.sync()?;
 			}
-			Ok(())
-		} else {
-			// In memory-only mode, we don't write to WAL
-			Ok(())
 		}
+
+		Ok(())
 	}
 
 	// Apply batch to memtable (can be called concurrently)

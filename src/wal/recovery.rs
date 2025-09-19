@@ -92,15 +92,11 @@ pub(crate) fn replay_wal<K: InternalKeyTrait>(
 					max_seq_num = seq_num;
 				}
 
-				// Convert BatchReader to Batch
-				let mut batch = Batch::new();
-				let mut reader = BatchReader::new(record_data)?;
-				while let Some((kind, key, value)) = reader.read_record()? {
-					batch.add_record(kind, key, value)?;
-				}
+				// Decode batch and get sequence number
+				let (batch_seq_num, batch) = Batch::decode(record_data)?;
 
 				// Apply the batch to the memtable
-				memtable.add(&batch, seq_num)?;
+				memtable.add(&batch, batch_seq_num)?;
 			}
 			Err(Error::Corruption(err)) => {
 				// Return the corruption information with the segment ID and last valid offset

@@ -2,18 +2,26 @@ use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::InternalKeyKind;
+use crate::vlog::ValuePointer;
 
 const MAX_BATCH_SIZE: u64 = 1 << 32;
 const BATCH_VERSION: u8 = 1;
 
 type RecordKey<'a> = (InternalKeyKind, &'a [u8], Option<&'a [u8]>);
-type RecordResult<'a> = Result<Option<RecordKey<'a>>>;
+
+/// Represents a single entry in a batch
+#[derive(Debug, Clone)]
+pub(crate) struct BatchEntry {
+	pub kind: InternalKeyKind,
+	pub key: Vec<u8>,
+	pub value: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Batch {
 	version: u8,
-	data: Vec<u8>,
-	count: u32,
+	entries: Vec<BatchEntry>,
+	valueptrs: Vec<Option<ValuePointer>>, // Parallel array to entries, None for inline values
 }
 
 impl Default for Batch {
@@ -25,24 +33,25 @@ impl Default for Batch {
 impl Batch {
 	pub(crate) fn new() -> Self {
 		Self {
-			data: Vec::new(),
-			count: 0,
+			entries: Vec::new(),
+			valueptrs: Vec::new(),
 			version: BATCH_VERSION,
 		}
 	}
 
 	// TODO: add a test for grow
 	fn grow(&mut self, n: usize) -> Result<()> {
-		let new_size = self.data.len() + n;
+		let new_size = self.entries.len() + self.valueptrs.len() + n;
 		if new_size as u64 >= MAX_BATCH_SIZE {
 			return Err(Error::BatchTooLarge);
 		}
-		self.data.reserve(n);
+		self.entries.reserve(n);
+		self.valueptrs.reserve(n);
 		Ok(())
 	}
 
 	pub(crate) fn encode(&self, seq_num: u64) -> Result<Vec<u8>> {
-		let mut encoded = Vec::with_capacity(self.data.len() + 1);
+		let mut encoded = Vec::new();
 
 		// Write version (1 byte)
 		encoded.push(self.version);
@@ -51,10 +60,37 @@ impl Batch {
 		encoded.write_varint(seq_num)?;
 
 		// Write count (4 bytes)
-		encoded.write_varint(self.count)?;
+		encoded.write_varint(self.entries.len() as u32)?;
 
-		// Write data records
-		encoded.extend_from_slice(&self.data[..]);
+		// Write entries
+		for entry in &self.entries {
+			// Write kind (1 byte)
+			encoded.push(entry.kind as u8);
+
+			// Write key length and key
+			encoded.write_varint(entry.key.len() as u64)?;
+			encoded.extend_from_slice(&entry.key);
+
+			// Write value length and value
+			let value_len = entry.value.as_ref().map_or(0, |v| v.len());
+			encoded.write_varint(value_len as u64)?;
+			if let Some(value) = &entry.value {
+				encoded.extend_from_slice(value);
+			}
+		}
+
+		// Write value pointers
+		for valueptr in &self.valueptrs {
+			match valueptr {
+				Some(ptr) => {
+					encoded.push(1); // Has pointer
+					encoded.extend_from_slice(&ptr.encode());
+				}
+				None => {
+					encoded.push(0); // No pointer (inline value)
+				}
+			}
+		}
 
 		Ok(encoded)
 	}
@@ -75,134 +111,190 @@ impl Batch {
 		key: &[u8],
 		value: Option<&[u8]>,
 	) -> Result<()> {
-		let key_len = key.len();
-		let value_len = value.map_or(0, |v| v.len());
+		self.grow(1)?;
 
-		// Calculate the total size needed for this record
-		let record_size = 1 + // kind
-            (key_len as u64).required_space() +
-            key_len +
-            (value_len as u64).required_space() +
-            value_len;
+		let entry = BatchEntry {
+			kind,
+			key: key.to_vec(),
+			value: value.map(|v| v.to_vec()),
+		};
 
-		self.grow(record_size)?;
-
-		// Write the record
-		self.data.push(kind as u8);
-		self.data.write_varint(key_len as u64)?;
-		self.data.extend_from_slice(key);
-		self.data.write_varint(value_len as u64)?;
-		if let Some(v) = value {
-			self.data.extend_from_slice(v);
-		}
-
-		self.count += 1;
+		self.entries.push(entry);
+		self.valueptrs.push(None); // Initially no VLog pointer
 
 		Ok(())
 	}
 
 	pub(crate) fn iter(&self) -> BatchIterator<'_> {
 		BatchIterator {
-			data: &self.data,
+			entries: &self.entries,
 			pos: 0,
 		}
 	}
 
 	pub(crate) fn count(&self) -> u32 {
-		self.count
+		self.entries.len() as u32
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		self.data.is_empty()
+		self.entries.is_empty()
+	}
+
+	/// Get entries for VLog processing
+	pub(crate) fn entries(&self) -> &[BatchEntry] {
+		&self.entries
+	}
+
+	/// Get mutable entries for VLog processing
+	pub(crate) fn entries_mut(&mut self) -> &mut [BatchEntry] {
+		&mut self.entries
+	}
+
+	/// Get value pointers
+	pub(crate) fn valueptrs(&self) -> &[Option<ValuePointer>] {
+		&self.valueptrs
+	}
+
+	/// Get mutable value pointers
+	pub(crate) fn valueptrs_mut(&mut self) -> &mut [Option<ValuePointer>] {
+		&mut self.valueptrs
+	}
+
+	/// Set a value pointer for a specific entry index
+	pub(crate) fn set_valueptr(
+		&mut self,
+		index: usize,
+		valueptr: Option<ValuePointer>,
+	) -> Result<()> {
+		if index >= self.valueptrs.len() {
+			return Err(Error::InvalidBatchRecord);
+		}
+		self.valueptrs[index] = valueptr;
+		Ok(())
+	}
+
+	/// Decode a batch from encoded data
+	pub(crate) fn decode(data: &[u8]) -> Result<(u64, Self)> {
+		if data.is_empty() {
+			return Err(Error::InvalidBatchRecord);
+		}
+
+		let mut pos = 0;
+
+		// Read version
+		let version = data[pos];
+		pos += 1;
+		if version != BATCH_VERSION {
+			return Err(Error::InvalidBatchRecord);
+		}
+
+		// Read sequence number
+		let (seq_num, bytes_read) =
+			u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+		pos += bytes_read;
+
+		// Read count
+		let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+		pos += bytes_read;
+
+		// Read entries
+		let mut entries = Vec::with_capacity(count as usize);
+		for _ in 0..count {
+			// Read kind
+			let kind_byte = data[pos];
+			pos += 1;
+			let kind = InternalKeyKind::from(kind_byte);
+			if kind == InternalKeyKind::Invalid {
+				return Err(Error::InvalidBatchRecord);
+			}
+
+			// Read key
+			let (key_len, bytes_read) =
+				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+			pos += bytes_read;
+			let key = data[pos..pos + key_len as usize].to_vec();
+			pos += key_len as usize;
+
+			// Read value
+			let (value_len, bytes_read) =
+				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+			pos += bytes_read;
+			let value = if value_len > 0 {
+				let value_data = data[pos..pos + value_len as usize].to_vec();
+				pos += value_len as usize;
+				Some(value_data)
+			} else {
+				None
+			};
+
+			entries.push(BatchEntry {
+				kind,
+				key,
+				value,
+			});
+		}
+
+		// Read value pointers
+		let mut valueptrs = Vec::with_capacity(count as usize);
+		for _ in 0..count {
+			let has_pointer = data[pos];
+			pos += 1;
+			let valueptr = if has_pointer == 1 {
+				let ptr_data = &data[pos..pos + crate::vlog::VALUE_POINTER_SIZE];
+				pos += crate::vlog::VALUE_POINTER_SIZE;
+				Some(ValuePointer::decode(ptr_data)?)
+			} else {
+				None
+			};
+			valueptrs.push(valueptr);
+		}
+
+		Ok((
+			seq_num,
+			Self {
+				version,
+				entries,
+				valueptrs,
+			},
+		))
 	}
 }
 
 pub(crate) struct BatchIterator<'a> {
-	data: &'a [u8],
+	entries: &'a [BatchEntry],
 	pos: usize,
-}
-
-/// Helper function to decode a single record from batch data
-/// Returns: Ok(Some((kind, key, value))) for successful decode,
-///          Ok(None) for end of data,
-///          Err(...) for decode errors
-fn decode_record_at<'a>(data: &'a [u8], pos: &mut usize) -> RecordResult<'a> {
-	if *pos >= data.len() {
-		return Ok(None);
-	}
-
-	// Read kind byte
-	let kind = InternalKeyKind::from(data[*pos]);
-	*pos += 1;
-	if kind == InternalKeyKind::Invalid {
-		return Err(Error::InvalidBatchRecord);
-	}
-
-	// Read key length
-	let (key_len, bytes_read) = u64::decode_var(&data[*pos..]).ok_or(Error::InvalidBatchRecord)?;
-	*pos += bytes_read;
-
-	// Read key bytes
-	let key_start = *pos;
-	let key_end = key_start + key_len as usize;
-	if key_end > data.len() {
-		return Err(Error::InvalidBatchRecord);
-	}
-	let key_slice = &data[key_start..key_end];
-	*pos = key_end;
-
-	// Read value length
-	let (val_len, bytes_read) = u64::decode_var(&data[*pos..]).ok_or(Error::InvalidBatchRecord)?;
-	*pos += bytes_read;
-
-	// Read value bytes (if any)
-	let value_slice = if val_len > 0 {
-		let val_start = *pos;
-		let val_end = val_start + val_len as usize;
-		if val_end > data.len() {
-			return Err(Error::InvalidBatchRecord);
-		}
-		let v = &data[val_start..val_end];
-		*pos = val_end;
-		Some(v)
-	} else {
-		None
-	};
-
-	Ok(Some((kind, key_slice, value_slice)))
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
 	type Item = Result<RecordKey<'a>>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		match decode_record_at(self.data, &mut self.pos) {
-			Ok(Some(record)) => Some(Ok(record)),
-			Ok(None) => None,
-			Err(e) => Some(Err(e)),
+		if self.pos >= self.entries.len() {
+			return None;
 		}
+
+		let entry = &self.entries[self.pos];
+		self.pos += 1;
+
+		let record = (entry.kind, entry.key.as_slice(), entry.value.as_deref());
+
+		Some(Ok(record))
 	}
 }
 
-pub(crate) struct BatchReader<'a> {
-	data: &'a [u8],
+pub(crate) struct BatchReader {
+	batch: Batch,
 	pos: usize,
 	seq_num: u64,
 }
 
-impl<'a> BatchReader<'a> {
-	pub(crate) fn new(data: &'a [u8]) -> Result<Self> {
-		if data.is_empty() {
-			return Err(Error::InvalidBatchRecord);
-		}
-
-		let (seq_num, read1) = u64::decode_var(&data[1..]).ok_or(Error::InvalidBatchRecord)?;
-		let (_count, read2) =
-			u32::decode_var(&data[1 + read1..]).ok_or(Error::InvalidBatchRecord)?;
+impl BatchReader {
+	pub(crate) fn new(data: &[u8]) -> Result<Self> {
+		let (seq_num, batch) = Batch::decode(data)?;
 
 		Ok(Self {
-			data,
-			pos: 1 + read1 + read2,
+			batch,
+			pos: 0,
 			seq_num,
 		})
 	}
@@ -211,8 +303,19 @@ impl<'a> BatchReader<'a> {
 		self.seq_num
 	}
 
-	pub(crate) fn read_record(&mut self) -> RecordResult<'a> {
-		decode_record_at(self.data, &mut self.pos)
+	pub(crate) fn read_record(
+		&mut self,
+	) -> Result<Option<(InternalKeyKind, Vec<u8>, Option<Vec<u8>>)>> {
+		if self.pos >= self.batch.entries.len() {
+			return Ok(None);
+		}
+
+		let entry = &self.batch.entries[self.pos];
+		self.pos += 1;
+
+		let record = (entry.kind, entry.key.clone(), entry.value.clone());
+
+		Ok(Some(record))
 	}
 }
 
@@ -223,8 +326,8 @@ mod tests {
 	#[test]
 	fn test_batch_new() {
 		let batch = Batch::new();
-		assert_eq!(batch.data.len(), 0);
-		assert_eq!(batch.count, 0);
+		assert_eq!(batch.entries.len(), 0);
+		assert_eq!(batch.count(), 0);
 	}
 
 	#[test]
@@ -245,23 +348,23 @@ mod tests {
 	#[test]
 	fn test_batch_get_count() {
 		let mut batch = Batch::new();
-		assert_eq!(batch.count, 0);
+		assert_eq!(batch.count(), 0);
 		batch.set(b"key1", b"value1").unwrap();
-		assert_eq!(batch.count, 1);
+		assert_eq!(batch.count(), 1);
 	}
 
 	#[test]
 	fn test_batch_set() {
 		let mut batch = Batch::new();
 		batch.set(b"key1", b"value1").unwrap();
-		assert_eq!(batch.count, 1);
+		assert_eq!(batch.count(), 1);
 	}
 
 	#[test]
 	fn test_batch_delete() {
 		let mut batch = Batch::new();
 		batch.delete(b"key1").unwrap();
-		assert_eq!(batch.count, 1);
+		assert_eq!(batch.count(), 1);
 	}
 
 	#[test]
@@ -311,7 +414,7 @@ mod tests {
 		batch.delete(b"key2").unwrap();
 		batch.set(b"key3", b"value3").unwrap();
 
-		assert_eq!(batch.count, 3);
+		assert_eq!(batch.count(), 3);
 
 		let encoded = batch.encode(1).unwrap();
 		let mut reader = BatchReader::new(&encoded).unwrap();
@@ -379,7 +482,7 @@ mod tests {
 
 		assert_eq!(records[0].0, InternalKeyKind::Set);
 		assert_eq!(records[0].1, b"key1");
-		assert_eq!(records[0].2.unwrap(), b"value1");
+		assert_eq!(records[0].2.as_ref().unwrap(), &b"value1".to_vec());
 
 		assert_eq!(records[1].0, InternalKeyKind::Delete);
 		assert_eq!(records[1].1, b"key2");
@@ -387,7 +490,7 @@ mod tests {
 
 		assert_eq!(records[2].0, InternalKeyKind::Set);
 		assert_eq!(records[2].1, b"key3");
-		assert_eq!(records[2].2.unwrap(), b"value3");
+		assert_eq!(records[2].2.as_ref().unwrap(), &b"value3".to_vec());
 	}
 
 	#[test]
@@ -458,7 +561,7 @@ mod tests {
 
 		assert_eq!(records[0].0, InternalKeyKind::Set);
 		assert_eq!(records[0].1, b"key1");
-		assert_eq!(records[0].2.unwrap(), b"value1");
+		assert_eq!(records[0].2.as_ref().unwrap(), &b"value1".to_vec());
 
 		assert_eq!(records[1].0, InternalKeyKind::Delete);
 		assert_eq!(records[1].1, b"key2");
@@ -466,7 +569,7 @@ mod tests {
 
 		assert_eq!(records[2].0, InternalKeyKind::Set);
 		assert_eq!(records[2].1, b"key3");
-		assert_eq!(records[2].2.unwrap(), b"value3");
+		assert_eq!(records[2].2.as_ref().unwrap(), &b"value3".to_vec());
 
 		assert_eq!(records[3].0, InternalKeyKind::Delete);
 		assert_eq!(records[3].1, b"key1");
@@ -474,7 +577,7 @@ mod tests {
 
 		assert_eq!(records[4].0, InternalKeyKind::Set);
 		assert_eq!(records[4].1, b"key2");
-		assert_eq!(records[4].2.unwrap(), b"new_value2");
+		assert_eq!(records[4].2.as_ref().unwrap(), &b"new_value2".to_vec());
 	}
 
 	#[test]
@@ -505,7 +608,7 @@ mod tests {
 			}
 		}
 
-		assert_eq!(batch.count as usize, NUM_RECORDS);
+		assert_eq!(batch.count() as usize, NUM_RECORDS);
 
 		let encoded = batch.encode(1).unwrap();
 		let mut reader = BatchReader::new(&encoded).unwrap();
@@ -570,14 +673,11 @@ mod tests {
 		let mut batch = Batch::new();
 		batch.set(b"k", b"v").unwrap();
 
-		let batch_ptr = batch.data.as_ptr() as usize;
-		let batch_len = batch.data.len();
+		// Test that we can iterate over entries
 		let (kind, key, value) = batch.iter().next().unwrap().unwrap();
 		assert_eq!(kind, InternalKeyKind::Set);
-		let key_ptr = key.as_ptr() as usize;
-		let val_ptr = value.unwrap().as_ptr() as usize;
-		assert!(key_ptr >= batch_ptr && key_ptr < batch_ptr + batch_len);
-		assert!(val_ptr >= batch_ptr && val_ptr < batch_ptr + batch_len);
+		assert_eq!(key, b"k");
+		assert_eq!(value.unwrap(), b"v");
 	}
 
 	#[test]
@@ -585,15 +685,11 @@ mod tests {
 		let mut batch = Batch::new();
 		batch.set(b"k", b"v").unwrap();
 		let encoded = batch.encode(1).unwrap();
-		let encoded_ptr = encoded.as_ptr() as usize;
-		let encoded_len = encoded.len();
 		let mut reader = BatchReader::new(&encoded).unwrap();
 		let (kind, key, value) = reader.read_record().unwrap().unwrap();
 		assert_eq!(kind, InternalKeyKind::Set);
-		let key_ptr = key.as_ptr() as usize;
-		let val_ptr = value.unwrap().as_ptr() as usize;
-		assert!(key_ptr >= encoded_ptr && key_ptr < encoded_ptr + encoded_len);
-		assert!(val_ptr >= encoded_ptr && val_ptr < encoded_ptr + encoded_len);
+		assert_eq!(key, b"k");
+		assert_eq!(value.unwrap(), b"v");
 	}
 
 	#[test]
@@ -652,7 +748,7 @@ mod tests {
 		let (kind3, key3, value3) = reader_merge.read_record().unwrap().unwrap();
 		assert_eq!(kind3, InternalKeyKind::Merge);
 		assert_eq!(key3, b"merge_key");
-		assert_eq!(value3, Some(&b"merge_data"[..]), "Merge operations now work correctly");
+		assert_eq!(value3, Some(b"merge_data".to_vec()), "Merge operations now work correctly");
 
 		// Test with Set operations (should still work as before)
 		let mut batch_set = Batch::new();
@@ -663,6 +759,6 @@ mod tests {
 		let (kind4, key4, value4) = reader_set.read_record().unwrap().unwrap();
 		assert_eq!(kind4, InternalKeyKind::Set);
 		assert_eq!(key4, b"set_key");
-		assert_eq!(value4, Some(&b"set_data"[..]), "Set operations still work correctly");
+		assert_eq!(value4, Some(b"set_data".to_vec()), "Set operations still work correctly");
 	}
 }
