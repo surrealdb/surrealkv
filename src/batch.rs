@@ -20,6 +20,7 @@ pub(crate) struct Batch {
 	entries: Vec<BatchEntry>,
 	valueptrs: Vec<Option<ValuePointer>>, // Parallel array to entries, None for inline values
 	starting_seq_num: u64,                // Starting sequence number for this batch
+	size: u64,                            // Total size of all records (not serialized)
 }
 
 impl Default for Batch {
@@ -35,17 +36,18 @@ impl Batch {
 			valueptrs: Vec::new(),
 			version: BATCH_VERSION,
 			starting_seq_num,
+			size: 0,
 		}
 	}
 
 	// TODO: add a test for grow
-	fn grow(&mut self, n: usize) -> Result<()> {
-		let new_size = self.entries.len() + self.valueptrs.len() + n;
-		if new_size as u64 >= MAX_BATCH_SIZE {
+	fn grow(&mut self, record_size: u64) -> Result<()> {
+		if self.size + record_size > MAX_BATCH_SIZE {
 			return Err(Error::BatchTooLarge);
 		}
-		self.entries.reserve(n);
-		self.valueptrs.reserve(n);
+		self.size += record_size;
+		self.entries.reserve(1);
+		self.valueptrs.reserve(1);
 		Ok(())
 	}
 
@@ -110,7 +112,17 @@ impl Batch {
 		key: &[u8],
 		value: Option<&[u8]>,
 	) -> Result<()> {
-		self.grow(1)?;
+		let key_len = key.len();
+		let value_len = value.map_or(0, |v| v.len());
+
+		// Calculate the total size needed for this record
+		let record_size = 1u64 + // kind
+			(key_len as u64).required_space() as u64 +
+			key_len as u64 +
+			(value_len as u64).required_space() as u64 +
+			value_len as u64;
+
+		self.grow(record_size)?;
 
 		let entry = BatchEntry {
 			kind,
@@ -261,6 +273,7 @@ impl Batch {
 			entries,
 			valueptrs,
 			starting_seq_num: seq_num,
+			size: 0, // Decoded batches don't track size
 		})
 	}
 }
@@ -280,7 +293,7 @@ mod tests {
 	fn test_batch_grow() {
 		let mut batch = Batch::new(0);
 		assert!(batch.grow(10).is_ok());
-		assert!(batch.grow(MAX_BATCH_SIZE as usize).is_err());
+		assert!(batch.grow(MAX_BATCH_SIZE).is_err());
 	}
 
 	#[test]
