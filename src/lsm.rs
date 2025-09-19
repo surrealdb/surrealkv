@@ -34,9 +34,6 @@ use crate::{
 
 use async_trait::async_trait;
 
-// ===== Constants =====
-pub const TABLE_FOLDER: &str = "sstables";
-
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
 /// Compaction is essential for maintaining read performance by merging
@@ -3245,5 +3242,152 @@ mod tests {
 
 			tree.close().await.unwrap();
 		}
+	}
+
+	#[tokio::test]
+	async fn test_checkpoint_with_vlog() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.vlog_max_file_size = 1024;
+			opts.max_memtable_size = 512;
+			opts.enable_vlog = true;
+		});
+
+		// Create initial data with VLog enabled
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Insert some data to ensure VLog and discard stats are created
+		let large_value = vec![1u8; 200]; // Large enough for VLog
+		for i in 0..5 {
+			let key = format!("key_{i}");
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), &large_value).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Force flush to create VLog files and initialize discard stats
+		tree.flush().unwrap();
+
+		// Update some keys to create discard statistics
+		let mut discard_updates = std::collections::HashMap::new();
+		let stats = tree.get_all_vlog_stats();
+		for (file_id, total_size, _discard_bytes, _ratio) in &stats {
+			if *total_size > 0 {
+				discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
+			}
+		}
+		tree.update_vlog_discard_stats(&discard_updates);
+
+		// Create checkpoint
+		let checkpoint_dir = temp_dir.path().join("checkpoint");
+		let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
+
+		// Verify checkpoint metadata
+		assert!(metadata.timestamp > 0);
+		assert!(metadata.total_size > 0);
+
+		// Verify all expected directories exist in checkpoint
+		assert!(checkpoint_dir.exists());
+		assert!(checkpoint_dir.join("sstables").exists());
+		assert!(checkpoint_dir.join("wal").exists());
+		assert!(checkpoint_dir.join("manifest").exists());
+		assert!(checkpoint_dir.join("vlog").exists());
+		assert!(checkpoint_dir.join("discard_stats").exists());
+		assert!(checkpoint_dir.join("delete_list").exists());
+		assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
+
+		// Verify VLog files are in the checkpoint
+		let vlog_checkpoint_dir = checkpoint_dir.join("vlog");
+		let vlog_entries = std::fs::read_dir(&vlog_checkpoint_dir).unwrap();
+		let vlog_files: Vec<_> = vlog_entries
+			.filter_map(|entry| {
+				let entry = entry.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		assert!(!vlog_files.is_empty(), "Should have VLog files in the checkpoint");
+
+		// Verify discard stats file exists
+		let discard_stats_checkpoint_dir = checkpoint_dir.join("discard_stats");
+		assert!(discard_stats_checkpoint_dir.exists());
+		assert!(discard_stats_checkpoint_dir.join("DISCARD").exists());
+
+		// Insert more data after checkpoint
+		for i in 5..10 {
+			let key = format!("key_{i}");
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), &large_value).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Force flush to ensure the new data is also on disk
+		tree.flush().unwrap();
+
+		// Verify all data exists before restore
+		for i in 0..10 {
+			let key = format!("key_{i}");
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert!(result.is_some(), "Key '{key}' should exist before restore");
+		}
+
+		// Restore from checkpoint
+		tree.restore_from_checkpoint(&checkpoint_dir).unwrap();
+
+		// Verify data is restored to checkpoint state (keys 0-4 exist, 5-9 don't)
+		for i in 0..5 {
+			let key = format!("key_{i}");
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert!(result.is_some(), "Key '{key}' should exist after restore");
+			assert_eq!(result.unwrap().as_ref(), &large_value);
+		}
+
+		// Verify the newer keys don't exist after restore
+		for i in 5..10 {
+			let key = format!("key_{i}");
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert!(result.is_none(), "Key '{key}' should not exist after restore");
+		}
+
+		// Verify VLog directories are restored
+		let vlog_dir = opts.vlog_dir();
+		let discard_stats_dir = opts.discard_stats_dir();
+		let delete_list_dir = opts.delete_list_dir();
+
+		assert!(vlog_dir.exists(), "VLog directory should exist after restore");
+		assert!(discard_stats_dir.exists(), "Discard stats directory should exist after restore");
+		assert!(delete_list_dir.exists(), "Delete list directory should exist after restore");
+
+		// Verify VLog files are restored
+		let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files: Vec<_> = vlog_entries
+			.filter_map(|entry| {
+				let entry = entry.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		assert!(!vlog_files.is_empty(), "Should have VLog files after restore");
+
+		// Verify discard stats file is restored
+		assert!(
+			discard_stats_dir.join("DISCARD").exists(),
+			"DISCARD file should exist after restore"
+		);
 	}
 }

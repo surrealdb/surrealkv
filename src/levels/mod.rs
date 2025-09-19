@@ -421,10 +421,7 @@ pub(crate) fn write_manifest_to_disk<K: InternalKeyTrait>(
 
 #[cfg(test)]
 mod tests {
-	use crate::{
-		lsm::TABLE_FOLDER,
-		sstable::{table::TableWriter, InternalKey, InternalKeyKind},
-	};
+	use crate::sstable::{table::TableWriter, InternalKey, InternalKeyKind};
 
 	use super::*;
 	use std::{
@@ -481,7 +478,7 @@ mod tests {
 		let opts = Arc::new(opts);
 
 		// Create sstables directory
-		let sstable_path = repo_path.join(TABLE_FOLDER);
+		let sstable_path = opts.sstable_dir();
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 		// Create manifest directory
@@ -848,7 +845,7 @@ mod tests {
 		let opts = Arc::new(opts);
 
 		// Create sstables directory
-		let sstable_path = repo_path.join(TABLE_FOLDER);
+		let sstable_path = opts.sstable_dir();
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 		// Create manifest directory
@@ -993,7 +990,7 @@ mod tests {
 		let opts = Arc::new(opts);
 
 		// Create sstables directory
-		let sstable_path = repo_path.join(TABLE_FOLDER);
+		let sstable_path = opts.sstable_dir();
 		fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 		// Create manifest directory

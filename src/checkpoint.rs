@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
-use crate::lsm::{CompactionOperations, CoreInner, TABLE_FOLDER};
+use crate::lsm::{CompactionOperations, CoreInner};
 use crate::sstable::InternalKeyTrait;
 
 /// Recursively copies a directory and all its contents
@@ -160,6 +160,7 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 	/// - All SSTables from all levels
 	/// - Current WAL segments
 	/// - Level manifest
+	/// - VLog directories (if enabled)
 	/// - Checkpoint metadata
 	///
 	/// # Arguments
@@ -186,7 +187,7 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 		};
 
 		// Step 3: Create checkpoint subdirectories
-		let sstables_dir = checkpoint_path.join(TABLE_FOLDER);
+		let sstables_dir = checkpoint_path.join("sstables");
 		let wal_dir = checkpoint_path.join("wal");
 		fs::create_dir_all(&sstables_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 		fs::create_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
@@ -200,17 +201,20 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 		// Step 6: Copy level manifest
 		let manifest_size = self.copy_level_manifest(checkpoint_path)?;
 
-		// Step 7: Create checkpoint metadata
+		// Step 7: Copy VLog directories if enabled
+		let vlog_size = self.copy_vlog_directories(checkpoint_path)?;
+
+		// Step 8: Create checkpoint metadata
 		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
 		let metadata = CheckpointMetadata::new(
 			timestamp,
 			sequence_number,
 			sstable_count,
-			sstables_size + manifest_size,
+			sstables_size + manifest_size + vlog_size,
 		);
 
-		// Step 8: Write metadata file
+		// Step 9: Write metadata file
 		self.write_checkpoint_metadata(checkpoint_path, &metadata)?;
 
 		Ok(metadata)
@@ -231,7 +235,7 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 		self.clear_current_state()?;
 
 		// Restore SSTables
-		let sstables_source = checkpoint_path.join(TABLE_FOLDER);
+		let sstables_source = checkpoint_path.join("sstables");
 		let sstables_dest = self.core.opts.sstable_dir();
 		if sstables_source.exists() {
 			Self::copy_directory_sync(&sstables_source, &sstables_dest)?;
@@ -253,6 +257,9 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 			}
 			copy_dir_all(&manifest_source, &manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
+
+		// Restore VLog directories if they exist in the checkpoint
+		self.restore_vlog_directories(checkpoint_path)?;
 
 		Ok(metadata)
 	}
@@ -357,6 +364,100 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 		Ok(0)
 	}
 
+	/// Copies VLog-related directories to the checkpoint directory if VLog is enabled
+	fn copy_vlog_directories(&self, dest_dir: &Path) -> Result<u64> {
+		if !self.core.opts.enable_vlog {
+			return Ok(0);
+		}
+
+		let mut total_size = 0u64;
+
+		// Copy VLog directory
+		let vlog_source = self.core.opts.vlog_dir();
+		let vlog_dest = dest_dir.join("vlog");
+		if vlog_source.exists() {
+			copy_dir_all(&vlog_source, &vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			total_size += Self::calculate_directory_size(&vlog_dest)?;
+		}
+
+		// Copy discard stats directory
+		let discard_stats_source = self.core.opts.discard_stats_dir();
+		let discard_stats_dest = dest_dir.join("discard_stats");
+		if discard_stats_source.exists() {
+			copy_dir_all(&discard_stats_source, &discard_stats_dest)
+				.map_err(|e| Error::Io(Arc::new(e)))?;
+			total_size += Self::calculate_directory_size(&discard_stats_dest)?;
+		}
+
+		// Copy delete list directory
+		let delete_list_source = self.core.opts.delete_list_dir();
+		let delete_list_dest = dest_dir.join("delete_list");
+		if delete_list_source.exists() {
+			copy_dir_all(&delete_list_source, &delete_list_dest)
+				.map_err(|e| Error::Io(Arc::new(e)))?;
+			total_size += Self::calculate_directory_size(&delete_list_dest)?;
+		}
+
+		Ok(total_size)
+	}
+
+	/// Calculates the total size of a directory recursively
+	fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
+		let mut total_size = 0u64;
+
+		if let Ok(entries) = fs::read_dir(dir_path) {
+			for entry in entries.flatten() {
+				let entry_path = entry.path();
+				if entry_path.is_file() {
+					if let Ok(metadata) = entry_path.metadata() {
+						total_size += metadata.len();
+					}
+				} else if entry_path.is_dir() {
+					total_size += Self::calculate_directory_size(&entry_path)?;
+				}
+			}
+		}
+
+		Ok(total_size)
+	}
+
+	/// Restores VLog-related directories from the checkpoint
+	fn restore_vlog_directories(&self, checkpoint_path: &Path) -> Result<()> {
+		// Restore VLog directory
+		let vlog_source = checkpoint_path.join("vlog");
+		let vlog_dest = self.core.opts.vlog_dir();
+		if vlog_source.exists() {
+			if vlog_dest.exists() {
+				fs::remove_dir_all(&vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+			copy_dir_all(&vlog_source, &vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+
+		// Restore discard stats directory
+		let discard_stats_source = checkpoint_path.join("discard_stats");
+		let discard_stats_dest = self.core.opts.discard_stats_dir();
+		if discard_stats_source.exists() {
+			if discard_stats_dest.exists() {
+				fs::remove_dir_all(&discard_stats_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+			copy_dir_all(&discard_stats_source, &discard_stats_dest)
+				.map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+
+		// Restore delete list directory
+		let delete_list_source = checkpoint_path.join("delete_list");
+		let delete_list_dest = self.core.opts.delete_list_dir();
+		if delete_list_source.exists() {
+			if delete_list_dest.exists() {
+				fs::remove_dir_all(&delete_list_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+			copy_dir_all(&delete_list_source, &delete_list_dest)
+				.map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+
+		Ok(())
+	}
+
 	/// Writes checkpoint metadata to a file
 	fn write_checkpoint_metadata(
 		&self,
@@ -432,6 +533,24 @@ impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
 		let manifest_path = self.core.opts.manifest_dir();
 		if manifest_path.exists() {
 			fs::remove_dir_all(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+
+		// Clear VLog directories if VLog is enabled
+		if self.core.opts.enable_vlog {
+			let vlog_dir = self.core.opts.vlog_dir();
+			if vlog_dir.exists() {
+				fs::remove_dir_all(&vlog_dir).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+
+			let discard_stats_dir = self.core.opts.discard_stats_dir();
+			if discard_stats_dir.exists() {
+				fs::remove_dir_all(&discard_stats_dir).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
+
+			let delete_list_dir = self.core.opts.delete_list_dir();
+			if delete_list_dir.exists() {
+				fs::remove_dir_all(&delete_list_dir).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
 		}
 
 		Ok(())
