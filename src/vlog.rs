@@ -891,9 +891,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 		// Check if this file meets the discard ratio threshold
 		let should_compact = {
-			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
-			println!("VLog file {}: total_size={}, discard_bytes={}, discard_ratio={:.2}, threshold={:.2}", 
-				file_id, total_size, discard_bytes, discard_ratio, self.gc_discard_ratio);
+			let (total_size, _, discard_ratio) = self.get_file_stats(file_id);
 
 			if total_size == 0 {
 				false

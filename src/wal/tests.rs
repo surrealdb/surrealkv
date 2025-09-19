@@ -135,8 +135,8 @@ fn test_wal_replay_latest_segment_only() {
 	// Verify no corruption was detected
 	assert!(corruption_info.is_none(), "Expected no corruption, but got: {corruption_info:?}");
 
-	// Verify sequence number is from the latest segment (100)
-	assert_eq!(sequence_number, 100);
+	// Verify sequence number is from the latest segment (104)
+	assert_eq!(sequence_number, 104);
 
 	// Verify the memtable contains only the data from the latest segment
 	assert_eq!(entry_count, 5, "Expected 5 entries from latest segment");

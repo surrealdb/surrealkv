@@ -167,17 +167,12 @@ impl Batch {
 		self.starting_seq_num = seq_num;
 	}
 
-	/// Get the starting sequence number for this batch
-	pub(crate) fn get_starting_seq_num(&self) -> u64 {
-		self.starting_seq_num
-	}
-
 	/// Get the highest sequence number used in this batch
-	pub(crate) fn get_highest_seq_num(&self) -> Result<u64> {
+	pub(crate) fn get_highest_seq_num(&self) -> u64 {
 		if self.entries.is_empty() {
-			Ok(self.starting_seq_num)
+			self.starting_seq_num
 		} else {
-			Ok(self.starting_seq_num + (self.entries.len() - 1) as u64)
+			self.starting_seq_num + (self.entries.len() - 1) as u64
 		}
 	}
 
@@ -332,7 +327,7 @@ mod tests {
 		batch.set(b"key1", b"value1").unwrap();
 		let encoded = batch.encode().unwrap();
 		let reader = Batch::decode(&encoded).unwrap();
-		assert_eq!(reader.get_starting_seq_num(), 100);
+		assert_eq!(reader.starting_seq_num, 100);
 	}
 
 	#[test]
@@ -340,7 +335,7 @@ mod tests {
 		let batch = Batch::new(100);
 		let encoded = batch.encode().unwrap();
 		let reader = Batch::decode(&encoded).unwrap();
-		assert_eq!(reader.get_starting_seq_num(), 100);
+		assert_eq!(reader.starting_seq_num, 100);
 	}
 
 	#[test]
@@ -349,7 +344,7 @@ mod tests {
 		batch.set(b"key1", b"value1").unwrap();
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
-		assert_eq!(decoded_batch.get_starting_seq_num(), 1);
+		assert_eq!(decoded_batch.starting_seq_num, 1);
 
 		let entries = decoded_batch.entries();
 		assert_eq!(entries.len(), 1);

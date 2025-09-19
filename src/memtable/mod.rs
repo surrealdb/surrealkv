@@ -120,7 +120,7 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		}
 
 		// Get the highest sequence number used from the batch
-		let highest_seq_num = batch.get_highest_seq_num()?;
+		let highest_seq_num = batch.get_highest_seq_num();
 
 		Ok((record_size, highest_seq_num))
 	}
@@ -831,6 +831,6 @@ mod tests {
 		batch.set(b"key4", b"value4").unwrap();
 		batch.set(b"key5", b"value5").unwrap();
 
-		assert_eq!(batch.get_highest_seq_num().unwrap(), 14);
+		assert_eq!(batch.get_highest_seq_num(), 14);
 	}
 }

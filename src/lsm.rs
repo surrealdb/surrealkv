@@ -811,18 +811,9 @@ impl<K: InternalKeyTrait> Tree<K> {
 
 	/// Triggers VLog garbage collection manually
 	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u32>> {
-		println!("=== VLog garbage collection called ===");
 		match &self.core.vlog {
-			Some(vlog) => {
-				println!("VLog exists, calling garbage_collect");
-				let result = vlog.garbage_collect(self.core.commit_pipeline.clone()).await;
-				println!("VLog garbage_collect result: {:?}", result);
-				result
-			}
-			None => {
-				println!("No VLog available, returning empty result");
-				Ok(Vec::new())
-			}
+			Some(vlog) => vlog.garbage_collect(self.core.commit_pipeline.clone()).await,
+			None => Ok(Vec::new()),
 		}
 	}
 
@@ -2419,130 +2410,75 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_compaction_with_updates_and_delete() {
-		println!("=== Starting test_compaction_with_updates_and_delete ===");
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
-		println!("Test directory: {:?}", path);
 
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.level_count = 2;
 			opts.vlog_max_file_size = 20;
 			opts.enable_vlog = true;
 		});
-		println!("VLog enabled: {}, max file size: {}", opts.enable_vlog, opts.vlog_max_file_size);
 
 		let tree = Tree::new(opts.clone()).unwrap();
-		println!("Tree created successfully");
 
 		// Create 2 keys in ascending order
 		let keys = ["key-1".as_bytes(), "key-2".as_bytes()];
-		println!("Keys to test: {:?}", keys);
 
 		// Insert first version of each key
-		println!("=== Inserting first version of each key ===");
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v1", i + 1);
-			println!("Inserting key: {:?}, value: {}", key, value);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
-			println!("Committed key: {:?}", key);
 			tree.flush().unwrap();
-			println!("Flushed after key: {:?}", key);
 		}
 
 		// Insert second version of each key
-		println!("=== Inserting second version of each key ===");
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v2", i + 1);
-			println!("Inserting key: {:?}, value: {}", key, value);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
-			println!("Committed key: {:?}", key);
 			tree.flush().unwrap();
-			println!("Flushed after key: {:?}", key);
 		}
 
 		// Verify the latest values before delete
-		println!("=== Verifying latest values before delete ===");
 		for (i, key) in keys.iter().enumerate() {
 			let tx = tree.begin().unwrap();
 			let result = tx.get(key).unwrap();
 			let expected = format!("value-{}-v2", i + 1);
-			println!(
-				"Key: {:?}, expected: {}, actual: {:?}",
-				key,
-				expected,
-				result.as_ref().map(|v| String::from_utf8_lossy(v))
-			);
 			assert_eq!(result.map(|v| v.to_vec()), Some(expected.as_bytes().to_vec()));
 		}
 
 		// Delete all keys
-		println!("=== Deleting all keys ===");
 		for key in keys.iter() {
-			println!("Deleting key: {:?}", key);
 			let mut tx = tree.begin().unwrap();
 			tx.delete(key).unwrap();
 			tx.commit().await.unwrap();
-			println!("Committed delete for key: {:?}", key);
 		}
 
 		// Flush memtable
-		println!("=== Flushing memtable after deletes ===");
 		tree.flush().unwrap();
-		println!("Memtable flushed");
-
-		// Check L0 state before compaction
-		println!("=== Checking L0 state before compaction ===");
-		let l0_size =
-			tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
-				.tables
-				.len();
-		println!("L0 tables before compaction: {}", l0_size);
 
 		// Force compaction
-		println!("=== Starting compaction ===");
 		let strategy = Arc::new(Strategy::default());
 		tree.core.compact(strategy).unwrap();
-		println!("Compaction completed");
-
-		// Check L0 state after compaction
-		println!("=== Checking L0 state after compaction ===");
-		let l0_size_after =
-			tree.core.level_manifest.as_ref().unwrap().read().unwrap().levels.get_levels()[0]
-				.tables
-				.len();
-		println!("L0 tables after compaction: {}", l0_size_after);
 
 		// There could be multiple VLog files, need to garbage collect them all but
 		// only one should remain because the active VLog file does not get garbage collected
-		println!("=== Starting VLog garbage collection ===");
-		for i in 0..6 {
-			println!("VLog GC iteration {}", i + 1);
-			let gc_result = tree.garbage_collect_vlog().await.unwrap();
-			println!("VLog GC result: {:?}", gc_result);
+		for _ in 0..6 {
+			tree.garbage_collect_vlog().await.unwrap();
 		}
-		println!("VLog garbage collection completed");
 
 		// Verify all keys are gone after compaction
-		println!("=== Verifying all keys are gone after compaction ===");
 		for key in keys.iter() {
 			let tx = tree.begin().unwrap();
 			let result = tx.get(key).unwrap();
-			println!(
-				"Key: {:?}, result after compaction: {:?}",
-				key,
-				result.as_ref().map(|v| String::from_utf8_lossy(v))
-			);
 			assert_eq!(result, None);
 		}
 
 		// Verify that only one VLog file remains after garbage collection
-		println!("=== Checking VLog files after garbage collection ===");
 		let vlog_dir = path.join("vlog");
-		println!("VLog directory: {:?}", vlog_dir);
 		let entries = std::fs::read_dir(&vlog_dir).unwrap();
 		let vlog_files: Vec<_> = entries
 			.filter_map(|e| {
@@ -2556,15 +2492,11 @@ mod tests {
 			})
 			.collect();
 
-		println!("VLog files found: {:?}", vlog_files);
-		println!("Number of VLog files: {}", vlog_files.len());
-
 		assert_eq!(
 			vlog_files.len(),
 			1,
 			"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
 		);
-		println!("=== Test completed successfully ===");
 	}
 
 	#[tokio::test]

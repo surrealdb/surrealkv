@@ -85,11 +85,11 @@ pub(crate) fn replay_wal<K: InternalKeyTrait>(
 
 				// Decode batch and get sequence number
 				let batch = Batch::decode(record_data)?;
-				let batch_seq_num = batch.get_starting_seq_num();
+				let batch_highest_seq_num = batch.get_highest_seq_num();
 
 				// Update max sequence number
-				if batch_seq_num > max_seq_num {
-					max_seq_num = batch_seq_num;
+				if batch_highest_seq_num > max_seq_num {
+					max_seq_num = batch_highest_seq_num;
 				}
 
 				// Apply the batch to the memtable
@@ -207,4 +207,164 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	);
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::sstable::InternalKey;
+	use crate::wal::segment::{Options, Segment, WAL_RECORD_HEADER_SIZE};
+	use std::fs;
+	use tempfile::TempDir;
+
+	#[test]
+	fn test_replay_wal_sequence_number_tracking() {
+		// Create a temporary directory for WAL files
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+
+		// Create WAL directory
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Create a memtable to replay into
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
+
+		// Test case: Multiple batches, each with multiple entries
+		// This is the critical test case that would have failed with the old bug
+
+		// Batch 1: Starting at 100, with 3 entries (100, 101, 102)
+		let mut batch1 = Batch::new(100);
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 100
+		batch1.set(b"key2", b"value2").unwrap(); // seq_num 101
+		batch1.set(b"key3", b"value3").unwrap(); // seq_num 102
+										   // Highest sequence number should be 102
+
+		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
+		let mut batch2 = Batch::new(200);
+		batch2.set(b"key4", b"value4").unwrap(); // seq_num 200
+		batch2.set(b"key5", b"value5").unwrap(); // seq_num 201
+		batch2.delete(b"key6").unwrap(); // seq_num 202
+		batch2.set(b"key7", b"value7").unwrap(); // seq_num 203
+										   // Highest sequence number should be 203
+
+		// Create WAL segments for both batches
+		let opts = Options::default();
+		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
+
+		segment1.append(&batch1.encode().unwrap()).unwrap();
+		segment2.append(&batch2.encode().unwrap()).unwrap();
+
+		segment1.close().unwrap();
+		segment2.close().unwrap();
+
+		// Replay the WAL
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+
+		// Verify the bug is fixed: max_seq_num should be 203 (highest from batch2), not 200 (starting of batch2)
+		assert_eq!(
+			max_seq_num, 203,
+			"WAL recovery should track highest sequence number (203), not starting sequence number (200)"
+		);
+		assert!(corruption_info.is_none(), "No corruption should be detected");
+
+		// Verify the memtable contains the expected entries
+		assert!(!memtable.is_empty(), "Memtable should not be empty after replay");
+	}
+
+	#[test]
+	fn test_replay_wal_empty_directory() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
+
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+
+		assert_eq!(max_seq_num, 0, "Empty WAL directory should return 0");
+		assert!(corruption_info.is_none(), "No corruption should be detected");
+	}
+
+	#[test]
+	fn test_replay_wal_single_entry_batches() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
+
+		// Test with multiple single-entry batches
+		// This tests the edge case where starting = highest for each batch
+		let mut batch1 = Batch::new(500);
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 500
+
+		let mut batch2 = Batch::new(600);
+		batch2.set(b"key2", b"value2").unwrap(); // seq_num 600
+
+		let mut batch3 = Batch::new(700);
+		batch3.set(b"key3", b"value3").unwrap(); // seq_num 700
+
+		// Create WAL segments for all batches
+		let opts = Options::default();
+		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
+		let mut segment3 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 3, &opts).unwrap();
+
+		segment1.append(&batch1.encode().unwrap()).unwrap();
+		segment2.append(&batch2.encode().unwrap()).unwrap();
+		segment3.append(&batch3.encode().unwrap()).unwrap();
+
+		segment1.close().unwrap();
+		segment2.close().unwrap();
+		segment3.close().unwrap();
+
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+
+		// For single-entry batches, starting and highest should be the same
+		// The max should be 700 (from the latest batch)
+		assert_eq!(
+			max_seq_num, 700,
+			"Multiple single-entry batches should return highest sequence number"
+		);
+		assert!(corruption_info.is_none(), "No corruption should be detected");
+	}
+
+	#[test]
+	fn test_replay_wal_multiple_batches() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Test case: Multiple batches with different starting sequence numbers
+		// This ensures the max tracking works across multiple batches
+		let mut batch1 = Batch::new(200); // Starting sequence number 200
+		batch1.set(b"key1", b"value1").unwrap(); // seq_num 200
+		batch1.set(b"key2", b"value2").unwrap(); // seq_num 201
+										   // Highest sequence number should be 201
+
+		let mut batch2 = Batch::new(300); // Starting sequence number 300
+		batch2.set(b"key3", b"value3").unwrap(); // seq_num 300
+		batch2.set(b"key4", b"value4").unwrap(); // seq_num 301
+										   // Highest sequence number should be 301
+
+		// Create WAL segments for both batches
+		let opts = Options::default();
+		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
+
+		segment1.append(&batch1.encode().unwrap()).unwrap();
+		segment2.append(&batch2.encode().unwrap()).unwrap();
+
+		segment1.close().unwrap();
+		segment2.close().unwrap();
+
+		// Create a fresh memtable for the test
+		let memtable = Arc::new(MemTable::<InternalKey>::new());
+		let (max_seq_num, _) = replay_wal(wal_dir, &memtable).unwrap();
+
+		// The max should be from the latest segment (301), not the starting sequence number
+		assert_eq!(
+			max_seq_num, 301,
+			"WAL recovery should track highest sequence number across all batches"
+		);
+	}
 }
