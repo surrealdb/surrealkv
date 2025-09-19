@@ -140,8 +140,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		};
 
 		let vlog = if opts.enable_vlog && !opts.in_memory_only {
-			let vlog_path = opts.vlog_dir();
-			Some(Arc::new(VLog::<K>::new(&vlog_path, opts.clone())?))
+			Some(Arc::new(VLog::<K>::new(opts.clone())?))
 		} else {
 			None
 		};
@@ -611,7 +610,13 @@ impl<K: InternalKeyTrait> Tree<K> {
 		create_dir_all(opts.sstable_dir())?;
 		create_dir_all(opts.wal_dir())?;
 		create_dir_all(opts.manifest_dir())?;
-		create_dir_all(opts.vlog_dir())?;
+
+		// Create VLog directories
+		if opts.enable_vlog {
+			create_dir_all(opts.vlog_dir())?;
+			create_dir_all(opts.discard_stats_dir())?;
+			create_dir_all(opts.delete_list_dir())?;
+		}
 
 		Ok(())
 	}
@@ -930,13 +935,32 @@ fn sync_directory_structure<K: InternalKeyTrait>(opts: &Options<K>) -> Result<()
 		))
 	})?;
 
-	fsync_directory(opts.vlog_dir()).map_err(|e| {
-		Error::Other(format!(
-			"Failed to sync VLog directory '{}': {}",
-			opts.vlog_dir().display(),
-			e
-		))
-	})?;
+	// Sync VLog directories
+	if opts.enable_vlog {
+		fsync_directory(opts.vlog_dir()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to sync VLog directory '{}': {}",
+				opts.vlog_dir().display(),
+				e
+			))
+		})?;
+
+		fsync_directory(opts.discard_stats_dir()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to sync discard stats directory '{}': {}",
+				opts.discard_stats_dir().display(),
+				e
+			))
+		})?;
+
+		fsync_directory(opts.delete_list_dir()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to sync delete list directory '{}': {}",
+				opts.delete_list_dir().display(),
+				e
+			))
+		})?;
+	}
 
 	fsync_directory(&opts.path).map_err(|e| {
 		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
@@ -2253,15 +2277,19 @@ mod tests {
 		let vlog_dir = path.join("vlog");
 		let sstables_dir = path.join("sstables");
 		let wal_dir = path.join("wal");
+		let discard_stats_dir = path.join("discard_stats");
+		let delete_list_dir = path.join("delete_list");
 
 		// Check that all expected directories exist
 		assert!(main_db_dir.exists(), "Main database directory should exist");
 		assert!(vlog_dir.exists(), "VLog directory should exist");
 		assert!(sstables_dir.exists(), "SSTables directory should exist");
 		assert!(wal_dir.exists(), "WAL directory should exist");
+		assert!(discard_stats_dir.exists(), "Discard stats directory should exist");
+		assert!(delete_list_dir.exists(), "Delete list directory should exist");
 
 		// Check that DISCARD file is in the main database directory
-		let discard_file_in_main = main_db_dir.join("DISCARD");
+		let discard_file_in_main = discard_stats_dir.join("DISCARD");
 		let discard_file_in_vlog = vlog_dir.join("DISCARD");
 
 		assert!(
@@ -2309,6 +2337,8 @@ mod tests {
 			discard_file_in_main.exists()
 		);
 		println!("  VLog dir: {vlog_dir:?}");
+		println!("  Discard stats dir: {discard_stats_dir:?}");
+		println!("  Delete list dir: {delete_list_dir:?}");
 		println!("  VLog files: {vlog_files:?}");
 		println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
 	}

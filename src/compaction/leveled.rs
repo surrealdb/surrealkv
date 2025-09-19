@@ -535,7 +535,11 @@ mod tests {
 		opts: Arc<LSMOptions>,
 		manifest: Arc<RwLock<LevelManifest<InternalKey>>>,
 	) -> CompactionOptions<InternalKey> {
-		let vlog = Arc::new(crate::vlog::VLog::new(opts.path.join("vlog"), opts.clone()).unwrap());
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
+
+		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone()).unwrap());
 
 		CompactionOptions {
 			lopts: opts,

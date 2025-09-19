@@ -366,9 +366,11 @@ mod tests {
 			path: temp_dir.path().to_path_buf(),
 			..Default::default()
 		};
-		let vlog_dir = temp_dir.path().join("vlog");
-		std::fs::create_dir_all(&vlog_dir).unwrap();
-		let vlog = Arc::new(VLog::new(&vlog_dir, Arc::new(opts)).unwrap());
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
+
+		let vlog = Arc::new(VLog::new(Arc::new(opts)).unwrap());
 		(vlog, temp_dir)
 	}
 

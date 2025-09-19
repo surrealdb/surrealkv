@@ -237,6 +237,16 @@ impl<K: InternalKeyTrait> Options<K> {
 		self.path.join("manifest")
 	}
 
+	/// Returns the directory path for discard stats files
+	pub(crate) fn discard_stats_dir(&self) -> PathBuf {
+		self.path.join("discard_stats")
+	}
+
+	/// Returns the directory path for delete list files
+	pub(crate) fn delete_list_dir(&self) -> PathBuf {
+		self.path.join("delete_list")
+	}
+
 	/// Checks if a filename matches the `VLog` file naming pattern
 	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
 	pub(crate) fn is_vlog_filename(&self, filename: &str) -> bool {

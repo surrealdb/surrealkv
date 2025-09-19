@@ -9,7 +9,7 @@ use std::{
 	},
 };
 
-use crate::bplustree::tree::{new_disk_tree, DiskBPlusTree, Durability};
+use crate::bplustree::tree::{new_disk_tree, DiskBPlusTree};
 use crate::cache::VLogCache;
 use crate::BytewiseComparator;
 use crate::{batch::Batch, discard::DiscardStats, Value};
@@ -551,21 +551,12 @@ impl<K: InternalKeyTrait> VLog<K> {
 	}
 
 	/// Creates a new VLog instance
-	pub(crate) fn new<P: AsRef<Path>>(dir: P, opts: Arc<Options<K>>) -> Result<Self> {
-		let dir = dir.as_ref().to_path_buf();
-
-		// Get the parent directory for the discard stats file
-		// This ensures the DISCARD file lives in the main database directory,
-		// not in the VLog subdirectory
-		let discard_stats_dir =
-			dir.parent().ok_or_else(|| Error::Other("VLog directory has no parent".to_string()))?;
-
-		// Initialize the global delete list LSM tree
-		// TODO: Make this internalkey
-		let delete_list = Arc::new(DeleteList::new(dir.clone())?);
+	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
+		// Initialize the global delete list tree
+		let delete_list = Arc::new(DeleteList::new(opts.delete_list_dir())?);
 
 		let vlog = Self {
-			path: dir.clone(),
+			path: opts.vlog_dir(),
 			max_file_size: opts.vlog_max_file_size,
 			checksum_level: opts.vlog_checksum_verification,
 			gc_discard_ratio: opts.vlog_gc_discard_ratio,
@@ -577,7 +568,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 			file_handles: RwLock::new(HashMap::new()),
 			files_to_be_deleted: RwLock::new(Vec::new()),
 			gc_in_progress: AtomicBool::new(false),
-			discard_stats: Mutex::new(DiscardStats::new(discard_stats_dir)?),
+			discard_stats: Mutex::new(DiscardStats::new(opts.discard_stats_dir())?),
 			delete_list,
 			cache: opts.vlog_cache.clone(),
 			opts,
@@ -1354,11 +1345,7 @@ pub(crate) struct DeleteList {
 }
 
 impl DeleteList {
-	pub(crate) fn new(base_path: PathBuf) -> Result<Self> {
-		// Create the delete_list directory if it doesn't exist
-		let delete_list_dir = base_path.join("delete_list");
-		std::fs::create_dir_all(&delete_list_dir)?;
-
+	pub(crate) fn new(delete_list_dir: PathBuf) -> Result<Self> {
 		// Create B+ tree for the delete list with a specific file name
 		let delete_list_file = delete_list_dir.join("delete_list.bpt");
 		let comparator = Arc::new(BytewiseComparator {});
@@ -1440,22 +1427,27 @@ mod tests {
 	use super::*;
 	use tempfile::TempDir;
 
-	fn create_test_vlog() -> (VLog<InternalKey>, TempDir) {
+	fn create_test_vlog(
+		opts: Option<Options<InternalKey>>,
+	) -> (VLog<InternalKey>, TempDir, Arc<Options<InternalKey>>) {
 		let temp_dir = TempDir::new().unwrap();
-		let mut opts = Options {
+
+		let mut opts = opts.unwrap_or(Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
 			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
-		};
-		// Set the path to the temp directory so vlog_file_path works correctly
+		});
+
 		opts.path = temp_dir.path().to_path_buf();
 
-		// Create vlog subdirectory to simulate the real directory structure
-		let vlog_dir = temp_dir.path().join("vlog");
-		std::fs::create_dir_all(&vlog_dir).unwrap();
+		// Create vlog subdirectory
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-		let vlog = VLog::new(&vlog_dir, Arc::new(opts)).unwrap();
-		(vlog, temp_dir)
+		let opts = Arc::new(opts);
+		let vlog = VLog::new(opts.clone()).unwrap();
+		(vlog, temp_dir, opts)
 	}
 
 	#[test]
@@ -1537,7 +1529,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_vlog_append_and_get() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
 		let key = b"test_key";
 		let value = vec![1u8; 300]; // Large enough for vlog
@@ -1550,7 +1542,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_vlog_small_value_acceptance() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
 		let key = b"test_key";
 		let small_value = vec![1u8; 10]; // Small value should now be accepted
@@ -1563,7 +1555,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_vlog_caching() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
 		let key = b"cache_test_key";
 		let value = vec![42u8; 1000]; // Large enough value
@@ -1587,22 +1579,14 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_prefill_file_handles() {
-		let temp_dir = TempDir::new().unwrap();
-		let mut opts = Options {
+		let opts = Options {
 			vlog_max_file_size: 1024, // Small file size to force multiple files
 			vlog_checksum_verification: VLogChecksumLevel::Full,
 			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
-		// Set the path to the temp directory so vlog_file_path works correctly
-		opts.path = temp_dir.path().to_path_buf();
-
-		// Create vlog subdirectory
-		let vlog_dir = temp_dir.path().join("vlog");
-		std::fs::create_dir_all(&vlog_dir).unwrap();
-
 		// Create initial VLog and add data to create multiple files
-		let vlog1 = VLog::<InternalKey>::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+		let (vlog1, _temp_dir, opts) = create_test_vlog(Some(opts));
 
 		// Add data to create multiple VLog files
 		let mut file_ids = Vec::new();
@@ -1632,7 +1616,7 @@ mod tests {
 		drop(vlog1);
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
-		let vlog2 = VLog::<InternalKey>::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+		let vlog2 = VLog::<InternalKey>::new(opts.clone()).unwrap();
 
 		// Verify that all existing files can be read
 		for (i, pointer) in pointers.iter().enumerate() {
@@ -1803,7 +1787,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_value_location_resolve_inline() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
 		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
@@ -1814,7 +1798,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_value_location_resolve_vlog() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let key = b"test_key";
 		let value = b"test_value_for_vlog_resolution";
@@ -1843,7 +1827,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_value_location_from_encoded_value_vlog() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let key = b"test_key";
 		let value = b"test_value_for_encoded_resolution";
 
@@ -1931,7 +1915,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_vlog_with_file_header() {
-		let (vlog, _temp_dir) = create_test_vlog();
+		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
 		// Append some data to create a VLog file with header
 		let key = b"test_key";
@@ -1956,14 +1940,15 @@ mod tests {
 		};
 
 		// Create vlog subdirectory
-		let vlog_dir = temp_dir.path().join("vlog");
-		std::fs::create_dir_all(&vlog_dir).unwrap();
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 		let mut pointers = Vec::new();
 
 		// Phase 1: Create initial VLog and add some data (but not enough to fill the file)
 		{
-			let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+			let vlog1 = VLog::new(Arc::new(opts.clone())).unwrap();
 
 			// Add some data to the first file
 			for i in 0..3 {
@@ -2002,7 +1987,7 @@ mod tests {
 
 		// Phase 2: Restart VLog and verify it continues with the last file
 		{
-			let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+			let vlog2 = VLog::new(Arc::new(opts.clone())).unwrap();
 
 			// Check that active_writer_id is set to the last file (file 0)
 			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -2097,15 +2082,16 @@ mod tests {
 		};
 
 		// Create vlog subdirectory
-		let vlog_dir = temp_dir.path().join("vlog");
-		std::fs::create_dir_all(&vlog_dir).unwrap();
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 		let mut all_pointers = Vec::new();
 		let mut highest_file_id = 0;
 
 		// Phase 1: Create VLog and add enough data to create 5+ files
 		{
-			let vlog1 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+			let vlog1 = VLog::new(Arc::new(opts.clone())).unwrap();
 
 			// Add enough data to create at least 5 VLog files
 			for i in 0..50 {
@@ -2138,7 +2124,7 @@ mod tests {
 
 		// Phase 2: Restart VLog and verify it picks up the correct active writer
 		{
-			let vlog2 = VLog::new(&vlog_dir, Arc::new(opts.clone())).unwrap();
+			let vlog2 = VLog::new(Arc::new(opts.clone())).unwrap();
 
 			// Check that active_writer_id is set to the highest file ID
 			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -2243,6 +2229,8 @@ mod tests {
 			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		});
+		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 		// Create a test file path
 		let test_file_path = temp_dir.path().join("vlog_writer_test.log");
@@ -2359,7 +2347,7 @@ mod tests {
 			let vlog_file_path = opts.vlog_file_path(file_id as u64);
 			std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
 
-			let vlog = VLog::new(&vlog_dir, opts.clone()).unwrap();
+			let vlog = VLog::new(opts.clone()).unwrap();
 
 			// Verify ALL phase 1 data can still be read (proving no overwrite occurred)
 			for (i, (pointer, (_, expected_value))) in
