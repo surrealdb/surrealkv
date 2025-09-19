@@ -309,56 +309,67 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 }
 
 impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
-	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &mut Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
-		// First, write large values to VLog and update batch with pointers
+	// Write batch to WAL and process VLog entries (synchronous operation)
+	// Returns a new batch with sequence numbers and VLog pointers applied
+	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<Batch> {
+		// Create a new batch with the same entries but updated value pointers
+		let mut processed_batch = Batch::new(seq_num);
+
+		// Process VLog entries and create the processed batch in a single loop
 		if let Some(ref vlog) = self.core.vlog {
-			let entries = batch.entries().to_vec(); // Clone to avoid borrowing issues
-			let mut current_seq_num = seq_num;
-			for (i, entry) in entries.iter().enumerate() {
-				if let Some(value) = &entry.value {
+			// Use the unified sequence number management
+			for (i, entry, current_seq_num) in batch.entries_with_seq_nums()? {
+				// Create full InternalKey for VLog
+				let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
+				let key_bytes = ikey.encode();
+
+				// Add the entry to the processed batch
+				processed_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+
+				// Determine value pointer based on VLog threshold
+				let valueptr = if let Some(value) = &entry.value {
 					// Check if value should go to VLog based on threshold
 					if value.len() > self.core.opts.vlog_value_threshold {
-						// Create full InternalKey for VLog
-						let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
-						let key_bytes = ikey.encode();
 						let pointer = vlog.append(&key_bytes, value)?;
-						batch.set_valueptr(i, Some(pointer))?;
+						Some(pointer)
 					} else {
 						// Small value, keep inline
-						batch.set_valueptr(i, None)?;
+						None
 					}
 				} else {
 					// No value (delete operation), keep inline
-					batch.set_valueptr(i, None)?;
-				}
-				current_seq_num += 1;
+					None
+				};
+
+				// Set the value pointer for this entry using the index from the iterator
+				processed_batch.set_valueptr(i, valueptr)?;
 			}
 
 			// Flush VLog to ensure data is written to disk
 			vlog.sync()?;
 		} else {
-			// No VLog, all values stay inline
-			for i in 0..batch.entries().len() {
-				batch.set_valueptr(i, None)?;
+			// No VLog, all values stay inline - just copy entries
+			for (i, entry) in batch.entries().iter().enumerate() {
+				processed_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+				processed_batch.set_valueptr(i, None)?;
 			}
 		}
 
 		// Then write to WAL
 		if let Some(ref wal) = self.core.wal {
 			let mut wal_guard = wal.write();
-			let enc_bytes = batch.encode(seq_num)?;
+			let enc_bytes = processed_batch.encode()?;
 			wal_guard.append(&enc_bytes)?;
 			if sync_wal {
 				wal_guard.sync()?;
 			}
 		}
 
-		Ok(())
+		Ok(processed_batch)
 	}
 
 	// Apply batch to memtable (can be called concurrently)
-	fn apply(&self, batch: &Batch, seq_num: u64) -> Result<()> {
+	fn apply(&self, batch: &Batch) -> Result<()> {
 		// Writes a batch of key-value pairs to the LSM tree.
 		//
 		// Write path in LSM trees:
@@ -377,7 +388,7 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 		}
 
 		// Add the batch to the active memtable
-		active_memtable.add(batch, seq_num)?;
+		active_memtable.add(batch)?;
 
 		Ok(())
 	}

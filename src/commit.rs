@@ -17,30 +17,29 @@ const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
-	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &mut Batch, seq_num: u64, sync_wal: bool) -> Result<()>;
+	// Write batch to WAL and process VLog entries (synchronous operation)
+	// Returns a new batch with sequence numbers and VLog pointers applied
+	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<Batch>;
 
-	// Apply batch to memtable (can be called concurrently)
-	fn apply(&self, batch: &Batch, seq_num: u64) -> Result<()>;
+	// Apply processed batch to memtable (can be called concurrently)
+	fn apply(&self, batch: &Batch) -> Result<()>;
 }
 
 // Lock-free commit queue entry
 struct CommitBatch {
-	batch: Mutex<Batch>,
 	seq_num: AtomicU64,
+	count: u32, // Number of entries in the batch
 	applied: AtomicBool,
-	sync_wal: bool,
 	complete_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
 }
 
 impl CommitBatch {
-	fn new(batch: Batch, sync_wal: bool) -> (Arc<Self>, oneshot::Receiver<Result<()>>) {
+	fn new(count: u32) -> (Arc<Self>, oneshot::Receiver<Result<()>>) {
 		let (tx, rx) = oneshot::channel();
 		let commit = Arc::new(Self {
-			batch: Mutex::new(batch),
 			seq_num: AtomicU64::new(0),
+			count,
 			applied: AtomicBool::new(false),
-			sync_wal,
 			complete_tx: Mutex::new(Some(tx)),
 		});
 		(commit, rx)
@@ -209,7 +208,7 @@ impl CommitPipeline {
 		}
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+	pub(crate) async fn commit(&self, mut batch: Batch, sync_wal: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -221,22 +220,27 @@ impl CommitPipeline {
 		// Acquire permit for flow control
 		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
 
-		let (commit_batch, complete_rx) = CommitBatch::new(batch, sync_wal);
+		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Phase 1: Prepare (single producer)
-		let seq_num = self.prepare(commit_batch.clone())?;
+		// Phase 1: Prepare (single producer) - assign sequence number
+		let seq_num = self.prepare(&mut batch, commit_batch.clone())?;
 
-		// Phase 2: Apply concurrently
+		// Phase 2: Write to WAL and process VLog (synchronous)
+		let processed_batch = {
+			let env = self.env.clone();
+			env.write(&batch, seq_num, sync_wal)?
+		};
+
+		// Phase 3: Apply to memtable (can be concurrent)
 		let apply_result = {
 			let env = self.env.clone();
-			let batch = commit_batch.batch.lock().unwrap();
-			env.apply(&*batch, seq_num)
+			env.apply(&processed_batch)
 		};
 
 		match apply_result {
 			Ok(_) => {
 				commit_batch.mark_applied();
-				// Phase 3: Publish (multi-consumer)
+				// Phase 4: Publish (multi-consumer)
 				self.publish();
 			}
 			Err(e) => {
@@ -250,22 +254,19 @@ impl CommitPipeline {
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
-	fn prepare(&self, commit_batch: Arc<CommitBatch>) -> Result<u64> {
+	fn prepare(&self, batch: &mut Batch, commit_batch: Arc<CommitBatch>) -> Result<u64> {
 		let _guard = self.write_mutex.lock().unwrap();
-
-		// Get mutable access to the batch
-		let mut batch = commit_batch.batch.lock().unwrap();
 
 		// Assign sequence number atomically
 		let count = batch.count() as u64;
 		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
 		commit_batch.set_seq_num(seq_num);
 
+		// Set the starting sequence number in the batch for unified sequence number management
+		batch.set_starting_seq_num(seq_num);
+
 		// Enqueue in pending queue (single producer operation)
 		self.pending.enqueue(commit_batch.clone());
-
-		// Write to WAL (must be serialized)
-		self.env.write(&mut *batch, seq_num, commit_batch.sync_wal)?;
 
 		Ok(seq_num)
 	}
@@ -278,8 +279,7 @@ impl CommitPipeline {
 			match dequeued {
 				Some(batch) => {
 					// Publish this batch's sequence number
-					let batch_guard = batch.batch.lock().unwrap();
-					let new_visible = batch.get_seq_num() + batch_guard.count() as u64 - 1;
+					let new_visible = batch.get_seq_num() + batch.count as u64 - 1;
 
 					loop {
 						let current = self.visible_seq_num.load(Ordering::Acquire);
@@ -339,11 +339,16 @@ mod tests {
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, _batch: &mut Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
-			Ok(())
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<Batch> {
+			// Create a copy of the batch for testing
+			let mut new_batch = Batch::new(_seq_num);
+			for entry in batch.entries() {
+				new_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+			}
+			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch, _seq_num: u64) -> Result<()> {
+		fn apply(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
 	}
@@ -352,7 +357,7 @@ mod tests {
 	async fn test_single_commit() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1")).unwrap();
 
 		let result = pipeline.commit(batch, false).await;
@@ -373,7 +378,7 @@ mod tests {
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
-			let mut batch = Batch::new();
+			let mut batch = Batch::new(0);
 			batch
 				.add_record(InternalKeyKind::Set, &format!("key{i}").into_bytes(), Some(&[1, 2, 3]))
 				.unwrap();
@@ -394,7 +399,7 @@ mod tests {
 		for i in 0..10 {
 			let pipeline = pipeline.clone();
 			let handle = tokio::spawn(async move {
-				let mut batch = Batch::new();
+				let mut batch = Batch::new(0);
 				batch
 					.add_record(
 						InternalKeyKind::Set,
@@ -428,15 +433,20 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, _batch: &mut Batch, _seq_num: u64, _sync_wal: bool) -> Result<()> {
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<Batch> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
 			}
-			Ok(())
+			// Create a copy of the batch for testing
+			let mut new_batch = Batch::new(_seq_num);
+			for entry in batch.entries() {
+				new_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+			}
+			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch, _seq_num: u64) -> Result<()> {
+		fn apply(&self, _batch: &Batch) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
@@ -453,7 +463,7 @@ mod tests {
 		for i in 0..5 {
 			let pipeline = pipeline.clone();
 			let handle = tokio::spawn(async move {
-				let mut batch = Batch::new();
+				let mut batch = Batch::new(0);
 				batch
 					.add_record(
 						InternalKeyKind::Set,

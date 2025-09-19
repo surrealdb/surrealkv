@@ -432,7 +432,7 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		self.core.oracle.unregister_txn_start(self.start_commit_id);
 
 		// Create and prepare batch directly
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(0);
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.

@@ -90,23 +90,21 @@ impl<K: InternalKeyTrait> MemTable<K> {
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
 	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive numbers)
-	pub(crate) fn add(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u32)> {
-		let (record_size, highest_seq_num) =
-			self.apply_batch_to_memtable(batch, starting_seq_num)?;
+	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
+		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
 		let size_before = self.update_memtable_size(record_size);
 		self.update_latest_sequence_number(highest_seq_num);
 		Ok((record_size, size_before + record_size))
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
-	/// Records in the batch get consecutive sequence numbers starting from `starting_seq_num`.
+	/// Records in the batch get consecutive sequence numbers from the batch's starting sequence number.
 	/// Returns (total_record_size, highest_seq_num_used).
-	fn apply_batch_to_memtable(&self, batch: &Batch, starting_seq_num: u64) -> Result<(u32, u64)> {
+	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
-		let mut current_seq_num = starting_seq_num;
 
-		// Process entries and their corresponding value pointers
-		for (i, entry) in batch.entries().iter().enumerate() {
+		// Process entries and their corresponding value pointers using unified sequence number management
+		for (i, entry, current_seq_num) in batch.entries_with_seq_nums()? {
 			let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
 
 			// Determine how to store the value based on value pointer
@@ -127,15 +125,10 @@ impl<K: InternalKeyTrait> MemTable<K> {
 
 			let entry_size = self.insert_into_memtable(&ikey, &val);
 			record_size += entry_size;
-			current_seq_num += 1;
 		}
 
-		// Return the highest sequence number used (current_seq_num - 1)
-		let highest_seq_num = if current_seq_num > starting_seq_num {
-			current_seq_num - 1
-		} else {
-			starting_seq_num // Empty batch case
-		};
+		// Get the highest sequence number used from the batch
+		let highest_seq_num = batch.get_highest_seq_num()?;
 
 		Ok((record_size, highest_seq_num))
 	}
@@ -282,10 +275,10 @@ mod tests {
 		let key = b"foo".to_vec();
 		let value = b"value";
 
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(1);
 		batch.set(&key, value).unwrap();
 
-		memtable.add(&batch, 1).unwrap();
+		memtable.add(&batch).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
 		assert_inline_value_matches(&res.1, value);
@@ -297,10 +290,10 @@ mod tests {
 		let key = b"foo".to_vec();
 		let value = b"value";
 
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(1);
 		batch.set(&key, value).unwrap();
 
-		memtable.add(&batch, 1).unwrap();
+		memtable.add(&batch).unwrap();
 
 		assert!(memtable.size() > 0);
 	}
@@ -312,10 +305,10 @@ mod tests {
 		let value = b"value";
 		let seq_num = 100;
 
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(seq_num);
 		batch.set(&key, value).unwrap();
 
-		memtable.add(&batch, 100).unwrap();
+		memtable.add(&batch).unwrap();
 
 		assert_eq!(seq_num, memtable.lsn());
 	}
@@ -326,18 +319,18 @@ mod tests {
 		let key1 = b"key1".to_vec();
 		let value1 = b"value1";
 
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new(1);
 		batch1.set(&key1, value1).unwrap();
 
-		memtable.add(&batch1, 1).unwrap();
+		memtable.add(&batch1).unwrap();
 
 		let key2 = b"key2".to_vec();
 		let value2 = b"value2";
 
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new(2);
 		batch2.set(&key2, value2).unwrap();
 
-		memtable.add(&batch2, 2).unwrap();
+		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
 		assert_inline_value_matches(&res.1, value1);
@@ -354,17 +347,17 @@ mod tests {
 		let value2 = &b"value2"[..];
 		let value3 = &b"value3"[..];
 
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new(1);
 		batch1.set(&key1, value1).unwrap();
-		memtable.add(&batch1, 1).unwrap();
+		memtable.add(&batch1).unwrap();
 
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new(2);
 		batch2.set(&key1, value2).unwrap();
-		memtable.add(&batch2, 2).unwrap();
+		memtable.add(&batch2).unwrap();
 
-		let mut batch3 = Batch::new();
+		let mut batch3 = Batch::new(3);
 		batch3.set(&key1, value3).unwrap();
-		memtable.add(&batch3, 3).unwrap();
+		memtable.add(&batch3).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
 		assert_inline_value_matches(&res.1, value3);
@@ -379,13 +372,13 @@ mod tests {
 		let key2 = b"foo1".to_vec();
 		let value2 = &b"value2"[..];
 
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new(0);
 		batch1.set(&key1, value1).unwrap();
-		memtable.add(&batch1, 0).unwrap();
+		memtable.add(&batch1).unwrap();
 
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new(1);
 		batch2.set(&key2, value2).unwrap();
-		memtable.add(&batch2, 1).unwrap();
+		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
 		assert_inline_value_matches(&res.1, value1);
@@ -410,7 +403,7 @@ mod tests {
 			});
 
 			// Create a single-entry batch for each record to ensure exact sequence number assignment
-			let mut batch = Batch::new();
+			let mut batch = Batch::new(seq_num);
 			match kind {
 				InternalKeyKind::Set => {
 					batch.set(&key, &value).unwrap();
@@ -424,7 +417,7 @@ mod tests {
 				}
 			}
 
-			memtable.add(&batch, seq_num).unwrap();
+			memtable.add(&batch).unwrap();
 
 			if custom_seq.is_some() {
 				last_seq = std::cmp::max(last_seq, seq_num);
@@ -820,20 +813,20 @@ mod tests {
 		assert_eq!(memtable.size(), 0);
 
 		// Add some data
-		let mut batch = Batch::new();
+		let mut batch = Batch::new(1);
 		batch.set(b"key1", b"value1").unwrap();
 		batch.set(b"key2", b"value2").unwrap();
 
-		let (record_size, total_size) = memtable.add(&batch, 1).unwrap();
+		let (record_size, total_size) = memtable.add(&batch).unwrap();
 		assert!(record_size > 0);
 		assert_eq!(total_size, record_size);
 		assert_eq!(memtable.size(), total_size as usize);
 
 		// Add more data
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new(2);
 		batch2.set(b"key3", b"value3").unwrap();
 
-		let (record_size2, total_size2) = memtable.add(&batch2, 2).unwrap();
+		let (record_size2, total_size2) = memtable.add(&batch2).unwrap();
 		assert!(record_size2 > 0);
 		assert_eq!(total_size2, total_size + record_size2);
 		assert_eq!(memtable.size(), total_size2 as usize);
@@ -847,21 +840,21 @@ mod tests {
 		assert_eq!(memtable.lsn(), 0);
 
 		// Add batch with seq_num 10
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new(10);
 		batch1.set(b"key1", b"value1").unwrap();
-		memtable.add(&batch1, 10).unwrap();
+		memtable.add(&batch1).unwrap();
 		assert_eq!(memtable.lsn(), 10);
 
 		// Add batch with lower seq_num - should not update
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new(5);
 		batch2.set(b"key2", b"value2").unwrap();
-		memtable.add(&batch2, 5).unwrap();
+		memtable.add(&batch2).unwrap();
 		assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 		// Add batch with higher seq_num
-		let mut batch3 = Batch::new();
+		let mut batch3 = Batch::new(20);
 		batch3.set(b"key3", b"value3").unwrap();
-		memtable.add(&batch3, 20).unwrap();
+		memtable.add(&batch3).unwrap();
 		assert_eq!(memtable.lsn(), 20);
 	}
 }

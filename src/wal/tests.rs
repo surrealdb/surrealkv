@@ -105,15 +105,15 @@ fn test_wal_replay_latest_segment_only() {
 	wal.rotate().unwrap();
 
 	// Write batch records to third segment (latest)
-	let mut batch = Batch::new();
+	// Encode the batch with sequence number 100
+	let mut batch = Batch::new(100);
 	for i in 20..25 {
 		let key = format!("key_{i:02}");
 		let value = format!("value_{i:02}");
 		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 	}
 
-	// Encode the batch with sequence number 100
-	let encoded_batch = batch.encode(100).unwrap();
+	let encoded_batch = batch.encode().unwrap();
 	wal.append(&encoded_batch).unwrap();
 
 	// Close WAL to ensure everything is flushed
