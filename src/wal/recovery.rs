@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::wal::segment::list_segment_ids;
 use crate::{
-	batch::{Batch, BatchReader},
+	batch::Batch,
 	error::Result,
 	memtable::MemTable,
 	sstable::InternalKeyTrait,
@@ -83,17 +83,13 @@ pub(crate) fn replay_wal<K: InternalKeyTrait>(
 				// Update tracking info
 				last_valid_offset = offset as usize;
 
-				// Parse the batch
-				let batch_reader = BatchReader::new(record_data)?;
-				let seq_num = batch_reader.get_seq_num();
-
-				// Update max sequence number
-				if seq_num > max_seq_num {
-					max_seq_num = seq_num;
-				}
-
 				// Decode batch and get sequence number
 				let (batch_seq_num, batch) = Batch::decode(record_data)?;
+
+				// Update max sequence number
+				if batch_seq_num > max_seq_num {
+					max_seq_num = batch_seq_num;
+				}
 
 				// Apply the batch to the memtable
 				memtable.add(&batch, batch_seq_num)?;

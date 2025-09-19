@@ -125,7 +125,8 @@ impl<K: InternalKeyTrait> MemTable<K> {
 					.into()
 			};
 
-			record_size += self.insert_into_memtable(&ikey, &val);
+			let entry_size = self.insert_into_memtable(&ikey, &val);
+			record_size += entry_size;
 			current_seq_num += 1;
 		}
 
@@ -179,6 +180,7 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		vlog: Option<Arc<VLog<K>>>,
 	) -> Result<Arc<Table<K>>> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
+
 		{
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone());

@@ -26,7 +26,7 @@ pub trait CommitEnv: Send + Sync + 'static {
 
 // Lock-free commit queue entry
 struct CommitBatch {
-	batch: Batch,
+	batch: Mutex<Batch>,
 	seq_num: AtomicU64,
 	applied: AtomicBool,
 	sync_wal: bool,
@@ -37,7 +37,7 @@ impl CommitBatch {
 	fn new(batch: Batch, sync_wal: bool) -> (Arc<Self>, oneshot::Receiver<Result<()>>) {
 		let (tx, rx) = oneshot::channel();
 		let commit = Arc::new(Self {
-			batch,
+			batch: Mutex::new(batch),
 			seq_num: AtomicU64::new(0),
 			applied: AtomicBool::new(false),
 			sync_wal,
@@ -229,8 +229,8 @@ impl CommitPipeline {
 		// Phase 2: Apply concurrently
 		let apply_result = {
 			let env = self.env.clone();
-			let batch_ref = &commit_batch.batch;
-			env.apply(batch_ref, seq_num)
+			let batch = commit_batch.batch.lock().unwrap();
+			env.apply(&*batch, seq_num)
 		};
 
 		match apply_result {
@@ -253,17 +253,19 @@ impl CommitPipeline {
 	fn prepare(&self, commit_batch: Arc<CommitBatch>) -> Result<u64> {
 		let _guard = self.write_mutex.lock().unwrap();
 
+		// Get mutable access to the batch
+		let mut batch = commit_batch.batch.lock().unwrap();
+
 		// Assign sequence number atomically
-		let count = commit_batch.batch.count() as u64;
+		let count = batch.count() as u64;
 		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
 		commit_batch.set_seq_num(seq_num);
 
 		// Enqueue in pending queue (single producer operation)
 		self.pending.enqueue(commit_batch.clone());
 
-		// Write to WAL (must be serialized) - clone batch for VLog processing
-		let mut batch_copy = commit_batch.batch.clone();
-		self.env.write(&mut batch_copy, seq_num, commit_batch.sync_wal)?;
+		// Write to WAL (must be serialized)
+		self.env.write(&mut *batch, seq_num, commit_batch.sync_wal)?;
 
 		Ok(seq_num)
 	}
@@ -276,7 +278,8 @@ impl CommitPipeline {
 			match dequeued {
 				Some(batch) => {
 					// Publish this batch's sequence number
-					let new_visible = batch.get_seq_num() + batch.batch.count() as u64 - 1;
+					let batch_guard = batch.batch.lock().unwrap();
+					let new_visible = batch.get_seq_num() + batch_guard.count() as u64 - 1;
 
 					loop {
 						let current = self.visible_seq_num.load(Ordering::Acquire);
@@ -351,13 +354,11 @@ mod tests {
 
 		let mut batch = Batch::new();
 		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1")).unwrap();
-		println!("Batch count: {}", batch.count());
 
 		let result = pipeline.commit(batch, false).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
-		println!("Visible seq num after single commit: {visible}");
 		assert_eq!(
 			visible, 1,
 			"Expected visible=1 after one commit with count=1 (highest seq num used)"
@@ -369,7 +370,6 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 	async fn test_sequential_commits() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-		println!("initial visible seq num: {}", pipeline.get_visible_seq_num());
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
@@ -377,13 +377,10 @@ mod tests {
 			batch
 				.add_record(InternalKeyKind::Set, &format!("key{i}").into_bytes(), Some(&[1, 2, 3]))
 				.unwrap();
-			// println!("Batch {} count: {}", i, batch.count());
 			let result = pipeline.commit(batch, false).await;
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
-			println!("visible seq num after commit {}: {}", i, pipeline.get_visible_seq_num());
 		}
 
-		println!("Final visible seq num: {}", pipeline.get_visible_seq_num());
 		assert_eq!(pipeline.get_visible_seq_num(), 5);
 
 		pipeline.shutdown();

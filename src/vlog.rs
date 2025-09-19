@@ -755,6 +755,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 		let key_len = pointer.key_size;
 		let value_len = pointer.value_size;
 		let total_size = pointer.total_entry_size();
+
 		let mut entry_data = vec![0u8; total_size as usize];
 		vfs::File::read_at(&*file, pointer.offset, &mut entry_data)?;
 
@@ -890,7 +891,9 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 		// Check if this file meets the discard ratio threshold
 		let should_compact = {
-			let (total_size, _, discard_ratio) = self.get_file_stats(file_id);
+			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
+			println!("VLog file {}: total_size={}, discard_bytes={}, discard_ratio={:.2}, threshold={:.2}", 
+				file_id, total_size, discard_bytes, discard_ratio, self.gc_discard_ratio);
 
 			if total_size == 0 {
 				false
