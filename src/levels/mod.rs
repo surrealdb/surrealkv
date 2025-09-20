@@ -358,7 +358,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 
 	// Generate a unique temporary filename
 	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::thread_rng().gen::<u64>());
+	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::rng().random::<u64>());
 	let temp_path = directory.join(temp_filename);
 
 	// Get original file permissions if the file exists

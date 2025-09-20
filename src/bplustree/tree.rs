@@ -2244,8 +2244,7 @@ mod tests {
 	use std::io::Read;
 
 	use super::*;
-	// use rand::{rngs::StdRng, Rng, SeedableRng};
-	use rand::Rng;
+	use rand::{rngs::StdRng, Rng, SeedableRng};
 	use tempfile::NamedTempFile;
 
 	#[derive(Clone)]
@@ -2505,8 +2504,8 @@ mod tests {
 	}
 
 	fn generate_random_values(n: usize, value_size: usize) -> Vec<Vec<u8>> {
-		let mut rng = rand::thread_rng();
-		(0..n).map(|_| (0..value_size).map(|_| rng.gen::<u8>()).collect()).collect()
+		let mut rng = rand::rng();
+		(0..n).map(|_| (0..value_size).map(|_| rng.random::<u8>()).collect()).collect()
 	}
 
 	#[test]
@@ -3592,121 +3591,121 @@ mod tests {
 		}
 	}
 
-	// // Long sequence of insertions and deletions to stress test size handling
-	// #[test]
-	// fn test_insertion_deletion_sequence() {
-	// 	let mut tree = create_test_tree(false);
+	// Long sequence of insertions and deletions to stress test size handling
+	#[test]
+	fn test_insertion_deletion_sequence() {
+		let mut tree = create_test_tree(false);
 
-	// 	// Use deterministic random for reproducibility
-	// 	let mut rng = StdRng::seed_from_u64(123);
+		// Use deterministic random for reproducibility
+		let mut rng = StdRng::seed_from_u64(123);
 
-	// 	// Track all inserted keys
-	// 	let mut all_keys = vec![];
-	// 	let mut active_keys = std::collections::HashSet::new();
+		// Track all inserted keys
+		let mut all_keys = vec![];
+		let mut active_keys = std::collections::HashSet::new();
 
-	// 	// Phase 1: Insert many keys of varying sizes
-	// 	let num_initial = 100;
-	// 	println!("Phase 1: Inserting {} initial keys", num_initial);
+		// Phase 1: Insert many keys of varying sizes
+		let num_initial = 100;
+		println!("Phase 1: Inserting {} initial keys", num_initial);
 
-	// 	for i in 0..num_initial {
-	// 		// Create key with sequence number and random size
-	// 		let key_size = rng.gen_range(10..400);
-	// 		let mut key = format!("key_{:05}_", i).into_bytes();
-	// 		key.extend(vec![b'k'; key_size - key.len()]);
+		for i in 0..num_initial {
+			// Create key with sequence number and random size
+			let key_size = rng.random_range(10..400);
+			let mut key = format!("key_{:05}_", i).into_bytes();
+			key.extend(vec![b'k'; key_size - key.len()]);
 
-	// 		let value_size = rng.gen_range(10..200);
-	// 		let value = vec![b'v'; value_size];
+			let value_size = rng.random_range(10..200);
+			let value = vec![b'v'; value_size];
 
-	// 		// Insert and track
-	// 		tree.insert(&key, &value).unwrap();
-	// 		all_keys.push((key.clone(), value));
-	// 		active_keys.insert(key);
+			// Insert and track
+			tree.insert(&key, &value).unwrap();
+			all_keys.push((key.clone(), value));
+			active_keys.insert(key);
 
-	// 		// Periodically flush
-	// 		if i % 20 == 19 {
-	// 			tree.flush().unwrap();
-	// 		}
-	// 	}
+			// Periodically flush
+			if i % 20 == 19 {
+				tree.flush().unwrap();
+			}
+		}
 
-	// 	// Phase 2: Delete random keys
-	// 	let num_deletions = 40;
-	// 	println!("Phase 2: Deleting {} random keys", num_deletions);
+		// Phase 2: Delete random keys
+		let num_deletions = 40;
+		println!("Phase 2: Deleting {} random keys", num_deletions);
 
-	// 	let mut keys_to_delete = active_keys.iter().cloned().collect::<Vec<_>>();
-	// 	for _ in 0..num_deletions {
-	// 		if keys_to_delete.is_empty() {
-	// 			break;
-	// 		}
+		let mut keys_to_delete = active_keys.iter().cloned().collect::<Vec<_>>();
+		for _ in 0..num_deletions {
+			if keys_to_delete.is_empty() {
+				break;
+			}
 
-	// 		let idx = rng.gen_range(0..keys_to_delete.len());
-	// 		let key = keys_to_delete.swap_remove(idx);
+			let idx = rng.random_range(0..keys_to_delete.len());
+			let key = keys_to_delete.swap_remove(idx);
 
-	// 		// println!("Deleting key of size {}", key.len());
-	// 		tree.delete(&key).unwrap();
-	// 		active_keys.remove(&key);
+			// println!("Deleting key of size {}", key.len());
+			tree.delete(&key).unwrap();
+			active_keys.remove(&key);
 
-	// 		// Periodic flush
-	// 		if rng.gen_bool(0.2) {
-	// 			tree.flush().unwrap();
-	// 		}
-	// 	}
+			// Periodic flush
+			if rng.random_bool(0.2) {
+				tree.flush().unwrap();
+			}
+		}
 
-	// 	// Phase 3: Insert more keys, some very large
-	// 	let num_additional = 30;
-	// 	println!("Phase 3: Inserting {} additional keys, some very large", num_additional);
+		// Phase 3: Insert more keys, some very large
+		let num_additional = 30;
+		println!("Phase 3: Inserting {} additional keys, some very large", num_additional);
 
-	// 	for i in 0..num_additional {
-	// 		// Every 3rd key is very large
-	// 		let key_size = if i % 3 == 0 {
-	// 			rng.gen_range(1000..2000)
-	// 		} else {
-	// 			rng.gen_range(10..200)
-	// 		};
+		for i in 0..num_additional {
+			// Every 3rd key is very large
+			let key_size = if i % 3 == 0 {
+				rng.random_range(1000..2000)
+			} else {
+				rng.random_range(10..200)
+			};
 
-	// 		let mut key = format!("additional_{:05}_", i).into_bytes();
-	// 		key.extend(vec![b'k'; key_size - key.len()]);
+			let mut key = format!("additional_{:05}_", i).into_bytes();
+			key.extend(vec![b'k'; key_size - key.len()]);
 
-	// 		let value_size = rng.gen_range(10..100);
-	// 		let value = vec![b'v'; value_size];
+			let value_size = rng.random_range(10..100);
+			let value = vec![b'v'; value_size];
 
-	// 		// Insert and track
-	// 		tree.insert(&key, &value).unwrap();
-	// 		all_keys.push((key.clone(), value));
-	// 		active_keys.insert(key);
+			// Insert and track
+			tree.insert(&key, &value).unwrap();
+			all_keys.push((key.clone(), value));
+			active_keys.insert(key);
 
-	// 		// Periodic flush
-	// 		if i % 10 == 9 {
-	// 			tree.flush().unwrap();
-	// 		}
-	// 	}
+			// Periodic flush
+			if i % 10 == 9 {
+				tree.flush().unwrap();
+			}
+		}
 
-	// 	// Final flush
-	// 	tree.flush().unwrap();
+		// Final flush
+		tree.flush().unwrap();
 
-	// 	// Verification phase
-	// 	println!("Verification: Checking all remaining keys can be found");
+		// Verification phase
+		println!("Verification: Checking all remaining keys can be found");
 
-	// 	// Verify all active keys can be found
-	// 	for key in &active_keys {
-	// 		let expected_value =
-	// 			all_keys.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap();
+		// Verify all active keys can be found
+		for key in &active_keys {
+			let expected_value =
+				all_keys.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap();
 
-	// 		let retrieved = tree.get(key).unwrap();
-	// 		assert!(retrieved.is_some(), "Active key of size {} not found", key.len());
-	// 		assert_eq!(retrieved.unwrap(), expected_value);
-	// 	}
+			let retrieved = tree.get(key).unwrap();
+			assert!(retrieved.is_some(), "Active key of size {} not found", key.len());
+			assert_eq!(retrieved.unwrap(), expected_value);
+		}
 
-	// 	// Verify deleted keys no longer exist
-	// 	for (key, _) in &all_keys {
-	// 		if !active_keys.contains(key) {
-	// 			assert!(
-	// 				tree.get(key).unwrap().is_none(),
-	// 				"Deleted key of size {} still exists",
-	// 				key.len()
-	// 			);
-	// 		}
-	// 	}
-	// }
+		// Verify deleted keys no longer exist
+		for (key, _) in &all_keys {
+			if !active_keys.contains(key) {
+				assert!(
+					tree.get(key).unwrap().is_none(),
+					"Deleted key of size {} still exists",
+					key.len()
+				);
+			}
+		}
+	}
 
 	#[test]
 	fn test_allocate_new_page_when_no_free_pages() {

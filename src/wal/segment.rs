@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::fs::{read_dir, OpenOptions};
@@ -6,7 +7,6 @@ use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
-use ahash::{HashMap, HashMapExt};
 use crc32fast::Hasher;
 
 /// The size of a single block in bytes.

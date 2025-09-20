@@ -1842,10 +1842,10 @@ mod tests {
 		let mut keys = Vec::new();
 
 		for _ in 0..100 {
-			let len = rng.gen_range(3..10);
+			let len = rng.random_range(3..10);
 			let mut key = Vec::with_capacity(len);
 			for _ in 0..len {
-				key.push(rng.gen_range(b'a'..=b'z'));
+				key.push(rng.random_range(b'a'..=b'z'));
 			}
 			keys.push(key);
 		}
