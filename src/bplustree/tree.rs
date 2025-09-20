@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +10,7 @@ use crate::vfs::File as VfsFile;
 use crate::Comparator;
 
 // These are type aliases for convenience
-pub type DiskBPlusTree = BPlusTree<std::fs::File>;
+pub type DiskBPlusTree = BPlusTree<File>;
 
 #[derive(Clone)]
 struct NodeWeighter;
@@ -931,7 +932,8 @@ impl<F: VfsFile> Drop for BPlusTree<F> {
 		}
 	}
 }
-impl BPlusTree<std::fs::File> {
+
+impl BPlusTree<File> {
 	pub fn disk<P: AsRef<Path>>(path: P, compare: Arc<dyn Comparator>) -> Result<Self> {
 		use std::fs::OpenOptions;
 		let file =
@@ -1008,6 +1010,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(tree)
 	}
 
+	#[allow(dead_code)]
 	pub fn set_durability(&mut self, durability: Durability) {
 		self.durability = durability;
 	}
@@ -2330,7 +2333,7 @@ mod tests {
 		}
 	}
 
-	fn create_test_tree(sync: bool) -> BPlusTree<std::fs::File> {
+	fn create_test_tree(sync: bool) -> BPlusTree<File> {
 		let file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap();
 		tree.set_durability(if sync {

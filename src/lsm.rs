@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
 	batch::Batch,
+	bplustree::tree::DiskBPlusTree,
 	checkpoint::{CheckpointMetadata, DatabaseCheckpoint},
 	commit::{CommitEnv, CommitPipeline},
 	compaction::{
@@ -19,7 +20,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, InternalKeyTrait},
+	sstable::{table::Table, InternalKey, InternalKeyKind, InternalKeyTrait, ReverseTimestampKey},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -110,6 +111,10 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	/// Write-Ahead Log (WAL) for durability
 	/// In memory-only mode, this is None since we don't persist to disk.
 	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
+
+	/// Versioned B+ tree index for timestamp-based queries
+	/// Maps ReverseTimestampKey -> Value for efficient time-range queries
+	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
 impl<K: InternalKeyTrait> CoreInner<K> {
@@ -142,6 +147,18 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 			None
 		};
 
+		// Initialize versioned index if versioned queries are enabled
+		let versioned_index = if opts.enable_versioning && !opts.in_memory_only {
+			// Create the versioned index directory if it doesn't exist
+			let versioned_index_dir = opts.versioned_index_dir();
+			let versioned_index_path = versioned_index_dir.join("index.bpt");
+			let comparator = Arc::new(crate::BytewiseComparator {});
+			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
+			Some(Arc::new(RwLock::new(tree)))
+		} else {
+			None
+		};
+
 		Ok(Self {
 			opts,
 			active_memtable,
@@ -151,6 +168,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 			oracle: Arc::new(oracle),
 			vlog,
 			wal: wal.map(parking_lot::RwLock::new),
+			versioned_index,
 		})
 	}
 
@@ -256,6 +274,72 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		let location = ValueLocation::decode(value)?;
 		location.resolve_value(self.vlog.as_ref())
 	}
+
+	/// TODO: Still needs work.
+	/// Cleans expired versions from the versioned index based on retention policy
+	#[allow(unused)]
+	pub(crate) fn clean_expired_versions(&self) -> Result<()> {
+		if !self.opts.enable_versioning || self.opts.versioned_history_retention_ns == 0 {
+			return Ok(()); // No retention limit or versioned queries disabled
+		}
+
+		if let Some(ref versioned_index) = self.versioned_index {
+			let current_time = std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos() as u64;
+
+			let cutoff_time = current_time.saturating_sub(self.opts.versioned_history_retention_ns);
+
+			// Create a range query to find all entries older than cutoff_time
+			let start_key = ReverseTimestampKey::new(
+				vec![], // Empty user key for range start
+				0,
+				InternalKeyKind::Set,
+				0, // Start from beginning of time
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				vec![0xFF; 256], // Max user key for range end
+				u64::MAX,
+				InternalKeyKind::Set,
+				cutoff_time, // End at cutoff time
+			)
+			.encode();
+
+			let mut index_guard = versioned_index.write().unwrap();
+
+			// Get all entries in the time range
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+			let mut keys_to_delete = Vec::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((key, _value)) => {
+						// Decode the key to check timestamp
+						let reverse_key = ReverseTimestampKey::decode(&key);
+						if reverse_key.timestamp < cutoff_time {
+							keys_to_delete.push(key);
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			// Delete expired entries
+			for key in keys_to_delete {
+				if let Err(e) = index_guard.delete(&key) {
+					eprintln!("Failed to delete expired version: {}", e);
+				}
+			}
+		}
+
+		Ok(())
+	}
 }
 
 impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
@@ -277,6 +361,9 @@ impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
 		// Execute compaction according to the chosen strategy
 		let compactor = Compactor::new(options, strategy);
 		compactor.compact()?;
+
+		// // Clean expired versions from versioned index after compaction
+		// self.clean_expired_versions()?;
 
 		Ok(())
 	}
@@ -318,9 +405,9 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 		// Process VLog entries and create the processed batch in a single loop
 		if let Some(ref vlog) = self.core.vlog {
 			// Use the unified sequence number management
-			for (_, entry, current_seq_num) in batch.entries_with_seq_nums()? {
+			for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 				// Create full InternalKey for VLog
-				let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
+				let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 				let key_bytes = ikey.encode();
 
 				// Determine value pointer and pre-encode ValueLocation
@@ -352,6 +439,7 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 					&entry.key,
 					encoded_value.as_deref(),
 					valueptr,
+					timestamp,
 				)?;
 			}
 
@@ -380,6 +468,7 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 					&entry.key,
 					encoded_value.as_deref(),
 					None,
+					entry.timestamp,
 				)?;
 			}
 		}
@@ -649,6 +738,9 @@ pub struct Tree<K: InternalKeyTrait = InternalKey> {
 impl<K: InternalKeyTrait> Tree<K> {
 	/// Creates a new LSM tree with the specified options
 	fn new(opts: Arc<Options<K>>) -> Result<Self> {
+		// Validate options before creating the tree
+		opts.validate()?;
+
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
@@ -685,6 +777,10 @@ impl<K: InternalKeyTrait> Tree<K> {
 			create_dir_all(opts.vlog_dir())?;
 			create_dir_all(opts.discard_stats_dir())?;
 			create_dir_all(opts.delete_list_dir())?;
+		}
+
+		if opts.enable_versioning {
+			create_dir_all(opts.versioned_index_dir())?;
 		}
 
 		Ok(())
@@ -945,6 +1041,12 @@ impl<K: InternalKeyTrait> TreeBuilder<K> {
 		self
 	}
 
+	/// Enables or disables versioned queries with timestamp tracking
+	pub fn with_enable_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
+		self.opts = self.opts.with_enable_versioning(enable, retention_ns);
+		self
+	}
+
 	/// Builds the LSM tree with the configured options.
 	///
 	/// This method ensures type safety by using the same key type K
@@ -1026,6 +1128,16 @@ fn sync_directory_structure<K: InternalKeyTrait>(opts: &Options<K>) -> Result<()
 			Error::Other(format!(
 				"Failed to sync delete list directory '{}': {}",
 				opts.delete_list_dir().display(),
+				e
+			))
+		})?;
+	}
+
+	if opts.enable_versioning {
+		fsync_directory(opts.versioned_index_dir()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to sync versioned index directory '{}': {}",
+				opts.versioned_index_dir().display(),
 				e
 			))
 		})?;

@@ -1064,13 +1064,17 @@ impl<K: InternalKeyTrait> VLog<K> {
 				// This preserves the original operation (Set, Delete, Merge, etc.)
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
-				let kind = internal_key.kind();
 				let val = if value.is_empty() {
 					None
 				} else {
 					Some(value.as_slice())
 				};
-				batch.add_record(kind, internal_key.user_key().as_ref(), val)?;
+				batch.add_record(
+					internal_key.kind(),
+					internal_key.user_key().as_ref(),
+					val,
+					internal_key.timestamp(),
+				)?;
 
 				// Update batch size tracking
 				batch_size += internal_key.user_key().len() + value.len();
