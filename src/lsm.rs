@@ -401,7 +401,7 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		// Create a new batch for processed entries with pre-encoded values
 		let mut processed_batch = Batch::new(seq_num);
-
+		let mut reverse_timestamp_entries = Vec::new();
 		// Process VLog entries and create the processed batch in a single loop
 		if let Some(ref vlog) = self.core.vlog {
 			// Use the unified sequence number management
@@ -419,6 +419,19 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 						// Pre-encode ValueLocation with VLog pointer
 						let value_location = ValueLocation::with_pointer(pointer.clone());
 						let encoded = value_location.encode();
+
+						if self.core.opts.enable_versioning {
+							// Create ReverseTimestampKey for efficient time-range queries
+							let reverse_key = ReverseTimestampKey::new(
+								entry.key.clone(),
+								current_seq_num,
+								entry.kind,
+								timestamp,
+							);
+							let encoded_key = reverse_key.encode();
+							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
+						}
+
 						(Some(pointer), Some(encoded))
 					} else {
 						// Small value, keep inline - pre-encode ValueLocation with inline value
@@ -470,6 +483,14 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 					None,
 					entry.timestamp,
 				)?;
+			}
+		}
+
+		// Write to versioned index
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			let mut versioned_index_guard = versioned_index.write().unwrap();
+			for (encoded_key, encoded_value) in reverse_timestamp_entries {
+				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
 		}
 

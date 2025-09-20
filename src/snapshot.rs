@@ -230,7 +230,7 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 			let range_iter = index_guard.range(&start_key, &end_key)?;
 
 			// Find the most recent version at or before the timestamp that's visible to this snapshot
-			let mut latest_value = None;
+			let mut latest_value: Option<Arc<[u8]>> = None;
 			let mut latest_timestamp = 0;
 
 			for entry in range_iter {
@@ -254,7 +254,8 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 				}
 			}
 
-			Ok(latest_value)
+			let val = self.core.resolve_value(latest_value.unwrap().as_ref())?;
+			Ok(Some(val))
 		} else {
 			Ok(None)
 		}
