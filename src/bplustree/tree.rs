@@ -325,51 +325,6 @@ impl InternalNode {
 		self.children.extend(right.children.clone());
 	}
 
-	// Check if this node can fit another entry
-	fn can_fit_entry(&self, key: &[u8]) -> bool {
-		self.would_fit(key, None)
-	}
-
-	fn find_split_point(&self, new_key: &[u8], compare: &dyn Comparator) -> usize {
-		// Find where the new key would go
-		let mut insert_idx = 0;
-		while insert_idx < self.keys.len()
-			&& compare.compare(new_key, &self.keys[insert_idx]) == Ordering::Greater
-		{
-			insert_idx += 1;
-		}
-
-		// Create a temporary node to simulate the insertion
-		let mut temp_keys = self.keys.clone();
-		temp_keys.insert(insert_idx, new_key.to_vec());
-
-		// Target size for left node after split (approximately half)
-		let target_size =
-			(self.current_size() + KEY_SIZE_PREFIX + new_key.len() + CHILD_PTR_SIZE) / 2;
-
-		// Find split point that results in approximately balanced sizes
-		let mut current_size = INTERNAL_HEADER_SIZE;
-		let mut split_idx = 0;
-
-		for (i, key) in temp_keys.iter().enumerate() {
-			let entry_size = KEY_SIZE_PREFIX + key.len() + CHILD_PTR_SIZE;
-
-			if current_size + entry_size > target_size && i > 0 {
-				split_idx = i;
-				break;
-			}
-
-			current_size += entry_size;
-		}
-
-		// Ensure we don't split at the end
-		if split_idx == 0 || split_idx >= temp_keys.len() - 1 {
-			split_idx = temp_keys.len() / 2;
-		}
-
-		split_idx
-	}
-
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
 		// Consider a node to be in underflow if it has less than 30% capacity utilized
@@ -437,7 +392,11 @@ impl Node for InternalNode {
 	fn would_fit(&self, key: &[u8], _value: Option<&[u8]>) -> bool {
 		// Calculate size with additional key and child pointer
 		let additional_size = KEY_SIZE_PREFIX + key.len() + CHILD_PTR_SIZE;
-		self.current_size() + additional_size <= Self::max_size()
+		let current_size = self.current_size();
+		let max_size = Self::max_size();
+		let would_fit = current_size + additional_size <= max_size;
+
+		would_fit
 	}
 
 	fn can_merge_with(&self, other: &Self) -> bool {
@@ -445,17 +404,22 @@ impl Node for InternalNode {
 		let actual_merged_size = combined_size - INTERNAL_HEADER_SIZE;
 
 		// We also need to add space for the separator key from parent
-		// TODO: This is an estimate based on average. Figure out how to calculate this
-		let avg_key_size = if !self.keys.is_empty() {
-			self.keys.iter().map(|k| k.len()).sum::<usize>() / self.keys.len()
+		// Use the maximum key size instead of average to be safe
+		let max_key_size = if !self.keys.is_empty() && !other.keys.is_empty() {
+			let self_max = self.keys.iter().map(|k| k.len()).max().unwrap_or(0);
+			let other_max = other.keys.iter().map(|k| k.len()).max().unwrap_or(0);
+			self_max.max(other_max)
+		} else if !self.keys.is_empty() {
+			self.keys.iter().map(|k| k.len()).max().unwrap_or(0)
 		} else if !other.keys.is_empty() {
-			other.keys.iter().map(|k| k.len()).sum::<usize>() / other.keys.len()
+			other.keys.iter().map(|k| k.len()).max().unwrap_or(0)
 		} else {
 			0 // Edge case: both nodes have no keys
 		};
 
-		let with_separator = actual_merged_size + KEY_SIZE_PREFIX + avg_key_size;
+		let with_separator = actual_merged_size + KEY_SIZE_PREFIX + max_key_size;
 
+		// Check if the combined size is within the maximum
 		with_separator <= Self::max_size()
 	}
 }
@@ -1129,8 +1093,16 @@ impl<F: VfsFile> BPlusTree<F> {
 						},
 					};
 
-					if parent.can_fit_entry(&promoted_key) {
-						// Parent has space, insert the new key and child
+
+					// IMPROVED APPROACH: Be more proactive about splitting nodes
+					// Check if adding this entry would put us close to the maximum size
+					// This helps avoid issues during deletion or future operations
+					let entry_size = KEY_SIZE_PREFIX + promoted_key.len() + CHILD_PTR_SIZE;
+					let would_be_size = parent.current_size() + entry_size;
+					let size_threshold = InternalNode::max_size() - 256; // Leave some buffer space
+
+					if would_be_size <= size_threshold {
+						// Parent has enough space with buffer, insert the new key and child
 						parent.insert_key_child(
 							&promoted_key,
 							new_node_offset,
@@ -1267,41 +1239,121 @@ impl<F: VfsFile> BPlusTree<F> {
 		extra_key: &[u8],
 		extra_child: u64,
 	) -> Result<(Vec<u8>, u64)> {
-		// Insert the extra key and child into the node temporarily
-		node.insert_key_child(extra_key, extra_child, self.compare.as_ref());
+		// PROPER FIX: Create a copy of the original node's data to work with
+		// This way we never temporarily overfill the node
+		let original_keys = node.keys.clone();
+		let original_children = node.children.clone();
 
-		// Now split the node
-		let (promoted_key, new_node_offset) = self.split_internal(node, None)?;
+		// Find where the extra key would be inserted
+		let mut insert_idx = 0;
+		while insert_idx < original_keys.len()
+			&& self.compare.compare(extra_key, &original_keys[insert_idx]) == Ordering::Greater
+		{
+			insert_idx += 1;
+		}
 
-		Ok((promoted_key, new_node_offset))
-	}
-
-	fn split_internal(
-		&mut self,
-		node: &mut InternalNode,
-		new_key: Option<&[u8]>,
-	) -> Result<(Vec<u8>, u64)> {
-		let split_idx = if let Some(key) = new_key {
-			// If we're splitting due to a specific key, find optimal split point
-			node.find_split_point(key, self.compare.as_ref())
-		} else {
-			// Otherwise use a simple middle split
-			node.keys.len() / 2
-		};
-
-		// Create new internal node
+		// Create a new internal node
 		let new_node_offset = self.allocate_page()?;
 		let mut new_node = InternalNode::new(new_node_offset);
 
+		// Find the optimal split point that ensures both resulting nodes will have enough space
+		// We need to consider the extra key/child in our calculations
+		let mut best_split_idx = original_keys.len() / 2; // Default to middle split
+		let mut best_balance = usize::MAX;
+
+		// Try all possible split points
+		for split_idx in 0..original_keys.len() {
+			// Calculate sizes if we split at this point
+
+			// Determine if extra key goes to left or right side
+			let extra_to_left = insert_idx <= split_idx;
+
+			// Calculate left node size (keys before split_idx + maybe extra key)
+			let mut left_keys_size = 0;
+			for i in 0..split_idx {
+				left_keys_size += KEY_SIZE_PREFIX + original_keys[i].len();
+			}
+
+			// Calculate right node size (keys after split_idx+1 + maybe extra key)
+			let mut right_keys_size = 0;
+			for i in (split_idx + 1)..original_keys.len() {
+				right_keys_size += KEY_SIZE_PREFIX + original_keys[i].len();
+			}
+
+			// Add size for children pointers
+			let left_children_size = (split_idx + 1) * CHILD_PTR_SIZE;
+			let right_children_size = (original_children.len() - split_idx - 1) * CHILD_PTR_SIZE;
+
+			// Add base header sizes
+			let mut left_size = INTERNAL_HEADER_SIZE + left_keys_size + left_children_size;
+			let mut right_size = INTERNAL_HEADER_SIZE + right_keys_size + right_children_size;
+
+			// Add extra key/child to appropriate side
+			let extra_key_size = KEY_SIZE_PREFIX + extra_key.len() + CHILD_PTR_SIZE;
+			if extra_to_left {
+				left_size += extra_key_size;
+			} else {
+				right_size += extra_key_size;
+			}
+
+			// Use a more conservative threshold to ensure we have enough buffer space
+			// This helps prevent issues during deletion or future operations
+			let size_threshold = InternalNode::max_size() - 256;
+
+			// Check if both nodes would be within our conservative size limits
+			if left_size <= size_threshold && right_size <= size_threshold {
+				// Calculate balance factor (how evenly distributed the nodes are)
+				let balance = if left_size > right_size {
+					left_size - right_size
+				} else {
+					right_size - left_size
+				};
+
+				// If this split point gives better balance, use it
+				if balance < best_balance {
+					best_balance = balance;
+					best_split_idx = split_idx;
+				}
+			}
+		}
+
+		// Use the best split point found
+		let split_idx = best_split_idx;
+
+		// Determine if the extra key/child goes to the left or right node
+		let extra_goes_to_left = insert_idx <= split_idx;
+
 		// Key to be promoted to parent
-		let promoted_key = node.keys[split_idx].clone();
+		let promoted_key = original_keys[split_idx].clone();
 
-		// Move keys and children after split point to new node
-		new_node.keys = node.keys.drain(split_idx + 1..).collect();
-		new_node.children = node.children.drain(split_idx + 1..).collect();
+		// Clear the current node and rebuild it with the left part
+		node.keys.clear();
+		node.children.clear();
 
-		// Remove the middle key from the original node (it gets promoted)
-		node.keys.remove(split_idx);
+		// Add keys and children to the left node (original node)
+		for i in 0..split_idx {
+			node.keys.push(original_keys[i].clone());
+		}
+
+		for i in 0..=split_idx {
+			node.children.push(original_children[i]);
+		}
+
+		// Add keys and children to the right node (new node)
+		for i in split_idx + 1..original_keys.len() {
+			new_node.keys.push(original_keys[i].clone());
+		}
+
+		for i in split_idx + 1..original_children.len() {
+			new_node.children.push(original_children[i]);
+		}
+
+		// Now insert the extra key and child into the appropriate node
+		if extra_goes_to_left {
+			node.insert_key_child(extra_key, extra_child, self.compare.as_ref());
+		} else {
+			new_node.insert_key_child(extra_key, extra_child, self.compare.as_ref());
+		}
 
 		// Write both nodes
 		self.write_node(&NodeType::Internal(node.clone()))?;
