@@ -110,7 +110,7 @@ fn test_wal_replay_latest_segment_only() {
 	for i in 20..25 {
 		let key = format!("key_{i:02}");
 		let value = format!("value_{i:02}");
-		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
 	}
 
 	let encoded_batch = batch.encode().unwrap();

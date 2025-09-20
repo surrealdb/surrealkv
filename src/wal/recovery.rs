@@ -234,18 +234,18 @@ mod tests {
 
 		// Batch 1: Starting at 100, with 3 entries (100, 101, 102)
 		let mut batch1 = Batch::new(100);
-		batch1.set(b"key1", b"value1").unwrap(); // seq_num 100
-		batch1.set(b"key2", b"value2").unwrap(); // seq_num 101
-		batch1.set(b"key3", b"value3").unwrap(); // seq_num 102
-										   // Highest sequence number should be 102
+		batch1.set(b"key1", b"value1", 0).unwrap(); // seq_num 100
+		batch1.set(b"key2", b"value2", 0).unwrap(); // seq_num 101
+		batch1.set(b"key3", b"value3", 0).unwrap(); // seq_num 102
+											  // Highest sequence number should be 102
 
 		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
 		let mut batch2 = Batch::new(200);
-		batch2.set(b"key4", b"value4").unwrap(); // seq_num 200
-		batch2.set(b"key5", b"value5").unwrap(); // seq_num 201
-		batch2.delete(b"key6").unwrap(); // seq_num 202
-		batch2.set(b"key7", b"value7").unwrap(); // seq_num 203
-										   // Highest sequence number should be 203
+		batch2.set(b"key4", b"value4", 0).unwrap(); // seq_num 200
+		batch2.set(b"key5", b"value5", 0).unwrap(); // seq_num 201
+		batch2.delete(b"key6", 0).unwrap(); // seq_num 202
+		batch2.set(b"key7", b"value7", 0).unwrap(); // seq_num 203
+											  // Highest sequence number should be 203
 
 		// Create WAL segments for both batches
 		let opts = Options::default();
@@ -295,13 +295,13 @@ mod tests {
 		// Test with multiple single-entry batches
 		// This tests the edge case where starting = highest for each batch
 		let mut batch1 = Batch::new(500);
-		batch1.set(b"key1", b"value1").unwrap(); // seq_num 500
+		batch1.set(b"key1", b"value1", 0).unwrap(); // seq_num 500
 
 		let mut batch2 = Batch::new(600);
-		batch2.set(b"key2", b"value2").unwrap(); // seq_num 600
+		batch2.set(b"key2", b"value2", 0).unwrap(); // seq_num 600
 
 		let mut batch3 = Batch::new(700);
-		batch3.set(b"key3", b"value3").unwrap(); // seq_num 700
+		batch3.set(b"key3", b"value3", 0).unwrap(); // seq_num 700
 
 		// Create WAL segments for all batches
 		let opts = Options::default();
@@ -337,14 +337,14 @@ mod tests {
 		// Test case: Multiple batches with different starting sequence numbers
 		// This ensures the max tracking works across multiple batches
 		let mut batch1 = Batch::new(200); // Starting sequence number 200
-		batch1.set(b"key1", b"value1").unwrap(); // seq_num 200
-		batch1.set(b"key2", b"value2").unwrap(); // seq_num 201
-										   // Highest sequence number should be 201
+		batch1.set(b"key1", b"value1", 0).unwrap(); // seq_num 200
+		batch1.set(b"key2", b"value2", 0).unwrap(); // seq_num 201
+											  // Highest sequence number should be 201
 
 		let mut batch2 = Batch::new(300); // Starting sequence number 300
-		batch2.set(b"key3", b"value3").unwrap(); // seq_num 300
-		batch2.set(b"key4", b"value4").unwrap(); // seq_num 301
-										   // Highest sequence number should be 301
+		batch2.set(b"key3", b"value3", 0).unwrap(); // seq_num 300
+		batch2.set(b"key4", b"value4", 0).unwrap(); // seq_num 301
+											  // Highest sequence number should be 301
 
 		// Create WAL segments for both batches
 		let opts = Options::default();

@@ -14,7 +14,7 @@ use crate::{
 	iter::MergeIterator,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
+		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	},
 	vfs::File,
 	Options, Value,
@@ -68,7 +68,8 @@ impl<K: InternalKeyTrait> MemTable<K> {
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(K, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = K::new(key.to_vec(), seq_no, InternalKeyKind::Max)..;
+		let range =
+			K::new(key.to_vec(), seq_no, InternalKeyKind::Max, INTERNAL_KEY_TIMESTAMP_MAX)..;
 
 		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key()[..] == key);
 		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -102,8 +103,8 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		let mut record_size = 0;
 
 		// Process entries with pre-encoded ValueLocations
-		for (_i, entry, current_seq_num) in batch.entries_with_seq_nums()? {
-			let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
+		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+			let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 
 			// Use the pre-encoded value directly, or create empty ValueLocation for deletes
 			let val = if let Some(encoded_value) = &entry.value {
@@ -201,12 +202,17 @@ impl<K: InternalKeyTrait> MemTable<K> {
 				// For inclusive start, we want the earliest internal key for this user key
 				// Since internal keys are sorted as (user_key asc, seq_num desc),
 				// we use the highest possible sequence number to get the first entry
-				Bound::Included(K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max))
+				Bound::Included(K::new(
+					key.clone(),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive start, we want to skip all versions of this user key
 				// We use the lowest sequence number to position after all real entries
-				Bound::Excluded(K::new(key.clone(), 0, InternalKeyKind::Set))
+				Bound::Excluded(K::new(key.clone(), 0, InternalKeyKind::Set, 0))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -215,12 +221,17 @@ impl<K: InternalKeyTrait> MemTable<K> {
 			Bound::Included(key) => {
 				// For inclusive end, we want to include all versions of this user key
 				// We use the lowest sequence number to include the last entry
-				Bound::Included(K::new(key.clone(), 0, InternalKeyKind::Set))
+				Bound::Included(K::new(key.clone(), 0, InternalKeyKind::Set, 0))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive end, we want to exclude all versions of this user key
 				// We use the highest sequence number to stop before any real entries
-				Bound::Excluded(K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max))
+				Bound::Excluded(K::new(
+					key.clone(),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -253,7 +264,7 @@ mod tests {
 		let value = b"value";
 
 		let mut batch = Batch::new(1);
-		batch.set(&key, value).unwrap();
+		batch.set(&key, value, 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -268,7 +279,7 @@ mod tests {
 		let value = b"value";
 
 		let mut batch = Batch::new(1);
-		batch.set(&key, value).unwrap();
+		batch.set(&key, value, 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -283,7 +294,7 @@ mod tests {
 		let seq_num = 100;
 
 		let mut batch = Batch::new(seq_num);
-		batch.set(&key, value).unwrap();
+		batch.set(&key, value, 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -297,7 +308,7 @@ mod tests {
 		let value1 = b"value1";
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(&key1, value1).unwrap();
+		batch1.set(&key1, value1, 0).unwrap();
 
 		memtable.add(&batch1).unwrap();
 
@@ -305,7 +316,7 @@ mod tests {
 		let value2 = b"value2";
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(&key2, value2).unwrap();
+		batch2.set(&key2, value2, 0).unwrap();
 
 		memtable.add(&batch2).unwrap();
 
@@ -325,15 +336,15 @@ mod tests {
 		let value3 = &b"value3"[..];
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(&key1, value1).unwrap();
+		batch1.set(&key1, value1, 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(&key1, value2).unwrap();
+		batch2.set(&key1, value2, 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let mut batch3 = Batch::new(3);
-		batch3.set(&key1, value3).unwrap();
+		batch3.set(&key1, value3, 0).unwrap();
 		memtable.add(&batch3).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
@@ -350,11 +361,11 @@ mod tests {
 		let value2 = &b"value2"[..];
 
 		let mut batch1 = Batch::new(0);
-		batch1.set(&key1, value1).unwrap();
+		batch1.set(&key1, value1, 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(1);
-		batch2.set(&key2, value2).unwrap();
+		batch2.set(&key2, value2, 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
@@ -383,14 +394,14 @@ mod tests {
 			let mut batch = Batch::new(seq_num);
 			match kind {
 				InternalKeyKind::Set => {
-					batch.set(&key, &value).unwrap();
+					batch.set(&key, &value, 0).unwrap();
 				}
 				InternalKeyKind::Delete => {
-					batch.delete(&key).unwrap();
+					batch.delete(&key, 0).unwrap();
 				}
 				_ => {
 					// For other kinds, use add_record directly
-					batch.add_record(kind, &key, Some(&value)).unwrap();
+					batch.add_record(kind, &key, Some(&value), 0).unwrap();
 				}
 			}
 
@@ -765,8 +776,8 @@ mod tests {
 
 		// Add some data
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1").unwrap();
-		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key1", b"value1", 0).unwrap();
+		batch.set(b"key2", b"value2", 0).unwrap();
 
 		let (record_size, total_size) = memtable.add(&batch).unwrap();
 		assert!(record_size > 0);
@@ -775,7 +786,7 @@ mod tests {
 
 		// Add more data
 		let mut batch2 = Batch::new(2);
-		batch2.set(b"key3", b"value3").unwrap();
+		batch2.set(b"key3", b"value3", 0).unwrap();
 
 		let (record_size2, total_size2) = memtable.add(&batch2).unwrap();
 		assert!(record_size2 > 0);
@@ -792,19 +803,19 @@ mod tests {
 
 		// Add batch with seq_num 10
 		let mut batch1 = Batch::new(10);
-		batch1.set(b"key1", b"value1").unwrap();
+		batch1.set(b"key1", b"value1", 0).unwrap();
 		memtable.add(&batch1).unwrap();
 		assert_eq!(memtable.lsn(), 10);
 
 		// Add batch with lower seq_num - should not update
 		let mut batch2 = Batch::new(5);
-		batch2.set(b"key2", b"value2").unwrap();
+		batch2.set(b"key2", b"value2", 0).unwrap();
 		memtable.add(&batch2).unwrap();
 		assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 		// Add batch with higher seq_num
 		let mut batch3 = Batch::new(20);
-		batch3.set(b"key3", b"value3").unwrap();
+		batch3.set(b"key3", b"value3", 0).unwrap();
 		memtable.add(&batch3).unwrap();
 		assert_eq!(memtable.lsn(), 20);
 	}
@@ -813,11 +824,11 @@ mod tests {
 	fn test_get_highest_seq_num() {
 		// Add a batch with 5 entries
 		let mut batch = Batch::new(10);
-		batch.set(b"key1", b"value1").unwrap();
-		batch.set(b"key2", b"value2").unwrap();
-		batch.set(b"key3", b"value3").unwrap();
-		batch.set(b"key4", b"value4").unwrap();
-		batch.set(b"key5", b"value5").unwrap();
+		batch.set(b"key1", b"value1", 0).unwrap();
+		batch.set(b"key2", b"value2", 0).unwrap();
+		batch.set(b"key3", b"value3", 0).unwrap();
+		batch.set(b"key4", b"value4", 0).unwrap();
+		batch.set(b"key5", b"value5", 0).unwrap();
 
 		assert_eq!(batch.get_highest_seq_num(), 14);
 	}

@@ -16,7 +16,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
+		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -297,7 +297,12 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		let handle = self.write_compressed_block(&contents, self.opts.compression)?;
 
 		// Encode the block handle and add it to the index block.
-		let sep_key = K::new(separator_key, INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator);
+		let sep_key = K::new(
+			separator_key,
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			INTERNAL_KEY_TIMESTAMP_MAX,
+		);
 		let handle_encoded = handle.encode();
 
 		self.partitioned_index.add(&sep_key.encode(), &handle_encoded)?;
@@ -345,14 +350,14 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
 				// TODO: Add this as part of property as the current trailer will mark it as deleted
-				let filter_key = K::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set);
+				let filter_key = K::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
 
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
 
 		// Write meta properties to the meta index block
-		let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set);
+		let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
@@ -536,7 +541,7 @@ pub(crate) fn read_filter_block(
 fn read_writer_meta_properties<K: InternalKeyTrait>(
 	metaix: &Block<K>,
 ) -> Result<Option<TableMetadata<K>>> {
-	let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set).encode();
+	let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter();
