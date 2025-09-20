@@ -443,6 +443,19 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 					}
 				} else {
 					// No value (delete operation) - pass None
+					// But still add to versioned index as tombstone
+					if self.core.opts.enable_versioning {
+						// Create ReverseTimestampKey for delete operation
+						let reverse_key = ReverseTimestampKey::new(
+							entry.key.clone(),
+							current_seq_num,
+							entry.kind,
+							timestamp,
+						);
+						let encoded_key = reverse_key.encode();
+						// For deletes, we don't need a value, just the key
+						reverse_timestamp_entries.push((encoded_key, Vec::new()));
+					}
 					(None, None)
 				};
 

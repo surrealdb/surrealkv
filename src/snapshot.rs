@@ -13,6 +13,9 @@ use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
 
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
+
+/// Type alias for versioned entries with key, timestamp, and optional value
+pub type VersionedEntry = (Vec<u8>, u64, Option<Value>);
 use interval_heap::IntervalHeap;
 
 #[derive(Eq)]
@@ -254,8 +257,12 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 				}
 			}
 
-			let val = self.core.resolve_value(latest_value.unwrap().as_ref())?;
-			Ok(Some(val))
+			if let Some(value) = latest_value {
+				let val = self.core.resolve_value(value.as_ref())?;
+				Ok(Some(val))
+			} else {
+				Ok(None)
+			}
 		} else {
 			Ok(None)
 		}
@@ -308,7 +315,8 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 								let value = if is_tombstone {
 									None
 								} else {
-									Some(Arc::from(encoded_value))
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
 								};
 								versions.push((reverse_key.timestamp, value));
 							}
@@ -371,7 +379,8 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 								let value = if is_tombstone {
 									None
 								} else {
-									Some(Arc::from(encoded_value))
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
 								};
 								versions.push((reverse_key.timestamp, value));
 							}
@@ -456,7 +465,7 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 		start_ts: u64,
 		end_ts: u64,
 		include_tombstones: bool,
-	) -> Result<Vec<(Vec<u8>, u64, Option<Value>)>> {
+	) -> Result<Vec<VersionedEntry>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
@@ -498,7 +507,8 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 								let value = if is_tombstone {
 									None
 								} else {
-									Some(Arc::from(encoded_value))
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
 								};
 								versions.push((
 									reverse_key.user_key.as_ref().to_vec(),

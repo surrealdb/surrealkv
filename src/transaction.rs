@@ -10,7 +10,7 @@ pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, VersionedEntry};
 use crate::sstable::InternalKeyKind;
 use crate::sstable::InternalKeyTrait;
 use crate::{IterResult, Value};
@@ -739,7 +739,7 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		start_ts: u64,
 		end_ts: u64,
 		include_tombstones: bool,
-	) -> Result<Vec<(Vec<u8>, u64, Option<Value>)>> {
+	) -> Result<Vec<VersionedEntry>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
