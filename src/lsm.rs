@@ -171,7 +171,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 
 		// Flush the immutable memtable to disk as an SSTable
 		// This converts the in-memory sorted data structure to an on-disk format
-		let table = flushed_memtable.flush(table_id, self.opts.clone(), self.vlog.clone())?;
+		let table = flushed_memtable.flush(table_id, self.opts.clone())?;
 
 		// Add the new SSTable to Level 0
 		// L0 is special: it contains recently flushed SSTables that may have overlapping keys
@@ -309,24 +309,96 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 }
 
 impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
-	// Write batch to WAL (synchronous operation)
-	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<()> {
+	// Write batch to WAL and process VLog entries (synchronous operation)
+	// Returns a new batch with VLog pointers, and pre-encoded ValueLocations
+	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
+		// Create a new batch for processed entries with pre-encoded values
+		let mut processed_batch = Batch::new(seq_num);
+
+		// Process VLog entries and create the processed batch in a single loop
+		if let Some(ref vlog) = self.core.vlog {
+			// Use the unified sequence number management
+			for (_, entry, current_seq_num) in batch.entries_with_seq_nums()? {
+				// Create full InternalKey for VLog
+				let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind);
+				let key_bytes = ikey.encode();
+
+				// Determine value pointer and pre-encode ValueLocation
+				let (valueptr, encoded_value) = if let Some(value) = &entry.value {
+					// Check if value should go to VLog based on threshold
+					if value.len() > self.core.opts.vlog_value_threshold {
+						let pointer = vlog.append(&key_bytes, value)?;
+
+						// Pre-encode ValueLocation with VLog pointer
+						let value_location = ValueLocation::with_pointer(pointer.clone());
+						let encoded = value_location.encode();
+						(Some(pointer), Some(encoded))
+					} else {
+						// Small value, keep inline - pre-encode ValueLocation with inline value
+						let value_location = ValueLocation::with_inline_value(Arc::from(
+							value.clone().into_boxed_slice(),
+						));
+						let encoded = value_location.encode();
+						(None, Some(encoded))
+					}
+				} else {
+					// No value (delete operation) - pass None
+					(None, None)
+				};
+
+				// Add the entry to the processed batch with pre-encoded value
+				processed_batch.add_record_with_valueptr(
+					entry.kind,
+					&entry.key,
+					encoded_value.as_deref(),
+					valueptr,
+				)?;
+			}
+
+			// Flush VLog to ensure data is written to disk
+			if sync {
+				vlog.sync()?;
+			} else {
+				vlog.flush()?;
+			}
+		} else {
+			// No VLog, all values stay inline - pre-encode all ValueLocations
+			for entry in batch.entries().iter() {
+				let encoded_value = if let Some(value) = &entry.value {
+					// Pre-encode ValueLocation with inline value
+					let value_location = ValueLocation::with_inline_value(Arc::from(
+						value.clone().into_boxed_slice(),
+					));
+					Some(value_location.encode())
+				} else {
+					// No value (delete operation) - pass None
+					None
+				};
+
+				processed_batch.add_record_with_valueptr(
+					entry.kind,
+					&entry.key,
+					encoded_value.as_deref(),
+					None,
+				)?;
+			}
+		}
+
+		// Then write to WAL
 		if let Some(ref wal) = self.core.wal {
 			let mut wal_guard = wal.write();
-			let enc_bytes = batch.encode(seq_num)?;
+			let enc_bytes = processed_batch.encode()?;
 			wal_guard.append(&enc_bytes)?;
-			if sync_wal {
+			if sync {
 				wal_guard.sync()?;
 			}
-			Ok(())
-		} else {
-			// In memory-only mode, we don't write to WAL
-			Ok(())
 		}
+
+		Ok(processed_batch)
 	}
 
 	// Apply batch to memtable (can be called concurrently)
-	fn apply(&self, batch: &Batch, seq_num: u64) -> Result<()> {
+	fn apply(&self, batch: &Batch) -> Result<()> {
 		// Writes a batch of key-value pairs to the LSM tree.
 		//
 		// Write path in LSM trees:
@@ -345,7 +417,7 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 		}
 
 		// Add the batch to the active memtable
-		active_memtable.add(batch, seq_num)?;
+		active_memtable.add(batch)?;
 
 		Ok(())
 	}
@@ -514,9 +586,9 @@ impl<K: InternalKeyTrait> Core<K> {
 		}
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
 		// Commit the batch using the commit pipeline
-		self.commit_pipeline.commit(batch, sync_wal).await
+		self.commit_pipeline.commit(batch, sync).await
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {

@@ -105,15 +105,15 @@ fn test_wal_replay_latest_segment_only() {
 	wal.rotate().unwrap();
 
 	// Write batch records to third segment (latest)
-	let mut batch = Batch::new();
+	// Encode the batch with sequence number 100
+	let mut batch = Batch::new(100);
 	for i in 20..25 {
 		let key = format!("key_{i:02}");
 		let value = format!("value_{i:02}");
 		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 	}
 
-	// Encode the batch with sequence number 100
-	let encoded_batch = batch.encode(100).unwrap();
+	let encoded_batch = batch.encode().unwrap();
 	wal.append(&encoded_batch).unwrap();
 
 	// Close WAL to ensure everything is flushed
@@ -135,8 +135,8 @@ fn test_wal_replay_latest_segment_only() {
 	// Verify no corruption was detected
 	assert!(corruption_info.is_none(), "Expected no corruption, but got: {corruption_info:?}");
 
-	// Verify sequence number is from the latest segment (100)
-	assert_eq!(sequence_number, 100);
+	// Verify sequence number is from the latest segment (104)
+	assert_eq!(sequence_number, 104);
 
 	// Verify the memtable contains only the data from the latest segment
 	assert_eq!(entry_count, 5, "Expected 5 entries from latest segment");

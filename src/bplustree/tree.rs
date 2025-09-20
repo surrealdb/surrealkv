@@ -2077,10 +2077,6 @@ impl<F: VfsFile> BPlusTree<F> {
 		RangeScanIterator::new(self, start_key, end_key)
 	}
 
-	pub fn prefix(&self, prefix: &[u8]) -> Result<PrefixScanIterator<'_, F>> {
-		PrefixScanIterator::new(self, prefix)
-	}
-
 	/// Calculate the height of the B+ tree.
 	#[cfg(test)]
 	pub fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
@@ -2224,108 +2220,6 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 			// Check if the current key is within range
 			let key = &leaf.keys[self.current_idx];
 			if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
-				self.reached_end = true;
-				return None;
-			}
-
-			// Return the current key-value pair and advance
-			let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
-			self.current_idx += 1;
-			return Some(result);
-		}
-
-		self.reached_end = true;
-		None
-	}
-}
-
-pub(crate) struct PrefixScanIterator<'a, F: VfsFile> {
-	tree: &'a BPlusTree<F>,
-	current_leaf: Option<LeafNode>,
-	prefix: Vec<u8>,
-	current_idx: usize,
-	reached_end: bool,
-}
-
-impl<'a, F: VfsFile> PrefixScanIterator<'a, F> {
-	pub(crate) fn new(tree: &'a BPlusTree<F>, prefix: &[u8]) -> Result<Self> {
-		// Find the leaf containing the first key >= prefix
-		let mut node_offset = tree.header.root_offset;
-
-		// Traverse the tree to find the starting leaf
-		let leaf = loop {
-			match tree.read_node(node_offset)? {
-				NodeType::Internal(internal) => {
-					// Find the child that would contain the key
-					let mut idx = 0;
-					while idx < internal.keys.len()
-						&& tree.compare.compare(prefix, &internal.keys[idx]) >= Ordering::Equal
-					{
-						idx += 1;
-					}
-					node_offset = internal.children[idx];
-				}
-				NodeType::Leaf(leaf) => {
-					break leaf;
-				}
-			}
-		};
-
-		// Find the first key >= prefix in the leaf
-		let current_idx =
-			leaf.keys.partition_point(|k| tree.compare.compare(k, prefix) == Ordering::Less);
-
-		Ok(PrefixScanIterator {
-			tree,
-			current_leaf: Some(leaf),
-			prefix: prefix.to_vec(),
-			current_idx,
-			reached_end: false,
-		})
-	}
-
-	fn key_has_prefix(&self, key: &[u8]) -> bool {
-		if key.len() < self.prefix.len() {
-			return false;
-		}
-
-		key.starts_with(&self.prefix)
-	}
-}
-
-impl<F: VfsFile> Iterator for PrefixScanIterator<'_, F> {
-	type Item = Result<(Vec<u8>, Vec<u8>)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.reached_end {
-			return None;
-		}
-
-		if let Some(leaf) = &self.current_leaf {
-			// Check if we've reached the end of the current leaf
-			if self.current_idx >= leaf.keys.len() {
-				// Move to the next leaf if possible
-				if leaf.next_leaf == 0 {
-					self.reached_end = true;
-					return None;
-				}
-
-				// Load the next leaf
-				match self.tree.read_node(leaf.next_leaf) {
-					Ok(NodeType::Leaf(next_leaf)) => {
-						self.current_leaf = Some(next_leaf);
-						self.current_idx = 0;
-						// Recursively call next() to process the new leaf
-						return self.next();
-					}
-					Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
-					Err(e) => return Some(Err(e)),
-				}
-			}
-
-			// Check if the current key starts with the prefix
-			let key = &leaf.keys[self.current_idx];
-			if !self.key_has_prefix(key) {
 				self.reached_end = true;
 				return None;
 			}
@@ -3333,31 +3227,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_prefix_scan_basic() {
-		let mut tree = create_test_tree(true);
-		tree.insert(b"apple", b"fruit").unwrap();
-		tree.insert(b"app", b"short").unwrap();
-		tree.insert(b"application", b"long").unwrap();
-		tree.insert(b"apricot", b"another").unwrap();
-		tree.insert(b"banana", b"yellow").unwrap();
-
-		let mut iter = tree.prefix(b"app").unwrap();
-		assert_eq!(iter.next().unwrap().unwrap(), (b"app".to_vec(), b"short".to_vec()));
-		assert_eq!(iter.next().unwrap().unwrap(), (b"apple".to_vec(), b"fruit".to_vec()));
-		assert_eq!(iter.next().unwrap().unwrap(), (b"application".to_vec(), b"long".to_vec()));
-		assert!(iter.next().is_none());
-	}
-
-	#[test]
-	fn test_prefix_scan_no_match() {
-		let mut tree = create_test_tree(true);
-		tree.insert(b"apple", b"1").unwrap();
-		tree.insert(b"app", b"2").unwrap();
-		let mut iter = tree.prefix(b"application").unwrap();
-		assert!(iter.next().is_none());
-	}
-
-	#[test]
 	fn test_large_dataset_range() {
 		let mut tree = create_test_tree(false);
 		// Insert 10000 keys
@@ -3374,29 +3243,6 @@ mod tests {
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();
-			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
-		}
-		assert!(iter.next().is_none());
-	}
-
-	#[test]
-	fn test_large_dataset_prefix() {
-		let mut tree = create_test_tree(false);
-		// Insert keys with prefix "pre_"
-		for i in 0..1000 {
-			let key = format!("pre_{:04}", i).into_bytes();
-			let value = format!("val_{:04}", i).into_bytes();
-			tree.insert(&key, &value).unwrap();
-		}
-
-		// Insert some keys with different prefix
-		tree.insert(b"pre", b"shorter").unwrap();
-		tree.insert(b"prez", b"last").unwrap();
-
-		let mut iter = tree.prefix(b"pre_").unwrap();
-		for i in 0..1000 {
-			let expected_key = format!("pre_{:04}", i).into_bytes();
-			let expected_value = format!("val_{:04}", i).into_bytes();
 			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
 		}
 		assert!(iter.next().is_none());

@@ -481,6 +481,11 @@ impl VLogWriter {
 		Ok(())
 	}
 
+	fn flush(&mut self) -> Result<()> {
+		self.writer.flush()?;
+		Ok(())
+	}
+
 	/// Gets the current size of the file
 	fn size(&self) -> u64 {
 		self.current_offset
@@ -755,6 +760,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 		let key_len = pointer.key_size;
 		let value_len = pointer.value_size;
 		let total_size = pointer.total_entry_size();
+
 		let mut entry_data = vec![0u8; total_size as usize];
 		vfs::File::read_at(&*file, pointer.offset, &mut entry_data)?;
 
@@ -1120,6 +1126,14 @@ impl<K: InternalKeyTrait> VLog<K> {
 		}
 
 		self.discard_stats.lock().unwrap().sync()?;
+
+		Ok(())
+	}
+
+	pub(crate) fn flush(&self) -> Result<()> {
+		if let Some(ref mut writer) = *self.writer.write().unwrap() {
+			writer.flush()?;
+		}
 
 		Ok(())
 	}
