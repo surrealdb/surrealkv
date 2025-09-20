@@ -18,10 +18,10 @@ const DEQUEUE_BITS: u32 = 32;
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
 	// Write batch to WAL and process VLog entries (synchronous operation)
-	// Returns a new batch with sequence numbers and VLog pointers applied
-	fn write(&self, batch: &Batch, seq_num: u64, sync_wal: bool) -> Result<Batch>;
+	// Returns a new batch with VLog pointers applied
+	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
 
-	// Apply processed batch to memtable (can be called concurrently)
+	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
 }
 
@@ -208,7 +208,7 @@ impl CommitPipeline {
 		}
 	}
 
-	pub(crate) async fn commit(&self, mut batch: Batch, sync_wal: bool) -> Result<()> {
+	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -228,7 +228,7 @@ impl CommitPipeline {
 		// Phase 2: Write to WAL and process VLog (synchronous)
 		let processed_batch = {
 			let env = self.env.clone();
-			env.write(&batch, seq_num, sync_wal)?
+			env.write(&batch, seq_num, sync)?
 		};
 
 		// Phase 3: Apply to memtable (can be concurrent)
@@ -339,7 +339,7 @@ mod tests {
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<Batch> {
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			// Create a copy of the batch for testing
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
@@ -433,7 +433,7 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync_wal: bool) -> Result<Batch> {
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();

@@ -17,7 +17,6 @@ use crate::{
 		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
-	vlog::VLog,
 	Options, Value,
 };
 
@@ -98,7 +97,6 @@ impl<K: InternalKeyTrait> MemTable<K> {
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
-	/// Records in the batch get consecutive sequence numbers from the batch's starting sequence number.
 	/// Returns (total_record_size, highest_seq_num_used).
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
@@ -158,12 +156,7 @@ impl<K: InternalKeyTrait> MemTable<K> {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}
 
-	pub(crate) fn flush(
-		&self,
-		table_id: u64,
-		lsm_opts: Arc<Options<K>>,
-		vlog: Option<Arc<VLog<K>>>,
-	) -> Result<Arc<Table<K>>> {
+	pub(crate) fn flush(&self, table_id: u64, lsm_opts: Arc<Options<K>>) -> Result<Arc<Table<K>>> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
 
 		{
@@ -177,11 +170,6 @@ impl<K: InternalKeyTrait> MemTable<K> {
 				// The memtable already contains the correct ValueLocation encoding
 				// (either inline or with VLog pointer), so we can use it directly
 				table_writer.add(key, &encoded_val)?;
-			}
-
-			// Sync VLog if it exists (values were already written during commit)
-			if let Some(ref vlog) = vlog {
-				vlog.sync()?;
 			}
 			// TODO: Check how to fsync this file
 			table_writer.finish()?;
@@ -512,11 +500,11 @@ mod tests {
 		// Verify ordering - higher sequence numbers should come first
 		assert_eq!(key1_entries.len(), 3);
 		assert_eq!(key1_entries[0].0, 20);
-		assert_eq!(&*key1_entries[0].1.as_ref(), b"value2");
+		assert_eq!(key1_entries[0].1.as_ref(), b"value2");
 		assert_eq!(key1_entries[1].0, 10);
-		assert_eq!(&*key1_entries[1].1.as_ref(), b"value1");
+		assert_eq!(key1_entries[1].1.as_ref(), b"value1");
 		assert_eq!(key1_entries[2].0, 5);
-		assert_eq!(&*key1_entries[2].1.as_ref(), b"value3");
+		assert_eq!(key1_entries[2].1.as_ref(), b"value3");
 
 		// Test get method - should return the highest sequence number
 		let result = memtable.get(b"key1", None);
@@ -688,25 +676,25 @@ mod tests {
 		// Key "a" entries (seq 20 then seq 10)
 		assert_eq!(entries_info[0].0.as_ref(), b"a");
 		assert_eq!(entries_info[0].1, 20);
-		assert_eq!(&*entries_info[0].2.as_ref(), b"value-a2");
+		assert_eq!(entries_info[0].2.as_ref(), b"value-a2");
 
 		assert_eq!(entries_info[1].0.as_ref(), b"a");
 		assert_eq!(entries_info[1].1, 10);
-		assert_eq!(&*entries_info[1].2.as_ref(), b"value-a1");
+		assert_eq!(entries_info[1].2.as_ref(), b"value-a1");
 
 		// Key "c" entry
 		assert_eq!(entries_info[2].0.as_ref(), b"c");
 		assert_eq!(entries_info[2].1, 15);
-		assert_eq!(&*entries_info[2].2.as_ref(), b"value-c1");
+		assert_eq!(entries_info[2].2.as_ref(), b"value-c1");
 
 		// Key "e" entries (seq 25 then seq 15)
 		assert_eq!(entries_info[3].0.as_ref(), b"e");
 		assert_eq!(entries_info[3].1, 25);
-		assert_eq!(&*entries_info[3].2.as_ref(), b"value-e1");
+		assert_eq!(entries_info[3].2.as_ref(), b"value-e1");
 
 		assert_eq!(entries_info[4].0.as_ref(), b"e");
 		assert_eq!(entries_info[4].1, 15);
-		assert_eq!(&*entries_info[4].2.as_ref(), b"value-e2");
+		assert_eq!(entries_info[4].2.as_ref(), b"value-e2");
 	}
 
 	#[test]

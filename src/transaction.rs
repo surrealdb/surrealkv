@@ -450,8 +450,8 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		}
 
 		// Write the batch to storage
-		let sync_wal = self.durability == Durability::Immediate;
-		self.core.commit(batch, sync_wal).await?;
+		let should_sync = self.durability == Durability::Immediate;
+		self.core.commit(batch, should_sync).await?;
 
 		// Mark the transaction as closed
 		self.closed = true;

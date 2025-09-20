@@ -2,7 +2,7 @@ use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::InternalKeyKind;
-use crate::vlog::ValuePointer;
+use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 
 const MAX_BATCH_SIZE: u64 = 1 << 32;
 const BATCH_VERSION: u8 = 1;
@@ -106,11 +106,13 @@ impl Batch {
 		self.add_record(InternalKeyKind::Delete, key, None)
 	}
 
-	pub(crate) fn add_record(
+	/// Internal method to add a record with optional value pointer
+	fn add_record_internal(
 		&mut self,
 		kind: InternalKeyKind,
 		key: &[u8],
 		value: Option<&[u8]>,
+		valueptr: Option<ValuePointer>,
 	) -> Result<()> {
 		let key_len = key.len();
 		let value_len = value.map_or(0, |v| v.len());
@@ -131,9 +133,28 @@ impl Batch {
 		};
 
 		self.entries.push(entry);
-		self.valueptrs.push(None); // Initially no VLog pointer
+		self.valueptrs.push(valueptr);
 
 		Ok(())
+	}
+
+	pub(crate) fn add_record(
+		&mut self,
+		kind: InternalKeyKind,
+		key: &[u8],
+		value: Option<&[u8]>,
+	) -> Result<()> {
+		self.add_record_internal(kind, key, value, None)
+	}
+
+	pub(crate) fn add_record_with_valueptr(
+		&mut self,
+		kind: InternalKeyKind,
+		key: &[u8],
+		value: Option<&[u8]>,
+		valueptr: Option<ValuePointer>,
+	) -> Result<()> {
+		self.add_record_internal(kind, key, value, valueptr)
 	}
 
 	pub(crate) fn count(&self) -> u32 {
@@ -147,19 +168,6 @@ impl Batch {
 	/// Get entries for VLog processing
 	pub(crate) fn entries(&self) -> &[BatchEntry] {
 		&self.entries
-	}
-
-	/// Set a value pointer for a specific entry index
-	pub(crate) fn set_valueptr(
-		&mut self,
-		index: usize,
-		valueptr: Option<ValuePointer>,
-	) -> Result<()> {
-		if index >= self.valueptrs.len() {
-			return Err(Error::InvalidBatchRecord);
-		}
-		self.valueptrs[index] = valueptr;
-		Ok(())
 	}
 
 	/// Set the starting sequence number for this batch
@@ -254,8 +262,8 @@ impl Batch {
 			let has_pointer = data[pos];
 			pos += 1;
 			let valueptr = if has_pointer == 1 {
-				let ptr_data = &data[pos..pos + crate::vlog::VALUE_POINTER_SIZE];
-				pos += crate::vlog::VALUE_POINTER_SIZE;
+				let ptr_data = &data[pos..pos + VALUE_POINTER_SIZE];
+				pos += VALUE_POINTER_SIZE;
 				Some(ValuePointer::decode(ptr_data)?)
 			} else {
 				None
@@ -570,8 +578,7 @@ mod tests {
 		let entries = decoded_batch.entries();
 		assert_eq!(entries.len(), NUM_RECORDS);
 
-		for i in 0..NUM_RECORDS {
-			let entry = &entries[i];
+		for (i, entry) in entries.iter().enumerate().take(NUM_RECORDS) {
 			let expected_key = format!("key{i}");
 
 			if i % 2 == 0 {
@@ -680,5 +687,138 @@ mod tests {
 		assert_eq!(entries_set[0].kind, InternalKeyKind::Set);
 		assert_eq!(entries_set[0].key, b"set_key");
 		assert_eq!(entries_set[0].value.as_ref().unwrap(), b"set_data");
+	}
+
+	#[test]
+	fn test_batch_encode_decode() {
+		// Create a batch with all possible variations
+		let mut batch = Batch::new(12345);
+
+		// Add various types of records with different value pointer scenarios
+		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1")).unwrap();
+		batch.add_record(InternalKeyKind::Delete, b"key2", None).unwrap();
+		batch.add_record(InternalKeyKind::Merge, b"key3", Some(b"merge_value")).unwrap();
+
+		// Add records with value pointers (simulating VLog pointers)
+		let valueptr1 = ValuePointer::new(100, 200, 10, 20, 30);
+		let valueptr2 = ValuePointer::new(400, 500, 15, 25, 35);
+
+		batch
+			.add_record_with_valueptr(
+				InternalKeyKind::Set,
+				b"key4",
+				Some(b"large_value"),
+				Some(valueptr1),
+			)
+			.unwrap();
+		batch
+			.add_record_with_valueptr(InternalKeyKind::Set, b"key5", None, Some(valueptr2))
+			.unwrap();
+		batch.add_record_with_valueptr(InternalKeyKind::Delete, b"key6", None, None).unwrap();
+
+		// Add some edge cases
+		batch.add_record(InternalKeyKind::Set, b"", Some(b"empty_key_value")).unwrap();
+		batch.add_record(InternalKeyKind::Set, b"empty_value_key", Some(b"")).unwrap();
+		batch.add_record(InternalKeyKind::Set, b"", Some(b"")).unwrap();
+
+		// Add unicode data
+		batch.add_record(InternalKeyKind::Set, "🔑".as_bytes(), Some("🗝️".as_bytes())).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, "こんにちは".as_bytes(), Some("世界".as_bytes()))
+			.unwrap();
+
+		// Verify original batch properties
+		assert_eq!(batch.starting_seq_num, 12345);
+		assert_eq!(batch.count(), 11);
+		assert!(!batch.is_empty());
+		assert_eq!(batch.get_highest_seq_num(), 12345 + 10); // starting + count - 1
+
+		// Encode the batch
+		let encoded = batch.encode().unwrap();
+		assert!(!encoded.is_empty());
+
+		// Decode the batch
+		let decoded_batch = Batch::decode(&encoded).unwrap();
+
+		// Verify all properties are preserved
+		assert_eq!(decoded_batch.version, BATCH_VERSION);
+		assert_eq!(decoded_batch.starting_seq_num, 12345);
+		assert_eq!(decoded_batch.count(), 11);
+		assert!(!decoded_batch.is_empty());
+		assert_eq!(decoded_batch.get_highest_seq_num(), 12345 + 10);
+
+		// Verify entries are preserved correctly
+		let entries = decoded_batch.entries();
+		assert_eq!(entries.len(), 11);
+
+		// Check first few entries
+		assert_eq!(entries[0].kind, InternalKeyKind::Set);
+		assert_eq!(entries[0].key, b"key1");
+		assert_eq!(entries[0].value.as_ref().unwrap(), b"value1");
+
+		assert_eq!(entries[1].kind, InternalKeyKind::Delete);
+		assert_eq!(entries[1].key, b"key2");
+		assert!(entries[1].value.is_none());
+
+		assert_eq!(entries[2].kind, InternalKeyKind::Merge);
+		assert_eq!(entries[2].key, b"key3");
+		assert_eq!(entries[2].value.as_ref().unwrap(), b"merge_value");
+
+		// Check entries with value pointers
+		assert_eq!(entries[3].kind, InternalKeyKind::Set);
+		assert_eq!(entries[3].key, b"key4");
+		assert_eq!(entries[3].value.as_ref().unwrap(), b"large_value");
+
+		assert_eq!(entries[4].kind, InternalKeyKind::Set);
+		assert_eq!(entries[4].key, b"key5");
+		assert!(entries[4].value.is_none());
+
+		assert_eq!(entries[5].kind, InternalKeyKind::Delete);
+		assert_eq!(entries[5].key, b"key6");
+		assert!(entries[5].value.is_none());
+
+		// Check edge cases
+		assert_eq!(entries[6].kind, InternalKeyKind::Set);
+		assert_eq!(entries[6].key, b"");
+		assert_eq!(entries[6].value.as_ref().unwrap(), b"empty_key_value");
+
+		assert_eq!(entries[7].kind, InternalKeyKind::Set);
+		assert_eq!(entries[7].key, b"empty_value_key");
+		// Empty string values decode as None (this is the intended behavior)
+		assert!(entries[7].value.is_none());
+
+		assert_eq!(entries[8].kind, InternalKeyKind::Set);
+		assert_eq!(entries[8].key, b"");
+		// Empty string values decode as None (this is the intended behavior)
+		assert!(entries[8].value.is_none());
+
+		// Check unicode entries
+		assert_eq!(entries[9].kind, InternalKeyKind::Set);
+		assert_eq!(entries[9].key, "🔑".as_bytes());
+		assert_eq!(entries[9].value.as_ref().unwrap(), "🗝️".as_bytes());
+
+		assert_eq!(entries[10].kind, InternalKeyKind::Set);
+		assert_eq!(entries[10].key, "こんにちは".as_bytes());
+		assert_eq!(entries[10].value.as_ref().unwrap(), "世界".as_bytes());
+
+		// Verify value pointers are preserved correctly
+		assert_eq!(decoded_batch.entries.len(), decoded_batch.valueptrs.len());
+
+		// Test sequence number iteration
+		let entries_with_seq_nums: Vec<_> =
+			decoded_batch.entries_with_seq_nums().unwrap().collect();
+		assert_eq!(entries_with_seq_nums.len(), 11);
+
+		for (i, (entry_idx, entry, seq_num)) in entries_with_seq_nums.iter().enumerate() {
+			assert_eq!(*entry_idx, i);
+			assert_eq!(*seq_num, 12345 + i as u64);
+			assert_eq!(entry.kind, entries[i].kind);
+			assert_eq!(entry.key, entries[i].key);
+			assert_eq!(entry.value, entries[i].value);
+		}
+
+		// Test that we can re-encode the decoded batch and get the same result
+		let re_encoded = decoded_batch.encode().unwrap();
+		assert_eq!(encoded, re_encoded, "Re-encoding should produce identical result");
 	}
 }
