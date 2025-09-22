@@ -546,6 +546,7 @@ mod tests {
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
+			versioned_index: None,
 		}
 	}
 

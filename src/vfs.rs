@@ -1,10 +1,6 @@
 use crate::error::{Error, Result};
 
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt as LockFileExt;
@@ -205,10 +201,14 @@ impl File for SysFile {
 
 		#[cfg(target_arch = "wasm32")]
 		{
-			// write_at is not supported on WASM, use seek + write
-			self.seek(SeekFrom::Start(offset))?;
-			self.write_all(buf)?;
-			Ok(buf.len())
+			// write_at is not supported on WASM, return an error
+			Err(Error::Io(
+				std::io::Error::new(
+					std::io::ErrorKind::Unsupported,
+					"write_at is not supported on WASM",
+				)
+				.into(),
+			))
 		}
 	}
 

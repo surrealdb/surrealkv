@@ -3,16 +3,19 @@ use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::{meta::KeyRange, InternalKeyKind, InternalKeyTrait};
+use crate::sstable::{meta::KeyRange, InternalKeyKind, InternalKeyTrait, ReverseTimestampKey};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
 
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
+
+/// Type alias for versioned entries with key, timestamp, and optional value
+pub type VersionedEntry = (Vec<u8>, u64, Option<Value>);
 use interval_heap::IntervalHeap;
 
 #[derive(Eq)]
@@ -167,7 +170,7 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 			// Check the tables in each level for the key
 			for level in &level_manifest.levels {
 				for table in level.tables.iter() {
-					let ikey = K::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set);
+					let ikey = K::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
 					if !table.is_key_in_key_range(&ikey) {
 						continue; // Skip this table if the key is not in its range
@@ -199,6 +202,397 @@ impl<K: InternalKeyTrait> Snapshot<K> {
 		// Create a range from start (inclusive) to end (inclusive)
 		let range = start.as_ref().to_vec()..=end.as_ref().to_vec();
 		SnapshotIterator::new_from(self.core.clone(), self.seq_num, range, keys_only)
+	}
+
+	/// Queries the versioned index for a specific key at a specific timestamp
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_at_timestamp(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Use range query for key-specific timestamp lookup
+			let start_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				0,
+				InternalKeyKind::Set,
+				0, // Start from beginning of time
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				u64::MAX,
+				InternalKeyKind::Max,
+				timestamp, // End at the specified timestamp
+			)
+			.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			// Find the most recent version at or before the timestamp that's visible to this snapshot
+			let mut latest_value: Option<Arc<[u8]>> = None;
+			let mut latest_timestamp = 0;
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.user_key.as_ref() == key
+							&& reverse_key.timestamp <= timestamp
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+							&& reverse_key.timestamp > latest_timestamp
+						{
+							latest_timestamp = reverse_key.timestamp;
+							latest_value = Some(Arc::from(encoded_value));
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			if let Some(value) = latest_value {
+				let val = self.core.resolve_value(value.as_ref())?;
+				Ok(Some(val))
+			} else {
+				Ok(None)
+			}
+		} else {
+			Ok(None)
+		}
+	}
+
+	/// Queries the versioned index for all versions of a key
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_all_versions(
+		&self,
+		key: &[u8],
+		include_tombstones: bool,
+	) -> Result<Vec<(u64, Option<Value>)>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Create a range query for this key across all timestamps
+			let start_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				0,
+				InternalKeyKind::Set,
+				0, // Start from beginning of time
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				u64::MAX,
+				InternalKeyKind::Max,
+				u64::MAX, // End at end of time
+			)
+			.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			let mut versions = Vec::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.user_key.as_ref() == key
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+						{
+							let is_tombstone = reverse_key.is_tombstone();
+							if include_tombstones || !is_tombstone {
+								let value = if is_tombstone {
+									None
+								} else {
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
+								};
+								versions.push((reverse_key.timestamp, value));
+							}
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			// Sort by timestamp (newest first)
+			versions.sort_by(|a, b| b.0.cmp(&a.0));
+			Ok(versions)
+		} else {
+			Ok(vec![])
+		}
+	}
+
+	/// Queries the versioned index for versions of a key within a time range
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_versions_in_range(
+		&self,
+		key: &[u8],
+		start_ts: u64,
+		end_ts: u64,
+		include_tombstones: bool,
+	) -> Result<Vec<(u64, Option<Value>)>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Create a range query for this key within the time range
+			let start_key =
+				ReverseTimestampKey::new(key.to_vec(), 0, InternalKeyKind::Set, start_ts).encode();
+
+			let end_key =
+				ReverseTimestampKey::new(key.to_vec(), u64::MAX, InternalKeyKind::Max, end_ts)
+					.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			let mut versions = Vec::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.user_key.as_ref() == key
+							&& reverse_key.timestamp >= start_ts
+							&& reverse_key.timestamp <= end_ts
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+						{
+							let is_tombstone = reverse_key.is_tombstone();
+							if include_tombstones || !is_tombstone {
+								let value = if is_tombstone {
+									None
+								} else {
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
+								};
+								versions.push((reverse_key.timestamp, value));
+							}
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			// Sort by timestamp (newest first)
+			versions.sort_by(|a, b| b.0.cmp(&a.0));
+			Ok(versions)
+		} else {
+			Ok(vec![])
+		}
+	}
+
+	/// Gets all timestamps for a key from the versioned index
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_versions(&self, key: &[u8]) -> Result<Vec<u64>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Use range query for key-specific lookup across all timestamps
+			let start_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				0,
+				InternalKeyKind::Set,
+				0, // Start from beginning of time
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				key.to_vec(),
+				u64::MAX,
+				InternalKeyKind::Max,
+				u64::MAX, // End at end of time
+			)
+			.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			let mut timestamps = Vec::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, _encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.user_key.as_ref() == key
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+						{
+							timestamps.push(reverse_key.timestamp);
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			// Sort by timestamp (newest first)
+			timestamps.sort_by(|a, b| b.cmp(a));
+			Ok(timestamps)
+		} else {
+			Ok(vec![])
+		}
+	}
+
+	/// Efficiently queries all versions within a time range across all keys
+	/// This leverages the timestamp-first ordering in ReverseTimestampKey
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_all_versions_in_time_range(
+		&self,
+		start_ts: u64,
+		end_ts: u64,
+		include_tombstones: bool,
+	) -> Result<Vec<VersionedEntry>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Create a range query for the time range
+			let start_key = ReverseTimestampKey::new(
+				vec![], // Empty user key for range start
+				0,
+				InternalKeyKind::Set,
+				start_ts,
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				vec![0xFF; 256], // Max user key for range end
+				u64::MAX,
+				InternalKeyKind::Max,
+				end_ts,
+			)
+			.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			let mut versions = Vec::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.timestamp >= start_ts
+							&& reverse_key.timestamp <= end_ts
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+						{
+							let is_tombstone = reverse_key.is_tombstone();
+							if include_tombstones || !is_tombstone {
+								let value = if is_tombstone {
+									None
+								} else {
+									let resolved_value = self.core.resolve_value(&encoded_value)?;
+									Some(resolved_value)
+								};
+								versions.push((
+									reverse_key.user_key.as_ref().to_vec(),
+									reverse_key.timestamp,
+									value,
+								));
+							}
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			// Sort by timestamp (newest first)
+			versions.sort_by(|a, b| b.1.cmp(&a.1));
+			Ok(versions)
+		} else {
+			Ok(vec![])
+		}
+	}
+
+	/// Efficiently gets all keys that have versions within a time range
+	/// This is useful for finding which keys were modified during a specific period
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	pub(crate) fn get_keys_in_time_range(
+		&self,
+		start_ts: u64,
+		end_ts: u64,
+	) -> Result<Vec<Vec<u8>>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			// Create a range query for the time range
+			let start_key = ReverseTimestampKey::new(
+				vec![], // Empty user key for range start
+				0,
+				InternalKeyKind::Set,
+				start_ts,
+			)
+			.encode();
+
+			let end_key = ReverseTimestampKey::new(
+				vec![0xFF; 256], // Max user key for range end
+				u64::MAX,
+				InternalKeyKind::Max,
+				end_ts,
+			)
+			.encode();
+
+			let index_guard = versioned_index.read().unwrap();
+			let range_iter = index_guard.range(&start_key, &end_key)?;
+
+			let mut keys = std::collections::HashSet::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, _encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+						if reverse_key.timestamp >= start_ts
+							&& reverse_key.timestamp <= end_ts
+							&& reverse_key.seq_num() <= self.seq_num
+						// Snapshot isolation
+						{
+							keys.insert(reverse_key.user_key.as_ref().to_vec());
+						}
+					}
+					Err(e) => {
+						eprintln!("Error iterating versioned index: {}", e);
+						break;
+					}
+				}
+			}
+
+			let mut result: Vec<Vec<u8>> = keys.into_iter().collect();
+			result.sort();
+			Ok(result)
+		} else {
+			Ok(vec![])
+		}
 	}
 }
 
@@ -280,12 +674,16 @@ impl<'a, K: InternalKeyTrait> KMergeIterator<'a, K> {
 					// Seek to start if unbounded
 					match &range.0 {
 						Bound::Included(key) => {
-							let ikey =
-								K::new(key.clone(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Max);
+							let ikey = K::new(
+								key.clone(),
+								INTERNAL_KEY_SEQ_NUM_MAX,
+								InternalKeyKind::Max,
+								0,
+							);
 							table_iter.seek(&ikey.encode());
 						}
 						Bound::Excluded(key) => {
-							let ikey = K::new(key.clone(), 0, InternalKeyKind::Delete);
+							let ikey = K::new(key.clone(), 0, InternalKeyKind::Delete, 0);
 							table_iter.seek(&ikey.encode());
 							// If we're at the excluded key, advance once
 							if table_iter.valid() {

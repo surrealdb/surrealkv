@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
@@ -9,7 +10,7 @@ pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, VersionedEntry};
 use crate::sstable::InternalKeyKind;
 use crate::sstable::InternalKeyTrait;
 use crate::{IterResult, Value};
@@ -239,6 +240,33 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		Ok(())
 	}
 
+	/// Sets a key-value pair with a specific timestamp
+	pub fn set_at_ts(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+		self.set_at_ts_with_options(key, value, timestamp, &WriteOptions::default())
+	}
+
+	/// Sets a key-value pair with a specific timestamp and custom write options
+	pub fn set_at_ts_with_options(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		timestamp: u64,
+		options: &WriteOptions,
+	) -> Result<()> {
+		let seqno = self.next_write_seqno();
+		self.write_with_options(
+			Entry::new_with_timestamp(
+				key,
+				Some(value),
+				InternalKeyKind::Set,
+				self.savepoints,
+				seqno,
+				timestamp,
+			),
+			options,
+		)
+	}
+
 	// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
@@ -440,12 +468,24 @@ impl<K: InternalKeyTrait> Transaction<K> {
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
 		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
 
+		// Generate a single timestamp for this commit
+		let commit_timestamp =
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+
 		// Add all entries to the batch
 		for entry in latest_writes {
+			// Use the entry's timestamp if it was explicitly set (via set_at_ts),
+			// otherwise use the commit timestamp
+			let timestamp = if entry.timestamp != 0 {
+				entry.timestamp
+			} else {
+				commit_timestamp
+			};
 			batch.add_record(
 				entry.kind,
 				&entry.key,
 				entry.value.as_ref().map(|bytes| bytes.as_ref()),
+				timestamp,
 			)?;
 		}
 
@@ -529,6 +569,219 @@ impl<K: InternalKeyTrait> Transaction<K> {
 		self.savepoints = 0;
 		self.write_seqno = 0;
 	}
+
+	/// Gets a value for a key at a specific timestamp
+	pub fn get_at_timestamp(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_at_timestamp(key, timestamp),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all versions of a key
+	pub fn get_all_versions(&self, key: &[u8]) -> Result<Vec<(u64, Value)>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot (excluding tombstones)
+		match &self.snapshot {
+			Some(snapshot) => {
+				let versions = snapshot.get_all_versions(key, false)?;
+				Ok(versions.into_iter().filter_map(|(ts, value)| value.map(|v| (ts, v))).collect())
+			}
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all versions of a key including tombstones
+	pub fn get_all_versions_with_tombstones(
+		&self,
+		key: &[u8],
+	) -> Result<Vec<(u64, Option<Value>)>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot (including tombstones)
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_all_versions(key, true),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets versions of a key within a time range
+	pub fn get_versions_in_range(
+		&self,
+		key: &[u8],
+		start_ts: u64,
+		end_ts: u64,
+	) -> Result<Vec<(u64, Value)>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot (excluding tombstones)
+		match &self.snapshot {
+			Some(snapshot) => {
+				let versions = snapshot.get_versions_in_range(key, start_ts, end_ts, false)?;
+				Ok(versions.into_iter().filter_map(|(ts, value)| value.map(|v| (ts, v))).collect())
+			}
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets versions of a key within a time range including tombstones
+	pub fn get_versions_in_range_with_tombstones(
+		&self,
+		key: &[u8],
+		start_ts: u64,
+		end_ts: u64,
+	) -> Result<Vec<(u64, Option<Value>)>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot (including tombstones)
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_versions_in_range(key, start_ts, end_ts, true),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all timestamps for a key
+	pub fn versions(&self, key: &[u8]) -> Result<Vec<u64>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_versions(key),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all versions within a time range across all keys
+	pub fn get_all_versions_in_time_range(
+		&self,
+		start_ts: u64,
+		end_ts: u64,
+		include_tombstones: bool,
+	) -> Result<Vec<VersionedEntry>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => {
+				snapshot.get_all_versions_in_time_range(start_ts, end_ts, include_tombstones)
+			}
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all keys that have versions within a time range
+	/// This is useful for finding which keys were modified during a specific period
+	pub fn get_keys_in_time_range(&self, start_ts: u64, end_ts: u64) -> Result<Vec<Vec<u8>>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_keys_in_time_range(start_ts, end_ts),
+			None => Err(Error::NoSnapshot),
+		}
+	}
 }
 
 impl<K: InternalKeyTrait> Drop for Transaction<K> {
@@ -554,6 +807,9 @@ pub(crate) struct Entry {
 
 	/// Sequence number for ordering writes within a transaction
 	pub(crate) seqno: u32,
+
+	/// Timestamp for versioned queries
+	pub(crate) timestamp: u64,
 }
 
 impl Entry {
@@ -570,6 +826,25 @@ impl Entry {
 			kind,
 			savepoint_no,
 			seqno,
+			timestamp: 0, // Will be set at commit time
+		}
+	}
+
+	fn new_with_timestamp(
+		key: &[u8],
+		value: Option<&[u8]>,
+		kind: InternalKeyKind,
+		savepoint_no: u32,
+		seqno: u32,
+		timestamp: u64,
+	) -> Entry {
+		Entry {
+			key: Bytes::copy_from_slice(key),
+			value: value.map(Bytes::copy_from_slice),
+			kind,
+			savepoint_no,
+			seqno,
+			timestamp,
 		}
 	}
 
@@ -832,7 +1107,7 @@ mod tests {
 
 	use bytes::Bytes;
 
-	use crate::{lsm::Tree, sstable::InternalKey, TreeBuilder};
+	use crate::{lsm::Tree, sstable::InternalKey, Options, TimestampKey, TreeBuilder};
 
 	use super::*;
 
@@ -2388,5 +2663,260 @@ mod tests {
 			let tx = store.begin().unwrap();
 			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
 		}
+	}
+
+	#[tokio::test]
+	async fn test_versioned_queries_basic() {
+		let temp_dir = create_temp_directory();
+		let opts: Options<TimestampKey> =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert some data with timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1_v1").unwrap();
+		tx1.commit().await.unwrap();
+
+		// Wait a bit to ensure different timestamps
+		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key1", b"value1_v2").unwrap();
+		tx2.commit().await.unwrap();
+
+		// Test regular get (should return latest)
+		let tx = tree.begin().unwrap();
+		let value = tx.get(b"key1").unwrap();
+		assert_eq!(value, Some(Arc::from(b"value1_v2" as &[u8])));
+
+		// Test versioned queries
+		let versions = tx.get_all_versions(b"key1").unwrap();
+		assert_eq!(versions.len(), 2);
+		assert_eq!(versions[0].1, Arc::from(b"value1_v2" as &[u8])); // Latest first
+		assert_eq!(versions[1].1, Arc::from(b"value1_v1" as &[u8]));
+
+		// Test versions with tombstones
+		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1").unwrap();
+		assert_eq!(versions_with_tombstones.len(), 2);
+		assert_eq!(versions_with_tombstones[0].1, Some(Arc::from(b"value1_v2" as &[u8])));
+		assert_eq!(versions_with_tombstones[1].1, Some(Arc::from(b"value1_v1" as &[u8])));
+
+		// Test versions listing
+		let timestamps = tx.versions(b"key1").unwrap();
+		assert_eq!(timestamps.len(), 2);
+		assert!(timestamps[0] > timestamps[1]); // Newest first
+
+		// Test get at specific timestamp
+		let value_at_ts = tx.get_at_timestamp(b"key1", timestamps[1]).unwrap();
+		assert_eq!(value_at_ts, Some(Arc::from(b"value1_v1" as &[u8])));
+
+		// Test range queries
+		let range_versions =
+			tx.get_versions_in_range(b"key1", timestamps[1], timestamps[0]).unwrap();
+		assert_eq!(range_versions.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn test_versioned_queries_with_deletes() {
+		let temp_dir = create_temp_directory();
+		let opts: Options<TimestampKey> =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert, update, then delete
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.commit().await.unwrap();
+
+		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key1", b"value2").unwrap();
+		tx2.commit().await.unwrap();
+
+		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+		let mut tx3 = tree.begin().unwrap();
+		tx3.delete(b"key1").unwrap();
+		tx3.commit().await.unwrap();
+
+		// Test regular get (should return None due to delete)
+		let tx = tree.begin().unwrap();
+		let value = tx.get(b"key1").unwrap();
+		assert_eq!(value, None);
+
+		// Test versions with tombstones (should include the delete)
+		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1").unwrap();
+		assert_eq!(versions_with_tombstones.len(), 3);
+		assert_eq!(versions_with_tombstones[0].1, None); // Delete
+		assert_eq!(versions_with_tombstones[1].1, Some(Arc::from(b"value2" as &[u8])));
+		assert_eq!(versions_with_tombstones[2].1, Some(Arc::from(b"value1" as &[u8])));
+
+		// Test versions without tombstones (should exclude the delete)
+		let versions = tx.get_all_versions(b"key1").unwrap();
+		assert_eq!(versions.len(), 2);
+		assert_eq!(versions[0].1, Arc::from(b"value2" as &[u8]));
+		assert_eq!(versions[1].1, Arc::from(b"value1" as &[u8]));
+	}
+
+	#[tokio::test]
+	async fn test_efficient_time_range_queries() {
+		let temp_dir = create_temp_directory();
+		let opts: Options<TimestampKey> =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data with different timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1_v1").unwrap();
+		tx1.commit().await.unwrap();
+
+		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key2", b"value2_v1").unwrap();
+		tx2.commit().await.unwrap();
+
+		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+		let mut tx3 = tree.begin().unwrap();
+		tx3.set(b"key1", b"value1_v2").unwrap();
+		tx3.set(b"key3", b"value3_v1").unwrap();
+		tx3.commit().await.unwrap();
+
+		// Get timestamps for range queries
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key1").unwrap();
+		assert_eq!(timestamps.len(), 2);
+
+		let start_ts = timestamps[1]; // Older timestamp
+		let end_ts = timestamps[0]; // Newer timestamp
+
+		// Test efficient time range query across all keys
+		let all_versions = tx.get_all_versions_in_time_range(start_ts, end_ts, false).unwrap();
+		assert!(all_versions.len() >= 2); // Should include key1 and key2 at least
+
+		// Test getting keys modified in time range
+		let modified_keys = tx.get_keys_in_time_range(start_ts, end_ts).unwrap();
+		assert!(modified_keys.len() >= 2); // Should include key1 and key2 at least
+		assert!(modified_keys.iter().any(|k| k == b"key1"));
+		assert!(modified_keys.iter().any(|k| k == b"key2"));
+
+		// Test with tombstones
+		let mut tx4 = tree.begin().unwrap();
+		tx4.delete(b"key1").unwrap();
+		tx4.commit().await.unwrap();
+
+		// Get updated timestamps to include the delete operation
+		let tx = tree.begin().unwrap();
+		let updated_timestamps = tx.versions(b"key1").unwrap();
+
+		// Use a broader time range that includes the delete operation
+		let extended_start_ts = updated_timestamps.last().unwrap() - 1000000; // 1ms before oldest
+		let extended_end_ts = updated_timestamps.first().unwrap() + 1000000; // 1ms after newest
+
+		let all_versions_with_tombstones =
+			tx.get_all_versions_in_time_range(extended_start_ts, extended_end_ts, true).unwrap();
+		let all_versions_without_tombstones =
+			tx.get_all_versions_in_time_range(extended_start_ts, extended_end_ts, false).unwrap();
+
+		// Should have more versions when including tombstones
+		assert!(all_versions_with_tombstones.len() > all_versions_without_tombstones.len());
+	}
+
+	#[tokio::test]
+	async fn test_set_at_timestamp() {
+		let temp_dir = create_temp_directory();
+		let opts: Options<TimestampKey> =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Set a value with a specific timestamp
+		let custom_timestamp = 1234567890000000000; // Some specific timestamp
+		let mut tx = tree.begin().unwrap();
+		tx.set_at_ts(b"key1", b"value1", custom_timestamp).unwrap();
+		tx.commit().await.unwrap();
+
+		// Verify we can get the value at that timestamp
+		let tx = tree.begin().unwrap();
+		let value = tx.get_at_timestamp(b"key1", custom_timestamp).unwrap();
+		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+
+		// Verify we can get the value at a later timestamp
+		let later_timestamp = custom_timestamp + 1000000;
+		let value = tx.get_at_timestamp(b"key1", later_timestamp).unwrap();
+		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+
+		// Verify we can't get the value at an earlier timestamp
+		let earlier_timestamp = custom_timestamp - 1000000;
+		let value = tx.get_at_timestamp(b"key1", earlier_timestamp).unwrap();
+		assert_eq!(value, None);
+
+		// Verify the timestamp appears in versions
+		let versions = tx.versions(b"key1").unwrap();
+		assert_eq!(versions.len(), 1);
+		assert_eq!(versions[0], custom_timestamp);
+	}
+
+	#[tokio::test]
+	async fn test_commit_timestamp_consistency() {
+		let temp_dir = create_temp_directory();
+		let opts: Options<TimestampKey> =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Set multiple values in a single transaction
+		let mut tx = tree.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.commit().await.unwrap();
+
+		// All keys should have the same timestamp
+		let tx = tree.begin().unwrap();
+		let versions1 = tx.versions(b"key1").unwrap();
+		let versions2 = tx.versions(b"key2").unwrap();
+		let versions3 = tx.versions(b"key3").unwrap();
+
+		assert_eq!(versions1.len(), 1);
+		assert_eq!(versions2.len(), 1);
+		assert_eq!(versions3.len(), 1);
+		assert_eq!(versions1[0], versions2[0]);
+		assert_eq!(versions2[0], versions3[0]);
+
+		// Test mixed explicit and implicit timestamps
+		let custom_timestamp = 9876543210000000000;
+		let mut tx = tree.begin().unwrap();
+		tx.set(b"key4", b"value4").unwrap(); // Will get commit timestamp
+		tx.set_at_ts(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
+		tx.set(b"key6", b"value6").unwrap(); // Will get commit timestamp
+		tx.commit().await.unwrap();
+
+		let tx = tree.begin().unwrap();
+		let versions4 = tx.versions(b"key4").unwrap();
+		let versions5 = tx.versions(b"key5").unwrap();
+		let versions6 = tx.versions(b"key6").unwrap();
+
+		assert_eq!(versions4.len(), 1);
+		assert_eq!(versions5.len(), 1);
+		assert_eq!(versions6.len(), 1);
+
+		// key4 and key6 should have the same timestamp (commit timestamp)
+		assert_eq!(versions4[0], versions6[0]);
+
+		// key5 should have the custom timestamp
+		assert_eq!(versions5[0], custom_timestamp);
+
+		// key4/key6 timestamp should be different from key5 timestamp
+		assert_ne!(versions4[0], versions5[0]);
 	}
 }

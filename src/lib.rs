@@ -21,7 +21,8 @@ mod wal;
 
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::sstable::InternalKey;
+use crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX;
+pub use crate::sstable::{InternalKey, TimestampKey};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
 use sstable::{bloom::LevelDBBloomFilter, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
@@ -72,6 +73,13 @@ pub struct Options<K: InternalKeyTrait = InternalKey> {
 	pub vlog_value_threshold: usize,
 	/// If true, runs the LSM store completely in memory
 	pub in_memory_only: bool,
+
+	// Versioned query configuration
+	/// If true, enables versioned queries with timestamp tracking
+	pub enable_versioning: bool,
+	/// History retention period in nanoseconds (0 means no retention limit)
+	/// Default: 0 (no retention limit)
+	pub versioned_history_retention_ns: u64,
 }
 
 impl<K: InternalKeyTrait> Default for Options<K> {
@@ -96,6 +104,8 @@ impl<K: InternalKeyTrait> Default for Options<K> {
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 4096, // 4KB default
 			in_memory_only: false,
+			enable_versioning: false,
+			versioned_history_retention_ns: 0, // No retention limit by default
 		}
 	}
 }
@@ -199,6 +209,20 @@ impl<K: InternalKeyTrait> Options<K> {
 		self
 	}
 
+	/// Enables or disables versioned queries with timestamp tracking
+	/// When enabled, automatically configures VLog and value threshold for optimal versioned query support
+	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
+		self.enable_versioning = value;
+		self.versioned_history_retention_ns = retention_ns;
+		if value {
+			// Versioned queries require VLog to be enabled
+			self.enable_vlog = true;
+			// All values should go to VLog for versioned queries
+			self.vlog_value_threshold = 0;
+		}
+		self
+	}
+
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
 	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
@@ -247,6 +271,11 @@ impl<K: InternalKeyTrait> Options<K> {
 		self.path.join("delete_list")
 	}
 
+	/// Returns the directory path for versioned index files
+	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
+		self.path.join("versioned_index")
+	}
+
 	/// Checks if a filename matches the `VLog` file naming pattern
 	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
 	pub(crate) fn is_vlog_filename(&self, filename: &str) -> bool {
@@ -267,6 +296,56 @@ impl<K: InternalKeyTrait> Options<K> {
 			}
 		}
 		None
+	}
+
+	/// Validates the configuration options for consistency and correctness
+	/// This should be called when the store starts to catch configuration errors early
+	pub fn validate(&self) -> Result<()> {
+		// Validate VLog GC discard ratio
+		if !(0.0..=1.0).contains(&self.vlog_gc_discard_ratio) {
+			return Err(Error::InvalidArgument(
+				"VLog GC discard ratio must be between 0.0 and 1.0".to_string(),
+			));
+		}
+
+		// Validate versioned queries configuration
+		if self.enable_versioning {
+			// Versioned queries require a key type that supports versioning
+			if !K::supports_versioning() {
+				return Err(Error::InvalidArgument(
+					"Versioning is enabled but the key type does not support versioning. Use TimestampKey instead of InternalKey for versioned queries.".to_string(),
+				));
+			}
+
+			// Versioned queries require VLog to be enabled
+			if !self.enable_vlog {
+				return Err(Error::InvalidArgument(
+					"Versioned queries require VLog to be enabled. Set enable_vlog to true."
+						.to_string(),
+				));
+			}
+
+			// Versioned queries don't work well with value threshold (values should go to VLog)
+			if self.vlog_value_threshold > 0 {
+				return Err(Error::InvalidArgument(
+					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
+				));
+			}
+
+			// Versioned queries don't work in memory-only mode (need persistence for history)
+			if self.in_memory_only {
+				return Err(Error::InvalidArgument(
+					"Versioned queries require persistence. Cannot use in_memory_only mode with versioned queries.".to_string(),
+				));
+			}
+		}
+
+		// Validate level count is reasonable
+		if self.level_count == 0 {
+			return Err(Error::InvalidArgument("Level count must be at least 1".to_string()));
+		}
+
+		Ok(())
 	}
 }
 
@@ -523,12 +602,13 @@ impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 			if sep.len() < key_a.user_key().len()
 				&& self.user_comparator.compare(key_a.user_key().as_ref(), &sep) == Ordering::Less
 			{
-				let result = K::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, key_a.kind());
+				let result =
+					K::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, key_a.kind(), INTERNAL_KEY_TIMESTAMP_MAX);
 				return result.encode();
 			}
 
 			// Otherwise use original sequence number
-			let result = K::new(sep, key_a.seq_num(), key_a.kind());
+			let result = K::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp());
 			return result.encode();
 		}
 
@@ -541,7 +621,12 @@ impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key().as_ref());
 
 		// Create a new internal key with the successor user key and original sequence/kind
-		let result = K::new(user_key_succ, internal_key.seq_num(), internal_key.kind());
+		let result = K::new(
+			user_key_succ,
+			internal_key.seq_num(),
+			internal_key.kind(),
+			internal_key.timestamp(),
+		);
 		result.encode()
 	}
 }

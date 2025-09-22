@@ -343,7 +343,12 @@ mod tests {
 			// Create a copy of the batch for testing
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
-				new_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+				new_batch.add_record(
+					entry.kind,
+					&entry.key,
+					entry.value.as_deref(),
+					entry.timestamp,
+				)?;
 			}
 			Ok(new_batch)
 		}
@@ -358,7 +363,7 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1")).unwrap();
+		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
 
 		let result = pipeline.commit(batch, false).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
@@ -380,7 +385,12 @@ mod tests {
 		for i in 0..5 {
 			let mut batch = Batch::new(0);
 			batch
-				.add_record(InternalKeyKind::Set, &format!("key{i}").into_bytes(), Some(&[1, 2, 3]))
+				.add_record(
+					InternalKeyKind::Set,
+					&format!("key{i}").into_bytes(),
+					Some(&[1, 2, 3]),
+					i,
+				)
 				.unwrap();
 			let result = pipeline.commit(batch, false).await;
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
@@ -405,6 +415,7 @@ mod tests {
 						InternalKeyKind::Set,
 						&format!("key{i}").into_bytes(),
 						Some(&[1, 2, 3]),
+						i,
 					)
 					.unwrap();
 				pipeline.commit(batch, false).await
@@ -441,7 +452,12 @@ mod tests {
 			// Create a copy of the batch for testing
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
-				new_batch.add_record(entry.kind, &entry.key, entry.value.as_deref())?;
+				new_batch.add_record(
+					entry.kind,
+					&entry.key,
+					entry.value.as_deref(),
+					entry.timestamp,
+				)?;
 			}
 			Ok(new_batch)
 		}
@@ -469,6 +485,7 @@ mod tests {
 						InternalKeyKind::Set,
 						&format!("key{i}").into_bytes(),
 						Some(&[1, 2, 3]),
+						i,
 					)
 					.unwrap();
 				pipeline.commit(batch, false).await
