@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use quick_cache::{sync::Cache, Weighter};
 
+use crate::sstable::ReverseTimestampKey;
 use crate::vfs::File as VfsFile;
 use crate::Comparator;
 
@@ -2097,6 +2098,22 @@ impl<F: VfsFile> BPlusTree<F> {
 		RangeScanIterator::new(self, start_key, end_key)
 	}
 
+	pub fn timestamp_range(
+		&self,
+		start_timestamp: u64,
+		end_timestamp: u64,
+		start_user_key: &[u8],
+		end_user_key: &[u8],
+	) -> Result<TimestampRangeIterator<'_, F>> {
+		TimestampRangeIterator::new(
+			self,
+			start_timestamp,
+			end_timestamp,
+			start_user_key,
+			end_user_key,
+		)
+	}
+
 	/// Calculate the height of the B+ tree.
 	#[cfg(test)]
 	pub fn calculate_tree_stats(&mut self) -> Result<(usize, usize, usize, usize)> {
@@ -2240,6 +2257,153 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 			// Check if the current key is within range
 			let key = &leaf.keys[self.current_idx];
 			if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
+				self.reached_end = true;
+				return None;
+			}
+
+			// Return the current key-value pair and advance
+			let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
+			self.current_idx += 1;
+			return Some(result);
+		}
+
+		self.reached_end = true;
+		None
+	}
+}
+
+/// A range scan iterator that performs conjunctive filtering on ReverseTimestampKey
+pub(crate) struct TimestampRangeIterator<'a, F: VfsFile> {
+	tree: &'a BPlusTree<F>,
+	current_leaf: Option<LeafNode>,
+	start_timestamp: u64,
+	end_timestamp: u64,
+	start_user_key: Vec<u8>,
+	end_user_key: Vec<u8>,
+	current_idx: usize,
+	reached_end: bool,
+}
+
+impl<'a, F: VfsFile> TimestampRangeIterator<'a, F> {
+	pub(crate) fn new(
+		tree: &'a BPlusTree<F>,
+		start_timestamp: u64,
+		end_timestamp: u64,
+		start_user_key: &[u8],
+		end_user_key: &[u8],
+	) -> Result<Self> {
+		let tree_start_key = ReverseTimestampKey::new(
+			start_user_key.to_vec(),
+			0,
+			crate::sstable::InternalKeyKind::Set,
+			0,
+		)
+		.encode();
+
+		// Find the leaf containing the start key
+		let mut node_offset = tree.header.root_offset;
+
+		// Traverse the tree to find the starting leaf
+		let leaf = loop {
+			match tree.read_node(node_offset)? {
+				NodeType::Internal(internal) => {
+					// Find the child that would contain the key
+					let mut idx = 0;
+					while idx < internal.keys.len()
+						&& tree.compare.compare(&tree_start_key, &internal.keys[idx])
+							>= Ordering::Equal
+					{
+						idx += 1;
+					}
+					node_offset = internal.children[idx];
+				}
+				NodeType::Leaf(leaf) => {
+					break leaf;
+				}
+			}
+		};
+
+		// Find the first key >= start_key in the leaf
+		let current_idx = leaf
+			.keys
+			.partition_point(|k| tree.compare.compare(k, &tree_start_key) == Ordering::Less);
+
+		Ok(TimestampRangeIterator {
+			tree,
+			current_leaf: Some(leaf),
+			start_timestamp,
+			end_timestamp,
+			start_user_key: start_user_key.to_vec(),
+			end_user_key: end_user_key.to_vec(),
+			current_idx,
+			reached_end: false,
+		})
+	}
+
+	/// Check if a key satisfies the conjunctive range constraints
+	fn is_within_range(&self, key: &[u8]) -> bool {
+		// Decode the key
+		let reverse_key = ReverseTimestampKey::decode(key);
+
+		// Check timestamp constraint
+		if reverse_key.timestamp < self.start_timestamp
+			|| reverse_key.timestamp > self.end_timestamp
+		{
+			return false;
+		}
+
+		// Check user key constraint
+		let user_key = reverse_key.user_key.as_ref();
+		if user_key < self.start_user_key.as_slice() || user_key > self.end_user_key.as_slice() {
+			return false;
+		}
+
+		true
+	}
+}
+
+impl<F: VfsFile> Iterator for TimestampRangeIterator<'_, F> {
+	type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.reached_end {
+			return None;
+		}
+
+		if let Some(leaf) = &self.current_leaf {
+			// Check if we've reached the end of the current leaf
+			if self.current_idx >= leaf.keys.len() {
+				// Move to the next leaf if possible
+				if leaf.next_leaf == 0 {
+					self.reached_end = true;
+					return None;
+				}
+
+				// Load the next leaf
+				match self.tree.read_node(leaf.next_leaf) {
+					Ok(NodeType::Leaf(next_leaf)) => {
+						self.current_leaf = Some(next_leaf);
+						self.current_idx = 0;
+						// Recursively call next() to process the new leaf
+						return self.next();
+					}
+					Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
+					Err(e) => return Some(Err(e)),
+				}
+			}
+
+			// Get the current key
+			let key = &leaf.keys[self.current_idx];
+
+			if !self.is_within_range(key) {
+				// Skip this key and continue
+				self.current_idx += 1;
+				return self.next();
+			}
+
+			// Check if we've exceeded the timestamp range (early termination)
+			let reverse_key = ReverseTimestampKey::decode(key);
+			if reverse_key.timestamp > self.end_timestamp {
 				self.reached_end = true;
 				return None;
 			}

@@ -1312,7 +1312,7 @@ mod tests {
 		assert!(!has_duplicates, "Found duplicate table IDs in the selected tables list");
 
 		// Count occurrences of each table ID
-		let mut id_count = std::collections::HashMap::new();
+		let mut id_count = HashMap::new();
 		for &id in &selected_tables {
 			*id_count.entry(id).or_insert(0) += 1;
 		}

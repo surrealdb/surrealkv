@@ -5,7 +5,7 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
 
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -137,16 +137,14 @@ impl InternalKey {
 	}
 }
 
+// Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Same as InternalKey: user key, then sequence number, then kind, with timestamp as final tiebreaker
-		match (&self.user_key, Reverse(self.seq_num()))
-			.cmp(&(&other.user_key, Reverse(other.seq_num())))
-		{
-			Ordering::Equal => match Reverse(self.kind() as u8).cmp(&Reverse(other.kind() as u8)) {
-				Ordering::Equal => Reverse(self.timestamp).cmp(&Reverse(other.timestamp)),
-				ordering => ordering,
-			},
+		// First compare by user key (ascending)
+		match self.user_key.cmp(&other.user_key) {
+			// If user keys are equal, compare by sequence number (descending)
+			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
 			ordering => ordering,
 		}
 	}
@@ -225,22 +223,6 @@ impl ReverseTimestampKey {
 
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_tombstone_kind(self.kind())
-	}
-}
-
-impl Ord for ReverseTimestampKey {
-	fn cmp(&self, other: &Self) -> Ordering {
-		// First compare by timestamp (ascending for chronological order), then by user key, then by sequence number (descending)
-		self.timestamp
-			.cmp(&other.timestamp)
-			.then(self.user_key.cmp(&other.user_key))
-			.then(Reverse(self.seq_num()).cmp(&Reverse(other.seq_num())))
-	}
-}
-
-impl PartialOrd for ReverseTimestampKey {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.cmp(other))
 	}
 }
 

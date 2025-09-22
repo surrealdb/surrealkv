@@ -3488,7 +3488,7 @@ mod tests {
 		tree.flush().unwrap();
 
 		// Update some keys to create discard statistics
-		let mut discard_updates = std::collections::HashMap::new();
+		let mut discard_updates = HashMap::new();
 		let stats = tree.get_all_vlog_stats();
 		for (file_id, total_size, _discard_bytes, _ratio) in &stats {
 			if *total_size > 0 {
