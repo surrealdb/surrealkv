@@ -1,17 +1,17 @@
 use super::LevelManifest;
-use crate::sstable::{table::Table, InternalKeyTrait};
+use crate::sstable::table::Table;
 use std::sync::Arc;
 
 /// Iterates through all levels
-pub(crate) struct LevelManifestIterator<'a, K: InternalKeyTrait> {
-	level_manifest: &'a LevelManifest<K>,
+pub(crate) struct LevelManifestIterator<'a> {
+	level_manifest: &'a LevelManifest,
 	current_level: usize,
 	current_idx: usize,
 }
 
-impl<'a, K: InternalKeyTrait> LevelManifestIterator<'a, K> {
+impl<'a> LevelManifestIterator<'a> {
 	#[must_use]
-	pub(crate) fn new(level_manifest: &'a LevelManifest<K>) -> Self {
+	pub(crate) fn new(level_manifest: &'a LevelManifest) -> Self {
 		Self {
 			level_manifest,
 			current_idx: 0,
@@ -20,8 +20,8 @@ impl<'a, K: InternalKeyTrait> LevelManifestIterator<'a, K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for LevelManifestIterator<'_, K> {
-	type Item = Arc<Table<K>>;
+impl Iterator for LevelManifestIterator<'_> {
+	type Item = Arc<Table>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {

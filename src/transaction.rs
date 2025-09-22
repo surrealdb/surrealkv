@@ -12,7 +12,6 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{Snapshot, VersionedEntry};
 use crate::sstable::InternalKeyKind;
-use crate::sstable::InternalKeyTrait;
 use crate::{IterResult, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
@@ -147,7 +146,7 @@ impl ReadOptions {
 
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
-pub struct Transaction<K: InternalKeyTrait> {
+pub struct Transaction {
 	/// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
 
@@ -155,10 +154,10 @@ pub struct Transaction<K: InternalKeyTrait> {
 	durability: Durability,
 
 	/// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
-	pub(crate) snapshot: Option<Snapshot<K>>,
+	pub(crate) snapshot: Option<Snapshot>,
 
 	/// `core` is the underlying core for the transaction. This is shared between transactions.
-	pub(crate) core: Arc<Core<K>>,
+	pub(crate) core: Arc<Core>,
 
 	/// `write_set` is a map of keys to entries.
 	/// These are the changes that the transaction intends to make to the data.
@@ -179,7 +178,7 @@ pub struct Transaction<K: InternalKeyTrait> {
 	write_seqno: u32,
 }
 
-impl<K: InternalKeyTrait> Transaction<K> {
+impl Transaction {
 	/// Bump the write sequence number and return it.
 	fn next_write_seqno(&mut self) -> u32 {
 		self.write_seqno += 1;
@@ -191,7 +190,7 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 
 	/// Prepare a new transaction in the given mode.
-	pub(crate) fn new(core: Arc<Core<K>>, mode: Mode) -> Result<Self> {
+	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
 
 		let start_commit_id =
@@ -784,7 +783,7 @@ impl<K: InternalKeyTrait> Transaction<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Drop for Transaction<K> {
+impl Drop for Transaction {
 	fn drop(&mut self) {
 		self.rollback();
 	}
@@ -863,7 +862,7 @@ impl Entry {
 }
 
 /// An iterator that performs a merging scan over a transaction's snapshot and write set.
-pub(crate) struct TransactionRangeIterator<'a, K: InternalKeyTrait> {
+pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
@@ -878,15 +877,12 @@ pub(crate) struct TransactionRangeIterator<'a, K: InternalKeyTrait> {
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
-
-	/// Phantom data to hold the key type
-	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
+impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
-		tx: &'a Transaction<K>,
+		tx: &'a Transaction,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
 		options: &ReadOptions,
@@ -924,7 +920,6 @@ impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
 			limit: options.limit.unwrap_or(usize::MAX),
 			count: 0,
 			keys_only: options.keys_only,
-			_phantom: std::marker::PhantomData,
 		})
 	}
 
@@ -969,7 +964,7 @@ impl<'a, K: InternalKeyTrait> TransactionRangeIterator<'a, K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for TransactionRangeIterator<'_, K> {
+impl Iterator for TransactionRangeIterator<'_> {
 	type Item = IterResult;
 
 	/// Merges results from write set and snapshot in key order
@@ -1036,7 +1031,7 @@ impl<K: InternalKeyTrait> Iterator for TransactionRangeIterator<'_, K> {
 	}
 }
 
-impl<K: InternalKeyTrait> DoubleEndedIterator for TransactionRangeIterator<'_, K> {
+impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 	/// Merges results from write set and snapshot in reverse key order
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if self.count >= self.limit {
@@ -1107,7 +1102,7 @@ mod tests {
 
 	use bytes::Bytes;
 
-	use crate::{lsm::Tree, sstable::InternalKey, Options, TimestampKey, TreeBuilder};
+	use crate::{lsm::Tree, Options, TreeBuilder};
 
 	use super::*;
 
@@ -2106,7 +2101,7 @@ mod tests {
 	async fn test_range_value_pointer_resolution_bug() {
 		let temp_dir = create_temp_directory();
 
-		let tree = TreeBuilder::<InternalKey>::new()
+		let tree = TreeBuilder::new()
 			.with_path(temp_dir.path().to_path_buf())
 			.with_max_memtable_size(512)
 			.build()
@@ -2668,7 +2663,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_versioned_queries_basic() {
 		let temp_dir = create_temp_directory();
-		let opts: Options<TimestampKey> =
+		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
@@ -2722,7 +2717,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_versioned_queries_with_deletes() {
 		let temp_dir = create_temp_directory();
-		let opts: Options<TimestampKey> =
+		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
@@ -2768,7 +2763,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_efficient_time_range_queries() {
 		let temp_dir = create_temp_directory();
-		let opts: Options<TimestampKey> =
+		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
@@ -2836,7 +2831,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_set_at_timestamp() {
 		let temp_dir = create_temp_directory();
-		let opts: Options<TimestampKey> =
+		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 		let tree = TreeBuilder::with_options(opts).build().unwrap();
 
@@ -2870,7 +2865,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_commit_timestamp_consistency() {
 		let temp_dir = create_temp_directory();
-		let opts: Options<TimestampKey> =
+		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 		let tree = TreeBuilder::with_options(opts).build().unwrap();
 

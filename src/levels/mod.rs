@@ -10,12 +10,7 @@ use std::{
 	time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{
-	error::Error,
-	sstable::{table::Table, InternalKeyTrait},
-	vfs::File,
-	Options, Result,
-};
+use crate::{error::Error, sstable::table::Table, vfs::File, Options, Result};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use rand::Rng;
@@ -55,7 +50,7 @@ impl SnapshotInfo {
 
 /// Represents a set of changes to be applied to the manifest
 #[derive(Clone, Default)]
-pub struct ManifestChangeSet<K: InternalKeyTrait> {
+pub(crate) struct ManifestChangeSet {
 	/// Manifest format version if changed
 	pub manifest_format_version: Option<u16>,
 
@@ -63,7 +58,7 @@ pub struct ManifestChangeSet<K: InternalKeyTrait> {
 	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
 
 	/// Tables to add to manifest
-	pub new_tables: Vec<(u8, Arc<Table<K>>)>, // (level, table)
+	pub new_tables: Vec<(u8, Arc<Table>)>, // (level, table)
 
 	/// Snapshots to add
 	pub new_snapshots: Vec<SnapshotInfo>,
@@ -78,12 +73,12 @@ mod level;
 pub type HiddenSet = HashSet<u64>;
 
 /// Represents the levels of a log-structured merge tree.
-pub struct LevelManifest<K: InternalKeyTrait> {
+pub(crate) struct LevelManifest {
 	/// Path of level manifest file
 	pub path: PathBuf,
 
 	/// Levels of the LSM tree
-	pub levels: Levels<K>,
+	pub levels: Levels,
 
 	/// Set of hidden tables that should not appear during compaction
 	pub(crate) hidden_set: HiddenSet,
@@ -98,8 +93,8 @@ pub struct LevelManifest<K: InternalKeyTrait> {
 	pub snapshots: Vec<SnapshotInfo>,
 }
 
-impl<K: InternalKeyTrait> LevelManifest<K> {
-	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
+impl LevelManifest {
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
 
 		let manifest_file_path = opts.manifest_file_path(0);
@@ -145,14 +140,14 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 	}
 
 	/// Initializes levels with default values
-	fn initialize_levels(level_count: u8) -> Levels<K> {
-		let levels = (0..level_count).map(|_| Arc::new(Level::<K>::default())).collect::<Vec<_>>();
+	fn initialize_levels(level_count: u8) -> Levels {
+		let levels = (0..level_count).map(|_| Arc::new(Level::default())).collect::<Vec<_>>();
 
 		Levels(levels)
 	}
 
 	/// Load a manifest from file and return a complete LevelManifest instance
-	fn load_from_file<P: AsRef<Path>>(manifest_path: P, opts: Arc<Options<K>>) -> Result<Self> {
+	fn load_from_file<P: AsRef<Path>>(manifest_path: P, opts: Arc<Options>) -> Result<Self> {
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
 		let mut level_manifest = Cursor::new(data);
@@ -169,7 +164,7 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 
 		// Read levels data
-		let level_data = Levels::<K>::decode(&mut level_manifest)?;
+		let level_data = Levels::decode(&mut level_manifest)?;
 
 		// Read snapshots
 		let snapshot_count = level_manifest.read_u32::<BigEndian>()?;
@@ -224,7 +219,7 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 		})
 	}
 
-	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table<K>>]) -> Result<()> {
+	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
 		// Basic sanity check for all tables
 		for table in tables {
 			// Ensure smallest_seq_num is not greater than largest_seq_num
@@ -258,7 +253,7 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 	}
 
 	/// Helper to load a single table by ID
-	fn load_table(table_id: u64, opts: Arc<Options<K>>) -> Result<Arc<Table<K>>> {
+	fn load_table(table_id: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
 		let table_file_path = opts.sstable_file_path(table_id);
 
 		// Open the table file
@@ -267,7 +262,7 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 		let file_size = file.size()?;
 
 		// Create and return the table
-		let table = Arc::new(Table::<K>::new(table_id, opts, file, file_size)?);
+		let table = Arc::new(Table::new(table_id, opts, file, file_size)?);
 		Ok(table)
 	}
 
@@ -281,11 +276,11 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 		self.depth() - 1
 	}
 
-	pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<Table<K>>> + '_ {
-		LevelManifestIterator::<K>::new(self)
+	pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<Table>> + '_ {
+		LevelManifestIterator::new(self)
 	}
 
-	pub(crate) fn get_all_tables(&self) -> HashMap<u64, Arc<Table<K>>> {
+	pub(crate) fn get_all_tables(&self) -> HashMap<u64, Arc<Table>> {
 		let mut output = HashMap::new();
 
 		for table in self.iter() {
@@ -308,7 +303,7 @@ impl<K: InternalKeyTrait> LevelManifest<K> {
 	}
 
 	/// Apply a changeset to this manifest
-	pub(crate) fn apply_changeset(&mut self, changeset: &ManifestChangeSet<K>) -> Result<()> {
+	pub(crate) fn apply_changeset(&mut self, changeset: &ManifestChangeSet) -> Result<()> {
 		// Apply scalar values if present in changeset
 		if let Some(version) = changeset.manifest_format_version {
 			self.manifest_format_version = version;
@@ -395,9 +390,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 }
 
 /// Write the full versioned manifest to disk
-pub(crate) fn write_manifest_to_disk<K: InternalKeyTrait>(
-	manifest: &LevelManifest<K>,
-) -> Result<()> {
+pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	let mut buf = Vec::new();
 
 	// Write header
@@ -430,11 +423,7 @@ mod tests {
 	};
 
 	// Helper function to create a test table with direct file IO
-	fn create_test_table(
-		table_id: u64,
-		num_items: u64,
-		opts: Arc<Options<InternalKey>>,
-	) -> Result<Arc<Table<InternalKey>>> {
+	fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
 		let table_file_path = opts.sstable_file_path(table_id);
 
 		let mut file = SysFile::create(&table_file_path)?;
@@ -448,7 +437,7 @@ mod tests {
 			let value = format!("value_{i:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key.into(), value.as_bytes())?;
 		}
@@ -462,14 +451,14 @@ mod tests {
 		let file: Arc<dyn File> = Arc::new(file);
 
 		// Create the table
-		let table = Table::<InternalKey>::new(table_id, opts.clone(), file, size as u64)?;
+		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
 
 		Ok(Arc::new(table))
 	}
 
 	#[test]
 	fn test_level_manifest_persistence() {
-		let mut opts = Options::<InternalKey>::default();
+		let mut opts = Options::default();
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
@@ -485,8 +474,7 @@ mod tests {
 		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 		// Create a new manifest with 3 levels
-		let mut manifest =
-			LevelManifest::<InternalKey>::new(opts.clone()).expect("Failed to create manifest");
+		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
 		// Create tables and add them to the manifest
 		// Create 2 tables for level 0
@@ -520,7 +508,7 @@ mod tests {
 		manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
 
 		// Create changeset for manifest field updates
-		let changeset = ManifestChangeSet::<InternalKey> {
+		let changeset = ManifestChangeSet {
 			new_snapshots: vec![
 				SnapshotInfo {
 					seq_num: 10,
@@ -800,8 +788,8 @@ mod tests {
 		table_id: u64,
 		seq_start: u64,
 		seq_end: u64,
-		opts: Arc<Options<InternalKey>>,
-	) -> Result<Arc<Table<InternalKey>>> {
+		opts: Arc<Options>,
+	) -> Result<Arc<Table>> {
 		let table_file_path = opts.sstable_file_path(table_id);
 
 		let mut file = SysFile::create(&table_file_path)?;
@@ -815,7 +803,7 @@ mod tests {
 			let value = format!("value_{seq_num:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set);
+				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key.into(), value.as_bytes())?;
 		}
@@ -829,14 +817,14 @@ mod tests {
 		let file: Arc<dyn File> = Arc::new(file);
 
 		// Create the table
-		let table = Table::<InternalKey>::new(table_id, opts.clone(), file, size as u64)?;
+		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
 
 		Ok(Arc::new(table))
 	}
 
 	#[test]
 	fn test_lsn_with_multiple_l0_tables() {
-		let mut opts = Options::<InternalKey>::default();
+		let mut opts = Options::default();
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
@@ -981,7 +969,7 @@ mod tests {
 
 	#[test]
 	fn test_lsn_persistence_across_manifest_reload() {
-		let mut opts = Options::<InternalKey>::default();
+		let mut opts = Options::default();
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();

@@ -3,7 +3,7 @@
 pub(crate) mod compactor;
 pub(crate) mod leveled;
 
-use crate::{levels::LevelManifest, sstable::InternalKeyTrait};
+use crate::levels::LevelManifest;
 
 /// Represents the input for a compaction operation
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -21,7 +21,7 @@ pub enum CompactionChoice {
 }
 
 /// Defines the strategy interface for compaction
-pub trait CompactionStrategy<K: InternalKeyTrait>: Send + Sync {
+pub trait CompactionStrategy: Send + Sync {
 	/// Determines which levels should be compacted
-	fn pick_levels(&self, manifest: &LevelManifest<K>) -> CompactionChoice;
+	fn pick_levels(&self, manifest: &LevelManifest) -> CompactionChoice;
 }

@@ -2,7 +2,6 @@ use tempdir::TempDir;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
-use crate::sstable::InternalKey;
 use crate::wal::cleanup::cleanup_old_segments;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
@@ -124,7 +123,7 @@ fn test_wal_replay_latest_segment_only() {
 	assert!(segment_ids.len() >= 3, "Expected at least 3 segments, got {}", segment_ids.len());
 
 	// Create a memtable for recovery
-	let memtable = Arc::new(MemTable::<InternalKey>::default());
+	let memtable = Arc::new(MemTable::default());
 
 	// Replay WAL - should only replay the latest segment
 	let (sequence_number, corruption_info) = replay_wal(temp_dir.path(), &memtable).unwrap();

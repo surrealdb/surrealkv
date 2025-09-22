@@ -8,7 +8,6 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
 use crate::lsm::{CompactionOperations, CoreInner};
-use crate::sstable::InternalKeyTrait;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -141,14 +140,14 @@ impl CheckpointMetadata {
 }
 
 /// Database checkpoint manager for creating consistent point-in-time snapshots
-pub(crate) struct DatabaseCheckpoint<K: InternalKeyTrait> {
+pub(crate) struct DatabaseCheckpoint {
 	/// Reference to the LSM core
-	core: Arc<CoreInner<K>>,
+	core: Arc<CoreInner>,
 }
 
-impl<K: InternalKeyTrait> DatabaseCheckpoint<K> {
+impl DatabaseCheckpoint {
 	/// Creates a new database checkpoint manager
-	pub fn new(core: Arc<CoreInner<K>>) -> Self {
+	pub fn new(core: Arc<CoreInner>) -> Self {
 		Self {
 			core,
 		}
