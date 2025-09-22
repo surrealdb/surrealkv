@@ -2669,7 +2669,7 @@ mod tests {
 	async fn test_versioned_queries_basic() {
 		let temp_dir = create_temp_directory();
 		let opts: Options<TimestampKey> =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_enable_versioning(
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
 			);
@@ -2723,7 +2723,7 @@ mod tests {
 	async fn test_versioned_queries_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options<TimestampKey> =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_enable_versioning(
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
 			);
@@ -2769,7 +2769,7 @@ mod tests {
 	async fn test_efficient_time_range_queries() {
 		let temp_dir = create_temp_directory();
 		let opts: Options<TimestampKey> =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_enable_versioning(
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
 				true,
 				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
 			);
@@ -2837,7 +2837,7 @@ mod tests {
 	async fn test_set_at_timestamp() {
 		let temp_dir = create_temp_directory();
 		let opts: Options<TimestampKey> =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_enable_versioning(true, 0);
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 		let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 		// Set a value with a specific timestamp
@@ -2871,7 +2871,7 @@ mod tests {
 	async fn test_commit_timestamp_consistency() {
 		let temp_dir = create_temp_directory();
 		let opts: Options<TimestampKey> =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_enable_versioning(true, 0);
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 		let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 		// Set multiple values in a single transaction

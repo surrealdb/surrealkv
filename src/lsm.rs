@@ -1075,8 +1075,8 @@ impl<K: InternalKeyTrait> TreeBuilder<K> {
 	}
 
 	/// Enables or disables versioned queries with timestamp tracking
-	pub fn with_enable_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
-		self.opts = self.opts.with_enable_versioning(enable, retention_ns);
+	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
+		self.opts = self.opts.with_versioning(enable, retention_ns);
 		self
 	}
 
