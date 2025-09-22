@@ -176,6 +176,10 @@ pub(crate) struct CompactionIterator<'a, K: InternalKeyTrait> {
 	/// Batch of stale entries to add to delete-list: (sequence_number, value_size)
 	delete_list_batch: Vec<(u64, u64)>,
 
+	/// Versioning configuration
+	enable_versioning: bool,
+	retention_period_ns: u64,
+
 	initialized: bool,
 }
 
@@ -184,6 +188,8 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 		iterators: Vec<BoxedIterator<'a, K>>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog<K>>>,
+		enable_versioning: bool,
+		retention_period_ns: u64,
 	) -> Self {
 		let heap = BinaryHeap::with_capacity(iterators.len());
 
@@ -196,6 +202,8 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 			discard_stats: HashMap::new(),
 			vlog,
 			delete_list_batch: Vec::new(),
+			enable_versioning,
+			retention_period_ns,
 			initialized: false,
 		}
 	}
@@ -238,18 +246,48 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 		let latest_value = self.current_key_versions[0].1.clone();
 		let is_latest_tombstone = latest_key.kind() == InternalKeyKind::Delete;
 
+		// Get current time for retention period check
+		let current_time = if self.enable_versioning && self.retention_period_ns > 0 {
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos() as u64
+		} else {
+			0
+		};
+
 		// Process all versions for delete list and discard stats
 		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
 			let is_tombstone = key.kind() == InternalKeyKind::Delete;
 			let is_latest = i == 0;
 
 			// Determine if this entry should be marked as stale in VLog
-			let should_mark_stale = if is_latest {
-				// Latest version: mark stale if it's a tombstone being removed at bottom level
-				is_tombstone && self.is_bottom_level
-			} else {
-				// Older version: always mark as stale
+			let should_mark_stale = if is_latest && !is_tombstone {
+				// Latest version of a SET operation: never mark as stale (it's being returned)
+				false
+			} else if is_latest && is_tombstone && self.is_bottom_level {
+				// Latest version of a DELETE operation at bottom level: mark as stale (not returned)
 				true
+			} else if is_latest && is_tombstone && !self.is_bottom_level {
+				// Latest version of a DELETE operation at non-bottom level: don't mark as stale (it's being returned)
+				false
+			} else if is_tombstone {
+				// For older DELETE operations (tombstones): always mark as stale since they don't have VLog values
+				// The B+ tree index entry will remain for versioned queries, but VLog doesn't store delete values
+				true
+			} else {
+				// Older version of a SET operation: check retention period
+				if self.enable_versioning && self.retention_period_ns > 0 {
+					let key_timestamp = key.timestamp();
+					// If timestamp is 0 (not set), assume it's old enough to be deleted
+					let is_within_retention = key_timestamp == 0
+						|| (current_time - key_timestamp) <= self.retention_period_ns;
+					// Mark as stale only if NOT within retention period
+					!is_within_retention
+				} else {
+					// If versioning is disabled, mark older versions as stale
+					true
+				}
 			};
 
 			// Add to delete list and collect discard stats if needed
@@ -633,6 +671,8 @@ mod tests {
 			vec![iter1, iter2, iter3],
 			false, // not bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		// Should return only the latest version (seq=300)
@@ -686,6 +726,8 @@ mod tests {
 			vec![iter1, iter2, iter3],
 			false, // not bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		// Consume the iterator
@@ -741,6 +783,8 @@ mod tests {
 			vec![iter1, iter2],
 			true, // bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		// At bottom level, tombstone should NOT be returned
@@ -780,6 +824,8 @@ mod tests {
 			vec![iter1, iter2],
 			false, // not bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		// At non-bottom level, tombstone SHOULD be returned
@@ -841,6 +887,8 @@ mod tests {
 			vec![iter1, iter2, iter3],
 			false, // not bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
@@ -919,6 +967,8 @@ mod tests {
 			vec![iter1, iter2],
 			false, // not bottom level
 			None,  // no vlog
+			false,
+			0,
 		);
 
 		// Should still work and return latest version
@@ -989,6 +1039,8 @@ mod tests {
 			vec![iter1, iter2, iter3],
 			false, // not bottom level
 			Some(vlog.clone()),
+			false,
+			0,
 		);
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
@@ -1059,6 +1111,111 @@ mod tests {
 		assert!(
 			!vlog.is_stale(150).unwrap(),
 			"key_d only version (seq=150) should NOT be marked as stale since it was returned"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_versioning_retention_logic() {
+		// Create test VLog
+		let (vlog, _temp_dir) = create_test_vlog();
+
+		// Create test data with timestamps
+		let current_time = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_nanos() as u64;
+
+		// Create keys with different timestamps and operations
+		let _recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
+		let _old_time = current_time - 10_000_000_000; // 10 seconds ago (outside retention)
+
+		// Test case 1: Recent SET, Old SET, Recent DELETE
+		// Expected: Recent SET kept, Old SET kept (within retention), Recent DELETE marked stale
+		let key1_recent_set = create_internal_key("key1", 100, InternalKeyKind::Set);
+		let key1_old_set = create_internal_key("key1", 200, InternalKeyKind::Set);
+		let key1_recent_delete = create_internal_key("key1", 300, InternalKeyKind::Delete);
+
+		// Test case 2: Old SET, Recent SET, Old DELETE
+		// Expected: Recent SET kept, Old SET kept (within retention), Old DELETE marked stale
+		let key2_old_set = create_internal_key("key2", 400, InternalKeyKind::Set);
+		let key2_recent_set = create_internal_key("key2", 500, InternalKeyKind::Set);
+		let key2_old_delete = create_internal_key("key2", 600, InternalKeyKind::Delete);
+
+		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
+		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
+		let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
+		let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+
+		// Create items for testing
+		let items1 = vec![
+			(key1_recent_delete, Arc::from(Vec::new())), // DELETE operation
+			(key1_old_set, val1_old),
+			(key1_recent_set, val1_recent),
+		];
+		let items2 = vec![
+			(key2_old_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_recent_set, val2_recent),
+			(key2_old_set, val2_old),
+		];
+
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+
+		// Test with versioning enabled and 5-second retention period
+		let retention_period_ns = 5_000_000_000; // 5 seconds
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // not bottom level
+			Some(vlog.clone()),
+			true, // enable versioning
+			retention_period_ns,
+		);
+
+		let result: Vec<_> = comp_iter.by_ref().collect();
+
+		// Should get 2 keys (latest versions only)
+		assert_eq!(result.len(), 2);
+
+		// Verify we get the latest versions
+		let keys: Vec<String> =
+			result.iter().map(|(k, _)| String::from_utf8_lossy(&k.user_key).to_string()).collect();
+		assert!(keys.contains(&"key1".to_string()));
+		assert!(keys.contains(&"key2".to_string()));
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Verify retention behavior for key1:
+		// - Recent DELETE (seq=300): NOT stale (latest, returned)
+		// - Old SET (seq=200): NOT stale (within retention)
+		// - Recent SET (seq=100): NOT stale (within retention)
+		assert!(
+			!vlog.is_stale(300).unwrap(),
+			"key1 recent DELETE (seq=300) should NOT be marked as stale (latest, returned)"
+		);
+		assert!(
+			!vlog.is_stale(200).unwrap(),
+			"key1 old SET (seq=200) should NOT be marked as stale (within retention)"
+		);
+		assert!(
+			!vlog.is_stale(100).unwrap(),
+			"key1 recent SET (seq=100) should NOT be marked as stale (within retention)"
+		);
+
+		// Verify retention behavior for key2:
+		// - Recent SET (seq=500): NOT stale (latest, returned)
+		// - Old SET (seq=400): NOT stale (within retention)
+		// - Old DELETE (seq=600): NOT stale (within retention)
+		assert!(
+			!vlog.is_stale(500).unwrap(),
+			"key2 recent SET (seq=500) should NOT be marked as stale (latest, returned)"
+		);
+		assert!(
+			!vlog.is_stale(400).unwrap(),
+			"key2 old SET (seq=400) should NOT be marked as stale (within retention)"
+		);
+		assert!(
+			!vlog.is_stale(600).unwrap(),
+			"key2 old DELETE (seq=600) should NOT be marked as stale (within retention)"
 		);
 	}
 }

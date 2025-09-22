@@ -145,8 +145,13 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		let max_level = self.options.lopts.level_count - 1;
 
 		let is_bottom_level = input.target_level >= max_level;
-		let mut comp_iter =
-			CompactionIterator::new(merge_iter, is_bottom_level, self.options.vlog.clone());
+		let mut comp_iter = CompactionIterator::new(
+			merge_iter,
+			is_bottom_level,
+			self.options.vlog.clone(),
+			self.options.lopts.enable_versioning,
+			self.options.lopts.versioned_history_retention_ns,
+		);
 
 		for (key, value) in &mut comp_iter {
 			writer.add(key, &value)?;
