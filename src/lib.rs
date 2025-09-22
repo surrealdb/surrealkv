@@ -24,6 +24,9 @@ pub use crate::lsm::{Tree, TreeBuilder};
 use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
+/// Type alias for version/timestamp values
+pub type Version = u64;
+
 use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};
 

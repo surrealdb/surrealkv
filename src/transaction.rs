@@ -10,7 +10,7 @@ pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::{Snapshot, VersionedEntry};
+use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
 use crate::{IterResult, Value};
 
@@ -594,7 +594,7 @@ impl Transaction {
 	}
 
 	/// Gets all versions of a key
-	pub fn get_all_versions(&self, key: &[u8]) -> Result<Vec<(u64, Value)>> {
+	pub fn get_all_versions(&self, key: &[u8], limit: Option<usize>) -> Result<Vec<(u64, Value)>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -613,7 +613,7 @@ impl Transaction {
 		// Query the versioned index through the snapshot (excluding tombstones)
 		match &self.snapshot {
 			Some(snapshot) => {
-				let versions = snapshot.get_all_versions(key, false)?;
+				let versions = snapshot.get_all_versions(key, false, limit)?;
 				Ok(versions.into_iter().filter_map(|(ts, value)| value.map(|v| (ts, v))).collect())
 			}
 			None => Err(Error::NoSnapshot),
@@ -624,6 +624,7 @@ impl Transaction {
 	pub fn get_all_versions_with_tombstones(
 		&self,
 		key: &[u8],
+		limit: Option<usize>,
 	) -> Result<Vec<(u64, Option<Value>)>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -642,74 +643,13 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot (including tombstones)
 		match &self.snapshot {
-			Some(snapshot) => snapshot.get_all_versions(key, true),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Gets versions of a key within a time range
-	pub fn get_versions_in_range(
-		&self,
-		key: &[u8],
-		start_ts: u64,
-		end_ts: u64,
-	) -> Result<Vec<(u64, Value)>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot (excluding tombstones)
-		match &self.snapshot {
-			Some(snapshot) => {
-				let versions = snapshot.get_versions_in_range(key, start_ts, end_ts, false)?;
-				Ok(versions.into_iter().filter_map(|(ts, value)| value.map(|v| (ts, v))).collect())
-			}
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Gets versions of a key within a time range including tombstones
-	pub fn get_versions_in_range_with_tombstones(
-		&self,
-		key: &[u8],
-		start_ts: u64,
-		end_ts: u64,
-	) -> Result<Vec<(u64, Option<Value>)>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot (including tombstones)
-		match &self.snapshot {
-			Some(snapshot) => snapshot.get_versions_in_range(key, start_ts, end_ts, true),
+			Some(snapshot) => snapshot.get_all_versions(key, true, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
 	/// Gets all timestamps for a key
-	pub fn versions(&self, key: &[u8]) -> Result<Vec<u64>> {
+	pub fn versions(&self, key: &[u8], limit: Option<usize>) -> Result<Vec<u64>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -727,18 +667,19 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.get_versions(key),
+			Some(snapshot) => snapshot.get_versions(key, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
-	/// Gets all versions within a time range across all keys
-	pub fn get_all_versions_in_time_range(
+	/// Gets keys in a key range at a specific timestamp
+	pub fn keys_at_timestamp(
 		&self,
-		start_ts: u64,
-		end_ts: u64,
-		include_tombstones: bool,
-	) -> Result<Vec<VersionedEntry>> {
+		start_key: &[u8],
+		end_key: &[u8],
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<Vec<Vec<u8>>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -753,16 +694,19 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => {
-				snapshot.get_all_versions_in_time_range(start_ts, end_ts, include_tombstones)
-			}
+			Some(snapshot) => snapshot.keys_at_timestamp(start_key, end_key, timestamp, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
-	/// Gets all keys that have versions within a time range
-	/// This is useful for finding which keys were modified during a specific period
-	pub fn get_keys_in_time_range(&self, start_ts: u64, end_ts: u64) -> Result<Vec<Vec<u8>>> {
+	/// Scans key-value pairs in a key range at a specific timestamp
+	pub fn scan_at_version(
+		&self,
+		start_key: &[u8],
+		end_key: &[u8],
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<Vec<(Vec<u8>, Value)>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -777,7 +721,33 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.get_keys_in_time_range(start_ts, end_ts),
+			Some(snapshot) => snapshot.scan_at_version(start_key, end_key, timestamp, limit),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all versions of keys in a key range
+	pub fn scan_all_versions(
+		&self,
+		start_key: &[u8],
+		end_key: &[u8],
+		limit: Option<usize>,
+	) -> Result<Vec<(Vec<u8>, Value, u64, bool)>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.scan_all_versions(start_key, end_key, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -2688,30 +2658,25 @@ mod tests {
 		assert_eq!(value, Some(Arc::from(b"value1_v2" as &[u8])));
 
 		// Test versioned queries
-		let versions = tx.get_all_versions(b"key1").unwrap();
+		let versions = tx.get_all_versions(b"key1", None).unwrap();
 		assert_eq!(versions.len(), 2);
 		assert_eq!(versions[0].1, Arc::from(b"value1_v2" as &[u8])); // Latest first
 		assert_eq!(versions[1].1, Arc::from(b"value1_v1" as &[u8]));
 
 		// Test versions with tombstones
-		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1").unwrap();
+		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1", None).unwrap();
 		assert_eq!(versions_with_tombstones.len(), 2);
 		assert_eq!(versions_with_tombstones[0].1, Some(Arc::from(b"value1_v2" as &[u8])));
 		assert_eq!(versions_with_tombstones[1].1, Some(Arc::from(b"value1_v1" as &[u8])));
 
 		// Test versions listing
-		let timestamps = tx.versions(b"key1").unwrap();
+		let timestamps = tx.versions(b"key1", None).unwrap();
 		assert_eq!(timestamps.len(), 2);
 		assert!(timestamps[0] > timestamps[1]); // Newest first
 
 		// Test get at specific timestamp
 		let value_at_ts = tx.get_at_timestamp(b"key1", timestamps[1]).unwrap();
 		assert_eq!(value_at_ts, Some(Arc::from(b"value1_v1" as &[u8])));
-
-		// Test range queries
-		let range_versions =
-			tx.get_versions_in_range(b"key1", timestamps[1], timestamps[0]).unwrap();
-		assert_eq!(range_versions.len(), 2);
 	}
 
 	#[tokio::test]
@@ -2747,85 +2712,17 @@ mod tests {
 		assert_eq!(value, None);
 
 		// Test versions with tombstones (should include the delete)
-		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1").unwrap();
+		let versions_with_tombstones = tx.get_all_versions_with_tombstones(b"key1", None).unwrap();
 		assert_eq!(versions_with_tombstones.len(), 3);
 		assert_eq!(versions_with_tombstones[0].1, None); // Delete
 		assert_eq!(versions_with_tombstones[1].1, Some(Arc::from(b"value2" as &[u8])));
 		assert_eq!(versions_with_tombstones[2].1, Some(Arc::from(b"value1" as &[u8])));
 
 		// Test versions without tombstones (should exclude the delete)
-		let versions = tx.get_all_versions(b"key1").unwrap();
+		let versions = tx.get_all_versions(b"key1", None).unwrap();
 		assert_eq!(versions.len(), 2);
 		assert_eq!(versions[0].1, Arc::from(b"value2" as &[u8]));
 		assert_eq!(versions[1].1, Arc::from(b"value1" as &[u8]));
-	}
-
-	#[tokio::test]
-	async fn test_efficient_time_range_queries() {
-		let temp_dir = create_temp_directory();
-		let opts: Options =
-			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
-				true,
-				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
-			);
-		let tree = TreeBuilder::with_options(opts).build().unwrap();
-
-		// Insert data with different timestamps
-		let mut tx1 = tree.begin().unwrap();
-		tx1.set(b"key1", b"value1_v1").unwrap();
-		tx1.commit().await.unwrap();
-
-		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-		let mut tx2 = tree.begin().unwrap();
-		tx2.set(b"key2", b"value2_v1").unwrap();
-		tx2.commit().await.unwrap();
-
-		tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-		let mut tx3 = tree.begin().unwrap();
-		tx3.set(b"key1", b"value1_v2").unwrap();
-		tx3.set(b"key3", b"value3_v1").unwrap();
-		tx3.commit().await.unwrap();
-
-		// Get timestamps for range queries
-		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key1").unwrap();
-		assert_eq!(timestamps.len(), 2);
-
-		let start_ts = timestamps[1]; // Older timestamp
-		let end_ts = timestamps[0]; // Newer timestamp
-
-		// Test efficient time range query across all keys
-		let all_versions = tx.get_all_versions_in_time_range(start_ts, end_ts, false).unwrap();
-		assert!(all_versions.len() >= 2); // Should include key1 and key2 at least
-
-		// Test getting keys modified in time range
-		let modified_keys = tx.get_keys_in_time_range(start_ts, end_ts).unwrap();
-		assert!(modified_keys.len() >= 2); // Should include key1 and key2 at least
-		assert!(modified_keys.iter().any(|k| k == b"key1"));
-		assert!(modified_keys.iter().any(|k| k == b"key2"));
-
-		// Test with tombstones
-		let mut tx4 = tree.begin().unwrap();
-		tx4.delete(b"key1").unwrap();
-		tx4.commit().await.unwrap();
-
-		// Get updated timestamps to include the delete operation
-		let tx = tree.begin().unwrap();
-		let updated_timestamps = tx.versions(b"key1").unwrap();
-
-		// Use a broader time range that includes the delete operation
-		let extended_start_ts = updated_timestamps.last().unwrap() - 1000000; // 1ms before oldest
-		let extended_end_ts = updated_timestamps.first().unwrap() + 1000000; // 1ms after newest
-
-		let all_versions_with_tombstones =
-			tx.get_all_versions_in_time_range(extended_start_ts, extended_end_ts, true).unwrap();
-		let all_versions_without_tombstones =
-			tx.get_all_versions_in_time_range(extended_start_ts, extended_end_ts, false).unwrap();
-
-		// Should have more versions when including tombstones
-		assert!(all_versions_with_tombstones.len() > all_versions_without_tombstones.len());
 	}
 
 	#[tokio::test]
@@ -2857,7 +2754,7 @@ mod tests {
 		assert_eq!(value, None);
 
 		// Verify the timestamp appears in versions
-		let versions = tx.versions(b"key1").unwrap();
+		let versions = tx.versions(b"key1", None).unwrap();
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0], custom_timestamp);
 	}
@@ -2878,9 +2775,9 @@ mod tests {
 
 		// All keys should have the same timestamp
 		let tx = tree.begin().unwrap();
-		let versions1 = tx.versions(b"key1").unwrap();
-		let versions2 = tx.versions(b"key2").unwrap();
-		let versions3 = tx.versions(b"key3").unwrap();
+		let versions1 = tx.versions(b"key1", None).unwrap();
+		let versions2 = tx.versions(b"key2", None).unwrap();
+		let versions3 = tx.versions(b"key3", None).unwrap();
 
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
@@ -2897,9 +2794,9 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let tx = tree.begin().unwrap();
-		let versions4 = tx.versions(b"key4").unwrap();
-		let versions5 = tx.versions(b"key5").unwrap();
-		let versions6 = tx.versions(b"key6").unwrap();
+		let versions4 = tx.versions(b"key4", None).unwrap();
+		let versions5 = tx.versions(b"key5", None).unwrap();
+		let versions6 = tx.versions(b"key6", None).unwrap();
 
 		assert_eq!(versions4.len(), 1);
 		assert_eq!(versions5.len(), 1);
@@ -2913,5 +2810,435 @@ mod tests {
 
 		// key4/key6 timestamp should be different from key5 timestamp
 		assert_ne!(versions4[0], versions5[0]);
+	}
+
+	#[tokio::test]
+	async fn test_keys_at_timestamp() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data at different timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.set(b"key2", b"value2").unwrap();
+		tx1.set(b"key3", b"value3").unwrap();
+		tx1.commit().await.unwrap();
+
+		// Get the timestamp from the first commit
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0];
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key2", b"value2_updated").unwrap();
+		tx2.set(b"key4", b"value4").unwrap();
+		tx2.commit().await.unwrap();
+
+		// Get the timestamp from the second commit
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0];
+
+		// Test keys_at_timestamp at first timestamp
+		let tx = tree.begin().unwrap();
+		let keys_at_ts1 = tx.keys_at_timestamp(b"key1", b"key4", ts1, None).unwrap();
+		assert_eq!(keys_at_ts1.len(), 3);
+		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
+		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
+		assert!(keys_at_ts1.contains(&b"key3".to_vec()));
+		assert!(!keys_at_ts1.contains(&b"key4".to_vec())); // key4 didn't exist at ts1
+
+		// Test keys_at_timestamp at second timestamp
+		let keys_at_ts2 = tx.keys_at_timestamp(b"key1", b"key4", ts2, None).unwrap();
+		assert_eq!(keys_at_ts2.len(), 4);
+		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
+		assert!(keys_at_ts2.contains(&b"key2".to_vec()));
+		assert!(keys_at_ts2.contains(&b"key3".to_vec()));
+		assert!(keys_at_ts2.contains(&b"key4".to_vec()));
+
+		// Test with limit
+		let keys_limited = tx.keys_at_timestamp(b"key1", b"key4", ts2, Some(2)).unwrap();
+		assert_eq!(keys_limited.len(), 2);
+
+		// Test with specific key range
+		let keys_range = tx.keys_at_timestamp(b"key2", b"key3", ts2, None).unwrap();
+		assert_eq!(keys_range.len(), 2);
+		assert!(keys_range.contains(&b"key2".to_vec()));
+		assert!(keys_range.contains(&b"key3".to_vec()));
+	}
+
+	#[tokio::test]
+	async fn test_keys_at_timestamp_with_deletes() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.set(b"key2", b"value2").unwrap();
+		tx1.set(b"key3", b"value3").unwrap();
+		tx1.commit().await.unwrap();
+
+		// Get timestamp
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0];
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.delete(b"key2").unwrap();
+		tx2.soft_delete(b"key3").unwrap();
+		tx2.commit().await.unwrap();
+
+		// Get timestamp
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0];
+
+		// Test keys_at_timestamp at first timestamp (before deletes)
+		let tx = tree.begin().unwrap();
+		let keys_at_ts1 = tx.keys_at_timestamp(b"key1", b"key3", ts1, None).unwrap();
+		assert_eq!(keys_at_ts1.len(), 3);
+		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
+		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
+		assert!(keys_at_ts1.contains(&b"key3".to_vec()));
+
+		// Test keys_at_timestamp at second timestamp (after deletes)
+		let keys_at_ts2 = tx.keys_at_timestamp(b"key1", b"key3", ts2, None).unwrap();
+		assert_eq!(keys_at_ts2.len(), 1); // Only key1 should be visible
+		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
+		assert!(!keys_at_ts2.contains(&b"key2".to_vec())); // Hard deleted
+		assert!(!keys_at_ts2.contains(&b"key3".to_vec())); // Soft deleted
+	}
+
+	#[tokio::test]
+	async fn test_scan_at_version() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data at different timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.set(b"key2", b"value2").unwrap();
+		tx1.set(b"key3", b"value3").unwrap();
+		tx1.commit().await.unwrap();
+
+		// Get the timestamp from the first commit
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0];
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key2", b"value2_updated").unwrap();
+		tx2.set(b"key4", b"value4").unwrap();
+		tx2.commit().await.unwrap();
+
+		// Get the timestamp from the second commit
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0];
+
+		// Test scan_at_version at first timestamp
+		let tx = tree.begin().unwrap();
+		let scan_at_ts1 = tx.scan_at_version(b"key1", b"key4", ts1, None).unwrap();
+		assert_eq!(scan_at_ts1.len(), 3);
+
+		// Check that we get key-value pairs
+		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+		for (key, value) in &scan_at_ts1 {
+			found_keys.insert(key.as_ref());
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref(), b"value2"),
+				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+				_ => panic!("Unexpected key: {:?}", key),
+			}
+		}
+		assert!(found_keys.contains(&b"key1".as_ref()));
+		assert!(found_keys.contains(&b"key2".as_ref()));
+		assert!(found_keys.contains(&b"key3".as_ref()));
+		assert!(!found_keys.contains(&b"key4".as_ref())); // key4 didn't exist at ts1
+
+		// Test scan_at_version at second timestamp
+		let scan_at_ts2 = tx.scan_at_version(b"key1", b"key4", ts2, None).unwrap();
+		assert_eq!(scan_at_ts2.len(), 4);
+
+		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+		for (key, value) in &scan_at_ts2 {
+			found_keys.insert(key.as_ref());
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+				b"key4" => assert_eq!(value.as_ref(), b"value4"),
+				_ => panic!("Unexpected key: {:?}", key),
+			}
+		}
+		assert!(found_keys.contains(&b"key1".as_ref()));
+		assert!(found_keys.contains(&b"key2".as_ref()));
+		assert!(found_keys.contains(&b"key3".as_ref()));
+		assert!(found_keys.contains(&b"key4".as_ref()));
+
+		// Test with limit
+		let scan_limited = tx.scan_at_version(b"key1", b"key4", ts2, Some(2)).unwrap();
+		assert_eq!(scan_limited.len(), 2);
+
+		// Test with specific key range
+		let scan_range = tx.scan_at_version(b"key2", b"key3", ts2, None).unwrap();
+		assert_eq!(scan_range.len(), 2);
+		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+		for (key, _) in &scan_range {
+			found_keys.insert(key.as_ref());
+		}
+		assert!(found_keys.contains(&b"key2".as_ref()));
+		assert!(found_keys.contains(&b"key3".as_ref()));
+	}
+
+	#[tokio::test]
+	async fn test_scan_at_version_with_deletes() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.set(b"key2", b"value2").unwrap();
+		tx1.set(b"key3", b"value3").unwrap();
+		tx1.commit().await.unwrap();
+
+		// Get timestamp
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0];
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.delete(b"key2").unwrap();
+		tx2.soft_delete(b"key3").unwrap();
+		tx2.commit().await.unwrap();
+
+		// Get timestamp
+		let tx = tree.begin().unwrap();
+		let timestamps = tx.versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0];
+
+		// Test scan_at_version at first timestamp (before deletes)
+		let tx = tree.begin().unwrap();
+		let scan_at_ts1 = tx.scan_at_version(b"key1", b"key3", ts1, None).unwrap();
+		assert_eq!(scan_at_ts1.len(), 3);
+
+		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+		for (key, value) in &scan_at_ts1 {
+			found_keys.insert(key.as_ref());
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref(), b"value2"),
+				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+				_ => panic!("Unexpected key: {:?}", key),
+			}
+		}
+		assert!(found_keys.contains(&b"key1".as_ref()));
+		assert!(found_keys.contains(&b"key2".as_ref()));
+		assert!(found_keys.contains(&b"key3".as_ref()));
+
+		// Test scan_at_version at second timestamp (after deletes)
+		let scan_at_ts2 = tx.scan_at_version(b"key1", b"key3", ts2, None).unwrap();
+		assert_eq!(scan_at_ts2.len(), 1); // Only key1 should be visible
+
+		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+		for (key, value) in &scan_at_ts2 {
+			found_keys.insert(key.as_ref());
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				_ => panic!("Unexpected key: {:?}", key),
+			}
+		}
+		assert!(found_keys.contains(&b"key1".as_ref()));
+		assert!(!found_keys.contains(&b"key2".as_ref())); // Hard deleted
+		assert!(!found_keys.contains(&b"key3".as_ref())); // Soft deleted
+	}
+
+	#[tokio::test]
+	async fn test_scan_all_versions() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data at different timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1_v1").unwrap();
+		tx1.set(b"key2", b"value2_v1").unwrap();
+		tx1.commit().await.unwrap();
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key1", b"value1_v2").unwrap();
+		tx2.set(b"key3", b"value3_v1").unwrap();
+		tx2.commit().await.unwrap();
+
+		let mut tx3 = tree.begin().unwrap();
+		tx3.set(b"key2", b"value2_v2").unwrap();
+		tx3.set(b"key4", b"value4_v1").unwrap();
+		tx3.commit().await.unwrap();
+
+		// Test scan_all_versions
+		let tx = tree.begin().unwrap();
+		let all_versions = tx.scan_all_versions(b"key1", b"key4", None).unwrap();
+
+		// Should get all versions of all keys in the range
+		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
+
+		// Group by key to verify we have all versions
+		let mut key_versions: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>> =
+			std::collections::HashMap::new();
+		for (key, value, timestamp, is_tombstone) in all_versions {
+			key_versions.entry(key).or_insert_with(Vec::new).push((
+				value.to_vec(),
+				timestamp,
+				is_tombstone,
+			));
+		}
+
+		// Verify key1 has 2 versions
+		let key1_versions = key_versions.get_mut(&b"key1".to_vec()).unwrap();
+		assert_eq!(key1_versions.len(), 2);
+		// Sort by timestamp to get chronological order
+		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
+		assert_eq!(key1_versions[0].0, b"value1_v1");
+		assert_eq!(key1_versions[1].0, b"value1_v2");
+		assert!(!key1_versions[0].2); // Not tombstone
+		assert!(!key1_versions[1].2); // Not tombstone
+
+		// Verify key2 has 2 versions
+		let key2_versions = key_versions.get_mut(&b"key2".to_vec()).unwrap();
+		assert_eq!(key2_versions.len(), 2);
+		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
+		assert_eq!(key2_versions[0].0, b"value2_v1");
+		assert_eq!(key2_versions[1].0, b"value2_v2");
+		assert!(!key2_versions[0].2); // Not tombstone
+		assert!(!key2_versions[1].2); // Not tombstone
+
+		// Verify key3 has 1 version
+		let key3_versions = key_versions.get(&b"key3".to_vec()).unwrap();
+		assert_eq!(key3_versions.len(), 1);
+		assert_eq!(key3_versions[0].0, b"value3_v1");
+		assert!(!key3_versions[0].2); // Not tombstone
+
+		// Verify key4 has 1 version
+		let key4_versions = key_versions.get(&b"key4".to_vec()).unwrap();
+		assert_eq!(key4_versions.len(), 1);
+		assert_eq!(key4_versions[0].0, b"value4_v1");
+		assert!(!key4_versions[0].2); // Not tombstone
+
+		// Test with limit
+		let limited_versions = tx.scan_all_versions(b"key1", b"key4", Some(3)).unwrap();
+		assert_eq!(limited_versions.len(), 3);
+
+		// Test with specific key range
+		let range_versions = tx.scan_all_versions(b"key2", b"key3", None).unwrap();
+		assert_eq!(range_versions.len(), 3); // 2 versions of key2 + 1 version of key3
+	}
+
+	#[tokio::test]
+	async fn test_scan_all_versions_with_deletes() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(
+				true,
+				std::time::Duration::from_secs(60 * 60 * 24 * 30).as_nanos() as u64,
+			);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1_v1").unwrap();
+		tx1.set(b"key2", b"value2_v1").unwrap();
+		tx1.commit().await.unwrap();
+
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set(b"key1", b"value1_v2").unwrap();
+		tx2.set(b"key2", b"value2_v2").unwrap();
+		tx2.commit().await.unwrap();
+
+		let mut tx3 = tree.begin().unwrap();
+		tx3.delete(b"key1").unwrap(); // Hard delete
+		tx3.soft_delete(b"key2").unwrap(); // Soft delete
+		tx3.commit().await.unwrap();
+
+		// Test scan_all_versions
+		let tx = tree.begin().unwrap();
+		let all_versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
+
+		// Should get all versions including tombstones
+		assert_eq!(all_versions.len(), 5); // 2 versions of key1 + 1 delete + 2 versions of key2 + 1 soft delete
+
+		// Group by key to verify we have all versions
+		let mut key_versions: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>> =
+			std::collections::HashMap::new();
+		for (key, value, timestamp, is_tombstone) in all_versions {
+			key_versions.entry(key).or_insert_with(Vec::new).push((
+				value.to_vec(),
+				timestamp,
+				is_tombstone,
+			));
+		}
+
+		// Verify key1 has 3 versions (2 values + 1 delete)
+		let key1_versions = key_versions.get_mut(&b"key1".to_vec()).unwrap();
+		assert_eq!(key1_versions.len(), 3);
+		// Sort by timestamp to get chronological order
+		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
+		assert_eq!(key1_versions[0].0, b"value1_v1");
+		assert!(!key1_versions[0].2); // Not tombstone
+		assert_eq!(key1_versions[1].0, b"value1_v2");
+		assert!(!key1_versions[1].2); // Not tombstone
+		assert_eq!(key1_versions[2].0, b""); // Delete has empty value
+		assert!(key1_versions[2].2); // Is tombstone
+
+		// Verify key2 has 3 versions (2 values + 1 soft delete)
+		let key2_versions = key_versions.get_mut(&b"key2".to_vec()).unwrap();
+		assert_eq!(key2_versions.len(), 3);
+		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
+		assert_eq!(key2_versions[0].0, b"value2_v1");
+		assert!(!key2_versions[0].2); // Not tombstone
+		assert_eq!(key2_versions[1].0, b"value2_v2");
+		assert!(!key2_versions[1].2); // Not tombstone
+		assert_eq!(key2_versions[2].0, b""); // Soft delete has empty value
+		assert!(key2_versions[2].2); // Is tombstone
+	}
+
+	#[tokio::test]
+	async fn test_versioned_queries_without_versioning() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(false, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Test that versioned queries fail when versioning is disabled
+		let tx = tree.begin().unwrap();
+		assert!(tx.keys_at_timestamp(b"key1", b"key2", 123456789, None).is_err());
+		assert!(tx.scan_at_version(b"key1", b"key2", 123456789, None).is_err());
+		assert!(tx.scan_all_versions(b"key1", b"key2", None).is_err());
 	}
 }
