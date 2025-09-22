@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
@@ -12,6 +12,9 @@ use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind, ReverseTimestampKey};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
+
+/// Type alias for version scan results
+pub type VersionScanResult = (Vec<u8>, Value, u64, bool);
 
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
@@ -94,6 +97,17 @@ pub(crate) struct IterState {
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
 	pub levels: Levels,
+}
+
+/// Query parameters for versioned range queries
+#[derive(Debug, Clone)]
+struct VersionedRangeQueryParams<'a> {
+	pub start_key: &'a [u8],
+	pub end_key: &'a [u8],
+	pub start_ts: u64,
+	pub end_ts: u64,
+	pub limit: Option<usize>,
+	pub include_tombstones: bool,
 }
 
 // ===== Snapshot Implementation =====
@@ -216,12 +230,14 @@ impl Snapshot {
 		let mut latest_timestamp = 0;
 
 		self.versioned_range_query(
-			key,
-			key, // Same key for start and end
-			0,   // Start from beginning of time
-			timestamp,
-			None,  // No limit for single key lookup
-			false, // Don't include tombstones
+			VersionedRangeQueryParams {
+				start_key: key,
+				end_key: key, // Same key for start and end
+				start_ts: 0,  // Start from beginning of time
+				end_ts: timestamp,
+				limit: None,               // No limit for single key lookup
+				include_tombstones: false, // Don't include tombstones
+			},
 			|reverse_key, encoded_value, _is_tombstone| {
 				// Only process this specific key at or before the timestamp
 				if reverse_key.user_key.as_ref() == key
@@ -377,12 +393,14 @@ impl Snapshot {
 		let mut keys = Vec::new();
 
 		self.versioned_range_query(
-			start_key,
-			end_key,
-			0,
-			timestamp,
-			limit,
-			false, // Don't include tombstones
+			VersionedRangeQueryParams {
+				start_key,
+				end_key,
+				start_ts: 0,
+				end_ts: timestamp,
+				limit,
+				include_tombstones: false, // Don't include tombstones
+			},
 			|reverse_key, _encoded_value, _is_tombstone| {
 				keys.push(reverse_key.user_key.as_ref().to_vec());
 				Ok(true) // Continue processing
@@ -405,12 +423,14 @@ impl Snapshot {
 		let mut results = Vec::new();
 
 		self.versioned_range_query(
-			start_key,
-			end_key,
-			0,
-			timestamp,
-			limit,
-			false, // Don't include tombstones
+			VersionedRangeQueryParams {
+				start_key,
+				end_key,
+				start_ts: 0,
+				end_ts: timestamp,
+				limit,
+				include_tombstones: false, // Don't include tombstones
+			},
 			|reverse_key, encoded_value, _is_tombstone| {
 				let resolved_value = self.core.resolve_value(encoded_value)?;
 				results.push((reverse_key.user_key.as_ref().to_vec(), resolved_value));
@@ -425,51 +445,102 @@ impl Snapshot {
 
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	/// The limit currently is on the unique keys, not the total number of results
 	pub(crate) fn scan_all_versions(
 		&self,
 		start_key: &[u8],
 		end_key: &[u8],
 		limit: Option<usize>,
-	) -> Result<Vec<(Vec<u8>, Value, u64, bool)>> {
-		let mut results = Vec::new();
+	) -> Result<Vec<VersionScanResult>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
 
-		self.versioned_range_query(
-			start_key,
-			end_key,
-			0,        // Start from beginning of time
-			u64::MAX, // End at end of time
-			limit,
-			true, // Include tombstones for all versions
-			|reverse_key, encoded_value, is_tombstone| {
-				let value = if is_tombstone {
-					Value::default() // Use default value for tombstones
-				} else {
-					let resolved_value = self.core.resolve_value(encoded_value)?;
-					resolved_value
-				};
-				results.push((
-					reverse_key.user_key.as_ref().to_vec(),
-					value,
-					reverse_key.timestamp,
-					is_tombstone,
-				));
-				Ok(true) // Continue processing
-			},
-		)?;
+		if let Some(ref versioned_index) = self.core.versioned_index {
+			let index_guard = versioned_index.read().unwrap();
 
-		Ok(results)
+			let range_iter = index_guard.timestamp_range(0, u64::MAX, start_key, end_key)?;
+
+			let max_keys = limit.unwrap_or(usize::MAX);
+			let mut results = Vec::new();
+			let mut unique_key_count = 0;
+
+			// Track which keys have been hard deleted
+			let mut hard_deleted_keys = HashSet::new();
+			// Track all versions for each key
+			let mut key_versions: HashMap<Vec<u8>, Vec<(Value, u64, bool)>> = HashMap::new();
+
+			for entry in range_iter {
+				match entry {
+					Ok((encoded_key, encoded_value)) => {
+						let reverse_key = ReverseTimestampKey::decode(&encoded_key);
+
+						// Check if this entry is visible to this snapshot
+						if reverse_key.seq_num() <= self.seq_num {
+							let key = reverse_key.user_key.as_ref().to_vec();
+							let is_tombstone = reverse_key.is_tombstone();
+
+							// Check if this is a hard delete (InternalKeyKind::Delete)
+							if is_tombstone
+								&& reverse_key.kind() == crate::sstable::InternalKeyKind::Delete
+							{
+								hard_deleted_keys.insert(key.clone());
+								continue; // Skip hard delete markers
+							}
+
+							let value = if is_tombstone {
+								Value::default() // Use default value for soft delete markers
+							} else {
+								self.core.resolve_value(&encoded_value)?
+							};
+
+							key_versions.entry(key).or_default().push((
+								value,
+								reverse_key.timestamp,
+								is_tombstone,
+							));
+						}
+					}
+					Err(_) => break,
+				}
+			}
+
+			// Process results: exclude hard-deleted keys, exclude all tombstone markers
+			for (key, versions) in key_versions {
+				// Skip keys that have been hard deleted
+				if hard_deleted_keys.contains(&key) {
+					continue;
+				}
+
+				// Check if we've reached the limit on unique keys
+				if unique_key_count >= max_keys {
+					break;
+				}
+
+				// Add only non-tombstone versions of this key
+				for (value, timestamp, is_tombstone) in versions {
+					// Skip tombstone markers (both hard and soft deletes)
+					if is_tombstone {
+						continue;
+					}
+
+					results.push((key.clone(), value, timestamp, is_tombstone));
+				}
+
+				unique_key_count += 1;
+			}
+
+			Ok(results)
+		} else {
+			Ok(Vec::new())
+		}
 	}
 
 	/// Since data is ordered by timestamp (ascending) in the B+ tree, we can process entries
 	/// in chronological order and stop when we find the latest version for each key
 	fn versioned_range_query<F>(
 		&self,
-		start_key: &[u8],
-		end_key: &[u8],
-		start_ts: u64,
-		end_ts: u64,
-		limit: Option<usize>,
-		include_tombstones: bool,
+		params: VersionedRangeQueryParams<'_>,
 		mut processor: F,
 	) -> Result<()>
 	where
@@ -480,23 +551,16 @@ impl Snapshot {
 		}
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
-			// Create a range query bounded by snapshot sequence number
-			let start_ts_key =
-				ReverseTimestampKey::new(start_key.to_vec(), 0, InternalKeyKind::Set, start_ts)
-					.encode();
-
-			let end_ts_key = ReverseTimestampKey::new(
-				end_key.to_vec(),
-				self.seq_num, // Limit to snapshot's sequence number
-				InternalKeyKind::Max,
-				end_ts,
-			)
-			.encode();
-
 			let index_guard = versioned_index.read().unwrap();
-			let range_iter = index_guard.range(&start_ts_key, &end_ts_key)?;
 
-			let max_results = limit.unwrap_or(usize::MAX);
+			let range_iter = index_guard.timestamp_range(
+				params.start_ts,
+				params.end_ts,
+				params.start_key,
+				params.end_key,
+			)?;
+
+			let max_results = params.limit.unwrap_or(usize::MAX);
 			let mut count = 0;
 
 			// Since data is ordered by timestamp (ascending), we process entries in chronological order
@@ -542,7 +606,7 @@ impl Snapshot {
 				}
 
 				// If key is deleted and we're not including tombstones, skip it
-				if is_tombstone && !include_tombstones {
+				if is_tombstone && !params.include_tombstones {
 					continue;
 				}
 

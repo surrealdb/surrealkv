@@ -563,15 +563,7 @@ impl Comparator for InternalKeyComparator {
 		// Decode internal keys using InternalKey
 		let key_a = InternalKey::decode(a);
 		let key_b = InternalKey::decode(b);
-
-		// First compare by user key (ascending)
-		match self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref()) {
-			Ordering::Equal => {
-				// If user keys are equal, compare by sequence number (descending)
-				key_b.seq_num().cmp(&key_a.seq_num())
-			}
-			ordering => ordering,
-		}
+		key_a.cmp(&key_b)
 	}
 
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {

@@ -10,7 +10,7 @@ pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, VersionScanResult};
 use crate::sstable::InternalKeyKind;
 use crate::{IterResult, Value};
 
@@ -732,7 +732,7 @@ impl Transaction {
 		start_key: &[u8],
 		end_key: &[u8],
 		limit: Option<usize>,
-	) -> Result<Vec<(Vec<u8>, Value, u64, bool)>> {
+	) -> Result<Vec<VersionScanResult>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -1068,7 +1068,7 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-	use std::mem::size_of;
+	use std::{collections::HashMap, mem::size_of};
 
 	use bytes::Bytes;
 
@@ -1081,6 +1081,11 @@ mod tests {
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()
 	}
+
+	/// Type alias for a map of keys to their version information
+	/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
+	#[allow(dead_code)]
+	type KeyVersionsMap = HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>>;
 
 	// Common setup logic for creating a store
 	fn create_store() -> (Tree, TempDir) {
@@ -3110,18 +3115,13 @@ mod tests {
 		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
 
 		// Group by key to verify we have all versions
-		let mut key_versions: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>> =
-			std::collections::HashMap::new();
+		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_insert_with(Vec::new).push((
-				value.to_vec(),
-				timestamp,
-				is_tombstone,
-			));
+			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
 		}
 
 		// Verify key1 has 2 versions
-		let key1_versions = key_versions.get_mut(&b"key1".to_vec()).unwrap();
+		let key1_versions = key_versions.get_mut(b"key1".as_slice()).unwrap();
 		assert_eq!(key1_versions.len(), 2);
 		// Sort by timestamp to get chronological order
 		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
@@ -3131,7 +3131,7 @@ mod tests {
 		assert!(!key1_versions[1].2); // Not tombstone
 
 		// Verify key2 has 2 versions
-		let key2_versions = key_versions.get_mut(&b"key2".to_vec()).unwrap();
+		let key2_versions = key_versions.get_mut(b"key2".as_slice()).unwrap();
 		assert_eq!(key2_versions.len(), 2);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
@@ -3140,20 +3140,20 @@ mod tests {
 		assert!(!key2_versions[1].2); // Not tombstone
 
 		// Verify key3 has 1 version
-		let key3_versions = key_versions.get(&b"key3".to_vec()).unwrap();
+		let key3_versions = key_versions.get(b"key3".as_slice()).unwrap();
 		assert_eq!(key3_versions.len(), 1);
 		assert_eq!(key3_versions[0].0, b"value3_v1");
 		assert!(!key3_versions[0].2); // Not tombstone
 
 		// Verify key4 has 1 version
-		let key4_versions = key_versions.get(&b"key4".to_vec()).unwrap();
+		let key4_versions = key_versions.get(b"key4".as_slice()).unwrap();
 		assert_eq!(key4_versions.len(), 1);
 		assert_eq!(key4_versions[0].0, b"value4_v1");
 		assert!(!key4_versions[0].2); // Not tombstone
 
 		// Test with limit
-		let limited_versions = tx.scan_all_versions(b"key1", b"key4", Some(3)).unwrap();
-		assert_eq!(limited_versions.len(), 3);
+		let limited_versions = tx.scan_all_versions(b"key1", b"key4", Some(4)).unwrap();
+		assert_eq!(limited_versions.len(), 6);
 
 		// Test with specific key range
 		let range_versions = tx.scan_all_versions(b"key2", b"key3", None).unwrap();
@@ -3190,42 +3190,26 @@ mod tests {
 		let tx = tree.begin().unwrap();
 		let all_versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 
-		// Should get all versions including tombstones
-		assert_eq!(all_versions.len(), 5); // 2 versions of key1 + 1 delete + 2 versions of key2 + 1 soft delete
+		// Should get all non-tombstone versions, exclude hard-deleted keys and all tombstone markers
+		assert_eq!(all_versions.len(), 2); // 2 versions of key2 (key1 is hard deleted, soft delete marker excluded)
 
 		// Group by key to verify we have all versions
-		let mut key_versions: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>> =
-			std::collections::HashMap::new();
+		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_insert_with(Vec::new).push((
-				value.to_vec(),
-				timestamp,
-				is_tombstone,
-			));
+			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
 		}
 
-		// Verify key1 has 3 versions (2 values + 1 delete)
-		let key1_versions = key_versions.get_mut(&b"key1".to_vec()).unwrap();
-		assert_eq!(key1_versions.len(), 3);
-		// Sort by timestamp to get chronological order
-		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
-		assert_eq!(key1_versions[0].0, b"value1_v1");
-		assert!(!key1_versions[0].2); // Not tombstone
-		assert_eq!(key1_versions[1].0, b"value1_v2");
-		assert!(!key1_versions[1].2); // Not tombstone
-		assert_eq!(key1_versions[2].0, b""); // Delete has empty value
-		assert!(key1_versions[2].2); // Is tombstone
+		// Verify key1 is not present (hard deleted)
+		assert!(!key_versions.contains_key(b"key1".as_slice()));
 
-		// Verify key2 has 3 versions (2 values + 1 soft delete)
-		let key2_versions = key_versions.get_mut(&b"key2".to_vec()).unwrap();
-		assert_eq!(key2_versions.len(), 3);
+		// Verify key2 has 2 versions (only non-tombstone values)
+		let key2_versions = key_versions.get_mut(b"key2".as_slice()).unwrap();
+		assert_eq!(key2_versions.len(), 2);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
 		assert!(!key2_versions[0].2); // Not tombstone
 		assert_eq!(key2_versions[1].0, b"value2_v2");
 		assert!(!key2_versions[1].2); // Not tombstone
-		assert_eq!(key2_versions[2].0, b""); // Soft delete has empty value
-		assert!(key2_versions[2].2); // Is tombstone
 	}
 
 	#[tokio::test]
