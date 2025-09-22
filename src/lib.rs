@@ -310,6 +310,13 @@ impl<K: InternalKeyTrait> Options<K> {
 
 		// Validate versioned queries configuration
 		if self.enable_versioning {
+			// Versioned queries require a key type that supports versioning
+			if !K::supports_versioning() {
+				return Err(Error::InvalidArgument(
+					"Versioning is enabled but the key type does not support versioning. Use TimestampKey instead of InternalKey for versioned queries.".to_string(),
+				));
+			}
+
 			// Versioned queries require VLog to be enabled
 			if !self.enable_vlog {
 				return Err(Error::InvalidArgument(

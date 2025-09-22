@@ -91,6 +91,10 @@ pub trait InternalKeyTrait:
 
 	/// Get the timestamp
 	fn timestamp(&self) -> u64;
+
+	/// Check if this key type supports versioning (timestamp-based queries)
+	/// Returns true for TimestampKey, false for InternalKey
+	fn supports_versioning() -> bool;
 }
 
 #[repr(u8)]
@@ -208,6 +212,10 @@ impl InternalKeyTrait for InternalKey {
 	fn timestamp(&self) -> u64 {
 		0
 	}
+
+	fn supports_versioning() -> bool {
+		false
+	}
 }
 
 // Compares two internal keys. For equal user keys, internal keys compare in
@@ -324,6 +332,10 @@ impl InternalKeyTrait for TimestampKey {
 
 	fn timestamp(&self) -> u64 {
 		self.timestamp
+	}
+
+	fn supports_versioning() -> bool {
+		true
 	}
 }
 
@@ -453,6 +465,10 @@ impl InternalKeyTrait for ReverseTimestampKey {
 
 	fn timestamp(&self) -> u64 {
 		self.timestamp
+	}
+
+	fn supports_versioning() -> bool {
+		true
 	}
 }
 
