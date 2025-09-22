@@ -13,7 +13,7 @@ use crate::bplustree::tree::{new_disk_tree, DiskBPlusTree};
 use crate::cache::VLogCache;
 use crate::BytewiseComparator;
 use crate::{batch::Batch, discard::DiscardStats, Value};
-use crate::{sstable::InternalKeyTrait, vfs, Options, VLogChecksumLevel};
+use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -282,10 +282,7 @@ impl ValueLocation {
 
 	/// Resolves the actual value, handling both inline and pointer cases
 	// TODO:: Check if this pattern copies the value unnecessarily.
-	pub(crate) fn resolve_value<K: InternalKeyTrait>(
-		&self,
-		vlog: Option<&Arc<VLog<K>>>,
-	) -> Result<Value> {
+	pub(crate) fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
 			// Value is a pointer to VLog
 			if let Some(vlog) = vlog {
@@ -499,7 +496,7 @@ impl VLogWriter {
 /// - Discard statistics tracking for intelligent GC candidate selection
 /// - Atomic file replacement during compaction
 /// - LSM integration for staleness detection
-pub(crate) struct VLog<K: InternalKeyTrait> {
+pub(crate) struct VLog {
 	/// Base directory for VLog files
 	path: PathBuf,
 
@@ -546,17 +543,17 @@ pub(crate) struct VLog<K: InternalKeyTrait> {
 	cache: Arc<VLogCache>,
 
 	/// Options for VLog configuration
-	opts: Arc<Options<K>>,
+	opts: Arc<Options>,
 }
 
-impl<K: InternalKeyTrait> VLog<K> {
+impl VLog {
 	/// Returns the file path for a VLog file with the given ID
 	fn vlog_file_path(&self, file_id: u32) -> PathBuf {
 		self.opts.vlog_file_path(file_id as u64)
 	}
 
 	/// Creates a new VLog instance
-	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Initialize the global delete list tree
 		let delete_list = Arc::new(DeleteList::new(opts.delete_list_dir())?);
 
@@ -1039,13 +1036,13 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-			let internal_key = K::decode(&key);
-			let user_key = internal_key.user_key().to_vec();
+			let internal_key = InternalKey::decode(&key);
 
 			// Check if this user key is stale using the global delete list
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
+					let user_key = internal_key.user_key.to_vec();
 					eprintln!(
 						"Warning: Failed to check delete list for user key {user_key:?}: {e}"
 					);
@@ -1058,7 +1055,7 @@ impl<K: InternalKeyTrait> VLog<K> {
 				values_skipped += 1;
 				stale_seq_nums.push(internal_key.seq_num());
 			} else {
-				let internal_key = K::decode(&key);
+				let internal_key = InternalKey::decode(&key);
 
 				// Add this entry to the batch to be rewritten with the correct operation type
 				// This preserves the original operation (Set, Delete, Merge, etc.)
@@ -1071,13 +1068,13 @@ impl<K: InternalKeyTrait> VLog<K> {
 				};
 				batch.add_record(
 					internal_key.kind(),
-					internal_key.user_key().as_ref(),
+					internal_key.user_key.as_ref(),
 					val,
-					internal_key.timestamp(),
+					internal_key.timestamp,
 				)?;
 
 				// Update batch size tracking
-				batch_size += internal_key.user_key().len() + value.len();
+				batch_size += internal_key.user_key.len() + value.len();
 
 				// If batch is full, commit it
 				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
@@ -1251,9 +1248,9 @@ impl<K: InternalKeyTrait> VLog<K> {
 
 // ===== VLog GC Manager =====
 /// Manages VLog garbage collection as an independent task
-pub(crate) struct VLogGCManager<K: InternalKeyTrait> {
+pub(crate) struct VLogGCManager {
 	/// Reference to the VLog
-	vlog: Arc<VLog<K>>,
+	vlog: Arc<VLog>,
 
 	/// Reference to the commit pipeline for coordinating writes during GC
 	commit_pipeline: Arc<CommitPipeline>,
@@ -1271,9 +1268,9 @@ pub(crate) struct VLogGCManager<K: InternalKeyTrait> {
 	task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl<K: InternalKeyTrait> VLogGCManager<K> {
+impl VLogGCManager {
 	/// Creates a new VLog GC manager
-	pub(crate) fn new(vlog: Arc<VLog<K>>, commit_pipeline: Arc<CommitPipeline>) -> Self {
+	pub(crate) fn new(vlog: Arc<VLog>, commit_pipeline: Arc<CommitPipeline>) -> Self {
 		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let notify = Arc::new(tokio::sync::Notify::new());
@@ -1440,14 +1437,10 @@ impl DeleteList {
 }
 #[cfg(test)]
 mod tests {
-	use crate::sstable::InternalKey;
-
 	use super::*;
 	use tempfile::TempDir;
 
-	fn create_test_vlog(
-		opts: Option<Options<InternalKey>>,
-	) -> (VLog<InternalKey>, TempDir, Arc<Options<InternalKey>>) {
+	fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 		let temp_dir = TempDir::new().unwrap();
 
 		let mut opts = opts.unwrap_or(Options {
@@ -1634,7 +1627,7 @@ mod tests {
 		drop(vlog1);
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
-		let vlog2 = VLog::<InternalKey>::new(opts.clone()).unwrap();
+		let vlog2 = VLog::new(opts.clone()).unwrap();
 
 		// Verify that all existing files can be read
 		for (i, pointer) in pointers.iter().enumerate() {
@@ -1810,7 +1803,7 @@ mod tests {
 		let test_data = b"inline test data";
 		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 
-		let resolved = location.resolve_value::<InternalKey>(Some(&vlog)).unwrap();
+		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1827,7 +1820,7 @@ mod tests {
 		let location = ValueLocation::with_pointer(pointer);
 
 		// Resolve should return the original value
-		let resolved = location.resolve_value::<InternalKey>(Some(&vlog)).unwrap();
+		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, value);
 	}
 
@@ -1839,7 +1832,7 @@ mod tests {
 
 		// Should work without VLog for inline data
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved = decoded_location.resolve_value::<InternalKey>(None).unwrap();
+		let resolved = decoded_location.resolve_value(None).unwrap();
 		assert_eq!(&*resolved, test_data);
 	}
 
@@ -1857,12 +1850,11 @@ mod tests {
 
 		// Should resolve with VLog
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved =
-			decoded_location.resolve_value::<InternalKey>(Some(&Arc::new(vlog))).unwrap();
+		let resolved = decoded_location.resolve_value(Some(&Arc::new(vlog))).unwrap();
 		assert_eq!(&*resolved, value);
 
 		// Should fail without VLog
-		let result = decoded_location.resolve_value::<InternalKey>(None);
+		let result = decoded_location.resolve_value(None);
 		assert!(result.is_err());
 	}
 
@@ -1885,7 +1877,7 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_encoding() {
-		let opts = Options::<InternalKey>::default();
+		let opts = Options::default();
 		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let encoded = header.encode();
 		let decoded = VLogFileHeader::decode(&encoded).unwrap();
@@ -1902,7 +1894,7 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_invalid_magic() {
-		let opts = Options::<InternalKey>::default();
+		let opts = Options::default();
 		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.magic = 0x12345678; // Invalid magic
 		let encoded = header.encode();
@@ -1912,7 +1904,7 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_invalid_size() {
-		let opts = Options::<InternalKey>::default();
+		let opts = Options::default();
 		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let mut encoded = header.encode().to_vec();
 		encoded.pop(); // Remove one byte to make it invalid size
@@ -1922,7 +1914,7 @@ mod tests {
 
 	#[test]
 	fn test_vlog_file_header_version_compatibility() {
-		let opts = Options::<InternalKey>::default();
+		let opts = Options::default();
 		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.version = VLOG_FORMAT_VERSION;
 		assert!(header.is_compatible());
@@ -1949,7 +1941,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_restart_continues_last_file() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options::<InternalKey> {
+		let opts = Options {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -2091,7 +2083,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_restart_with_multiple_files() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Options::<InternalKey> {
+		let opts = Options {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 800,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -2240,7 +2232,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_vlog_writer_reopen_append_only_behavior() {
 		let temp_dir = TempDir::new().unwrap();
-		let opts = Arc::new(Options::<InternalKey> {
+		let opts = Arc::new(Options {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,

@@ -1,5 +1,5 @@
 use crate::{
-	sstable::{meta::KeyRange, table::Table, InternalKeyTrait},
+	sstable::{meta::KeyRange, table::Table},
 	Result,
 };
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -11,20 +11,20 @@ use std::{
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.
 #[derive(Clone)]
-pub(crate) struct Level<K: InternalKeyTrait> {
+pub(crate) struct Level {
 	/// Vector of tables in this level, sorted by sequence numbers in descending order
-	pub(crate) tables: Vec<Arc<Table<K>>>,
+	pub(crate) tables: Vec<Arc<Table>>,
 }
 
-impl<K: InternalKeyTrait> std::ops::Deref for Level<K> {
-	type Target = Vec<Arc<Table<K>>>;
+impl std::ops::Deref for Level {
+	type Target = Vec<Arc<Table>>;
 
 	fn deref(&self) -> &Self::Target {
 		&self.tables
 	}
 }
 
-impl<K: InternalKeyTrait> Default for Level<K> {
+impl Default for Level {
 	fn default() -> Self {
 		const DEFAULT_CAPACITY: usize = 10;
 		Self {
@@ -33,7 +33,7 @@ impl<K: InternalKeyTrait> Default for Level<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Level<K> {
+impl Level {
 	/// Creates a new Level with a specified maximum capacity
 	#[allow(unused)]
 	pub(crate) fn with_capacity(capacity: usize) -> Self {
@@ -44,7 +44,7 @@ impl<K: InternalKeyTrait> Level<K> {
 
 	/// Inserts a new table into the level and maintains sorted order
 	/// Tables are sorted by sequence numbers in descending order
-	pub(crate) fn insert(&mut self, table: Arc<Table<K>>) {
+	pub(crate) fn insert(&mut self, table: Arc<Table>) {
 		let insert_pos = self
 			.tables
 			.partition_point(|x| x.meta.properties.seqnos.1 > table.meta.properties.seqnos.1);
@@ -62,16 +62,16 @@ impl<K: InternalKeyTrait> Level<K> {
 	pub(crate) fn overlapping_tables<'a>(
 		&'a self,
 		key_range: &'a KeyRange,
-	) -> impl Iterator<Item = &'a Arc<Table<K>>> + 'a {
+	) -> impl Iterator<Item = &'a Arc<Table>> + 'a {
 		self.tables.iter().filter(move |table| table.overlaps_with_range(key_range))
 	}
 }
 
 /// Represents all levels in the LSM tree
 #[derive(Clone)]
-pub(crate) struct Levels<K: InternalKeyTrait>(pub(crate) Vec<Arc<Level<K>>>);
+pub(crate) struct Levels(pub(crate) Vec<Arc<Level>>);
 
-impl<K: InternalKeyTrait> Levels<K> {
+impl Levels {
 	/// Creates a new Levels structure with specified number of levels and capacity per level
 	#[allow(unused)]
 	pub(crate) fn new(level_count: usize, capacity_per_level: usize) -> Self {
@@ -128,36 +128,36 @@ impl<K: InternalKeyTrait> Levels<K> {
 	}
 
 	/// Returns a reference to all levels
-	pub(crate) fn get_levels(&self) -> &Vec<Arc<Level<K>>> {
+	pub(crate) fn get_levels(&self) -> &Vec<Arc<Level>> {
 		&self.0
 	}
 
 	/// Returns a mutable reference to all levels
-	pub(crate) fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level<K>>> {
+	pub(crate) fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level>> {
 		&mut self.0
 	}
 }
 
-impl<K: InternalKeyTrait> IntoIterator for Levels<K> {
-	type Item = Arc<Level<K>>;
-	type IntoIter = std::vec::IntoIter<Arc<Level<K>>>;
+impl IntoIterator for Levels {
+	type Item = Arc<Level>;
+	type IntoIter = std::vec::IntoIter<Arc<Level>>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.into_iter()
 	}
 }
 
-impl<'a, K: InternalKeyTrait> IntoIterator for &'a Levels<K> {
-	type Item = &'a Arc<Level<K>>;
-	type IntoIter = std::slice::Iter<'a, Arc<Level<K>>>;
+impl<'a> IntoIterator for &'a Levels {
+	type Item = &'a Arc<Level>;
+	type IntoIter = std::slice::Iter<'a, Arc<Level>>;
 
 	fn into_iter(self) -> Self::IntoIter {
 		self.0.iter()
 	}
 }
 
-impl<K: InternalKeyTrait> AsRef<Vec<Arc<Level<K>>>> for Levels<K> {
-	fn as_ref(&self) -> &Vec<Arc<Level<K>>> {
+impl AsRef<Vec<Arc<Level>>> for Levels {
+	fn as_ref(&self) -> &Vec<Arc<Level>> {
 		&self.0
 	}
 }

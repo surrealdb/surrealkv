@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{
 	error::Error,
-	sstable::{table::TableFormat, InternalKeyTrait},
+	sstable::{table::TableFormat, InternalKey},
 	CompressionType, Result, Value,
 };
 
@@ -176,16 +176,16 @@ impl Properties {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableMetadata<K: InternalKeyTrait> {
+pub(crate) struct TableMetadata {
 	pub(crate) has_point_keys: Option<bool>,
 	pub(crate) smallest_seq_num: u64,
 	pub(crate) largest_seq_num: u64,
 	pub(crate) properties: Properties,
-	pub(crate) smallest_point: Option<K>,
-	pub(crate) largest_point: Option<K>,
+	pub(crate) smallest_point: Option<InternalKey>,
+	pub(crate) largest_point: Option<InternalKey>,
 }
 
-impl<K: InternalKeyTrait> TableMetadata<K> {
+impl TableMetadata {
 	pub(crate) fn new() -> Self {
 		TableMetadata {
 			smallest_point: None,
@@ -197,12 +197,12 @@ impl<K: InternalKeyTrait> TableMetadata<K> {
 		}
 	}
 
-	pub(crate) fn set_smallest_point_key(&mut self, k: K) {
+	pub(crate) fn set_smallest_point_key(&mut self, k: InternalKey) {
 		self.smallest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
 
-	pub(crate) fn set_largest_point_key(&mut self, k: K) {
+	pub(crate) fn set_largest_point_key(&mut self, k: InternalKey) {
 		self.largest_point = Some(k);
 		self.has_point_keys = Some(true);
 	}
@@ -295,7 +295,7 @@ impl<K: InternalKeyTrait> TableMetadata<K> {
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
 				let key_bytes = Bytes::from(key_bytes);
-				Some(K::decode(&key_bytes))
+				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
 		};
@@ -308,7 +308,7 @@ impl<K: InternalKeyTrait> TableMetadata<K> {
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
 				let key_bytes = Bytes::from(key_bytes);
-				Some(K::decode(&key_bytes))
+				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
 		};
@@ -324,11 +324,11 @@ impl<K: InternalKeyTrait> TableMetadata<K> {
 	}
 }
 
-pub(crate) fn size_of_writer_metadata<K: InternalKeyTrait>() -> usize {
+pub(crate) fn size_of_writer_metadata() -> usize {
 	size_of::<Option<bool>>()
 		+ size_of::<u64>() * 2
 		+ size_of_properties()
-		+ size_of::<Option<K>>() * 2
+		+ size_of::<Option<InternalKey>>() * 2
 }
 
 fn size_of_properties() -> usize {

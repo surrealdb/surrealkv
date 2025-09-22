@@ -3,15 +3,15 @@ use quick_cache::{sync::Cache as QCache, Equivalent};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use crate::sstable::{block::Block, InternalKeyTrait};
+use crate::sstable::block::Block;
 use crate::Value;
 
 pub type CacheID = u64;
 
 #[derive(Clone)]
-pub enum Item<K: InternalKeyTrait> {
-	Data(Arc<Block<K>>),
-	Index(Arc<Block<K>>),
+pub enum Item {
+	Data(Arc<Block>),
+	Index(Arc<Block>),
 }
 
 // VLog cache key: (file_id, offset)
@@ -63,8 +63,8 @@ impl Equivalent<CacheKey> for (u64, &u64) {
 #[derive(Clone)]
 struct BlockWeighter;
 
-impl<K: InternalKeyTrait> Weighter<CacheKey, Item<K>> for BlockWeighter {
-	fn weight(&self, _: &CacheKey, block: &Item<K>) -> u64 {
+impl Weighter<CacheKey, Item> for BlockWeighter {
+	fn weight(&self, _: &CacheKey, block: &Item) -> u64 {
 		match block {
 			Item::Data(block) => block.size() as u64,
 			Item::Index(block) => block.size() as u64,
@@ -103,12 +103,12 @@ impl VLogCache {
 	}
 }
 
-pub(crate) struct BlockCache<K: InternalKeyTrait> {
-	data: QCache<CacheKey, Item<K>, BlockWeighter>,
+pub(crate) struct BlockCache {
+	data: QCache<CacheKey, Item, BlockWeighter>,
 	id: AtomicU64,
 }
 
-impl<K: InternalKeyTrait> BlockCache<K> {
+impl BlockCache {
 	pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, BlockWeighter),
@@ -116,11 +116,11 @@ impl<K: InternalKeyTrait> BlockCache<K> {
 		}
 	}
 
-	pub(crate) fn insert(&self, table_id: u64, offset: u64, value: Item<K>) {
+	pub(crate) fn insert(&self, table_id: u64, offset: u64, value: Item) {
 		self.data.insert((table_id, offset).into(), value);
 	}
 
-	pub(crate) fn get_data_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block<K>>> {
+	pub(crate) fn get_data_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
 		let item = self.data.get(&key)?;
 
@@ -130,7 +130,7 @@ impl<K: InternalKeyTrait> BlockCache<K> {
 		}
 	}
 
-	pub(crate) fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block<K>>> {
+	pub(crate) fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
 		let item = self.data.get(&key)?;
 

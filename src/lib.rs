@@ -21,11 +21,10 @@ mod wal;
 
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX;
-pub use crate::sstable::{InternalKey, TimestampKey};
+use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
-use sstable::{bloom::LevelDBBloomFilter, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX};
+use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{cmp::Ordering, path::PathBuf, sync::Arc};
 
 /// Type alias for iterator results containing key-value pairs
@@ -48,13 +47,13 @@ pub enum VLogChecksumLevel {
 }
 
 #[derive(Clone)]
-pub struct Options<K: InternalKeyTrait = InternalKey> {
+pub struct Options {
 	pub block_size: usize,
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
 	pub compression: CompressionType,
-	block_cache: Arc<cache::BlockCache<K>>,
+	block_cache: Arc<cache::BlockCache>,
 	vlog_cache: Arc<cache::VLogCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
@@ -82,7 +81,7 @@ pub struct Options<K: InternalKeyTrait = InternalKey> {
 	pub versioned_history_retention_ns: u64,
 }
 
-impl<K: InternalKeyTrait> Default for Options<K> {
+impl Default for Options {
 	fn default() -> Self {
 		let bf = LevelDBBloomFilter::new(10);
 
@@ -92,7 +91,7 @@ impl<K: InternalKeyTrait> Default for Options<K> {
 			comparator: Arc::new(crate::BytewiseComparator {}),
 			compression: CompressionType::None,
 			filter_policy: Some(Arc::new(bf)),
-			block_cache: Arc::new(cache::BlockCache::<K>::with_capacity_bytes(1 << 20)),
+			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
 			vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
 			path: PathBuf::from(""),
 			level_count: 1,
@@ -110,7 +109,7 @@ impl<K: InternalKeyTrait> Default for Options<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Options<K> {
+impl Options {
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -157,7 +156,7 @@ impl<K: InternalKeyTrait> Options<K> {
 
 	// Method to set block_cache capacity
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
-		self.block_cache = Arc::new(cache::BlockCache::<K>::with_capacity_bytes(capacity_bytes));
+		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
 		self
 	}
 
@@ -310,13 +309,6 @@ impl<K: InternalKeyTrait> Options<K> {
 
 		// Validate versioned queries configuration
 		if self.enable_versioning {
-			// Versioned queries require a key type that supports versioning
-			if !K::supports_versioning() {
-				return Err(Error::InvalidArgument(
-					"Versioning is enabled but the key type does not support versioning. Use TimestampKey instead of InternalKey for versioned queries.".to_string(),
-				));
-			}
-
 			// Versioned queries require VLog to be enabled
 			if !self.enable_vlog {
 				return Err(Error::InvalidArgument(
@@ -414,7 +406,7 @@ pub trait FilterPolicy: Send + Sync {
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
 
-pub trait Iterator<K: InternalKeyTrait> {
+pub(crate) trait Iterator {
 	/// An iterator is either positioned at a key/value pair, or
 	/// not valid.  This method returns true iff the iterator is valid.
 	fn valid(&self) -> bool;
@@ -446,7 +438,7 @@ pub trait Iterator<K: InternalKeyTrait> {
 	/// the returned slice is valid only until the next modification of
 	/// the iterator.
 	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<K>;
+	fn key(&self) -> Arc<InternalKey>;
 
 	/// Return the value for the current entry.  The underlying storage for
 	/// the returned slice is valid only until the next modification of
@@ -547,32 +539,30 @@ impl Comparator for BytewiseComparator {
 }
 
 #[derive(Clone)]
-pub(crate) struct InternalKeyComparator<K: InternalKeyTrait> {
+pub(crate) struct InternalKeyComparator {
 	user_comparator: Arc<dyn Comparator>,
-	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<K: InternalKeyTrait> InternalKeyComparator<K> {
+impl InternalKeyComparator {
 	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
 		Self {
 			user_comparator,
-			_phantom: std::marker::PhantomData,
 		}
 	}
 }
 
-impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
+impl Comparator for InternalKeyComparator {
 	fn name(&self) -> &'static str {
 		"leveldb.InternalKeyComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using the generic trait
-		let key_a = K::decode(a);
-		let key_b = K::decode(b);
+		// Decode internal keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
 
 		// First compare by user key (ascending)
-		match self.user_comparator.compare(key_a.user_key().as_ref(), key_b.user_key().as_ref()) {
+		match self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref()) {
 			Ordering::Equal => {
 				// If user keys are equal, compare by sequence number (descending)
 				key_b.seq_num().cmp(&key_a.seq_num())
@@ -586,29 +576,32 @@ impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 			return a.to_vec();
 		}
 
-		// Decode keys using the generic trait
-		let key_a = K::decode(a);
-		let key_b = K::decode(b);
+		// Decode keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
 
 		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(key_a.user_key().as_ref(), key_b.user_key().as_ref())
+		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
 			!= Ordering::Equal
 		{
-			let sep = self
-				.user_comparator
-				.separator(key_a.user_key().as_ref(), key_b.user_key().as_ref());
+			let sep =
+				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
 
 			// Use MAX_SEQUENCE_NUMBER when separator is shorter than original
-			if sep.len() < key_a.user_key().len()
-				&& self.user_comparator.compare(key_a.user_key().as_ref(), &sep) == Ordering::Less
+			if sep.len() < key_a.user_key.len()
+				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
-				let result =
-					K::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, key_a.kind(), INTERNAL_KEY_TIMESTAMP_MAX);
+				let result = InternalKey::new(
+					sep,
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					key_a.kind(),
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				);
 				return result.encode();
 			}
 
 			// Otherwise use original sequence number
-			let result = K::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp());
+			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp);
 			return result.encode();
 		}
 
@@ -617,15 +610,15 @@ impl<K: InternalKeyTrait> Comparator for InternalKeyComparator<K> {
 	}
 
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = K::decode(key);
-		let user_key_succ = self.user_comparator.successor(internal_key.user_key().as_ref());
+		let internal_key = InternalKey::decode(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
 
 		// Create a new internal key with the successor user key and original sequence/kind
-		let result = K::new(
+		let result = InternalKey::new(
 			user_key_succ,
 			internal_key.seq_num(),
 			internal_key.kind(),
-			internal_key.timestamp(),
+			internal_key.timestamp,
 		);
 		result.encode()
 	}

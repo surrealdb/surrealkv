@@ -20,7 +20,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, InternalKeyTrait, ReverseTimestampKey},
+	sstable::{table::Table, InternalKey, ReverseTimestampKey},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -40,14 +40,14 @@ use async_trait::async_trait;
 /// Compaction is essential for maintaining read performance by merging
 /// overlapping SSTables and removing deleted entries.
 #[async_trait]
-pub trait CompactionOperations<K: InternalKeyTrait>: Send + Sync {
+pub trait CompactionOperations: Send + Sync {
 	/// Flushes the active memtable to disk, converting it into an immutable SSTable.
 	/// This is the first step in the LSM tree's write path.
 	fn compact_memtable(&self) -> Result<()>;
 
 	/// Performs compaction according to the specified strategy.
 	/// Compaction merges SSTables to reduce read amplification and remove tombstones.
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy<K>>) -> Result<()>;
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -68,13 +68,13 @@ pub trait CompactionOperations<K: InternalKeyTrait>: Send + Sync {
 ///   has progressively larger SSTables with non-overlapping key ranges (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
-pub(crate) struct CoreInner<K: InternalKeyTrait> {
+pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
 	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
 	/// This memtable is typically implemented as a skip list or balanced tree to
 	/// maintain sorted order while supporting concurrent access.
-	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable<K>>>>,
+	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
 
 	/// Collection of immutable memtables waiting to be flushed to disk.
 	///
@@ -82,7 +82,7 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	/// immutable and a new active memtable is created. These immutable memtables
 	/// continue serving reads while waiting for background threads to flush them
 	/// to disk as SSTables.
-	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
+	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -92,10 +92,10 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	///   key ranges within a level, enabling efficient binary search.
 	///
 	/// In memory-only mode, this is None since we don't persist to disk.
-	pub level_manifest: Option<Arc<RwLock<LevelManifest<K>>>>,
+	pub level_manifest: Option<Arc<RwLock<LevelManifest>>>,
 
 	/// Configuration options controlling LSM tree behavior
-	pub opts: Arc<Options<K>>,
+	pub opts: Arc<Options>,
 
 	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency Control).
 	/// Snapshots provide consistent point-in-time views of the data.
@@ -106,7 +106,7 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	pub(crate) oracle: Arc<Oracle>,
 
 	/// Value Log (VLog)
-	pub(crate) vlog: Option<Arc<VLog<K>>>,
+	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
 	/// In memory-only mode, this is None since we don't persist to disk.
@@ -117,9 +117,9 @@ pub(crate) struct CoreInner<K: InternalKeyTrait> {
 	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
-impl<K: InternalKeyTrait> CoreInner<K> {
+impl CoreInner {
 	/// Creates a new LSM tree core instance
-	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Initialize active and immutable memtables
 		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new())));
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
@@ -142,7 +142,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		};
 
 		let vlog = if opts.enable_vlog && !opts.in_memory_only {
-			Some(Arc::new(VLog::<K>::new(opts.clone())?))
+			Some(Arc::new(VLog::new(opts.clone())?))
 		} else {
 			None
 		};
@@ -212,7 +212,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 	///
 	/// This prevents race conditions by holding the active_memtable write lock
 	/// for both the memtable swap and WAL rotation operations.
-	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable<K>>)>> {
+	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable>)>> {
 		let mut active_memtable = self.active_memtable.write().unwrap();
 
 		// Don't flush an empty memtable
@@ -248,13 +248,13 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 	/// - SSTables may have overlapping key ranges
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
-	fn add_table_to_l0(&self, table: Arc<Table<K>>) -> Result<()> {
+	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
 		let mut original_manifest = self.level_manifest.as_ref().unwrap().write().unwrap();
 		let mut memtable_lock = self.immutable_memtables.write().unwrap();
 		let table_id = table.id;
 
 		// Create a changeset to add the table
-		let mut changeset = ManifestChangeSet::<K>::default();
+		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, table));
 
 		// Apply the changeset
@@ -341,7 +341,7 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 	// }
 }
 
-impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
+impl CompactionOperations for CoreInner {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
 		self.make_room_for_write()
@@ -353,7 +353,7 @@ impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
 	/// - Merges overlapping SSTables to reduce read amplification
 	/// - Removes deleted entries (tombstones) to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
-	fn compact(&self, strategy: Arc<dyn CompactionStrategy<K>>) -> Result<()> {
+	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
@@ -368,17 +368,17 @@ impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
 	}
 }
 
-struct LsmCommitEnv<K: InternalKeyTrait> {
-	core: Arc<CoreInner<K>>,
+struct LsmCommitEnv {
+	core: Arc<CoreInner>,
 
 	/// Manages background tasks like flushing and compaction
 	/// In memory-only mode, this is None since we don't need background tasks
 	task_manager: Option<Arc<TaskManager>>,
 }
 
-impl<K: InternalKeyTrait> LsmCommitEnv<K> {
+impl LsmCommitEnv {
 	/// Creates a new commit environment for the LSM tree
-	pub(crate) fn new(core: Arc<CoreInner<K>>, task_manager: Arc<TaskManager>) -> Result<Self> {
+	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager: Some(task_manager),
@@ -386,7 +386,7 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 	}
 
 	/// Creates a new commit environment for in-memory mode (without task manager)
-	pub(crate) fn new_in_memory(core: Arc<CoreInner<K>>) -> Result<Self> {
+	pub(crate) fn new_in_memory(core: Arc<CoreInner>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager: None,
@@ -394,7 +394,7 @@ impl<K: InternalKeyTrait> LsmCommitEnv<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
+impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL and process VLog entries (synchronous operation)
 	// Returns a new batch with VLog pointers, and pre-encoded ValueLocations
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
@@ -406,7 +406,8 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 			// Use the unified sequence number management
 			for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 				// Create full InternalKey for VLog
-				let ikey = K::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
+				let ikey =
+					InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 				let key_bytes = ikey.encode();
 
 				// Determine value pointer and pre-encode ValueLocation
@@ -552,9 +553,9 @@ impl<K: InternalKeyTrait> CommitEnv for LsmCommitEnv<K> {
 /// - Memtable flushing: Converting full memtables to SSTables
 /// - Compaction: Merging SSTables to maintain read performance
 /// - Garbage collection: Removing obsolete SSTables
-pub(crate) struct Core<K: InternalKeyTrait> {
+pub(crate) struct Core {
 	/// The inner LSM tree implementation
-	inner: Arc<CoreInner<K>>,
+	inner: Arc<CoreInner>,
 
 	/// The commit pipeline that handles write batches
 	commit_pipeline: Arc<CommitPipeline>,
@@ -563,18 +564,18 @@ pub(crate) struct Core<K: InternalKeyTrait> {
 	task_manager: Mutex<Option<Arc<TaskManager>>>,
 
 	/// VLog garbage collection manager
-	vlog_gc_manager: Mutex<Option<VLogGCManager<K>>>,
+	vlog_gc_manager: Mutex<Option<VLogGCManager>>,
 }
 
-impl<K: InternalKeyTrait> std::ops::Deref for Core<K> {
-	type Target = CoreInner<K>;
+impl std::ops::Deref for Core {
+	type Target = CoreInner;
 
 	fn deref(&self) -> &Self::Target {
 		&self.inner
 	}
 }
 
-impl<K: InternalKeyTrait> Core<K> {
+impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
 	///
 	fn replay_wal_with_repair<F>(
@@ -583,13 +584,13 @@ impl<K: InternalKeyTrait> Core<K> {
 		mut set_recovered_memtable: F,
 	) -> Result<u64>
 	where
-		F: FnMut(Arc<MemTable<K>>) -> Result<()>,
+		F: FnMut(Arc<MemTable>) -> Result<()>,
 	{
 		// Create a new empty memtable to recover WAL entries
-		let recovered_memtable = Arc::new(MemTable::<K>::default());
+		let recovered_memtable = Arc::new(MemTable::default());
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num = match replay_wal::<K>(wal_path, &recovered_memtable)? {
+		let wal_seq_num = match replay_wal(wal_path, &recovered_memtable)? {
 			(seq_num, None) => {
 				// No corruption detected, successful replay
 				seq_num
@@ -646,12 +647,12 @@ impl<K: InternalKeyTrait> Core<K> {
 	}
 
 	/// Creates a new LSM tree with background task management
-	pub(crate) fn new(opts: Arc<Options<K>>) -> Result<Self> {
-		let inner = Arc::new(CoreInner::<K>::new(opts.clone())?);
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		let inner = Arc::new(CoreInner::new(opts.clone())?);
 
 		if opts.in_memory_only {
 			// For in-memory mode, create a minimal core without background tasks
-			let commit_env = Arc::new(LsmCommitEnv::<K>::new_in_memory(inner.clone())?);
+			let commit_env = Arc::new(LsmCommitEnv::new_in_memory(inner.clone())?);
 			let commit_pipeline = CommitPipeline::new(commit_env);
 
 			// Set initial sequence number
@@ -698,8 +699,7 @@ impl<K: InternalKeyTrait> Core<K> {
 
 			// Initialize VLog GC manager only if VLog is enabled
 			if let Some(ref vlog) = inner.vlog {
-				let vlog_gc_manager =
-					VLogGCManager::<K>::new(vlog.clone(), commit_pipeline.clone());
+				let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
 				vlog_gc_manager.start();
 				*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
 			}
@@ -757,20 +757,20 @@ impl<K: InternalKeyTrait> Core<K> {
 
 		// Step 5: Flush all directories to ensure durability
 		// Skip this in memory-only mode since we don't persist to disk
-		sync_directory_structure(&*self.inner.opts)?;
+		sync_directory_structure(&self.inner.opts)?;
 
 		Ok(())
 	}
 }
 
 #[derive(Clone)]
-pub struct Tree<K: InternalKeyTrait = InternalKey> {
-	pub(crate) core: Arc<Core<K>>,
+pub struct Tree {
+	pub(crate) core: Arc<Core>,
 }
 
-impl<K: InternalKeyTrait> Tree<K> {
+impl Tree {
 	/// Creates a new LSM tree with the specified options
-	fn new(opts: Arc<Options<K>>) -> Result<Self> {
+	fn new(opts: Arc<Options>) -> Result<Self> {
 		// Validate options before creating the tree
 		opts.validate()?;
 
@@ -792,7 +792,7 @@ impl<K: InternalKeyTrait> Tree<K> {
 	}
 
 	/// Creates all required directory structure for the LSM tree
-	fn create_directory_structure(opts: &Options<K>) -> Result<()> {
+	fn create_directory_structure(opts: &Options) -> Result<()> {
 		if opts.in_memory_only {
 			return Ok(());
 		}
@@ -820,13 +820,13 @@ impl<K: InternalKeyTrait> Tree<K> {
 	}
 
 	/// Transactions provide a consistent, atomic view of the database.
-	pub fn begin(&self) -> Result<Transaction<K>> {
+	pub fn begin(&self) -> Result<Transaction> {
 		let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
 		Ok(txn)
 	}
 
 	/// Begins a new transaction with the specified mode
-	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction<K>> {
+	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
 		let txn = Transaction::new(self.core.clone(), mode)?;
 		Ok(txn)
 	}
@@ -834,7 +834,7 @@ impl<K: InternalKeyTrait> Tree<K> {
 	/// Executes a read-only operation in a consistent snapshot.
 	///
 	/// This provides a consistent view of the database without blocking writes.
-	pub fn view(&self, f: impl FnOnce(&mut Transaction<K>) -> Result<()>) -> Result<()> {
+	pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
 		let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
 		f(&mut txn)?;
 		Ok(())
@@ -957,22 +957,22 @@ impl<K: InternalKeyTrait> Tree<K> {
 }
 
 /// A builder for creating LSM trees with type-safe configuration.
-pub struct TreeBuilder<K: InternalKeyTrait> {
-	opts: Options<K>,
+pub struct TreeBuilder {
+	opts: Options,
 }
 
-impl<K: InternalKeyTrait> TreeBuilder<K> {
+impl TreeBuilder {
 	/// Creates a new TreeBuilder with default options for the specified key type.
 	pub fn new() -> Self {
 		Self {
-			opts: Options::<K>::default(),
+			opts: Options::default(),
 		}
 	}
 
 	/// Creates a new TreeBuilder with the specified options.
 	///
 	/// This method ensures type safety by requiring the options to use the same key type.
-	pub fn with_options(opts: Options<K>) -> Self {
+	pub fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
 		}
@@ -1084,7 +1084,7 @@ impl<K: InternalKeyTrait> TreeBuilder<K> {
 	///
 	/// This method ensures type safety by using the same key type K
 	/// for both the builder and the resulting tree.
-	pub fn build(self) -> Result<Tree<K>> {
+	pub fn build(self) -> Result<Tree> {
 		Tree::new(Arc::new(self.opts))
 	}
 
@@ -1092,14 +1092,14 @@ impl<K: InternalKeyTrait> TreeBuilder<K> {
 	///
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
-	pub fn build_with_options(self) -> Result<(Tree<K>, Arc<Options<K>>)> {
+	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
 		let opts = Arc::new(self.opts);
 		let tree = Tree::new(opts.clone())?;
 		Ok((tree, opts))
 	}
 }
 
-impl<K: InternalKeyTrait> Default for TreeBuilder<K> {
+impl Default for TreeBuilder {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -1113,7 +1113,7 @@ fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 
 /// Syncs all directory structures for the LSM store to ensure durability
 /// Returns explicit errors indicating which path failed
-fn sync_directory_structure<K: InternalKeyTrait>(opts: &Options<K>) -> Result<()> {
+fn sync_directory_structure(opts: &Options) -> Result<()> {
 	if opts.in_memory_only {
 		return Ok(());
 	}
@@ -3314,7 +3314,7 @@ mod tests {
 		let path = temp_dir.path().to_path_buf();
 
 		// Test TreeBuilder with default key type (InternalKey)
-		let tree = TreeBuilder::<InternalKey>::new()
+		let tree = TreeBuilder::new()
 			.with_path(path.clone())
 			.with_max_memtable_size(64 * 1024)
 			.with_enable_vlog(true)
@@ -3333,7 +3333,7 @@ mod tests {
 		assert_eq!(result, Arc::from(b"test_value".as_slice()));
 
 		// Test build_with_options
-		let (tree2, opts) = TreeBuilder::<InternalKey>::new()
+		let (tree2, opts) = TreeBuilder::new()
 			.with_path(temp_dir.path().join("tree2"))
 			.with_in_memory_only(true)
 			.build_with_options()

@@ -8,7 +8,7 @@ use crate::{
 	memtable::ImmutableMemtables,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKeyKind, InternalKeyTrait, ReverseTimestampKey,
+		InternalKeyKind, ReverseTimestampKey,
 	},
 	vfs::File,
 	vlog::VLog,
@@ -23,16 +23,16 @@ use std::{
 };
 
 /// Compaction options
-pub(crate) struct CompactionOptions<K: InternalKeyTrait> {
-	pub lopts: Arc<LSMOptions<K>>,
-	pub level_manifest: Arc<RwLock<LevelManifest<K>>>,
-	pub immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
-	pub vlog: Option<Arc<VLog<K>>>,
+pub(crate) struct CompactionOptions {
+	pub lopts: Arc<LSMOptions>,
+	pub level_manifest: Arc<RwLock<LevelManifest>>,
+	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+	pub vlog: Option<Arc<VLog>>,
 	pub versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
-impl<K: InternalKeyTrait> CompactionOptions<K> {
-	pub(crate) fn from(tree: &CoreInner<K>) -> Self {
+impl CompactionOptions {
+	pub(crate) fn from(tree: &CoreInner) -> Self {
 		Self {
 			lopts: tree.opts.clone(),
 			level_manifest: tree
@@ -47,16 +47,13 @@ impl<K: InternalKeyTrait> CompactionOptions<K> {
 }
 
 /// Handles the compaction state and operations
-pub(crate) struct Compactor<K: InternalKeyTrait> {
-	pub(crate) options: CompactionOptions<K>,
-	pub(crate) strategy: Arc<dyn CompactionStrategy<K>>,
+pub(crate) struct Compactor {
+	pub(crate) options: CompactionOptions,
+	pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
-impl<K: InternalKeyTrait> Compactor<K> {
-	pub(crate) fn new(
-		options: CompactionOptions<K>,
-		strategy: Arc<dyn CompactionStrategy<K>>,
-	) -> Self {
+impl Compactor {
+	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
 		Self {
 			options,
 			strategy,
@@ -75,7 +72,7 @@ impl<K: InternalKeyTrait> Compactor<K> {
 
 	fn merge_tables(
 		&self,
-		mut levels: RwLockWriteGuard<'_, LevelManifest<K>>,
+		mut levels: RwLockWriteGuard<'_, LevelManifest>,
 		input: &CompactionInput,
 	) -> Result<()> {
 		let merge_result = {
@@ -90,9 +87,9 @@ impl<K: InternalKeyTrait> Compactor<K> {
 				})
 				.collect();
 
-			let iterators: Vec<BoxedIterator<'_, K>> = to_merge
+			let iterators: Vec<BoxedIterator<'_>> = to_merge
 				.into_iter()
-				.map(|table| Box::new(table.iter()) as BoxedIterator<'_, K>)
+				.map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
 				.collect();
 
 			// Hide tables that are being merged
@@ -143,7 +140,7 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedIterator<'_, K>>,
+		merge_iter: Vec<BoxedIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<(HashMap<u32, i64>, Vec<Key>)> {
 		let file = SysFile::create(path)?;
@@ -177,7 +174,7 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		Ok((comp_iter.discard_stats, deleted_keys))
 	}
 
-	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table<K>>) -> Result<()> {
+	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write().unwrap();
 		let _imm_guard = self.options.immutable_memtables.write();
 
@@ -189,7 +186,7 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		}
 
 		// Create a changeset for the compaction
-		let mut changeset = ManifestChangeSet::<K>::default();
+		let mut changeset = ManifestChangeSet::default();
 
 		// Add tables to delete (the ones being merged) - use the same efficient approach as original
 		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
@@ -228,12 +225,12 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		}
 	}
 
-	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table<K>>> {
+	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
 		let file = SysFile::open(table_path)?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		Ok(Arc::new(Table::<K>::new(table_id, self.options.lopts.clone(), file, file_size)?))
+		Ok(Arc::new(Table::new(table_id, self.options.lopts.clone(), file, file_size)?))
 	}
 
 	/// Cleans up deleted keys from the versioned index

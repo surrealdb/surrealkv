@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::{
 	error::{Error, Result},
-	sstable::InternalKeyTrait,
+	sstable::InternalKey,
 	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Options, Value,
 };
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
@@ -85,24 +85,21 @@ impl BlockHandle {
 /// ```
 ///
 #[derive(Clone)]
-pub struct Block<K: InternalKeyTrait> {
+pub(crate) struct Block {
 	pub(crate) block: Arc<BlockData>,
-	opts: Arc<Options<K>>,
-	/// Phantom data to hold the key type
-	_phantom: std::marker::PhantomData<K>,
+	opts: Arc<Options>,
 }
 
-impl<K: InternalKeyTrait> Block<K> {
-	pub(crate) fn iter(&self) -> BlockIterator<K> {
+impl Block {
+	pub(crate) fn iter(&self) -> BlockIterator {
 		BlockIterator::new(self.opts.clone(), self.block.clone())
 	}
 
-	pub(crate) fn new(data: BlockData, opts: Arc<Options<K>>) -> Block<K> {
+	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: Arc::new(data),
 			opts,
-			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -111,7 +108,7 @@ impl<K: InternalKeyTrait> Block<K> {
 	}
 }
 
-pub(crate) struct BlockWriter<K: InternalKeyTrait> {
+pub(crate) struct BlockWriter {
 	restart_interval: usize,
 	// Destination buffer
 	buffer: Vec<u8>,
@@ -123,8 +120,6 @@ pub(crate) struct BlockWriter<K: InternalKeyTrait> {
 	num_entries: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
-	/// Phantom data to hold the key type
-	_phantom: std::marker::PhantomData<K>,
 }
 
 /*
@@ -176,18 +171,17 @@ Block writer logic:
    67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
 
 */
-impl<K: InternalKeyTrait> BlockWriter<K> {
+impl BlockWriter {
 	// Constructor for BlockWriter
-	pub(crate) fn new(opt: Arc<Options<K>>) -> Self {
+	pub(crate) fn new(opt: Arc<Options>) -> Self {
 		BlockWriter {
-			internal_cmp: Arc::new(InternalKeyComparator::<K>::new(opt.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::new(opt.comparator.clone())),
 			buffer: Vec::with_capacity(opt.block_size),
 			restart_interval: opt.block_restart_interval,
 			restart_points: vec![0],
 			last_key: Vec::new(),
 			restart_counter: 0,
 			num_entries: 0,
-			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -276,7 +270,7 @@ impl<K: InternalKeyTrait> BlockWriter<K> {
 	}
 }
 
-pub struct BlockIterator<K: InternalKeyTrait> {
+pub(crate) struct BlockIterator {
 	block: Arc<BlockData>,
 	restart_points: Vec<u32>,
 	offset: usize,
@@ -290,13 +284,11 @@ pub struct BlockIterator<K: InternalKeyTrait> {
 	current_value_offset_end: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
-	/// Phantom data to hold the key type
-	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<K: InternalKeyTrait> BlockIterator<K> {
+impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options<K>>, block: Arc<BlockData>) -> Self {
+	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -307,8 +299,7 @@ impl<K: InternalKeyTrait> BlockIterator<K> {
 			*restart_point = u32::decode_fixed(&block[start_point..end_point]).unwrap();
 		}
 
-		let internal_comparator =
-			Arc::new(InternalKeyComparator::<K>::new(options.comparator.clone()));
+		let internal_comparator = Arc::new(InternalKeyComparator::new(options.comparator.clone()));
 
 		BlockIterator {
 			block,
@@ -321,7 +312,6 @@ impl<K: InternalKeyTrait> BlockIterator<K> {
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
 			internal_cmp: internal_comparator,
-			_phantom: std::marker::PhantomData,
 		}
 	}
 
@@ -384,7 +374,7 @@ impl<K: InternalKeyTrait> BlockIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for BlockIterator<K> {
+impl Iterator for BlockIterator {
 	type Item = (Key, Value);
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.advance() {
@@ -397,7 +387,7 @@ impl<K: InternalKeyTrait> Iterator for BlockIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> DoubleEndedIterator for BlockIterator<K> {
+impl DoubleEndedIterator for BlockIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.prev() {
 			return None;
@@ -410,7 +400,7 @@ impl<K: InternalKeyTrait> DoubleEndedIterator for BlockIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> LSMIterator<K> for BlockIterator<K> {
+impl LSMIterator for BlockIterator {
 	// Checks if the iterator is valid (has a current entry)
 	fn valid(&self) -> bool {
 		!self.current_key.is_empty()
@@ -512,8 +502,8 @@ impl<K: InternalKeyTrait> LSMIterator<K> for BlockIterator<K> {
 	}
 
 	// Get the current key
-	fn key(&self) -> Arc<K> {
-		Arc::new(K::decode(&self.current_key))
+	fn key(&self) -> Arc<InternalKey> {
+		Arc::new(InternalKey::decode(&self.current_key))
 	}
 
 	// Get the current value
@@ -548,7 +538,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(key.to_vec(), 0, kind).encode()
+		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
 	}
 
 	#[test]
@@ -642,7 +632,7 @@ mod tests {
 
 		let mut block_iter = Block::new(block_contents, o.clone()).iter();
 
-		let key = InternalKey::new("pkey2".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new("pkey2".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -650,7 +640,7 @@ mod tests {
 			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey0".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new("pkey0".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -658,7 +648,7 @@ mod tests {
 			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("key1".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new("key1".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -666,7 +656,7 @@ mod tests {
 			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey3".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new("pkey3".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -674,7 +664,7 @@ mod tests {
 			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey8".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new("pkey8".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(!block_iter.valid());
 	}

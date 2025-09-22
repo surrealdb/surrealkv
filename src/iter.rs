@@ -6,37 +6,37 @@ use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{
-	sstable::{InternalKeyKind, InternalKeyTrait},
+	sstable::{InternalKey, InternalKeyKind},
 	Key, Value,
 };
 
-pub type BoxedIterator<'a, K> = Box<dyn DoubleEndedIterator<Item = (Arc<K>, Value)> + 'a>;
+pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
 
 // Holds a key-value pair and the iterator index
 #[derive(Eq)]
-pub(crate) struct HeapItem<K: InternalKeyTrait> {
-	pub(crate) key: Arc<K>,
+pub(crate) struct HeapItem {
+	pub(crate) key: Arc<InternalKey>,
 	pub(crate) value: Value,
 	pub(crate) iterator_index: usize,
 }
 
-impl<K: InternalKeyTrait> PartialEq for HeapItem<K> {
+impl PartialEq for HeapItem {
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
 }
 
-impl<K: InternalKeyTrait> Ord for HeapItem<K> {
+impl Ord for HeapItem {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Invert for min-heap behavior
 		other.cmp_internal(self)
 	}
 }
 
-impl<K: InternalKeyTrait> HeapItem<K> {
+impl HeapItem {
 	fn cmp_internal(&self, other: &Self) -> Ordering {
 		// First compare by user key
-		match self.key.user_key().cmp(other.key.user_key()) {
+		match self.key.user_key.cmp(&other.key.user_key) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
@@ -50,16 +50,16 @@ impl<K: InternalKeyTrait> HeapItem<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> PartialOrd for HeapItem<K> {
+impl PartialOrd for HeapItem {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-pub(crate) struct MergeIterator<'a, K: InternalKeyTrait> {
-	iterators: Vec<BoxedIterator<'a, K>>,
+pub(crate) struct MergeIterator<'a> {
+	iterators: Vec<BoxedIterator<'a>>,
 	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem<K>>,
+	heap: BinaryHeap<HeapItem>,
 	// Current key we're processing, to skip duplicate versions
 	current_user_key: Option<Key>,
 	initialized: bool,
@@ -67,8 +67,8 @@ pub(crate) struct MergeIterator<'a, K: InternalKeyTrait> {
 	is_bottom_level: bool,
 }
 
-impl<'a, K: InternalKeyTrait> MergeIterator<'a, K> {
-	pub(crate) fn new(iterators: Vec<BoxedIterator<'a, K>>, is_bottom_level: bool) -> Self {
+impl<'a> MergeIterator<'a> {
+	pub(crate) fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
 		let heap = BinaryHeap::with_capacity(iterators.len());
 
 		Self {
@@ -95,8 +95,8 @@ impl<'a, K: InternalKeyTrait> MergeIterator<'a, K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for MergeIterator<'_, K> {
-	type Item = (Arc<K>, Value);
+impl Iterator for MergeIterator<'_> {
+	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized {
@@ -116,7 +116,7 @@ impl<K: InternalKeyTrait> Iterator for MergeIterator<'_, K> {
 				});
 			}
 
-			let user_key = heap_item.key.user_key().clone();
+			let user_key = heap_item.key.user_key.clone();
 			let is_tombstone = heap_item.key.kind() == InternalKeyKind::Delete;
 
 			// Check if this is a new user key
@@ -154,24 +154,24 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Val
 	Ok(())
 }
 
-pub(crate) struct CompactionIterator<'a, K: InternalKeyTrait> {
-	iterators: Vec<BoxedIterator<'a, K>>,
+pub(crate) struct CompactionIterator<'a> {
+	iterators: Vec<BoxedIterator<'a>>,
 	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem<K>>,
+	heap: BinaryHeap<HeapItem>,
 	is_bottom_level: bool,
 
 	// Track the current key being processed
 	current_user_key: Option<Key>,
 
 	// Collected versions of the current key
-	current_key_versions: Vec<(Arc<K>, Value)>,
+	current_key_versions: Vec<(Arc<InternalKey>, Value)>,
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
 	pub discard_stats: HashMap<u32, i64>,
 
 	/// Reference to VLog for populating delete-list
-	vlog: Option<Arc<VLog<K>>>,
+	vlog: Option<Arc<VLog>>,
 
 	/// Batch of stale entries to add to delete-list: (sequence_number, value_size)
 	delete_list_batch: Vec<(u64, u64)>,
@@ -186,11 +186,11 @@ pub(crate) struct CompactionIterator<'a, K: InternalKeyTrait> {
 	initialized: bool,
 }
 
-impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
+impl<'a> CompactionIterator<'a> {
 	pub(crate) fn new(
-		iterators: Vec<BoxedIterator<'a, K>>,
+		iterators: Vec<BoxedIterator<'a>>,
 		is_bottom_level: bool,
-		vlog: Option<Arc<VLog<K>>>,
+		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,
 		retention_period_ns: u64,
 	) -> Self {
@@ -242,7 +242,7 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 	}
 
 	/// Process all collected versions of the current key and return the one to output
-	fn process_current_key_versions(&mut self) -> Option<(Arc<K>, Value)> {
+	fn process_current_key_versions(&mut self) -> Option<(Arc<InternalKey>, Value)> {
 		if self.current_key_versions.is_empty() {
 			return None;
 		}
@@ -257,7 +257,7 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 
 		// If the latest version is a tombstone and we're at bottom level, collect the key for versioned index cleanup
 		if is_latest_tombstone && self.is_bottom_level && self.enable_versioning {
-			self.deleted_keys.push(latest_key.user_key().clone());
+			self.deleted_keys.push(latest_key.user_key.clone());
 		}
 
 		// Get current time for retention period check
@@ -292,7 +292,7 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 			} else {
 				// Older version of a SET operation: check retention period
 				if self.enable_versioning && self.retention_period_ns > 0 {
-					let key_timestamp = key.timestamp();
+					let key_timestamp = key.timestamp;
 					// If timestamp is 0 (not set), assume it's old enough to be deleted
 					let is_within_retention = key_timestamp == 0
 						|| (current_time - key_timestamp) <= self.retention_period_ns;
@@ -338,8 +338,8 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for CompactionIterator<'_, K> {
-	type Item = (Arc<K>, Value);
+impl Iterator for CompactionIterator<'_> {
+	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized {
@@ -365,7 +365,7 @@ impl<K: InternalKeyTrait> Iterator for CompactionIterator<'_, K> {
 				});
 			}
 
-			let user_key = heap_item.key.user_key().clone();
+			let user_key = heap_item.key.user_key.clone();
 
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
@@ -408,10 +408,10 @@ mod tests {
 		sequence: u64,
 		kind: InternalKeyKind,
 	) -> Arc<InternalKey> {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind).into()
+		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0).into()
 	}
 
-	fn create_test_vlog() -> (Arc<VLog<InternalKey>>, TempDir) {
+	fn create_test_vlog() -> (Arc<VLog>, TempDir) {
 		let temp_dir = TempDir::new().unwrap();
 		let opts = Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
@@ -426,19 +426,19 @@ mod tests {
 		(vlog, temp_dir)
 	}
 
-	fn create_vlog_value(vlog: &Arc<VLog<InternalKey>>, key: &[u8], value: &[u8]) -> Value {
+	fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 		let pointer = vlog.append(key, value).unwrap();
 		ValueLocation::with_pointer(pointer).encode().into()
 	}
 
 	// Creates a mock iterator with predefined entries
-	struct MockIterator<K: InternalKeyTrait> {
-		items: Vec<(Arc<K>, Value)>,
+	struct MockIterator {
+		items: Vec<(Arc<InternalKey>, Value)>,
 		index: usize,
 	}
 
-	impl<K: InternalKeyTrait> MockIterator<K> {
-		fn new(items: Vec<(Arc<K>, Value)>) -> Self {
+	impl MockIterator {
+		fn new(items: Vec<(Arc<InternalKey>, Value)>) -> Self {
 			Self {
 				items,
 				index: 0,
@@ -446,8 +446,8 @@ mod tests {
 		}
 	}
 
-	impl<K: InternalKeyTrait> Iterator for MockIterator<K> {
-		type Item = (Arc<K>, Value);
+	impl Iterator for MockIterator {
+		type Item = (Arc<InternalKey>, Value);
 
 		fn next(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {
@@ -460,7 +460,7 @@ mod tests {
 		}
 	}
 
-	impl<K: InternalKeyTrait> DoubleEndedIterator for MockIterator<K> {
+	impl DoubleEndedIterator for MockIterator {
 		fn next_back(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {
 				let item = self.items.pop()?;

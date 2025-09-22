@@ -6,7 +6,6 @@ use crate::{
 	batch::Batch,
 	error::Result,
 	memtable::MemTable,
-	sstable::InternalKeyTrait,
 	wal::{
 		reader::Reader,
 		segment::{get_segment_range, Error, MultiSegmentReader, SegmentRef},
@@ -28,9 +27,9 @@ use crate::{
 ///
 /// If no corruption is found, the second element will be None.
 /// If corruption is found, the second element contains (segment_id, last_valid_offset) for repair.
-pub(crate) fn replay_wal<K: InternalKeyTrait>(
+pub(crate) fn replay_wal(
 	wal_dir: &Path,
-	memtable: &Arc<MemTable<K>>,
+	memtable: &Arc<MemTable>,
 ) -> Result<(u64, Option<(usize, usize)>)> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
@@ -212,7 +211,6 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::sstable::InternalKey;
 	use crate::wal::segment::{Options, Segment, WAL_RECORD_HEADER_SIZE};
 	use std::fs;
 	use tempfile::TempDir;
@@ -227,7 +225,7 @@ mod tests {
 		fs::create_dir_all(wal_dir).unwrap();
 
 		// Create a memtable to replay into
-		let memtable = Arc::new(MemTable::<InternalKey>::new());
+		let memtable = Arc::new(MemTable::new());
 
 		// Test case: Multiple batches, each with multiple entries
 		// This is the critical test case that would have failed with the old bug
@@ -276,7 +274,7 @@ mod tests {
 	fn test_replay_wal_empty_directory() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
-		let memtable = Arc::new(MemTable::<InternalKey>::new());
+		let memtable = Arc::new(MemTable::new());
 
 		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
 
@@ -290,7 +288,7 @@ mod tests {
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
-		let memtable = Arc::new(MemTable::<InternalKey>::new());
+		let memtable = Arc::new(MemTable::new());
 
 		// Test with multiple single-entry batches
 		// This tests the edge case where starting = highest for each batch
@@ -358,7 +356,7 @@ mod tests {
 		segment2.close().unwrap();
 
 		// Create a fresh memtable for the test
-		let memtable = Arc::new(MemTable::<InternalKey>::new());
+		let memtable = Arc::new(MemTable::new());
 		let (max_seq_num, _) = replay_wal(wal_dir, &memtable).unwrap();
 
 		// The max should be from the latest segment (301), not the starting sequence number

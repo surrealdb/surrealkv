@@ -16,7 +16,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKeyKind, InternalKeyTrait, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -161,28 +161,26 @@ impl Footer {
 }
 
 // Defines a writer for constructing and writing table structures to a storage medium.
-pub(crate) struct TableWriter<W: Write, K: InternalKeyTrait> {
-	writer: W,             // Underlying writer to write data to.
-	opts: Arc<Options<K>>, // Shared table options.
+pub(crate) struct TableWriter<W: Write> {
+	writer: W,          // Underlying writer to write data to.
+	opts: Arc<Options>, // Shared table options.
 
-	meta: TableMetadata<K>, // Metadata properties of the table.
+	meta: TableMetadata, // Metadata properties of the table.
 
 	offset: usize, // Current offset in the writer where the next write will happen.
 	prev_block_last_key: Vec<u8>, // Last key of the previous block.
 
-	data_block: Option<BlockWriter<K>>, // Writer for the current data block.
-	partitioned_index: TopLevelIndexWriter<K>, // Writer for partitioned index.
+	data_block: Option<BlockWriter>, // Writer for the current data block.
+	partitioned_index: TopLevelIndexWriter, // Writer for partitioned index.
 	filter_block: Option<FilterBlockWriter>, // Writer for the optional filter block.
 
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
-	/// Internal key phantom data to track key type
-	_phantom: std::marker::PhantomData<K>,
 }
 
-impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
+impl<W: Write> TableWriter<W> {
 	// Constructs a new TableWriter with the provided writer and options.
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options<K>>) -> Self {
+	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(policy.clone());
@@ -193,7 +191,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 			}
 		};
 
-		let mut meta = TableMetadata::<K>::new();
+		let mut meta = TableMetadata::new();
 		meta.properties.id = id;
 
 		TableWriter {
@@ -203,14 +201,10 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 			meta,
 			prev_block_last_key: Vec::new(),
 
-			data_block: Some(BlockWriter::<K>::new(opts.clone())),
-			partitioned_index: TopLevelIndexWriter::<K>::new(
-				opts.clone(),
-				opts.index_partition_size,
-			),
+			data_block: Some(BlockWriter::new(opts.clone())),
+			partitioned_index: TopLevelIndexWriter::new(opts.clone(), opts.index_partition_size),
 			filter_block: fb,
-			internal_cmp: Arc::new(InternalKeyComparator::<K>::new(opts.comparator.clone())),
-			_phantom: std::marker::PhantomData,
+			internal_cmp: Arc::new(InternalKeyComparator::new(opts.comparator.clone())),
 		}
 	}
 
@@ -224,13 +218,13 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		data_block_size
 			+ index_block_size
 			+ filter_block_size
-			+ size_of_writer_metadata::<K>()
+			+ size_of_writer_metadata()
 			+ self.offset
 			+ TABLE_FULL_FOOTER_LENGTH
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub(crate) fn add(&mut self, key: Arc<K>, val: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: Arc<InternalKey>, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -261,7 +255,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 
 		// Optionally add the key to the filter block.
 		if let Some(fblock) = self.filter_block.as_mut() {
-			fblock.add_key(key.user_key());
+			fblock.add_key(key.user_key.as_ref());
 		}
 
 		// Add the key-value pair to the data block and increment the entry count.
@@ -297,7 +291,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		let handle = self.write_compressed_block(&contents, self.opts.compression)?;
 
 		// Encode the block handle and add it to the index block.
-		let sep_key = K::new(
+		let sep_key = InternalKey::new(
 			separator_key,
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
@@ -308,7 +302,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		self.partitioned_index.add(&sep_key.encode(), &handle_encoded)?;
 
 		// Prepare for the next data block.
-		self.data_block = Some(BlockWriter::<K>::new(self.opts.clone()));
+		self.data_block = Some(BlockWriter::new(self.opts.clone()));
 
 		Ok(())
 	}
@@ -333,7 +327,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		}
 
 		// Initialize meta_index block
-		let mut meta_ix_block = BlockWriter::<K>::new(self.opts.clone());
+		let mut meta_ix_block = BlockWriter::new(self.opts.clone());
 
 		// Write the filter block to the meta index block if present.
 		if let Some(fblock) = self.filter_block.take() {
@@ -350,14 +344,15 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
 				// TODO: Add this as part of property as the current trailer will mark it as deleted
-				let filter_key = K::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+				let filter_key =
+					InternalKey::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
 
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
 
 		// Write meta properties to the meta index block
-		let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+		let meta_key = InternalKey::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
@@ -407,7 +402,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		Ok(handle)
 	}
 
-	fn update_meta_properties(&mut self, key: &K, value: &[u8]) {
+	fn update_meta_properties(&mut self, key: &InternalKey, value: &[u8]) {
 		let seq_num = key.seq_num();
 
 		// Update sequence numbers
@@ -437,7 +432,7 @@ impl<W: Write, K: InternalKeyTrait> TableWriter<W, K> {
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
 
-		let user_key = key.user_key();
+		let user_key = &key.user_key;
 
 		// Update key range if needed
 		if props.key_range.is_none() {
@@ -538,10 +533,9 @@ pub(crate) fn read_filter_block(
 	Ok(FilterBlockReader::new(buf, policy))
 }
 
-fn read_writer_meta_properties<K: InternalKeyTrait>(
-	metaix: &Block<K>,
-) -> Result<Option<TableMetadata<K>>> {
-	let meta_key = K::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0).encode();
+fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
+	let meta_key =
+		InternalKey::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter();
@@ -555,11 +549,11 @@ fn read_writer_meta_properties<K: InternalKeyTrait>(
 	Ok(None)
 }
 
-pub(crate) fn read_table_block<K: InternalKeyTrait>(
-	opt: Arc<Options<K>>,
+pub(crate) fn read_table_block(
+	opt: Arc<Options>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
-) -> Result<Block<K>> {
+) -> Result<Block> {
 	let buf = read_bytes(f.clone(), location)?;
 	let compress = read_bytes(
 		f.clone(),
@@ -582,7 +576,7 @@ pub(crate) fn read_table_block<K: InternalKeyTrait>(
 
 	let block = decompress_block(&buf, CompressionType::from(compress[0]))?;
 
-	Ok(Block::<K>::new(block, opt))
+	Ok(Block::new(block, opt))
 }
 
 /// Verify checksum of block
@@ -594,34 +588,34 @@ fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
 }
 
 #[derive(Clone)]
-pub enum IndexType<K: InternalKeyTrait> {
-	Partitioned(TopLevelIndex<K>),
+pub enum IndexType {
+	Partitioned(TopLevelIndex),
 }
 
 #[derive(Clone)]
-pub struct Table<K: InternalKeyTrait> {
+pub(crate) struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
 	pub file_size: u64,
 	cache_id: cache::CacheID,
 
-	opts: Arc<Options<K>>,             // Shared table options.
-	pub(crate) meta: TableMetadata<K>, // Metadata properties of the table.
+	opts: Arc<Options>,             // Shared table options.
+	pub(crate) meta: TableMetadata, // Metadata properties of the table.
 
-	index_block: IndexType<K>,
+	index_block: IndexType,
 	filter_reader: Option<FilterBlockReader>,
 
-	pub(crate) internal_cmp: Arc<InternalKeyComparator<K>>, // Internal key comparator for the table.
+	pub(crate) internal_cmp: Arc<InternalKeyComparator>, // Internal key comparator for the table.
 }
 
-impl<K: InternalKeyTrait> Table<K> {
+impl Table {
 	pub(crate) fn new(
 		id: u64,
-		opts: Arc<Options<K>>,
+		opts: Arc<Options>,
 		file: Arc<dyn File>,
 		file_size: u64,
-	) -> Result<Table<K>> {
+	) -> Result<Table> {
 		// Read in the following order:
 		//    1. Footer
 		//    2. [index block]
@@ -634,15 +628,15 @@ impl<K: InternalKeyTrait> Table<K> {
 		// Using partitioned index
 		let index_block = {
 			let partitioned_index =
-				TopLevelIndex::<K>::new(id, opts.clone(), file.clone(), &footer.index)?;
-			IndexType::<K>::Partitioned(partitioned_index)
+				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
+			IndexType::Partitioned(partitioned_index)
 		};
 
 		let metaindexblock = read_table_block(opts.clone(), file.clone(), &footer.meta_index)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
-		let writer_metadata = read_writer_meta_properties::<K>(&metaindexblock)?
-			.ok_or(Error::TableMetadataNotFound)?;
+		let writer_metadata =
+			read_writer_meta_properties(&metaindexblock)?.ok_or(Error::TableMetadataNotFound)?;
 		// println!("Writer metadata: {:?}", writer_metadata);
 
 		let filter_reader = if opts.filter_policy.is_some() {
@@ -654,7 +648,7 @@ impl<K: InternalKeyTrait> Table<K> {
 
 		let cache_id = opts.block_cache.new_cache_id();
 
-		Ok(Table::<K> {
+		Ok(Table {
 			id,
 			file,
 			file_size,
@@ -668,9 +662,9 @@ impl<K: InternalKeyTrait> Table<K> {
 	}
 
 	fn read_filter_block(
-		metaix: &Block<K>,
+		metaix: &Block,
 		file: Arc<dyn File>,
-		options: &Options<K>,
+		options: &Options,
 	) -> Result<Option<FilterBlockReader>> {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name())
 			.as_bytes()
@@ -703,14 +697,14 @@ impl<K: InternalKeyTrait> Table<K> {
 		Ok(None)
 	}
 
-	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block<K>>> {
+	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		if let Some(block) =
 			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
 		{
 			return Ok(block.clone());
 		}
 
-		let b = read_table_block::<K>(self.opts.clone(), self.file.clone(), location)?;
+		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;
 		let b = Arc::new(b);
 
 		self.opts.block_cache.insert(
@@ -722,21 +716,21 @@ impl<K: InternalKeyTrait> Table<K> {
 		Ok(b)
 	}
 
-	pub(crate) fn get(&self, key: K) -> Result<Option<(Arc<K>, Value)>> {
+	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(Arc<InternalKey>, Value)>> {
 		let key_encoded = &key.encode();
 
 		// Check filter first
 		if let Some(ref filters) = self.filter_reader {
-			let may_contain = filters.may_contain(key.user_key(), 0);
+			let may_contain = filters.may_contain(key.user_key.as_ref(), 0);
 			if !may_contain {
 				return Ok(None);
 			}
 		}
 
 		let handle = match &self.index_block {
-			IndexType::<K>::Partitioned(partitioned_index) => {
+			IndexType::Partitioned(partitioned_index) => {
 				// First find the correct partition using just the user key (optimization)
-				let partition_block = match partitioned_index.get(key.user_key()) {
+				let partition_block = match partitioned_index.get(key.user_key.as_ref()) {
 					Ok(block) => block,
 					Err(_e) => {
 						return Ok(None);
@@ -787,9 +781,9 @@ impl<K: InternalKeyTrait> Table<K> {
 		}
 	}
 
-	pub(crate) fn iter(&self) -> TableIterator<K> {
+	pub(crate) fn iter(&self) -> TableIterator {
 		let index_block_iter = match &self.index_block {
-			IndexType::<K>::Partitioned(partitioned_index) => {
+			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
 				if let Ok(first_block) = partitioned_index.first_partition() {
 					first_block.iter()
@@ -797,7 +791,7 @@ impl<K: InternalKeyTrait> Table<K> {
 					// If there are no partitions, create a proper empty block
 					let empty_writer = BlockWriter::new(self.opts.clone());
 					let empty_block_data = empty_writer.finish();
-					let empty_block = Block::<K>::new(empty_block_data, self.opts.clone());
+					let empty_block = Block::new(empty_block_data, self.opts.clone());
 					empty_block.iter()
 				}
 			}
@@ -815,10 +809,12 @@ impl<K: InternalKeyTrait> Table<K> {
 		}
 	}
 
-	pub(crate) fn is_key_in_key_range(&self, key: &K) -> bool {
+	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
 		if let Some(ref range) = self.meta.properties.key_range {
-			return self.opts.comparator.compare(key.user_key(), &range.low) >= Ordering::Equal
-				&& self.opts.comparator.compare(key.user_key(), &range.high) <= Ordering::Equal;
+			return self.opts.comparator.compare(key.user_key.as_ref(), &range.low)
+				>= Ordering::Equal
+				&& self.opts.comparator.compare(key.user_key.as_ref(), &range.high)
+					<= Ordering::Equal;
 		}
 		true // If no key range is defined, assume the key is in range.
 	}
@@ -834,23 +830,23 @@ impl<K: InternalKeyTrait> Table<K> {
 	}
 }
 
-pub struct TableIterator<K: InternalKeyTrait> {
-	table: Arc<Table<K>>,
-	current_block: Option<BlockIterator<K>>,
+pub(crate) struct TableIterator {
+	table: Arc<Table>,
+	current_block: Option<BlockIterator>,
 	current_block_off: usize,
-	index_block: BlockIterator<K>,
+	index_block: BlockIterator,
 	/// Whether the iterator has been positioned at least once
 	positioned: bool,
 	/// Whether the iterator has been exhausted (reached the end)
 	exhausted: bool,
 	// For partitioned index support
 	current_partition_index: usize,
-	current_partition_iter: Option<BlockIterator<K>>,
+	current_partition_iter: Option<BlockIterator>,
 }
 
-impl<K: InternalKeyTrait> TableIterator<K> {
+impl TableIterator {
 	fn skip_to_next_entry(&mut self) -> Result<bool> {
-		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// First try to advance within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
@@ -920,7 +916,7 @@ impl<K: InternalKeyTrait> TableIterator<K> {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
-	fn key(&self) -> Arc<K> {
+	fn key(&self) -> Arc<InternalKey> {
 		self.current_block.as_ref().unwrap().key()
 	}
 
@@ -969,7 +965,7 @@ impl<K: InternalKeyTrait> TableIterator<K> {
 		// Current partition exhausted, move to previous partition
 		if self.current_partition_index > 0 {
 			// Get the partitioned index
-			let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
+			let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 			self.current_partition_index -= 1;
 			let partition_handle = &partitioned_index.blocks[self.current_partition_index];
@@ -1000,8 +996,8 @@ impl<K: InternalKeyTrait> TableIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> Iterator for TableIterator<K> {
-	type Item = (Arc<K>, Value);
+impl Iterator for TableIterator {
+	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		// If not positioned, position at first entry
@@ -1027,7 +1023,7 @@ impl<K: InternalKeyTrait> Iterator for TableIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> DoubleEndedIterator for TableIterator<K> {
+impl DoubleEndedIterator for TableIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.prev() {
 			return None;
@@ -1039,7 +1035,7 @@ impl<K: InternalKeyTrait> DoubleEndedIterator for TableIterator<K> {
 	}
 }
 
-impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
+impl LSMIterator for TableIterator {
 	fn valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
@@ -1050,7 +1046,7 @@ impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
-		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		if !partitioned_index.blocks.is_empty() {
 			let partition_handle = &partitioned_index.blocks[0];
@@ -1082,7 +1078,7 @@ impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 	}
 
 	fn seek_to_last(&mut self) {
-		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
 		if !partitioned_index.blocks.is_empty() {
@@ -1125,14 +1121,14 @@ impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 	}
 
 	fn seek(&mut self, target: &[u8]) -> Option<()> {
-		let IndexType::<K>::Partitioned(partitioned_index) = &self.table.index_block;
+		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// Extract user key from target for partition lookup (optimization)
-		let target_key = K::decode(target);
+		let target_key = InternalKey::decode(target);
 
 		// For partitioned index, first find the correct partition
 		if let Some(block_handle) =
-			partitioned_index.find_block_handle_by_key(target_key.user_key())
+			partitioned_index.find_block_handle_by_key(target_key.user_key.as_ref())
 		{
 			// Find the partition index
 			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
@@ -1263,7 +1259,7 @@ impl<K: InternalKeyTrait> LSMIterator<K> for TableIterator<K> {
 		false
 	}
 
-	fn key(&self) -> Arc<K> {
+	fn key(&self) -> Arc<InternalKey> {
 		self.key()
 	}
 
@@ -1323,19 +1319,19 @@ mod tests {
 
 		for i in 0..data.len() {
 			b.add(
-				InternalKey::new(data[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set).into(),
+				InternalKey::new(data[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
 				data[i].1.as_bytes(),
 			)
 			.unwrap();
 			b.add(
-				InternalKey::new(data2[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set).into(),
+				InternalKey::new(data2[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
 				data2[i].1.as_bytes(),
 			)
 			.unwrap();
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(596, actual);
+		assert_eq!(724, actual);
 	}
 
 	#[test]
@@ -1351,7 +1347,7 @@ mod tests {
 
 		for &(k, v) in data.iter() {
 			b.add(
-				InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set).into(),
+				InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
 				v.as_bytes(),
 			)
 			.unwrap();
@@ -1389,7 +1385,7 @@ mod tests {
 
 			for &(k, v) in data.iter() {
 				b.add(
-					InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set).into(),
+					InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1414,22 +1410,22 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 		let mut iter = table.iter();
 
-		let key = InternalKey::new("bcd".as_bytes().to_vec(), 2, InternalKeyKind::Set);
+		let key = InternalKey::new("bcd".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
-		let key = InternalKey::new("abc".as_bytes().to_vec(), 2, InternalKeyKind::Set);
+		let key = InternalKey::new("abc".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
 		// Seek-past-last invalidates.
-		let key = InternalKey::new("{{{".as_bytes().to_vec(), 2, InternalKeyKind::Set);
+		let key = InternalKey::new("{{{".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(!iter.valid());
 
-		let key = InternalKey::new("bbb".as_bytes().to_vec(), 2, InternalKeyKind::Set);
+		let key = InternalKey::new("bbb".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 	}
@@ -1497,6 +1493,7 @@ mod tests {
 				key.as_bytes().to_vec(),
 				i + 2, // Descending sequence numbers
 				InternalKeyKind::Set,
+				0,
 			);
 
 			writer.add(internal_key.into(), value.as_bytes()).unwrap();
@@ -1518,7 +1515,7 @@ mod tests {
 		// Verify all items can be retrieved
 		for (key, value) in &items {
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), num_items + 1, InternalKeyKind::Set);
+				InternalKey::new(key.as_bytes().to_vec(), num_items + 1, InternalKeyKind::Set, 0);
 
 			let result = table.get(internal_key).unwrap();
 
@@ -1565,7 +1562,7 @@ mod tests {
 			items.push((key.clone(), value.clone()));
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key.into(), value.as_bytes()).unwrap();
 		}
@@ -1607,12 +1604,12 @@ mod tests {
 	}
 
 	fn add_key(
-		writer: &mut TableWriter<Vec<u8>, InternalKey>,
+		writer: &mut TableWriter<Vec<u8>>,
 		key: &[u8],
 		seq: u64,
 		value: &[u8],
 	) -> Result<()> {
-		writer.add(Arc::new(InternalKey::new(key.to_vec(), seq, InternalKeyKind::Set)), value)
+		writer.add(Arc::new(InternalKey::new(key.to_vec(), seq, InternalKeyKind::Set, 0)), value)
 	}
 
 	#[test]
@@ -1932,12 +1929,14 @@ mod tests {
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			expected_low.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			expected_high.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 
 		// A key before the range should not be in the range
@@ -1945,7 +1944,8 @@ mod tests {
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
 			before_range.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 
 		// A key after the range should not be in the range
@@ -1953,7 +1953,8 @@ mod tests {
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
 			after_range.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 
 		// Test a key in the middle of the range
@@ -1961,7 +1962,8 @@ mod tests {
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			middle_key.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 	}
 
@@ -1996,14 +1998,16 @@ mod tests {
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			in_first_gap.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 
 		let in_second_gap = "xxx".as_bytes(); // Between qqq and zzz
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			in_second_gap.to_vec(),
 			1,
-			InternalKeyKind::Set
+			InternalKeyKind::Set,
+			0
 		)));
 	}
 
@@ -2045,7 +2049,8 @@ mod tests {
 			assert!(table.is_key_in_key_range(&InternalKey::new(
 				key.as_bytes().to_vec(),
 				1,
-				InternalKeyKind::Set
+				InternalKeyKind::Set,
+				0
 			)));
 		}
 	}
@@ -2094,7 +2099,7 @@ mod tests {
 					InternalKeyKind::Set
 				};
 
-				b.add(InternalKey::new(k.as_bytes().to_vec(), 1, kind).into(), v.as_bytes())
+				b.add(InternalKey::new(k.as_bytes().to_vec(), 1, kind, 0).into(), v.as_bytes())
 					.unwrap();
 			}
 
@@ -2354,7 +2359,7 @@ mod tests {
 			let mut iter = table.iter();
 
 			let internal_key =
-				InternalKey::new(seek_key.as_bytes().to_vec(), 1, InternalKeyKind::Set);
+				InternalKey::new(seek_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&internal_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to '{seek_key}'");
@@ -2414,7 +2419,8 @@ mod tests {
 		// Test seek to existing key
 		{
 			let mut iter = table.iter();
-			let seek_key = InternalKey::new("key_005".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+			let seek_key =
+				InternalKey::new("key_005".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
@@ -2446,7 +2452,8 @@ mod tests {
 		// Test seek to non-existing key (should find next key)
 		{
 			let mut iter = table.iter();
-			let seek_key = InternalKey::new("key_003".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+			let seek_key =
+				InternalKey::new("key_003".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
@@ -2458,7 +2465,8 @@ mod tests {
 		// Test seek past end
 		{
 			let mut iter = table.iter();
-			let seek_key = InternalKey::new("key_999".as_bytes().to_vec(), 1, InternalKeyKind::Set);
+			let seek_key =
+				InternalKey::new("key_999".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(!iter.valid(), "Iterator should be invalid after seeking past end");
@@ -2496,6 +2504,7 @@ mod tests {
 				format!("key_{i:06}").as_bytes().to_vec(),
 				1,
 				InternalKeyKind::Set,
+				0,
 			);
 			iter.seek(&seek_key.encode());
 			assert!(iter.valid(), "Seek to key_{i:06} should succeed");
@@ -2731,7 +2740,7 @@ mod tests {
 			let key = format!("key_{i:03}");
 			let value = format!("value_{i:03}");
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
 		}
 
@@ -2743,7 +2752,7 @@ mod tests {
 
 		// Verify it's using partitioned index
 		match &table.index_block {
-			IndexType::<InternalKey>::Partitioned(_) => {
+			IndexType::Partitioned(_) => {
 				// Expected - partitioned index is the only supported type
 			}
 		}
@@ -2756,6 +2765,7 @@ mod tests {
 				key.as_bytes().to_vec(),
 				i + 2, // Higher seq number for lookup
 				InternalKeyKind::Set,
+				0,
 			);
 
 			let result = table.get(internal_key).unwrap();
