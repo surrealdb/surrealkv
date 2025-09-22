@@ -1,4 +1,5 @@
 use crate::{
+	bplustree::tree::DiskBPlusTree,
 	compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
 	error::Result,
 	iter::{BoxedIterator, CompactionIterator},
@@ -7,11 +8,11 @@ use crate::{
 	memtable::ImmutableMemtables,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKeyTrait,
+		InternalKeyKind, InternalKeyTrait, ReverseTimestampKey,
 	},
 	vfs::File,
 	vlog::VLog,
-	Options as LSMOptions,
+	Key, Options as LSMOptions,
 };
 
 use std::{
@@ -27,6 +28,7 @@ pub(crate) struct CompactionOptions<K: InternalKeyTrait> {
 	pub level_manifest: Arc<RwLock<LevelManifest<K>>>,
 	pub immutable_memtables: Arc<RwLock<ImmutableMemtables<K>>>,
 	pub vlog: Option<Arc<VLog<K>>>,
+	pub versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
 impl<K: InternalKeyTrait> CompactionOptions<K> {
@@ -39,6 +41,7 @@ impl<K: InternalKeyTrait> CompactionOptions<K> {
 				.expect("Compaction requires level manifest"),
 			immutable_memtables: tree.immutable_memtables.clone(),
 			vlog: tree.vlog.clone(),
+			versioned_index: tree.versioned_index.clone(),
 		}
 	}
 }
@@ -101,15 +104,15 @@ impl<K: InternalKeyTrait> Compactor<K> {
 			let new_table_path = self.get_table_path(new_table_id);
 
 			// Write merged data and collect discard statistics
-			let discard_stats =
+			let (discard_stats, deleted_keys) =
 				self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
 
 			let new_table = self.open_table(new_table_id, &new_table_path)?;
-			Ok((new_table, new_table_id, discard_stats))
+			Ok((new_table, new_table_id, discard_stats, deleted_keys))
 		};
 
 		match merge_result {
-			Ok((new_table, _, discard_stats)) => {
+			Ok((new_table, _, discard_stats, deleted_keys)) => {
 				self.update_manifest(input, new_table)?;
 				self.cleanup_old_tables(input);
 
@@ -118,6 +121,11 @@ impl<K: InternalKeyTrait> Compactor<K> {
 					if let Some(ref vlog) = self.options.vlog {
 						vlog.update_discard_stats(&discard_stats);
 					}
+				}
+
+				// Clean up deleted keys from versioned index if versioning is enabled
+				if self.options.lopts.enable_versioning && !deleted_keys.is_empty() {
+					self.cleanup_deleted_keys_from_versioned_index(&deleted_keys)?;
 				}
 
 				Ok(())
@@ -137,7 +145,7 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		table_id: u64,
 		merge_iter: Vec<BoxedIterator<'_, K>>,
 		input: &CompactionInput,
-	) -> Result<HashMap<u32, i64>> {
+	) -> Result<(HashMap<u32, i64>, Vec<Key>)> {
 		let file = SysFile::create(path)?;
 		let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
 
@@ -162,8 +170,11 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		// Flush any remaining delete-list entries to VLog
 		comp_iter.flush_delete_list_batch()?;
 
-		// Return collected discard statistics
-		Ok(comp_iter.discard_stats)
+		// Collect deleted keys for versioned index cleanup
+		let deleted_keys = comp_iter.take_deleted_keys();
+
+		// Return collected discard statistics and deleted keys
+		Ok((comp_iter.discard_stats, deleted_keys))
 	}
 
 	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table<K>>) -> Result<()> {
@@ -223,5 +234,77 @@ impl<K: InternalKeyTrait> Compactor<K> {
 		let file_size = file.size()?;
 
 		Ok(Arc::new(Table::<K>::new(table_id, self.options.lopts.clone(), file, file_size)?))
+	}
+
+	/// Cleans up deleted keys from the versioned index
+	/// This removes all versions of keys that were marked for deletion during compaction
+	fn cleanup_deleted_keys_from_versioned_index(&self, deleted_keys: &[Key]) -> Result<()> {
+		if !self.options.lopts.enable_versioning || deleted_keys.is_empty() {
+			return Ok(());
+		}
+
+		if let Some(ref versioned_index) = self.options.versioned_index {
+			let mut index_guard = versioned_index.write().unwrap();
+			let mut total_deleted = 0;
+
+			for key in deleted_keys {
+				// Create a range query to find all versions of this key
+				// We need to search for all possible timestamps and sequence numbers for this key
+				let start_key = ReverseTimestampKey::new(
+					key.to_vec(),
+					0, // Start from sequence 0
+					InternalKeyKind::Set,
+					0, // Start from beginning of time
+				)
+				.encode();
+
+				let end_key = ReverseTimestampKey::new(
+					key.to_vec(),
+					u64::MAX, // End at max sequence
+					InternalKeyKind::Set,
+					u64::MAX, // End at max timestamp
+				)
+				.encode();
+
+				// Get all entries in the range for this key
+				let range_iter = index_guard.range(&start_key, &end_key)?;
+				let mut keys_to_delete = Vec::new();
+
+				for entry in range_iter {
+					match entry {
+						Ok((index_key, _value)) => {
+							// Decode the key to verify it matches our target key
+							let reverse_key = ReverseTimestampKey::decode(&index_key);
+							if reverse_key.user_key == *key {
+								keys_to_delete.push(index_key);
+							}
+						}
+						Err(e) => {
+							eprintln!("Error iterating versioned index for key {:?}: {}", key, e);
+							break;
+						}
+					}
+				}
+
+				// Delete all versions of this key
+				for key_to_delete in keys_to_delete {
+					if let Err(e) = index_guard.delete(&key_to_delete) {
+						eprintln!("Failed to delete versioned key: {}", e);
+					} else {
+						total_deleted += 1;
+					}
+				}
+			}
+
+			if total_deleted > 0 {
+				eprintln!(
+					"Cleaned up {} versioned entries for {} deleted keys",
+					total_deleted,
+					deleted_keys.len()
+				);
+			}
+		}
+
+		Ok(())
 	}
 }

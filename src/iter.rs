@@ -180,6 +180,9 @@ pub(crate) struct CompactionIterator<'a, K: InternalKeyTrait> {
 	enable_versioning: bool,
 	retention_period_ns: u64,
 
+	/// Keys that are being deleted during compaction (for versioned index cleanup)
+	deleted_keys: Vec<Key>,
+
 	initialized: bool,
 }
 
@@ -204,6 +207,7 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 			delete_list_batch: Vec::new(),
 			enable_versioning,
 			retention_period_ns,
+			deleted_keys: Vec::new(),
 			initialized: false,
 		}
 	}
@@ -232,6 +236,11 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 		Ok(())
 	}
 
+	/// Returns the keys that were deleted during compaction (for versioned index cleanup)
+	pub(crate) fn take_deleted_keys(&mut self) -> Vec<Key> {
+		std::mem::take(&mut self.deleted_keys)
+	}
+
 	/// Process all collected versions of the current key and return the one to output
 	fn process_current_key_versions(&mut self) -> Option<(Arc<K>, Value)> {
 		if self.current_key_versions.is_empty() {
@@ -245,6 +254,11 @@ impl<'a, K: InternalKeyTrait> CompactionIterator<'a, K> {
 		let latest_key = self.current_key_versions[0].0.clone();
 		let latest_value = self.current_key_versions[0].1.clone();
 		let is_latest_tombstone = latest_key.kind() == InternalKeyKind::Delete;
+
+		// If the latest version is a tombstone and we're at bottom level, collect the key for versioned index cleanup
+		if is_latest_tombstone && self.is_bottom_level && self.enable_versioning {
+			self.deleted_keys.push(latest_key.user_key().clone());
+		}
 
 		// Get current time for retention period check
 		let current_time = if self.enable_versioning && self.retention_period_ns > 0 {

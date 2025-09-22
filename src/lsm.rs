@@ -20,7 +20,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, InternalKeyKind, InternalKeyTrait, ReverseTimestampKey},
+	sstable::{table::Table, InternalKey, InternalKeyTrait, ReverseTimestampKey},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -275,71 +275,70 @@ impl<K: InternalKeyTrait> CoreInner<K> {
 		location.resolve_value(self.vlog.as_ref())
 	}
 
-	/// TODO: Still needs work.
-	/// Cleans expired versions from the versioned index based on retention policy
-	#[allow(unused)]
-	pub(crate) fn clean_expired_versions(&self) -> Result<()> {
-		if !self.opts.enable_versioning || self.opts.versioned_history_retention_ns == 0 {
-			return Ok(()); // No retention limit or versioned queries disabled
-		}
+	// /// TODO: Still needs work.
+	// /// Cleans expired versions from the versioned index based on retention policy
+	// pub(crate) fn clean_expired_versions(&self) -> Result<()> {
+	// 	if !self.opts.enable_versioning || self.opts.versioned_history_retention_ns == 0 {
+	// 		return Ok(()); // No retention limit or versioned queries disabled
+	// 	}
 
-		if let Some(ref versioned_index) = self.versioned_index {
-			let current_time = std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_nanos() as u64;
+	// 	if let Some(ref versioned_index) = self.versioned_index {
+	// 		let current_time = std::time::SystemTime::now()
+	// 			.duration_since(std::time::UNIX_EPOCH)
+	// 			.unwrap_or_default()
+	// 			.as_nanos() as u64;
 
-			let cutoff_time = current_time.saturating_sub(self.opts.versioned_history_retention_ns);
+	// 		let cutoff_time = current_time.saturating_sub(self.opts.versioned_history_retention_ns);
 
-			// Create a range query to find all entries older than cutoff_time
-			let start_key = ReverseTimestampKey::new(
-				vec![], // Empty user key for range start
-				0,
-				InternalKeyKind::Set,
-				0, // Start from beginning of time
-			)
-			.encode();
+	// 		// Create a range query to find all entries older than cutoff_time
+	// 		let start_key = ReverseTimestampKey::new(
+	// 			vec![], // Empty user key for range start
+	// 			0,
+	// 			InternalKeyKind::Set,
+	// 			0, // Start from beginning of time
+	// 		)
+	// 		.encode();
 
-			let end_key = ReverseTimestampKey::new(
-				vec![0xFF; 256], // Max user key for range end
-				u64::MAX,
-				InternalKeyKind::Set,
-				cutoff_time, // End at cutoff time
-			)
-			.encode();
+	// 		let end_key = ReverseTimestampKey::new(
+	// 			vec![0xFF; 256], // Max user key for range end
+	// 			u64::MAX,
+	// 			InternalKeyKind::Set,
+	// 			cutoff_time, // End at cutoff time
+	// 		)
+	// 		.encode();
 
-			let mut index_guard = versioned_index.write().unwrap();
+	// 		let mut index_guard = versioned_index.write().unwrap();
 
-			// Get all entries in the time range
-			let range_iter = index_guard.range(&start_key, &end_key)?;
-			let mut keys_to_delete = Vec::new();
+	// 		// Get all entries in the time range
+	// 		let range_iter = index_guard.range(&start_key, &end_key)?;
+	// 		let mut keys_to_delete = Vec::new();
 
-			for entry in range_iter {
-				match entry {
-					Ok((key, _value)) => {
-						// Decode the key to check timestamp
-						let reverse_key = ReverseTimestampKey::decode(&key);
-						if reverse_key.timestamp < cutoff_time {
-							keys_to_delete.push(key);
-						}
-					}
-					Err(e) => {
-						eprintln!("Error iterating versioned index: {}", e);
-						break;
-					}
-				}
-			}
+	// 		for entry in range_iter {
+	// 			match entry {
+	// 				Ok((key, _value)) => {
+	// 					// Decode the key to check timestamp
+	// 					let reverse_key = ReverseTimestampKey::decode(&key);
+	// 					if reverse_key.timestamp < cutoff_time {
+	// 						keys_to_delete.push(key);
+	// 					}
+	// 				}
+	// 				Err(e) => {
+	// 					eprintln!("Error iterating versioned index: {}", e);
+	// 					break;
+	// 				}
+	// 			}
+	// 		}
 
-			// Delete expired entries
-			for key in keys_to_delete {
-				if let Err(e) = index_guard.delete(&key) {
-					eprintln!("Failed to delete expired version: {}", e);
-				}
-			}
-		}
+	// 		// Delete expired entries
+	// 		for key in keys_to_delete {
+	// 			if let Err(e) = index_guard.delete(&key) {
+	// 				eprintln!("Failed to delete expired version: {}", e);
+	// 			}
+	// 		}
+	// 	}
 
-		Ok(())
-	}
+	// 	Ok(())
+	// }
 }
 
 impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
@@ -362,7 +361,7 @@ impl<K: InternalKeyTrait> CompactionOperations<K> for CoreInner<K> {
 		let compactor = Compactor::new(options, strategy);
 		compactor.compact()?;
 
-		// // Clean expired versions from versioned index after compaction
+		// // Clean deleted versions from versioned index after compaction
 		// self.clean_expired_versions()?;
 
 		Ok(())
