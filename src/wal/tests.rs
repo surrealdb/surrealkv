@@ -6,9 +6,7 @@ use crate::wal::cleanup::cleanup_old_segments;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::segment::list_segment_ids;
-use crate::wal::segment::{
-	MultiSegmentReader, Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE,
-};
+use crate::wal::segment::{MultiSegmentReader, Options, Segment, SegmentRef};
 use crate::wal::writer::Wal;
 use std::sync::Arc;
 
@@ -147,8 +145,7 @@ fn test_wal_with_zero_padding_eof_handling() {
 
 	// Create a WAL segment with small data that doesn't fill the block
 	let opts = Options::default();
-	let mut segment = Segment::<WAL_RECORD_HEADER_SIZE>::open(temp_dir.path(), 0, &opts)
-		.expect("should create segment");
+	let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 	// Write a small record that won't fill the entire block
 	let small_data = b"hello";
@@ -208,8 +205,7 @@ fn test_empty_wal_segment() {
 
 	// Create an empty WAL segment
 	let opts = Options::default();
-	let segment = Segment::<WAL_RECORD_HEADER_SIZE>::open(temp_dir.path(), 0, &opts)
-		.expect("should create segment");
+	let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 	// Close immediately without writing anything
 	drop(segment);

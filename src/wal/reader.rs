@@ -218,7 +218,7 @@ mod tests {
 	use std::io::{Read, Write};
 	use std::vec::Vec;
 
-	use crate::wal::segment::{Options, Segment, SegmentRef, WAL_RECORD_HEADER_SIZE};
+	use crate::wal::segment::{Options, Segment, SegmentRef};
 	use crate::wal::writer::Wal;
 	use tempdir::TempDir;
 
@@ -257,11 +257,7 @@ mod tests {
 		assert_eq!(bytes_read, 0); // Only "World!" left to read
 	}
 
-	fn create_test_segment(
-		temp_dir: &TempDir,
-		id: u64,
-		data: &[u8],
-	) -> Segment<WAL_RECORD_HEADER_SIZE> {
+	fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
 		let opts = Options::default();
 		let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 		let r = segment.append(data);
@@ -300,10 +296,7 @@ mod tests {
 		assert_eq!(reader.total_read, BLOCK_SIZE * 2 + 10);
 	}
 
-	fn create_test_segment_with_data(
-		temp_dir: &TempDir,
-		id: u64,
-	) -> Segment<WAL_RECORD_HEADER_SIZE> {
+	fn create_test_segment_with_data(temp_dir: &TempDir, id: u64) -> Segment {
 		let opts = Options::default();
 		let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 
