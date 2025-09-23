@@ -5,15 +5,13 @@ use std::path::PathBuf;
 
 use parking_lot::RwLock;
 
-use crate::wal::segment::{
-	get_segment_range, Error, IOError, Options, Result, Segment, WAL_RECORD_HEADER_SIZE,
-};
+use crate::wal::segment::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Write-Ahead Log (Wal) is a data structure used to sequentially
 /// store records in a series of segments.
 pub(crate) struct Wal {
 	/// The currently active segment where data is being written.
-	active_segment: Segment<WAL_RECORD_HEADER_SIZE>,
+	active_segment: Segment,
 
 	/// The ID of the currently active segment.
 	active_segment_id: u64,
@@ -161,8 +159,7 @@ impl Wal {
 		if segment_id == self.active_segment_id {
 			self.active_segment.read_at(buf, read_offset)
 		} else {
-			let segment: Segment<WAL_RECORD_HEADER_SIZE> =
-				Segment::open(&self.dir, segment_id, &self.opts)?;
+			let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
 			segment.read_at(buf, read_offset)
 		}
 	}

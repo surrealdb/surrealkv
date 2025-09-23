@@ -769,7 +769,7 @@ impl SegmentRef {
 	 .                                                       |
 	 +------+------+------+------+------+------+------+------+
 */
-pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
+pub(crate) struct Segment {
 	/// The unique identifier of the segment.
 	#[allow(unused)]
 	pub id: u64,
@@ -779,7 +779,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	pub file_path: PathBuf,
 
 	/// The active block for buffering data.
-	block: Block<BLOCK_SIZE, RECORD_HEADER_SIZE>,
+	block: Block<BLOCK_SIZE, WAL_RECORD_HEADER_SIZE>,
 
 	/// The underlying file for storing the segment's data.
 	file: File,
@@ -799,7 +799,7 @@ pub(crate) struct Segment<const RECORD_HEADER_SIZE: usize> {
 	closed: bool,
 }
 
-impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
+impl Segment {
 	pub(crate) fn open(dir: &Path, id: u64, opts: &Options) -> Result<Self> {
 		// Ensure the options are valid
 		opts.validate()?;
@@ -1050,7 +1050,7 @@ impl<const RECORD_HEADER_SIZE: usize> Segment<RECORD_HEADER_SIZE> {
 	}
 }
 
-impl<const RECORD_HEADER_SIZE: usize> Drop for Segment<RECORD_HEADER_SIZE> {
+impl Drop for Segment {
 	/// Attempt to fsync data on drop, in case we're running without sync.
 	fn drop(&mut self) {
 		self.close().ok();
@@ -1558,7 +1558,7 @@ mod tests {
 
 		// Create segment options and open a segment
 		let opts = Options::default();
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset
@@ -1640,7 +1640,7 @@ mod tests {
 
 		// Create segment options and open a segment
 		let opts = Options::default();
-		let segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset
@@ -1649,7 +1649,7 @@ mod tests {
 		drop(segment);
 
 		// Reopen segment should pass
-		let segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset
@@ -1663,7 +1663,7 @@ mod tests {
 
 		// Create segment options and open a segment
 		let opts = Options::default();
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset
@@ -1695,7 +1695,7 @@ mod tests {
 		drop(segment);
 
 		// Reopen segment
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset
@@ -1751,7 +1751,7 @@ mod tests {
 
 		// Create a new segment file and open it
 		let opts = Options::default();
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Append data to the segment
@@ -1780,7 +1780,7 @@ mod tests {
 		segment.close().expect("should close segment");
 	}
 
-	fn create_test_segment_ref(segment: &Segment<WAL_RECORD_HEADER_SIZE>) -> SegmentRef {
+	fn create_test_segment_ref(segment: &Segment) -> SegmentRef {
 		SegmentRef {
 			file_path: segment.file_path.clone(),
 			file_header_offset: segment.file_header_offset,
@@ -1788,11 +1788,7 @@ mod tests {
 		}
 	}
 
-	fn create_test_segment(
-		temp_dir: &TempDir,
-		id: u64,
-		data: &[u8],
-	) -> Segment<WAL_RECORD_HEADER_SIZE> {
+	fn create_test_segment(temp_dir: &TempDir, id: u64, data: &[u8]) -> Segment {
 		let opts = Options::default();
 		let mut segment = Segment::open(temp_dir.path(), id, &opts).expect("should create segment");
 		let r = segment.append(data);
@@ -1807,8 +1803,7 @@ mod tests {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
 
 		// Create a sample segment file and populate it with data
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
-			create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
+		let mut segment: Segment = create_test_segment(&temp_dir, 0, &[0, 1, 2, 3]);
 
 		// Test appending another buffer
 		let r = segment.append(&[4, 5, 6, 7]);
@@ -2085,7 +2080,7 @@ mod tests {
 
 		// Create a new segment file and open it
 		let opts = Options::default();
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test appending a non-empty buffer
@@ -2113,7 +2108,7 @@ mod tests {
 		segment.close().expect("should close segment");
 
 		// Reopen segment and validate offset
-		let mut segment: Segment<WAL_RECORD_HEADER_SIZE> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Test initial offset - should be BLOCK_SIZE since the block was padded
@@ -2325,8 +2320,7 @@ mod tests {
 		// Create segment options
 		let opts = Options::default();
 
-		let mut segment: Segment<0> =
-			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+		let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Close the segment
 		segment.close().expect("should close segment");
@@ -2345,7 +2339,7 @@ mod tests {
 		corrupted_file.write_all(&corrupted_data).expect("should write corrupted data to file");
 
 		// Attempt to reopen the segment with corrupted metadata
-		let reopened_segment: std::result::Result<Segment<0>, Error> =
+		let reopened_segment: std::result::Result<Segment, Error> =
 			Segment::open(temp_dir.path(), 0, &opts);
 		assert!(reopened_segment.is_err()); // Opening should fail due to corrupted metadata
 	}
@@ -2359,7 +2353,7 @@ mod tests {
 		let opts = Options::default();
 
 		// Create a new segment file and open it
-		let mut segment: Segment<0> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
 
 		// Close the segment
@@ -2377,7 +2371,7 @@ mod tests {
 		assert!(n.is_err()); // Reading should fail
 
 		// Reopen the closed segment
-		let mut segment: Segment<0> =
+		let mut segment: Segment =
 			Segment::open(temp_dir.path(), 0, &opts).expect("should reopen segment");
 
 		// Try to perform operations on the reopened segment

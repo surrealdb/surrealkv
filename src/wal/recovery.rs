@@ -115,12 +115,12 @@ pub(crate) fn replay_wal(
 
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
 	use crate::wal::reader::Reader;
-	use crate::wal::segment::{Options, Segment, WAL_RECORD_HEADER_SIZE};
+	use crate::wal::segment::{Options, Segment};
 	use std::fs;
 
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}"));
-	let temp_path = wal_dir.join(format!("{segment_id:020}.repair"));
+	let temp_path = wal_dir.join(format!("{segment_id:020}"));
 
 	// Verify the corrupted segment exists
 	if !segment_path.exists() {
@@ -130,9 +130,11 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	}
 
 	// Create a new segment for writing the repaired data
-	let opts = Options::default();
-	let mut new_segment =
-		Segment::<WAL_RECORD_HEADER_SIZE>::open(&temp_path, segment_id as u64, &opts)?;
+	let opts = Options {
+		file_extension: Some("repair".to_string()),
+		..Options::default()
+	};
+	let mut new_segment = Segment::open(wal_dir, segment_id as u64, &opts)?;
 
 	// Create a SegmentRef directly pointing to the original file
 	let original_segment = crate::wal::segment::SegmentRef {
@@ -211,7 +213,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::wal::segment::{Options, Segment, WAL_RECORD_HEADER_SIZE};
+	use crate::wal::segment::{Options, Segment};
 	use std::fs;
 	use tempfile::TempDir;
 
@@ -247,8 +249,8 @@ mod tests {
 
 		// Create WAL segments for both batches
 		let opts = Options::default();
-		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
-		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
+		let mut segment1 = Segment::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::open(wal_dir, 2, &opts).unwrap();
 
 		segment1.append(&batch1.encode().unwrap()).unwrap();
 		segment2.append(&batch2.encode().unwrap()).unwrap();
@@ -303,9 +305,9 @@ mod tests {
 
 		// Create WAL segments for all batches
 		let opts = Options::default();
-		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
-		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
-		let mut segment3 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 3, &opts).unwrap();
+		let mut segment1 = Segment::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::open(wal_dir, 2, &opts).unwrap();
+		let mut segment3 = Segment::open(wal_dir, 3, &opts).unwrap();
 
 		segment1.append(&batch1.encode().unwrap()).unwrap();
 		segment2.append(&batch2.encode().unwrap()).unwrap();
@@ -346,8 +348,8 @@ mod tests {
 
 		// Create WAL segments for both batches
 		let opts = Options::default();
-		let mut segment1 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 1, &opts).unwrap();
-		let mut segment2 = Segment::<WAL_RECORD_HEADER_SIZE>::open(wal_dir, 2, &opts).unwrap();
+		let mut segment1 = Segment::open(wal_dir, 1, &opts).unwrap();
+		let mut segment2 = Segment::open(wal_dir, 2, &opts).unwrap();
 
 		segment1.append(&batch1.encode().unwrap()).unwrap();
 		segment2.append(&batch2.encode().unwrap()).unwrap();
@@ -364,5 +366,71 @@ mod tests {
 			max_seq_num, 301,
 			"WAL recovery should track highest sequence number across all batches"
 		);
+	}
+
+	#[test]
+	fn test_repair_corrupted_wal_segment() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Create a valid WAL segment first
+		let opts = Options::default();
+		let mut segment = Segment::open(wal_dir, 0, &opts).unwrap();
+
+		// Add some valid data
+		let mut batch1 = Batch::new(100);
+		batch1.set(b"key1", b"value1", 0).unwrap();
+		batch1.set(b"key2", b"value2", 0).unwrap();
+
+		let mut batch2 = Batch::new(200);
+		batch2.set(b"key3", b"value3", 0).unwrap();
+		batch2.set(b"key4", b"value4", 0).unwrap();
+
+		segment.append(&batch1.encode().unwrap()).unwrap();
+		segment.append(&batch2.encode().unwrap()).unwrap();
+		segment.close().unwrap();
+
+		// Now manually corrupt the segment by truncating it in the middle
+		let segment_path = wal_dir.join("00000000000000000000");
+		let file = std::fs::OpenOptions::new().write(true).open(&segment_path).unwrap();
+
+		// Get the file size and truncate it to simulate corruption
+		let file_size = file.metadata().unwrap().len();
+		file.set_len(file_size - 100).unwrap(); // Truncate by 100 bytes to create corruption
+		drop(file);
+
+		// Now test the repair function
+		let result = repair_corrupted_wal_segment(wal_dir, 0);
+
+		// The repair should succeed and recover the valid batches
+		match result {
+			Ok(_) => {
+				// Verify the repaired segment exists and is valid
+				assert!(segment_path.exists(), "Repaired segment should exist");
+
+				// Try to read from the repaired segment
+				let memtable = Arc::new(MemTable::new());
+				let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+
+				// Should have recovered some data and no corruption
+				assert!(max_seq_num > 0, "Should have recovered some sequence numbers");
+				assert!(corruption_info.is_none(), "Should not detect corruption after repair");
+			}
+			Err(e) => {
+				panic!("Repair failed with error: {:?}", e);
+			}
+		}
+	}
+
+	#[test]
+	fn test_repair_corrupted_wal_segment_nonexistent() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Test repair of non-existent segment
+		let result = repair_corrupted_wal_segment(wal_dir, 999);
+		assert!(result.is_err(), "Should fail when segment doesn't exist");
 	}
 }
