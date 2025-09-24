@@ -37,12 +37,12 @@ pub(crate) fn replay_wal(
 		return Ok((0, None));
 	}
 
-	if list_segment_ids(wal_dir)?.is_empty() {
+	if list_segment_ids(wal_dir, None)?.is_empty() {
 		return Ok((0, None));
 	}
 
 	// Get range of segment IDs
-	let (first, last) = match get_segment_range(wal_dir) {
+	let (first, last) = match get_segment_range(wal_dir, None) {
 		Ok(range) => range,
 		Err(Error::IO(_)) => return Ok((0, None)),
 		Err(e) => return Err(e.into()),
@@ -63,7 +63,7 @@ pub(crate) fn replay_wal(
 	let mut last_valid_offset = 0;
 
 	// Get only the latest segment
-	let all_segments = SegmentRef::read_segments_from_directory(wal_dir)?;
+	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, None)?;
 	let latest_segments =
 		all_segments.into_iter().filter(|seg| seg.id == latest_segment_id).collect::<Vec<_>>();
 
