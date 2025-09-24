@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::lsm::fsync_directory;
 use crate::wal::segment::list_segment_ids;
 use crate::{
 	batch::Batch,
@@ -120,7 +121,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}"));
-	let temp_path = wal_dir.join(format!("{segment_id:020}"));
+	let repair_path = wal_dir.join(format!("{segment_id:020}.repair"));
 
 	// Verify the corrupted segment exists
 	if !segment_path.exists() {
@@ -137,15 +138,14 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	let mut new_segment = Segment::open(wal_dir, segment_id as u64, &opts)?;
 
 	// Create a SegmentRef directly pointing to the original file
+	let mut file = fs::File::open(&segment_path)?;
+	let header = crate::wal::segment::read_file_header(&mut file)?;
+	let original_file_header_offset = (4 + header.len()) as u64;
+
 	let original_segment = crate::wal::segment::SegmentRef {
 		id: segment_id as u64,
 		file_path: segment_path.clone(),
-		file_header_offset: {
-			// Read the header to get the correct offset
-			let mut file = fs::File::open(&segment_path)?;
-			let header = crate::wal::segment::read_file_header(&mut file)?;
-			(4 + header.len()) as u64
-		},
+		file_header_offset: original_file_header_offset,
 	};
 
 	let segments = MultiSegmentReader::new(vec![original_segment])?;
@@ -193,7 +193,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
 	if repair_failed {
 		// Clean up the failed repair attempt
-		let _ = fs::remove_file(&temp_path);
+		let _ = fs::remove_file(&repair_path);
 
 		return Err(crate::error::Error::Other(format!(
 			"Failed to repair WAL segment {segment_id}. Original segment unchanged."
@@ -201,7 +201,9 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	}
 
 	// Atomically replace the original with the repaired version
-	fs::rename(&temp_path, &segment_path)?;
+	fs::rename(&repair_path, &segment_path)?;
+	// fsync directory
+	fsync_directory(wal_dir)?;
 
 	eprintln!(
 		"Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
@@ -215,6 +217,7 @@ mod tests {
 	use super::*;
 	use crate::wal::segment::{Options, Segment};
 	use std::fs;
+	use std::io::{Seek, Write};
 	use tempfile::TempDir;
 
 	#[test]
@@ -369,7 +372,18 @@ mod tests {
 	}
 
 	#[test]
-	fn test_repair_corrupted_wal_segment() {
+	fn test_repair_corrupted_wal_segment_nonexistent() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Test repair of non-existent segment
+		let result = repair_corrupted_wal_segment(wal_dir, 999);
+		assert!(result.is_err(), "Should fail when segment doesn't exist");
+	}
+
+	#[test]
+	fn test_post_corruption_replay() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -383,54 +397,140 @@ mod tests {
 		batch1.set(b"key1", b"value1", 0).unwrap();
 		batch1.set(b"key2", b"value2", 0).unwrap();
 
-		let mut batch2 = Batch::new(200);
-		batch2.set(b"key3", b"value3", 0).unwrap();
-		batch2.set(b"key4", b"value4", 0).unwrap();
-
 		segment.append(&batch1.encode().unwrap()).unwrap();
-		segment.append(&batch2.encode().unwrap()).unwrap();
 		segment.close().unwrap();
 
-		// Now manually corrupt the segment by truncating it in the middle
+		// Now manually corrupt the segment to reproduce the exact error
 		let segment_path = wal_dir.join("00000000000000000000");
-		let file = std::fs::OpenOptions::new().write(true).open(&segment_path).unwrap();
+		let mut file =
+			std::fs::OpenOptions::new().read(true).write(true).open(&segment_path).unwrap();
 
-		// Get the file size and truncate it to simulate corruption
-		let file_size = file.metadata().unwrap().len();
-		file.set_len(file_size - 100).unwrap(); // Truncate by 100 bytes to create corruption
+		// Read the file header to get the correct offset
+		file.seek(std::io::SeekFrom::Start(0)).unwrap();
+		let header = crate::wal::segment::read_file_header(&mut file).unwrap();
+		let first_record_offset = (4 + header.len()) as u64;
+
+		// Corrupt the first record
+		file.seek(std::io::SeekFrom::Start(first_record_offset)).unwrap();
+
+		// Write a Middle record where a First/Full record should be
+		let record_type = 3u8;
+		let length = 10u16; // Length of data
+		let data = vec![0xFF; 10]; // Some data
+		let crc = crate::wal::segment::calculate_crc32(&[record_type], &data);
+
+		file.write_all(&[record_type]).unwrap(); // Record type: Middle (WRONG!)
+		file.write_all(&length.to_be_bytes()).unwrap(); // Length
+		file.write_all(&crc.to_be_bytes()).unwrap(); // CRC
+		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		// Now test the repair function
-		let result = repair_corrupted_wal_segment(wal_dir, 0);
+		// Test using Core::replay_wal_with_repair (the actual production flow)
+		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
+		let max_seq_num =
+			crate::lsm::Core::replay_wal_with_repair(wal_dir, "Test repair", |memtable| {
+				// This closure is called with the recovered memtable
+				*recovered_memtable.write().unwrap() = memtable;
+				Ok(())
+			})
+			.unwrap();
 
-		// The repair should succeed and recover the valid batches
-		match result {
-			Ok(_) => {
-				// Verify the repaired segment exists and is valid
-				assert!(segment_path.exists(), "Repaired segment should exist");
+		// Verify the repair worked correctly
+		// Since the first record is corrupted, we should recover 0 sequence numbers
+		assert_eq!(
+			max_seq_num, 0,
+			"Should have recovered 0 sequence numbers when first record is corrupted"
+		);
 
-				// Try to read from the repaired segment
-				let memtable = Arc::new(MemTable::new());
-				let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
-
-				// Should have recovered some data and no corruption
-				assert!(max_seq_num > 0, "Should have recovered some sequence numbers");
-				assert!(corruption_info.is_none(), "Should not detect corruption after repair");
-			}
-			Err(e) => {
-				panic!("Repair failed with error: {:?}", e);
-			}
-		}
+		// Verify that the memtable contains no entries (since first record was corrupted)
+		let entry_count = recovered_memtable.read().unwrap().iter().count();
+		assert_eq!(
+			entry_count, 0,
+			"Should have recovered 0 entries when first record is corrupted"
+		);
 	}
 
 	#[test]
-	fn test_repair_corrupted_wal_segment_nonexistent() {
+	fn test_repair_with_three_batches_corrupt_third() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
-		// Test repair of non-existent segment
-		let result = repair_corrupted_wal_segment(wal_dir, 999);
-		assert!(result.is_err(), "Should fail when segment doesn't exist");
+		// Create a valid WAL segment first
+		let opts = Options::default();
+		let mut segment = Segment::open(wal_dir, 0, &opts).unwrap();
+
+		// Create three batches with different sequence numbers
+		let mut batch1 = Batch::new(100);
+		batch1.set(b"key1", b"value1", 0).unwrap();
+		batch1.set(b"key2", b"value2", 0).unwrap();
+
+		let mut batch2 = Batch::new(200);
+		batch2.set(b"key3", b"value3", 0).unwrap();
+		batch2.set(b"key4", b"value4", 0).unwrap();
+
+		let mut batch3 = Batch::new(300);
+		batch3.set(b"key5", b"value5", 0).unwrap();
+		batch3.set(b"key6", b"value6", 0).unwrap();
+
+		// Encode all batches to understand their sizes
+		let encoded1 = batch1.encode().unwrap();
+		let encoded2 = batch2.encode().unwrap();
+		let encoded3 = batch3.encode().unwrap();
+
+		// Append all batches
+		segment.append(&encoded1).unwrap();
+		segment.append(&encoded2).unwrap();
+		segment.append(&encoded3).unwrap();
+		segment.close().unwrap();
+
+		// Now manually corrupt the segment by corrupting the third batch
+		let segment_path = wal_dir.join("00000000000000000000");
+		let mut file =
+			std::fs::OpenOptions::new().read(true).write(true).open(&segment_path).unwrap();
+
+		// Read the file header to get the correct offset
+		file.seek(std::io::SeekFrom::Start(0)).unwrap();
+		let header = crate::wal::segment::read_file_header(&mut file).unwrap();
+		let first_record_offset = (4 + header.len()) as u64;
+
+		// Calculate the offset for the third batch
+		// Each batch is written as a WAL record with a 7-byte header
+		let batch1_size = encoded1.len() + 7; // encoded data + WAL record header
+		let batch2_size = encoded2.len() + 7; // encoded data + WAL record header
+		let third_batch_offset = first_record_offset + batch1_size as u64 + batch2_size as u64;
+
+		// Corrupt the third batch by changing its record type to Middle
+		file.seek(std::io::SeekFrom::Start(third_batch_offset)).unwrap();
+		let record_type = 3u8;
+		let length = 10u16;
+		let data = vec![0xFF; 10];
+		let crc = crate::wal::segment::calculate_crc32(&[record_type], &data);
+
+		file.write_all(&[record_type]).unwrap();
+		file.write_all(&length.to_be_bytes()).unwrap(); // Length
+		file.write_all(&crc.to_be_bytes()).unwrap(); // CRC
+		file.write_all(&data).unwrap(); // Data
+		drop(file);
+
+		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
+		let max_seq_num =
+			crate::lsm::Core::replay_wal_with_repair(wal_dir, "Test repair", |memtable| {
+				*recovered_memtable.write().unwrap() = memtable;
+				Ok(())
+			})
+			.unwrap();
+
+		// Verify the repair worked correctly
+		// Since the third batch is corrupted, we should recover data from the first two batches
+		// The max sequence number should be from batch 2 (201), not batch 3 (301)
+		assert_eq!(
+			max_seq_num, 201,
+			"Should have recovered sequence numbers from first two batches only"
+		);
+
+		// Verify that the memtable contains entries from the first two batches
+		let entry_count = recovered_memtable.read().unwrap().iter().count();
+		assert_eq!(entry_count, 4, "Should have recovered 4 entries from first two batches");
 	}
 }

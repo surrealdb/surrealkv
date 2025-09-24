@@ -578,7 +578,7 @@ impl std::ops::Deref for Core {
 impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
 	///
-	fn replay_wal_with_repair<F>(
+	pub fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		context: &str, // "Database startup" or "Database reload"
 		mut set_recovered_memtable: F,
@@ -610,7 +610,6 @@ impl Core {
                         "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
                     )));
 				}
-				eprintln!("Successfully repaired WAL segment {corrupted_segment_id}");
 
 				// After repair, try to replay again to get any additional data
 				// Create a fresh memtable for the retry
@@ -1105,7 +1104,7 @@ impl Default for TreeBuilder {
 	}
 }
 /// Syncs a directory to ensure all changes are persisted to disk
-fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let file = File::open(path)?;
 	debug_assert!(file.metadata()?.is_dir());
 	file.sync_all()
