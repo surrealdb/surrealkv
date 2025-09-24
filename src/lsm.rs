@@ -578,7 +578,7 @@ impl std::ops::Deref for Core {
 impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
 	///
-	pub fn replay_wal_with_repair<F>(
+	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		context: &str, // "Database startup" or "Database reload"
 		mut set_recovered_memtable: F,
@@ -952,6 +952,26 @@ impl Tree {
 	/// Flushes the active memtable to disk
 	pub fn flush(&self) -> Result<()> {
 		self.core.make_room_for_write()
+	}
+}
+
+impl Drop for Tree {
+	fn drop(&mut self) {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			// Native environment - use tokio
+			if let Ok(handle) = tokio::runtime::Handle::try_current() {
+				// Clone the Arc to move into the async task
+				let core = Arc::clone(&self.core);
+				handle.spawn(async move {
+					if let Err(err) = core.close().await {
+						eprintln!("Error closing store: {}", err);
+					}
+				});
+			} else {
+				eprintln!("No runtime available for closing the store correctly");
+			}
+		}
 	}
 }
 
