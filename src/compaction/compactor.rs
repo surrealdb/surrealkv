@@ -8,7 +8,7 @@ use crate::{
 	memtable::ImmutableMemtables,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKeyKind, ReverseTimestampKey,
+		InternalKeyKind, InternalKey,
 	},
 	vfs::File,
 	vlog::VLog,
@@ -247,7 +247,7 @@ impl Compactor {
 			for key in deleted_keys {
 				// Create a range query to find all versions of this key
 				// We need to search for all possible timestamps and sequence numbers for this key
-				let start_key = ReverseTimestampKey::new(
+				let start_key = InternalKey::new(
 					key.to_vec(),
 					0, // Start from sequence 0
 					InternalKeyKind::Set,
@@ -255,7 +255,7 @@ impl Compactor {
 				)
 				.encode();
 
-				let end_key = ReverseTimestampKey::new(
+				let end_key = InternalKey::new(
 					key.to_vec(),
 					u64::MAX, // End at max sequence
 					InternalKeyKind::Set,
@@ -271,8 +271,8 @@ impl Compactor {
 					match entry {
 						Ok((index_key, _value)) => {
 							// Decode the key to verify it matches our target key
-							let reverse_key = ReverseTimestampKey::decode(&index_key);
-							if reverse_key.user_key == *key {
+							let internal_key = InternalKey::decode(&index_key);
+							if internal_key.user_key == *key {
 								keys_to_delete.push(index_key);
 							}
 						}

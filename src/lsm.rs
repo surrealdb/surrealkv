@@ -7,30 +7,15 @@ use std::{
 };
 
 use crate::{
-	batch::Batch,
-	bplustree::tree::DiskBPlusTree,
-	checkpoint::{CheckpointMetadata, DatabaseCheckpoint},
-	commit::{CommitEnv, CommitPipeline},
-	compaction::{
+	batch::Batch, bplustree::tree::DiskBPlusTree, checkpoint::{CheckpointMetadata, DatabaseCheckpoint}, commit::{CommitEnv, CommitPipeline}, compaction::{
 		compactor::{CompactionOptions, Compactor},
 		CompactionStrategy,
-	},
-	error::Result,
-	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
-	memtable::{ImmutableMemtables, MemTable},
-	oracle::Oracle,
-	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, ReverseTimestampKey},
-	task::TaskManager,
-	transaction::{Mode, Transaction},
-	vlog::{VLog, VLogGCManager, ValueLocation},
-	wal::{
+	}, error::Result, levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet}, memtable::{ImmutableMemtables, MemTable}, oracle::Oracle, snapshot::Counter as SnapshotCounter, sstable::{table::Table, InternalKey}, task::TaskManager, transaction::{Mode, Transaction}, vlog::{VLog, VLogGCManager, ValueLocation}, wal::{
 		self,
 		cleanup::cleanup_old_segments,
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		writer::Wal,
-	},
-	Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value,
+	}, BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value
 };
 
 use async_trait::async_trait;
@@ -113,7 +98,7 @@ pub(crate) struct CoreInner {
 	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
 
 	/// Versioned B+ tree index for timestamp-based queries
-	/// Maps ReverseTimestampKey -> Value for efficient time-range queries
+	/// Maps InternalKey -> Value for efficient time-range queries
 	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
@@ -152,7 +137,7 @@ impl CoreInner {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator = Arc::new(crate::BytewiseComparator {});
+			let comparator = Arc::new(crate::InternalKeyComparator {user_comparator: Arc::new(BytewiseComparator {})});
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(RwLock::new(tree)))
 		} else {
@@ -421,14 +406,13 @@ impl CommitEnv for LsmCommitEnv {
 						let encoded = value_location.encode();
 
 						if self.core.opts.enable_versioning {
-							// Create ReverseTimestampKey for efficient time-range queries
-							let reverse_key = ReverseTimestampKey::new(
+							// Create InternalKey for efficient time-range queries
+							let encoded_key = InternalKey::new(
 								entry.key.clone(),
 								current_seq_num,
 								entry.kind,
 								timestamp,
-							);
-							let encoded_key = reverse_key.encode();
+							).encode();
 							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
 						}
 
@@ -445,14 +429,13 @@ impl CommitEnv for LsmCommitEnv {
 					// No value (delete operation) - pass None
 					// But still add to versioned index as tombstone
 					if self.core.opts.enable_versioning {
-						// Create ReverseTimestampKey for delete operation
-						let reverse_key = ReverseTimestampKey::new(
+						// Create InternalKey for delete operation
+						let encoded_key = InternalKey::new(
 							entry.key.clone(),
 							current_seq_num,
 							entry.kind,
 							timestamp,
-						);
-						let encoded_key = reverse_key.encode();
+						).encode();
 						// For deletes, we don't need a value, just the key
 						reverse_timestamp_entries.push((encoded_key, Vec::new()));
 					}

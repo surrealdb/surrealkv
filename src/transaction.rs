@@ -648,30 +648,6 @@ impl Transaction {
 		}
 	}
 
-	/// Gets all timestamps for a key
-	pub fn versions(&self, key: &[u8], limit: Option<usize>) -> Result<Vec<u64>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.get_versions(key, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
 	/// Gets keys in a key range at a specific timestamp
 	pub fn keys_at_timestamp(
 		&self,
@@ -2675,12 +2651,12 @@ mod tests {
 		assert_eq!(versions_with_tombstones[1].1, Some(Arc::from(b"value1_v1" as &[u8])));
 
 		// Test versions listing
-		let timestamps = tx.versions(b"key1", None).unwrap();
+		let timestamps = tx.get_all_versions(b"key1", None).unwrap();
 		assert_eq!(timestamps.len(), 2);
 		assert!(timestamps[0] > timestamps[1]); // Newest first
 
 		// Test get at specific timestamp
-		let value_at_ts = tx.get_at_timestamp(b"key1", timestamps[1]).unwrap();
+		let value_at_ts = tx.get_at_timestamp(b"key1", timestamps[1].0).unwrap();
 		assert_eq!(value_at_ts, Some(Arc::from(b"value1_v1" as &[u8])));
 	}
 
@@ -2759,9 +2735,9 @@ mod tests {
 		assert_eq!(value, None);
 
 		// Verify the timestamp appears in versions
-		let versions = tx.versions(b"key1", None).unwrap();
+		let versions = tx.get_all_versions(b"key1", None).unwrap();
 		assert_eq!(versions.len(), 1);
-		assert_eq!(versions[0], custom_timestamp);
+		assert_eq!(versions[0].0, custom_timestamp);
 	}
 
 	#[tokio::test]
@@ -2780,9 +2756,9 @@ mod tests {
 
 		// All keys should have the same timestamp
 		let tx = tree.begin().unwrap();
-		let versions1 = tx.versions(b"key1", None).unwrap();
-		let versions2 = tx.versions(b"key2", None).unwrap();
-		let versions3 = tx.versions(b"key3", None).unwrap();
+		let versions1 = tx.get_all_versions(b"key1", None).unwrap();
+		let versions2 = tx.get_all_versions(b"key2", None).unwrap();
+		let versions3 = tx.get_all_versions(b"key3", None).unwrap();
 
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
@@ -2799,9 +2775,9 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let tx = tree.begin().unwrap();
-		let versions4 = tx.versions(b"key4", None).unwrap();
-		let versions5 = tx.versions(b"key5", None).unwrap();
-		let versions6 = tx.versions(b"key6", None).unwrap();
+		let versions4 = tx.get_all_versions(b"key4", None).unwrap();
+		let versions5 = tx.get_all_versions(b"key5", None).unwrap();
+		let versions6 = tx.get_all_versions(b"key6", None).unwrap();
 
 		assert_eq!(versions4.len(), 1);
 		assert_eq!(versions5.len(), 1);
@@ -2811,7 +2787,7 @@ mod tests {
 		assert_eq!(versions4[0], versions6[0]);
 
 		// key5 should have the custom timestamp
-		assert_eq!(versions5[0], custom_timestamp);
+		assert_eq!(versions5[0].0, custom_timestamp);
 
 		// key4/key6 timestamp should be different from key5 timestamp
 		assert_ne!(versions4[0], versions5[0]);
@@ -2836,8 +2812,8 @@ mod tests {
 
 		// Get the timestamp from the first commit
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key1", None).unwrap();
-		let ts1 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0].0;
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set(b"key2", b"value2_updated").unwrap();
@@ -2846,8 +2822,8 @@ mod tests {
 
 		// Get the timestamp from the second commit
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key2", None).unwrap();
-		let ts2 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0].0;
 
 		// Test keys_at_timestamp at first timestamp
 		let tx = tree.begin().unwrap();
@@ -2896,8 +2872,8 @@ mod tests {
 
 		// Get timestamp
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key1", None).unwrap();
-		let ts1 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0].0;
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.delete(b"key2").unwrap();
@@ -2906,8 +2882,8 @@ mod tests {
 
 		// Get timestamp
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key2", None).unwrap();
-		let ts2 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0].0;
 
 		// Test keys_at_timestamp at first timestamp (before deletes)
 		let tx = tree.begin().unwrap();
@@ -2944,8 +2920,8 @@ mod tests {
 
 		// Get the timestamp from the first commit
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key1", None).unwrap();
-		let ts1 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0].0;
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set(b"key2", b"value2_updated").unwrap();
@@ -2954,8 +2930,8 @@ mod tests {
 
 		// Get the timestamp from the second commit
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key2", None).unwrap();
-		let ts2 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0].0;
 
 		// Test scan_at_version at first timestamp
 		let tx = tree.begin().unwrap();
@@ -3032,8 +3008,8 @@ mod tests {
 
 		// Get timestamp
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key1", None).unwrap();
-		let ts1 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key1", None).unwrap();
+		let ts1 = timestamps[0].0;
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.delete(b"key2").unwrap();
@@ -3042,8 +3018,8 @@ mod tests {
 
 		// Get timestamp
 		let tx = tree.begin().unwrap();
-		let timestamps = tx.versions(b"key2", None).unwrap();
-		let ts2 = timestamps[0];
+		let timestamps = tx.get_all_versions(b"key2", None).unwrap();
+		let ts2 = timestamps[0].0;
 
 		// Test scan_at_version at first timestamp (before deletes)
 		let tx = tree.begin().unwrap();
