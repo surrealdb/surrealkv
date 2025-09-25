@@ -2228,47 +2228,49 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 	type Item = Result<(Vec<u8>, Vec<u8>)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if self.reached_end {
-			return None;
-		}
+		loop {
+			if self.reached_end {
+				return None;
+			}
 
-		if let Some(leaf) = &self.current_leaf {
-			// Check if we've reached the end of the current leaf
-			if self.current_idx >= leaf.keys.len() {
-				// Move to the next leaf if possible
-				if leaf.next_leaf == 0 {
+			if let Some(leaf) = &self.current_leaf {
+				// Check if we've reached the end of the current leaf
+				if self.current_idx >= leaf.keys.len() {
+					// Move to the next leaf if possible
+					if leaf.next_leaf == 0 {
+						self.reached_end = true;
+						return None;
+					}
+
+					// Load the next leaf
+					match self.tree.read_node(leaf.next_leaf) {
+						Ok(NodeType::Leaf(next_leaf)) => {
+							self.current_leaf = Some(next_leaf);
+							self.current_idx = 0;
+							// Continue the loop instead of recursing
+							continue;
+						}
+						Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
+						Err(e) => return Some(Err(e)),
+					}
+				}
+
+				// Check if the current key is within range
+				let key = &leaf.keys[self.current_idx];
+				if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
 					self.reached_end = true;
 					return None;
 				}
 
-				// Load the next leaf
-				match self.tree.read_node(leaf.next_leaf) {
-					Ok(NodeType::Leaf(next_leaf)) => {
-						self.current_leaf = Some(next_leaf);
-						self.current_idx = 0;
-						// Recursively call next() to process the new leaf
-						return self.next();
-					}
-					Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
-					Err(e) => return Some(Err(e)),
-				}
+				// Return the current key-value pair and advance
+				let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
+				self.current_idx += 1;
+				return Some(result);
 			}
 
-			// Check if the current key is within range
-			let key = &leaf.keys[self.current_idx];
-			if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
-				self.reached_end = true;
-				return None;
-			}
-
-			// Return the current key-value pair and advance
-			let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
-			self.current_idx += 1;
-			return Some(result);
+			self.reached_end = true;
+			return None;
 		}
-
-		self.reached_end = true;
-		None
 	}
 }
 
@@ -2366,56 +2368,59 @@ impl<F: VfsFile> Iterator for TimestampRangeIterator<'_, F> {
 	type Item = Result<(Vec<u8>, Vec<u8>)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if self.reached_end {
-			return None;
-		}
+		loop {
+			if self.reached_end {
+				return None;
+			}
 
-		if let Some(leaf) = &self.current_leaf {
-			// Check if we've reached the end of the current leaf
-			if self.current_idx >= leaf.keys.len() {
-				// Move to the next leaf if possible
-				if leaf.next_leaf == 0 {
+			if let Some(leaf) = &self.current_leaf {
+				// Check if we've reached the end of the current leaf
+				if self.current_idx >= leaf.keys.len() {
+					// Move to the next leaf if possible
+					if leaf.next_leaf == 0 {
+						self.reached_end = true;
+						return None;
+					}
+
+					// Load the next leaf
+					match self.tree.read_node(leaf.next_leaf) {
+						Ok(NodeType::Leaf(next_leaf)) => {
+							self.current_leaf = Some(next_leaf);
+							self.current_idx = 0;
+							// Continue the loop instead of recursing
+							continue;
+						}
+						Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
+						Err(e) => return Some(Err(e)),
+					}
+				}
+
+				// Get the current key
+				let key = &leaf.keys[self.current_idx];
+
+				if !self.is_within_range(key) {
+					// Skip this key and continue
+					self.current_idx += 1;
+					// Continue the loop instead of recursing
+					continue;
+				}
+
+				// Check if we've exceeded the timestamp range (early termination)
+				let reverse_key = ReverseTimestampKey::decode(key);
+				if reverse_key.timestamp > self.end_timestamp {
 					self.reached_end = true;
 					return None;
 				}
 
-				// Load the next leaf
-				match self.tree.read_node(leaf.next_leaf) {
-					Ok(NodeType::Leaf(next_leaf)) => {
-						self.current_leaf = Some(next_leaf);
-						self.current_idx = 0;
-						// Recursively call next() to process the new leaf
-						return self.next();
-					}
-					Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
-					Err(e) => return Some(Err(e)),
-				}
-			}
-
-			// Get the current key
-			let key = &leaf.keys[self.current_idx];
-
-			if !self.is_within_range(key) {
-				// Skip this key and continue
+				// Return the current key-value pair and advance
+				let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
 				self.current_idx += 1;
-				return self.next();
+				return Some(result);
 			}
 
-			// Check if we've exceeded the timestamp range (early termination)
-			let reverse_key = ReverseTimestampKey::decode(key);
-			if reverse_key.timestamp > self.end_timestamp {
-				self.reached_end = true;
-				return None;
-			}
-
-			// Return the current key-value pair and advance
-			let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
-			self.current_idx += 1;
-			return Some(result);
+			self.reached_end = true;
+			return None;
 		}
-
-		self.reached_end = true;
-		None
 	}
 }
 

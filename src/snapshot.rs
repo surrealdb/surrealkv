@@ -463,7 +463,6 @@ impl Snapshot {
 
 			let max_keys = limit.unwrap_or(usize::MAX);
 			let mut results = Vec::new();
-			let mut unique_key_count = 0;
 
 			// Track which keys have been hard deleted
 			let mut hard_deleted_keys = HashSet::new();
@@ -505,8 +504,14 @@ impl Snapshot {
 				}
 			}
 
-			// Process results: exclude hard-deleted keys, exclude all tombstone markers
-			for (key, versions) in key_versions {
+			// Process results: exclude hard-deleted keys, include soft delete markers
+			let mut unique_key_count = 0;
+
+			// Convert to Vec and sort by key to ensure deterministic ordering
+			let mut sorted_entries: Vec<_> = key_versions.into_iter().collect();
+			sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+			for (key, mut versions) in sorted_entries {
 				// Skip keys that have been hard deleted
 				if hard_deleted_keys.contains(&key) {
 					continue;
@@ -517,18 +522,26 @@ impl Snapshot {
 					break;
 				}
 
-				// Add only non-tombstone versions of this key
-				for (value, timestamp, is_tombstone) in versions {
-					// Skip tombstone markers (both hard and soft deletes)
-					if is_tombstone {
-						continue;
-					}
+				// Sort versions by timestamp (oldest first)
+				versions.sort_by(|a, b| a.1.cmp(&b.1));
 
+				// Add all versions of this key (including soft delete markers)
+				for (value, timestamp, is_tombstone) in versions {
 					results.push((key.clone(), value, timestamp, is_tombstone));
 				}
 
 				unique_key_count += 1;
 			}
+
+			// Sort results by key, then by timestamp within each key
+			results.sort_by(|a, b| {
+				let key_cmp = a.0.cmp(&b.0);
+				if key_cmp == std::cmp::Ordering::Equal {
+					a.2.cmp(&b.2) // Sort by timestamp within same key
+				} else {
+					key_cmp
+				}
+			});
 
 			Ok(results)
 		} else {
