@@ -279,7 +279,7 @@ mod tests {
 		assert!(segment2.close().is_ok());
 		assert!(segment3.close().is_ok());
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
 			.expect("should read segments");
 
 		let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
@@ -322,7 +322,7 @@ mod tests {
 		let mut segment1 = create_test_segment_with_data(&temp_dir, 4);
 		assert!(segment1.close().is_ok());
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
 			.expect("should read segments");
 
 		let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
@@ -349,7 +349,7 @@ mod tests {
 		assert!(segment2.close().is_ok());
 		assert!(segment3.close().is_ok());
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
 			.expect("should read segments");
 
 		let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));
@@ -385,7 +385,7 @@ mod tests {
 
 		a.sync().expect("should sync");
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
 			.expect("should read segments");
 
 		let mut reader = Reader::new(MultiSegmentReader::new(sr).expect("should create"));

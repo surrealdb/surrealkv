@@ -578,7 +578,7 @@ impl std::ops::Deref for Core {
 impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
 	///
-	fn replay_wal_with_repair<F>(
+	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		context: &str, // "Database startup" or "Database reload"
 		mut set_recovered_memtable: F,
@@ -610,7 +610,6 @@ impl Core {
                         "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
                     )));
 				}
-				eprintln!("Successfully repaired WAL segment {corrupted_segment_id}");
 
 				// After repair, try to replay again to get any additional data
 				// Create a fresh memtable for the retry
@@ -956,6 +955,26 @@ impl Tree {
 	}
 }
 
+impl Drop for Tree {
+	fn drop(&mut self) {
+		#[cfg(not(target_arch = "wasm32"))]
+		{
+			// Native environment - use tokio
+			if let Ok(handle) = tokio::runtime::Handle::try_current() {
+				// Clone the Arc to move into the async task
+				let core = Arc::clone(&self.core);
+				handle.spawn(async move {
+					if let Err(err) = core.close().await {
+						eprintln!("Error closing store: {}", err);
+					}
+				});
+			} else {
+				eprintln!("No runtime available for closing the store correctly");
+			}
+		}
+	}
+}
+
 /// A builder for creating LSM trees with type-safe configuration.
 pub struct TreeBuilder {
 	opts: Options,
@@ -1105,7 +1124,7 @@ impl Default for TreeBuilder {
 	}
 }
 /// Syncs a directory to ensure all changes are persisted to disk
-fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let file = File::open(path)?;
 	debug_assert!(file.metadata()?.is_dir());
 	file.sync_all()

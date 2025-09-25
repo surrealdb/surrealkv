@@ -23,7 +23,7 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
 	}
 
 	// Get range of segment IDs
-	let (first, last) = match get_segment_range(wal_dir) {
+	let (first, last) = match get_segment_range(wal_dir, None) {
 		Ok(range) => range,
 		Err(_) => return Ok(0), // No segments to clean
 	};
@@ -34,7 +34,7 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
 	}
 
 	// List all segment IDs
-	let segment_ids = list_segment_ids(wal_dir)?;
+	let segment_ids = list_segment_ids(wal_dir, None)?;
 	let mut removed_count = 0;
 
 	// Remove all segments except the latest one

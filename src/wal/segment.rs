@@ -379,7 +379,7 @@ impl Metadata {
 /// - `First`: Denotes the first fragment of a record.
 /// - `Middle`: Denotes middle fragments of a record.
 /// - `Last`: Denotes the final fragment of a record.
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub(crate) enum RecordType {
 	Empty = 0,  // Rest of block is empty.
 	Full = 1,   // Full record.
@@ -660,8 +660,8 @@ pub(crate) fn segment_name(index: u64, ext: &str) -> String {
 ///
 /// This function returns a tuple containing the minimum and maximum segment IDs
 /// found in the directory. If no segments are found, the tuple will contain (0, 0).
-pub(crate) fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
-	let refs = list_segment_ids(dir)?;
+pub(crate) fn get_segment_range(dir: &Path, allowed_extension: Option<&str>) -> Result<(u64, u64)> {
+	let refs = list_segment_ids(dir, allowed_extension)?;
 	if refs.is_empty() {
 		return Ok((0, 0));
 	}
@@ -673,7 +673,11 @@ pub(crate) fn get_segment_range(dir: &Path) -> Result<(u64, u64)> {
 /// This function reads the names of segment files in the directory and extracts the segment IDs.
 /// The segment IDs are returned as a sorted vector. If no segment files are found, an empty
 /// vector is returned.
-pub(crate) fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
+///
+/// # Arguments
+/// * `dir` - The directory to read segments from
+/// * `allowed_extension` - Optional extension to filter by.
+pub(crate) fn list_segment_ids(dir: &Path, allowed_extension: Option<&str>) -> Result<Vec<u64>> {
 	let mut refs: Vec<u64> = Vec::new();
 	let entries = read_dir(dir)?;
 
@@ -684,7 +688,13 @@ pub(crate) fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 		if std::fs::metadata(file.path())?.is_file() {
 			let fn_name = file.file_name();
 			let fn_str = fn_name.to_string_lossy();
-			let (index, _) = parse_segment_name(&fn_str)?;
+			let (index, extension) = parse_segment_name(&fn_str)?;
+
+			// Filter files based on extension
+			if !should_include_file(allowed_extension, extension) {
+				continue;
+			}
+
 			refs.push(index);
 		}
 	}
@@ -692,6 +702,16 @@ pub(crate) fn list_segment_ids(dir: &Path) -> Result<Vec<u64>> {
 	refs.sort();
 
 	Ok(refs)
+}
+
+/// Helper function to check if a file should be included based on extension filtering
+fn should_include_file(allowed_extension: Option<&str>, file_extension: Option<String>) -> bool {
+	match (&allowed_extension, &file_extension) {
+		(None, Some(_)) => false, // Skip files with extensions when looking for files without extensions
+		(Some(allowed), Some(ext)) if allowed != ext => false, // Skip files with different extensions
+		(Some(_), None) => false, // Skip files without extensions when looking for specific extension
+		_ => true,                // Allow this file
+	}
 }
 
 #[derive(Debug)]
@@ -706,7 +726,14 @@ pub(crate) struct SegmentRef {
 
 impl SegmentRef {
 	/// Creates a vector of SegmentRef instances by reading segments in the specified directory.
-	pub(crate) fn read_segments_from_directory(directory_path: &Path) -> Result<Vec<SegmentRef>> {
+	///
+	/// # Arguments
+	/// * `directory_path` - The directory to read segments from
+	/// * `allowed_extension` - Optional extension to filter by.
+	pub(crate) fn read_segments_from_directory(
+		directory_path: &Path,
+		allowed_extension: Option<&str>,
+	) -> Result<Vec<SegmentRef>> {
 		let mut segment_refs = Vec::new();
 
 		// Read the directory and iterate through its entries
@@ -717,7 +744,12 @@ impl SegmentRef {
 				let file_path = entry.path();
 				let fn_name = entry.file_name();
 				let fn_str = fn_name.to_string_lossy();
-				let (index, _) = parse_segment_name(&fn_str)?;
+				let (index, extension) = parse_segment_name(&fn_str)?;
+
+				// Filter files based on extension
+				if !should_include_file(allowed_extension, extension) {
+					continue;
+				}
 
 				let mut file = OpenOptions::new().read(true).open(&file_path)?;
 				let header = read_file_header(&mut file)?;
@@ -1476,7 +1508,7 @@ mod tests {
 		let temp_dir = create_temp_directory();
 		let dir = temp_dir.path().to_path_buf();
 
-		let result = get_segment_range(&dir).unwrap();
+		let result = get_segment_range(&dir, None).unwrap();
 		assert_eq!(result, (0, 0));
 	}
 
@@ -1490,7 +1522,7 @@ mod tests {
 		create_segment_file(&dir, "00000000000000000002.log");
 		create_segment_file(&dir, "00000000000000000004.log");
 
-		let result = get_segment_range(&dir).unwrap();
+		let result = get_segment_range(&dir, Some("log")).unwrap();
 		assert_eq!(result, (1, 4));
 	}
 
@@ -2034,7 +2066,7 @@ mod tests {
 		assert!(segment2.close().is_ok());
 		assert!(segment3.close().is_ok());
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path())
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
 			.expect("should read segments");
 		assert!(sr.len() == 3);
 		assert!(sr[0].id == 4);
@@ -2306,10 +2338,51 @@ mod tests {
 		create_segment_file(dir_path, &segment_name(10, ""));
 
 		// Call the function under test
-		let segment_ids = list_segment_ids(dir_path).unwrap();
+		let segment_ids = list_segment_ids(dir_path, None).unwrap();
 
 		// Verify the output
 		assert_eq!(segment_ids, vec![1, 2, 10]);
+	}
+
+	#[test]
+	fn test_list_segment_ids_with_extension_filter() {
+		// Create a temporary directory
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let dir_path = temp_dir.path();
+
+		// Create files with different extensions
+		create_segment_file(dir_path, &segment_name(1, "")); // No extension
+		create_segment_file(dir_path, &segment_name(2, "repair")); // .repair extension
+		create_segment_file(dir_path, &segment_name(3, "tmp")); // .tmp extension
+		create_segment_file(dir_path, &segment_name(4, "repair")); // Another .repair
+
+		// Test reading files without extensions only
+		let segment_ids_no_ext = list_segment_ids(dir_path, None).unwrap();
+		assert_eq!(segment_ids_no_ext, vec![1]);
+
+		// Test reading files with .repair extension only
+		let segment_ids_repair = list_segment_ids(dir_path, Some("repair")).unwrap();
+		assert_eq!(segment_ids_repair, vec![2, 4]);
+
+		// Test reading files with .tmp extension only
+		let segment_ids_tmp = list_segment_ids(dir_path, Some("tmp")).unwrap();
+		assert_eq!(segment_ids_tmp, vec![3]);
+	}
+
+	#[test]
+	fn test_should_include_file_helper() {
+		// Test cases for the should_include_file helper function
+
+		// When looking for files without extensions (None)
+		assert!(should_include_file(None, None)); // File without extension - should include
+		assert!(!should_include_file(None, Some("repair".to_string()))); // File with extension - should skip
+		assert!(!should_include_file(None, Some("tmp".to_string()))); // File with extension - should skip
+
+		// When looking for files with specific extension
+		assert!(!should_include_file(Some("repair"), None)); // File without extension - should skip
+		assert!(should_include_file(Some("repair"), Some("repair".to_string()))); // File with matching extension - should include
+		assert!(!should_include_file(Some("repair"), Some("tmp".to_string()))); // File with different extension - should skip
+		assert!(!should_include_file(Some("tmp"), Some("repair".to_string()))); // File with different extension - should skip
 	}
 
 	#[test]

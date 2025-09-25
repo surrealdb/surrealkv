@@ -86,7 +86,7 @@ impl Wal {
 	}
 
 	fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
-		let (_, last) = get_segment_range(dir)?;
+		let (_, last) = get_segment_range(dir, None)?;
 		Ok(if last > 0 {
 			last + 1
 		} else {
