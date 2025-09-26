@@ -2763,8 +2763,8 @@ mod tests {
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
 		assert_eq!(versions3.len(), 1);
-		assert_eq!(versions1[0], versions2[0]);
-		assert_eq!(versions2[0], versions3[0]);
+		assert_eq!(versions1[0].0, versions2[0].0);
+		assert_eq!(versions2[0].0, versions3[0].0);
 
 		// Test mixed explicit and implicit timestamps
 		let custom_timestamp = 9876543210000000000;
@@ -2784,13 +2784,13 @@ mod tests {
 		assert_eq!(versions6.len(), 1);
 
 		// key4 and key6 should have the same timestamp (commit timestamp)
-		assert_eq!(versions4[0], versions6[0]);
+		assert_eq!(versions4[0].0, versions6[0].0);
 
 		// key5 should have the custom timestamp
 		assert_eq!(versions5[0].0, custom_timestamp);
 
 		// key4/key6 timestamp should be different from key5 timestamp
-		assert_ne!(versions4[0], versions5[0]);
+		assert_ne!(versions4[0].0, versions5[0].0);
 	}
 
 	#[tokio::test]
@@ -3200,5 +3200,608 @@ mod tests {
 		assert!(tx.keys_at_timestamp(b"key1", b"key2", 123456789, None).is_err());
 		assert!(tx.scan_at_version(b"key1", b"key2", 123456789, None).is_err());
 		assert!(tx.scan_all_versions(b"key1", b"key2", None).is_err());
+	}
+
+	// Version management tests
+	mod version_tests {
+		use std::collections::HashSet;
+
+		use super::*;
+
+		fn create_tree() -> (Tree, TempDir) {
+			let temp_dir = create_temp_directory();
+			let opts: Options =
+				Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+			(TreeBuilder::with_options(opts).build().unwrap(), temp_dir)
+		}
+
+		#[tokio::test]
+		async fn test_insert_multiple_versions_in_same_tx() {
+			let (store, _tmp_dir) = create_tree();
+			let key = Bytes::from("key1");
+
+			// Insert multiple versions of the same key
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			for (i, value) in values.iter().enumerate() {
+				let mut txn = store.begin().unwrap();
+				let version = (i + 1) as u64; // Incremental version
+				txn.set_at_ts(&key, value, version).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), key.as_ref(), None).unwrap();
+
+			// Verify that the output contains all the versions of the key
+			assert_eq!(results.len(), values.len());
+			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+				assert_eq!(k, &key);
+				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(*version, (i + 1) as u64);
+				assert!(!(*is_deleted));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_single_key_multiple_versions() {
+			let (store, _tmp_dir) = create_tree();
+			let key = Bytes::from("key1");
+
+			// Insert multiple versions of the same key
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			for (i, value) in values.iter().enumerate() {
+				let mut txn = store.begin().unwrap();
+				let version = (i + 1) as u64; // Incremental version
+				txn.set_at_ts(&key, value, version).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), key.as_ref(), None).unwrap();
+
+			// Verify that the output contains all the versions of the key
+			assert_eq!(results.len(), values.len());
+			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+				assert_eq!(k, &key);
+				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(*version, (i + 1) as u64);
+				assert!(!(*is_deleted));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_multiple_keys_single_version_each() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let value = Bytes::from("value1");
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					None,
+				)
+				.unwrap();
+
+			assert_eq!(results.len(), keys.len());
+			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+				assert_eq!(k, &keys[i]);
+				assert_eq!(v.as_ref(), value.as_ref());
+				assert_eq!(*version, 1);
+				assert!(!(*is_deleted));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					let mut txn = store.begin().unwrap();
+					let version = (i + 1) as u64;
+					txn.set_at_ts(key, value, version).unwrap();
+					txn.commit().await.unwrap();
+				}
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					None,
+				)
+				.unwrap();
+
+			let mut expected_results = Vec::new();
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					expected_results.push((key.clone(), value.clone(), (i + 1) as u64, false));
+				}
+			}
+
+			assert_eq!(results.len(), expected_results.len());
+			for (result, expected) in results.iter().zip(expected_results.iter()) {
+				let (k, v, version, is_deleted) = result;
+				let (expected_key, expected_value, expected_version, expected_is_deleted) =
+					expected;
+				assert_eq!(k, expected_key);
+				assert_eq!(v.as_ref(), expected_value.as_ref());
+				assert_eq!(*version, *expected_version);
+				assert_eq!(*is_deleted, *expected_is_deleted);
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_deleted_records() {
+			let (store, _tmp_dir) = create_tree();
+			let key = Bytes::from("key1");
+			let value = Bytes::from("value1");
+
+			let mut txn = store.begin().unwrap();
+			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.commit().await.unwrap();
+
+			let mut txn = store.begin().unwrap();
+			txn.soft_delete(&key).unwrap();
+			txn.commit().await.unwrap();
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), key.as_ref(), None).unwrap();
+
+			assert_eq!(results.len(), 2);
+			let (k, v, version, is_deleted) = &results[0];
+			assert_eq!(k, &key);
+			assert_eq!(v.as_ref(), value.as_ref());
+			assert_eq!(*version, 1);
+			assert!(!(*is_deleted));
+
+			let (k, v, _, is_deleted) = &results[1];
+			assert_eq!(k, &key);
+			assert_eq!(v.as_ref(), Bytes::new().as_ref());
+			assert!(*is_deleted);
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let value = Bytes::from("value1");
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.soft_delete(key).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					None,
+				)
+				.unwrap();
+
+			assert_eq!(results.len(), keys.len() * 2);
+			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
+				let key_index = i / 2;
+				let is_deleted_version = i % 2 == 1;
+				assert_eq!(k, &keys[key_index]);
+				if is_deleted_version {
+					assert_eq!(v.as_ref(), &Bytes::new());
+					assert!(*is_deleted);
+				} else {
+					assert_eq!(v.as_ref(), &value);
+					assert_eq!(*version, 1);
+					assert!(!(*is_deleted));
+				}
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					let mut txn = store.begin().unwrap();
+					let version = (i + 1) as u64;
+					txn.set_at_ts(key, value, version).unwrap();
+					txn.commit().await.unwrap();
+				}
+			}
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.soft_delete(key).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					None,
+				)
+				.unwrap();
+
+			let mut expected_results = Vec::new();
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					expected_results.push((key.clone(), value.clone(), (i + 1) as u64, false));
+				}
+				expected_results.push((key.clone(), Bytes::new(), 0, true));
+			}
+
+			assert_eq!(results.len(), expected_results.len());
+			for (result, expected) in results.iter().zip(expected_results.iter()) {
+				let (k, v, version, is_deleted) = result;
+				let (expected_key, expected_value, expected_version, expected_is_deleted) =
+					expected;
+				assert_eq!(k, expected_key);
+				assert_eq!(v.as_ref(), expected_value);
+				if !expected_is_deleted {
+					assert_eq!(*version, *expected_version);
+				}
+				assert_eq!(*is_deleted, *expected_is_deleted);
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_soft_and_hard_delete() {
+			let (store, _tmp_dir) = create_tree();
+			let key = Bytes::from("key1");
+			let value = Bytes::from("value1");
+
+			let mut txn = store.begin().unwrap();
+			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.commit().await.unwrap();
+
+			let mut txn = store.begin().unwrap();
+			txn.soft_delete(&key).unwrap();
+			txn.commit().await.unwrap();
+
+			let mut txn = store.begin().unwrap();
+			txn.delete(&key).unwrap();
+			txn.commit().await.unwrap();
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), key.as_ref(), None).unwrap();
+
+			assert_eq!(results.len(), 0);
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_range_boundaries() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let value = Bytes::from("value1");
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Inclusive range
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					None,
+				)
+				.unwrap();
+			assert_eq!(results.len(), keys.len());
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_with_limit() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let value = Bytes::from("value1");
+
+			for key in &keys {
+				let mut txn = store.begin().unwrap();
+				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					Some(2),
+				)
+				.unwrap();
+
+			assert_eq!(results.len(), 2);
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_single_key_single_version() {
+			let (store, _tmp_dir) = create_tree();
+			let key = Bytes::from("key1");
+			let value = Bytes::from("value1");
+
+			let mut txn = store.begin().unwrap();
+			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.commit().await.unwrap();
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), key.as_ref(), None).unwrap();
+
+			assert_eq!(results.len(), 1);
+			let (k, v, version, is_deleted) = &results[0];
+			assert_eq!(k, &key);
+			assert_eq!(v.as_ref(), &value);
+			assert_eq!(*version, 1);
+			assert!(!(*is_deleted));
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			// Insert multiple versions for each key
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					let mut txn = store.begin().unwrap();
+					let version = (i + 1) as u64;
+					txn.set_at_ts(key, value, version).unwrap();
+					txn.commit().await.unwrap();
+				}
+			}
+
+			let txn = store.begin().unwrap();
+			let results: Vec<_> = txn
+				.scan_all_versions(
+					keys.first().unwrap().as_ref(),
+					keys.last().unwrap().as_ref(),
+					Some(2),
+				)
+				.unwrap();
+			assert_eq!(results.len(), 6); // 3 versions for each of 2 keys
+
+			// Collect unique keys from the results
+			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+
+			// Verify that the number of unique keys is equal to the limit
+			assert_eq!(unique_keys.len(), 2);
+
+			// Verify that the results contain all versions for each key
+			for key in unique_keys {
+				let key_versions: Vec<_> =
+					results.iter().filter(|(k, _, _, _)| k == &key).collect();
+
+				assert_eq!(key_versions.len(), 3); // Should have all 3 versions
+
+				// Check the latest version
+				let latest = key_versions.iter().max_by_key(|(_, _, version, _)| version).unwrap();
+				assert_eq!(latest.1.as_ref(), *values.last().unwrap());
+				assert_eq!(latest.2, values.len() as u64);
+			}
+		}
+
+		#[tokio::test]
+		async fn test_scan_all_versions_with_subsets() {
+			let (store, _tmp_dir) = create_tree();
+			let keys = vec![
+				Bytes::from("key1"),
+				Bytes::from("key2"),
+				Bytes::from("key3"),
+				Bytes::from("key4"),
+				Bytes::from("key5"),
+				Bytes::from("key6"),
+				Bytes::from("key7"),
+			];
+			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+
+			// Insert multiple versions for each key
+			for key in &keys {
+				for (i, value) in values.iter().enumerate() {
+					let mut txn = store.begin().unwrap();
+					let version = (i + 1) as u64;
+					txn.set_at_ts(key, value, version).unwrap();
+					txn.commit().await.unwrap();
+				}
+			}
+
+			// Define subsets of the entire range
+			let subsets = vec![
+				(keys[0].as_ref(), keys[2].as_ref()),
+				(keys[1].as_ref(), keys[3].as_ref()),
+				(keys[2].as_ref(), keys[4].as_ref()),
+				(keys[3].as_ref(), keys[5].as_ref()),
+				(keys[4].as_ref(), keys[6].as_ref()),
+			];
+
+			// Scan each subset and collect versions
+			for subset in subsets {
+				let txn = store.begin().unwrap();
+				let results: Vec<_> = txn.scan_all_versions(subset.0, subset.1, None).unwrap();
+
+				// Collect unique keys from the results
+				let unique_keys: HashSet<_> =
+					results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+
+				// Verify that the results contain all versions for each key in the subset
+				for key in unique_keys {
+					for (i, value) in values.iter().enumerate() {
+						let version = (i + 1) as u64;
+						let result = results
+							.iter()
+							.find(|(k, v, ver, _)| {
+								k == &key && v.as_ref() == value && *ver == version
+							})
+							.unwrap();
+						assert_eq!(result.1.as_ref(), *value);
+						assert_eq!(result.2, version);
+					}
+				}
+			}
+		}
+
+		// #[tokio::test]
+		// async fn test_scan_all_versions_with_batches() {
+		// 	let (store, _tmp_dir) = create_tree();
+		// 	let keys = [
+		// 		Bytes::from("key1"),
+		// 		Bytes::from("key2"),
+		// 		Bytes::from("key3"),
+		// 		Bytes::from("key4"),
+		// 		Bytes::from("key5"),
+		// 	];
+		// 	let versions = [
+		// 		vec![Bytes::from("v1"), Bytes::from("v2"), Bytes::from("v3"), Bytes::from("v4")],
+		// 		vec![Bytes::from("v1"), Bytes::from("v2")],
+		// 		vec![Bytes::from("v1"), Bytes::from("v2"), Bytes::from("v3"), Bytes::from("v4")],
+		// 		vec![Bytes::from("v1")],
+		// 		vec![Bytes::from("v1")],
+		// 	];
+
+		// 	// Insert multiple versions for each key
+		// 	for (key, key_versions) in keys.iter().zip(versions.iter()) {
+		// 		for (i, value) in key_versions.iter().enumerate() {
+		// 			let mut txn = store.begin().unwrap();
+		// 			let version = (i + 1) as u64;
+		// 			txn.set_at_ts(key, value, version).unwrap();
+		// 			txn.commit().await.unwrap();
+		// 		}
+		// 	}
+
+		// 	// Set the batch size
+		// 	let batch_size: usize = 2;
+
+		// 	// Define a function to scan in batches
+		// 	fn scan_in_batches(
+		// 		store: &Tree,
+		// 		batch_size: usize,
+		// 	) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
+		// 		let mut all_results = Vec::new();
+		// 		let mut last_key = Vec::new();
+		// 		let mut first_iteration = true;
+
+		// 		loop {
+		// 			let txn = store.begin().unwrap();
+
+		// 			// For the first iteration, scan from the beginning
+		// 			// For subsequent iterations, scan from after the last key
+		// 			let start_key = if first_iteration {
+		// 				b""
+		// 			} else {
+		// 				&last_key[..]
+		// 			};
+
+		// 			println!(
+		// 				"start_key{}, last_key{}",
+		// 				String::from_utf8_lossy(start_key.as_ref()),
+		// 				String::from_utf8_lossy(last_key.as_ref())
+		// 			);
+		// 			let results =
+		// 				txn.scan_all_versions(start_key, b"\xff", Some(batch_size)).unwrap();
+		// 			println!(
+		// 				"DEBUG: scanned {} entries, results.len={}",
+		// 				batch_size,
+		// 				results.len()
+		// 			);
+
+		// 			if results.is_empty() {
+		// 				break;
+		// 			}
+
+		// 			let mut batch_results = Vec::new();
+		// 			let mut processed_count = 0;
+		// 			for (k, v, ts, is_deleted) in results {
+		// 				// Convert borrowed key to owned immediately
+		// 				let key_bytes = Bytes::copy_from_slice(&k);
+		// 				let val_bytes = Bytes::from(v.to_vec());
+		// 				batch_results.push((key_bytes, val_bytes, ts, is_deleted));
+
+		// 				// Update last_key with a new vector
+		// 				last_key = k;
+		// 				processed_count += 1;
+		// 			}
+
+		// 			if processed_count == 0 {
+		// 				break;
+		// 			}
+
+		// 			first_iteration = false;
+		// 			all_results.push(batch_results);
+		// 		}
+
+		// 		all_results
+		// 	}
+
+		// 	// Scan in batches and collect the results
+		// 	let all_results = scan_in_batches(&store, batch_size);
+
+		// 	// Debug: Print actual results
+		// 	println!("DEBUG: Got {} batches", all_results.len());
+		// 	for (i, batch) in all_results.iter().enumerate() {
+		// 		println!("DEBUG: Batch {} has {} results", i, batch.len());
+		// 		for (j, (key, value, ts, deleted)) in batch.iter().enumerate() {
+		// 			println!(
+		// 				"DEBUG:   {}: key={:?}, value={:?}, ts={}, deleted={}",
+		// 				j, key, value, ts, deleted
+		// 			);
+		// 		}
+		// 	}
+
+		// 	// Verify the results
+		// 	let expected_results = [
+		// 		vec![
+		// 			(Bytes::from("key1"), Bytes::from("v1"), 1, false),
+		// 			(Bytes::from("key1"), Bytes::from("v2"), 2, false),
+		// 			(Bytes::from("key1"), Bytes::from("v3"), 3, false),
+		// 			(Bytes::from("key1"), Bytes::from("v4"), 4, false),
+		// 			(Bytes::from("key2"), Bytes::from("v1"), 1, false),
+		// 			(Bytes::from("key2"), Bytes::from("v2"), 2, false),
+		// 		],
+		// 		vec![
+		// 			(Bytes::from("key3"), Bytes::from("v1"), 1, false),
+		// 			(Bytes::from("key3"), Bytes::from("v2"), 2, false),
+		// 			(Bytes::from("key3"), Bytes::from("v3"), 3, false),
+		// 			(Bytes::from("key3"), Bytes::from("v4"), 4, false),
+		// 			(Bytes::from("key4"), Bytes::from("v1"), 1, false),
+		// 		],
+		// 		vec![(Bytes::from("key5"), Bytes::from("v1"), 1, false)],
+		// 	];
+
+		// 	assert_eq!(all_results.len(), expected_results.len());
+
+		// 	for (batch, expected_batch) in all_results.iter().zip(expected_results.iter()) {
+		// 		assert_eq!(batch.len(), expected_batch.len());
+		// 		for (result, expected) in batch.iter().zip(expected_batch.iter()) {
+		// 			assert_eq!(result, expected);
+		// 		}
+		// 	}
+		// }
 	}
 }

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
@@ -241,14 +241,6 @@ impl Snapshot {
 				snapshot_seq_num: self.seq_num,
 			},
 			|reverse_key, encoded_value, _is_tombstone| {
-				// Only process this specific key at or before the timestamp
-				// if reverse_key.user_key.as_ref() == key
-				// 	&& reverse_key.timestamp <= timestamp
-				// 	&& reverse_key.timestamp > latest_timestamp
-				// {
-				// 	latest_timestamp = reverse_key.timestamp;
-				// 	latest_value = Some(self.core.resolve_value(encoded_value)?);
-				// }
 				latest_timestamp = reverse_key.timestamp;
 				latest_value = Some(self.core.resolve_value(encoded_value)?);
 
@@ -294,13 +286,13 @@ impl Snapshot {
 
 			let mut versions = Vec::new();
 			let max_results = limit.unwrap_or(usize::MAX);
-
 			for entry in range_iter {
 				if versions.len() >= max_results {
 					break;
 				}
 				let (encoded_key, encoded_value) = entry?;
 				let internal_key = InternalKey::decode(&encoded_key);
+
 				if internal_key.user_key.as_ref() == key && internal_key.seq_num() <= self.seq_num
 				// Snapshot isolation
 				{
@@ -324,7 +316,6 @@ impl Snapshot {
 			Ok(vec![])
 		}
 	}
-
 
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
@@ -409,8 +400,7 @@ impl Snapshot {
 
 		// Track which keys have been hard deleted
 		let mut hard_deleted_keys = HashSet::new();
-		// Track all versions for each key
-		let mut key_versions: HashMap<Vec<u8>, Vec<(Value, u64, bool)>> = HashMap::new();
+		let mut last_processed_key: Option<Vec<u8>> = None;
 
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
@@ -419,17 +409,20 @@ impl Snapshot {
 				start_ts: 0,
 				end_ts: u64::MAX,
 				snapshot_seq_num: self.seq_num,
-				limit: None, // No limit on individual entries, we'll handle it per key
+				limit: None,              // No limit on individual entries, we'll handle it per key
 				include_tombstones: true, // We need to see all entries to track hard deletes
 			},
 			|internal_key, encoded_value, is_tombstone| {
 				let key = internal_key.user_key.as_ref().to_vec();
 
 				// Check if this is a hard delete (InternalKeyKind::Delete)
-				if is_tombstone
-					&& internal_key.kind() == crate::sstable::InternalKeyKind::Delete
-				{
+				if is_tombstone && internal_key.kind() == crate::sstable::InternalKeyKind::Delete {
 					hard_deleted_keys.insert(key.clone());
+					return Ok(true); // Continue processing
+				}
+
+				// Skip keys that have been hard deleted
+				if hard_deleted_keys.contains(&key) {
 					return Ok(true); // Continue processing
 				}
 
@@ -439,40 +432,33 @@ impl Snapshot {
 					self.core.resolve_value(encoded_value)?
 				};
 
-				key_versions.entry(key).or_default().push((
-					value,
-					internal_key.timestamp,
-					is_tombstone,
-				));
+				// Only include soft deletes and normal operations, exclude hard deletes
+				if !is_tombstone
+					|| internal_key.kind() == crate::sstable::InternalKeyKind::SoftDelete
+				{
+					// Check if this is a new key by comparing with the last processed key
+					let is_new_key = last_processed_key.as_ref() != Some(&key);
+
+					// If this is a new key and we've reached the limit, stop processing
+					if is_new_key && unique_key_count >= max_keys {
+						return Ok(false); // Stop processing
+					}
+
+					results.push((key.clone(), value, internal_key.timestamp, is_tombstone));
+
+					// If this is a new key, increment the unique key count
+					if is_new_key {
+						unique_key_count += 1;
+						last_processed_key = Some(key.clone());
+					}
+				}
 
 				Ok(true) // Continue processing
 			},
 		)?;
 
-		// Process results: exclude hard-deleted keys, exclude all tombstone markers
-		for (key, versions) in key_versions {
-			// Skip keys that have been hard deleted
-			if hard_deleted_keys.contains(&key) {
-				continue;
-			}
-
-			// Check if we've reached the limit on unique keys
-			if unique_key_count >= max_keys {
-				break;
-			}
-
-			// Add only non-tombstone versions of this key
-			for (value, timestamp, is_tombstone) in versions {
-				// Skip tombstone markers (both hard and soft deletes)
-				if is_tombstone {
-					continue;
-				}
-
-				results.push((key.clone(), value, timestamp, is_tombstone));
-			}
-
-			unique_key_count += 1;
-		}
+		// Filter out results for keys that were hard deleted
+		results.retain(|(key, _, _, _)| !hard_deleted_keys.contains(key));
 
 		Ok(results)
 	}
@@ -493,12 +479,21 @@ impl Snapshot {
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let index_guard = versioned_index.read().unwrap();
-			let start_key =
-				InternalKey::new(params.start_key.to_vec(), 0, InternalKeyKind::Set, params.start_ts).encode();
+			let start_key = InternalKey::new(
+				params.start_key.to_vec(),
+				0,
+				InternalKeyKind::Set,
+				params.start_ts,
+			)
+			.encode();
 
-			let end_key =
-				InternalKey::new(params.end_key.to_vec(), params.snapshot_seq_num, InternalKeyKind::Max, params.end_ts)
-					.encode();
+			let end_key = InternalKey::new(
+				params.end_key.to_vec(),
+				params.snapshot_seq_num,
+				InternalKeyKind::Max,
+				params.end_ts,
+			)
+			.encode();
 
 			let range_iter = index_guard.range(&start_key, &end_key)?;
 
@@ -519,33 +514,37 @@ impl Snapshot {
 							// Check if this is a new key (different from the last one we processed)
 							// Since data is ordered by user key first, then sequence number (descending),
 							// the first entry we see for each key is the latest version
-							let is_new_key = last_key.as_ref().map_or(true, |last| last != &current_key);
+							let is_new_key = last_key.as_ref() != Some(&current_key);
 
 							if is_new_key {
-								// This is the latest version of this key
-								last_key = Some(current_key);
-
-								// Check if we've reached the limit
-								if count >= max_results {
-									break;
-								}
-
-								// If key is deleted and we're not including tombstones, skip it
-								if is_tombstone && !params.include_tombstones {
-									continue;
-								}
-
-								// Process this entry
-								let should_continue = processor(&internal_key, &encoded_value, is_tombstone)?;
-								if !should_continue {
-									return Ok(());
-								}
-
-								count += 1;
+								// This is a new key we haven't seen before
+								last_key = Some(current_key.clone());
 							}
+
+							// Check if we've reached the limit
+							if count >= max_results {
+								break;
+							}
+
+							// If key is deleted and we're not including tombstones, skip it
+							if is_tombstone && !params.include_tombstones {
+								continue;
+							}
+
+							// Process this entry (all versions, not just latest)
+							let should_continue =
+								processor(&internal_key, &encoded_value, is_tombstone)?;
+							if !should_continue {
+								return Ok(());
+							}
+
+							count += 1;
 						}
 					}
-					Err(_) => break,
+					Err(e) => {
+						println!("DEBUG: versioned_range_query - error iterating: {:?}", e);
+						break;
+					}
 				}
 			}
 

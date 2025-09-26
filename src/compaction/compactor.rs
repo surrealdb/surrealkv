@@ -8,7 +8,7 @@ use crate::{
 	memtable::ImmutableMemtables,
 	sstable::{
 		table::{Table, TableWriter},
-		InternalKeyKind, InternalKey,
+		InternalKey, InternalKeyKind,
 	},
 	vfs::File,
 	vlog::VLog,

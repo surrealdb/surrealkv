@@ -7,15 +7,31 @@ use std::{
 };
 
 use crate::{
-	batch::Batch, bplustree::tree::DiskBPlusTree, checkpoint::{CheckpointMetadata, DatabaseCheckpoint}, commit::{CommitEnv, CommitPipeline}, compaction::{
+	batch::Batch,
+	bplustree::tree::DiskBPlusTree,
+	checkpoint::{CheckpointMetadata, DatabaseCheckpoint},
+	commit::{CommitEnv, CommitPipeline},
+	compaction::{
 		compactor::{CompactionOptions, Compactor},
 		CompactionStrategy,
-	}, error::Result, levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet}, memtable::{ImmutableMemtables, MemTable}, oracle::Oracle, snapshot::Counter as SnapshotCounter, sstable::{table::Table, InternalKey}, task::TaskManager, transaction::{Mode, Transaction}, vlog::{VLog, VLogGCManager, ValueLocation}, wal::{
+	},
+	error::Result,
+	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
+	memtable::{ImmutableMemtables, MemTable},
+	oracle::Oracle,
+	snapshot::Counter as SnapshotCounter,
+	sstable::{table::Table, InternalKey},
+	task::TaskManager,
+	transaction::{Mode, Transaction},
+	vlog::{VLog, VLogGCManager, ValueLocation},
+	wal::{
 		self,
 		cleanup::cleanup_old_segments,
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		writer::Wal,
-	}, BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value
+	},
+	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
+	VLogChecksumLevel, Value,
 };
 
 use async_trait::async_trait;
@@ -137,7 +153,9 @@ impl CoreInner {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator = Arc::new(crate::InternalKeyComparator {user_comparator: Arc::new(BytewiseComparator {})});
+			let comparator = Arc::new(crate::TimestampComparator {
+				user_comparator: Arc::new(BytewiseComparator {}),
+			});
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(RwLock::new(tree)))
 		} else {
@@ -412,7 +430,10 @@ impl CommitEnv for LsmCommitEnv {
 								current_seq_num,
 								entry.kind,
 								timestamp,
-							).encode();
+							)
+							.encode();
+							println!("DEBUG: LSM - adding to versioned index: key={:?}, timestamp={}, seq_num={}", 
+								String::from_utf8_lossy(&entry.key), timestamp, current_seq_num);
 							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
 						}
 
@@ -435,7 +456,8 @@ impl CommitEnv for LsmCommitEnv {
 							current_seq_num,
 							entry.kind,
 							timestamp,
-						).encode();
+						)
+						.encode();
 						// For deletes, we don't need a value, just the key
 						reverse_timestamp_entries.push((encoded_key, Vec::new()));
 					}
@@ -484,10 +506,17 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Write to versioned index
 		if let Some(ref versioned_index) = self.core.versioned_index {
+			println!(
+				"DEBUG: LSM - writing {} entries to versioned index",
+				reverse_timestamp_entries.len()
+			);
 			let mut versioned_index_guard = versioned_index.write().unwrap();
 			for (encoded_key, encoded_value) in reverse_timestamp_entries {
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
+			println!("DEBUG: LSM - finished writing to versioned index");
+		} else {
+			println!("DEBUG: LSM - no versioned index available");
 		}
 
 		// Then write to WAL

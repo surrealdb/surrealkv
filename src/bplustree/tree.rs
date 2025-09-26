@@ -2255,7 +2255,6 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use std::fs::File;

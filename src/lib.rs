@@ -228,20 +228,26 @@ impl Options {
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
 	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
-		self.path.join("manifest").join(format!("{id:020}.manifest"))
+		self.manifest_dir().join(format!("{id:020}.manifest"))
 	}
 
 	/// Returns the path for an `SSTable` file with the given ID
 	/// Format: {path}/sstables/{id:020}.sst
 	pub(crate) fn sstable_file_path(&self, id: u64) -> PathBuf {
-		self.path.join("sstables").join(format!("{id:020}.sst"))
+		self.sstable_dir().join(format!("{id:020}.sst"))
 	}
 
 	/// Returns the path for a `VLog` file with the given ID
 	/// Format: {path}/vlog/{id:020}.vlog
 	pub(crate) fn vlog_file_path(&self, id: u64) -> PathBuf {
-		self.path.join("vlog").join(format!("{id:020}.vlog"))
+		self.vlog_dir().join(format!("{id:020}.vlog"))
 	}
+
+	// /// Returns the path for a WAL file with the given ID
+	// /// Format: {path}/wal/{id:020}
+	// pub(crate) fn wal_file_path(&self, id: u64) -> PathBuf {
+	// 	self.wal_dir().join(format!("{id:020}"))
+	// }
 
 	/// Returns the directory path for WAL files
 	pub(crate) fn wal_dir(&self) -> PathBuf {
@@ -609,6 +615,124 @@ impl Comparator for InternalKeyComparator {
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
 
 		// Create a new internal key with the successor user key and original sequence/kind
+		let result = InternalKey::new(
+			user_key_succ,
+			internal_key.seq_num(),
+			internal_key.kind(),
+			internal_key.timestamp,
+		);
+		result.encode()
+	}
+}
+
+/// A comparator that compares internal keys first by user key, then by timestamp
+/// This is useful for versioned queries where you want to order by user key and timestamp
+#[derive(Clone)]
+pub struct TimestampComparator {
+	user_comparator: Arc<dyn Comparator>,
+}
+
+impl TimestampComparator {
+	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
+		Self {
+			user_comparator,
+		}
+	}
+}
+
+impl Comparator for TimestampComparator {
+	fn name(&self) -> &'static str {
+		"leveldb.TimestampComparator"
+	}
+
+	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+		println!(
+			"DEBUG: TimestampComparator::compare called with a_len={}, b_len={}",
+			a.len(),
+			b.len()
+		);
+
+		if a.is_empty() {
+			println!("DEBUG: TimestampComparator::compare - WARNING: key a is empty!");
+		}
+		if b.is_empty() {
+			println!("DEBUG: TimestampComparator::compare - WARNING: key b is empty!");
+		}
+
+		// Decode internal keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+
+		println!(
+			"DEBUG: TimestampComparator::compare - key_a={:?}@{} vs key_b={:?}@{}",
+			String::from_utf8_lossy(key_a.user_key.as_ref()),
+			key_a.timestamp,
+			String::from_utf8_lossy(key_b.user_key.as_ref()),
+			key_b.timestamp
+		);
+
+		// Use the timestamp-based comparison method
+		let result = key_a.cmp_by_timestamp(&key_b);
+		println!("DEBUG: TimestampComparator::compare - result: {:?}", result);
+		result
+	}
+
+	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
+		if a == b {
+			return a.to_vec();
+		}
+
+		// Decode keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+
+		// If user keys are different, compute a separator for user keys
+		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
+			!= Ordering::Equal
+		{
+			let sep =
+				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
+
+			// Use MAX_TIMESTAMP when separator is shorter than original
+			if sep.len() < key_a.user_key.len()
+				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
+			{
+				let result = InternalKey::new(
+					sep,
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					key_a.kind(),
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				);
+				return result.encode();
+			}
+
+			// Otherwise use original timestamp
+			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp);
+			return result.encode();
+		}
+
+		// User keys are the same, check if we can create a timestamp separator
+		if key_a.timestamp < key_b.timestamp {
+			// Create a key with timestamp between a and b
+			let mid_timestamp = key_a.timestamp + (key_b.timestamp - key_a.timestamp) / 2;
+			let result = InternalKey::new(
+				key_a.user_key.as_ref().to_vec(),
+				key_a.seq_num(),
+				key_a.kind(),
+				mid_timestamp,
+			);
+			return result.encode();
+		}
+
+		// Can't create a meaningful separator, return a
+		a.to_vec()
+	}
+
+	fn successor(&self, key: &[u8]) -> Vec<u8> {
+		let internal_key = InternalKey::decode(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
+
+		// Create a new internal key with the successor user key and original timestamp/kind
 		let result = InternalKey::new(
 			user_key_succ,
 			internal_key.seq_num(),

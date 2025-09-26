@@ -106,10 +106,33 @@ impl InternalKey {
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
+		println!(
+			"DEBUG: InternalKey::decode - encoded_key_len={}, encoded_key={:?}",
+			encoded_key.len(),
+			&encoded_key[..std::cmp::min(32, encoded_key.len())]
+		);
+
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
+		println!(
+			"DEBUG: InternalKey::decode - n={}, trailer_range=[{}..{}], timestamp_range=[{}..{}]",
+			n,
+			n,
+			n + 8,
+			n + 8,
+			encoded_key.len()
+		);
+
 		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
 		let timestamp = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
 		let user_key = Arc::<[u8]>::from(&encoded_key[..n]);
+
+		println!(
+			"DEBUG: InternalKey::decode - user_key={:?}, trailer={}, timestamp={}",
+			String::from_utf8_lossy(&user_key),
+			trailer,
+			timestamp
+		);
+
 		Self {
 			user_key,
 			timestamp,
@@ -134,6 +157,17 @@ impl InternalKey {
 
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_tombstone_kind(self.kind())
+	}
+
+	/// Compares this key with another key using timestamp-based ordering
+	/// First compares by user key, then by timestamp (ascending - older timestamps first)
+	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
+		// First compare by user key (ascending)
+		match self.user_key.cmp(&other.user_key) {
+			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
+			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
+			ordering => ordering,
+		}
 	}
 }
 
@@ -165,4 +199,3 @@ impl Default for InternalKey {
 		}
 	}
 }
-
