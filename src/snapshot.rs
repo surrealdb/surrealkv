@@ -236,7 +236,7 @@ impl Snapshot {
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
 				key_range: &key_range,
-				start_ts: 0,  // Start from beginning of time
+				start_ts: 0, // Start from beginning of time
 				end_ts: timestamp,
 				limit: None,               // No limit for single key lookup
 				include_tombstones: false, // Don't include tombstones
@@ -374,15 +374,21 @@ impl Snapshot {
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let index_guard = versioned_index.read().unwrap();
-			
+
 			// Extract start and end bounds from the RangeBounds
 			let start_bound = params.key_range.start_bound();
 			let end_bound = params.key_range.end_bound();
-			
+
 			// Convert to InternalKey format for the B+ tree query
 			let start_key = match start_bound {
-				Bound::Included(key) | Bound::Excluded(key) => {
+				Bound::Included(key) => {
 					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, params.start_ts).encode()
+				}
+				Bound::Excluded(key) => {
+					// For excluded bounds, create a key that's lexicographically greater
+					let mut next_key = key.clone();
+					next_key.push(0); // Add null byte to make it greater
+					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
 				}
 				Bound::Unbounded => {
 					InternalKey::new(Vec::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
@@ -390,12 +396,32 @@ impl Snapshot {
 			};
 
 			let end_key = match end_bound {
-				Bound::Included(key) | Bound::Excluded(key) => {
-					InternalKey::new(key.clone(), params.snapshot_seq_num, InternalKeyKind::Max, params.end_ts).encode()
+				Bound::Included(key) => InternalKey::new(
+					key.clone(),
+					params.snapshot_seq_num,
+					InternalKeyKind::Max,
+					params.end_ts,
+				)
+				.encode(),
+				Bound::Excluded(key) => {
+					// For excluded bounds, create a key that's lexicographically greater
+					let mut next_key = key.clone();
+					next_key.push(0); // Add null byte to make it greater
+					InternalKey::new(
+						next_key,
+						params.snapshot_seq_num,
+						InternalKeyKind::Max,
+						params.end_ts,
+					)
+					.encode()
 				}
-				Bound::Unbounded => {
-					InternalKey::new(vec![0xff], params.snapshot_seq_num, InternalKeyKind::Max, params.end_ts).encode()
-				}
+				Bound::Unbounded => InternalKey::new(
+					vec![0xff],
+					params.snapshot_seq_num,
+					InternalKeyKind::Max,
+					params.end_ts,
+				)
+				.encode(),
 			};
 
 			let range_iter = index_guard.range(&start_key, &end_key)?;
