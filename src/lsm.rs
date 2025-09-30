@@ -432,8 +432,6 @@ impl CommitEnv for LsmCommitEnv {
 								timestamp,
 							)
 							.encode();
-							println!("DEBUG: LSM - adding to versioned index: key={:?}, timestamp={}, seq_num={}", 
-								String::from_utf8_lossy(&entry.key), timestamp, current_seq_num);
 							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
 						}
 
@@ -506,17 +504,10 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Write to versioned index
 		if let Some(ref versioned_index) = self.core.versioned_index {
-			println!(
-				"DEBUG: LSM - writing {} entries to versioned index",
-				reverse_timestamp_entries.len()
-			);
 			let mut versioned_index_guard = versioned_index.write().unwrap();
 			for (encoded_key, encoded_value) in reverse_timestamp_entries {
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
-			println!("DEBUG: LSM - finished writing to versioned index");
-		} else {
-			println!("DEBUG: LSM - no versioned index available");
 		}
 
 		// Then write to WAL

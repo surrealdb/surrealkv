@@ -47,6 +47,11 @@ fn is_tombstone_kind(kind: InternalKeyKind) -> bool {
 	)
 }
 
+/// Checks if a key kind represents a hard delete (delete operation)
+fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
+	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
+}
+
 /// Calculates the size of a key with the given user key length
 /// This centralizes the size calculation logic to avoid duplication
 fn calculate_key_size(user_key_len: usize, has_timestamp: bool) -> usize {
@@ -106,32 +111,10 @@ impl InternalKey {
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
-		println!(
-			"DEBUG: InternalKey::decode - encoded_key_len={}, encoded_key={:?}",
-			encoded_key.len(),
-			&encoded_key[..std::cmp::min(32, encoded_key.len())]
-		);
-
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		println!(
-			"DEBUG: InternalKey::decode - n={}, trailer_range=[{}..{}], timestamp_range=[{}..{}]",
-			n,
-			n,
-			n + 8,
-			n + 8,
-			encoded_key.len()
-		);
-
 		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
 		let timestamp = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
 		let user_key = Arc::<[u8]>::from(&encoded_key[..n]);
-
-		println!(
-			"DEBUG: InternalKey::decode - user_key={:?}, trailer={}, timestamp={}",
-			String::from_utf8_lossy(&user_key),
-			trailer,
-			timestamp
-		);
 
 		Self {
 			user_key,
@@ -157,6 +140,10 @@ impl InternalKey {
 
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_tombstone_kind(self.kind())
+	}
+
+	pub(crate) fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
 	}
 
 	/// Compares this key with another key using timestamp-based ordering

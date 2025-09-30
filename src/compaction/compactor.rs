@@ -239,9 +239,10 @@ impl Compactor {
 		if !self.options.lopts.enable_versioning || deleted_keys.is_empty() {
 			return Ok(());
 		}
+		let mut keys_to_delete = Vec::new();
 
 		if let Some(ref versioned_index) = self.options.versioned_index {
-			let mut index_guard = versioned_index.write().unwrap();
+			let read_index = versioned_index.read().unwrap();
 			let mut total_deleted = 0;
 
 			for key in deleted_keys {
@@ -264,32 +265,28 @@ impl Compactor {
 				.encode();
 
 				// Get all entries in the range for this key
-				let range_iter = index_guard.range(&start_key, &end_key)?;
-				let mut keys_to_delete = Vec::new();
+				let range_iter = read_index.range(&start_key, &end_key)?;
 
 				for entry in range_iter {
-					match entry {
-						Ok((index_key, _value)) => {
-							// Decode the key to verify it matches our target key
-							let internal_key = InternalKey::decode(&index_key);
-							if internal_key.user_key == *key {
-								keys_to_delete.push(index_key);
-							}
-						}
-						Err(e) => {
-							eprintln!("Error iterating versioned index for key {:?}: {}", key, e);
-							break;
-						}
+					let (index_key, _value) = entry?;
+					// Decode the key to verify it matches our target key
+					let internal_key = InternalKey::decode(&index_key);
+					if internal_key.user_key == *key {
+						keys_to_delete.push(index_key);
 					}
 				}
+			}
+			drop(read_index);
 
-				// Delete all versions of this key
-				for key_to_delete in keys_to_delete {
-					if let Err(e) = index_guard.delete(&key_to_delete) {
-						eprintln!("Failed to delete versioned key: {}", e);
-					} else {
-						total_deleted += 1;
-					}
+			// Take write lock
+			let mut write_index = versioned_index.write().unwrap();
+
+			// Delete all versions of this key
+			for key_to_delete in keys_to_delete {
+				if let Err(e) = write_index.delete(&key_to_delete) {
+					eprintln!("Failed to delete versioned key: {}", e);
+				} else {
+					total_deleted += 1;
 				}
 			}
 

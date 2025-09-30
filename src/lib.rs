@@ -646,35 +646,11 @@ impl Comparator for TimestampComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		println!(
-			"DEBUG: TimestampComparator::compare called with a_len={}, b_len={}",
-			a.len(),
-			b.len()
-		);
-
-		if a.is_empty() {
-			println!("DEBUG: TimestampComparator::compare - WARNING: key a is empty!");
-		}
-		if b.is_empty() {
-			println!("DEBUG: TimestampComparator::compare - WARNING: key b is empty!");
-		}
-
 		// Decode internal keys using InternalKey
 		let key_a = InternalKey::decode(a);
 		let key_b = InternalKey::decode(b);
-
-		println!(
-			"DEBUG: TimestampComparator::compare - key_a={:?}@{} vs key_b={:?}@{}",
-			String::from_utf8_lossy(key_a.user_key.as_ref()),
-			key_a.timestamp,
-			String::from_utf8_lossy(key_b.user_key.as_ref()),
-			key_b.timestamp
-		);
-
 		// Use the timestamp-based comparison method
-		let result = key_a.cmp_by_timestamp(&key_b);
-		println!("DEBUG: TimestampComparator::compare - result: {:?}", result);
-		result
+		key_a.cmp_by_timestamp(&key_b)
 	}
 
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
