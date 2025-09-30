@@ -114,7 +114,7 @@ pub(crate) struct CoreInner {
 	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
 
 	/// Versioned B+ tree index for timestamp-based queries
-	/// Maps InternalKey -> Value for efficient time-range queries
+	/// Maps InternalKey -> Value for time-range queries
 	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
@@ -403,7 +403,7 @@ impl CommitEnv for LsmCommitEnv {
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		// Create a new batch for processed entries with pre-encoded values
 		let mut processed_batch = Batch::new(seq_num);
-		let mut reverse_timestamp_entries = Vec::new();
+		let mut timestamp_entries = Vec::new();
 		// Process VLog entries and create the processed batch in a single loop
 		if let Some(ref vlog) = self.core.vlog {
 			// Use the unified sequence number management
@@ -424,7 +424,7 @@ impl CommitEnv for LsmCommitEnv {
 						let encoded = value_location.encode();
 
 						if self.core.opts.enable_versioning {
-							// Create InternalKey for efficient time-range queries
+							// Create InternalKey for time-range queries
 							let encoded_key = InternalKey::new(
 								entry.key.clone(),
 								current_seq_num,
@@ -432,7 +432,7 @@ impl CommitEnv for LsmCommitEnv {
 								timestamp,
 							)
 							.encode();
-							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
+							timestamp_entries.push((encoded_key, encoded.clone()));
 						}
 
 						(Some(pointer), Some(encoded))
@@ -457,7 +457,7 @@ impl CommitEnv for LsmCommitEnv {
 						)
 						.encode();
 						// For deletes, we don't need a value, just the key
-						reverse_timestamp_entries.push((encoded_key, Vec::new()));
+						timestamp_entries.push((encoded_key, Vec::new()));
 					}
 					(None, None)
 				};
@@ -505,7 +505,7 @@ impl CommitEnv for LsmCommitEnv {
 		// Write to versioned index
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let mut versioned_index_guard = versioned_index.write().unwrap();
-			for (encoded_key, encoded_value) in reverse_timestamp_entries {
+			for (encoded_key, encoded_value) in timestamp_entries {
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
 		}

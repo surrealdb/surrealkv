@@ -243,8 +243,8 @@ impl Snapshot {
 				snapshot_seq_num: self.seq_num,
 				include_latest_only: true,
 			},
-			|reverse_key, encoded_value, _is_tombstone| {
-				latest_timestamp = reverse_key.timestamp;
+			|internal_key, encoded_value, _is_tombstone| {
+				latest_timestamp = internal_key.timestamp;
 				latest_value = Some(self.core.resolve_value(encoded_value)?);
 
 				Ok(true) // Continue processing
@@ -274,8 +274,8 @@ impl Snapshot {
 				include_tombstones: false, // Don't include tombstones
 				include_latest_only: true,
 			},
-			|reverse_key, _encoded_value, _is_tombstone| {
-				keys.push(reverse_key.user_key.as_ref().to_vec());
+			|internal_key, _encoded_value, _is_tombstone| {
+				keys.push(internal_key.user_key.as_ref().to_vec());
 				Ok(true) // Continue processing
 			},
 		)?;
@@ -303,9 +303,9 @@ impl Snapshot {
 				include_tombstones: false, // Don't include tombstones
 				include_latest_only: true,
 			},
-			|reverse_key, encoded_value, _is_tombstone| {
+			|internal_key, encoded_value, _is_tombstone| {
 				let resolved_value = self.core.resolve_value(encoded_value)?;
-				results.push((reverse_key.user_key.as_ref().to_vec(), resolved_value));
+				results.push((internal_key.user_key.as_ref().to_vec(), resolved_value));
 				Ok(true) // Continue processing
 			},
 		)?;
@@ -358,8 +358,6 @@ impl Snapshot {
 		Ok(results)
 	}
 
-	/// Since data is ordered by user key first, then sequence number (descending) in the B+ tree,
-	/// we can process entries and get the latest version for each key directly
 	fn versioned_range_query<F, R: RangeBounds<Vec<u8>>>(
 		&self,
 		params: VersionedRangeQueryParams<'_, R>,
@@ -442,7 +440,6 @@ impl Snapshot {
 
 				let current_key = internal_key.user_key.as_ref().to_vec();
 
-				// Store the complete InternalKey with its value
 				key_versions
 					.entry(current_key)
 					.or_default()

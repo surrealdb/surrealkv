@@ -562,7 +562,7 @@ impl InternalKeyComparator {
 
 impl Comparator for InternalKeyComparator {
 	fn name(&self) -> &'static str {
-		"leveldb.InternalKeyComparator"
+		"surrealkv.InternalKeyComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -626,23 +626,15 @@ impl Comparator for InternalKeyComparator {
 }
 
 /// A comparator that compares internal keys first by user key, then by timestamp
-/// This is useful for versioned queries where you want to order by user key and timestamp
+/// This is used for versioned queries where we want to order by user key and timestamp
 #[derive(Clone)]
-pub struct TimestampComparator {
+pub(crate) struct TimestampComparator {
 	user_comparator: Arc<dyn Comparator>,
-}
-
-impl TimestampComparator {
-	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
-		Self {
-			user_comparator,
-		}
-	}
 }
 
 impl Comparator for TimestampComparator {
 	fn name(&self) -> &'static str {
-		"leveldb.TimestampComparator"
+		"surrealkv.TimestampComparator"
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -684,19 +676,6 @@ impl Comparator for TimestampComparator {
 
 			// Otherwise use original timestamp
 			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp);
-			return result.encode();
-		}
-
-		// User keys are the same, check if we can create a timestamp separator
-		if key_a.timestamp < key_b.timestamp {
-			// Create a key with timestamp between a and b
-			let mid_timestamp = key_a.timestamp + (key_b.timestamp - key_a.timestamp) / 2;
-			let result = InternalKey::new(
-				key_a.user_key.as_ref().to_vec(),
-				key_a.seq_num(),
-				key_a.kind(),
-				mid_timestamp,
-			);
 			return result.encode();
 		}
 
