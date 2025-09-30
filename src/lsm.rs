@@ -20,7 +20,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, ReverseTimestampKey},
+	sstable::{table::Table, InternalKey},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -30,7 +30,8 @@ use crate::{
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		writer::Wal,
 	},
-	Comparator, CompressionType, Error, FilterPolicy, Options, VLogChecksumLevel, Value,
+	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
+	VLogChecksumLevel, Value,
 };
 
 use async_trait::async_trait;
@@ -113,7 +114,7 @@ pub(crate) struct CoreInner {
 	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
 
 	/// Versioned B+ tree index for timestamp-based queries
-	/// Maps ReverseTimestampKey -> Value for efficient time-range queries
+	/// Maps InternalKey -> Value for time-range queries
 	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
@@ -152,7 +153,9 @@ impl CoreInner {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator = Arc::new(crate::BytewiseComparator {});
+			let comparator = Arc::new(crate::TimestampComparator {
+				user_comparator: Arc::new(BytewiseComparator {}),
+			});
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(RwLock::new(tree)))
 		} else {
@@ -400,7 +403,7 @@ impl CommitEnv for LsmCommitEnv {
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		// Create a new batch for processed entries with pre-encoded values
 		let mut processed_batch = Batch::new(seq_num);
-		let mut reverse_timestamp_entries = Vec::new();
+		let mut timestamp_entries = Vec::new();
 		// Process VLog entries and create the processed batch in a single loop
 		if let Some(ref vlog) = self.core.vlog {
 			// Use the unified sequence number management
@@ -421,15 +424,15 @@ impl CommitEnv for LsmCommitEnv {
 						let encoded = value_location.encode();
 
 						if self.core.opts.enable_versioning {
-							// Create ReverseTimestampKey for efficient time-range queries
-							let reverse_key = ReverseTimestampKey::new(
+							// Create InternalKey for time-range queries
+							let encoded_key = InternalKey::new(
 								entry.key.clone(),
 								current_seq_num,
 								entry.kind,
 								timestamp,
-							);
-							let encoded_key = reverse_key.encode();
-							reverse_timestamp_entries.push((encoded_key, encoded.clone()));
+							)
+							.encode();
+							timestamp_entries.push((encoded_key, encoded.clone()));
 						}
 
 						(Some(pointer), Some(encoded))
@@ -445,16 +448,16 @@ impl CommitEnv for LsmCommitEnv {
 					// No value (delete operation) - pass None
 					// But still add to versioned index as tombstone
 					if self.core.opts.enable_versioning {
-						// Create ReverseTimestampKey for delete operation
-						let reverse_key = ReverseTimestampKey::new(
+						// Create InternalKey for delete operation
+						let encoded_key = InternalKey::new(
 							entry.key.clone(),
 							current_seq_num,
 							entry.kind,
 							timestamp,
-						);
-						let encoded_key = reverse_key.encode();
+						)
+						.encode();
 						// For deletes, we don't need a value, just the key
-						reverse_timestamp_entries.push((encoded_key, Vec::new()));
+						timestamp_entries.push((encoded_key, Vec::new()));
 					}
 					(None, None)
 				};
@@ -502,7 +505,7 @@ impl CommitEnv for LsmCommitEnv {
 		// Write to versioned index
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let mut versioned_index_guard = versioned_index.write().unwrap();
-			for (encoded_key, encoded_value) in reverse_timestamp_entries {
+			for (encoded_key, encoded_value) in timestamp_entries {
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
 		}

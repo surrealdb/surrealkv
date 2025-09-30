@@ -47,6 +47,11 @@ fn is_tombstone_kind(kind: InternalKeyKind) -> bool {
 	)
 }
 
+/// Checks if a key kind represents a hard delete (delete operation)
+fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
+	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
+}
+
 /// Calculates the size of a key with the given user key length
 /// This centralizes the size calculation logic to avoid duplication
 fn calculate_key_size(user_key_len: usize, has_timestamp: bool) -> usize {
@@ -110,6 +115,7 @@ impl InternalKey {
 		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
 		let timestamp = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
 		let user_key = Arc::<[u8]>::from(&encoded_key[..n]);
+
 		Self {
 			user_key,
 			timestamp,
@@ -134,6 +140,21 @@ impl InternalKey {
 
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_tombstone_kind(self.kind())
+	}
+
+	pub(crate) fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	/// Compares this key with another key using timestamp-based ordering
+	/// First compares by user key, then by timestamp (ascending - older timestamps first)
+	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
+		// First compare by user key (ascending)
+		match self.user_key.cmp(&other.user_key) {
+			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
+			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
+			ordering => ordering,
+		}
 	}
 }
 
@@ -161,76 +182,6 @@ impl Default for InternalKey {
 		Self {
 			user_key: Arc::from([]),
 			timestamp: 0,
-			trailer: 0,
-		}
-	}
-}
-
-/// ReverseTimestampKey has timestamp first, then internal key structure
-/// This allows efficient range queries by time
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReverseTimestampKey {
-	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
-	pub(crate) user_key: Arc<[u8]>,
-	pub(crate) trailer: u64, // Same as InternalKey: (seq_num << 8) | kind
-}
-
-impl ReverseTimestampKey {
-	pub(crate) fn new(
-		user_key: Vec<u8>,
-		seq_num: u64,
-		kind: InternalKeyKind,
-		timestamp: u64,
-	) -> Self {
-		Self {
-			timestamp,
-			user_key: Arc::from(user_key.into_boxed_slice()),
-			trailer: (seq_num << 8) | kind as u64,
-		}
-	}
-
-	pub(crate) fn size(&self) -> usize {
-		calculate_key_size(self.user_key.len(), true)
-	}
-
-	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
-		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		let timestamp = u64::from_be_bytes(encoded_key[..8].try_into().unwrap());
-		let trailer = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
-		let user_key = Arc::<[u8]>::from(&encoded_key[8..n + 8]);
-		Self {
-			timestamp,
-			user_key,
-			trailer,
-		}
-	}
-
-	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = Vec::with_capacity(self.size());
-		buf.extend_from_slice(&self.timestamp.to_be_bytes());
-		buf.extend_from_slice(self.user_key.as_ref());
-		buf.extend_from_slice(&self.trailer.to_be_bytes());
-		buf
-	}
-
-	pub(crate) fn seq_num(&self) -> u64 {
-		trailer_to_seq_num(self.trailer)
-	}
-
-	pub(crate) fn kind(&self) -> InternalKeyKind {
-		trailer_to_kind(self.trailer)
-	}
-
-	pub(crate) fn is_tombstone(&self) -> bool {
-		is_tombstone_kind(self.kind())
-	}
-}
-
-impl Default for ReverseTimestampKey {
-	fn default() -> Self {
-		Self {
-			timestamp: 0,
-			user_key: Arc::from([]),
 			trailer: 0,
 		}
 	}
