@@ -1003,6 +1003,11 @@ mod tests {
 		TempDir::new("test").unwrap()
 	}
 
+	fn now() -> u64 {
+		std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+			as u64
+	}
+
 	/// Type alias for a map of keys to their version information
 	/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
 	#[allow(dead_code)]
@@ -2740,7 +2745,7 @@ mod tests {
 		assert_eq!(versions5.len(), 1);
 		assert_eq!(versions6.len(), 1);
 
-		// Get timestamps from scan results (timestamp is the third element in the tuple)
+		// Get timestamps from scan results(timestamp is the third element in the tuple)
 		let ts4 = versions4[0].2;
 		let ts5 = versions5[0].2;
 		let ts6 = versions6[0].2;
@@ -2915,11 +2920,6 @@ mod tests {
 		}
 		assert!(found_keys.contains(&b"key2".as_ref()));
 		assert!(found_keys.contains(&b"key3".as_ref()));
-	}
-
-	fn now() -> u64 {
-		std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-			as u64
 	}
 
 	#[tokio::test]

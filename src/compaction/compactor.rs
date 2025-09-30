@@ -239,49 +239,51 @@ impl Compactor {
 		if !self.options.lopts.enable_versioning || deleted_keys.is_empty() {
 			return Ok(());
 		}
-		let mut keys_to_delete = Vec::new();
 
 		if let Some(ref versioned_index) = self.options.versioned_index {
-			let read_index = versioned_index.read().unwrap();
-			let mut total_deleted = 0;
+			// Collect keys to delete while holding read lock
+			let keys_to_delete = {
+				let read_index = versioned_index.read().unwrap();
+				let mut keys_to_delete = Vec::new();
 
-			for key in deleted_keys {
-				// Create a range query to find all versions of this key
-				// We need to search for all possible timestamps and sequence numbers for this key
-				let start_key = InternalKey::new(
-					key.to_vec(),
-					0, // Start from sequence 0
-					InternalKeyKind::Set,
-					0, // Start from beginning of time
-				)
-				.encode();
+				for key in deleted_keys {
+					// Create a range query to find all versions of this key
+					// We need to search for all possible timestamps and sequence numbers for this key
+					let start_key = InternalKey::new(
+						key.to_vec(),
+						0, // Start from sequence 0
+						InternalKeyKind::Set,
+						0, // Start from beginning of time
+					)
+					.encode();
 
-				let end_key = InternalKey::new(
-					key.to_vec(),
-					u64::MAX, // End at max sequence
-					InternalKeyKind::Set,
-					u64::MAX, // End at max timestamp
-				)
-				.encode();
+					let end_key = InternalKey::new(
+						key.to_vec(),
+						u64::MAX, // End at max sequence
+						InternalKeyKind::Set,
+						u64::MAX, // End at max timestamp
+					)
+					.encode();
 
-				// Get all entries in the range for this key
-				let range_iter = read_index.range(&start_key, &end_key)?;
+					// Get all entries in the range for this key
+					let range_iter = read_index.range(&start_key, &end_key)?;
 
-				for entry in range_iter {
-					let (index_key, _value) = entry?;
-					// Decode the key to verify it matches our target key
-					let internal_key = InternalKey::decode(&index_key);
-					if internal_key.user_key == *key {
-						keys_to_delete.push(index_key);
+					for entry in range_iter {
+						let (index_key, _value) = entry?;
+						// Decode the key to verify it matches our target key
+						let internal_key = InternalKey::decode(&index_key);
+						if internal_key.user_key == *key {
+							keys_to_delete.push(index_key);
+						}
 					}
 				}
-			}
-			drop(read_index);
+				keys_to_delete // Return collected keys, read lock is released here
+			};
 
-			// Take write lock
+			// Take write lock and delete the collected keys
 			let mut write_index = versioned_index.write().unwrap();
+			let mut total_deleted = 0;
 
-			// Delete all versions of this key
 			for key_to_delete in keys_to_delete {
 				if let Err(e) = write_index.delete(&key_to_delete) {
 					eprintln!("Failed to delete versioned key: {}", e);
