@@ -101,9 +101,8 @@ pub(crate) struct IterState {
 
 /// Query parameters for versioned range queries
 #[derive(Debug, Clone)]
-struct VersionedRangeQueryParams<'a> {
-	start_key: &'a [u8],
-	end_key: &'a [u8],
+struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
+	key_range: &'a R,
 	start_ts: u64,
 	end_ts: u64,
 	snapshot_seq_num: u64,
@@ -231,10 +230,12 @@ impl Snapshot {
 		let mut latest_value: Option<Value> = None;
 		let mut latest_timestamp = 0;
 
+		// Create a range that includes only the specific key
+		let key_range = key.to_vec()..=key.to_vec();
+
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
-				start_key: key,
-				end_key: key, // Same key for start and end
+				key_range: &key_range,
 				start_ts: 0,  // Start from beginning of time
 				end_ts: timestamp,
 				limit: None,               // No limit for single key lookup
@@ -255,10 +256,9 @@ impl Snapshot {
 
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn keys_at_timestamp(
+	pub(crate) fn keys_at_timestamp<R: RangeBounds<Vec<u8>>>(
 		&self,
-		start_key: &[u8],
-		end_key: &[u8],
+		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<Vec<Vec<u8>>> {
@@ -266,8 +266,7 @@ impl Snapshot {
 
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
-				start_key,
-				end_key,
+				key_range: &key_range,
 				start_ts: 0,
 				end_ts: timestamp,
 				snapshot_seq_num: self.seq_num,
@@ -286,10 +285,9 @@ impl Snapshot {
 
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn scan_at_timestamp(
+	pub(crate) fn scan_at_timestamp<R: RangeBounds<Vec<u8>>>(
 		&self,
-		start_key: &[u8],
-		end_key: &[u8],
+		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<Vec<(Vec<u8>, Value)>> {
@@ -297,8 +295,7 @@ impl Snapshot {
 
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
-				start_key,
-				end_key,
+				key_range: &key_range,
 				start_ts: 0,
 				end_ts: timestamp,
 				snapshot_seq_num: self.seq_num,
@@ -321,10 +318,9 @@ impl Snapshot {
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// The limit currently is on the unique keys, not the total number of results
-	pub(crate) fn scan_all_timestamps(
+	pub(crate) fn scan_all_timestamps<R: RangeBounds<Vec<u8>>>(
 		&self,
-		start_key: &[u8],
-		end_key: &[u8],
+		key_range: R,
 		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
 		if !self.core.opts.enable_versioning {
@@ -335,8 +331,7 @@ impl Snapshot {
 
 		self.versioned_range_query(
 			VersionedRangeQueryParams {
-				start_key,
-				end_key,
+				key_range: &key_range,
 				start_ts: 0,
 				end_ts: u64::MAX,
 				snapshot_seq_num: self.seq_num,
@@ -365,9 +360,9 @@ impl Snapshot {
 
 	/// Since data is ordered by user key first, then sequence number (descending) in the B+ tree,
 	/// we can process entries and get the latest version for each key directly
-	fn versioned_range_query<F>(
+	fn versioned_range_query<F, R: RangeBounds<Vec<u8>>>(
 		&self,
-		params: VersionedRangeQueryParams<'_>,
+		params: VersionedRangeQueryParams<'_, R>,
 		mut processor: F,
 	) -> Result<()>
 	where
@@ -379,21 +374,29 @@ impl Snapshot {
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let index_guard = versioned_index.read().unwrap();
-			let start_key = InternalKey::new(
-				params.start_key.to_vec(),
-				0,
-				InternalKeyKind::Set,
-				params.start_ts,
-			)
-			.encode();
+			
+			// Extract start and end bounds from the RangeBounds
+			let start_bound = params.key_range.start_bound();
+			let end_bound = params.key_range.end_bound();
+			
+			// Convert to InternalKey format for the B+ tree query
+			let start_key = match start_bound {
+				Bound::Included(key) | Bound::Excluded(key) => {
+					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, params.start_ts).encode()
+				}
+				Bound::Unbounded => {
+					InternalKey::new(Vec::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
+				}
+			};
 
-			let end_key = InternalKey::new(
-				params.end_key.to_vec(),
-				params.snapshot_seq_num,
-				InternalKeyKind::Max,
-				params.end_ts,
-			)
-			.encode();
+			let end_key = match end_bound {
+				Bound::Included(key) | Bound::Excluded(key) => {
+					InternalKey::new(key.clone(), params.snapshot_seq_num, InternalKeyKind::Max, params.end_ts).encode()
+				}
+				Bound::Unbounded => {
+					InternalKey::new(vec![0xff], params.snapshot_seq_num, InternalKeyKind::Max, params.end_ts).encode()
+				}
+			};
 
 			let range_iter = index_guard.range(&start_key, &end_key)?;
 
