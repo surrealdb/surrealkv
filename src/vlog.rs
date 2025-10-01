@@ -589,7 +589,7 @@ impl VLog {
 	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
-			let mut writer = self.writer.write().unwrap();
+			let mut writer = self.writer.write()?;
 
 			if writer.is_none() || writer.as_ref().unwrap().size() >= self.max_file_size {
 				// Create new file
@@ -616,7 +616,7 @@ impl VLog {
 		};
 
 		// Now append the key+value pair
-		let mut writer = self.writer.write().unwrap();
+		let mut writer = self.writer.write()?;
 		let writer = writer.as_mut().unwrap();
 
 		let pointer = writer.append(key, value)?;
@@ -633,8 +633,8 @@ impl VLog {
 
 		let mut max_file_id: Option<u32> = None;
 		let mut max_file_path: Option<PathBuf> = None;
-		let mut file_handles = self.file_handles.write().unwrap();
-		let mut files_map = self.files_map.write().unwrap();
+		let mut file_handles = self.file_handles.write()?;
+		let mut files_map = self.files_map.write()?;
 
 		for entry in entries {
 			let entry = entry?;
@@ -692,7 +692,7 @@ impl VLog {
 				self.opts.compression as u8,
 			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
-			*self.writer.write().unwrap() = Some(writer);
+			*self.writer.write()? = Some(writer);
 		}
 
 		// println!(
@@ -707,7 +707,7 @@ impl VLog {
 	/// Retrieves (and caches) an open file handle for the given file ID
 	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
 		{
-			let handles = self.file_handles.read().unwrap();
+			let handles = self.file_handles.read()?;
 			if let Some(handle) = handles.get(&file_id) {
 				return Ok(handle.clone());
 			}
@@ -738,7 +738,7 @@ impl VLog {
 
 		let handle = Arc::new(file);
 
-		let mut handles = self.file_handles.write().unwrap();
+		let mut handles = self.file_handles.write()?;
 		// Another thread might have inserted it while we were opening the file
 		let entry = handles.entry(file_id).or_insert_with(|| handle.clone());
 		Ok(entry.clone())
@@ -840,9 +840,9 @@ impl VLog {
 
 	/// Deletes files that were marked for deletion when no iterators were active
 	fn delete_pending_files(&self) -> Result<()> {
-		let mut files_to_delete = self.files_to_be_deleted.write().unwrap();
-		let mut files_map = self.files_map.write().unwrap();
-		let mut file_handles = self.file_handles.write().unwrap();
+		let mut files_to_delete = self.files_to_be_deleted.write()?;
+		let mut files_map = self.files_map.write()?;
+		let mut file_handles = self.file_handles.write()?;
 
 		for file_id in files_to_delete.drain(..) {
 			file_handles.remove(&file_id);
@@ -924,7 +924,7 @@ impl VLog {
 	) -> Result<bool> {
 		// Check if file is already marked for deletion
 		{
-			let files_to_delete = self.files_to_be_deleted.read().unwrap();
+			let files_to_delete = self.files_to_be_deleted.read()?;
 			if files_to_delete.contains(&file_id) {
 				return Err(Error::Other(format!(
 					"Value log file already marked for deletion fid: {file_id}"
@@ -946,8 +946,8 @@ impl VLog {
 			// Schedule for safe deletion based on iterator count
 			if self.iterator_count() == 0 {
 				// No active iterators, safe to delete immediately
-				let mut files_map = self.files_map.write().unwrap();
-				let mut file_handles = self.file_handles.write().unwrap();
+				let mut files_map = self.files_map.write()?;
+				let mut file_handles = self.file_handles.write()?;
 				file_handles.remove(&file_id);
 				if let Some(vlog_file) = files_map.remove(&file_id) {
 					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
@@ -959,9 +959,9 @@ impl VLog {
 				}
 			} else {
 				// There are active iterators, defer deletion
-				let mut files_to_delete = self.files_to_be_deleted.write().unwrap();
+				let mut files_to_delete = self.files_to_be_deleted.write()?;
 				files_to_delete.push(file_id);
-				self.file_handles.write().unwrap().remove(&file_id);
+				self.file_handles.write()?.remove(&file_id);
 			}
 		}
 
@@ -1122,7 +1122,7 @@ impl VLog {
 
 	/// Syncs all data to disk
 	pub(crate) fn sync(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write().unwrap() {
+		if let Some(ref mut writer) = *self.writer.write()? {
 			writer.sync()?;
 		}
 
@@ -1132,7 +1132,7 @@ impl VLog {
 	}
 
 	pub(crate) fn flush(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write().unwrap() {
+		if let Some(ref mut writer) = *self.writer.write()? {
 			writer.flush()?;
 		}
 
@@ -1378,7 +1378,7 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
@@ -1395,7 +1395,7 @@ impl DeleteList {
 
 	/// Checks if a sequence number is in the delete list (stale)
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		let tree = self.tree.read().unwrap();
+		let tree = self.tree.read()?;
 
 		// Convert sequence number to bytes for lookup
 		let seq_key = seq_num.to_be_bytes().to_vec();
@@ -1414,7 +1414,7 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
@@ -1429,7 +1429,7 @@ impl DeleteList {
 	}
 
 	fn close(&self) -> Result<()> {
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 		tree.sync()?;
 		tree.close()?;
 		Ok(())

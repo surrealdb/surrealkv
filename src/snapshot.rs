@@ -153,7 +153,7 @@ impl Snapshot {
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
-		let memtable_lock = self.core.active_memtable.read().unwrap();
+		let memtable_lock = self.core.active_memtable.read()?;
 
 		// Check the active memtable for the key
 		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
@@ -165,7 +165,7 @@ impl Snapshot {
 		drop(memtable_lock); // Release the lock on the active memtable
 
 		// Read lock on the immutable memtables
-		let memtable_lock = self.core.immutable_memtables.read().unwrap();
+		let memtable_lock = self.core.immutable_memtables.read()?;
 
 		// Check the immutable memtables for the key
 		for (_, memtable) in memtable_lock.iter().rev() {
@@ -180,7 +180,7 @@ impl Snapshot {
 
 		// Read lock on the level manifest
 		if let Some(ref level_manifest) = self.core.level_manifest {
-			let level_manifest = level_manifest.read().unwrap();
+			let level_manifest = level_manifest.read()?;
 
 			// Check the tables in each level for the key
 			for level in &level_manifest.levels {
@@ -371,7 +371,7 @@ impl Snapshot {
 		}
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
-			let index_guard = versioned_index.read().unwrap();
+			let index_guard = versioned_index.read()?;
 
 			// Extract start and end bounds from the RangeBounds
 			let start_bound = params.key_range.start_bound();

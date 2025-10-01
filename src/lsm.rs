@@ -216,21 +216,21 @@ impl CoreInner {
 	/// This prevents race conditions by holding the active_memtable write lock
 	/// for both the memtable swap and WAL rotation operations.
 	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable>)>> {
-		let mut active_memtable = self.active_memtable.write().unwrap();
+		let mut active_memtable = self.active_memtable.write()?;
 
 		// Don't flush an empty memtable
 		if active_memtable.is_empty() {
 			return Ok(None);
 		}
 
-		let mut immutable_memtables = self.immutable_memtables.write().unwrap();
+		let mut immutable_memtables = self.immutable_memtables.write()?;
 
 		// Atomically swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
 		// Track the immutable memtable until it's successfully flushed
-		let memtable_id = self.level_manifest.as_ref().unwrap().read().unwrap().next_table_id();
+		let memtable_id = self.level_manifest.as_ref().unwrap().read()?.next_table_id();
 		immutable_memtables.add(memtable_id, flushed_memtable.clone());
 
 		// Now rotate the WAL while still holding the active_memtable lock
@@ -252,8 +252,8 @@ impl CoreInner {
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
 	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
-		let mut original_manifest = self.level_manifest.as_ref().unwrap().write().unwrap();
-		let mut memtable_lock = self.immutable_memtables.write().unwrap();
+		let mut original_manifest = self.level_manifest.as_ref().unwrap().write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
 		let table_id = table.id;
 
 		// Create a changeset to add the table
@@ -310,7 +310,7 @@ impl CoreInner {
 	// 		)
 	// 		.encode();
 
-	// 		let mut index_guard = versioned_index.write().unwrap();
+	// 		let mut index_guard = versioned_index.write()?;
 
 	// 		// Get all entries in the time range
 	// 		let range_iter = index_guard.range(&start_key, &end_key)?;
@@ -401,116 +401,84 @@ impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL and process VLog entries (synchronous operation)
 	// Returns a new batch with VLog pointers, and pre-encoded ValueLocations
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
-		// Create a new batch for processed entries with pre-encoded values
 		let mut processed_batch = Batch::new(seq_num);
-		let mut timestamp_entries = Vec::new();
-		// Process VLog entries and create the processed batch in a single loop
-		if let Some(ref vlog) = self.core.vlog {
-			// Use the unified sequence number management
-			for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-				// Create full InternalKey for VLog
-				let ikey =
-					InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
-				let key_bytes = ikey.encode();
+		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
-				// Determine value pointer and pre-encode ValueLocation
-				let (valueptr, encoded_value) = if let Some(value) = &entry.value {
-					// Check if value should go to VLog based on threshold
-					if value.len() > self.core.opts.vlog_value_threshold {
-						let pointer = vlog.append(&key_bytes, value)?;
+		let vlog_threshold = self.core.opts.vlog_value_threshold;
+		let enable_versioning = self.core.opts.enable_versioning;
+		let has_vlog = self.core.vlog.is_some();
 
-						// Pre-encode ValueLocation with VLog pointer
-						let value_location = ValueLocation::with_pointer(pointer.clone());
-						let encoded = value_location.encode();
+		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
+			let encoded_key = ikey.encode();
 
-						if self.core.opts.enable_versioning {
-							// Create InternalKey for time-range queries
-							let encoded_key = InternalKey::new(
-								entry.key.clone(),
-								current_seq_num,
-								entry.kind,
-								timestamp,
-							)
-							.encode();
-							timestamp_entries.push((encoded_key, encoded.clone()));
-						}
+			// Process value based on whether VLog is available and value size
+			let (valueptr, encoded_value) = match &entry.value {
+				Some(value) if has_vlog && value.len() > vlog_threshold => {
+					// Large value: store in VLog and create pointer
+					let vlog = self.core.vlog.as_ref().unwrap();
+					let pointer = vlog.append(&encoded_key, value)?;
+					let value_location = ValueLocation::with_pointer(pointer.clone());
+					let encoded = value_location.encode();
 
-						(Some(pointer), Some(encoded))
-					} else {
-						// Small value, keep inline - pre-encode ValueLocation with inline value
-						let value_location = ValueLocation::with_inline_value(Arc::from(
-							value.clone().into_boxed_slice(),
-						));
-						let encoded = value_location.encode();
-						(None, Some(encoded))
+					// Add to versioned index if enabled
+					if enable_versioning {
+						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
-				} else {
-					// No value (delete operation) - pass None
-					// But still add to versioned index as tombstone
-					if self.core.opts.enable_versioning {
-						// Create InternalKey for delete operation
-						let encoded_key = InternalKey::new(
-							entry.key.clone(),
-							current_seq_num,
-							entry.kind,
-							timestamp,
-						)
-						.encode();
-						// For deletes, we don't need a value, just the key
-						timestamp_entries.push((encoded_key, Vec::new()));
+
+					(Some(pointer), Some(encoded))
+				}
+				Some(value) => {
+					// Small value or no VLog: store inline
+					let value_location = ValueLocation::with_inline_value(Arc::from(
+						value.clone().into_boxed_slice(),
+					));
+					let encoded = value_location.encode();
+
+					// Add to versioned index if enabled
+					if enable_versioning {
+						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
+					}
+
+					(None, Some(encoded))
+				}
+				None => {
+					// Delete operation: no value but may need versioned index entry
+					if enable_versioning {
+						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
 					(None, None)
-				};
+				}
+			};
 
-				// Add the entry to the processed batch with pre-encoded value
-				processed_batch.add_record_with_valueptr(
-					entry.kind,
-					&entry.key,
-					encoded_value.as_deref(),
-					valueptr,
-					timestamp,
-				)?;
-			}
+			// Add processed entry to batch
+			processed_batch.add_record_with_valueptr(
+				entry.kind,
+				&entry.key,
+				encoded_value.as_deref(),
+				valueptr,
+				timestamp,
+			)?;
+		}
 
-			// Flush VLog to ensure data is written to disk
+		// Flush VLog if present
+		if let Some(ref vlog) = self.core.vlog {
 			if sync {
 				vlog.sync()?;
 			} else {
 				vlog.flush()?;
 			}
-		} else {
-			// No VLog, all values stay inline - pre-encode all ValueLocations
-			for entry in batch.entries().iter() {
-				let encoded_value = if let Some(value) = &entry.value {
-					// Pre-encode ValueLocation with inline value
-					let value_location = ValueLocation::with_inline_value(Arc::from(
-						value.clone().into_boxed_slice(),
-					));
-					Some(value_location.encode())
-				} else {
-					// No value (delete operation) - pass None
-					None
-				};
-
-				processed_batch.add_record_with_valueptr(
-					entry.kind,
-					&entry.key,
-					encoded_value.as_deref(),
-					None,
-					entry.timestamp,
-				)?;
-			}
 		}
 
-		// Write to versioned index
-		if let Some(ref versioned_index) = self.core.versioned_index {
-			let mut versioned_index_guard = versioned_index.write().unwrap();
+		// Write to versioned index if present
+		if enable_versioning {
+			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write()?;
 			for (encoded_key, encoded_value) in timestamp_entries {
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
 		}
 
-		// Then write to WAL
+		// Write to WAL if present
 		if let Some(ref wal) = self.core.wal {
 			let mut wal_guard = wal.write();
 			let enc_bytes = processed_batch.encode()?;
@@ -532,7 +500,7 @@ impl CommitEnv for LsmCommitEnv {
 		// 2. Insert into active memtable for fast access
 		// 3. Trigger background flush if memtable is full
 		// 4. Apply write stall if too many L0 files accumulate
-		let active_memtable = self.core.active_memtable.read().unwrap();
+		let active_memtable = self.core.active_memtable.read()?;
 
 		// Check if memtable needs flushing
 		if active_memtable.size() > self.core.opts.max_memtable_size {
@@ -680,13 +648,13 @@ impl Core {
 			// Replay WAL with automatic repair on corruption
 			let wal_seq_num =
 				Self::replay_wal_with_repair(&wal_path, "Database startup", |memtable| {
-					let mut active_memtable = inner.active_memtable.write().unwrap();
+					let mut active_memtable = inner.active_memtable.write()?;
 					*active_memtable = memtable;
 					Ok(())
 				})?;
 
 			// Update sequence number to max of LSM sequence number and WAL sequence number
-			let current_seq_num = inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
+			let current_seq_num = inner.level_manifest.as_ref().unwrap().read()?.lsn();
 			let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
 			// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
@@ -744,7 +712,7 @@ impl Core {
 		// Step 3: Flush the active memtable only if it exceeds the configured size
 		// Skip this in memory-only mode since we don't persist to disk
 		if !self.inner.opts.in_memory_only {
-			let active_memtable = self.inner.active_memtable.read().unwrap();
+			let active_memtable = self.inner.active_memtable.read()?;
 			if active_memtable.size() > self.inner.opts.max_memtable_size {
 				self.inner.compact_memtable()?;
 			}
@@ -879,20 +847,19 @@ impl Tree {
 
 		// Replace the current levels with the reloaded ones
 		{
-			let mut levels_guard =
-				self.core.inner.level_manifest.as_ref().unwrap().write().unwrap();
+			let mut levels_guard = self.core.inner.level_manifest.as_ref().unwrap().write()?;
 			*levels_guard = new_levels;
 		}
 
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
-			let mut active_memtable = self.core.inner.active_memtable.write().unwrap();
+			let mut active_memtable = self.core.inner.active_memtable.write()?;
 			*active_memtable = Arc::new(MemTable::default());
 		}
 
 		{
-			let mut immutable_memtables = self.core.inner.immutable_memtables.write().unwrap();
+			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
 			*immutable_memtables = ImmutableMemtables::default();
 		}
 
@@ -908,14 +875,13 @@ impl Tree {
 		let wal_path = self.core.inner.opts.path.join("wal");
 		let wal_seq_num =
 			Core::replay_wal_with_repair(&wal_path, "Database restore", |memtable| {
-				let mut active_memtable = self.core.inner.active_memtable.write().unwrap();
+				let mut active_memtable = self.core.inner.active_memtable.write()?;
 				*active_memtable = memtable;
 				Ok(())
 			})?;
 
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num =
-			self.core.inner.level_manifest.as_ref().unwrap().read().unwrap().lsn();
+		let current_seq_num = self.core.inner.level_manifest.as_ref().unwrap().read()?.lsn();
 		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
 
 		// Set visible sequence number to highest of lsn from WAL or latest table in manifest

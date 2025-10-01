@@ -61,7 +61,7 @@ impl Compactor {
 	}
 
 	pub(crate) fn compact(&self) -> Result<()> {
-		let levels_guard = self.options.level_manifest.write().unwrap();
+		let levels_guard = self.options.level_manifest.write()?;
 		let choice = self.strategy.pick_levels(&levels_guard);
 
 		match choice {
@@ -129,7 +129,7 @@ impl Compactor {
 			}
 			Err(e) => {
 				// Restore the original state
-				let mut levels = self.options.level_manifest.write().unwrap();
+				let mut levels = self.options.level_manifest.write()?;
 				levels.unhide_tables(&input.tables_to_merge);
 				Err(e)
 			}
@@ -175,7 +175,7 @@ impl Compactor {
 	}
 
 	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
-		let mut manifest = self.options.level_manifest.write().unwrap();
+		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
 
 		let new_table_id = new_table.id;
@@ -281,7 +281,7 @@ impl Compactor {
 			};
 
 			// Take write lock and delete the collected keys
-			let mut write_index = versioned_index.write().unwrap();
+			let mut write_index = versioned_index.write()?;
 			let mut total_deleted = 0;
 
 			for key_to_delete in keys_to_delete {
