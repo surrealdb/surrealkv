@@ -544,6 +544,9 @@ pub(crate) struct VLog {
 
 	/// Options for VLog configuration
 	opts: Arc<Options>,
+
+	/// Reference to versioned index for atomic cleanup during GC
+	versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
 impl VLog {
@@ -553,7 +556,10 @@ impl VLog {
 	}
 
 	/// Creates a new VLog instance
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) fn new(
+		opts: Arc<Options>,
+		versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
+	) -> Result<Self> {
 		// Initialize the global delete list tree
 		let delete_list = Arc::new(DeleteList::new(opts.delete_list_dir())?);
 
@@ -574,6 +580,7 @@ impl VLog {
 			delete_list,
 			cache: opts.vlog_cache.clone(),
 			opts,
+			versioned_index,
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -589,7 +596,7 @@ impl VLog {
 	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
-			let mut writer = self.writer.write().unwrap();
+			let mut writer = self.writer.write()?;
 
 			if writer.is_none() || writer.as_ref().unwrap().size() >= self.max_file_size {
 				// Create new file
@@ -616,7 +623,7 @@ impl VLog {
 		};
 
 		// Now append the key+value pair
-		let mut writer = self.writer.write().unwrap();
+		let mut writer = self.writer.write()?;
 		let writer = writer.as_mut().unwrap();
 
 		let pointer = writer.append(key, value)?;
@@ -633,8 +640,8 @@ impl VLog {
 
 		let mut max_file_id: Option<u32> = None;
 		let mut max_file_path: Option<PathBuf> = None;
-		let mut file_handles = self.file_handles.write().unwrap();
-		let mut files_map = self.files_map.write().unwrap();
+		let mut file_handles = self.file_handles.write()?;
+		let mut files_map = self.files_map.write()?;
 
 		for entry in entries {
 			let entry = entry?;
@@ -692,7 +699,7 @@ impl VLog {
 				self.opts.compression as u8,
 			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
-			*self.writer.write().unwrap() = Some(writer);
+			*self.writer.write()? = Some(writer);
 		}
 
 		// println!(
@@ -707,7 +714,7 @@ impl VLog {
 	/// Retrieves (and caches) an open file handle for the given file ID
 	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
 		{
-			let handles = self.file_handles.read().unwrap();
+			let handles = self.file_handles.read()?;
 			if let Some(handle) = handles.get(&file_id) {
 				return Ok(handle.clone());
 			}
@@ -738,7 +745,7 @@ impl VLog {
 
 		let handle = Arc::new(file);
 
-		let mut handles = self.file_handles.write().unwrap();
+		let mut handles = self.file_handles.write()?;
 		// Another thread might have inserted it while we were opening the file
 		let entry = handles.entry(file_id).or_insert_with(|| handle.clone());
 		Ok(entry.clone())
@@ -840,9 +847,9 @@ impl VLog {
 
 	/// Deletes files that were marked for deletion when no iterators were active
 	fn delete_pending_files(&self) -> Result<()> {
-		let mut files_to_delete = self.files_to_be_deleted.write().unwrap();
-		let mut files_map = self.files_map.write().unwrap();
-		let mut file_handles = self.file_handles.write().unwrap();
+		let mut files_to_delete = self.files_to_be_deleted.write()?;
+		let mut files_map = self.files_map.write()?;
+		let mut file_handles = self.file_handles.write()?;
 
 		for file_id in files_to_delete.drain(..) {
 			file_handles.remove(&file_id);
@@ -924,7 +931,7 @@ impl VLog {
 	) -> Result<bool> {
 		// Check if file is already marked for deletion
 		{
-			let files_to_delete = self.files_to_be_deleted.read().unwrap();
+			let files_to_delete = self.files_to_be_deleted.read()?;
 			if files_to_delete.contains(&file_id) {
 				return Err(Error::Other(format!(
 					"Value log file already marked for deletion fid: {file_id}"
@@ -946,8 +953,8 @@ impl VLog {
 			// Schedule for safe deletion based on iterator count
 			if self.iterator_count() == 0 {
 				// No active iterators, safe to delete immediately
-				let mut files_map = self.files_map.write().unwrap();
-				let mut file_handles = self.file_handles.write().unwrap();
+				let mut files_map = self.files_map.write()?;
+				let mut file_handles = self.file_handles.write()?;
 				file_handles.remove(&file_id);
 				if let Some(vlog_file) = files_map.remove(&file_id) {
 					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
@@ -959,9 +966,9 @@ impl VLog {
 				}
 			} else {
 				// There are active iterators, defer deletion
-				let mut files_to_delete = self.files_to_be_deleted.write().unwrap();
+				let mut files_to_delete = self.files_to_be_deleted.write()?;
 				files_to_delete.push(file_id);
-				self.file_handles.write().unwrap().remove(&file_id);
+				self.file_handles.write()?.remove(&file_id);
 			}
 		}
 
@@ -996,6 +1003,7 @@ impl VLog {
 		let mut offset = VLogFileHeader::SIZE as u64;
 		let mut values_skipped = 0;
 		let mut stale_seq_nums: Vec<u64> = Vec::new();
+		let mut stale_internal_keys: Vec<InternalKey> = Vec::new();
 
 		let mut batch = Batch::default();
 		let mut batch_size = 0;
@@ -1054,6 +1062,7 @@ impl VLog {
 				// Skip this entry (it's stale)
 				values_skipped += 1;
 				stale_seq_nums.push(internal_key.seq_num());
+				stale_internal_keys.push(internal_key.clone());
 			} else {
 				let internal_key = InternalKey::decode(&key);
 
@@ -1095,10 +1104,20 @@ impl VLog {
 			commit_pipeline.commit(batch, true).await?;
 		}
 
+		// Clean up versioned index BEFORE cleaning delete list
+		// This ensures that when VLog entries are deleted, B+ tree entries are also cleaned up
+		if !stale_internal_keys.is_empty() {
+			if let Err(e) = self.cleanup_versioned_index_for_keys(&stale_internal_keys) {
+				eprintln!("Warning: Failed to clean up versioned index during VLog GC: {e}");
+				return Err(e);
+			}
+		}
+
 		// Clean up delete list entries for merged stale data
 		if !stale_seq_nums.is_empty() {
 			if let Err(e) = self.delete_list.delete_entries_batch(stale_seq_nums) {
 				eprintln!("Warning: Failed to clean up delete list after merge: {e}");
+				return Err(e);
 			}
 		}
 
@@ -1122,7 +1141,7 @@ impl VLog {
 
 	/// Syncs all data to disk
 	pub(crate) fn sync(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write().unwrap() {
+		if let Some(ref mut writer) = *self.writer.write()? {
 			writer.sync()?;
 		}
 
@@ -1132,7 +1151,7 @@ impl VLog {
 	}
 
 	pub(crate) fn flush(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write().unwrap() {
+		if let Some(ref mut writer) = *self.writer.write()? {
 			writer.flush()?;
 		}
 
@@ -1239,6 +1258,38 @@ impl VLog {
 		self.delete_list.is_stale(seq_num)
 	}
 
+	/// Cleans up deleted keys from the versioned index atomically during VLog GC
+	/// This ensures that when VLog entries are deleted, corresponding B+ tree entries are also cleaned up
+	fn cleanup_versioned_index_for_keys(&self, deleted_keys: &[InternalKey]) -> Result<()> {
+		if !self.opts.enable_versioning || deleted_keys.is_empty() {
+			return Ok(());
+		}
+
+		if let Some(ref versioned_index) = self.versioned_index {
+			// Take write lock and delete the specific versions
+			let mut write_index = versioned_index.write()?;
+			let mut total_deleted = 0;
+
+			for internal_key in deleted_keys {
+				// Encode the specific internal key to delete
+				let encoded_key = internal_key.encode();
+
+				if let Err(e) = write_index.delete(&encoded_key) {
+					eprintln!("Failed to delete versioned key: {}", e);
+					return Err(e.into());
+				} else {
+					total_deleted += 1;
+				}
+			}
+
+			if total_deleted > 0 {
+				eprintln!("VLog GC: Cleaned up {} versioned index entries", total_deleted);
+			}
+		}
+
+		Ok(())
+	}
+
 	pub(crate) fn close(&self) -> Result<()> {
 		self.sync()?;
 		self.delete_list.close()?;
@@ -1307,7 +1358,6 @@ impl VLogGCManager {
 				}
 
 				running.store(true, Ordering::SeqCst);
-				// TODO: Use commit_pipeline during GC when VLog is enhanced to support it
 				if let Err(e) = vlog.garbage_collect(commit_pipeline.clone()).await {
 					// TODO: Handle error appropriately
 					eprintln!("\n VLog GC task error: {e:?}");
@@ -1378,7 +1428,7 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
@@ -1395,7 +1445,7 @@ impl DeleteList {
 
 	/// Checks if a sequence number is in the delete list (stale)
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		let tree = self.tree.read().unwrap();
+		let tree = self.tree.read()?;
 
 		// Convert sequence number to bytes for lookup
 		let seq_key = seq_num.to_be_bytes().to_vec();
@@ -1414,7 +1464,7 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
@@ -1429,7 +1479,7 @@ impl DeleteList {
 	}
 
 	fn close(&self) -> Result<()> {
-		let mut tree = self.tree.write().unwrap();
+		let mut tree = self.tree.write()?;
 		tree.sync()?;
 		tree.close()?;
 		Ok(())
@@ -1457,7 +1507,7 @@ mod tests {
 		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 		let opts = Arc::new(opts);
-		let vlog = VLog::new(opts.clone()).unwrap();
+		let vlog = VLog::new(opts.clone(), None).unwrap();
 		(vlog, temp_dir, opts)
 	}
 
@@ -1627,7 +1677,7 @@ mod tests {
 		drop(vlog1);
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
-		let vlog2 = VLog::new(opts.clone()).unwrap();
+		let vlog2 = VLog::new(opts.clone(), None).unwrap();
 
 		// Verify that all existing files can be read
 		for (i, pointer) in pointers.iter().enumerate() {
@@ -1958,7 +2008,7 @@ mod tests {
 
 		// Phase 1: Create initial VLog and add some data (but not enough to fill the file)
 		{
-			let vlog1 = VLog::new(Arc::new(opts.clone())).unwrap();
+			let vlog1 = VLog::new(Arc::new(opts.clone()), None).unwrap();
 
 			// Add some data to the first file
 			for i in 0..3 {
@@ -1997,7 +2047,7 @@ mod tests {
 
 		// Phase 2: Restart VLog and verify it continues with the last file
 		{
-			let vlog2 = VLog::new(Arc::new(opts.clone())).unwrap();
+			let vlog2 = VLog::new(Arc::new(opts.clone()), None).unwrap();
 
 			// Check that active_writer_id is set to the last file (file 0)
 			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -2101,7 +2151,7 @@ mod tests {
 
 		// Phase 1: Create VLog and add enough data to create 5+ files
 		{
-			let vlog1 = VLog::new(Arc::new(opts.clone())).unwrap();
+			let vlog1 = VLog::new(Arc::new(opts.clone()), None).unwrap();
 
 			// Add enough data to create at least 5 VLog files
 			for i in 0..50 {
@@ -2134,7 +2184,7 @@ mod tests {
 
 		// Phase 2: Restart VLog and verify it picks up the correct active writer
 		{
-			let vlog2 = VLog::new(Arc::new(opts.clone())).unwrap();
+			let vlog2 = VLog::new(Arc::new(opts.clone()), None).unwrap();
 
 			// Check that active_writer_id is set to the highest file ID
 			let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -2357,7 +2407,7 @@ mod tests {
 			let vlog_file_path = opts.vlog_file_path(file_id as u64);
 			std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
 
-			let vlog = VLog::new(opts.clone()).unwrap();
+			let vlog = VLog::new(opts.clone(), None).unwrap();
 
 			// Verify ALL phase 1 data can still be read (proving no overwrite occurred)
 			for (i, (pointer, (_, expected_value))) in
@@ -2438,5 +2488,156 @@ mod tests {
 				all_offsets[i - 1]
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
+		use crate::compaction::leveled::Strategy;
+		use crate::lsm::{CompactionOperations, TreeBuilder};
+		use crate::util::MockLogicalClock;
+
+		// Create test environment
+		let temp_dir = TempDir::new().unwrap();
+
+		// Set up mock clock and retention period
+		let mock_clock = Arc::new(MockLogicalClock::with_timestamp(1000));
+		let retention_ns = 2000; // 2 seconds retention - very short for testing
+
+		let opts = Options {
+			clock: mock_clock.clone(),
+			vlog_max_file_size: 950, // Small files to force frequent rotations (like VLog compaction test)
+			vlog_gc_discard_ratio: 0.0, // Disable discard ratio to preserve all values initially
+			level_count: 2,          // Two levels for compaction strategy
+			..Options::default()
+		};
+
+		// Create Tree with versioning enabled
+		let tree = TreeBuilder::with_options(opts)
+			.with_path(temp_dir.path().to_path_buf())
+			.with_versioning(true, retention_ns)
+			.build()
+			.unwrap();
+
+		// Insert multiple versions of the same key with LARGE values to fill VLog files
+		let user_key = b"test_key";
+
+		// Insert versions with large values to fill VLog files quickly
+		for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
+			let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
+			let mut tx = tree.begin().unwrap();
+			tx.set_at_ts(user_key, value.as_bytes(), *ts).unwrap();
+			tx.commit().await.unwrap();
+			tree.flush().unwrap(); // Force flush after each version
+		}
+
+		// Insert and delete a different key to create stale entries
+		{
+			let mut tx = tree.begin().unwrap();
+			tx.set_at_ts(b"other_key", &b"other_value_large_data".repeat(50), 5000).unwrap();
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Delete other_key to make it stale
+			let mut tx = tree.begin().unwrap();
+			tx.delete(b"other_key").unwrap();
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+		}
+
+		// Verify all versions exist using the public API
+		let tx = tree.begin().unwrap();
+		let scan_all = tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+		assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
+
+		drop(tx);
+
+		// Advance time to make some versions expire
+		mock_clock.set_time(6000);
+
+		// Trigger LSM compaction first
+		let strategy = Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+
+		// Check VLog file stats before GC
+		if let Some(vlog) = &tree.core.vlog {
+			let stats = vlog.get_all_file_stats();
+			for (file_id, total_size, discard_bytes, ratio) in stats {
+				println!(
+					"  File {}: total={}, discard={}, ratio={:.2}",
+					file_id, total_size, discard_bytes, ratio
+				);
+			}
+		}
+
+		// Now run VLog garbage collection multiple times to process all files
+		let mut all_deleted_files = Vec::new();
+
+		loop {
+			let deleted_files = tree.garbage_collect_vlog().await.unwrap();
+			if deleted_files.is_empty() {
+				break;
+			}
+
+			all_deleted_files.extend(deleted_files);
+		}
+
+		// Verify that some versions were cleaned up using the public API
+		let tx = tree.begin().unwrap();
+		let scan_after =
+			tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+
+		// We should have at least some versions remaining
+		assert!(!scan_after.is_empty(), "Should have at least some versions remaining");
+
+		// If GC deleted files, we should have fewer versions
+		if !all_deleted_files.is_empty() {
+			// We should have fewer versions after GC
+			assert!(
+				scan_after.len() < 6,
+				"Should have fewer versions after GC deleted files. Before: 6, After: {}",
+				scan_after.len()
+			);
+		}
+
+		// Test specific timestamp queries to verify which versions were deleted
+		let scan_at_ts1 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 1000, None).unwrap();
+		let scan_at_ts2 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 2000, None).unwrap();
+		let scan_at_ts3 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 3000, None).unwrap();
+		let scan_at_ts4 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 4000, None).unwrap();
+		let scan_at_ts5 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6000, None).unwrap();
+		let scan_at_ts6 =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6001, None).unwrap();
+
+		// The key insight: VLog GC only processes files with high discard ratios
+		// Files 0, 1, 2 had high discard ratios (0.97) and were processed
+		// Files 3, 4, 5, 6 had zero discard ratios (0.00) and were NOT processed
+		// This means versions in files 0, 1, 2 were cleaned up, but versions in files 3+ were not
+
+		// Verify that versions in processed files (1000, 2000, 3000) are NOT accessible
+		assert_eq!(
+			scan_at_ts1.len(),
+			0,
+			"Version at timestamp 1000 should be deleted (was in processed file)"
+		);
+		assert_eq!(
+			scan_at_ts2.len(),
+			0,
+			"Version at timestamp 2000 should be deleted (was in processed file)"
+		);
+		assert_eq!(
+			scan_at_ts3.len(),
+			0,
+			"Version at timestamp 3000 should be deleted (was in processed file)"
+		);
+
+		// Verify that recent versions (6000, 6001) are still accessible
+		assert_eq!(scan_at_ts4.len(), 1, "Version at timestamp 4000 should still exist (recent)");
+		assert_eq!(scan_at_ts5.len(), 1, "Version at timestamp 6000 should still exist (recent)");
+		assert_eq!(scan_at_ts6.len(), 1, "Version at timestamp 6001 should still exist (recent)");
 	}
 }

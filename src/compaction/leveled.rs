@@ -522,14 +522,13 @@ mod tests {
 		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone()).unwrap());
+		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone(), None).unwrap());
 
 		CompactionOptions {
 			lopts: opts,
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
-			versioned_index: None,
 		}
 	}
 
@@ -2024,8 +2023,7 @@ mod tests {
 		let bottom_result: Vec<_> = comp_iter_bottom.collect();
 
 		// Bottom level should filter out tombstones
-		let has_tombstones =
-			bottom_result.iter().any(|(key, _)| key.kind() == InternalKeyKind::Delete);
+		let has_tombstones = bottom_result.iter().any(|(key, _)| key.is_hard_delete_marker());
 		assert!(!has_tombstones, "Bottom level should filter out tombstones");
 
 		// Key should be completely gone after tombstone consumes older value

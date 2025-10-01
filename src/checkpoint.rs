@@ -181,7 +181,7 @@ impl DatabaseCheckpoint {
 
 		// Step 2: Get current sequence number from the levels
 		let sequence_number = {
-			let levels_guard = self.core.level_manifest.as_ref().unwrap().read().unwrap();
+			let levels_guard = self.core.level_manifest.as_ref().unwrap().read()?;
 			levels_guard.lsn()
 		};
 
@@ -270,12 +270,12 @@ impl DatabaseCheckpoint {
 		loop {
 			// Check if there are any memtables to flush
 			let has_active = {
-				let active_guard = self.core.active_memtable.read().unwrap();
+				let active_guard = self.core.active_memtable.read()?;
 				!active_guard.is_empty()
 			};
 
 			let has_immutable = {
-				let immutable_guard = self.core.immutable_memtables.read().unwrap();
+				let immutable_guard = self.core.immutable_memtables.read()?;
 				!immutable_guard.is_empty()
 			};
 
@@ -292,7 +292,7 @@ impl DatabaseCheckpoint {
 
 	/// Copies all SSTables to the checkpoint directory
 	fn copy_sstables(&self, dest_dir: &Path) -> Result<(usize, u64)> {
-		let levels_guard = self.core.level_manifest.as_ref().unwrap().read().unwrap();
+		let levels_guard = self.core.level_manifest.as_ref().unwrap().read()?;
 		let mut total_size = 0u64;
 		let mut count = 0usize;
 

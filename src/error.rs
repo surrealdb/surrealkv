@@ -125,3 +125,9 @@ impl From<crate::bplustree::tree::BPlusTreeError> for Error {
 		Error::BPlusTree(err.to_string())
 	}
 }
+
+impl<T> From<std::sync::PoisonError<T>> for Error {
+	fn from(_err: std::sync::PoisonError<T>) -> Self {
+		Error::Other("Lock poisoned - another thread panicked while holding the lock".to_string())
+	}
+}

@@ -8,13 +8,13 @@ surrealkv is a versioned, low-level, persistent, embedded key-value database imp
 
 ## Features
 
-- ✨ **ACID Compliance**: Full support for Atomicity, Consistency, Isolation, and Durability
-- 🔄 **Rich Transaction Support**: Atomic operations for multiple inserts, updates, and deletes
-- 🔒 **Isolation Level**: Supports Snapshot Isolation
-- 💾 **Durability Guaranteed**: Persistent storage with protection against system failures
-- 📦 **Embedded Database**: Easily integrate into your Rust applications
-- 🔄 **MVCC Support**: Non-blocking concurrent reads and writes with snapshot isolation
-- 📚 [TODO] **Built-in Versioning**: Track and access historical versions of your data
+- **ACID Compliance**: Full support for Atomicity, Consistency, Isolation, and Durability
+- **Rich Transaction Support**: Atomic operations for multiple inserts, updates, and deletes
+- **Isolation Level**: Supports Snapshot Isolation
+- **Durability Guaranteed**: Persistent storage with protection against system failures
+- **Embedded Database**: Easily integrate into your Rust applications
+- **MVCC Support**: Non-blocking concurrent reads and writes with snapshot isolation
+- [TODO] **Built-in Versioning**: Track and access historical versions of your data
 
 ## Quick Start
 
