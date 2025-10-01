@@ -522,14 +522,13 @@ mod tests {
 		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone()).unwrap());
+		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone(), None).unwrap());
 
 		CompactionOptions {
 			lopts: opts,
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
-			versioned_index: None,
 		}
 	}
 

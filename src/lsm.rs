@@ -142,12 +142,6 @@ impl CoreInner {
 			(wal, level_manifest)
 		};
 
-		let vlog = if opts.enable_vlog && !opts.in_memory_only {
-			Some(Arc::new(VLog::new(opts.clone())?))
-		} else {
-			None
-		};
-
 		// Initialize versioned index if versioned queries are enabled
 		let versioned_index = if opts.enable_versioning && !opts.in_memory_only {
 			// Create the versioned index directory if it doesn't exist
@@ -158,6 +152,12 @@ impl CoreInner {
 			});
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(RwLock::new(tree)))
+		} else {
+			None
+		};
+
+		let vlog = if opts.enable_vlog && !opts.in_memory_only {
+			Some(Arc::new(VLog::new(opts.clone(), versioned_index.clone())?))
 		} else {
 			None
 		};

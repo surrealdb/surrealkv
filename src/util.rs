@@ -68,6 +68,10 @@ impl MockLogicalClock {
 			current_tick: AtomicI64::new(timestamp as i64),
 		}
 	}
+
+	pub fn set_time(&self, timestamp: u64) {
+		self.current_tick.store(timestamp as i64, AtomicOrdering::SeqCst);
+	}
 }
 
 #[cfg(test)]

@@ -183,9 +183,6 @@ pub(crate) struct CompactionIterator<'a> {
 	enable_versioning: bool,
 	retention_period_ns: u64,
 
-	/// Keys that are being deleted during compaction (for versioned index cleanup)
-	deleted_keys: Vec<Key>,
-
 	/// Logical clock for time-based operations
 	clock: Arc<dyn LogicalClock>,
 
@@ -214,7 +211,6 @@ impl<'a> CompactionIterator<'a> {
 			delete_list_batch: Vec::new(),
 			enable_versioning,
 			retention_period_ns,
-			deleted_keys: Vec::new(),
 			clock,
 			initialized: false,
 		}
@@ -244,11 +240,6 @@ impl<'a> CompactionIterator<'a> {
 		Ok(())
 	}
 
-	/// Returns the keys that were deleted during compaction (for versioned index cleanup)
-	pub(crate) fn take_deleted_keys(&mut self) -> Vec<Key> {
-		std::mem::take(&mut self.deleted_keys)
-	}
-
 	/// Process all collected versions of the current key and return the one to output
 	fn process_current_key_versions(&mut self) -> Option<(Arc<InternalKey>, Value)> {
 		if self.current_key_versions.is_empty() {
@@ -262,11 +253,6 @@ impl<'a> CompactionIterator<'a> {
 		let latest_key = self.current_key_versions[0].0.clone();
 		let latest_value = self.current_key_versions[0].1.clone();
 		let is_latest_delete_marker = latest_key.is_hard_delete_marker();
-
-		// If the latest version is a hard delete marker and we're at bottom level, collect the key for versioned index cleanup
-		if is_latest_delete_marker && self.is_bottom_level && self.enable_versioning {
-			self.deleted_keys.push(latest_key.user_key.clone());
-		}
 
 		// Process all versions for delete list and discard stats
 		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
@@ -431,7 +417,7 @@ mod tests {
 		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 		std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-		let vlog = Arc::new(VLog::new(Arc::new(opts)).unwrap());
+		let vlog = Arc::new(VLog::new(Arc::new(opts), None).unwrap());
 		(vlog, temp_dir)
 	}
 
@@ -1316,61 +1302,7 @@ mod tests {
 			);
 		}
 
-		// Test case 2: Range delete should always be marked as stale
-		{
-			let (vlog, _temp_dir) = create_test_vlog();
-			let user_key = "range_delete_key";
-
-			// Create a range delete
-			let range_delete_key = create_internal_key_with_timestamp(
-				user_key,
-				200,
-				InternalKeyKind::RangeDelete,
-				current_time,
-			);
-
-			// Create old value with timestamp beyond retention
-			let old_value_key = create_internal_key_with_timestamp(
-				user_key,
-				100,
-				InternalKeyKind::Set,
-				current_time - retention_period - 1,
-			);
-
-			let empty_value: Vec<u8> = Vec::new();
-			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-
-			let items = vec![
-				(range_delete_key.clone(), empty_value.into()),
-				(old_value_key.clone(), actual_value.clone()),
-			];
-
-			let iter = Box::new(MockIterator::new(items));
-			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				true, // bottom level
-				Some(vlog.clone()),
-				true, // enable versioning
-				retention_period,
-				clock,
-			);
-
-			// Process the entries
-			let _result: Vec<_> = comp_iter.by_ref().collect();
-			comp_iter.flush_delete_list_batch().unwrap();
-
-			// Range delete should be marked as stale (it's a hard delete marker)
-			assert!(
-				vlog.is_stale(200).unwrap(),
-				"Range delete (seq=200) should be marked as stale - it's a hard delete marker"
-			);
-
-			// Old value should be marked as stale (older version)
-			assert!(vlog.is_stale(100).unwrap(), "Old value (seq=100) should be marked as stale");
-		}
-
-		// Test case 3: Hard delete should always be marked as stale
+		// Test case 2: Hard delete should always be marked as stale
 		{
 			let (vlog, _temp_dir) = create_test_vlog();
 			let user_key = "hard_delete_key";
@@ -1424,7 +1356,7 @@ mod tests {
 			assert!(vlog.is_stale(100).unwrap(), "Old value (seq=100) should be marked as stale");
 		}
 
-		// Test case 4: Soft delete with versioning disabled
+		// Test case 3: Soft delete with versioning disabled
 		{
 			let (vlog, _temp_dir) = create_test_vlog();
 			let user_key = "soft_delete_no_versioning";
@@ -1481,7 +1413,7 @@ mod tests {
 			);
 		}
 
-		// Test case 5: Soft delete beyond retention period
+		// Test case 4: Soft delete beyond retention period
 		{
 			let (vlog, _temp_dir) = create_test_vlog();
 			let user_key = "soft_delete_old";
