@@ -128,7 +128,7 @@ impl CoreInner {
 		// TODO: Add a way to recover from the WAL or level manifest
 		// Initialize the transaction oracle for MVCC support
 		// The oracle provides monotonic timestamps for transaction ordering
-		let oracle = Oracle::new();
+		let oracle = Oracle::new(opts.clock.clone());
 
 		// Initialize WAL and level manifest only if not in memory-only mode
 		let (wal, level_manifest) = if opts.in_memory_only {

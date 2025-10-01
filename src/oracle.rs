@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Error, Result};
 use crate::transaction::Transaction;
+use crate::util::LogicalClock;
 
 /// Entry used for tracking transaction operations in the commit queue
 struct CommitEntry {
@@ -48,22 +48,21 @@ pub(crate) struct Oracle {
 
 	/// Track active transaction start points
 	active_txn_starts: SkipMap<u64, AtomicUsize>,
+
+	/// Logical clock for time-based operations
+	clock: Arc<dyn LogicalClock>,
 }
 
 impl Oracle {
 	/// Creates a new Oracle with default configuration.
-	pub(crate) fn new() -> Self {
+	pub(crate) fn new(clock: Arc<dyn LogicalClock>) -> Self {
 		Self {
 			transaction_commit_id: AtomicU64::new(0),
 			transaction_commit_queue: SkipMap::new(),
 			max_queue_size: 10000,
 			active_txn_starts: SkipMap::new(),
+			clock,
 		}
-	}
-
-	/// Gets the current timestamp (can be used for commit timestamp)
-	pub(crate) fn now() -> u64 {
-		SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 	}
 
 	/// Register a new transaction start
@@ -117,7 +116,7 @@ impl Oracle {
 		self.cleanup_queue();
 
 		// No conflicts found, return the tx_id and commit timestamp
-		let commit_ts = Self::now();
+		let commit_ts = self.clock.now();
 
 		Ok(commit_ts)
 	}

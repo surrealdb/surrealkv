@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
+use crate::util::LogicalClock;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{sstable::InternalKey, Key, Value};
@@ -180,6 +181,9 @@ pub(crate) struct CompactionIterator<'a> {
 	/// Keys that are being deleted during compaction (for versioned index cleanup)
 	deleted_keys: Vec<Key>,
 
+	/// Logical clock for time-based operations
+	clock: Arc<dyn LogicalClock>,
+
 	initialized: bool,
 }
 
@@ -190,6 +194,7 @@ impl<'a> CompactionIterator<'a> {
 		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,
 		retention_period_ns: u64,
+		clock: Arc<dyn LogicalClock>,
 	) -> Self {
 		let heap = BinaryHeap::with_capacity(iterators.len());
 
@@ -205,6 +210,7 @@ impl<'a> CompactionIterator<'a> {
 			enable_versioning,
 			retention_period_ns,
 			deleted_keys: Vec::new(),
+			clock,
 			initialized: false,
 		}
 	}
@@ -257,16 +263,6 @@ impl<'a> CompactionIterator<'a> {
 			self.deleted_keys.push(latest_key.user_key.clone());
 		}
 
-		// Get current time for retention period check
-		let current_time = if self.enable_versioning && self.retention_period_ns > 0 {
-			std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap_or_default()
-				.as_nanos() as u64
-		} else {
-			0
-		};
-
 		// Process all versions for delete list and discard stats
 		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
@@ -289,10 +285,11 @@ impl<'a> CompactionIterator<'a> {
 			} else {
 				// Older version of a SET operation: check retention period
 				if self.enable_versioning && self.retention_period_ns > 0 {
+					// Get current time for retention period check
+					let current_time = self.clock.now();
 					let key_timestamp = key.timestamp;
-					// If timestamp is 0 (not set), assume it's old enough to be deleted
-					let is_within_retention = key_timestamp == 0
-						|| (current_time - key_timestamp) <= self.retention_period_ns;
+					let age = current_time - key_timestamp;
+					let is_within_retention = age <= self.retention_period_ns;
 					// Mark as stale only if NOT within retention period
 					!is_within_retention
 				} else {
@@ -395,6 +392,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		sstable::{InternalKey, InternalKeyKind},
+		util::MockLogicalClock,
 		Options, VLogChecksumLevel, Value,
 	};
 	use std::sync::Arc;
@@ -406,6 +404,15 @@ mod tests {
 		kind: InternalKeyKind,
 	) -> Arc<InternalKey> {
 		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0).into()
+	}
+
+	fn create_internal_key_with_timestamp(
+		user_key: &str,
+		sequence: u64,
+		kind: InternalKeyKind,
+		timestamp: u64,
+	) -> Arc<InternalKey> {
+		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp).into()
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {
@@ -684,6 +691,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		// Should return only the latest version (seq=300)
@@ -739,6 +747,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		// Consume the iterator
@@ -796,6 +805,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		// At bottom level, hard_delete should NOT be returned
@@ -837,6 +847,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		// At non-bottom level, hard_delete SHOULD be returned
@@ -900,6 +911,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
@@ -980,6 +992,7 @@ mod tests {
 			None,  // no vlog
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		// Should still work and return latest version
@@ -1052,6 +1065,7 @@ mod tests {
 			Some(vlog.clone()),
 			false,
 			0,
+			Arc::new(MockLogicalClock::default()),
 		);
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
@@ -1130,27 +1144,31 @@ mod tests {
 		// Create test VLog
 		let (vlog, _temp_dir) = create_test_vlog();
 
-		// Create test data with timestamps
-		let current_time = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap_or_default()
-			.as_nanos() as u64;
+		// Use fixed current time for consistent testing
+		let current_time = 1000000000000; // Fixed current time
+		let retention_period_ns = 5_000_000_000; // 5 seconds
 
 		// Create keys with different timestamps and operations
-		let _recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
-		let _old_time = current_time - 10_000_000_000; // 10 seconds ago (outside retention)
+		let recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
+		let old_time = current_time - 3_000_000_000; // 3 seconds ago (within retention)
 
 		// Test case 1: Recent SET, Old SET, Recent DELETE
 		// Expected: Recent SET kept, Old SET kept (within retention), Recent DELETE marked stale
-		let key1_recent_set = create_internal_key("key1", 100, InternalKeyKind::Set);
-		let key1_old_set = create_internal_key("key1", 200, InternalKeyKind::Set);
-		let key1_recent_delete = create_internal_key("key1", 300, InternalKeyKind::Delete);
+		let key1_recent_set =
+			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, recent_time);
+		let key1_old_set =
+			create_internal_key_with_timestamp("key1", 200, InternalKeyKind::Set, old_time);
+		let key1_recent_delete =
+			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Delete, recent_time);
 
 		// Test case 2: Old SET, Recent SET, Old DELETE
 		// Expected: Recent SET kept, Old SET kept (within retention), Old DELETE marked stale
-		let key2_old_set = create_internal_key("key2", 400, InternalKeyKind::Set);
-		let key2_recent_set = create_internal_key("key2", 500, InternalKeyKind::Set);
-		let key2_old_delete = create_internal_key("key2", 600, InternalKeyKind::Delete);
+		let key2_old_set =
+			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
+		let key2_recent_set =
+			create_internal_key_with_timestamp("key2", 500, InternalKeyKind::Set, recent_time);
+		let key2_old_delete =
+			create_internal_key_with_timestamp("key2", 600, InternalKeyKind::Delete, old_time);
 
 		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
 		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
@@ -1173,13 +1191,14 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Test with versioning enabled and 5-second retention period
-		let retention_period_ns = 5_000_000_000; // 5 seconds
+		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // not bottom level
 			Some(vlog.clone()),
 			true, // enable versioning
 			retention_period_ns,
+			clock,
 		);
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
@@ -1228,5 +1247,290 @@ mod tests {
 			!vlog.is_stale(600).unwrap(),
 			"key2 old DELETE (seq=600) should NOT be marked as stale (within retention)"
 		);
+	}
+
+	#[tokio::test]
+	async fn test_delete_list_logic() {
+		let current_time = 1000000000000; // Fixed current time for testing
+		let retention_period = 1000000; // 1 millisecond
+
+		// Test case 1: Soft delete should respect retention period
+		{
+			let (vlog, _temp_dir) = create_test_vlog();
+			let user_key = "soft_delete_key";
+
+			// Create a soft delete within retention period
+			let soft_delete_key = create_internal_key_with_timestamp(
+				user_key,
+				200,
+				InternalKeyKind::SoftDelete,
+				current_time,
+			);
+
+			// Create old value with timestamp beyond retention
+			let old_value_key = create_internal_key_with_timestamp(
+				user_key,
+				100,
+				InternalKeyKind::Set,
+				current_time - retention_period - 1,
+			);
+
+			let empty_value: Vec<u8> = Vec::new();
+			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+			let items = vec![
+				(soft_delete_key.clone(), empty_value.into()),
+				(old_value_key.clone(), actual_value.clone()),
+			];
+
+			let iter = Box::new(MockIterator::new(items));
+			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				retention_period,
+				clock,
+			);
+
+			// Process the entries
+			let _result: Vec<_> = comp_iter.by_ref().collect();
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Soft delete should NOT be marked as stale (it's not a hard delete marker)
+			assert!(
+				!vlog.is_stale(200).unwrap(),
+				"Soft delete (seq=200) should NOT be marked as stale - it respects retention period"
+			);
+
+			// Old value should be marked as stale (older version, respects retention period)
+			assert!(
+				vlog.is_stale(100).unwrap(),
+				"Old value (seq=100) should be marked as stale - older version beyond retention period"
+			);
+		}
+
+		// Test case 2: Range delete should always be marked as stale
+		{
+			let (vlog, _temp_dir) = create_test_vlog();
+			let user_key = "range_delete_key";
+
+			// Create a range delete
+			let range_delete_key = create_internal_key_with_timestamp(
+				user_key,
+				200,
+				InternalKeyKind::RangeDelete,
+				current_time,
+			);
+
+			// Create old value with timestamp beyond retention
+			let old_value_key = create_internal_key_with_timestamp(
+				user_key,
+				100,
+				InternalKeyKind::Set,
+				current_time - retention_period - 1,
+			);
+
+			let empty_value: Vec<u8> = Vec::new();
+			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+			let items = vec![
+				(range_delete_key.clone(), empty_value.into()),
+				(old_value_key.clone(), actual_value.clone()),
+			];
+
+			let iter = Box::new(MockIterator::new(items));
+			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				retention_period,
+				clock,
+			);
+
+			// Process the entries
+			let _result: Vec<_> = comp_iter.by_ref().collect();
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Range delete should be marked as stale (it's a hard delete marker)
+			assert!(
+				vlog.is_stale(200).unwrap(),
+				"Range delete (seq=200) should be marked as stale - it's a hard delete marker"
+			);
+
+			// Old value should be marked as stale (older version)
+			assert!(vlog.is_stale(100).unwrap(), "Old value (seq=100) should be marked as stale");
+		}
+
+		// Test case 3: Hard delete should always be marked as stale
+		{
+			let (vlog, _temp_dir) = create_test_vlog();
+			let user_key = "hard_delete_key";
+
+			// Create a hard delete
+			let hard_delete_key = create_internal_key_with_timestamp(
+				user_key,
+				200,
+				InternalKeyKind::Delete,
+				current_time,
+			);
+
+			// Create old value with timestamp beyond retention
+			let old_value_key = create_internal_key_with_timestamp(
+				user_key,
+				100,
+				InternalKeyKind::Set,
+				current_time - retention_period - 1,
+			);
+
+			let empty_value: Vec<u8> = Vec::new();
+			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+			let items = vec![
+				(hard_delete_key.clone(), empty_value.into()),
+				(old_value_key.clone(), actual_value.clone()),
+			];
+
+			let iter = Box::new(MockIterator::new(items));
+			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				retention_period,
+				clock,
+			);
+
+			// Process the entries
+			let _result: Vec<_> = comp_iter.by_ref().collect();
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Hard delete should be marked as stale (it's a hard delete marker)
+			assert!(
+				vlog.is_stale(200).unwrap(),
+				"Hard delete (seq=200) should be marked as stale - it's a hard delete marker"
+			);
+
+			// Old value should be marked as stale (older version)
+			assert!(vlog.is_stale(100).unwrap(), "Old value (seq=100) should be marked as stale");
+		}
+
+		// Test case 4: Soft delete with versioning disabled
+		{
+			let (vlog, _temp_dir) = create_test_vlog();
+			let user_key = "soft_delete_no_versioning";
+
+			// Create a soft delete
+			let soft_delete_key = create_internal_key_with_timestamp(
+				user_key,
+				200,
+				InternalKeyKind::SoftDelete,
+				current_time,
+			);
+
+			// Create old value with timestamp beyond retention
+			let old_value_key = create_internal_key_with_timestamp(
+				user_key,
+				100,
+				InternalKeyKind::Set,
+				current_time - retention_period - 1,
+			);
+
+			let empty_value: Vec<u8> = Vec::new();
+			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+			let items = vec![
+				(soft_delete_key.clone(), empty_value.into()),
+				(old_value_key.clone(), actual_value.clone()),
+			];
+
+			let iter = Box::new(MockIterator::new(items));
+			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				true, // bottom level
+				Some(vlog.clone()),
+				false, // disable versioning
+				retention_period,
+				clock,
+			);
+
+			// Process the entries
+			let _result: Vec<_> = comp_iter.by_ref().collect();
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Soft delete should NOT be marked as stale (it's the latest version)
+			assert!(
+				!vlog.is_stale(200).unwrap(),
+				"Soft delete (seq=200) should NOT be marked as stale - it's the latest version"
+			);
+
+			// Old value should be marked as stale (older version, versioning disabled)
+			assert!(
+				vlog.is_stale(100).unwrap(),
+				"Old value (seq=100) should be marked as stale when versioning is disabled"
+			);
+		}
+
+		// Test case 5: Soft delete beyond retention period
+		{
+			let (vlog, _temp_dir) = create_test_vlog();
+			let user_key = "soft_delete_old";
+
+			// Create a soft delete with old timestamp (beyond retention)
+			let soft_delete_key = create_internal_key_with_timestamp(
+				user_key,
+				200,
+				InternalKeyKind::SoftDelete,
+				current_time - retention_period - 1,
+			);
+
+			// Create old value with timestamp within retention
+			let old_value_key = create_internal_key_with_timestamp(
+				user_key,
+				100,
+				InternalKeyKind::Set,
+				current_time - retention_period + 1,
+			);
+
+			let empty_value: Vec<u8> = Vec::new();
+			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+
+			let items = vec![
+				(soft_delete_key.clone(), empty_value.into()),
+				(old_value_key.clone(), actual_value.clone()),
+			];
+
+			let iter = Box::new(MockIterator::new(items));
+			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				retention_period,
+				clock,
+			);
+
+			// Process the entries
+			let _result: Vec<_> = comp_iter.by_ref().collect();
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Soft delete should NOT be marked as stale (it's the latest version)
+			assert!(
+				!vlog.is_stale(200).unwrap(),
+				"Soft delete (seq=200) should NOT be marked as stale - it's the latest version"
+			);
+
+			// Old value should NOT be marked as stale (within retention period)
+			assert!(
+				!vlog.is_stale(100).unwrap(),
+				"Old value (seq=100) should NOT be marked as stale - within retention period"
+			);
+		}
 	}
 }

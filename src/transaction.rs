@@ -2,7 +2,6 @@ use std::cmp::Ordering;
 use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
@@ -471,8 +470,7 @@ impl Transaction {
 		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
 
 		// Generate a single timestamp for this commit
-		let commit_timestamp =
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+		let commit_timestamp = self.core.opts.clock.now();
 
 		// Add all entries to the batch
 		for entry in latest_writes {

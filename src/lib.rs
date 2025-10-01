@@ -15,6 +15,7 @@ mod snapshot;
 mod sstable;
 mod task;
 mod transaction;
+mod util;
 mod vfs;
 mod vlog;
 mod wal;
@@ -23,6 +24,7 @@ pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
 use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+use crate::util::{DefaultLogicalClock, LogicalClock};
 
 /// Type alias for version/timestamp values
 pub type Version = u64;
@@ -82,11 +84,15 @@ pub struct Options {
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
+	/// Logical clock for time-based operations
+	pub(crate) clock: Arc<dyn LogicalClock>,
 }
 
 impl Default for Options {
 	fn default() -> Self {
 		let bf = LevelDBBloomFilter::new(10);
+		// Initialize the logical clock
+		let clock = Arc::new(DefaultLogicalClock::new());
 
 		Self {
 			block_size: 1 << 10,
@@ -108,6 +114,7 @@ impl Default for Options {
 			in_memory_only: false,
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
+			clock,
 		}
 	}
 }

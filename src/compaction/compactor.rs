@@ -24,11 +24,11 @@ use std::{
 
 /// Compaction options
 pub(crate) struct CompactionOptions {
-	pub lopts: Arc<LSMOptions>,
-	pub level_manifest: Arc<RwLock<LevelManifest>>,
-	pub immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-	pub vlog: Option<Arc<VLog>>,
-	pub versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
+	pub(crate) lopts: Arc<LSMOptions>,
+	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
+	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+	pub(crate) vlog: Option<Arc<VLog>>,
+	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
 impl CompactionOptions {
@@ -156,6 +156,7 @@ impl Compactor {
 			self.options.vlog.clone(),
 			self.options.lopts.enable_versioning,
 			self.options.lopts.versioned_history_retention_ns,
+			self.options.lopts.clock.clone(),
 		);
 
 		for (key, value) in &mut comp_iter {
