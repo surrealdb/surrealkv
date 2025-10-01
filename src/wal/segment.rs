@@ -1085,7 +1085,9 @@ impl Segment {
 impl Drop for Segment {
 	/// Attempt to fsync data on drop, in case we're running without sync.
 	fn drop(&mut self) {
-		self.close().ok();
+		if !self.closed {
+			self.close().ok();
+		}
 	}
 }
 

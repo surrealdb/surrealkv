@@ -1094,6 +1094,13 @@ impl Default for TreeBuilder {
 }
 /// Syncs a directory to ensure all changes are persisted to disk
 pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+	let path = path.as_ref();
+
+	// Check if the directory still exists before trying to sync it
+	if !path.exists() {
+		return Ok(());
+	}
+
 	let file = File::open(path)?;
 	debug_assert!(file.metadata()?.is_dir());
 	file.sync_all()
@@ -2285,7 +2292,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_vlog() {
+	async fn test_vlog_basic() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
 
@@ -2353,6 +2360,7 @@ mod tests {
 
 		// Force flush to ensure all data is persisted
 		tree.flush().unwrap();
+		tree.close().await.unwrap();
 
 		let tree = Arc::new(tree);
 
@@ -2379,6 +2387,9 @@ mod tests {
 		for handle in read_handles {
 			handle.await.unwrap();
 		}
+
+		// Explicitly close the tree to ensure proper cleanup
+		tree.close().await.unwrap();
 	}
 
 	#[tokio::test]

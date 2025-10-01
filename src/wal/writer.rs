@@ -165,12 +165,19 @@ impl Wal {
 	}
 
 	pub(crate) fn close(&mut self) -> Result<()> {
+		if self.closed {
+			return Ok(());
+		}
+		self.closed = true;
 		let _lock = self.mutex.write();
 		self.active_segment.close()?;
 		Ok(())
 	}
 
 	pub(crate) fn sync(&mut self) -> Result<()> {
+		if self.closed {
+			return Ok(());
+		}
 		let _lock = self.mutex.write();
 		self.active_segment.sync()?;
 		Ok(())
@@ -213,7 +220,9 @@ impl Wal {
 impl Drop for Wal {
 	/// Attempt to fsync data on drop, in case we're running without sync.
 	fn drop(&mut self) {
-		self.close().ok();
+		if !self.closed {
+			self.close().ok();
+		}
 	}
 }
 

@@ -142,6 +142,11 @@ impl Iterator for MergeIterator<'_> {
 }
 
 fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Value) -> Result<()> {
+	// Skip empty values (e.g., hard delete entries)
+	if value.is_empty() {
+		return Ok(());
+	}
+
 	// Check if this is a ValueLocation
 	let location = ValueLocation::decode(value)?;
 	if location.is_value_pointer() {
