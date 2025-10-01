@@ -5,10 +5,7 @@ use std::{cmp::Ordering, sync::Arc};
 use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
-use crate::{
-	sstable::{InternalKey, InternalKeyKind},
-	Key, Value,
-};
+use crate::{sstable::InternalKey, Key, Value};
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
 
@@ -63,7 +60,7 @@ pub(crate) struct MergeIterator<'a> {
 	// Current key we're processing, to skip duplicate versions
 	current_user_key: Option<Key>,
 	initialized: bool,
-	// If true, skip tombstones at the bottom level
+	// If true, skip hard delete entries at the bottom level
 	is_bottom_level: bool,
 }
 
@@ -117,7 +114,7 @@ impl Iterator for MergeIterator<'_> {
 			}
 
 			let user_key = heap_item.key.user_key.clone();
-			let is_tombstone = heap_item.key.kind() == InternalKeyKind::Delete;
+			let is_hard_delete = heap_item.key.is_hard_delete_marker();
 
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
@@ -129,8 +126,8 @@ impl Iterator for MergeIterator<'_> {
 				// New user key - update tracking
 				self.current_user_key = Some(user_key);
 
-				// At the bottom level, skip tombstones since there are no older entries below
-				if is_tombstone && self.is_bottom_level {
+				// At the bottom level, skip hard delete entries since there are no older entries below
+				if is_hard_delete && self.is_bottom_level {
 					continue;
 				}
 
@@ -253,10 +250,10 @@ impl<'a> CompactionIterator<'a> {
 		// Clone the latest version data to avoid borrow conflicts
 		let latest_key = self.current_key_versions[0].0.clone();
 		let latest_value = self.current_key_versions[0].1.clone();
-		let is_latest_tombstone = latest_key.kind() == InternalKeyKind::Delete;
+		let is_latest_delete_marker = latest_key.is_hard_delete_marker();
 
-		// If the latest version is a tombstone and we're at bottom level, collect the key for versioned index cleanup
-		if is_latest_tombstone && self.is_bottom_level && self.enable_versioning {
+		// If the latest version is a hard delete marker and we're at bottom level, collect the key for versioned index cleanup
+		if is_latest_delete_marker && self.is_bottom_level && self.enable_versioning {
 			self.deleted_keys.push(latest_key.user_key.clone());
 		}
 
@@ -272,21 +269,21 @@ impl<'a> CompactionIterator<'a> {
 
 		// Process all versions for delete list and discard stats
 		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
-			let is_tombstone = key.kind() == InternalKeyKind::Delete;
+			let is_hard_delete = key.is_hard_delete_marker();
 			let is_latest = i == 0;
 
 			// Determine if this entry should be marked as stale in VLog
-			let should_mark_stale = if is_latest && !is_tombstone {
+			let should_mark_stale = if is_latest && !is_hard_delete {
 				// Latest version of a SET operation: never mark as stale (it's being returned)
 				false
-			} else if is_latest && is_tombstone && self.is_bottom_level {
+			} else if is_latest && is_hard_delete && self.is_bottom_level {
 				// Latest version of a DELETE operation at bottom level: mark as stale (not returned)
 				true
-			} else if is_latest && is_tombstone && !self.is_bottom_level {
+			} else if is_latest && is_hard_delete && !self.is_bottom_level {
 				// Latest version of a DELETE operation at non-bottom level: don't mark as stale (it's being returned)
 				false
-			} else if is_tombstone {
-				// For older DELETE operations (tombstones): always mark as stale since they don't have VLog values
+			} else if is_hard_delete {
+				// For older DELETE operations (hard delete entries): always mark as stale since they don't have VLog values
 				// The B+ tree index entry will remain for versioned queries, but VLog doesn't store delete values
 				true
 			} else {
@@ -306,8 +303,8 @@ impl<'a> CompactionIterator<'a> {
 
 			// Add to delete list and collect discard stats if needed
 			if should_mark_stale && self.vlog.is_some() {
-				if is_tombstone {
-					// Tombstone: add key size to delete list
+				if is_hard_delete {
+					// Hard Delete: add key size to delete list
 					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
 				} else {
 					let location = ValueLocation::decode(value).unwrap();
@@ -329,8 +326,8 @@ impl<'a> CompactionIterator<'a> {
 		self.current_key_versions.clear();
 
 		// Return the latest version if it should be returned
-		if is_latest_tombstone && self.is_bottom_level {
-			// At bottom level, don't return tombstones
+		if is_latest_delete_marker && self.is_bottom_level {
+			// At bottom level, don't return hard delete entries
 			None
 		} else {
 			Some((latest_key, latest_value))
@@ -473,11 +470,11 @@ mod tests {
 
 	#[test]
 	fn test_merge_iterator_sequence_ordering() {
-		// First iterator (L0) with tombstones for even keys
+		// First iterator (L0) with hard delete entries for even keys
 		let mut items1 = Vec::new();
 		for i in 0..10 {
 			if i % 2 == 0 {
-				// Tombstone for even keys
+				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
 				items1.push((key, empty_value.into()));
@@ -520,7 +517,7 @@ mod tests {
 			);
 		}
 
-		// 2. Check that for keys with tombstones, the tombstone comes first
+		// 2. Check that for keys with hard delete entries, the hard_delete comes first
 		for i in 0..10 {
 			if i % 2 == 0 {
 				// Find this key in the result
@@ -530,7 +527,7 @@ mod tests {
 				// Should only have one entry per key due to deduplication
 				assert_eq!(entries.len(), 1, "Key {key} has multiple entries");
 
-				// And it should be the tombstone (seq=200, kind=Delete)
+				// And it should be the hard_delete (seq=200, kind=Delete)
 				let (_, seq, kind) = entries[0];
 				assert_eq!(*seq, 200, "Key {key} has wrong sequence");
 				assert_eq!(*kind, InternalKeyKind::Delete, "Key {key} has wrong kind");
@@ -538,16 +535,16 @@ mod tests {
 		}
 
 		// 3. Check that we have the correct total number of entries
-		// All keys (20) because we get 5 keys with tombstones from items1 and 15 other keys from items2
+		// All keys (20) because we get 5 keys with hard delete entries from items1 and 15 other keys from items2
 		assert_eq!(result.len(), 20, "Wrong number of entries");
 	}
 
 	#[test]
-	fn test_compaction_iterator_tombstone_filtering() {
+	fn test_compaction_iterator_hard_delete_filtering() {
 		let mut items1 = Vec::new();
 		for i in 0..10 {
 			if i % 2 == 0 {
-				// Tombstone for even keys
+				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
 				items1.push((key, empty_value.into()));
@@ -565,7 +562,7 @@ mod tests {
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
 
-		// Test non-bottom level (should keep tombstones)
+		// Test non-bottom level (should keep hard delete entries)
 		let comp_iter = MergeIterator::new(vec![iter1, iter2], false);
 
 		// Collect all items
@@ -589,7 +586,7 @@ mod tests {
 			);
 		}
 
-		// 2. For even keys (0, 2, 4...), we should have tombstones
+		// 2. For even keys (0, 2, 4...), we should have hard delete entries
 		for entry in &result {
 			let (key, seq, kind) = entry;
 
@@ -597,7 +594,7 @@ mod tests {
 			let key_num = key.strip_prefix("key-").unwrap().parse::<i32>().unwrap();
 
 			if key_num % 2 == 0 && key_num < 10 {
-				// Even keys under 10 should be tombstones with seq=200
+				// Even keys under 10 should be hard delete entries with seq=200
 				assert_eq!(*seq, 200, "Even key {key} has wrong sequence");
 				assert_eq!(*kind, InternalKeyKind::Delete, "Even key {key} has wrong kind");
 			} else {
@@ -607,13 +604,13 @@ mod tests {
 			}
 		}
 
-		// 3. Test bottom level (should drop tombstones)
+		// 3. Test bottom level (should drop hard delete entries)
 		let mut items1 = Vec::new();
 		for i in 0..10 {
 			if i % 2 == 0 {
-				// Tombstone for even keys
+				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
-				// Create empty Vec<u8> and wrap it in Arc for tombstone value
+				// Create empty Vec<u8> and wrap it in Arc for hard_delete value
 				let empty_value: Vec<u8> = Vec::new();
 				items1.push((key, empty_value.into()));
 			}
@@ -640,12 +637,12 @@ mod tests {
 			bottom_result.push(key_str);
 		}
 
-		// At bottom level, tombstones should be removed
+		// At bottom level, hard delete entries should be removed
 		for i in 0..20 {
 			let key = format!("key-{i:03}");
 
 			if i % 2 == 0 && i < 10 {
-				// Even keys under 10 should be removed due to tombstones
+				// Even keys under 10 should be removed due to hard delete entries
 				assert!(
 					!bottom_result.contains(&key),
 					"Key {key} should be removed at bottom level"
@@ -777,17 +774,17 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_tombstone_at_bottom_level() {
+	async fn test_hard_delete_at_bottom_level() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
 		let user_key = "key1";
-		let tombstone_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
+		let hard_delete_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
 		let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
 
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(tombstone_key.clone(), empty_value.into())];
+		let items1 = vec![(hard_delete_key.clone(), empty_value.into())];
 		let items2 = vec![(value_key.clone(), actual_value.clone())];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -801,34 +798,34 @@ mod tests {
 			0,
 		);
 
-		// At bottom level, tombstone should NOT be returned
+		// At bottom level, hard_delete should NOT be returned
 		let result: Vec<_> = comp_iter.by_ref().collect();
-		assert_eq!(result.len(), 0, "At bottom level, tombstone should not be returned");
+		assert_eq!(result.len(), 0, "At bottom level, hard_delete should not be returned");
 
 		// Flush delete list batch
 		comp_iter.flush_delete_list_batch().unwrap();
 
-		// Both tombstone and older value should be added to delete list
-		// At bottom level, both the tombstone and the older value should be marked as stale
+		// Both hard_delete and older value should be added to delete list
+		// At bottom level, both the hard_delete and the older value should be marked as stale
 		assert!(
 			vlog.is_stale(200).unwrap(),
-			"Tombstone (seq=200) should be marked as stale at bottom level"
+			"hard_delete (seq=200) should be marked as stale at bottom level"
 		);
 		assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
 	}
 
 	#[tokio::test]
-	async fn test_tombstone_at_non_bottom_level() {
+	async fn test_hard_delete_at_non_bottom_level() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
 		let user_key = "key1";
-		let tombstone_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
+		let hard_delete_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
 		let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
 
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(tombstone_key.clone(), empty_value.into())];
+		let items1 = vec![(hard_delete_key.clone(), empty_value.into())];
 		let items2 = vec![(value_key.clone(), actual_value.clone())];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -842,27 +839,27 @@ mod tests {
 			0,
 		);
 
-		// At non-bottom level, tombstone SHOULD be returned
+		// At non-bottom level, hard_delete SHOULD be returned
 		let result: Vec<_> = comp_iter.by_ref().collect();
-		assert_eq!(result.len(), 1, "At non-bottom level, tombstone should be returned");
+		assert_eq!(result.len(), 1, "At non-bottom level, hard_delete should be returned");
 
 		let (returned_key, returned_value) = &result[0];
 		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 200);
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
-		// Verify tombstone has empty value
-		assert_eq!(returned_value.len(), 0, "Tombstone should have empty value");
+		// Verify hard_delete has empty value
+		assert_eq!(returned_value.len(), 0, "hard_delete should have empty value");
 
 		// Flush delete list batch
 		comp_iter.flush_delete_list_batch().unwrap();
 
-		// Only the older value should be added to delete list (not the tombstone)
+		// Only the older value should be added to delete list (not the hard_delete)
 		// Check that the older value (seq=100) is marked as stale
 		assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
-		// Check that the tombstone (seq=200) is NOT marked as stale (since it was returned)
+		// Check that the hard_delete (seq=200) is NOT marked as stale (since it was returned)
 		assert!(
 			!vlog.is_stale(200).unwrap(),
-			"Tombstone (seq=200) should NOT be marked as stale since it was returned"
+			"hard_delete (seq=200) should NOT be marked as stale since it was returned"
 		);
 	}
 
@@ -876,7 +873,7 @@ mod tests {
 		let key1_val1 = create_vlog_value(&vlog, b"key1", b"value1_old");
 		let key1_val2 = create_vlog_value(&vlog, b"key1", b"value1_new");
 
-		// Key2: Multiple versions (latest is tombstone)
+		// Key2: Multiple versions (latest is hard_delete)
 		let key2_v1 = create_internal_key("key2", 110, InternalKeyKind::Set);
 		let key2_v2 = create_internal_key("key2", 210, InternalKeyKind::Delete);
 		let key2_val1 = create_vlog_value(&vlog, b"key2", b"value2");
@@ -917,7 +914,7 @@ mod tests {
 
 		// Verify sequence numbers (latest versions)
 		assert_eq!(result[0].0.seq_num(), 200); // key1 latest
-		assert_eq!(result[1].0.seq_num(), 210); // key2 latest (tombstone)
+		assert_eq!(result[1].0.seq_num(), 210); // key2 latest (hard_delete)
 		assert_eq!(result[2].0.seq_num(), 150); // key3 only version
 
 		// Verify kinds
@@ -927,7 +924,7 @@ mod tests {
 
 		// Verify values match the latest versions
 		assert_eq!(result[0].1, key1_val2, "key1 should have the latest value (key1_val2)");
-		assert_eq!(result[1].1.len(), 0, "key2 tombstone should have empty value");
+		assert_eq!(result[1].1.len(), 0, "key2 hard_delete should have empty value");
 		assert_eq!(result[2].1, key3_val1, "key3 should have its only value (key3_val1)");
 
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -943,14 +940,14 @@ mod tests {
 			"Key1 latest version (seq=200) should NOT be marked as stale since it was returned"
 		);
 
-		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale (latest tombstone, returned)
+		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale (latest hard_delete, returned)
 		assert!(
 			vlog.is_stale(110).unwrap(),
 			"Key2 older version (seq=110) should be marked as stale"
 		);
 		assert!(
 			!vlog.is_stale(210).unwrap(),
-			"Key2 latest tombstone (seq=210) should NOT be marked as stale since it was returned"
+			"Key2 latest hard_delete (seq=210) should NOT be marked as stale since it was returned"
 		);
 
 		// Key3: seq=150 should NOT be stale (only version, returned)
@@ -1069,7 +1066,7 @@ mod tests {
 		// Verify we get the latest versions
 		assert_eq!(result[0].0.seq_num(), 300); // key_a latest
 		assert_eq!(result[1].0.seq_num(), 250); // key_b only version
-		assert_eq!(result[2].0.seq_num(), 350); // key_c latest (tombstone)
+		assert_eq!(result[2].0.seq_num(), 350); // key_c latest (hard_delete)
 		assert_eq!(result[3].0.seq_num(), 150); // key_d only version
 
 		// Verify kinds
@@ -1081,7 +1078,7 @@ mod tests {
 		// Verify values match the latest versions of each key
 		assert_eq!(result[0].1, val_a_v3, "key_a should have the latest value (val_a_v3)");
 		assert_eq!(result[1].1, val_b_v2, "key_b should have its only value (val_b_v2)");
-		assert_eq!(result[2].1.len(), 0, "key_c tombstone should have empty value");
+		assert_eq!(result[2].1.len(), 0, "key_c hard_delete should have empty value");
 		assert_eq!(result[3].1, val_d_v1, "key_d should have its only value (val_d_v1)");
 
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -1107,7 +1104,7 @@ mod tests {
 			"key_b only version (seq=250) should NOT be marked as stale since it was returned"
 		);
 
-		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be stale (latest tombstone, returned)
+		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be stale (latest hard_delete, returned)
 		assert!(
 			vlog.is_stale(120).unwrap(),
 			"key_c oldest version (seq=120) should be marked as stale"
@@ -1118,7 +1115,7 @@ mod tests {
 		);
 		assert!(
 			!vlog.is_stale(350).unwrap(),
-			"key_c latest tombstone (seq=350) should NOT be marked as stale since it was returned"
+			"key_c latest hard_delete (seq=350) should NOT be marked as stale since it was returned"
 		);
 
 		// key_d: seq=150 should NOT be stale (only version, returned)

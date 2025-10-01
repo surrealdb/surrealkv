@@ -2024,8 +2024,7 @@ mod tests {
 		let bottom_result: Vec<_> = comp_iter_bottom.collect();
 
 		// Bottom level should filter out tombstones
-		let has_tombstones =
-			bottom_result.iter().any(|(key, _)| key.kind() == InternalKeyKind::Delete);
+		let has_tombstones = bottom_result.iter().any(|(key, _)| key.is_hard_delete_marker());
 		assert!(!has_tombstones, "Bottom level should filter out tombstones");
 
 		// Key should be completely gone after tombstone consumes older value

@@ -354,7 +354,7 @@ impl CompactionOperations for CoreInner {
 	///
 	/// Compaction is crucial for LSM tree performance:
 	/// - Merges overlapping SSTables to reduce read amplification
-	/// - Removes deleted entries (tombstones) to reclaim space
+	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
 		// Create compaction options from the current LSM tree state

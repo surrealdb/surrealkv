@@ -39,8 +39,7 @@ fn trailer_to_seq_num(trailer: u64) -> u64 {
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
-/// This centralizes the tombstone check logic to avoid duplication and ensure consistency
-fn is_tombstone_kind(kind: InternalKeyKind) -> bool {
+fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
 		InternalKeyKind::Delete | InternalKeyKind::SoftDelete | InternalKeyKind::RangeDelete
@@ -139,7 +138,7 @@ impl InternalKey {
 	}
 
 	pub(crate) fn is_tombstone(&self) -> bool {
-		is_tombstone_kind(self.kind())
+		is_delete_kind(self.kind())
 	}
 
 	pub(crate) fn is_hard_delete_marker(&self) -> bool {
