@@ -275,6 +275,31 @@ impl Transaction {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
 	}
 
+	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
+	/// This is similar to a regular set but does not preserve any older versions in the versioned index.
+	pub fn replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+		self.replace_with_options(key, value, &WriteOptions::default())
+	}
+
+	/// Sets a key-value pair with SetWithDelete and custom write options.
+	pub fn replace_with_options(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		options: &WriteOptions,
+	) -> Result<()> {
+		let write_seqno = self.next_write_seqno();
+		let entry = Entry::new(
+			key,
+			Some(value),
+			InternalKeyKind::SetWithDelete,
+			self.savepoints,
+			write_seqno,
+		);
+		self.write_with_options(entry, options)?;
+		Ok(())
+	}
+
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
 	pub fn delete_with_options(
 		&mut self,
@@ -3767,6 +3792,99 @@ mod tests {
 					assert_eq!(result, expected);
 				}
 			}
+		}
+
+		#[tokio::test]
+		async fn test_replace_basic() {
+			let (store, _tmp_dir) = create_tree();
+
+			// Test basic SetWithDelete functionality
+			let mut txn = store.begin().unwrap();
+			txn.replace(b"test_key", b"test_value").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the value exists
+			let txn = store.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"test_value");
+
+			// Test SetWithDelete with options
+			let mut txn = store.begin().unwrap();
+			txn.replace_with_options(b"test_key2", b"test_value2", &WriteOptions::default())
+				.unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the second value exists
+			let txn = store.begin().unwrap();
+			let result = txn.get(b"test_key2").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"test_value2");
+		}
+
+		#[tokio::test]
+		async fn test_replace_replaces_previous_versions() {
+			let (store, _tmp_dir) = create_tree();
+
+			// Create multiple versions of the same key
+			for version in 1..=5 {
+				let value = format!("value_v{}", version);
+				let mut txn = store.begin().unwrap();
+				txn.set(b"test_key", value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Verify the latest version exists
+			let txn = store.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"value_v5");
+
+			// Use SetWithDelete to replace all previous versions
+			let mut txn = store.begin().unwrap();
+			txn.replace(b"test_key", b"replaced_value").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the new value exists
+			let txn = store.begin().unwrap();
+			let result = txn.get(b"test_key").unwrap().unwrap();
+			assert_eq!(result.as_ref(), b"replaced_value");
+		}
+
+		#[tokio::test]
+		async fn test_replace_mixed_with_regular_operations() {
+			let (store, _tmp_dir) = create_tree();
+
+			// Mix regular set and replace operations
+			let mut txn = store.begin().unwrap();
+			txn.set(b"key1", b"regular_value1").unwrap();
+			txn.replace(b"key2", b"replace_value2").unwrap();
+			txn.set(b"key3", b"regular_value3").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify all values exist
+			let txn = store.begin().unwrap();
+			assert_eq!(txn.get(b"key1").unwrap().unwrap().as_ref(), b"regular_value1");
+			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"replace_value2");
+			assert_eq!(txn.get(b"key3").unwrap().unwrap().as_ref(), b"regular_value3");
+
+			// Update key2 with regular set
+			let mut txn = store.begin().unwrap();
+			txn.set(b"key2", b"updated_regular_value2").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the updated value
+			let txn = store.begin().unwrap();
+			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"updated_regular_value2");
+
+			// Use replace on key1
+			let mut txn = store.begin().unwrap();
+			txn.replace(b"key1", b"final_set_with_delete_value1").unwrap();
+			txn.commit().await.unwrap();
+
+			// Verify the final value
+			let txn = store.begin().unwrap();
+			assert_eq!(
+				txn.get(b"key1").unwrap().unwrap().as_ref(),
+				b"final_set_with_delete_value1"
+			);
 		}
 	}
 }

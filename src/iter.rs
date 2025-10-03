@@ -234,6 +234,7 @@ impl<'a> CompactionIterator<'a> {
 	pub(crate) fn flush_delete_list_batch(&mut self) -> Result<()> {
 		if let Some(ref vlog) = self.vlog {
 			if !self.delete_list_batch.is_empty() {
+				println!("Flushing delete list batch: {:?}", self.delete_list_batch);
 				vlog.add_batch_to_delete_list(std::mem::take(&mut self.delete_list_batch))?;
 			}
 		}
@@ -246,6 +247,7 @@ impl<'a> CompactionIterator<'a> {
 			return None;
 		}
 
+		// TODO: Check if this could be removed as entries are sorted in the sstables. Verify with tests.
 		// Sort by sequence number (descending) to get the latest version first
 		self.current_key_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
 
@@ -254,14 +256,19 @@ impl<'a> CompactionIterator<'a> {
 		let latest_value = self.current_key_versions[0].1.clone();
 		let is_latest_delete_marker = latest_key.is_hard_delete_marker();
 
+		// Check if any version is SetWithDelete - if so, mark all older versions as stale
+		let has_set_with_delete =
+			self.current_key_versions.iter().any(|(key, _)| key.is_set_with_delete());
+
 		// Process all versions for delete list and discard stats
 		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
+			let is_set_with_delete = key.is_set_with_delete();
 			let is_latest = i == 0;
 
 			// Determine if this entry should be marked as stale in VLog
-			let should_mark_stale = if is_latest && !is_hard_delete {
-				// Latest version of a SET operation: never mark as stale (it's being returned)
+			let should_mark_stale = if is_latest && !is_hard_delete && !is_set_with_delete {
+				// Latest version of a regular SET operation: never mark as stale (it's being returned)
 				false
 			} else if is_latest && is_hard_delete && self.is_bottom_level {
 				// Latest version of a DELETE operation at bottom level: mark as stale (not returned)
@@ -269,9 +276,15 @@ impl<'a> CompactionIterator<'a> {
 			} else if is_latest && is_hard_delete && !self.is_bottom_level {
 				// Latest version of a DELETE operation at non-bottom level: don't mark as stale (it's being returned)
 				false
+			} else if is_latest && is_set_with_delete {
+				// Latest version of a SetWithDelete operation: don't mark as stale (it's being returned)
+				false
 			} else if is_hard_delete {
 				// For older DELETE operations (hard delete entries): always mark as stale since they don't have VLog values
 				// The B+ tree index entry will remain for versioned queries, but VLog doesn't store delete values
+				true
+			} else if has_set_with_delete && !is_set_with_delete {
+				// If there's a SetWithDelete operation, mark all older non-SetWithDelete versions as stale
 				true
 			} else {
 				// Older version of a SET operation: check retention period
@@ -1469,5 +1482,241 @@ mod tests {
 				"Old value (seq=100) should NOT be marked as stale - within retention period"
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_set_with_delete_behavior() {
+		let (vlog, _tmp_dir) = create_test_vlog();
+		let clock = Arc::new(MockLogicalClock::new());
+
+		// Create test data with SetWithDelete operations
+		let mut items1 = Vec::new();
+		let mut items2 = Vec::new();
+
+		// Table 1: Regular SET operations
+		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+		items1.push((key1, value1));
+
+		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
+		let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+		items1.push((key2, value2));
+
+		// Table 2: SetWithDelete operation (newer sequence number)
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+		items2.push((key3, value3));
+
+		// Create iterators
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+
+		// Test non-bottom level compaction (should preserve SetWithDelete)
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // non-bottom level
+			Some(vlog.clone()),
+			true, // enable versioning
+			1000, // retention period
+			clock.clone(),
+		);
+
+		let mut result = Vec::new();
+		for item in comp_iter.by_ref() {
+			result.push(item);
+		}
+
+		// Should return only the SetWithDelete version (latest)
+		assert_eq!(result.len(), 1);
+		let (returned_key, _) = &result[0];
+		assert_eq!(returned_key.seq_num(), 300);
+		assert!(returned_key.is_set_with_delete());
+
+		// Flush the delete list batch to actually mark entries as stale
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Verify that older versions were marked as stale in VLog
+		assert!(vlog.is_stale(100).unwrap());
+		assert!(vlog.is_stale(200).unwrap());
+		assert!(!vlog.is_stale(300).unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
+		let (vlog, _tmp_dir) = create_test_vlog();
+		let clock = Arc::new(MockLogicalClock::new());
+
+		// Create test data with multiple versions and SetWithDelete
+		let mut items1 = Vec::new();
+		let mut items2 = Vec::new();
+
+		// Table 1: Multiple regular SET operations
+		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+		items1.push((key1, value1));
+
+		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
+		let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+		items1.push((key2, value2));
+
+		let key3 = create_internal_key("test_key", 250, InternalKeyKind::Set);
+		let value3 = create_vlog_value(&vlog, b"test_key", b"value3");
+		items1.push((key3, value3));
+
+		// Table 2: SetWithDelete operation (not the latest)
+		let key4 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		let value4 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+		items2.push((key4, value4));
+
+		// Table 3: Regular SET after SetWithDelete (latest)
+		let key5 = create_internal_key("test_key", 400, InternalKeyKind::Set);
+		let value5 = create_vlog_value(&vlog, b"test_key", b"final_value");
+		items2.push((key5, value5));
+
+		// Create iterators
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+
+		// Test compaction
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // non-bottom level
+			Some(vlog.clone()),
+			true, // enable versioning
+			1000, // retention period
+			clock.clone(),
+		);
+
+		let mut result = Vec::new();
+		for item in comp_iter.by_ref() {
+			result.push(item);
+		}
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Should return only the latest version (regular SET, not SetWithDelete)
+		assert_eq!(result.len(), 1);
+		let (returned_key, _) = &result[0];
+		assert_eq!(returned_key.seq_num(), 400);
+		assert!(!returned_key.is_set_with_delete());
+
+		// The SetWithDelete and all older regular SET versions should be marked as stale
+		assert!(vlog.is_stale(100).unwrap());
+		assert!(vlog.is_stale(200).unwrap());
+		assert!(vlog.is_stale(250).unwrap());
+		assert!(vlog.is_stale(300).unwrap());
+		assert!(!vlog.is_stale(400).unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_set_with_delete_latest_version() {
+		let (vlog, _tmp_dir) = create_test_vlog();
+		let clock = Arc::new(MockLogicalClock::new());
+
+		// Create test data where SetWithDelete is the latest version
+		let mut items1 = Vec::new();
+		let mut items2 = Vec::new();
+
+		// Table 1: Regular SET operations
+		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+		items1.push((key1, value1));
+
+		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
+		let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+		items1.push((key2, value2));
+
+		// Table 2: SetWithDelete as the latest version
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_final");
+		items2.push((key3, value3));
+
+		// Create iterators
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+
+		// Test compaction
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // non-bottom level
+			Some(vlog.clone()),
+			true, // enable versioning
+			1000, // retention period
+			clock.clone(),
+		);
+
+		let mut result = Vec::new();
+		for item in comp_iter.by_ref() {
+			result.push(item);
+		}
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Should return the SetWithDelete version (latest)
+		assert_eq!(result.len(), 1);
+		let (returned_key, _) = &result[0];
+		assert_eq!(returned_key.seq_num(), 300);
+		assert!(returned_key.is_set_with_delete());
+
+		// All older regular SET versions should be marked as stale
+		assert!(vlog.is_stale(100).unwrap());
+		assert!(vlog.is_stale(200).unwrap());
+		assert!(!vlog.is_stale(300).unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
+		let (vlog, _tmp_dir) = create_test_vlog();
+		let clock = Arc::new(MockLogicalClock::new());
+
+		// Create test data with SetWithDelete and hard delete operations
+		let mut items1 = Vec::new();
+		let mut items2 = Vec::new();
+
+		// Table 1: Regular SET and hard delete
+		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+		items1.push((key1, value1));
+
+		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Delete);
+		let value2 = Value::from(vec![]); // Empty value for delete
+		items1.push((key2, value2));
+
+		// Table 2: SetWithDelete operation
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+		items2.push((key3, value3));
+
+		// Create iterators
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+
+		// Test non-bottom level compaction
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // non-bottom level
+			Some(vlog.clone()),
+			true, // enable versioning
+			1000, // retention period
+			clock.clone(),
+		);
+
+		let mut result = Vec::new();
+		for item in comp_iter.by_ref() {
+			result.push(item);
+		}
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Should return the SetWithDelete version (latest)
+		assert_eq!(result.len(), 1);
+		let (returned_key, _) = &result[0];
+		assert_eq!(returned_key.seq_num(), 300);
+		assert!(returned_key.is_set_with_delete());
+
+		// The hard delete and regular SET should be marked as stale
+		assert!(vlog.is_stale(100).unwrap());
+		assert!(vlog.is_stale(200).unwrap());
+		assert!(!vlog.is_stale(300).unwrap());
 	}
 }

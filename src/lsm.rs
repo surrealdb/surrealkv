@@ -20,7 +20,7 @@ use crate::{
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey},
+	sstable::{table::Table, InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX},
 	task::TaskManager,
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
@@ -473,7 +473,39 @@ impl CommitEnv for LsmCommitEnv {
 		// Write to versioned index if present
 		if enable_versioning {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write()?;
+
+			// Single pass: process each entry individually
 			for (encoded_key, encoded_value) in timestamp_entries {
+				let ikey = InternalKey::decode(&encoded_key);
+
+				if ikey.is_set_with_delete() {
+					// For SetWithDelete: first delete all existing entries for this user key
+					let user_key = ikey.user_key.as_ref().to_vec();
+					let start_key =
+						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
+					let end_key = InternalKey::new(
+						user_key.clone(),
+						u64::MAX,
+						InternalKeyKind::Max,
+						INTERNAL_KEY_TIMESTAMP_MAX,
+					)
+					.encode();
+
+					// Collect and delete all existing entries for this user key
+					let range_iter = versioned_index_guard.range(&start_key, &end_key)?;
+					let mut keys_to_delete = Vec::new();
+					for entry in range_iter {
+						let (key, _) = entry?;
+						keys_to_delete.push(key);
+					}
+
+					// Delete all existing entries
+					for key in keys_to_delete {
+						versioned_index_guard.delete(&key)?;
+					}
+				}
+
+				// Insert the new entry (whether it's regular Set or SetWithDelete)
 				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
 			}
 		}
