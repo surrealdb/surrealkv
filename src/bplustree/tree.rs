@@ -7,7 +7,7 @@ use std::sync::Arc;
 use quick_cache::{sync::Cache, Weighter};
 
 use crate::vfs::File as VfsFile;
-use crate::Comparator;
+use crate::{Comparator, Key, Value};
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<File>;
@@ -2208,7 +2208,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 }
 
 impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
-	type Item = Result<(Vec<u8>, Vec<u8>)>;
+	type Item = Result<(Key, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
@@ -2246,7 +2246,10 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 				}
 
 				// Return the current key-value pair and advance
-				let result = Ok((key.clone(), leaf.values[self.current_idx].clone()));
+				let result = Ok((
+					Arc::from(key.as_ref()),
+					Arc::from(leaf.values[self.current_idx].as_ref()),
+				));
 				self.current_idx += 1;
 				return Some(result);
 			}
@@ -2256,6 +2259,7 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 		}
 	}
 }
+
 #[cfg(test)]
 mod tests {
 	use std::fs::File;
@@ -3080,10 +3084,10 @@ mod tests {
 		n.to_le_bytes().to_vec()
 	}
 
-	fn deserialize_pair(pair: (Vec<u8>, Vec<u8>)) -> (u32, u32) {
+	fn deserialize_pair(pair: (Key, Value)) -> (u32, u32) {
 		(
-			u32::from_le_bytes(pair.0.as_slice().try_into().unwrap()),
-			u32::from_le_bytes(pair.1.as_slice().try_into().unwrap()),
+			u32::from_le_bytes((&*pair.0).try_into().unwrap()),
+			u32::from_le_bytes((&*pair.1).try_into().unwrap()),
 		)
 	}
 
@@ -3101,7 +3105,7 @@ mod tests {
 		let results = tree.range(&serialize_u32(3), &serialize_u32(7)).unwrap();
 		let expected: Vec<_> = (3..=7).map(|i| (i, i * 10)).collect();
 		assert_eq!(
-			results.into_iter().map(|res| res.map(deserialize_pair).unwrap()).collect::<Vec<_>>(),
+			results.into_iter().map(|res| deserialize_pair(res.unwrap())).collect::<Vec<_>>(),
 			expected
 		);
 	}
@@ -3120,7 +3124,7 @@ mod tests {
 		let results = tree.range(&serialize_u32(5), &serialize_u32(15)).unwrap();
 		let expected: Vec<_> = (5..=15).map(|i| (i, i * 10)).collect();
 		assert_eq!(
-			results.into_iter().map(|res| res.map(deserialize_pair).unwrap()).collect::<Vec<_>>(),
+			results.into_iter().map(|res| deserialize_pair(res.unwrap())).collect::<Vec<_>>(),
 			expected
 		);
 	}
@@ -3169,9 +3173,7 @@ mod tests {
 		assert_eq!(
 			results
 				.into_iter()
-				.map(|res| res
-					.map(|(k, _)| u32::from_le_bytes(k.as_slice().try_into().unwrap()))
-					.unwrap())
+				.map(|res| res.map(|(k, _)| u32::from_le_bytes((&*k).try_into().unwrap())).unwrap())
 				.collect::<Vec<_>>(),
 			expected
 		);
@@ -3217,9 +3219,7 @@ mod tests {
 		assert_eq!(
 			results
 				.into_iter()
-				.map(|res| res
-					.map(|(k, _)| u32::from_le_bytes(k.as_slice().try_into().unwrap()))
-					.unwrap())
+				.map(|res| res.map(|(k, _)| u32::from_le_bytes((&*k).try_into().unwrap())).unwrap())
 				.collect::<Vec<_>>(),
 			expected
 		);
@@ -3233,8 +3233,14 @@ mod tests {
 		tree.insert(b"key2", b"value2").unwrap();
 
 		let mut iter = tree.range(b"key2", b"key3").unwrap();
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key2".to_vec(), b"value2".to_vec()));
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key3".to_vec(), b"value3".to_vec()));
+		assert_eq!(
+			iter.next().unwrap().unwrap(),
+			(Arc::from(b"key2" as &[u8]), Arc::from(b"value2" as &[u8]))
+		);
+		assert_eq!(
+			iter.next().unwrap().unwrap(),
+			(Arc::from(b"key3" as &[u8]), Arc::from(b"value3" as &[u8]))
+		);
 		assert!(iter.next().is_none());
 	}
 
@@ -3264,7 +3270,10 @@ mod tests {
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();
-			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
+			assert_eq!(
+				iter.next().unwrap().unwrap(),
+				(Arc::from(expected_key.as_slice()), Arc::from(expected_value.as_slice()))
+			);
 		}
 		assert!(iter.next().is_none());
 	}

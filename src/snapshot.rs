@@ -443,7 +443,7 @@ impl Snapshot {
 				key_versions
 					.entry(current_key)
 					.or_default()
-					.push((internal_key, encoded_value.clone()));
+					.push((internal_key, encoded_value.to_vec()));
 			}
 
 			// Filter out keys where the latest version is a hard delete

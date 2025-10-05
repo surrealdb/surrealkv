@@ -234,7 +234,6 @@ impl<'a> CompactionIterator<'a> {
 	pub(crate) fn flush_delete_list_batch(&mut self) -> Result<()> {
 		if let Some(ref vlog) = self.vlog {
 			if !self.delete_list_batch.is_empty() {
-				println!("Flushing delete list batch: {:?}", self.delete_list_batch);
 				vlog.add_batch_to_delete_list(std::mem::take(&mut self.delete_list_batch))?;
 			}
 		}
