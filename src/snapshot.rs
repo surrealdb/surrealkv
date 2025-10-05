@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
@@ -10,6 +9,7 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
+use crate::versioned_iter::VersionedRangeIterator;
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
 
@@ -97,18 +97,6 @@ pub(crate) struct IterState {
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
 	pub levels: Levels,
-}
-
-/// Query parameters for versioned range queries
-#[derive(Debug, Clone)]
-struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
-	key_range: &'a R,
-	start_ts: u64,
-	end_ts: u64,
-	snapshot_seq_num: u64,
-	limit: Option<usize>,
-	include_tombstones: bool,
-	include_latest_only: bool, // When true, only include the latest version of each key
 }
 
 // ===== Snapshot Implementation =====
@@ -227,92 +215,75 @@ impl Snapshot {
 	/// Queries the versioned index for a specific key at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	pub(crate) fn get_at_timestamp(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		let mut latest_value: Option<Value> = None;
-		let mut latest_timestamp = 0;
-
 		// Create a range that includes only the specific key
 		let key_range = key.to_vec()..=key.to_vec();
 
-		self.versioned_range_query(
-			VersionedRangeQueryParams {
-				key_range: &key_range,
-				start_ts: 0, // Start from beginning of time
-				end_ts: timestamp,
-				limit: None,               // No limit for single key lookup
-				include_tombstones: false, // Don't include tombstones
-				snapshot_seq_num: self.seq_num,
-				include_latest_only: true,
-			},
-			|internal_key, encoded_value, _is_tombstone| {
-				latest_timestamp = internal_key.timestamp;
-				latest_value = Some(self.core.resolve_value(encoded_value)?);
-
-				Ok(true) // Continue processing
-			},
+		let mut iter = VersionedRangeIterator::new(
+			self.core.clone(),
+			self.seq_num,
+			key_range,
+			0,
+			timestamp,
+			false, // Don't include tombstones
+			true,  // Include latest only
 		)?;
 
-		Ok(latest_value)
+		// Get the first (and only) result
+		if let Some(result) = iter.next() {
+			let (_internal_key, encoded_value, _is_tombstone) = result?;
+			Ok(Some(self.core.resolve_value(&encoded_value)?))
+		} else {
+			Ok(None)
+		}
 	}
 
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn keys_at_timestamp<R: RangeBounds<Vec<u8>>>(
-		&self,
+	pub(crate) fn keys_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
 		key_range: R,
 		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<Vec<Vec<u8>>> {
-		let mut keys = Vec::new();
-
-		self.versioned_range_query(
-			VersionedRangeQueryParams {
-				key_range: &key_range,
-				start_ts: 0,
-				end_ts: timestamp,
-				snapshot_seq_num: self.seq_num,
-				limit,
-				include_tombstones: false, // Don't include tombstones
-				include_latest_only: true,
-			},
-			|internal_key, _encoded_value, _is_tombstone| {
-				keys.push(internal_key.user_key.as_ref().to_vec());
-				Ok(true) // Continue processing
-			},
+	) -> Result<impl DoubleEndedIterator<Item = Result<Vec<u8>>> + 'a> {
+		let iter = VersionedRangeIterator::new(
+			self.core.clone(),
+			self.seq_num,
+			key_range,
+			0,
+			timestamp,
+			false, // Don't include tombstones
+			true,  // Include latest only
 		)?;
 
-		Ok(keys)
+		Ok(iter.map(|result| {
+			result.map(|(internal_key, _encoded_value, _is_tombstone)| {
+				internal_key.user_key.as_ref().to_vec()
+			})
+		}))
 	}
 
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn scan_at_timestamp<R: RangeBounds<Vec<u8>>>(
-		&self,
+	pub(crate) fn scan_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
 		key_range: R,
 		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<Vec<(Vec<u8>, Value)>> {
-		let mut results = Vec::new();
-
-		self.versioned_range_query(
-			VersionedRangeQueryParams {
-				key_range: &key_range,
-				start_ts: 0,
-				end_ts: timestamp,
-				snapshot_seq_num: self.seq_num,
-				limit,
-				include_tombstones: false, // Don't include tombstones
-				include_latest_only: true,
-			},
-			|internal_key, encoded_value, _is_tombstone| {
-				let resolved_value = self.core.resolve_value(encoded_value)?;
-				results.push((internal_key.user_key.as_ref().to_vec(), resolved_value));
-				Ok(true) // Continue processing
-			},
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
+		let iter = VersionedRangeIterator::new(
+			self.core.clone(),
+			self.seq_num,
+			key_range,
+			0,
+			timestamp,
+			false, // Don't include tombstones
+			true,  // Include latest only
 		)?;
 
-		// Sort by key
-		results.sort_by(|a, b| a.0.cmp(&b.0));
-		Ok(results)
+		Ok(iter.map(|result| {
+			result.and_then(|(internal_key, encoded_value, _is_tombstone)| {
+				let resolved_value = self.core.resolve_value(&encoded_value)?;
+				Ok((internal_key.user_key.as_ref().to_vec(), resolved_value))
+			})
+		}))
 	}
 
 	/// Gets all versions of keys in a key range
@@ -327,172 +298,45 @@ impl Snapshot {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
 
-		let mut results = Vec::new();
-
-		self.versioned_range_query(
-			VersionedRangeQueryParams {
-				key_range: &key_range,
-				start_ts: 0,
-				end_ts: u64::MAX,
-				snapshot_seq_num: self.seq_num,
-				limit,
-				include_tombstones: true,
-				include_latest_only: false, // Include all versions for scan_all_versions
-			},
-			|internal_key, encoded_value, is_tombstone| {
-				let value = if is_tombstone {
-					Value::default() // Use default value for soft delete markers
-				} else {
-					self.core.resolve_value(encoded_value)?
-				};
-				results.push((
-					internal_key.user_key.as_ref().to_vec(),
-					value,
-					internal_key.timestamp,
-					is_tombstone,
-				));
-				Ok(true) // Continue processing
-			},
+		let iter = VersionedRangeIterator::new(
+			self.core.clone(),
+			self.seq_num,
+			key_range,
+			0,
+			u64::MAX,
+			true,  // Include tombstones
+			false, // Include all versions
 		)?;
 
-		Ok(results)
-	}
+		let mut results = Vec::new();
+		let max_keys = limit.unwrap_or(usize::MAX);
+		let mut unique_key_count = 0;
+		let mut current_key: Option<Vec<u8>> = None;
 
-	fn versioned_range_query<F, R: RangeBounds<Vec<u8>>>(
-		&self,
-		params: VersionedRangeQueryParams<'_, R>,
-		mut processor: F,
-	) -> Result<()>
-	where
-		F: FnMut(&InternalKey, &[u8], bool) -> Result<bool>,
-	{
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
+		for result in iter {
+			let (internal_key, encoded_value, is_tombstone) = result?;
+			let key = internal_key.user_key.as_ref().to_vec();
 
-		if let Some(ref versioned_index) = self.core.versioned_index {
-			let index_guard = versioned_index.read()?;
-
-			// Extract start and end bounds from the RangeBounds
-			let start_bound = params.key_range.start_bound();
-			let end_bound = params.key_range.end_bound();
-
-			// Convert to InternalKey format for the B+ tree query
-			let start_key = match start_bound {
-				Bound::Included(key) => {
-					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-				Bound::Excluded(key) => {
-					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
-					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-				Bound::Unbounded => {
-					InternalKey::new(Vec::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-			};
-
-			let end_key = match end_bound {
-				Bound::Included(key) => InternalKey::new(
-					key.clone(),
-					params.snapshot_seq_num,
-					InternalKeyKind::Max,
-					params.end_ts,
-				)
-				.encode(),
-				Bound::Excluded(key) => {
-					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
-					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(
-						next_key,
-						params.snapshot_seq_num,
-						InternalKeyKind::Max,
-						params.end_ts,
-					)
-					.encode()
-				}
-				Bound::Unbounded => InternalKey::new(
-					vec![0xff],
-					params.snapshot_seq_num,
-					InternalKeyKind::Max,
-					params.end_ts,
-				)
-				.encode(),
-			};
-
-			let range_iter = index_guard.range(&start_key, &end_key)?;
-
-			// Collect all versions by key (already in timestamp order from B+tree)
-			// Store the complete InternalKey to preserve all original information
-			// Use BTreeMap to maintain keys in sorted order
-			let mut key_versions: BTreeMap<Vec<u8>, Vec<(InternalKey, Vec<u8>)>> = BTreeMap::new();
-
-			for entry in range_iter {
-				let (encoded_key, encoded_value) = entry?;
-				let internal_key = InternalKey::decode(&encoded_key);
-				assert!(internal_key.seq_num() <= params.snapshot_seq_num);
-
-				if internal_key.timestamp > params.end_ts {
-					continue;
-				}
-
-				let current_key = internal_key.user_key.as_ref().to_vec();
-
-				key_versions
-					.entry(current_key)
-					.or_default()
-					.push((internal_key, encoded_value.clone()));
-			}
-
-			// Filter out keys where the latest version is a hard delete
-			key_versions.retain(|_, versions| {
-				let latest_version = versions.last().unwrap();
-				!latest_version.0.is_hard_delete_marker()
-			});
-
-			// Process each key's versions
-			let max_unique_keys = params.limit.unwrap_or(usize::MAX);
-
-			for (unique_key_count, (_user_key, mut versions)) in
-				key_versions.into_iter().enumerate()
-			{
-				// Check if we've reached the limit of unique keys
-				if unique_key_count >= max_unique_keys {
+			// Check if we've moved to a new key
+			if current_key.as_ref() != Some(&key) {
+				// If we've reached the limit on unique keys, stop
+				if unique_key_count >= max_keys {
 					break;
 				}
-
-				// If include_latest_only is true, keep only the latest version (highest timestamp)
-				if params.include_latest_only && !versions.is_empty() {
-					// B+tree already provides entries in timestamp order, so just take the last element (highest timestamp)
-					let latest_version = versions.pop().unwrap();
-					versions = vec![latest_version];
-				}
-
-				// Determine which versions to output
-				let versions_to_output: Vec<_> = if params.include_tombstones {
-					// For scan_all_versions, include ALL versions (both values and tombstones)
-					versions.into_iter().collect()
-				} else {
-					// Otherwise, only include non-tombstone versions
-					versions.into_iter().filter(|version| !version.0.is_tombstone()).collect()
-				};
-
-				// Output the filtered versions with original InternalKey preserved
-				for (internal_key, encoded_value) in versions_to_output.into_iter() {
-					let should_continue =
-						processor(&internal_key, &encoded_value, internal_key.is_tombstone())?;
-					if !should_continue {
-						return Ok(());
-					}
-				}
+				current_key = Some(key.clone());
+				unique_key_count += 1;
 			}
 
-			Ok(())
-		} else {
-			Ok(())
+			let value = if is_tombstone {
+				Value::default() // Use default value for soft delete markers
+			} else {
+				self.core.resolve_value(&encoded_value).unwrap_or_default()
+			};
+
+			results.push((key, value, internal_key.timestamp, is_tombstone));
 		}
+
+		Ok(results)
 	}
 }
 

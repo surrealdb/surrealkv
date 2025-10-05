@@ -2546,7 +2546,9 @@ mod tests {
 
 		// Verify all versions exist using the public API
 		let tx = tree.begin().unwrap();
-		let scan_all = tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+		let scan_all: Vec<_> = tx
+			.scan_all_timestamps(user_key.as_ref().to_vec()..=user_key.as_ref().to_vec(), None)
+			.unwrap();
 		assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
 
 		drop(tx);
@@ -2583,8 +2585,9 @@ mod tests {
 
 		// Verify that some versions were cleaned up using the public API
 		let tx = tree.begin().unwrap();
-		let scan_after =
-			tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+		let scan_after: Vec<_> = tx
+			.scan_all_timestamps(user_key.as_ref().to_vec()..=user_key.as_ref().to_vec(), None)
+			.unwrap();
 
 		// We should have at least some versions remaining
 		assert!(!scan_after.is_empty(), "Should have at least some versions remaining");
@@ -2600,18 +2603,18 @@ mod tests {
 		}
 
 		// Test specific timestamp queries to verify which versions were deleted
-		let scan_at_ts1 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 1000, None).unwrap();
-		let scan_at_ts2 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 2000, None).unwrap();
-		let scan_at_ts3 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 3000, None).unwrap();
-		let scan_at_ts4 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 4000, None).unwrap();
-		let scan_at_ts5 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6000, None).unwrap();
-		let scan_at_ts6 =
-			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6001, None).unwrap();
+		let scan_at_ts1: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 1000).unwrap().collect();
+		let scan_at_ts2: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 2000).unwrap().collect();
+		let scan_at_ts3: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 3000).unwrap().collect();
+		let scan_at_ts4: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 4000).unwrap().collect();
+		let scan_at_ts5: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6000).unwrap().collect();
+		let scan_at_ts6: Vec<_> =
+			tx.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6001).unwrap().collect();
 
 		// The key insight: VLog GC only processes files with high discard ratios
 		// Files 0, 1, 2 had high discard ratios (0.97) and were processed

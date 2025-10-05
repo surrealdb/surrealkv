@@ -16,6 +16,7 @@ mod sstable;
 mod task;
 mod transaction;
 mod util;
+mod versioned_iter;
 mod vfs;
 mod vlog;
 mod wal;
