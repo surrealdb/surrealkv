@@ -6,7 +6,6 @@ use crate::lsm::Core;
 use crate::sstable::{InternalKey, InternalKeyKind};
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
-
 /// A versioning filter iterator that handles versioning logic (latest version per key)
 pub(crate) struct VersioningFilterIter<I>
 where
@@ -137,45 +136,27 @@ impl VersionedRangeIterator {
 			let extended_converted_iter =
 				extended_range_iter.map(|result| result.map_err(|e| Error::from(e)));
 
-			// Convert B+ tree iterator to expected format: (Vec<u8>, Arc<[u8]>) → (InternalKey, Vec<u8>, bool)
 			let converted_iter = extended_converted_iter.map(|result| {
 				result.map(|(encoded_key, encoded_value)| {
 					let internal_key = InternalKey::decode(&encoded_key);
 					let is_tombstone = internal_key.is_tombstone();
-					// Convert Arc<[u8]> to Vec<u8>
 					let value_vec = encoded_value.to_vec();
 					(internal_key, value_vec, is_tombstone)
 				})
 			});
 
-			// Build the pipeline: B+ Tree → .filter() → VersioningFilterIter/ScanVersioningFilterIter → TombstoneFilterIter
-			let timestamp_filtered_iter = converted_iter.filter(move |result| {
-				match result {
-					Ok((internal_key, _, _)) => {
-						// Check timestamp bounds
-						internal_key.timestamp >= start_ts && internal_key.timestamp <= end_ts
-					}
-					Err(_) => true, // Pass through errors
+			let timestamp_filtered_iter = converted_iter.filter(move |result| match result {
+				Ok((internal_key, _, _)) => {
+					internal_key.timestamp >= start_ts && internal_key.timestamp <= end_ts
 				}
+				Err(_) => true,
 			});
 
-			// Use different versioning filters based on the use case
 			let versioning_iter = if include_latest_only {
-				// For latest-only queries, use VersioningFilterIter which handles latest version logic
 				Box::new(VersioningFilterIter::new(timestamp_filtered_iter, include_latest_only))
-					as Box<
-						dyn DoubleEndedIterator<Item = Result<(InternalKey, Vec<u8>, bool)>>
-							+ 'static,
-					>
 			} else if include_tombstones {
-				// For scan_all_timestamps, use ScanAllTimestampsFilterIter which includes all versions and tombstones
 				Box::new(ScanAllTimestampsFilterIter::new(timestamp_filtered_iter))
-					as Box<
-						dyn DoubleEndedIterator<Item = Result<(InternalKey, Vec<u8>, bool)>>
-							+ 'static,
-					>
 			} else {
-				// For scan_at_timestamp_with_deletes, use ScanVersioningFilterIter which filters hard deletes but includes all versions
 				Box::new(ScanVersioningFilterIter::new(timestamp_filtered_iter))
 					as Box<
 						dyn DoubleEndedIterator<Item = Result<(InternalKey, Vec<u8>, bool)>>
@@ -193,7 +174,6 @@ impl VersionedRangeIterator {
 		}
 	}
 
-	/// Initializes the iterator (no-op for pipeline architecture)
 	fn initialize(&mut self) -> Result<()> {
 		if self.initialized {
 			return Ok(());
@@ -222,7 +202,6 @@ impl DoubleEndedIterator for VersionedRangeIterator {
 		self.pipeline.next_back()
 	}
 }
-
 
 // ===== VersioningFilterIter Implementation =====
 
@@ -253,51 +232,34 @@ where
 				Err(e) => return Some(Err(e)),
 			};
 
-		let key = latest_internal_key.user_key.as_ref().to_vec(); // Clone the key to avoid borrowing issues
+		let key = latest_internal_key.user_key.as_ref().to_vec();
 
-		println!("DEBUG: VersioningFilterIter processing key: {:?}, timestamp: {}, seq_num: {}, is_tombstone: {}, is_hard_delete: {}", 
-			&key, latest_internal_key.timestamp, latest_internal_key.seq_num(), latest_is_tombstone, latest_internal_key.is_hard_delete_marker());
-
-		// If include_latest_only is true, skip to the latest version of this key
 		if self.include_latest_only {
-			// Keep consuming versions until we find the latest one
 			while let Some(next_item) = self.inner.peek() {
 				match next_item {
 					Ok((internal_key, _, _)) => {
 						if internal_key.user_key.as_ref() == &key {
-							// This is another version of the same key, consume it and update our latest
 							if let Ok((new_key, new_value, new_tombstone)) =
 								self.inner.next().expect("should not be empty")
 							{
 								latest_internal_key = new_key;
 								latest_encoded_value = new_value;
 								latest_is_tombstone = new_tombstone;
-								println!("DEBUG: Updated to latest version - timestamp: {}, seq_num: {}, is_tombstone: {}, is_hard_delete: {}", 
-									latest_internal_key.timestamp, latest_internal_key.seq_num(), latest_is_tombstone, latest_internal_key.is_hard_delete_marker());
 							}
 						} else {
-							// Different key, stop
 							break;
 						}
 					}
 					Err(_) => {
-						// If there's an error, consume it and continue
 						let _ = self.inner.next().expect("should not be empty");
 					}
 				}
 			}
 		}
 
-		// Check if the latest version is a hard delete - if so, skip this key entirely
 		if latest_internal_key.is_hard_delete_marker() {
-			println!("DEBUG: Latest version is hard delete, skipping key: {:?}", &key);
-			return self.next(); // Skip this key and try the next one
+			return self.next();
 		}
-
-		println!(
-			"DEBUG: VersioningFilterIter returning key: {:?}, is_tombstone: {}",
-			&key, latest_is_tombstone
-		);
 		Some(Ok((latest_internal_key, latest_encoded_value, latest_is_tombstone)))
 	}
 }
@@ -307,9 +269,7 @@ where
 	I: DoubleEndedIterator<Item = Result<(InternalKey, Vec<u8>, bool)>>,
 {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		// For now, just delegate to the inner iterator
-		// TODO: Implement proper backward iteration
-		None
+		unimplemented!("VersioningFilterIter::next_back is not implemented");
 	}
 }
 
@@ -336,102 +296,49 @@ where
 			return Ok(false);
 		}
 
-		println!(
-			"DEBUG: ScanVersioningFilterIter load_next_key called, current_key: {:?}",
-			self.current_key
-		);
-
-		// Keep iterating as long as the key is the same, collect all versions
 		while let Some(entry) = self.inner.next() {
 			let (internal_key, encoded_value, is_tombstone) = entry?;
 			let current_key = internal_key.user_key.as_ref().to_vec();
 
-			println!("DEBUG: ScanVersioningFilterIter processing entry - key: {:?}, timestamp: {}, seq_num: {}, is_tombstone: {}, is_hard_delete: {}", 
-				current_key, internal_key.timestamp, internal_key.seq_num(), is_tombstone, internal_key.is_hard_delete_marker());
-
-			// If this is a new key and we already have a key to process, process it first
 			if let Some(prev_key) = self.current_key.clone() {
 				if prev_key != current_key {
-					println!("DEBUG: ScanVersioningFilterIter new key encountered, processing previous key: {:?}", prev_key);
-					// Process the previous key - this will check hard delete and filter
 					if self.process_key_versions(prev_key.clone())? {
-						// Start collecting versions for the new key
 						self.current_key = Some(current_key);
-						self.current_versions.clear(); // Clear any previous versions
+						self.current_versions.clear();
 						self.current_versions.push((internal_key, encoded_value, is_tombstone));
 						return Ok(true);
 					}
-					// Clear current_key so we don't try to process it again
 					self.current_key = None;
 				}
 			}
 
-			// If this is the first key or same key, add to current versions
 			if self.current_key.is_none() || self.current_key.as_ref() == Some(&current_key) {
 				self.current_key = Some(current_key);
 				self.current_versions.push((internal_key, encoded_value, is_tombstone));
-				println!("DEBUG: ScanVersioningFilterIter added version to current_versions, total versions: {}", self.current_versions.len());
 			}
 		}
 
-		// Process the last key if we have one
 		if let Some(key) = self.current_key.take() {
-			println!("DEBUG: ScanVersioningFilterIter processing final key: {:?}", key);
 			if self.process_key_versions(key)? {
 				return Ok(true);
 			}
 		}
-
-		println!("DEBUG: ScanVersioningFilterIter no more keys to process");
 		self.finished = true;
 		Ok(false)
 	}
 
-	/// Processes versions for a key and prepares them for iteration
-	fn process_key_versions(&mut self, key: Vec<u8>) -> Result<bool> {
-		println!("DEBUG: ScanVersioningFilterIter process_key_versions called for key: {:?}", key);
-
-		// Use the current_versions we've been collecting
+	fn process_key_versions(&mut self, _key: Vec<u8>) -> Result<bool> {
 		let versions = std::mem::take(&mut self.current_versions);
 
-		println!(
-			"DEBUG: ScanVersioningFilterIter processing {} versions for key: {:?}",
-			versions.len(),
-			key
-		);
-		for (i, (internal_key, _, _)) in versions.iter().enumerate() {
-			println!(
-				"DEBUG:   Version {}: timestamp={}, seq_num={}, is_tombstone={}, is_hard_delete={}",
-				i,
-				internal_key.timestamp,
-				internal_key.seq_num(),
-				internal_key.is_tombstone(),
-				internal_key.is_hard_delete_marker()
-			);
-		}
-
-		// If no versions, skip this key
 		if versions.is_empty() {
-			println!("DEBUG: ScanVersioningFilterIter no versions for key, skipping");
 			return Ok(false);
 		}
 
-		// Always filter out keys where the latest version is a hard delete
 		let latest_version = versions.last().unwrap();
 		if latest_version.0.is_hard_delete_marker() {
-			println!(
-				"DEBUG: ScanVersioningFilterIter latest version is hard delete, skipping key: {:?}",
-				key
-			);
 			return Ok(false);
 		}
 
-		// For ScanVersioningFilterIter, we want all versions of the key
-		println!(
-			"DEBUG: ScanVersioningFilterIter keeping all {} versions for key: {:?}",
-			versions.len(),
-			key
-		);
 		self.current_versions = versions;
 		self.forward_pos = 0;
 		Ok(true)
@@ -445,59 +352,26 @@ where
 	type Item = Result<(InternalKey, Vec<u8>, bool)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		println!("DEBUG: ScanVersioningFilterIter::next called, current_versions.len(): {}, forward_pos: {}", 
-			self.current_versions.len(), self.forward_pos);
-
-		// If we have no current versions, try to load the next key
 		if self.current_versions.is_empty() {
-			println!("DEBUG: ScanVersioningFilterIter no current versions, loading next key");
 			match self.load_next_key() {
-				Ok(true) => {
-					println!(
-						"DEBUG: ScanVersioningFilterIter loaded new key with versions, continuing"
-					);
-					// We loaded a new key with versions, continue to process it
-				}
-				Ok(false) => {
-					println!("DEBUG: ScanVersioningFilterIter no more keys to process");
-					// No more keys to process
-					return None;
-				}
-				Err(e) => {
-					println!("DEBUG: ScanVersioningFilterIter error loading next key: {:?}", e);
-					return Some(Err(e));
-				}
+				Ok(true) => {}
+				Ok(false) => return None,
+				Err(e) => return Some(Err(e)),
 			}
 		}
 
-		// If we still have no versions after loading, we're done
 		if self.current_versions.is_empty() {
-			println!("DEBUG: ScanVersioningFilterIter still no versions after loading, done");
 			return None;
 		}
 
-		// Return the next version from current_versions and remove it
 		if !self.current_versions.is_empty() {
 			let (internal_key, encoded_value, is_tombstone) = self.current_versions.remove(0);
-			println!("DEBUG: ScanVersioningFilterIter returning version for key: {:?}, is_tombstone: {}, remaining versions: {}", 
-				internal_key.user_key.as_ref(), is_tombstone, self.current_versions.len());
 			Some(Ok((internal_key, encoded_value, is_tombstone)))
 		} else {
-			println!("DEBUG: ScanVersioningFilterIter no more versions in current_versions, loading next key");
-			// We've exhausted current versions, try to load the next key
 			match self.load_next_key() {
-				Ok(true) => {
-					println!("DEBUG: ScanVersioningFilterIter loaded next key, recursing");
-					self.next()
-				}
-				Ok(false) => {
-					println!("DEBUG: ScanVersioningFilterIter no more keys after clearing");
-					None
-				}
-				Err(e) => {
-					println!("DEBUG: ScanVersioningFilterIter error loading next key after clearing: {:?}", e);
-					Some(Err(e))
-				}
+				Ok(true) => self.next(),
+				Ok(false) => None,
+				Err(e) => Some(Err(e)),
 			}
 		}
 	}
@@ -511,7 +385,6 @@ where
 		while let Some(item) = self.inner.next_back() {
 			match item {
 				Ok((internal_key, encoded_value, is_tombstone)) => {
-					// Filter out hard deletes - if this is a hard delete, skip it
 					if internal_key.is_hard_delete_marker() {
 						continue;
 					}
@@ -542,119 +415,59 @@ where
 		}
 	}
 
-	/// Loads the next key and its versions from the inner iterator
 	fn load_next_key(&mut self) -> Result<bool> {
 		if self.finished {
 			return Ok(false);
 		}
 
-		println!(
-			"DEBUG: ScanAllTimestampsFilterIter load_next_key called, current_key: {:?}",
-			self.current_key
-		);
-
-		// If we have a buffered entry from the previous call, use it
 		if let Some((internal_key, encoded_value, is_tombstone)) = self.next_key_buffer.take() {
 			let current_key = internal_key.user_key.as_ref().to_vec();
 			self.current_key = Some(current_key.clone());
 			self.current_versions.push((internal_key, encoded_value, is_tombstone));
-			println!(
-				"DEBUG: ScanAllTimestampsFilterIter using buffered entry for key: {:?}",
-				current_key
-			);
 		}
 
-		// Keep iterating as long as the key is the same, collect all versions
 		while let Some(entry) = self.inner.next() {
 			let (internal_key, encoded_value, is_tombstone) = entry?;
 			let current_key = internal_key.user_key.as_ref().to_vec();
 
-			println!("DEBUG: ScanAllTimestampsFilterIter processing entry - key: {:?}, timestamp: {}, seq_num: {}, is_tombstone: {}, is_hard_delete: {}", 
-				current_key, internal_key.timestamp, internal_key.seq_num(), is_tombstone, internal_key.is_hard_delete_marker());
-
-			// If this is a new key and we already have a key to process, process it first
 			if let Some(prev_key) = self.current_key.clone() {
 				if prev_key != current_key {
-					println!("DEBUG: ScanAllTimestampsFilterIter new key encountered, processing previous key: {:?}", prev_key);
-					// Buffer the new key's first entry for the next call
 					self.next_key_buffer = Some((internal_key, encoded_value, is_tombstone));
-					// Process the previous key - this will check hard delete and filter
 					if self.process_key_versions(prev_key.clone())? {
 						return Ok(true);
 					}
-					// If the previous key was filtered out, clear current_key and continue with the buffered entry
 					self.current_key = None;
-					// Recursively call load_next_key to process the buffered entry
 					return self.load_next_key();
 				}
 			}
 
-			// If this is the first key or same key, add to current versions
 			if self.current_key.is_none() || self.current_key.as_ref() == Some(&current_key) {
 				self.current_key = Some(current_key);
 				self.current_versions.push((internal_key, encoded_value, is_tombstone));
-				println!("DEBUG: ScanAllTimestampsFilterIter added version to current_versions, total versions: {}", self.current_versions.len());
 			}
 		}
 
-		// Process the last key if we have one
 		if let Some(key) = self.current_key.take() {
-			println!("DEBUG: ScanAllTimestampsFilterIter processing final key: {:?}", key);
 			if self.process_key_versions(key)? {
 				return Ok(true);
 			}
 		}
-
-		println!("DEBUG: ScanAllTimestampsFilterIter no more keys to process");
 		self.finished = true;
 		Ok(false)
 	}
 
-	/// Processes versions for a key and prepares them for iteration
-	fn process_key_versions(&mut self, key: Vec<u8>) -> Result<bool> {
-		println!(
-			"DEBUG: ScanAllTimestampsFilterIter process_key_versions called for key: {:?}",
-			key
-		);
-
-		// Use the current_versions we've been collecting
+	fn process_key_versions(&mut self, _key: Vec<u8>) -> Result<bool> {
 		let versions = std::mem::take(&mut self.current_versions);
 
-		println!(
-			"DEBUG: ScanAllTimestampsFilterIter processing {} versions for key: {:?}",
-			versions.len(),
-			key
-		);
-		for (i, (internal_key, _, _)) in versions.iter().enumerate() {
-			println!(
-				"DEBUG:   Version {}: timestamp={}, seq_num={}, is_tombstone={}, is_hard_delete={}",
-				i,
-				internal_key.timestamp,
-				internal_key.seq_num(),
-				internal_key.is_tombstone(),
-				internal_key.is_hard_delete_marker()
-			);
-		}
-
-		// If no versions, skip this key
 		if versions.is_empty() {
-			println!("DEBUG: ScanAllTimestampsFilterIter no versions for key, skipping");
 			return Ok(false);
 		}
 
-		// Always filter out keys where the latest version is a hard delete
 		let latest_version = versions.last().unwrap();
 		if latest_version.0.is_hard_delete_marker() {
-			println!("DEBUG: ScanAllTimestampsFilterIter latest version is hard delete, skipping key: {:?}", key);
 			return Ok(false);
 		}
 
-		// For ScanAllTimestampsFilterIter, we want all versions of the key
-		println!(
-			"DEBUG: ScanAllTimestampsFilterIter keeping all {} versions for key: {:?}",
-			versions.len(),
-			key
-		);
 		self.current_versions = versions;
 		self.forward_pos = 0;
 		Ok(true)
@@ -668,57 +481,26 @@ where
 	type Item = Result<(InternalKey, Vec<u8>, bool)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		println!("DEBUG: ScanAllTimestampsFilterIter::next called, current_versions.len(): {}, forward_pos: {}", 
-			self.current_versions.len(), self.forward_pos);
-
-		// If we have no current versions, try to load the next key
 		if self.current_versions.is_empty() {
-			println!("DEBUG: ScanAllTimestampsFilterIter no current versions, loading next key");
 			match self.load_next_key() {
-				Ok(true) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter loaded new key with versions, continuing");
-					// We loaded a new key with versions, continue to process it
-				}
-				Ok(false) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter no more keys to process");
-					// No more keys to process
-					return None;
-				}
-				Err(e) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter error loading next key: {:?}", e);
-					return Some(Err(e));
-				}
+				Ok(true) => {}
+				Ok(false) => return None,
+				Err(e) => return Some(Err(e)),
 			}
 		}
 
-		// If we still have no versions after loading, we're done
 		if self.current_versions.is_empty() {
-			println!("DEBUG: ScanAllTimestampsFilterIter still no versions after loading, done");
 			return None;
 		}
 
-		// Return the next version from current_versions and remove it
 		if !self.current_versions.is_empty() {
 			let (internal_key, encoded_value, is_tombstone) = self.current_versions.remove(0);
-			println!("DEBUG: ScanAllTimestampsFilterIter returning version for key: {:?}, is_tombstone: {}, remaining versions: {}", 
-				internal_key.user_key.as_ref(), is_tombstone, self.current_versions.len());
 			Some(Ok((internal_key, encoded_value, is_tombstone)))
 		} else {
-			println!("DEBUG: ScanAllTimestampsFilterIter no more versions in current_versions, loading next key");
-			// We've exhausted current versions, try to load the next key
 			match self.load_next_key() {
-				Ok(true) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter loaded next key, recursing");
-					self.next()
-				}
-				Ok(false) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter no more keys after clearing");
-					None
-				}
-				Err(e) => {
-					println!("DEBUG: ScanAllTimestampsFilterIter error loading next key after clearing: {:?}", e);
-					Some(Err(e))
-				}
+				Ok(true) => self.next(),
+				Ok(false) => None,
+				Err(e) => Some(Err(e)),
 			}
 		}
 	}
@@ -729,9 +511,7 @@ where
 	I: DoubleEndedIterator<Item = Result<(InternalKey, Vec<u8>, bool)>>,
 {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		// For now, just delegate to the inner iterator
-		// TODO: Implement proper backward iteration
-		None
+		unimplemented!("ScanAllTimestampsFilterIter::next_back is not implemented");
 	}
 }
 
@@ -759,26 +539,9 @@ where
 		while let Some(item) = self.inner.next() {
 			match item {
 				Ok((internal_key, encoded_value, is_tombstone)) => {
-					println!("DEBUG: TombstoneFilterIter received - key: {:?}, is_tombstone: {}, include_tombstones: {}", 
-						internal_key.user_key.as_ref(), is_tombstone, self.include_tombstones);
-
-					// Filter tombstones if needed
 					if !self.include_tombstones && is_tombstone {
-						println!(
-							"DEBUG: Filtering out tombstone for key: {:?}",
-							internal_key.user_key.as_ref()
-						);
 						continue;
 					}
-
-					println!(
-						"DEBUG: TombstoneFilterIter returning - key: {:?}, is_tombstone: {}",
-						internal_key.user_key.as_ref(),
-						is_tombstone
-					);
-
-					// If include_latest_only is true, we need to ensure we only return the latest version
-					// This is handled by the VersionedFilterIter, so we just pass through
 					return Some(Ok((internal_key, encoded_value, is_tombstone)));
 				}
 				Err(e) => return Some(Err(e)),
@@ -796,13 +559,9 @@ where
 		while let Some(item) = self.inner.next_back() {
 			match item {
 				Ok((internal_key, encoded_value, is_tombstone)) => {
-					// Filter tombstones if needed
 					if !self.include_tombstones && is_tombstone {
 						continue;
 					}
-
-					// If include_latest_only is true, we need to ensure we only return the latest version
-					// This is handled by the VersionedFilterIter, so we just pass through
 					return Some(Ok((internal_key, encoded_value, is_tombstone)));
 				}
 				Err(e) => return Some(Err(e)),
