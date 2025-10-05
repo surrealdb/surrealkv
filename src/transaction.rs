@@ -620,12 +620,12 @@ impl Transaction {
 	}
 
 	/// Gets keys in a key range at a specific timestamp
-	pub fn keys_at_timestamp<R: RangeBounds<Vec<u8>>>(
-		&self,
+	pub fn keys_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
 		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<Vec<Vec<u8>>> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Vec<u8>>> + 'a> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -646,12 +646,12 @@ impl Transaction {
 	}
 
 	/// Scans key-value pairs in a key range at a specific timestamp
-	pub fn scan_at_timestamp<R: RangeBounds<Vec<u8>>>(
-		&self,
+	pub fn scan_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
 		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<Vec<(Vec<u8>, Value)>> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -2673,19 +2673,28 @@ mod tests {
 		assert_eq!(val2.1.as_ref(), b"value2");
 
 		// Test scan_at_timestamp with specific timestamp to get point-in-time view
-		let version_at_ts1 =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts1, None).unwrap();
+		let version_at_ts1 = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
 		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
 
-		let version_at_ts2 =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts2, None).unwrap();
+		let version_at_ts2 = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
 		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
 
 		// Test with timestamp after delete - should show nothing
-		let version_at_ts3 =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts3, None).unwrap();
+		let version_at_ts3 = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(version_at_ts3.len(), 0);
 	}
 
@@ -2813,8 +2822,11 @@ mod tests {
 
 		// Test keys_at_timestamp at first timestamp
 		let tx = tree.begin().unwrap();
-		let keys_at_ts1 =
-			tx.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None).unwrap();
+		let keys_at_ts1 = tx
+			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(keys_at_ts1.len(), 3);
 		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
 		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
@@ -2822,8 +2834,11 @@ mod tests {
 		assert!(!keys_at_ts1.contains(&b"key4".to_vec())); // key4 didn't exist at ts1
 
 		// Test keys_at_timestamp at second timestamp
-		let keys_at_ts2 =
-			tx.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None).unwrap();
+		let keys_at_ts2 = tx
+			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(keys_at_ts2.len(), 4);
 		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
 		assert!(keys_at_ts2.contains(&b"key2".to_vec()));
@@ -2831,13 +2846,19 @@ mod tests {
 		assert!(keys_at_ts2.contains(&b"key4".to_vec()));
 
 		// Test with limit
-		let keys_limited =
-			tx.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2)).unwrap();
+		let keys_limited = tx
+			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(keys_limited.len(), 2);
 
 		// Test with specific key range
-		let keys_range =
-			tx.keys_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None).unwrap();
+		let keys_range = tx
+			.keys_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(keys_range.len(), 2);
 		assert!(keys_range.contains(&b"key2".to_vec()));
 		assert!(keys_range.contains(&b"key3".to_vec()));
@@ -2866,8 +2887,11 @@ mod tests {
 		// Test keys_at_timestamp with current timestamp
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
-		let keys =
-			tx.keys_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), u64::MAX, None).unwrap();
+		let keys = tx
+			.keys_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), u64::MAX, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
 		assert!(keys.contains(&b"key1".to_vec()));
 		assert!(!keys.contains(&b"key2".to_vec())); // Hard deleted
@@ -2900,8 +2924,11 @@ mod tests {
 
 		// Test scan_at_timestamp at first timestamp
 		let tx = tree.begin().unwrap();
-		let scan_at_ts1 =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None).unwrap();
+		let scan_at_ts1 = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(scan_at_ts1.len(), 3);
 
 		// Check that we get key-value pairs
@@ -2921,8 +2948,11 @@ mod tests {
 		assert!(!found_keys.contains(&b"key4".as_ref())); // key4 didn't exist at ts1
 
 		// Test scan_at_timestamp at second timestamp
-		let scan_at_ts2 =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None).unwrap();
+		let scan_at_ts2 = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(scan_at_ts2.len(), 4);
 
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
@@ -2942,13 +2972,19 @@ mod tests {
 		assert!(found_keys.contains(&b"key4".as_ref()));
 
 		// Test with limit
-		let scan_limited =
-			tx.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2)).unwrap();
+		let scan_limited = tx
+			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(scan_limited.len(), 2);
 
 		// Test with specific key range
-		let scan_range =
-			tx.scan_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None).unwrap();
+		let scan_range = tx
+			.scan_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.unwrap();
 		assert_eq!(scan_range.len(), 2);
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, _) in &scan_range {
@@ -2977,6 +3013,8 @@ mod tests {
 		let tx_before = tree.begin().unwrap();
 		let scan_before = tx_before
 			.scan_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(scan_before.len(), 3, "Should have all 3 keys before deletes");
 
@@ -2998,6 +3036,8 @@ mod tests {
 		// Perform scan at timestamp after deletes
 		let scan_result = tx
 			.scan_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
+			.unwrap()
+			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(scan_result.len(), 1, "Should have only 1 key after deletes");
 
