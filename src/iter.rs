@@ -166,8 +166,11 @@ pub(crate) struct CompactionIterator<'a> {
 	// Track the current key being processed
 	current_user_key: Option<Key>,
 
-	// Collected versions of the current key
-	current_key_versions: Vec<(Arc<InternalKey>, Value)>,
+	// Buffer for accumulating versions from the heap (raw, unprocessed)
+	accumulated_versions: Vec<(Arc<InternalKey>, Value)>,
+
+	// Buffer for processed versions ready to return
+	output_versions: Vec<(Arc<InternalKey>, Value)>,
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
@@ -205,7 +208,8 @@ impl<'a> CompactionIterator<'a> {
 			heap,
 			is_bottom_level,
 			current_user_key: None,
-			current_key_versions: Vec::new(),
+			accumulated_versions: Vec::new(),
+			output_versions: Vec::new(),
 			discard_stats: HashMap::new(),
 			vlog,
 			delete_list_batch: Vec::new(),
@@ -240,33 +244,36 @@ impl<'a> CompactionIterator<'a> {
 		Ok(())
 	}
 
-	/// Process all collected versions of the current key and return the one to output
-	fn process_current_key_versions(&mut self) -> Option<(Arc<InternalKey>, Value)> {
-		if self.current_key_versions.is_empty() {
-			return None;
+	/// Process all accumulated versions of the current key
+	/// Filters out stale entries and populates output_versions with valid entries
+	fn process_accumulated_versions(&mut self) {
+		if self.accumulated_versions.is_empty() {
+			return;
 		}
 
-		// TODO: Check if this could be removed as entries are sorted in the sstables. Verify with tests.
 		// Sort by sequence number (descending) to get the latest version first
-		self.current_key_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
+		self.accumulated_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
 
-		// Clone the latest version data to avoid borrow conflicts
-		let latest_key = self.current_key_versions[0].0.clone();
-		let latest_value = self.current_key_versions[0].1.clone();
-		let is_latest_delete_marker = latest_key.is_hard_delete_marker();
+		// Check if latest version is DELETE at bottom level - if so, discard entire key
+		let latest_is_delete_at_bottom = self.is_bottom_level
+			&& !self.accumulated_versions.is_empty()
+			&& self.accumulated_versions[0].0.is_hard_delete_marker();
 
 		// Check if any version is SetWithDelete - if so, mark all older versions as stale
 		let has_set_with_delete =
-			self.current_key_versions.iter().any(|(key, _)| key.is_set_with_delete());
+			self.accumulated_versions.iter().any(|(key, _)| key.is_set_with_delete());
 
-		// Process all versions for delete list and discard stats
-		for (i, (key, value)) in self.current_key_versions.iter().enumerate() {
+		// Process all versions for delete list and determine which to keep
+		for (i, (key, value)) in self.accumulated_versions.iter().enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_set_with_delete = key.is_set_with_delete();
 			let is_latest = i == 0;
 
 			// Determine if this entry should be marked as stale in VLog
-			let should_mark_stale = if is_latest && !is_hard_delete && !is_set_with_delete {
+			let should_mark_stale = if latest_is_delete_at_bottom {
+				// If latest version is DELETE at bottom level, mark ALL versions as stale
+				true
+			} else if is_latest && !is_hard_delete && !is_set_with_delete {
 				// Latest version of a regular SET operation: never mark as stale (it's being returned)
 				false
 			} else if is_latest && is_hard_delete && self.is_bottom_level {
@@ -280,7 +287,6 @@ impl<'a> CompactionIterator<'a> {
 				false
 			} else if is_hard_delete {
 				// For older DELETE operations (hard delete entries): always mark as stale since they don't have VLog values
-				// The B+ tree index entry will remain for versioned queries, but VLog doesn't store delete values
 				true
 			} else if has_set_with_delete && !is_set_with_delete {
 				// If there's a SetWithDelete operation, mark all older non-SetWithDelete versions as stale
@@ -320,18 +326,29 @@ impl<'a> CompactionIterator<'a> {
 					eprintln!("Error collecting discard stats: {e:?}");
 				}
 			}
+
+			// Determine if this version should be kept for output
+			let should_output = if latest_is_delete_at_bottom {
+				// If latest version is DELETE at bottom level, output NOTHING for this key
+				false
+			} else if should_mark_stale {
+				// Stale entries: don't output
+				false
+			} else if self.enable_versioning {
+				// Versioning enabled: output all non-stale versions
+				true
+			} else {
+				// Versioning disabled: only output the latest version
+				is_latest
+			};
+
+			if should_output {
+				self.output_versions.push((key.clone(), value.clone()));
+			}
 		}
 
-		// Clear the versions for the next key
-		self.current_key_versions.clear();
-
-		// Return the latest version if it should be returned
-		if is_latest_delete_marker && self.is_bottom_level {
-			// At bottom level, don't return hard delete entries
-			None
-		} else {
-			Some((latest_key, latest_value))
-		}
+		// Clear accumulated versions for the next key
+		self.accumulated_versions.clear();
 	}
 }
 
@@ -344,12 +361,25 @@ impl Iterator for CompactionIterator<'_> {
 		}
 
 		loop {
+			// First, return any pending output versions
+			if !self.output_versions.is_empty() {
+				// Remove from front to maintain sequence number order (already sorted descending)
+				return Some(self.output_versions.remove(0));
+			}
+
 			// Get the next item from the heap
 			let heap_item = match self.heap.pop() {
 				Some(item) => item,
 				None => {
-					// No more items in heap, process any remaining key versions
-					return self.process_current_key_versions();
+					// No more items in heap, process any remaining accumulated versions
+					if !self.accumulated_versions.is_empty() {
+						self.process_accumulated_versions();
+						// Return first output version if any
+						if !self.output_versions.is_empty() {
+							return Some(self.output_versions.remove(0));
+						}
+					}
+					return None;
 				}
 			};
 
@@ -371,25 +401,30 @@ impl Iterator for CompactionIterator<'_> {
 			};
 
 			if is_new_key {
-				// Process any accumulated versions of the previous key
-				if let Some(result) = self.process_current_key_versions() {
-					// Add the current item to the new key's versions
-					self.current_user_key = Some(user_key);
-					self.current_key_versions.push((heap_item.key, heap_item.value));
-					return Some(result);
-				}
+				// Process accumulated versions of the previous key
+				if !self.accumulated_versions.is_empty() {
+					self.process_accumulated_versions();
 
-				// Start collecting versions for the new key
-				self.current_user_key = Some(user_key);
-				self.current_key_versions.push((heap_item.key, heap_item.value));
+					// Start accumulating the new key
+					self.current_user_key = Some(user_key);
+					self.accumulated_versions.push((heap_item.key, heap_item.value));
+
+					// Return first output version from processed key if any
+					if !self.output_versions.is_empty() {
+						return Some(self.output_versions.remove(0));
+					}
+				} else {
+					// First key - start accumulating
+					self.current_user_key = Some(user_key);
+					self.accumulated_versions.push((heap_item.key, heap_item.value));
+				}
 			} else {
-				// Same user key - add to current key's versions
-				self.current_key_versions.push((heap_item.key, heap_item.value));
+				// Same user key - add to accumulated versions
+				self.accumulated_versions.push((heap_item.key, heap_item.value));
 			}
 		}
 	}
 }
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1154,9 +1189,10 @@ mod tests {
 		// Create keys with different timestamps and operations
 		let recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
 		let old_time = current_time - 3_000_000_000; // 3 seconds ago (within retention)
+		let very_old_time = current_time - 10_000_000_000; // 10 seconds ago (OUTSIDE retention)
 
 		// Test case 1: Recent SET, Old SET, Recent DELETE
-		// Expected: Recent SET kept, Old SET kept (within retention), Recent DELETE marked stale
+		// Expected: All 3 versions kept (all within retention)
 		let key1_recent_set =
 			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, recent_time);
 		let key1_old_set =
@@ -1165,7 +1201,7 @@ mod tests {
 			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Delete, recent_time);
 
 		// Test case 2: Old SET, Recent SET, Old DELETE
-		// Expected: Recent SET kept, Old SET kept (within retention), Old DELETE marked stale
+		// Expected: All 3 versions kept (all within retention)
 		let key2_old_set =
 			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
 		let key2_recent_set =
@@ -1173,10 +1209,22 @@ mod tests {
 		let key2_old_delete =
 			create_internal_key_with_timestamp("key2", 600, InternalKeyKind::Delete, old_time);
 
+		// Test case 3: Recent SET with very old versions outside retention
+		// Expected: Only recent SET kept, very old versions marked as stale
+		let key3_very_old_set1 =
+			create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Set, very_old_time);
+		let key3_very_old_set2 =
+			create_internal_key_with_timestamp("key3", 800, InternalKeyKind::Set, very_old_time);
+		let key3_recent_set =
+			create_internal_key_with_timestamp("key3", 900, InternalKeyKind::Set, recent_time);
+
 		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
 		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
 		let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
 		let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+		let val3_very_old1 = create_vlog_value(&vlog, b"key3", b"value3_very_old1");
+		let val3_very_old2 = create_vlog_value(&vlog, b"key3", b"value3_very_old2");
+		let val3_recent = create_vlog_value(&vlog, b"key3", b"value3_recent");
 
 		// Create items for testing
 		let items1 = vec![
@@ -1189,14 +1237,20 @@ mod tests {
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
+		let items3 = vec![
+			(key3_recent_set, val3_recent),
+			(key3_very_old_set2, val3_very_old2),
+			(key3_very_old_set1, val3_very_old1),
+		];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
+		let iter3 = Box::new(MockIterator::new(items3));
 
 		// Test with versioning enabled and 5-second retention period
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
+			vec![iter1, iter2, iter3],
 			false, // not bottom level
 			Some(vlog.clone()),
 			true, // enable versioning
@@ -1206,14 +1260,43 @@ mod tests {
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
 
-		// Should get 2 keys (latest versions only)
-		assert_eq!(result.len(), 2);
+		// With versioning enabled and retention period of 5 seconds, should get 7 items total:
+		// - key1: 3 versions (all within retention)
+		// - key2: 3 versions (all within retention)
+		// - key3: 1 version (only recent one, very old versions filtered out due to retention)
+		assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
 
-		// Verify we get the latest versions
-		let keys: Vec<String> =
-			result.iter().map(|(k, _)| String::from_utf8_lossy(&k.user_key).to_string()).collect();
-		assert!(keys.contains(&"key1".to_string()));
-		assert!(keys.contains(&"key2".to_string()));
+		// Verify we get all versions of key1 (all within retention)
+		let key1_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		assert_eq!(key1_versions.len(), 3, "key1 should have 3 versions within retention");
+
+		// Verify we get all versions of key2 (all within retention)
+		let key2_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		assert_eq!(key2_versions.len(), 3, "key2 should have 3 versions within retention");
+
+		// Verify we get only the recent version of key3 (very old versions outside retention)
+		let key3_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		assert_eq!(
+			key3_versions.len(),
+			1,
+			"key3 should have only 1 version (recent), very old versions filtered"
+		);
+
+		// Verify sequence numbers for key1 (sorted descending: latest first)
+		assert_eq!(key1_versions[0].0.seq_num(), 300); // DELETE
+		assert_eq!(key1_versions[1].0.seq_num(), 200); // SET
+		assert_eq!(key1_versions[2].0.seq_num(), 100); // SET
+
+		// Verify sequence numbers for key2 (sorted descending: latest first)
+		assert_eq!(key2_versions[0].0.seq_num(), 600); // DELETE
+		assert_eq!(key2_versions[1].0.seq_num(), 500); // SET
+		assert_eq!(key2_versions[2].0.seq_num(), 400); // SET
+
+		// Verify sequence number for key3 (only recent version)
+		assert_eq!(key3_versions[0].0.seq_num(), 900); // Recent SET only
 
 		comp_iter.flush_delete_list_batch().unwrap();
 
@@ -1249,6 +1332,495 @@ mod tests {
 		assert!(
 			!vlog.is_stale(600).unwrap(),
 			"key2 old DELETE (seq=600) should NOT be marked as stale (within retention)"
+		);
+
+		// Verify retention behavior for key3:
+		// - Recent SET (seq=900): NOT stale (latest, returned)
+		// - Very old SET (seq=800): STALE (outside retention period)
+		// - Very old SET (seq=700): STALE (outside retention period)
+		assert!(
+			!vlog.is_stale(900).unwrap(),
+			"key3 recent SET (seq=900) should NOT be marked as stale (latest, returned)"
+		);
+		assert!(
+			vlog.is_stale(800).unwrap(),
+			"key3 very old SET (seq=800) SHOULD be marked as stale (outside retention period)"
+		);
+		assert!(
+			vlog.is_stale(700).unwrap(),
+			"key3 very old SET (seq=700) SHOULD be marked as stale (outside retention period)"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_versioning_retention_bottom_level() {
+		// Create test VLog
+		let (vlog, _temp_dir) = create_test_vlog();
+
+		// Use fixed current time for consistent testing
+		let current_time = 1000000000000; // Fixed current time
+		let retention_period_ns = 5_000_000_000; // 5 seconds
+
+		// Create keys with different timestamps and operations
+		let recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
+		let old_time = current_time - 3_000_000_000; // 3 seconds ago (within retention)
+		let very_old_time = current_time - 10_000_000_000; // 10 seconds ago (OUTSIDE retention)
+
+		// Test case 1: DELETE marker is latest at bottom level - entire key should be discarded
+		// Expected: All versions (DELETE + SETs) marked as stale and discarded
+		let key1_recent_set =
+			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, recent_time);
+		let key1_old_set =
+			create_internal_key_with_timestamp("key1", 200, InternalKeyKind::Set, old_time);
+		let key1_recent_delete =
+			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Delete, recent_time);
+
+		// Test case 2: Only DELETE marker at bottom level - entire key should disappear
+		// Expected: Nothing returned for this key
+		let key2_delete =
+			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Delete, recent_time);
+
+		// Test case 3: Recent SET with very old versions outside retention
+		// Expected: Only recent SET kept, very old versions marked as stale
+		let key3_very_old_set1 =
+			create_internal_key_with_timestamp("key3", 500, InternalKeyKind::Set, very_old_time);
+		let key3_very_old_set2 =
+			create_internal_key_with_timestamp("key3", 600, InternalKeyKind::Set, very_old_time);
+		let key3_recent_set =
+			create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Set, recent_time);
+
+		// Test case 4: Very old DELETE marker is latest at bottom level - entire key discarded
+		// Expected: All versions (DELETE + SET) marked as stale and discarded
+		let key4_old_set =
+			create_internal_key_with_timestamp("key4", 800, InternalKeyKind::Set, old_time);
+		let key4_very_old_delete =
+			create_internal_key_with_timestamp("key4", 900, InternalKeyKind::Delete, very_old_time);
+
+		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
+		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
+		let val3_very_old1 = create_vlog_value(&vlog, b"key3", b"value3_very_old1");
+		let val3_very_old2 = create_vlog_value(&vlog, b"key3", b"value3_very_old2");
+		let val3_recent = create_vlog_value(&vlog, b"key3", b"value3_recent");
+		let val4_old = create_vlog_value(&vlog, b"key4", b"value4_old");
+
+		// Create items for testing
+		let items1 = vec![
+			(key1_recent_delete, Arc::from(Vec::new())), // DELETE operation - should be dropped
+			(key1_old_set, val1_old),
+			(key1_recent_set, val1_recent),
+		];
+		let items2 = vec![
+			(key2_delete, Arc::from(Vec::new())), // DELETE only - entire key disappears
+		];
+		let items3 = vec![
+			(key3_recent_set, val3_recent),
+			(key3_very_old_set2, val3_very_old2),
+			(key3_very_old_set1, val3_very_old1),
+		];
+		let items4 = vec![
+			(key4_very_old_delete, Arc::from(Vec::new())), // Very old DELETE - dropped
+			(key4_old_set, val4_old),
+		];
+
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+		let iter3 = Box::new(MockIterator::new(items3));
+		let iter4 = Box::new(MockIterator::new(items4));
+
+		// Test with versioning enabled, 5-second retention period, and BOTTOM LEVEL
+		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2, iter3, iter4],
+			true, // BOTTOM LEVEL - delete markers should be dropped
+			Some(vlog.clone()),
+			true, // enable versioning
+			retention_period_ns,
+			clock,
+		);
+
+		let result: Vec<_> = comp_iter.by_ref().collect();
+
+		// With versioning enabled at bottom level:
+		// - key1: 0 versions (DELETE is latest, entire key discarded)
+		// - key2: 0 versions (DELETE-only key discarded)
+		// - key3: 1 version (only recent SET kept, very old versions filtered)
+		// - key4: 0 versions (DELETE is latest, entire key discarded)
+		// Total: 1 item
+		assert_eq!(result.len(), 1, "Expected 1 item: only key3 with recent SET");
+
+		// Verify key1: Entire key discarded (DELETE is latest at bottom level)
+		let key1_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		assert_eq!(
+			key1_versions.len(),
+			0,
+			"key1 should have 0 versions (DELETE is latest at bottom level, entire key discarded)"
+		);
+
+		// Verify key2: DELETE-only key should completely disappear
+		let key2_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		assert_eq!(
+			key2_versions.len(),
+			0,
+			"key2 should have 0 versions (DELETE-only at bottom level)"
+		);
+
+		// Verify key3: only recent version kept (very old versions outside retention)
+		let key3_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		assert_eq!(
+			key3_versions.len(),
+			1,
+			"key3 should have only 1 version (recent), very old versions filtered"
+		);
+		assert_eq!(key3_versions[0].0.seq_num(), 700); // Recent SET only
+
+		// Verify key4: Entire key discarded (DELETE is latest at bottom level)
+		let key4_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key4").collect();
+		assert_eq!(
+			key4_versions.len(),
+			0,
+			"key4 should have 0 versions (DELETE is latest at bottom level, entire key discarded)"
+		);
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Verify staleness behavior:
+
+		// key1: DELETE is latest at bottom level, so ALL versions should be marked as stale
+		assert!(
+			vlog.is_stale(300).unwrap(),
+			"key1 DELETE (seq=300) SHOULD be marked as stale (latest DELETE at bottom level)"
+		);
+		assert!(
+			vlog.is_stale(200).unwrap(),
+			"key1 old SET (seq=200) SHOULD be marked as stale (entire key discarded)"
+		);
+		assert!(
+			vlog.is_stale(100).unwrap(),
+			"key1 recent SET (seq=100) SHOULD be marked as stale (entire key discarded)"
+		);
+
+		// key2: DELETE (seq=400) should be marked as stale (dropped at bottom level)
+		assert!(
+			vlog.is_stale(400).unwrap(),
+			"key2 DELETE (seq=400) SHOULD be marked as stale (dropped at bottom level)"
+		);
+
+		// key3: Recent version NOT stale, very old versions STALE
+		assert!(
+			!vlog.is_stale(700).unwrap(),
+			"key3 recent SET (seq=700) should NOT be marked as stale (latest, returned)"
+		);
+		assert!(
+			vlog.is_stale(600).unwrap(),
+			"key3 very old SET (seq=600) SHOULD be marked as stale (outside retention period)"
+		);
+		assert!(
+			vlog.is_stale(500).unwrap(),
+			"key3 very old SET (seq=500) SHOULD be marked as stale (outside retention period)"
+		);
+
+		// key4: DELETE is latest at bottom level, so ALL versions should be marked as stale
+		assert!(
+		vlog.is_stale(900).unwrap(),
+		"key4 very old DELETE (seq=900) SHOULD be marked as stale (latest DELETE at bottom level)"
+	);
+		assert!(
+			vlog.is_stale(800).unwrap(),
+			"key4 old SET (seq=800) SHOULD be marked as stale (entire key discarded)"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_no_versioning_non_bottom_level() {
+		// Create test VLog
+		let (vlog, _temp_dir) = create_test_vlog();
+
+		// Use fixed current time for consistent testing
+		let current_time = 1000000000000; // Fixed current time
+		let retention_period_ns = 0; // No retention period (versioning disabled)
+
+		// Create keys with different timestamps and operations
+		let recent_time = current_time - 1_000_000_000; // 1 second ago
+		let old_time = current_time - 3_000_000_000; // 3 seconds ago
+		let very_old_time = current_time - 10_000_000_000; // 10 seconds ago
+
+		// Test case 1: Multiple SET versions - only latest should be kept
+		// Expected: Only seq=300 (latest SET) kept, older versions marked stale
+		let key1_very_old_set =
+			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, very_old_time);
+		let key1_old_set =
+			create_internal_key_with_timestamp("key1", 200, InternalKeyKind::Set, old_time);
+		let key1_recent_set =
+			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Set, recent_time);
+
+		// Test case 2: Latest is DELETE at non-bottom level - DELETE should be preserved
+		// Expected: Only DELETE (seq=600) kept, older SETs marked stale
+		let key2_old_set =
+			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
+		let key2_recent_set =
+			create_internal_key_with_timestamp("key2", 500, InternalKeyKind::Set, recent_time);
+		let key2_delete =
+			create_internal_key_with_timestamp("key2", 600, InternalKeyKind::Delete, recent_time);
+
+		// Test case 3: Only DELETE marker - should be preserved at non-bottom level
+		// Expected: DELETE (seq=700) kept
+		let key3_delete =
+			create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Delete, recent_time);
+
+		let val1_very_old = create_vlog_value(&vlog, b"key1", b"value1_very_old");
+		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
+		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
+		let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
+		let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+
+		// Create items for testing
+		let items1 = vec![
+			(key1_recent_set, val1_recent),
+			(key1_old_set, val1_old),
+			(key1_very_old_set, val1_very_old),
+		];
+		let items2 = vec![
+			(key2_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_recent_set, val2_recent),
+			(key2_old_set, val2_old),
+		];
+		let items3 = vec![(key3_delete, Arc::from(Vec::new()))]; // DELETE only
+
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+		let iter3 = Box::new(MockIterator::new(items3));
+
+		// Test with versioning DISABLED at NON-BOTTOM level
+		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2, iter3],
+			false, // NON-BOTTOM LEVEL
+			Some(vlog.clone()),
+			false, // VERSIONING DISABLED
+			retention_period_ns,
+			clock,
+		);
+
+		let result: Vec<_> = comp_iter.by_ref().collect();
+
+		// Without versioning at non-bottom level, should get 3 items (only latest versions):
+		// - key1: 1 version (latest SET, seq=300)
+		// - key2: 1 version (latest DELETE, seq=600)
+		// - key3: 1 version (DELETE, seq=700)
+		assert_eq!(result.len(), 3, "Expected 3 items: latest version of each key");
+
+		// Verify key1: Only latest SET kept
+		let key1_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		assert_eq!(
+			key1_versions.len(),
+			1,
+			"key1 should have only 1 version (latest, versioning disabled)"
+		);
+		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
+
+		// Verify key2: Only latest DELETE kept
+		let key2_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		assert_eq!(
+			key2_versions.len(),
+			1,
+			"key2 should have only 1 version (latest DELETE, versioning disabled)"
+		);
+		assert_eq!(key2_versions[0].0.seq_num(), 600); // DELETE
+
+		// Verify key3: Only DELETE kept
+		let key3_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		assert_eq!(key3_versions.len(), 1, "key3 should have only 1 version (DELETE)");
+		assert_eq!(key3_versions[0].0.seq_num(), 700); // DELETE
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Verify staleness behavior:
+
+		// key1: Latest SET (seq=300) NOT stale, older versions STALE
+		assert!(
+			!vlog.is_stale(300).unwrap(),
+			"key1 latest SET (seq=300) should NOT be marked as stale (returned)"
+		);
+		assert!(
+			vlog.is_stale(200).unwrap(),
+			"key1 old SET (seq=200) SHOULD be marked as stale (older version)"
+		);
+		assert!(
+			vlog.is_stale(100).unwrap(),
+			"key1 very old SET (seq=100) SHOULD be marked as stale (older version)"
+		);
+
+		// key2: Latest DELETE (seq=600) NOT stale (returned), older SETs STALE
+		assert!(
+			!vlog.is_stale(600).unwrap(),
+			"key2 DELETE (seq=600) should NOT be marked as stale (returned at non-bottom level)"
+		);
+		assert!(
+			vlog.is_stale(500).unwrap(),
+			"key2 recent SET (seq=500) SHOULD be marked as stale (older version)"
+		);
+		assert!(
+			vlog.is_stale(400).unwrap(),
+			"key2 old SET (seq=400) SHOULD be marked as stale (older version)"
+		);
+
+		// key3: DELETE (seq=700) NOT stale (returned at non-bottom level)
+		assert!(
+			!vlog.is_stale(700).unwrap(),
+			"key3 DELETE (seq=700) should NOT be marked as stale (returned at non-bottom level)"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_no_versioning_bottom_level() {
+		// Create test VLog
+		let (vlog, _temp_dir) = create_test_vlog();
+
+		// Use fixed current time for consistent testing
+		let current_time = 1000000000000; // Fixed current time
+		let retention_period_ns = 0; // No retention period (versioning disabled)
+
+		// Create keys with different timestamps and operations
+		let recent_time = current_time - 1_000_000_000; // 1 second ago
+		let old_time = current_time - 3_000_000_000; // 3 seconds ago
+		let very_old_time = current_time - 10_000_000_000; // 10 seconds ago
+
+		// Test case 1: Multiple SET versions - only latest should be kept
+		// Expected: Only seq=300 (latest SET) kept, older versions marked stale
+		let key1_very_old_set =
+			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, very_old_time);
+		let key1_old_set =
+			create_internal_key_with_timestamp("key1", 200, InternalKeyKind::Set, old_time);
+		let key1_recent_set =
+			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Set, recent_time);
+
+		// Test case 2: Latest is DELETE at bottom level - entire key should be discarded
+		// Expected: All versions marked stale, nothing returned
+		let key2_old_set =
+			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
+		let key2_recent_set =
+			create_internal_key_with_timestamp("key2", 500, InternalKeyKind::Set, recent_time);
+		let key2_delete =
+			create_internal_key_with_timestamp("key2", 600, InternalKeyKind::Delete, recent_time);
+
+		// Test case 3: Only DELETE marker at bottom level - entire key should disappear
+		// Expected: DELETE marked stale, nothing returned
+		let key3_delete =
+			create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Delete, recent_time);
+
+		let val1_very_old = create_vlog_value(&vlog, b"key1", b"value1_very_old");
+		let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
+		let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
+		let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
+		let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+
+		// Create items for testing
+		let items1 = vec![
+			(key1_recent_set, val1_recent),
+			(key1_old_set, val1_old),
+			(key1_very_old_set, val1_very_old),
+		];
+		let items2 = vec![
+			(key2_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_recent_set, val2_recent),
+			(key2_old_set, val2_old),
+		];
+		let items3 = vec![(key3_delete, Arc::from(Vec::new()))]; // DELETE only
+
+		let iter1 = Box::new(MockIterator::new(items1));
+		let iter2 = Box::new(MockIterator::new(items2));
+		let iter3 = Box::new(MockIterator::new(items3));
+
+		// Test with versioning DISABLED at BOTTOM level
+		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2, iter3],
+			true, // BOTTOM LEVEL
+			Some(vlog.clone()),
+			false, // VERSIONING DISABLED
+			retention_period_ns,
+			clock,
+		);
+
+		let result: Vec<_> = comp_iter.by_ref().collect();
+
+		// Without versioning at bottom level, should get 1 item:
+		// - key1: 1 version (latest SET, seq=300)
+		// - key2: 0 versions (DELETE is latest, entire key discarded)
+		// - key3: 0 versions (DELETE-only, entire key discarded)
+		assert_eq!(result.len(), 1, "Expected 1 item: only key1 with latest SET");
+
+		// Verify key1: Only latest SET kept
+		let key1_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		assert_eq!(
+			key1_versions.len(),
+			1,
+			"key1 should have only 1 version (latest SET, versioning disabled)"
+		);
+		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
+
+		// Verify key2: Entire key discarded (DELETE is latest at bottom level)
+		let key2_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		assert_eq!(
+			key2_versions.len(),
+			0,
+			"key2 should have 0 versions (DELETE is latest at bottom level)"
+		);
+
+		// Verify key3: Entire key discarded (DELETE-only at bottom level)
+		let key3_versions: Vec<_> =
+			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		assert_eq!(
+			key3_versions.len(),
+			0,
+			"key3 should have 0 versions (DELETE-only at bottom level)"
+		);
+
+		comp_iter.flush_delete_list_batch().unwrap();
+
+		// Verify staleness behavior:
+
+		// key1: Latest SET (seq=300) NOT stale, older versions STALE
+		assert!(
+			!vlog.is_stale(300).unwrap(),
+			"key1 latest SET (seq=300) should NOT be marked as stale (returned)"
+		);
+		assert!(
+			vlog.is_stale(200).unwrap(),
+			"key1 old SET (seq=200) SHOULD be marked as stale (older version)"
+		);
+		assert!(
+			vlog.is_stale(100).unwrap(),
+			"key1 very old SET (seq=100) SHOULD be marked as stale (older version)"
+		);
+
+		// key2: DELETE is latest at bottom level, ALL versions should be marked as stale
+		assert!(
+			vlog.is_stale(600).unwrap(),
+			"key2 DELETE (seq=600) SHOULD be marked as stale (latest DELETE at bottom level)"
+		);
+		assert!(
+			vlog.is_stale(500).unwrap(),
+			"key2 recent SET (seq=500) SHOULD be marked as stale (entire key discarded)"
+		);
+		assert!(
+			vlog.is_stale(400).unwrap(),
+			"key2 old SET (seq=400) SHOULD be marked as stale (entire key discarded)"
+		);
+
+		// key3: DELETE marked as stale (dropped at bottom level)
+		assert!(
+			vlog.is_stale(700).unwrap(),
+			"key3 DELETE (seq=700) SHOULD be marked as stale (dropped at bottom level)"
 		);
 	}
 
