@@ -239,12 +239,12 @@ impl Transaction {
 	}
 
 	/// Sets a key-value pair with a specific timestamp
-	pub fn set_at_ts(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
-		self.set_at_ts_with_options(key, value, timestamp, &WriteOptions::default())
+	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+		self.set_at_version_with_options(key, value, timestamp, &WriteOptions::default())
 	}
 
 	/// Sets a key-value pair with a specific timestamp and custom write options
-	pub fn set_at_ts_with_options(
+	pub fn set_at_version_with_options(
 		&mut self,
 		key: &[u8],
 		value: &[u8],
@@ -494,7 +494,7 @@ impl Transaction {
 
 		// Add all entries to the batch
 		for entry in latest_writes {
-			// Use the entry's timestamp if it was explicitly set (via set_at_ts),
+			// Use the entry's timestamp if it was explicitly set (via set_at_version),
 			// otherwise use the commit timestamp
 			let timestamp = if entry.timestamp != 0 {
 				entry.timestamp
@@ -591,7 +591,7 @@ impl Transaction {
 	}
 
 	/// Gets a value for a key at a specific timestamp
-	pub fn get_at_timestamp(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -609,18 +609,18 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.get_at_timestamp(key, timestamp),
+			Some(snapshot) => snapshot.get_at_version(key, timestamp),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
 	/// Gets keys in a key range at a specific timestamp
-	pub fn keys_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+	pub fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Vec<u8>>> + 'a> {
+	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -635,13 +635,13 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.keys_at_timestamp(key_range, timestamp, limit),
+			Some(snapshot) => snapshot.keys_at_version(key_range, timestamp, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
 	/// Scans key-value pairs in a key range at a specific timestamp
-	pub fn scan_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+	pub fn scan_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
@@ -661,13 +661,13 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_at_timestamp(key_range, timestamp, limit),
+			Some(snapshot) => snapshot.scan_at_version(key_range, timestamp, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
 
 	/// Gets all versions of keys in a key range
-	pub fn scan_all_timestamps<R: RangeBounds<Vec<u8>>>(
+	pub fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
 		&self,
 		key_range: R,
 		limit: Option<usize>,
@@ -686,7 +686,7 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_timestamps(key_range, limit),
+			Some(snapshot) => snapshot.scan_all_versions(key_range, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -2592,11 +2592,11 @@ mod tests {
 
 		// Insert data with explicit timestamps
 		let mut tx1 = tree.begin().unwrap();
-		tx1.set_at_ts(b"key1", b"value1_v1", ts1).unwrap();
+		tx1.set_at_version(b"key1", b"value1_v1", ts1).unwrap();
 		tx1.commit().await.unwrap();
 
 		let mut tx2 = tree.begin().unwrap();
-		tx2.set_at_ts(b"key1", b"value1_v2", ts2).unwrap();
+		tx2.set_at_version(b"key1", b"value1_v2", ts2).unwrap();
 		tx2.commit().await.unwrap();
 
 		// Test regular get (should return latest)
@@ -2605,7 +2605,7 @@ mod tests {
 		assert_eq!(value, Some(Arc::from(b"value1_v2" as &[u8])));
 
 		// Get all versions to verify timestamps and values
-		let versions = tx.scan_all_timestamps(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		let versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
 		assert_eq!(versions.len(), 2);
 
 		// Find versions by timestamp
@@ -2617,11 +2617,11 @@ mod tests {
 		assert_eq!(v2.1.as_ref(), b"value1_v2");
 
 		// Test get at specific timestamp (earlier version)
-		let value_at_ts1 = tx.get_at_timestamp(b"key1", ts1).unwrap();
+		let value_at_ts1 = tx.get_at_version(b"key1", ts1).unwrap();
 		assert_eq!(value_at_ts1, Some(Arc::from(b"value1_v1" as &[u8])));
 
 		// Test get at later timestamp (should return latest version as of that time)
-		let value_at_ts2 = tx.get_at_timestamp(b"key1", ts2).unwrap();
+		let value_at_ts2 = tx.get_at_version(b"key1", ts2).unwrap();
 		assert_eq!(value_at_ts2, Some(Arc::from(b"value1_v2" as &[u8])));
 	}
 
@@ -2655,9 +2655,8 @@ mod tests {
 		let value = tx.get(b"key1").unwrap();
 		assert_eq!(value, None);
 
-		// Test scan_all_timestamps to get all versions including tombstones
-		let all_versions =
-			tx.scan_all_timestamps(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		// Test scan_all_versions to get all versions including tombstones
+		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
 		assert_eq!(all_versions.len(), 3);
 
 		// Check values by timestamp
@@ -2667,9 +2666,9 @@ mod tests {
 		assert_eq!(val1.1.as_ref(), b"value1");
 		assert_eq!(val2.1.as_ref(), b"value2");
 
-		// Test scan_at_timestamp with specific timestamp to get point-in-time view
+		// Test scan_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
+			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2677,7 +2676,7 @@ mod tests {
 		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
 
 		let version_at_ts2 = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
+			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2686,7 +2685,7 @@ mod tests {
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
+			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2703,26 +2702,26 @@ mod tests {
 		// Set a value with a specific timestamp
 		let custom_timestamp = 10;
 		let mut tx = tree.begin().unwrap();
-		tx.set_at_ts(b"key1", b"value1", custom_timestamp).unwrap();
+		tx.set_at_version(b"key1", b"value1", custom_timestamp).unwrap();
 		tx.commit().await.unwrap();
 
 		// Verify we can get the value at that timestamp
 		let tx = tree.begin().unwrap();
-		let value = tx.get_at_timestamp(b"key1", custom_timestamp).unwrap();
+		let value = tx.get_at_version(b"key1", custom_timestamp).unwrap();
 		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
 
 		// Verify we can get the value at a later timestamp
 		let later_timestamp = custom_timestamp + 1000000;
-		let value = tx.get_at_timestamp(b"key1", later_timestamp).unwrap();
+		let value = tx.get_at_version(b"key1", later_timestamp).unwrap();
 		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
 
 		// Verify we can't get the value at an earlier timestamp
 		let earlier_timestamp = custom_timestamp - 5;
-		let value = tx.get_at_timestamp(b"key1", earlier_timestamp).unwrap();
+		let value = tx.get_at_version(b"key1", earlier_timestamp).unwrap();
 		assert_eq!(value, None);
 
-		// Verify using scan_all_timestamps to check the timestamp
-		let versions = tx.scan_all_timestamps(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		// Verify using scan_all_versions to check the timestamp
+		let versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0].2, custom_timestamp); // Check the timestamp
 		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
@@ -2744,9 +2743,9 @@ mod tests {
 
 		// All keys should have the same timestamp
 		let tx = tree.begin().unwrap();
-		let versions1 = tx.scan_all_timestamps(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
-		let versions2 = tx.scan_all_timestamps(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
-		let versions3 = tx.scan_all_timestamps(b"key3".to_vec()..=b"key3".to_vec(), None).unwrap();
+		let versions1 = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		let versions2 = tx.scan_all_versions(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
+		let versions3 = tx.scan_all_versions(b"key3".to_vec()..=b"key3".to_vec(), None).unwrap();
 
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
@@ -2763,14 +2762,14 @@ mod tests {
 		let custom_timestamp = 9876543210000000000;
 		let mut tx = tree.begin().unwrap();
 		tx.set(b"key4", b"value4").unwrap(); // Will get commit timestamp
-		tx.set_at_ts(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
+		tx.set_at_version(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
 		tx.set(b"key6", b"value6").unwrap(); // Will get commit timestamp
 		tx.commit().await.unwrap();
 
 		let tx = tree.begin().unwrap();
-		let versions4 = tx.scan_all_timestamps(b"key4".to_vec()..=b"key4".to_vec(), None).unwrap();
-		let versions5 = tx.scan_all_timestamps(b"key5".to_vec()..=b"key5".to_vec(), None).unwrap();
-		let versions6 = tx.scan_all_timestamps(b"key6".to_vec()..=b"key6".to_vec(), None).unwrap();
+		let versions4 = tx.scan_all_versions(b"key4".to_vec()..=b"key4".to_vec(), None).unwrap();
+		let versions5 = tx.scan_all_versions(b"key5".to_vec()..=b"key5".to_vec(), None).unwrap();
+		let versions6 = tx.scan_all_versions(b"key6".to_vec()..=b"key6".to_vec(), None).unwrap();
 
 		assert_eq!(versions4.len(), 1);
 		assert_eq!(versions5.len(), 1);
@@ -2792,7 +2791,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_keys_at_timestamp() {
+	async fn test_keys_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -2804,36 +2803,34 @@ mod tests {
 
 		// Insert data with first timestamp
 		let mut tx1 = tree.begin().unwrap();
-		tx1.set_at_ts(b"key1", b"value1", ts1).unwrap();
-		tx1.set_at_ts(b"key2", b"value2", ts1).unwrap();
-		tx1.set_at_ts(b"key3", b"value3", ts1).unwrap();
+		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
+		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
+		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
 		tx1.commit().await.unwrap();
 
 		// Insert data with second timestamp
 		let mut tx2 = tree.begin().unwrap();
-		tx2.set_at_ts(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
-		tx2.set_at_ts(b"key4", b"value4", ts2).unwrap(); // Add new key
+		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
+		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
 		tx2.commit().await.unwrap();
 
-		// Test keys_at_timestamp at first timestamp
+		// Test keys_at_version at first timestamp
 		let tx = tree.begin().unwrap();
 		let keys_at_ts1 = tx
-			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
 			.unwrap()
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.unwrap();
+			.collect::<Vec<_>>();
 		assert_eq!(keys_at_ts1.len(), 3);
 		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
 		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
 		assert!(keys_at_ts1.contains(&b"key3".to_vec()));
 		assert!(!keys_at_ts1.contains(&b"key4".to_vec())); // key4 didn't exist at ts1
 
-		// Test keys_at_timestamp at second timestamp
+		// Test keys_at_version at second timestamp
 		let keys_at_ts2 = tx
-			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
 			.unwrap()
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.unwrap();
+			.collect::<Vec<_>>();
 		assert_eq!(keys_at_ts2.len(), 4);
 		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
 		assert!(keys_at_ts2.contains(&b"key2".to_vec()));
@@ -2842,25 +2839,23 @@ mod tests {
 
 		// Test with limit
 		let keys_limited = tx
-			.keys_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
 			.unwrap()
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.unwrap();
+			.collect::<Vec<_>>();
 		assert_eq!(keys_limited.len(), 2);
 
 		// Test with specific key range
 		let keys_range = tx
-			.keys_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.keys_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
 			.unwrap()
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.unwrap();
+			.collect::<Vec<_>>();
 		assert_eq!(keys_range.len(), 2);
 		assert!(keys_range.contains(&b"key2".to_vec()));
 		assert!(keys_range.contains(&b"key3".to_vec()));
 	}
 
 	#[tokio::test]
-	async fn test_keys_at_timestamp_with_deletes() {
+	async fn test_keys_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -2879,14 +2874,13 @@ mod tests {
 		tx2.soft_delete(b"key3").unwrap();
 		tx2.commit().await.unwrap();
 
-		// Test keys_at_timestamp with current timestamp
+		// Test keys_at_version with current timestamp
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
 		let keys = tx
-			.keys_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), u64::MAX, None)
+			.keys_at_version(b"key1".to_vec()..=b"key3".to_vec(), u64::MAX, None)
 			.unwrap()
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.unwrap();
+			.collect::<Vec<_>>();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
 		assert!(keys.contains(&b"key1".to_vec()));
 		assert!(!keys.contains(&b"key2".to_vec())); // Hard deleted
@@ -2894,7 +2888,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_scan_at_timestamp() {
+	async fn test_scan_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -2906,21 +2900,21 @@ mod tests {
 
 		// Insert data with first timestamp
 		let mut tx1 = tree.begin().unwrap();
-		tx1.set_at_ts(b"key1", b"value1", ts1).unwrap();
-		tx1.set_at_ts(b"key2", b"value2", ts1).unwrap();
-		tx1.set_at_ts(b"key3", b"value3", ts1).unwrap();
+		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
+		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
+		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
 		tx1.commit().await.unwrap();
 
 		// Insert data with second timestamp
 		let mut tx2 = tree.begin().unwrap();
-		tx2.set_at_ts(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
-		tx2.set_at_ts(b"key4", b"value4", ts2).unwrap(); // Add new key
+		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
+		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
 		tx2.commit().await.unwrap();
 
-		// Test scan_at_timestamp at first timestamp
+		// Test scan_at_version at first timestamp
 		let tx = tree.begin().unwrap();
 		let scan_at_ts1 = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2942,9 +2936,9 @@ mod tests {
 		assert!(found_keys.contains(&b"key3".as_ref()));
 		assert!(!found_keys.contains(&b"key4".as_ref())); // key4 didn't exist at ts1
 
-		// Test scan_at_timestamp at second timestamp
+		// Test scan_at_version at second timestamp
 		let scan_at_ts2 = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2968,7 +2962,7 @@ mod tests {
 
 		// Test with limit
 		let scan_limited = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2976,7 +2970,7 @@ mod tests {
 
 		// Test with specific key range
 		let scan_range = tx
-			.scan_at_timestamp(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.scan_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -2990,7 +2984,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_scan_at_timestamp_with_deletes() {
+	async fn test_scan_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3007,7 +3001,7 @@ mod tests {
 		// Query at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
 		let scan_before = tx_before
-			.scan_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
+			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3020,17 +3014,17 @@ mod tests {
 		tx2.commit().await.unwrap();
 		let ts_after_deletes = now();
 
-		// Test scan_at_timestamp at a time after the deletes
+		// Test scan_at_version at a time after the deletes
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
 
 		// Verify key2 is completely gone (hard deleted)
-		let versions2 = tx.scan_all_timestamps(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
+		let versions2 = tx.scan_all_versions(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
 		assert_eq!(versions2.len(), 0, "Hard deleted key should have no versions");
 
 		// Perform scan at timestamp after deletes
 		let scan_result = tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
+			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3050,7 +3044,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_scan_all_timestamps() {
+	async fn test_scan_all_versions() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3072,10 +3066,9 @@ mod tests {
 		tx3.set(b"key4", b"value4_v1").unwrap();
 		tx3.commit().await.unwrap();
 
-		// Test scan_all_timestamps
+		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
-		let all_versions =
-			tx.scan_all_timestamps(b"key1".to_vec()..=b"key4".to_vec(), None).unwrap();
+		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key4".to_vec(), None).unwrap();
 
 		// Should get all versions of all keys in the range
 		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
@@ -3119,17 +3112,17 @@ mod tests {
 
 		// Test with limit
 		let limited_versions =
-			tx.scan_all_timestamps(b"key1".to_vec()..=b"key4".to_vec(), Some(4)).unwrap();
+			tx.scan_all_versions(b"key1".to_vec()..=b"key4".to_vec(), Some(4)).unwrap();
 		assert_eq!(limited_versions.len(), 6);
 
 		// Test with specific key range
 		let range_versions =
-			tx.scan_all_timestamps(b"key2".to_vec()..=b"key3".to_vec(), None).unwrap();
+			tx.scan_all_versions(b"key2".to_vec()..=b"key3".to_vec(), None).unwrap();
 		assert_eq!(range_versions.len(), 3); // 2 versions of key2 + 1 version of key3
 	}
 
 	#[tokio::test]
-	async fn test_scan_all_timestamps_with_deletes() {
+	async fn test_scan_all_versions_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3151,10 +3144,9 @@ mod tests {
 		tx3.soft_delete(b"key2").unwrap(); // Soft delete
 		tx3.commit().await.unwrap();
 
-		// Test scan_all_timestamps
+		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
-		let all_versions =
-			tx.scan_all_timestamps(b"key1".to_vec()..=b"key2".to_vec(), None).unwrap();
+		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key2".to_vec(), None).unwrap();
 
 		// Should get all versions including soft delete markers, exclude hard-deleted keys
 		assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
@@ -3189,13 +3181,9 @@ mod tests {
 
 		// Test that versioned queries fail when versioning is disabled
 		let tx = tree.begin().unwrap();
-		assert!(tx
-			.keys_at_timestamp(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None)
-			.is_err());
-		assert!(tx
-			.scan_at_timestamp(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None)
-			.is_err());
-		assert!(tx.scan_all_timestamps(b"key1".to_vec()..=b"key2".to_vec(), None).is_err());
+		assert!(tx.keys_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
+		assert!(tx.scan_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
+		assert!(tx.scan_all_versions(b"key1".to_vec()..=b"key2".to_vec(), None).is_err());
 	}
 
 	// Version management tests
@@ -3222,14 +3210,13 @@ mod tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64; // Incremental version
-				txn.set_at_ts(&key, value, version).unwrap();
+				txn.set_at_version(&key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_timestamps(key.as_ref().to_vec()..=key.as_ref().to_vec(), None)
-				.unwrap();
+			let results: Vec<_> =
+				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
 
 			// Verify that the output contains all the versions of the key
 			assert_eq!(results.len(), values.len());
@@ -3242,7 +3229,7 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_single_key_multiple_versions() {
+		async fn test_scan_all_versions_single_key_multiple_versions() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
 
@@ -3252,14 +3239,13 @@ mod tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64; // Incremental version
-				txn.set_at_ts(&key, value, version).unwrap();
+				txn.set_at_version(&key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_timestamps(key.as_ref().to_vec()..=key.as_ref().to_vec(), None)
-				.unwrap();
+			let results: Vec<_> =
+				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
 
 			// Verify that the output contains all the versions of the key
 			assert_eq!(results.len(), values.len());
@@ -3272,20 +3258,20 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_multiple_keys_single_version_each() {
+		async fn test_scan_all_versions_multiple_keys_single_version_each() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let value = Bytes::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
-				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.set_at_version(key, &value, 1).unwrap();
 				txn.commit().await.unwrap();
 			}
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					None,
@@ -3302,7 +3288,7 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_multiple_keys_multiple_versions_each() {
+		async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
@@ -3311,14 +3297,14 @@ mod tests {
 				for (i, value) in values.iter().enumerate() {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
-					txn.set_at_ts(key, value, version).unwrap();
+					txn.set_at_version(key, value, version).unwrap();
 					txn.commit().await.unwrap();
 				}
 			}
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					None,
@@ -3345,13 +3331,13 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_deleted_records() {
+		async fn test_scan_all_versions_deleted_records() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
 			let value = Bytes::from("value1");
 
 			let mut txn = store.begin().unwrap();
-			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.set_at_version(&key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 
 			let mut txn = store.begin().unwrap();
@@ -3359,9 +3345,8 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_timestamps(key.as_ref().to_vec()..=key.as_ref().to_vec(), None)
-				.unwrap();
+			let results: Vec<_> =
+				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
 
 			assert_eq!(results.len(), 2);
 			let (k, v, version, is_deleted) = &results[0];
@@ -3377,14 +3362,14 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_multiple_keys_single_version_each_deleted() {
+		async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let value = Bytes::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
-				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.set_at_version(key, &value, 1).unwrap();
 				txn.commit().await.unwrap();
 			}
 
@@ -3396,7 +3381,7 @@ mod tests {
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					None,
@@ -3420,7 +3405,7 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_multiple_keys_multiple_versions_each_deleted() {
+		async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
@@ -3429,7 +3414,7 @@ mod tests {
 				for (i, value) in values.iter().enumerate() {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
-					txn.set_at_ts(key, value, version).unwrap();
+					txn.set_at_version(key, value, version).unwrap();
 					txn.commit().await.unwrap();
 				}
 			}
@@ -3442,7 +3427,7 @@ mod tests {
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					None,
@@ -3472,13 +3457,13 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_soft_and_hard_delete() {
+		async fn test_scan_all_versions_soft_and_hard_delete() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
 			let value = Bytes::from("value1");
 
 			let mut txn = store.begin().unwrap();
-			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.set_at_version(&key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 
 			let mut txn = store.begin().unwrap();
@@ -3490,29 +3475,28 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_timestamps(key.as_ref().to_vec()..=key.as_ref().to_vec(), None)
-				.unwrap();
+			let results: Vec<_> =
+				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
 
 			assert_eq!(results.len(), 0);
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_range_boundaries() {
+		async fn test_scan_all_versions_range_boundaries() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let value = Bytes::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
-				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.set_at_version(key, &value, 1).unwrap();
 				txn.commit().await.unwrap();
 			}
 
 			// Inclusive range
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					None,
@@ -3522,20 +3506,20 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_with_limit() {
+		async fn test_scan_all_versions_with_limit() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let value = Bytes::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
-				txn.set_at_ts(key, &value, 1).unwrap();
+				txn.set_at_version(key, &value, 1).unwrap();
 				txn.commit().await.unwrap();
 			}
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					Some(2),
@@ -3546,19 +3530,18 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_single_key_single_version() {
+		async fn test_scan_all_versions_single_key_single_version() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
 			let value = Bytes::from("value1");
 
 			let mut txn = store.begin().unwrap();
-			txn.set_at_ts(&key, &value, 1).unwrap();
+			txn.set_at_version(&key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_timestamps(key.as_ref().to_vec()..=key.as_ref().to_vec(), None)
-				.unwrap();
+			let results: Vec<_> =
+				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
 
 			assert_eq!(results.len(), 1);
 			let (k, v, version, is_deleted) = &results[0];
@@ -3569,7 +3552,7 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_with_limit_with_multiple_versions_per_key() {
+		async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
 			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
@@ -3579,14 +3562,14 @@ mod tests {
 				for (i, value) in values.iter().enumerate() {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
-					txn.set_at_ts(key, value, version).unwrap();
+					txn.set_at_version(key, value, version).unwrap();
 					txn.commit().await.unwrap();
 				}
 			}
 
 			let txn = store.begin().unwrap();
 			let results: Vec<_> = txn
-				.scan_all_timestamps(
+				.scan_all_versions(
 					keys.first().unwrap().as_ref().to_vec()
 						..=keys.last().unwrap().as_ref().to_vec(),
 					Some(2),
@@ -3615,7 +3598,7 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_with_subsets() {
+		async fn test_scan_all_versions_with_subsets() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![
 				Bytes::from("key1"),
@@ -3633,7 +3616,7 @@ mod tests {
 				for (i, value) in values.iter().enumerate() {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
-					txn.set_at_ts(key, value, version).unwrap();
+					txn.set_at_version(key, value, version).unwrap();
 					txn.commit().await.unwrap();
 				}
 			}
@@ -3651,7 +3634,7 @@ mod tests {
 			for subset in subsets {
 				let txn = store.begin().unwrap();
 				let results: Vec<_> =
-					txn.scan_all_timestamps(subset.0.to_vec()..=subset.1.to_vec(), None).unwrap();
+					txn.scan_all_versions(subset.0.to_vec()..=subset.1.to_vec(), None).unwrap();
 
 				// Collect unique keys from the results
 				let unique_keys: HashSet<_> =
@@ -3675,24 +3658,24 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_range_bounds() {
+		async fn test_scan_all_versions_range_bounds() {
 			let (store, _tmp_dir) = create_tree();
 
 			// Insert test data with multiple versions
 			let mut txn = store.begin().unwrap();
-			txn.set_at_ts(b"key1", b"value1", 1).unwrap();
-			txn.set_at_ts(b"key1", b"value1_v2", 2).unwrap();
-			txn.set_at_ts(b"key2", b"value2", 1).unwrap();
-			txn.set_at_ts(b"key2", b"value2_v2", 2).unwrap();
-			txn.set_at_ts(b"key3", b"value3", 1).unwrap();
-			txn.set_at_ts(b"key4", b"value4", 1).unwrap();
-			txn.set_at_ts(b"key5", b"value5", 1).unwrap();
+			txn.set_at_version(b"key1", b"value1", 1).unwrap();
+			txn.set_at_version(b"key1", b"value1_v2", 2).unwrap();
+			txn.set_at_version(b"key2", b"value2", 1).unwrap();
+			txn.set_at_version(b"key2", b"value2_v2", 2).unwrap();
+			txn.set_at_version(b"key3", b"value3", 1).unwrap();
+			txn.set_at_version(b"key4", b"value4", 1).unwrap();
+			txn.set_at_version(b"key5", b"value5", 1).unwrap();
 
 			txn.commit().await.unwrap();
 
 			// Test 1: Unbounded range should return all keys
 			let txn = store.begin().unwrap();
-			let results = txn.scan_all_timestamps(.., None).unwrap();
+			let results = txn.scan_all_versions(.., None).unwrap();
 			assert_eq!(results.len(), 5); // 5 total versions (only latest per key)
 								 // Check if the results are correct
 			assert_eq!(
@@ -3707,24 +3690,24 @@ mod tests {
 			);
 
 			// Test 2: Range from key2 (inclusive) should exclude key1
-			let results = txn.scan_all_timestamps(b"key2".to_vec().., None).unwrap();
+			let results = txn.scan_all_versions(b"key2".to_vec().., None).unwrap();
 			assert_eq!(results.len(), 4); // key2, key3, key4, key5 versions
 
 			// Test 3: Range excluding key2 should exclude key2 but include others
 			let results = txn
-				.scan_all_timestamps((Bound::Excluded(b"key2".to_vec()), Bound::Unbounded), None)
+				.scan_all_versions((Bound::Excluded(b"key2".to_vec()), Bound::Unbounded), None)
 				.unwrap();
 			assert_eq!(results.len(), 3); // key3, key4, key5 versions
 
 			// Test 4: Range excluding key5 should exclude key5
 			let results = txn
-				.scan_all_timestamps((Bound::Excluded(b"key5".to_vec()), Bound::Unbounded), None)
+				.scan_all_versions((Bound::Excluded(b"key5".to_vec()), Bound::Unbounded), None)
 				.unwrap();
 			assert_eq!(results.len(), 0); // Should be empty!
 		}
 
 		#[tokio::test]
-		async fn test_scan_all_timestamps_with_batches() {
+		async fn test_scan_all_versions_with_batches() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = [
 				Bytes::from("key1"),
@@ -3746,7 +3729,7 @@ mod tests {
 				for (i, value) in key_versions.iter().enumerate() {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
-					txn.set_at_ts(key, value, version).unwrap();
+					txn.set_at_version(key, value, version).unwrap();
 					txn.commit().await.unwrap();
 				}
 			}
@@ -3774,7 +3757,7 @@ mod tests {
 					};
 
 					let mut batch_results = Vec::new();
-					let results = txn.scan_all_timestamps(range, Some(batch_size)).unwrap();
+					let results = txn.scan_all_versions(range, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
 						// Convert borrowed key to owned immediately
 						let key_bytes = Bytes::copy_from_slice(k.as_ref());

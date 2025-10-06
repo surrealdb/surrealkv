@@ -226,7 +226,7 @@ impl Snapshot {
 
 	/// Queries the versioned index for a specific key at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn get_at_timestamp(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+	pub(crate) fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		// Create a range that includes only the specific key
 		let key_range = key.to_vec()..=key.to_vec();
 
@@ -250,12 +250,12 @@ impl Snapshot {
 
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn keys_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+	pub(crate) fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Vec<u8>>> + 'a> {
+	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -273,7 +273,7 @@ impl Snapshot {
 
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn scan_at_timestamp<'a, R: RangeBounds<Vec<u8>>>(
+	pub(crate) fn scan_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
@@ -298,7 +298,7 @@ impl Snapshot {
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// The limit currently is on the unique keys, not the total number of results
-	pub(crate) fn scan_all_timestamps<R: RangeBounds<Vec<u8>>>(
+	pub(crate) fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
 		&self,
 		key_range: R,
 		limit: Option<usize>,
@@ -523,10 +523,10 @@ pub(crate) struct KeysAtTimestampIterator {
 }
 
 impl Iterator for KeysAtTimestampIterator {
-	type Item = Result<Vec<u8>>;
+	type Item = Vec<u8>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		self.inner.next().map(|(internal_key, _)| Ok(internal_key.user_key.as_ref().to_vec()))
+		self.inner.next().map(|(internal_key, _)| internal_key.user_key.as_ref().to_vec())
 	}
 
 	fn size_hint(&self) -> (usize, Option<usize>) {
@@ -536,7 +536,7 @@ impl Iterator for KeysAtTimestampIterator {
 
 impl DoubleEndedIterator for KeysAtTimestampIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		self.inner.next_back().map(|(internal_key, _)| Ok(internal_key.user_key.as_ref().to_vec()))
+		self.inner.next_back().map(|(internal_key, _)| internal_key.user_key.as_ref().to_vec())
 	}
 }
 

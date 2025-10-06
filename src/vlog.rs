@@ -2523,7 +2523,7 @@ mod tests {
 		for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
 			let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
 			let mut tx = tree.begin().unwrap();
-			tx.set_at_ts(user_key, value.as_bytes(), *ts).unwrap();
+			tx.set_at_version(user_key, value.as_bytes(), *ts).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap(); // Force flush after each version
 		}
@@ -2531,7 +2531,7 @@ mod tests {
 		// Insert and delete a different key to create stale entries
 		{
 			let mut tx = tree.begin().unwrap();
-			tx.set_at_ts(b"other_key", &b"other_value_large_data".repeat(50), 5000).unwrap();
+			tx.set_at_version(b"other_key", &b"other_value_large_data".repeat(50), 5000).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 
@@ -2544,7 +2544,7 @@ mod tests {
 
 		// Verify all versions exist using the public API
 		let tx = tree.begin().unwrap();
-		let scan_all = tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+		let scan_all = tx.scan_all_versions(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
 		assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
 
 		drop(tx);
@@ -2581,8 +2581,7 @@ mod tests {
 
 		// Verify that some versions were cleaned up using the public API
 		let tx = tree.begin().unwrap();
-		let scan_after =
-			tx.scan_all_timestamps(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
+		let scan_after = tx.scan_all_versions(user_key.to_vec()..=user_key.to_vec(), None).unwrap();
 
 		// We should have at least some versions remaining
 		assert!(!scan_after.is_empty(), "Should have at least some versions remaining");
@@ -2599,32 +2598,32 @@ mod tests {
 
 		// Test specific timestamp queries to verify which versions were deleted
 		let scan_at_ts1 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 1000, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 1000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts2 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 2000, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 2000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts3 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 3000, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 3000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts4 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 4000, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 4000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts5 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6000, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 6000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts6 = tx
-			.scan_at_timestamp(user_key.to_vec()..=user_key.to_vec(), 6001, None)
+			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 6001, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
