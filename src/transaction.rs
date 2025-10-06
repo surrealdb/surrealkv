@@ -2111,6 +2111,389 @@ mod tests {
 		}
 	}
 
+	// Double-ended iterator tests
+	mod double_ended_iterator_tests {
+		use super::*;
+
+		#[tokio::test]
+		async fn test_reverse_iteration_basic() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert test data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key2", b"value2").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.set(b"key4", b"value4").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration
+			{
+				let tx = store.begin().unwrap();
+				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order
+				assert_eq!(reverse_results.len(), 5);
+
+				// Check that keys are in reverse order
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key5");
+				assert_eq!(keys[1], b"key4");
+				assert_eq!(keys[2], b"key3");
+				assert_eq!(keys[3], b"key2");
+				assert_eq!(keys[4], b"key1");
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_with_writes() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert initial data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with transaction writes
+			{
+				let mut tx = store.begin().unwrap();
+
+				// Add some writes to the transaction
+				tx.set(b"key2", b"new_value2").unwrap();
+				tx.set(b"key4", b"new_value4").unwrap();
+				tx.set(b"key6", b"new_value6").unwrap();
+
+				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order including transaction writes
+				assert_eq!(reverse_results.len(), 6);
+
+				// Check that keys are in reverse order
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key6");
+				assert_eq!(keys[1], b"key5");
+				assert_eq!(keys[2], b"key4");
+				assert_eq!(keys[3], b"key3");
+				assert_eq!(keys[4], b"key2");
+				assert_eq!(keys[5], b"key1");
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_with_deletes() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert initial data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key2", b"value2").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.set(b"key4", b"value4").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with deletes in transaction
+			{
+				let mut tx = store.begin().unwrap();
+
+				// Delete some keys
+				tx.delete(b"key2").unwrap();
+				tx.delete(b"key4").unwrap();
+
+				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order, excluding deleted keys
+				assert_eq!(reverse_results.len(), 3);
+
+				// Check that keys are in reverse order and deleted keys are excluded
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key5");
+				assert_eq!(keys[1], b"key3");
+				assert_eq!(keys[2], b"key1");
+
+				// Ensure deleted keys are not present
+				assert!(!keys.contains(&b"key2".to_vec()));
+				assert!(!keys.contains(&b"key4".to_vec()));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_with_soft_deletes() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert initial data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key2", b"value2").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.set(b"key4", b"value4").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with soft deletes in transaction
+			{
+				let mut tx = store.begin().unwrap();
+
+				// Soft delete some keys
+				tx.soft_delete(b"key2").unwrap();
+				tx.soft_delete(b"key4").unwrap();
+
+				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order, excluding soft deleted keys
+				assert_eq!(reverse_results.len(), 3);
+
+				// Check that keys are in reverse order and soft deleted keys are excluded
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key5");
+				assert_eq!(keys[1], b"key3");
+				assert_eq!(keys[2], b"key1");
+
+				// Ensure soft deleted keys are not present
+				assert!(!keys.contains(&b"key2".to_vec()));
+				assert!(!keys.contains(&b"key4".to_vec()));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_with_limits() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert test data
+			{
+				let mut tx = store.begin().unwrap();
+				for i in 1..=10 {
+					let key = format!("key{:02}", i);
+					let value = format!("value{}", i);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with limit
+			{
+				let tx = store.begin().unwrap();
+				let mut iter = tx.range(b"key01", b"key10", Some(3)).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get exactly 3 results in reverse order
+				assert_eq!(reverse_results.len(), 3);
+
+				// Check that keys are in reverse order
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key10");
+				assert_eq!(keys[1], b"key09");
+				assert_eq!(keys[2], b"key08");
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_keys_only() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert test data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key2", b"value2").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with keys only
+			{
+				let tx = store.begin().unwrap();
+				let mut iter = tx.keys(b"key1", b"key3", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order
+				assert_eq!(reverse_results.len(), 3);
+
+				// Check that keys are in reverse order
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key3");
+				assert_eq!(keys[1], b"key2");
+				assert_eq!(keys[2], b"key1");
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_mixed_operations() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert initial data
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key2", b"value2").unwrap();
+				tx.set(b"key3", b"value3").unwrap();
+				tx.set(b"key4", b"value4").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration with mixed operations in transaction
+			{
+				let mut tx = store.begin().unwrap();
+
+				// Mix of operations
+				tx.set(b"key0", b"new_value0").unwrap(); // New key
+				tx.set(b"key2", b"updated_value2").unwrap(); // Update existing
+				tx.delete(b"key3").unwrap(); // Delete existing
+				tx.soft_delete(b"key4").unwrap(); // Soft delete existing
+				tx.set(b"key6", b"new_value6").unwrap(); // New key
+
+				let mut iter = tx.range(b"key0", b"key6", None).unwrap();
+
+				// Collect in reverse order
+				let mut reverse_results = Vec::new();
+				while let Some(result) = iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Should get results in reverse key order
+				assert_eq!(reverse_results.len(), 5);
+
+				// Check that keys are in reverse order
+				let keys: Vec<Vec<u8>> =
+					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+
+				assert_eq!(keys[0], b"key6");
+				assert_eq!(keys[1], b"key5");
+				assert_eq!(keys[2], b"key2");
+				assert_eq!(keys[3], b"key1");
+				assert_eq!(keys[4], b"key0");
+
+				// Ensure deleted keys are not present
+				assert!(!keys.contains(&b"key3".to_vec()));
+				assert!(!keys.contains(&b"key4".to_vec()));
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_empty_range() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert data outside the range we'll query
+			{
+				let mut tx = store.begin().unwrap();
+				tx.set(b"key1", b"value1").unwrap();
+				tx.set(b"key5", b"value5").unwrap();
+				tx.commit().await.unwrap();
+			}
+
+			// Test reverse iteration on empty range
+			{
+				let tx = store.begin().unwrap();
+				let mut iter = tx.range(b"key2", b"key4", None).unwrap();
+
+				// Should get no results
+				assert!(iter.next_back().is_none());
+			}
+		}
+
+		#[tokio::test]
+		async fn test_reverse_iteration_consistency_with_forward() {
+			let (store, _temp_dir) = create_store();
+
+			// Insert test data
+			{
+				let mut tx = store.begin().unwrap();
+				for i in 1..=5 {
+					let key = format!("key{}", i);
+					let value = format!("value{}", i);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+				tx.commit().await.unwrap();
+			}
+
+			// Test that reverse iteration gives same results as forward iteration reversed
+			{
+				let tx = store.begin().unwrap();
+
+				// Forward iteration
+				let forward_results: Vec<_> = tx.range(b"key1", b"key5", None).unwrap().collect();
+
+				// Reverse iteration
+				let mut reverse_iter = tx.range(b"key1", b"key5", None).unwrap();
+				let mut reverse_results = Vec::new();
+				while let Some(result) = reverse_iter.next_back() {
+					reverse_results.push(result);
+				}
+
+				// Reverse the forward results
+				let mut forward_reversed = forward_results.clone();
+				forward_reversed.reverse();
+
+				// Results should be identical
+				assert_eq!(forward_reversed.len(), reverse_results.len());
+				for (forward, reverse) in forward_reversed.iter().zip(reverse_results.iter()) {
+					let forward_result = forward.as_ref().unwrap();
+					let reverse_result = reverse.as_ref().unwrap();
+					assert_eq!(forward_result.0, reverse_result.0);
+					assert_eq!(forward_result.1, reverse_result.1);
+				}
+			}
+		}
+	}
+
 	// Savepoint tests
 	mod savepoint_tests {
 		use super::*;
