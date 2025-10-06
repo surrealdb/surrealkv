@@ -181,7 +181,7 @@ impl DatabaseCheckpoint {
 
 		// Step 2: Get current sequence number from the levels
 		let sequence_number = {
-			let levels_guard = self.core.level_manifest.as_ref().unwrap().read()?;
+			let levels_guard = self.core.level_manifest.read()?;
 			levels_guard.lsn()
 		};
 
@@ -292,7 +292,7 @@ impl DatabaseCheckpoint {
 
 	/// Copies all SSTables to the checkpoint directory
 	fn copy_sstables(&self, dest_dir: &Path) -> Result<(usize, u64)> {
-		let levels_guard = self.core.level_manifest.as_ref().unwrap().read()?;
+		let levels_guard = self.core.level_manifest.read()?;
 		let mut total_size = 0u64;
 		let mut count = 0usize;
 

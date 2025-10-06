@@ -187,28 +187,6 @@ mod tests {
         tree2.close().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_lock_file_in_memory_mode() {
-        let temp_dir = TempDir::new().unwrap();
-        let temp_path = temp_dir.path().to_path_buf();
-        
-        // In-memory mode should not create lock file, so multiple instances should work
-        let tree1 = TreeBuilder::<InternalKey>::new()
-            .with_path(temp_path.clone())
-            .with_in_memory_only(true)
-            .build()
-            .expect("First in-memory tree should be created successfully");
-
-        // Second in-memory instance should succeed since no lock file is used
-        let tree2 = TreeBuilder::<InternalKey>::new()
-            .with_path(temp_path.clone())
-            .with_in_memory_only(true)
-            .build()
-            .expect("Second in-memory tree should also succeed");
-        
-        tree1.close().await.unwrap();
-        tree2.close().await.unwrap();
-    }
 
     #[test]
     fn test_lock_file_multithreaded() {
@@ -228,10 +206,9 @@ mod tests {
                 // Wait for all threads to be ready
                 thread_barrier.wait();
                 
-                // Try to open the database (using in-memory mode to avoid VLog GC manager)
+                // Try to open the database
                 let result = TreeBuilder::<InternalKey>::new()
                     .with_path(path)
-                    .with_in_memory_only(true)
                     .build();
                 
                 (i, result)
@@ -246,9 +223,9 @@ mod tests {
             results.push(handle.join().unwrap());
         }
         
-        // All threads should succeed since in-memory mode doesn't use lock files
+        // All threads should succeed since they're using different paths
         let success_count = results.iter().filter(|(_, result)| result.is_ok()).count();
-        assert_eq!(success_count, threads, "All threads should succeed in in-memory mode");
+        assert_eq!(success_count, threads, "All threads should succeed");
         
         // Close all successful instances
         for (_, result) in results {
