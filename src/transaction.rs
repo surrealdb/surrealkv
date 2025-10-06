@@ -281,7 +281,7 @@ impl Transaction {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Sets a key-value pair with SetWithDelete and custom write options.
+	/// Sets a key-value pair with Replace and custom write options.
 	pub fn replace_with_options(
 		&mut self,
 		key: &[u8],
@@ -289,13 +289,8 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry = Entry::new(
-			key,
-			Some(value),
-			InternalKeyKind::SetWithDelete,
-			self.savepoints,
-			write_seqno,
-		);
+		let entry =
+			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno);
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -3838,7 +3833,7 @@ mod tests {
 		async fn test_replace_basic() {
 			let (store, _tmp_dir) = create_tree();
 
-			// Test basic SetWithDelete functionality
+			// Test basic Replace functionality
 			let mut txn = store.begin().unwrap();
 			txn.replace(b"test_key", b"test_value").unwrap();
 			txn.commit().await.unwrap();
@@ -3848,7 +3843,7 @@ mod tests {
 			let result = txn.get(b"test_key").unwrap().unwrap();
 			assert_eq!(result.as_ref(), b"test_value");
 
-			// Test SetWithDelete with options
+			// Test Replace with options
 			let mut txn = store.begin().unwrap();
 			txn.replace_with_options(b"test_key2", b"test_value2", &WriteOptions::default())
 				.unwrap();
@@ -3877,7 +3872,7 @@ mod tests {
 			let result = txn.get(b"test_key").unwrap().unwrap();
 			assert_eq!(result.as_ref(), b"value_v5");
 
-			// Use SetWithDelete to replace all previous versions
+			// Use Replace to replace all previous versions
 			let mut txn = store.begin().unwrap();
 			txn.replace(b"test_key", b"replaced_value").unwrap();
 			txn.commit().await.unwrap();

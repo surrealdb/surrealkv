@@ -259,21 +259,20 @@ impl<'a> CompactionIterator<'a> {
 			&& !self.accumulated_versions.is_empty()
 			&& self.accumulated_versions[0].0.is_hard_delete_marker();
 
-		// Check if any version is SetWithDelete - if so, mark all older versions as stale
-		let has_set_with_delete =
-			self.accumulated_versions.iter().any(|(key, _)| key.is_set_with_delete());
+		// Check if any version is Replace - if so, mark all older versions as stale
+		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
 		// Process all versions for delete list and determine which to keep
 		for (i, (key, value)) in self.accumulated_versions.iter().enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
-			let is_set_with_delete = key.is_set_with_delete();
+			let is_replace = key.is_replace();
 			let is_latest = i == 0;
 
 			// Determine if this entry should be marked as stale in VLog
 			let should_mark_stale = if latest_is_delete_at_bottom {
 				// If latest version is DELETE at bottom level, mark ALL versions as stale
 				true
-			} else if is_latest && !is_hard_delete && !is_set_with_delete {
+			} else if is_latest && !is_hard_delete && !is_replace {
 				// Latest version of a regular SET operation: never mark as stale (it's being returned)
 				false
 			} else if is_latest && is_hard_delete && self.is_bottom_level {
@@ -282,14 +281,14 @@ impl<'a> CompactionIterator<'a> {
 			} else if is_latest && is_hard_delete && !self.is_bottom_level {
 				// Latest version of a DELETE operation at non-bottom level: don't mark as stale (it's being returned)
 				false
-			} else if is_latest && is_set_with_delete {
-				// Latest version of a SetWithDelete operation: don't mark as stale (it's being returned)
+			} else if is_latest && is_replace {
+				// Latest version of a Replace operation: don't mark as stale (it's being returned)
 				false
 			} else if is_hard_delete {
 				// For older DELETE operations (hard delete entries): always mark as stale since they don't have VLog values
 				true
-			} else if has_set_with_delete && !is_set_with_delete {
-				// If there's a SetWithDelete operation, mark all older non-SetWithDelete versions as stale
+			} else if has_set_with_delete && !is_replace {
+				// If there's a Replace operation, mark all older non-Replace versions as stale
 				true
 			} else {
 				// Older version of a SET operation: check retention period
@@ -2060,7 +2059,7 @@ mod tests {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
 
-		// Create test data with SetWithDelete operations
+		// Create test data with Replace operations
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
@@ -2073,8 +2072,8 @@ mod tests {
 		let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
 		items1.push((key2, value2));
 
-		// Table 2: SetWithDelete operation (newer sequence number)
-		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		// Table 2: Replace operation (newer sequence number)
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
 		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
 		items2.push((key3, value3));
 
@@ -2082,7 +2081,7 @@ mod tests {
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
 
-		// Test non-bottom level compaction (should preserve SetWithDelete)
+		// Test non-bottom level compaction (should preserve Replace)
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
@@ -2097,11 +2096,11 @@ mod tests {
 			result.push(item);
 		}
 
-		// Should return only the SetWithDelete version (latest)
+		// Should return only the Replace version (latest)
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 300);
-		assert!(returned_key.is_set_with_delete());
+		assert!(returned_key.is_replace());
 
 		// Flush the delete list batch to actually mark entries as stale
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -2117,7 +2116,7 @@ mod tests {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
 
-		// Create test data with multiple versions and SetWithDelete
+		// Create test data with multiple versions and Replace
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
@@ -2134,12 +2133,12 @@ mod tests {
 		let value3 = create_vlog_value(&vlog, b"test_key", b"value3");
 		items1.push((key3, value3));
 
-		// Table 2: SetWithDelete operation (not the latest)
-		let key4 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		// Table 2: Replace operation (not the latest)
+		let key4 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
 		let value4 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
 		items2.push((key4, value4));
 
-		// Table 3: Regular SET after SetWithDelete (latest)
+		// Table 3: Regular SET after Replace (latest)
 		let key5 = create_internal_key("test_key", 400, InternalKeyKind::Set);
 		let value5 = create_vlog_value(&vlog, b"test_key", b"final_value");
 		items2.push((key5, value5));
@@ -2165,13 +2164,13 @@ mod tests {
 
 		comp_iter.flush_delete_list_batch().unwrap();
 
-		// Should return only the latest version (regular SET, not SetWithDelete)
+		// Should return only the latest version (regular SET, not Replace)
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 400);
-		assert!(!returned_key.is_set_with_delete());
+		assert!(!returned_key.is_replace());
 
-		// The SetWithDelete and all older regular SET versions should be marked as stale
+		// The Replace and all older regular SET versions should be marked as stale
 		assert!(vlog.is_stale(100).unwrap());
 		assert!(vlog.is_stale(200).unwrap());
 		assert!(vlog.is_stale(250).unwrap());
@@ -2184,7 +2183,7 @@ mod tests {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
 
-		// Create test data where SetWithDelete is the latest version
+		// Create test data where Replace is the latest version
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
@@ -2197,8 +2196,8 @@ mod tests {
 		let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
 		items1.push((key2, value2));
 
-		// Table 2: SetWithDelete as the latest version
-		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		// Table 2: Replace as the latest version
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
 		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_final");
 		items2.push((key3, value3));
 
@@ -2223,11 +2222,11 @@ mod tests {
 
 		comp_iter.flush_delete_list_batch().unwrap();
 
-		// Should return the SetWithDelete version (latest)
+		// Should return the Replace version (latest)
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 300);
-		assert!(returned_key.is_set_with_delete());
+		assert!(returned_key.is_replace());
 
 		// All older regular SET versions should be marked as stale
 		assert!(vlog.is_stale(100).unwrap());
@@ -2240,7 +2239,7 @@ mod tests {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
 
-		// Create test data with SetWithDelete and hard delete operations
+		// Create test data with Replace and hard delete operations
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
@@ -2253,8 +2252,8 @@ mod tests {
 		let value2 = Value::from(vec![]); // Empty value for delete
 		items1.push((key2, value2));
 
-		// Table 2: SetWithDelete operation
-		let key3 = create_internal_key("test_key", 300, InternalKeyKind::SetWithDelete);
+		// Table 2: Replace operation
+		let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
 		let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
 		items2.push((key3, value3));
 
@@ -2279,11 +2278,11 @@ mod tests {
 
 		comp_iter.flush_delete_list_batch().unwrap();
 
-		// Should return the SetWithDelete version (latest)
+		// Should return the Replace version (latest)
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 300);
-		assert!(returned_key.is_set_with_delete());
+		assert!(returned_key.is_replace());
 
 		// The hard delete and regular SET should be marked as stale
 		assert!(vlog.is_stale(100).unwrap());

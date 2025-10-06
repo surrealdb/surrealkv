@@ -939,7 +939,6 @@ impl VLog {
 	}
 
 	/// Compacts a single value log file
-	/// Assumes caller has already checked that file is not active writer and not marked for deletion
 	async fn compact_vlog_file_safe(
 		&self,
 		file_id: u32,

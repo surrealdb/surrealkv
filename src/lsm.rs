@@ -478,8 +478,8 @@ impl CommitEnv for LsmCommitEnv {
 			for (encoded_key, encoded_value) in timestamp_entries {
 				let ikey = InternalKey::decode(&encoded_key);
 
-				if ikey.is_set_with_delete() {
-					// For SetWithDelete: first delete all existing entries for this user key
+				if ikey.is_replace() {
+					// For Replace: first delete all existing entries for this user key
 					let user_key = ikey.user_key.as_ref().to_vec();
 					let start_key =
 						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
