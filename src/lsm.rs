@@ -467,7 +467,7 @@ impl CommitEnv for LsmCommitEnv {
 						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
 					let end_key = InternalKey::new(
 						user_key.clone(),
-						u64::MAX,
+						seq_num,
 						InternalKeyKind::Max,
 						INTERNAL_KEY_TIMESTAMP_MAX,
 					)

@@ -2289,4 +2289,678 @@ mod tests {
 		assert!(vlog.is_stale(200).unwrap());
 		assert!(!vlog.is_stale(300).unwrap());
 	}
+
+	#[tokio::test]
+	async fn test_compaction_iterator_multiple_replace_operations() {
+		let (vlog, _tmp_dir) = create_test_vlog();
+		let clock = Arc::new(MockLogicalClock::new());
+
+		// Test case 1: Multiple Replace operations for the same key
+		// Only the latest Replace should be preserved
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Multiple Replace operations
+			let key1 = create_internal_key("test_key", 100, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key", b"replace_value1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key", 200, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"test_key", b"replace_value2");
+			items1.push((key2, value2));
+
+			// Table 2: Another Replace operation (latest)
+			let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"test_key", b"replace_value3");
+			items2.push((key3, value3));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test non-bottom level compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the latest Replace version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 300);
+			assert!(returned_key.is_replace());
+
+			// Older Replace versions should be marked as stale
+			assert!(vlog.is_stale(100).unwrap());
+			assert!(vlog.is_stale(200).unwrap());
+			assert!(!vlog.is_stale(300).unwrap());
+		}
+
+		// Test case 2: Multiple Replace operations at bottom level
+		// Should still preserve only the latest Replace
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Multiple Replace operations
+			let key1 = create_internal_key("test_key2", 400, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key2", b"replace_value4");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key2", 500, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"test_key2", b"replace_value5");
+			items1.push((key2, value2));
+
+			// Table 2: Another Replace operation (latest)
+			let key3 = create_internal_key("test_key2", 600, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"test_key2", b"replace_value6");
+			items2.push((key3, value3));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test bottom level compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the latest Replace version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 600);
+			assert!(returned_key.is_replace());
+
+			// Older Replace versions should be marked as stale
+			assert!(vlog.is_stale(400).unwrap());
+			assert!(vlog.is_stale(500).unwrap());
+			assert!(!vlog.is_stale(600).unwrap());
+		}
+
+		// Test case 3: Multiple SET operations followed by Replace
+		// Only the Replace should be preserved
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Multiple regular SET operations
+			let key1 = create_internal_key("test_key3", 700, InternalKeyKind::Set);
+			let value1 = create_vlog_value(&vlog, b"test_key3", b"set_value1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key3", 800, InternalKeyKind::Set);
+			let value2 = create_vlog_value(&vlog, b"test_key3", b"set_value2");
+			items1.push((key2, value2));
+
+			let key3 = create_internal_key("test_key3", 850, InternalKeyKind::Set);
+			let value3 = create_vlog_value(&vlog, b"test_key3", b"set_value3");
+			items1.push((key3, value3));
+
+			// Table 2: Replace operation (latest)
+			let key4 = create_internal_key("test_key3", 900, InternalKeyKind::Replace);
+			let value4 = create_vlog_value(&vlog, b"test_key3", b"replace_value7");
+			items2.push((key4, value4));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the Replace version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 900);
+			assert!(returned_key.is_replace());
+
+			// All older SET versions should be marked as stale
+			assert!(vlog.is_stale(700).unwrap());
+			assert!(vlog.is_stale(800).unwrap());
+			assert!(vlog.is_stale(850).unwrap());
+			assert!(!vlog.is_stale(900).unwrap());
+		}
+
+		// Test case 4: Multiple Replace operations for different keys
+		// Each key should preserve only its latest Replace
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Replace operations for different keys
+			let key1 = create_internal_key("key_a", 1000, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"key_a", b"replace_a1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("key_b", 1100, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"key_b", b"replace_b1");
+			items1.push((key2, value2));
+
+			// Table 2: Newer Replace operations for the same keys
+			let key3 = create_internal_key("key_a", 1200, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"key_a", b"replace_a2");
+			items2.push((key3, value3));
+
+			let key4 = create_internal_key("key_b", 1300, InternalKeyKind::Replace);
+			let value4 = create_vlog_value(&vlog, b"key_b", b"replace_b2");
+			items2.push((key4, value4));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return 2 entries (one for each key)
+			assert_eq!(result.len(), 2);
+			
+			// Sort results by key for consistent testing
+			result.sort_by(|a, b| a.0.user_key.cmp(&b.0.user_key));
+
+			// Check key_a
+			let (returned_key_a, _) = &result[0];
+			assert_eq!(returned_key_a.user_key.as_ref(), b"key_a");
+			assert_eq!(returned_key_a.seq_num(), 1200);
+			assert!(returned_key_a.is_replace());
+
+			// Check key_b
+			let (returned_key_b, _) = &result[1];
+			assert_eq!(returned_key_b.user_key.as_ref(), b"key_b");
+			assert_eq!(returned_key_b.seq_num(), 1300);
+			assert!(returned_key_b.is_replace());
+
+			// Older versions should be marked as stale
+			assert!(vlog.is_stale(1000).unwrap());
+			assert!(vlog.is_stale(1100).unwrap());
+			assert!(!vlog.is_stale(1200).unwrap());
+			assert!(!vlog.is_stale(1300).unwrap());
+		}
+
+		// Test case 5: Multiple SET operations followed by Replace followed by SET
+		// Only the final SET should be preserved
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+			let mut items3 = Vec::new();
+
+			// Table 1: Multiple regular SET operations
+			let key1 = create_internal_key("test_key4", 1400, InternalKeyKind::Set);
+			let value1 = create_vlog_value(&vlog, b"test_key4", b"set_value1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key4", 1500, InternalKeyKind::Set);
+			let value2 = create_vlog_value(&vlog, b"test_key4", b"set_value2");
+			items1.push((key2, value2));
+
+			// Table 2: Replace operation
+			let key3 = create_internal_key("test_key4", 1600, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"test_key4", b"replace_value");
+			items2.push((key3, value3));
+
+			// Table 3: Final SET operation (latest)
+			let key4 = create_internal_key("test_key4", 1700, InternalKeyKind::Set);
+			let value4 = create_vlog_value(&vlog, b"test_key4", b"final_set_value");
+			items3.push((key4, value4));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+			let iter3 = Box::new(MockIterator::new(items3));
+
+			// Test compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2, iter3],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the final SET version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 1700);
+			assert!(!returned_key.is_replace());
+			assert_eq!(returned_key.kind(), InternalKeyKind::Set);
+
+			// All older versions (SET and Replace) should be marked as stale
+			assert!(vlog.is_stale(1400).unwrap());
+			assert!(vlog.is_stale(1500).unwrap());
+			assert!(vlog.is_stale(1600).unwrap());
+			assert!(!vlog.is_stale(1700).unwrap());
+		}
+
+		// Test case 6: Replace followed by Delete (non-bottom level)
+		// Should preserve only the Delete
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Replace operation
+			let key1 = create_internal_key("test_key5", 1800, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key5", b"replace_value");
+			items1.push((key1, value1));
+
+			// Table 2: Delete operation (latest)
+			let key2 = create_internal_key("test_key5", 1900, InternalKeyKind::Delete);
+			let value2 = Vec::new(); // Empty value for delete
+			items2.push((key2, value2.into()));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test non-bottom level compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the Delete version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 1900);
+			assert!(returned_key.is_hard_delete_marker());
+			assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
+
+			// The Replace should be marked as stale
+			assert!(vlog.is_stale(1800).unwrap());
+			assert!(!vlog.is_stale(1900).unwrap());
+		}
+
+		// Test case 7: Replace followed by Delete (bottom level)
+		// Should return nothing (Delete at bottom level discards everything)
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Replace operation
+			let key1 = create_internal_key("test_key6", 2000, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key6", b"replace_value");
+			items1.push((key1, value1));
+
+			// Table 2: Delete operation (latest)
+			let key2 = create_internal_key("test_key6", 2100, InternalKeyKind::Delete);
+			let value2 = Vec::new(); // Empty value for delete
+			items2.push((key2, value2.into()));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test bottom level compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				true, // bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return nothing (Delete at bottom level discards everything)
+			assert_eq!(result.len(), 0);
+
+			// The Replace should be marked as stale
+			assert!(vlog.is_stale(2000).unwrap());
+			// Note: Delete at bottom level doesn't get marked as stale since it's not returned
+		}
+
+		// Test case 8: Multiple Replace operations followed by Delete
+		// Should preserve only the Delete (non-bottom) or nothing (bottom)
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+			let mut items3 = Vec::new();
+
+			// Table 1: Multiple Replace operations
+			let key1 = create_internal_key("test_key7", 2200, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key7", b"replace_value1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key7", 2300, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"test_key7", b"replace_value2");
+			items1.push((key2, value2));
+
+			// Table 2: Another Replace operation
+			let key3 = create_internal_key("test_key7", 2400, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"test_key7", b"replace_value3");
+			items2.push((key3, value3));
+
+			// Table 3: Delete operation (latest)
+			let key4 = create_internal_key("test_key7", 2500, InternalKeyKind::Delete);
+			let value4 = Vec::new(); // Empty value for delete
+			items3.push((key4, value4.into()));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+			let iter3 = Box::new(MockIterator::new(items3));
+
+			// Test non-bottom level compaction
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2, iter3],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				true, // enable versioning
+				1000, // retention period
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the Delete version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 2500);
+			assert!(returned_key.is_hard_delete_marker());
+			assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
+
+			// All Replace versions should be marked as stale
+			assert!(vlog.is_stale(2200).unwrap());
+			assert!(vlog.is_stale(2300).unwrap());
+			assert!(vlog.is_stale(2400).unwrap());
+			assert!(!vlog.is_stale(2500).unwrap());
+		}
+
+		// Test case 9: Multiple Replace operations without versioning enabled
+		// Should still preserve only the latest version
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Multiple Replace operations
+			let key1 = create_internal_key("test_key8", 2600, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key8", b"replace_value1");
+			items1.push((key1, value1));
+
+			let key2 = create_internal_key("test_key8", 2700, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"test_key8", b"replace_value2");
+			items1.push((key2, value2));
+
+			// Table 2: Another Replace operation (latest)
+			let key3 = create_internal_key("test_key8", 2800, InternalKeyKind::Replace);
+			let value3 = create_vlog_value(&vlog, b"test_key8", b"replace_value3");
+			items2.push((key3, value3));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test compaction without versioning
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				false, // versioning disabled
+				1000, // retention period (ignored when versioning is disabled)
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the latest Replace version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 2800);
+			assert!(returned_key.is_replace());
+
+			// Older Replace versions should be marked as stale
+			assert!(vlog.is_stale(2600).unwrap());
+			assert!(vlog.is_stale(2700).unwrap());
+			assert!(!vlog.is_stale(2800).unwrap());
+		}
+
+		// Test case 10: SET -> Replace -> SET without versioning
+		// Should preserve only the latest SET
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+			let mut items3 = Vec::new();
+
+			// Table 1: SET operation
+			let key1 = create_internal_key("test_key9", 2900, InternalKeyKind::Set);
+			let value1 = create_vlog_value(&vlog, b"test_key9", b"set_value1");
+			items1.push((key1, value1));
+
+			// Table 2: Replace operation
+			let key2 = create_internal_key("test_key9", 3000, InternalKeyKind::Replace);
+			let value2 = create_vlog_value(&vlog, b"test_key9", b"replace_value");
+			items2.push((key2, value2));
+
+			// Table 3: Final SET operation (latest)
+			let key3 = create_internal_key("test_key9", 3100, InternalKeyKind::Set);
+			let value3 = create_vlog_value(&vlog, b"test_key9", b"final_set_value");
+			items3.push((key3, value3));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+			let iter3 = Box::new(MockIterator::new(items3));
+
+			// Test compaction without versioning
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2, iter3],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				false, // versioning disabled
+				1000, // retention period (ignored when versioning is disabled)
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the latest SET version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 3100);
+			assert!(!returned_key.is_replace());
+			assert_eq!(returned_key.kind(), InternalKeyKind::Set);
+
+			// All older versions should be marked as stale
+			assert!(vlog.is_stale(2900).unwrap());
+			assert!(vlog.is_stale(3000).unwrap());
+			assert!(!vlog.is_stale(3100).unwrap());
+		}
+
+		// Test case 11: Replace -> Delete without versioning
+		// Should preserve only the Delete (non-bottom) or nothing (bottom)
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Replace operation
+			let key1 = create_internal_key("test_key10", 3200, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key10", b"replace_value");
+			items1.push((key1, value1));
+
+			// Table 2: Delete operation (latest)
+			let key2 = create_internal_key("test_key10", 3300, InternalKeyKind::Delete);
+			let value2 = Vec::new(); // Empty value for delete
+			items2.push((key2, value2.into()));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test non-bottom level compaction without versioning
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				false, // non-bottom level
+				Some(vlog.clone()),
+				false, // versioning disabled
+				1000, // retention period (ignored when versioning is disabled)
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return only the Delete version
+			assert_eq!(result.len(), 1);
+			let (returned_key, _) = &result[0];
+			assert_eq!(returned_key.seq_num(), 3300);
+			assert!(returned_key.is_hard_delete_marker());
+			assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
+
+			// The Replace should be marked as stale
+			assert!(vlog.is_stale(3200).unwrap());
+			assert!(!vlog.is_stale(3300).unwrap());
+		}
+
+		// Test case 12: Replace -> Delete at bottom level without versioning
+		// Should return nothing (Delete at bottom level discards everything)
+		{
+			let mut items1 = Vec::new();
+			let mut items2 = Vec::new();
+
+			// Table 1: Replace operation
+			let key1 = create_internal_key("test_key11", 3400, InternalKeyKind::Replace);
+			let value1 = create_vlog_value(&vlog, b"test_key11", b"replace_value");
+			items1.push((key1, value1));
+
+			// Table 2: Delete operation (latest)
+			let key2 = create_internal_key("test_key11", 3500, InternalKeyKind::Delete);
+			let value2 = Vec::new(); // Empty value for delete
+			items2.push((key2, value2.into()));
+
+			// Create iterators
+			let iter1 = Box::new(MockIterator::new(items1));
+			let iter2 = Box::new(MockIterator::new(items2));
+
+			// Test bottom level compaction without versioning
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter1, iter2],
+				true, // bottom level
+				Some(vlog.clone()),
+				false, // versioning disabled
+				1000, // retention period (ignored when versioning is disabled)
+				clock.clone(),
+			);
+
+			let mut result = Vec::new();
+			for item in comp_iter.by_ref() {
+				result.push(item);
+			}
+
+			// Flush to mark entries as stale
+			comp_iter.flush_delete_list_batch().unwrap();
+
+			// Should return nothing (Delete at bottom level discards everything)
+			assert_eq!(result.len(), 0);
+
+			// The Replace should be marked as stale
+			assert!(vlog.is_stale(3400).unwrap());
+			// Note: Delete at bottom level doesn't get marked as stale since it's not returned
+		}
+	}
 }
