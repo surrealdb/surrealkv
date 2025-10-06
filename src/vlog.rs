@@ -864,6 +864,8 @@ impl VLog {
 	}
 
 	/// Selects files based on discard statistics and compacts them
+	/// Attempts to compact the best candidate file (highest discard bytes that meets criteria)
+	/// Only processes one file per invocation
 	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u32>> {
 		// Try to set the gc_in_progress flag to true, if it's already true, return error
 		if self
@@ -880,72 +882,69 @@ impl VLog {
 			self.gc_in_progress.store(false, Ordering::SeqCst);
 		});
 
-		// Get the file with maximum discardable bytes
-		let (file_id, discard_bytes) = {
+		// Get all files with discardable bytes, sorted by discard bytes (descending)
+		let candidates = {
 			let discard_stats = self.discard_stats.lock().unwrap();
-			let result = discard_stats.max_discard();
+			discard_stats.get_gc_candidates()
+		};
 
-			match result {
-				Ok((file_id, discard_bytes)) => (file_id, discard_bytes),
-				Err(_) => {
-					return Ok(vec![]);
+		if candidates.is_empty() {
+			return Ok(vec![]);
+		}
+
+		// Get active writer ID once
+		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
+
+		// Find the best candidate to compact (first one that meets all criteria)
+		let candidate_to_compact = candidates.into_iter().find(|(file_id, discard_bytes)| {
+			// Skip if no discard bytes
+			if *discard_bytes == 0 {
+				return false;
+			}
+
+			// Check if this file meets the discard ratio threshold
+			let (total_size, _, discard_ratio) = self.get_file_stats(*file_id);
+			if total_size == 0 || discard_ratio < self.gc_discard_ratio {
+				return false;
+			}
+
+			// Skip if this is the active writer
+			if *file_id == active_writer_id {
+				return false;
+			}
+
+			// Skip if file is already marked for deletion
+			if let Ok(files_to_delete) = self.files_to_be_deleted.read() {
+				if files_to_delete.contains(file_id) {
+					return false;
 				}
 			}
-		};
 
-		if discard_bytes == 0 {
-			// No files with discardable data
-			return Ok(vec![]);
-		}
+			true
+		});
 
-		// Check if this file meets the discard ratio threshold
-		let should_compact = {
-			let (total_size, _, discard_ratio) = self.get_file_stats(file_id);
+		// If we found a candidate, try to compact it
+		if let Some((file_id, _)) = candidate_to_compact {
+			let compacted = self.compact_vlog_file_safe(file_id, commit_pipeline.clone()).await?;
 
-			if total_size == 0 {
-				false
+			if compacted {
+				Ok(vec![file_id])
 			} else {
-				discard_ratio >= self.gc_discard_ratio
+				Ok(vec![])
 			}
-		};
-
-		if !should_compact {
-			return Ok(vec![]);
-		}
-
-		// Compact the selected file
-		let compacted = self.compact_vlog_file_safe(file_id, commit_pipeline.clone()).await?;
-
-		if compacted {
-			Ok(vec![file_id])
 		} else {
+			// No suitable candidate found
 			Ok(vec![])
 		}
 	}
 
 	/// Compacts a single value log file
+	/// Assumes caller has already checked that file is not active writer and not marked for deletion
 	async fn compact_vlog_file_safe(
 		&self,
 		file_id: u32,
 		commit_pipeline: Arc<CommitPipeline>,
 	) -> Result<bool> {
-		// Check if file is already marked for deletion
-		{
-			let files_to_delete = self.files_to_be_deleted.read()?;
-			if files_to_delete.contains(&file_id) {
-				return Err(Error::Other(format!(
-					"Value log file already marked for deletion fid: {file_id}"
-				)));
-			}
-		}
-
-		// Check if this is the currently open file for writing - we shouldn't compact/delete it
-		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
-		if file_id == active_writer_id {
-			// Skip compacting the active file as it is currently open for writing
-			return Ok(false);
-		}
-
 		// Perform the actual compaction
 		let compacted = self.compact_vlog_file(file_id, commit_pipeline.clone()).await?;
 
@@ -1064,8 +1063,6 @@ impl VLog {
 				stale_seq_nums.push(internal_key.seq_num());
 				stale_internal_keys.push(internal_key.clone());
 			} else {
-				let internal_key = InternalKey::decode(&key);
-
 				// Add this entry to the batch to be rewritten with the correct operation type
 				// This preserves the original operation (Set, Delete, Merge, etc.)
 				// This will cause the value to be written to the active VLog file
@@ -1557,7 +1554,8 @@ mod tests {
 		// Test another file
 		stats.update(2, 300); // Higher discard
 
-		let (max_file, max_discard) = stats.max_discard().unwrap();
+		let candidates = stats.get_gc_candidates();
+		let (max_file, max_discard) = candidates[0];
 		assert_eq!(max_file, 2);
 		assert_eq!(max_discard, 300);
 	}
@@ -1583,7 +1581,8 @@ mod tests {
 		assert_eq!(discard_bytes_2, 200);
 
 		// Test max discard selection (used by conservative GC)
-		let (max_file, max_discard) = stats.max_discard().unwrap();
+		let candidates = stats.get_gc_candidates();
+		let (max_file, max_discard) = candidates[0];
 		assert_eq!(max_file, 1, "File 1 should have maximum discard bytes");
 		assert_eq!(max_discard, 600);
 	}
