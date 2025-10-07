@@ -166,10 +166,10 @@ pub(crate) struct CompactionIterator<'a> {
 	// Track the current key being processed
 	current_user_key: Option<Key>,
 
-	// Buffer for accumulating versions from the heap (raw, unprocessed)
+	// Buffer for accumulating all versions of the current key
 	accumulated_versions: Vec<(Arc<InternalKey>, Value)>,
 
-	// Buffer for processed versions ready to return
+	// Buffer for outputting the versions of the current key
 	output_versions: Vec<(Arc<InternalKey>, Value)>,
 
 	// Compaction state
@@ -2510,7 +2510,7 @@ mod tests {
 
 			// Should return 2 entries (one for each key)
 			assert_eq!(result.len(), 2);
-			
+
 			// Sort results by key for consistent testing
 			result.sort_by(|a, b| a.0.user_key.cmp(&b.0.user_key));
 
@@ -2785,7 +2785,7 @@ mod tests {
 				false, // non-bottom level
 				Some(vlog.clone()),
 				false, // versioning disabled
-				1000, // retention period (ignored when versioning is disabled)
+				1000,  // retention period (ignored when versioning is disabled)
 				clock.clone(),
 			);
 
@@ -2842,7 +2842,7 @@ mod tests {
 				false, // non-bottom level
 				Some(vlog.clone()),
 				false, // versioning disabled
-				1000, // retention period (ignored when versioning is disabled)
+				1000,  // retention period (ignored when versioning is disabled)
 				clock.clone(),
 			);
 
@@ -2893,7 +2893,7 @@ mod tests {
 				false, // non-bottom level
 				Some(vlog.clone()),
 				false, // versioning disabled
-				1000, // retention period (ignored when versioning is disabled)
+				1000,  // retention period (ignored when versioning is disabled)
 				clock.clone(),
 			);
 
@@ -2943,7 +2943,7 @@ mod tests {
 				true, // bottom level
 				Some(vlog.clone()),
 				false, // versioning disabled
-				1000, // retention period (ignored when versioning is disabled)
+				1000,  // retention period (ignored when versioning is disabled)
 				clock.clone(),
 			);
 

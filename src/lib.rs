@@ -102,9 +102,9 @@ impl Default for Options {
 			vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
 			path: PathBuf::from(""),
 			level_count: 1,
-			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
-			index_partition_size: 16384,           // 16KB
-			vlog_max_file_size: 128 * 1024 * 1024, // 128MB
+			max_memtable_size: 100 * 1024 * 1024, // 100 MB
+			index_partition_size: 16384,          // 16KB
+			vlog_max_file_size: 64 * 1024 * 1024, // 128MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
