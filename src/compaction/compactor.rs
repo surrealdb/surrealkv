@@ -30,10 +30,7 @@ impl CompactionOptions {
 	pub(crate) fn from(tree: &CoreInner) -> Self {
 		Self {
 			lopts: tree.opts.clone(),
-			level_manifest: tree
-				.level_manifest
-				.clone()
-				.expect("Compaction requires level manifest"),
+			level_manifest: tree.level_manifest.clone(),
 			immutable_memtables: tree.immutable_memtables.clone(),
 			vlog: tree.vlog.clone(),
 		}

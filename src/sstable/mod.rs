@@ -27,7 +27,8 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 		4 => InternalKeyKind::LogData,
 		5 => InternalKeyKind::RangeDelete,
 		6 => InternalKeyKind::Separator,
-		7 => InternalKeyKind::Max,
+		7 => InternalKeyKind::Replace,
+		24 => InternalKeyKind::Max,
 		_ => InternalKeyKind::Invalid,
 	}
 }
@@ -51,6 +52,11 @@ fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
 }
 
+/// Checks if a key kind represents a Replace operation
+fn is_replace_kind(kind: InternalKeyKind) -> bool {
+	matches!(kind, InternalKeyKind::Replace)
+}
+
 /// Calculates the size of a key with the given user key length
 /// This centralizes the size calculation logic to avoid duplication
 fn calculate_key_size(user_key_len: usize, has_timestamp: bool) -> usize {
@@ -72,8 +78,9 @@ pub enum InternalKeyKind {
 	LogData = 4,
 	RangeDelete = 5,
 	Separator = 6,
-	Max = 7,
-	Invalid = 8,
+	Replace = 7, // Replaces previous key when versioning is enabled
+	Max = 24,    // Leaving space for other kinds
+	Invalid = 191,
 }
 
 impl From<u8> for InternalKeyKind {
@@ -143,6 +150,10 @@ impl InternalKey {
 
 	pub(crate) fn is_hard_delete_marker(&self) -> bool {
 		is_hard_delete_marker(self.kind())
+	}
+
+	pub(crate) fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
 	}
 
 	/// Compares this key with another key using timestamp-based ordering

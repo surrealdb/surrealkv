@@ -75,8 +75,6 @@ pub struct Options {
 	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
-	/// If true, runs the LSM store completely in memory
-	pub in_memory_only: bool,
 
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
@@ -106,12 +104,11 @@ impl Default for Options {
 			level_count: 1,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
 			index_partition_size: 16384,           // 16KB
-			vlog_max_file_size: 128 * 1024 * 1024, // 128MB
+			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 4096, // 4KB default
-			in_memory_only: false,
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
@@ -204,17 +201,6 @@ impl Options {
 	pub fn with_vlog_gc_discard_ratio(mut self, value: f64) -> Self {
 		assert!((0.0..=1.0).contains(&value), "VLog GC discard ratio must be between 0.0 and 1.0");
 		self.vlog_gc_discard_ratio = value;
-		self
-	}
-
-	/// Sets the in-memory only mode.
-	///
-	/// When enabled, the LSM store will run completely in memory without:
-	/// - WAL (Write-Ahead Log)
-	/// - Compactor and task manager
-	/// - Disk persistence
-	pub const fn with_in_memory_only(mut self, value: bool) -> Self {
-		self.in_memory_only = value;
 		self
 	}
 
@@ -337,13 +323,6 @@ impl Options {
 			if self.vlog_value_threshold > 0 {
 				return Err(Error::InvalidArgument(
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
-				));
-			}
-
-			// Versioned queries don't work in memory-only mode (need persistence for history)
-			if self.in_memory_only {
-				return Err(Error::InvalidArgument(
-					"Versioned queries require persistence. Cannot use in_memory_only mode with versioned queries.".to_string(),
 				));
 			}
 		}

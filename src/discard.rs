@@ -6,7 +6,7 @@ use std::{
 
 use memmap2::{MmapMut, MmapOptions};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 const DISCARD_STATS_FILENAME: &str = "DISCARD";
 const ENTRY_SIZE: usize = 12; // 4 bytes for file_id + 8 bytes for discard_bytes
@@ -270,30 +270,26 @@ impl DiscardStats {
 		Ok(())
 	}
 
-	/// Returns the file with maximum discard bytes
-	pub(crate) fn max_discard(&self) -> Result<(u32, u64)> {
+	/// Returns all files with discard bytes, sorted by discard bytes (descending)
+	/// Returns a vector of (file_id, discard_bytes) tuples
+	pub(crate) fn get_gc_candidates(&self) -> Vec<(u32, u64)> {
 		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
 
-		let mut max_file_id = 0;
-		let mut max_discard = 0;
-		let mut found_any = false;
+		let mut candidates = Vec::new();
 
 		for slot in 0..next_empty_slot {
 			let file_id = self.get_file_id(slot);
 			let discard_bytes = self.get_discard_bytes(slot);
 
-			if discard_bytes > max_discard {
-				max_discard = discard_bytes;
-				max_file_id = file_id;
-				found_any = true;
+			if discard_bytes > 0 {
+				candidates.push((file_id, discard_bytes));
 			}
 		}
 
-		if !found_any || max_discard == 0 {
-			return Err(Error::Other("No files with discardable data found".to_string()));
-		}
+		// Sort by discard_bytes in descending order
+		candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-		Ok((max_file_id, max_discard))
+		candidates
 	}
 
 	/// Gets discard bytes for a specific file
@@ -371,7 +367,8 @@ mod tests {
 		assert_eq!(stats.update(3, 300), 300);
 
 		// Test max discard
-		let (file_id, discard) = stats.max_discard().unwrap();
+		let candidates = stats.get_gc_candidates();
+		let (file_id, discard) = candidates[0];
 		assert_eq!(file_id, 3);
 		assert_eq!(discard, 300);
 	}
@@ -396,7 +393,8 @@ mod tests {
 			assert_eq!(stats.get_file_stats(2), 200);
 			assert_eq!(stats.get_file_stats(3), 300);
 
-			let (file_id, discard) = stats.max_discard().unwrap();
+			let candidates = stats.get_gc_candidates();
+			let (file_id, discard) = candidates[0];
 			assert_eq!(file_id, 3);
 			assert_eq!(discard, 300);
 		}
@@ -421,7 +419,9 @@ mod tests {
 		assert_eq!(stats.get_file_stats(3), 300);
 
 		// Verify max discard updated
-		let (file_id, discard) = stats.max_discard().unwrap();
+		let candidates = stats.get_gc_candidates();
+		let (file_id, discard) = candidates[0];
+
 		assert_eq!(file_id, 3);
 		assert_eq!(discard, 300);
 	}
