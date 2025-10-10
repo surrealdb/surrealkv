@@ -97,7 +97,7 @@ pub(crate) fn replay_wal(
 			}
 			Err(Error::Corruption(err)) => {
 				// Return the corruption information with the segment ID and last valid offset
-				eprintln!(
+				log::warn!(
                     "Corrupted WAL record detected in segment {latest_segment_id:020} at offset {last_valid_offset}: {err}"
                 );
 				return Ok((max_seq_num, Some((latest_segment_id as usize, last_valid_offset))));
@@ -160,7 +160,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			Ok((record_data, _offset)) => {
 				// We have a valid batch, write it to the new segment
 				if let Err(e) = new_segment.append(record_data) {
-					eprintln!("Failed to write valid batch to repaired segment: {e}");
+					log::error!("Failed to write valid batch to repaired segment: {e}");
 					repair_failed = true;
 					break;
 				}
@@ -168,20 +168,20 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			}
 			Err(Error::Corruption(err)) => {
 				// Stop at the first corruption - we've written all valid batches
-				eprintln!(
+				log::info!(
                     "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
                 );
 				break;
 			}
 			Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
 				// End of segment reached - all data was valid
-				eprintln!(
+				log::info!(
 					"Repair completed successfully. Recovered {valid_batches_count} valid batches."
 				);
 				break;
 			}
 			Err(err) => {
-				eprintln!("Unexpected error during repair: {err}");
+				log::error!("Unexpected error during repair: {err}");
 				repair_failed = true;
 				break;
 			}
@@ -205,7 +205,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	// fsync directory
 	fsync_directory(wal_dir)?;
 
-	eprintln!(
+	log::info!(
 		"Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
 	);
 
@@ -219,6 +219,7 @@ mod tests {
 	use std::fs;
 	use std::io::{Seek, Write};
 	use tempfile::TempDir;
+	use test_log::test;
 
 	#[test]
 	fn test_replay_wal_sequence_number_tracking() {

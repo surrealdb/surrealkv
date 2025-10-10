@@ -322,7 +322,7 @@ impl<'a> CompactionIterator<'a> {
 
 				// Collect discard statistics
 				if let Err(e) = collect_vlog_discard_stats(&mut self.discard_stats, value) {
-					eprintln!("Error collecting discard stats: {e:?}");
+					log::warn!("Error collecting discard stats: {e:?}");
 				}
 			}
 
@@ -434,6 +434,7 @@ mod tests {
 	};
 	use std::sync::Arc;
 	use tempfile::TempDir;
+	use test_log::test;
 
 	fn create_internal_key(
 		user_key: &str,
@@ -698,7 +699,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_combined_iterator_returns_latest_version() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -757,7 +758,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -819,7 +820,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_hard_delete_at_bottom_level() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -861,7 +862,7 @@ mod tests {
 		assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_hard_delete_at_non_bottom_level() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -911,7 +912,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_multiple_keys_with_mixed_scenarios() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -1050,7 +1051,7 @@ mod tests {
 		assert_eq!(comp_iter.delete_list_batch.len(), 0);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_sequence_ordering_across_iterators() {
 		let (vlog, _temp_dir) = create_test_vlog();
 
@@ -1176,7 +1177,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_versioning_retention_logic() {
 		// Create test VLog
 		let (vlog, _temp_dir) = create_test_vlog();
@@ -1351,7 +1352,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		// Create test VLog
 		let (vlog, _temp_dir) = create_test_vlog();
@@ -1533,7 +1534,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 		// Create test VLog
 		let (vlog, _temp_dir) = create_test_vlog();
@@ -1677,7 +1678,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_no_versioning_bottom_level() {
 		// Create test VLog
 		let (vlog, _temp_dir) = create_test_vlog();
@@ -1823,7 +1824,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_delete_list_logic() {
 		let current_time = 1000000000000; // Fixed current time for testing
 		let retention_period = 1000000; // 1 millisecond
@@ -2054,7 +2055,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_set_with_delete_behavior() {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
@@ -2111,7 +2112,7 @@ mod tests {
 		assert!(!vlog.is_stale(300).unwrap());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
@@ -2178,7 +2179,7 @@ mod tests {
 		assert!(!vlog.is_stale(400).unwrap());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_set_with_delete_latest_version() {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
@@ -2234,7 +2235,7 @@ mod tests {
 		assert!(!vlog.is_stale(300).unwrap());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());
@@ -2290,7 +2291,7 @@ mod tests {
 		assert!(!vlog.is_stale(300).unwrap());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_iterator_multiple_replace_operations() {
 		let (vlog, _tmp_dir) = create_test_vlog();
 		let clock = Arc::new(MockLogicalClock::new());

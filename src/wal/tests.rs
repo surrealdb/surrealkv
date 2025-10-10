@@ -1,4 +1,5 @@
 use tempdir::TempDir;
+use test_log::test;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;

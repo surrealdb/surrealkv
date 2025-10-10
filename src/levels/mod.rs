@@ -190,7 +190,7 @@ impl LevelManifest {
 				match Self::load_table(table_id, opts.clone()) {
 					Ok(table) => tables.push(table),
 					Err(err) => {
-						eprintln!("Error loading table {table_id}: {err:?}");
+						log::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));
 					}
 				}
@@ -415,6 +415,7 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::{table::TableWriter, InternalKey, InternalKeyKind};
+	use test_log::test;
 
 	use super::*;
 	use std::{

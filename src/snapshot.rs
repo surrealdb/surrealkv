@@ -1029,7 +1029,7 @@ impl Drop for SnapshotIterator<'_> {
 		// Decrement VLog iterator count when iterator is dropped
 		if let Some(ref vlog) = self.core.vlog {
 			if let Err(e) = vlog.decr_iterator_count() {
-				eprintln!("Warning: Failed to decrement VLog iterator count: {e}");
+				log::warn!("Failed to decrement VLog iterator count: {e}");
 			}
 		}
 	}
@@ -1041,6 +1041,7 @@ mod tests {
 	use crate::{Options, Tree};
 	use std::collections::HashSet;
 	use std::sync::Arc;
+	use test_log::test;
 
 	use super::{IterState, KMergeIterator};
 	use crate::levels::Level;
@@ -1066,7 +1067,7 @@ mod tests {
 		(tree, temp_dir)
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_empty_snapshot() {
 		let (store, _temp_dir) = create_store();
 
@@ -1080,7 +1081,7 @@ mod tests {
 		assert!(range.is_empty());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_basic_snapshot_visibility() {
 		let (store, _temp_dir) = create_store();
 
@@ -1112,7 +1113,7 @@ mod tests {
 		assert_eq!(range[1].0.as_ref(), b"key2");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_snapshot_isolation_with_updates() {
 		let (store, _temp_dir) = create_store();
 
@@ -1153,7 +1154,7 @@ mod tests {
 		assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value2_v2");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_tombstone_handling() {
 		let (store, _temp_dir) = create_store();
 
@@ -1195,7 +1196,7 @@ mod tests {
 		assert_eq!(range[1].0.as_ref(), b"key3");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_version_resolution() {
 		let (store, _temp_dir) = create_store();
 
@@ -1235,7 +1236,7 @@ mod tests {
 		assert_eq!(value3.as_ref(), b"version3");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_with_random_operations() {
 		let (store, _temp_dir) = create_store();
 
@@ -1308,7 +1309,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_concurrent_snapshots() {
 		let (store, _temp_dir) = create_store();
 
@@ -1342,7 +1343,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_snapshot_with_complex_key_patterns() {
 		let (store, _temp_dir) = create_store();
 
@@ -1379,7 +1380,7 @@ mod tests {
 		assert_eq!(mixed_range.len(), 5);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_snapshot_ordering_invariants() {
 		let (store, _temp_dir) = create_store();
 
@@ -1413,7 +1414,7 @@ mod tests {
 		assert_eq!(keys.len(), range.len());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_snapshot_keys_only() {
 		let (store, _temp_dir) = create_store();
 
@@ -1515,7 +1516,7 @@ mod tests {
 		assert_eq!(items[1].0.user_key.as_ref(), b"z2");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_double_ended_iteration() {
 		let (store, _temp_dir) = create_store();
 
@@ -1556,7 +1557,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_double_ended_iteration_with_tombstones() {
 		let (store, _temp_dir) = create_store();
 
@@ -1610,7 +1611,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_snapshot_individual_get() {
 		let (store, _temp_dir) = create_store();
 
@@ -1648,7 +1649,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_snapshot_double_ended_iteration() {
 		let (store, _temp_dir) = create_store();
 
@@ -1700,7 +1701,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 		let (store, _temp_dir) = create_store();
 
@@ -1753,7 +1754,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_double_ended_iteration_mixed_operations() {
 		let (store, _temp_dir) = create_store();
 

@@ -680,7 +680,8 @@ impl VLog {
 						);
 					}
 					Err(e) => {
-						eprintln!("Warning: Failed to pre-open VLog file {file_name_str}: {e}");
+						log::error!("Failed to pre-open VLog file {file_name_str}: {e}");
+						return Err(Error::Io(Arc::new(e)));
 					}
 				}
 			}
@@ -855,7 +856,8 @@ impl VLog {
 			file_handles.remove(&file_id);
 			if let Some(vlog_file) = files_map.remove(&file_id) {
 				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-					eprintln!("Warning: Failed to delete VLog file {:?}: {}", vlog_file.path, e);
+					log::error!("Failed to delete VLog file {:?}: {}", vlog_file.path, e);
+					return Err(Error::Io(Arc::new(e)));
 				}
 			}
 		}
@@ -956,10 +958,8 @@ impl VLog {
 				file_handles.remove(&file_id);
 				if let Some(vlog_file) = files_map.remove(&file_id) {
 					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-						eprintln!(
-							"Warning: Failed to delete VLog file {:?}: {}",
-							vlog_file.path, e
-						);
+						log::error!("Failed to delete VLog file {:?}: {}", vlog_file.path, e);
+						return Err(Error::Io(Arc::new(e)));
 					}
 				}
 			} else {
@@ -1049,9 +1049,7 @@ impl VLog {
 				Ok(stale) => stale,
 				Err(e) => {
 					let user_key = internal_key.user_key.to_vec();
-					eprintln!(
-						"Warning: Failed to check delete list for user key {user_key:?}: {e}"
-					);
+					log::warn!("Failed to check delete list for user key {user_key:?}: {e}");
 					false // Conservative: assume live on error
 				}
 			};
@@ -1104,7 +1102,7 @@ impl VLog {
 		// This ensures that when VLog entries are deleted, B+ tree entries are also cleaned up
 		if !stale_internal_keys.is_empty() {
 			if let Err(e) = self.cleanup_versioned_index_for_keys(&stale_internal_keys) {
-				eprintln!("Warning: Failed to clean up versioned index during VLog GC: {e}");
+				log::error!("Failed to clean up versioned index during VLog GC: {e}");
 				return Err(e);
 			}
 		}
@@ -1112,7 +1110,7 @@ impl VLog {
 		// Clean up delete list entries for merged stale data
 		if !stale_seq_nums.is_empty() {
 			if let Err(e) = self.delete_list.delete_entries_batch(stale_seq_nums) {
-				eprintln!("Warning: Failed to clean up delete list after merge: {e}");
+				log::error!("Failed to clean up delete list after merge: {e}");
 				return Err(e);
 			}
 		}
@@ -1200,7 +1198,7 @@ impl VLog {
 
 				// Try to remove the temporary file
 				if let Err(e) = std::fs::remove_file(&temp_path) {
-					eprintln!("Warning: Failed to cleanup temp file {temp_path:?}: {e}");
+					log::warn!("Failed to cleanup temp file {temp_path:?}: {e}");
 				}
 			}
 		}
@@ -1271,7 +1269,7 @@ impl VLog {
 				let encoded_key = internal_key.encode();
 
 				if let Err(e) = write_index.delete(&encoded_key) {
-					eprintln!("Failed to delete versioned key: {}", e);
+					log::error!("Failed to delete versioned key: {}", e);
 					return Err(e.into());
 				} else {
 					total_deleted += 1;
@@ -1279,7 +1277,7 @@ impl VLog {
 			}
 
 			if total_deleted > 0 {
-				eprintln!("VLog GC: Cleaned up {} versioned index entries", total_deleted);
+				log::info!("VLog GC: Cleaned up {} versioned index entries", total_deleted);
 			}
 		}
 
@@ -1356,7 +1354,7 @@ impl VLogGCManager {
 				running.store(true, Ordering::SeqCst);
 				if let Err(e) = vlog.garbage_collect(commit_pipeline.clone()).await {
 					// TODO: Handle error appropriately
-					eprintln!("\n VLog GC task error: {e:?}");
+					log::error!("VLog GC task error: {e:?}");
 				}
 				running.store(false, Ordering::SeqCst);
 			}
@@ -1388,7 +1386,7 @@ impl VLogGCManager {
 
 		if let Some(handle) = handle_opt {
 			if let Err(e) = handle.await {
-				eprintln!("Error shutting down VLog GC task: {e:?}");
+				log::error!("Error shutting down VLog GC task: {e:?}");
 			}
 		}
 
@@ -1485,6 +1483,7 @@ impl DeleteList {
 mod tests {
 	use super::*;
 	use tempfile::TempDir;
+	use test_log::test;
 
 	fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 		let temp_dir = TempDir::new().unwrap();
@@ -1586,7 +1585,7 @@ mod tests {
 		assert_eq!(max_discard, 600);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_append_and_get() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
@@ -1599,7 +1598,7 @@ mod tests {
 		assert_eq!(value, *retrieved);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_small_value_acceptance() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
@@ -1612,7 +1611,7 @@ mod tests {
 		assert_eq!(small_value, *retrieved);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_caching() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
@@ -1636,7 +1635,7 @@ mod tests {
 		assert_eq!(cached_value.unwrap(), value.into());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_prefill_file_handles() {
 		let opts = Options {
 			vlog_max_file_size: 1024, // Small file size to force multiple files
@@ -1844,7 +1843,7 @@ mod tests {
 		assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version + pointer
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_value_location_resolve_inline() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
@@ -1855,7 +1854,7 @@ mod tests {
 		assert_eq!(&*resolved, test_data);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_value_location_resolve_vlog() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
@@ -1884,7 +1883,7 @@ mod tests {
 		assert_eq!(&*resolved, test_data);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_value_location_from_encoded_value_vlog() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let key = b"test_key";
@@ -1971,7 +1970,7 @@ mod tests {
 		assert!(!header.is_compatible());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_with_file_header() {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 
@@ -1986,7 +1985,7 @@ mod tests {
 		assert_eq!(retrieved_value.as_ref(), value);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_restart_continues_last_file() {
 		let temp_dir = TempDir::new().unwrap();
 		let opts = Options {
@@ -2128,7 +2127,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_restart_with_multiple_files() {
 		let temp_dir = TempDir::new().unwrap();
 		let opts = Options {
@@ -2277,7 +2276,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_writer_reopen_append_only_behavior() {
 		let temp_dir = TempDir::new().unwrap();
 		let opts = Arc::new(Options {
@@ -2488,7 +2487,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 		use crate::compaction::leveled::Strategy;
 		use crate::lsm::{CompactionOperations, TreeBuilder};

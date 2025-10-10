@@ -1271,6 +1271,7 @@ impl LSMIterator for TableIterator {
 #[cfg(test)]
 mod tests {
 	use std::vec;
+	use test_log::test;
 
 	use crate::sstable::InternalKey;
 

@@ -1322,6 +1322,7 @@ mod tests {
 	use std::io::Seek;
 	use std::io::{Read, SeekFrom, Write};
 	use tempdir::TempDir;
+	use test_log::test;
 
 	#[test]
 	fn new_empty() {

@@ -253,6 +253,7 @@ impl MemTable {
 
 #[cfg(test)]
 mod tests {
+	use test_log::test;
 
 	use super::*;
 	use std::collections::HashMap;

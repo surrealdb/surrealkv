@@ -158,6 +158,7 @@ impl FilterBlockReader {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::{bloom::LevelDBBloomFilter, InternalKey, InternalKeyKind};
+	use test_log::test;
 
 	use super::*;
 

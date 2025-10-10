@@ -79,6 +79,7 @@ impl Drop for LockFile {
 
 #[cfg(test)]
 mod tests {
+    use test_log::test;
     use super::*;
     use std::fs;
     use std::sync::{Arc, Barrier};
@@ -153,7 +154,7 @@ mod tests {
     
     // Integration tests with Tree
     
-    #[tokio::test]
+    #[test(tokio::test)]
     async fn test_lock_file_prevents_concurrent_access() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_path_buf();
@@ -238,7 +239,7 @@ mod tests {
         }
     }
     
-    #[tokio::test(flavor = "multi_thread")]
+    #[test(tokio::test(flavor = "multi_thread"))]
     async fn test_lock_file_multithreaded_with_disk() {
         let temp_dir = TempDir::new().unwrap();
         let temp_path = temp_dir.path().to_path_buf();
