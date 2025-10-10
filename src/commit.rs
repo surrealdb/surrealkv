@@ -331,6 +331,7 @@ impl Drop for CommitPipeline {
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
+	use test_log::test;
 
 	use crate::sstable::InternalKeyKind;
 
@@ -358,7 +359,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_single_commit() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
@@ -377,7 +378,7 @@ mod tests {
 		pipeline.shutdown();
 	}
 
-	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_sequential_commits() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
@@ -401,7 +402,7 @@ mod tests {
 		pipeline.shutdown();
 	}
 
-	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_concurrent_commits() {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
@@ -471,7 +472,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_commits_with_delays() {
 		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv));
 

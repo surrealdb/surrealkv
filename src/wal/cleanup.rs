@@ -48,7 +48,7 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
 				}
 				Err(e) => {
 					// Log error but continue trying to remove other segments
-					eprintln!("Error removing old WAL segment {segment_id}: {e}");
+					log::warn!("Error removing old WAL segment {segment_id}: {e}");
 				}
 			}
 		}

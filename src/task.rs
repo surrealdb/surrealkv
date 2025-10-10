@@ -72,7 +72,7 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					if let Err(e) = core.compact_memtable() {
 						// TODO: Handle error appropriately
-						eprintln!("\n Memtable compaction task error: {e:?}");
+						log::error!("Memtable compaction task error: {e:?}");
 					} else {
 						// If memtable compaction succeeded, trigger level compaction
 						level_notify.notify_one();
@@ -104,7 +104,7 @@ impl TaskManager {
 					let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
 					if let Err(e) = core.compact(strategy) {
 						// TODO: Handle error appropriately
-						eprintln!("\n Level compaction task error: {e:?}");
+						log::error!("Level compaction task error: {e:?}");
 					}
 					running.store(false, Ordering::SeqCst);
 				}
@@ -157,7 +157,7 @@ impl TaskManager {
 		let task_handles = self.task_handles.lock().unwrap().take().unwrap();
 		for handle in task_handles {
 			if let Err(e) = handle.await {
-				eprintln!("Error shutting down task: {e:?}");
+				log::error!("Error shutting down task: {e:?}");
 			}
 		}
 	}
@@ -170,6 +170,7 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::sync::Arc;
 	use std::time::Duration;
+	use test_log::test;
 	use tokio::time;
 
 	use crate::compaction::CompactionStrategy;
@@ -245,7 +246,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_wake_up_memtable() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
@@ -259,7 +260,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_multiple_wake_up_memtable() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
@@ -278,7 +279,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_wake_up_level() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
@@ -292,7 +293,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_multiple_wake_up_level() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
@@ -311,7 +312,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_alternating_compactions() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
@@ -337,7 +338,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_already_running_tasks() {
 		// Create core with longer delays to ensure tasks are still running when we try to wake them again
 		let core = Arc::new(MockCoreInner::with_delays(100, 100));
@@ -367,7 +368,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_wake_up_memtable() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = Arc::new(TaskManager::new(core.clone()));
@@ -395,7 +396,7 @@ mod tests {
 		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_wake_up_level() {
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = Arc::new(TaskManager::new(core.clone()));
@@ -428,7 +429,7 @@ mod tests {
 		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_error_handling() {
 		// This test verifies the correct error handling behavior
 
@@ -499,7 +500,7 @@ mod tests {
 		task_manager.stop().await;
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_task_from_fail() {
 		// Create a core that will fail on the first attempt but succeed on subsequent attempts
 		let core = Arc::new(MockCoreInner::new());

@@ -135,6 +135,7 @@ impl FilterPolicy for LevelDBBloomFilter {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use test_log::test;
 
 	#[test]
 	fn test_bloom_filter_creation() {

@@ -198,7 +198,7 @@ impl DiscardStats {
 			if slot >= self.max_slots() {
 				drop(next_slot_guard); // Release lock before expand
 				if let Err(e) = self.expand() {
-					eprintln!("Failed to expand discard stats file: {e}");
+					log::error!("Failed to expand discard stats file: {e}");
 					return 0;
 				}
 				// After expansion, get the slot again
@@ -350,6 +350,7 @@ impl Drop for DiscardStats {
 mod tests {
 	use super::*;
 	use tempfile::TempDir;
+	use test_log::test;
 
 	#[test]
 	fn test_discard_stats_basic() {

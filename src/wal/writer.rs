@@ -229,6 +229,7 @@ impl Drop for Wal {
 #[cfg(test)]
 mod tests {
 	use crate::wal::segment::{BLOCK_SIZE, WAL_RECORD_HEADER_SIZE};
+	use test_log::test;
 
 	use super::*;
 	use tempdir::TempDir;

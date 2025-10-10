@@ -204,7 +204,7 @@ impl Compactor {
 			let path = self.options.lopts.sstable_file_path(table_id);
 			if let Err(e) = std::fs::remove_file(path) {
 				// Log error but continue with cleanup
-				eprintln!("Failed to remove old table file: {e}");
+				log::warn!("Failed to remove old table file: {e}");
 			}
 		}
 	}

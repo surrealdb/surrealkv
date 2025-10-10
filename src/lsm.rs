@@ -195,7 +195,7 @@ impl CoreInner {
 		let wal_dir = wal_guard.get_dir_path().to_path_buf();
 		tokio::spawn(async move {
 			if let Err(e) = cleanup_old_segments(&wal_dir) {
-				eprintln!("Failed to clean up old WAL segments: {e}");
+				log::warn!("Failed to clean up old WAL segments: {e}");
 			}
 		});
 
@@ -581,7 +581,7 @@ impl Core {
 				seq_num
 			}
 			(_seq_num, Some((corrupted_segment_id, last_valid_offset))) => {
-				eprintln!(
+				log::warn!(
                     "Detected WAL corruption in segment {corrupted_segment_id} at offset {last_valid_offset}. Attempting repair..."
                 );
 
@@ -589,7 +589,7 @@ impl Core {
 				if let Err(repair_err) =
 					repair_corrupted_wal_segment(wal_path, corrupted_segment_id)
 				{
-					eprintln!("Failed to repair WAL segment: {repair_err}");
+					log::error!("Failed to repair WAL segment: {repair_err}");
 					// Fail fast - cannot continue with corrupted WAL
 					return Err(Error::Other(format!(
                         "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
@@ -924,11 +924,11 @@ impl Drop for Tree {
 				let core = Arc::clone(&self.core);
 				handle.spawn(async move {
 					if let Err(err) = core.close().await {
-						eprintln!("Error closing store: {}", err);
+						log::error!("Error closing store: {}", err);
 					}
 				});
 			} else {
-				eprintln!("No runtime available for closing the store correctly");
+				log::warn!("No runtime available for closing the store correctly");
 			}
 		}
 	}
@@ -1161,6 +1161,7 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use std::{collections::HashMap, path::PathBuf};
+	use test_log::test;
 
 	use crate::compaction::leveled::Strategy;
 
@@ -1211,7 +1212,7 @@ mod tests {
 		})
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_tree_basic() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1231,7 +1232,7 @@ mod tests {
 		assert_eq!(result, value.as_bytes().into());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_memtable_flush() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1265,7 +1266,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_memtable_flush_with_delete() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1305,7 +1306,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_memtable_flush_with_multiple_keys_and_updates() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1360,7 +1361,7 @@ mod tests {
 		assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_persistence() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1445,7 +1446,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_checkpoint_functionality() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1529,7 +1530,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_checkpoint_restore_discards_pending_writes() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1597,7 +1598,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_simple_range_seek() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1675,7 +1676,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_large_range_scan() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1856,7 +1857,7 @@ mod tests {
 		assert_eq!(empty_result.len(), 0, "Empty range scan should return 0 items");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_skip_take() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1918,7 +1919,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_skip_take_alphabetical() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1995,7 +1996,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_limit_functionality() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2030,7 +2031,7 @@ mod tests {
 			.map(|r| match r {
 				Ok(kv) => kv,
 				Err(e) => {
-					eprintln!("Error in range iterator: {e:?}");
+					log::error!("Error in range iterator: {e:?}");
 					panic!("Range iterator error: {e}");
 				}
 			})
@@ -2123,7 +2124,7 @@ mod tests {
 		assert_eq!(zero_result.len(), 0, "Range scan with limit 0 should return no items");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_limit_with_skip_take() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2264,7 +2265,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_basic() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2302,7 +2303,7 @@ mod tests {
 		assert_eq!(retrieved_large, large_value.as_bytes().into());
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_vlog_concurrent_operations() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2365,7 +2366,7 @@ mod tests {
 		tree.close().await.unwrap();
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_file_rotation() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2421,7 +2422,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_discard_file_directory_structure() {
 		// Test to verify that the DISCARD file lives in the main database directory,
 		// not in the VLog subdirectory
@@ -2529,7 +2530,7 @@ mod tests {
 		println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_with_updates_and_delete() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2620,7 +2621,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2731,7 +2732,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_vlog_compaction_preserves_sequence_numbers() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2827,7 +2828,7 @@ mod tests {
 		tree.close().await.unwrap();
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_sstable_lsn_bug() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -2905,7 +2906,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_table_id_assignment_across_restart() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -3098,7 +3099,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test(flavor = "multi_thread")]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_vlog_prefill_on_reopen() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -3187,7 +3188,7 @@ mod tests {
 		tree2.close().await.unwrap();
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_tree_builder() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -3229,7 +3230,7 @@ mod tests {
 		assert_eq!(result, Arc::from(b"value2".as_slice()));
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -3337,7 +3338,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_checkpoint_with_vlog() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();

@@ -1008,6 +1008,7 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 #[cfg(test)]
 mod tests {
 	use std::{collections::HashMap, mem::size_of};
+	use test_log::test;
 
 	use bytes::Bytes;
 
@@ -1040,7 +1041,7 @@ mod tests {
 		(tree, temp_dir)
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn basic_transaction() {
 		let (store, _temp_dir) = create_store();
 
@@ -1081,7 +1082,7 @@ mod tests {
 		assert_eq!(val.as_ref(), value2.as_ref());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn mvcc_snapshot_isolation() {
 		let (store, _) = create_store();
 
@@ -1143,7 +1144,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn ryow() {
 		let (store, _) = create_store();
 
@@ -1203,7 +1204,7 @@ mod tests {
 	// Specifically, the tests are derived from FoundationDB tests: https://github.com/ept/hermitage/blob/master/foundationdb.md
 
 	// G0: Write Cycles (dirty writes)
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn g0_tests() {
 		let store = create_hermitage_store().await;
 		let key1 = Bytes::from("k1");
@@ -1248,7 +1249,7 @@ mod tests {
 	}
 
 	// P4: Lost Update
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn p4() {
 		let store = create_hermitage_store().await;
 
@@ -1304,7 +1305,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn g_single() {
 		g_single_tests().await;
 	}
@@ -1312,7 +1313,7 @@ mod tests {
 	fn require_send<T: Send>(_: T) {}
 	fn require_sync<T: Sync + Send>(_: T) {}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn is_send_sync() {
 		let (db, _) = create_store();
 
@@ -1368,7 +1369,7 @@ mod tests {
 		fastrand::Rng::with_seed(RNG_SEED)
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	#[ignore]
 	async fn insert_large_txn_and_get() {
 		let store = create_hermitage_store().await;
@@ -1392,7 +1393,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn sdb_delete_record_id_bug() {
 		let (store, _) = create_store();
 
@@ -1543,7 +1544,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn transaction_delete_from_index() {
 		let (store, _) = create_store();
 
@@ -1584,7 +1585,7 @@ mod tests {
 		assert_eq!(val.as_ref(), value.as_ref());
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_insert_delete_read_key() {
 		let (store, _) = create_store();
 
@@ -1620,7 +1621,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_basic_functionality() {
 		let (store, _temp_dir) = create_store();
 
@@ -1651,7 +1652,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_with_bounds() {
 		let (store, _temp_dir) = create_store();
 
@@ -1690,7 +1691,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_with_limit() {
 		let (store, _temp_dir) = create_store();
 
@@ -1721,7 +1722,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_read_your_own_writes() {
 		let (store, _temp_dir) = create_store();
 
@@ -1758,7 +1759,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_with_deletes() {
 		let (store, _temp_dir) = create_store();
 
@@ -1792,7 +1793,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_delete_then_set() {
 		let (store, _temp_dir) = create_store();
 
@@ -1822,7 +1823,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_empty_result() {
 		let (store, _temp_dir) = create_store();
 
@@ -1844,7 +1845,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_ordering() {
 		let (store, _temp_dir) = create_store();
 
@@ -1873,7 +1874,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_boundary_conditions() {
 		let (store, _temp_dir) = create_store();
 
@@ -1910,7 +1911,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_write_sequence_order() {
 		let (store, _temp_dir) = create_store();
 
@@ -1930,7 +1931,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_keys_method() {
 		let (store, _temp_dir) = create_store();
 
@@ -2016,7 +2017,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_range_value_pointer_resolution_bug() {
 		let temp_dir = create_temp_directory();
 
@@ -2114,8 +2115,9 @@ mod tests {
 	// Double-ended iterator tests
 	mod double_ended_iterator_tests {
 		use super::*;
+		use test_log::test;
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_basic() {
 			let (store, _temp_dir) = create_store();
 
@@ -2156,7 +2158,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_with_writes() {
 			let (store, _temp_dir) = create_store();
 
@@ -2202,7 +2204,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_with_deletes() {
 			let (store, _temp_dir) = create_store();
 
@@ -2250,7 +2252,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_with_soft_deletes() {
 			let (store, _temp_dir) = create_store();
 
@@ -2298,7 +2300,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_with_limits() {
 			let (store, _temp_dir) = create_store();
 
@@ -2337,7 +2339,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_keys_only() {
 			let (store, _temp_dir) = create_store();
 
@@ -2374,7 +2376,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_mixed_operations() {
 			let (store, _temp_dir) = create_store();
 
@@ -2427,7 +2429,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_empty_range() {
 			let (store, _temp_dir) = create_store();
 
@@ -2449,7 +2451,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_reverse_iteration_consistency_with_forward() {
 			let (store, _temp_dir) = create_store();
 
@@ -2497,8 +2499,9 @@ mod tests {
 	// Savepoint tests
 	mod savepoint_tests {
 		use super::*;
+		use test_log::test;
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn multiple_savepoints() {
 			let (store, _) = create_store();
 
@@ -2561,7 +2564,7 @@ mod tests {
 			assert!(txn2.get(&key3).unwrap().is_none());
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn savepoint_rollback_on_updated_key() {
 			let (store, _) = create_store();
 
@@ -2581,7 +2584,7 @@ mod tests {
 			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value2.as_ref());
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn savepoint_rollback_with_range_scan() {
 			let (store, _) = create_store();
 
@@ -2603,7 +2606,7 @@ mod tests {
 			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), value.as_ref());
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn savepoint_with_deletes() {
 			let (store, _) = create_store();
 
@@ -2633,7 +2636,7 @@ mod tests {
 			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn savepoint_nested_operations() {
 			let (store, _) = create_store();
 
@@ -2675,7 +2678,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_basic_functionality() {
 		let (store, _temp_dir) = create_store();
 
@@ -2722,7 +2725,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_vs_hard_delete() {
 		let (store, _temp_dir) = create_store();
 
@@ -2761,7 +2764,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_in_transaction_write_set() {
 		let (store, _temp_dir) = create_store();
 
@@ -2801,7 +2804,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_then_reinsert() {
 		let (store, _temp_dir) = create_store();
 
@@ -2839,7 +2842,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_range_scan_filtering() {
 		let (store, _temp_dir) = create_store();
 
@@ -2888,7 +2891,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_mixed_with_other_operations() {
 		let (store, _temp_dir) = create_store();
 
@@ -2932,7 +2935,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_rollback() {
 		let (store, _temp_dir) = create_store();
 
@@ -2962,7 +2965,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_versioned_queries_basic() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3008,7 +3011,7 @@ mod tests {
 		assert_eq!(value_at_ts2, Some(Arc::from(b"value1_v2" as &[u8])));
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_versioned_queries_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3075,7 +3078,7 @@ mod tests {
 		assert_eq!(version_at_ts3.len(), 0);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_set_at_timestamp() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3110,7 +3113,7 @@ mod tests {
 		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_commit_timestamp_consistency() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3173,7 +3176,7 @@ mod tests {
 		assert_ne!(ts4, ts5);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_keys_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3237,7 +3240,7 @@ mod tests {
 		assert!(keys_range.contains(&b"key3".to_vec()));
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_keys_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3270,7 +3273,7 @@ mod tests {
 		assert!(!keys.contains(&b"key3".to_vec())); // Soft deleted
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_scan_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3366,7 +3369,7 @@ mod tests {
 		assert!(found_keys.contains(&b"key3".as_ref()));
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_scan_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3426,7 +3429,7 @@ mod tests {
 		assert!(!found_keys.contains(&b"key3".as_ref())); // Soft deleted
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_scan_all_versions() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3504,7 +3507,7 @@ mod tests {
 		assert_eq!(range_versions.len(), 3); // 2 versions of key2 + 1 version of key3
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_scan_all_versions_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3555,7 +3558,7 @@ mod tests {
 		assert!(key2_versions[2].2); // Is tombstone
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_versioned_queries_without_versioning() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
@@ -3574,6 +3577,7 @@ mod tests {
 		use std::collections::HashSet;
 
 		use super::*;
+		use test_log::test;
 
 		fn create_tree() -> (Tree, TempDir) {
 			let temp_dir = create_temp_directory();
@@ -3582,7 +3586,7 @@ mod tests {
 			(TreeBuilder::with_options(opts).build().unwrap(), temp_dir)
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_insert_multiple_versions_in_same_tx() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
@@ -3611,7 +3615,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_single_key_multiple_versions() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
@@ -3640,7 +3644,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_single_version_each() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3670,7 +3674,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3713,7 +3717,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_deleted_records() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
@@ -3744,7 +3748,7 @@ mod tests {
 			assert!(*is_deleted);
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3787,7 +3791,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3839,7 +3843,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_soft_and_hard_delete() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
@@ -3864,7 +3868,7 @@ mod tests {
 			assert_eq!(results.len(), 0);
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_range_boundaries() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3888,7 +3892,7 @@ mod tests {
 			assert_eq!(results.len(), keys.len());
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_limit() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3912,7 +3916,7 @@ mod tests {
 			assert_eq!(results.len(), 2);
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_single_key_single_version() {
 			let (store, _tmp_dir) = create_tree();
 			let key = Bytes::from("key1");
@@ -3934,7 +3938,7 @@ mod tests {
 			assert!(!(*is_deleted));
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
@@ -3980,7 +3984,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_subsets() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![
@@ -4040,7 +4044,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_range_bounds() {
 			let (store, _tmp_dir) = create_tree();
 
@@ -4089,7 +4093,7 @@ mod tests {
 			assert_eq!(results.len(), 0); // Should be empty!
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_batches() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = [
@@ -4195,7 +4199,7 @@ mod tests {
 			}
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_replace_basic() {
 			let (store, _tmp_dir) = create_tree();
 
@@ -4221,7 +4225,7 @@ mod tests {
 			assert_eq!(result.as_ref(), b"test_value2");
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_replace_replaces_previous_versions() {
 			let (store, _tmp_dir) = create_tree();
 
@@ -4249,7 +4253,7 @@ mod tests {
 			assert_eq!(result.as_ref(), b"replaced_value");
 		}
 
-		#[tokio::test]
+		#[test(tokio::test)]
 		async fn test_replace_mixed_with_regular_operations() {
 			let (store, _tmp_dir) = create_tree();
 

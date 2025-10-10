@@ -233,6 +233,7 @@ mod tests {
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::Iterator;
 	use std::sync::Arc;
+	use test_log::test;
 
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)

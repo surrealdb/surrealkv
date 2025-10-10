@@ -515,6 +515,7 @@ impl LSMIterator for BlockIterator {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::{InternalKey, InternalKeyKind};
+	use test_log::test;
 
 	use super::*;
 

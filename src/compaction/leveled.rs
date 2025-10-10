@@ -329,6 +329,7 @@ mod tests {
 		fs::File,
 		sync::{atomic::AtomicU64, Arc, RwLock},
 	};
+	use test_log::test;
 
 	use tempfile::TempDir;
 
@@ -841,7 +842,7 @@ mod tests {
 		entries
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_simple_merge_compaction() {
 		let env = TestEnv::new();
 
@@ -976,7 +977,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_multi_level_merge_compaction() {
 		// Generate key-value entries for a table
 		fn generate_entries(
@@ -1408,7 +1409,7 @@ mod tests {
 		assert_eq!(selected_tables.len(), 1, "Should select exactly 1 table (only L1 table since overlap detection may not work in test)");
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_with_large_keys_and_values() {
 		let env = TestEnv::new();
 
@@ -1475,7 +1476,7 @@ mod tests {
 
 	// TODO: add more tests for:
 	// - Compaction with keys that are split across multiple tables
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_compaction_respects_sequence_numbers() {
 		let env = TestEnv::new();
 
@@ -1572,7 +1573,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_tombstone_propagation() {
 		// Test 95% deletion via tombstones with bottom-level filtering
 		let env = TestEnv::new();
@@ -1641,7 +1642,7 @@ mod tests {
 		assert_eq!(remaining_keys, expected_keys);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_l0_overlapping_keys_compaction() {
 		let env = TestEnv::new();
 		let mut levels = Levels::new(3, 10);
@@ -1769,7 +1770,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_l0_tombstone_propagation_overlapping() {
 		let env = TestEnv::new();
 		let mut levels = Levels::new(3, 10);
@@ -1896,7 +1897,7 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_tombstone_propagation_through_levels() {
 		let env = TestEnv::new();
 		let mut levels = Levels::new(4, 10);
@@ -2123,7 +2124,7 @@ mod tests {
 		assert_eq!(selected, Some(table_id));
 	}
 
-	#[tokio::test]
+	#[test(tokio::test)]
 	async fn test_soft_delete_compaction_behavior() {
 		let env = TestEnv::new_with_levels(2); // Only 2 levels: L0 and L1
 		let mut levels = Levels::new(2, 10);

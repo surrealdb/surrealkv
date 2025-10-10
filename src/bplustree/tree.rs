@@ -888,7 +888,7 @@ pub struct BPlusTree<F: VfsFile> {
 impl<F: VfsFile> Drop for BPlusTree<F> {
 	fn drop(&mut self) {
 		if let Err(e) = self.flush() {
-			eprintln!("Error during BPlusTree drop: {}", e);
+			log::error!("Error during BPlusTree drop: {}", e);
 		}
 	}
 }
@@ -2264,6 +2264,7 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 mod tests {
 	use std::fs::File;
 	use std::io::Read;
+	use test_log::test;
 
 	use super::*;
 	use rand::{rngs::StdRng, Rng, SeedableRng};

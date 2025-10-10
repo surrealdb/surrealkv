@@ -217,6 +217,7 @@ mod tests {
 	use std::io::BufReader;
 	use std::io::{Read, Write};
 	use std::vec::Vec;
+	use test_log::test;
 
 	use crate::wal::segment::{Options, Segment, SegmentRef};
 	use crate::wal::writer::Wal;
