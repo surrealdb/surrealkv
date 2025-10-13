@@ -648,7 +648,7 @@ impl Core {
 		// Stop VLog GC manager if it exists
 		let vlog_gc_manager = self.vlog_gc_manager.lock().unwrap().take();
 		if let Some(vlog_gc_manager) = vlog_gc_manager {
-			vlog_gc_manager.stop().await;
+			vlog_gc_manager.stop().await?;
 		}
 
 		// Step 3: Flush the active memtable only if it exceeds the configured size
