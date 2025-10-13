@@ -1049,8 +1049,8 @@ impl VLog {
 				Ok(stale) => stale,
 				Err(e) => {
 					let user_key = internal_key.user_key.to_vec();
-					log::warn!("Failed to check delete list for user key {user_key:?}: {e}");
-					false // Conservative: assume live on error
+					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
+					return Err(e);
 				}
 			};
 
@@ -1364,7 +1364,7 @@ impl VLogGCManager {
 	}
 
 	/// Stops the VLog GC background task
-	pub(crate) async fn stop(&self) {
+	pub(crate) async fn stop(&self) -> Result<()> {
 		// Set the stop flag to prevent new operations from starting
 		self.stop_flag.store(true, Ordering::SeqCst);
 
@@ -1387,11 +1387,17 @@ impl VLogGCManager {
 		if let Some(handle) = handle_opt {
 			if let Err(e) = handle.await {
 				log::error!("Error shutting down VLog GC task: {e:?}");
+				// Continue to close the VLog
 			}
 		}
 
 		// Close the VLog
-		self.vlog.close().unwrap();
+		if let Err(e) = self.vlog.close() {
+			log::error!("Error closing VLog: {e:?}");
+			return Err(e);
+		}
+
+		Ok(())
 	}
 }
 
