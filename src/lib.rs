@@ -8,6 +8,7 @@ mod discard;
 mod error;
 mod iter;
 mod levels;
+mod lockfile;
 mod lsm;
 mod memtable;
 mod oracle;
