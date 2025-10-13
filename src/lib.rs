@@ -8,6 +8,7 @@ mod discard;
 mod error;
 mod iter;
 mod levels;
+mod lockfile;
 mod lsm;
 mod memtable;
 mod oracle;
@@ -235,12 +236,6 @@ impl Options {
 	pub(crate) fn vlog_file_path(&self, id: u64) -> PathBuf {
 		self.vlog_dir().join(format!("{id:020}.vlog"))
 	}
-
-	// /// Returns the path for a WAL file with the given ID
-	// /// Format: {path}/wal/{id:020}
-	// pub(crate) fn wal_file_path(&self, id: u64) -> PathBuf {
-	// 	self.wal_dir().join(format!("{id:020}"))
-	// }
 
 	/// Returns the directory path for WAL files
 	pub(crate) fn wal_dir(&self) -> PathBuf {

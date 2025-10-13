@@ -17,6 +17,7 @@ use crate::{
 	},
 	error::Result,
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
+	lockfile::LockFile,
 	memtable::{ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
@@ -113,11 +114,18 @@ pub(crate) struct CoreInner {
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
 	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
+
+	/// Lock file to prevent multiple processes from opening the same database
+	pub(crate) lockfile: Mutex<LockFile>,
 }
 
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		// Acquire database lock to prevent multiple processes from opening the same database
+		let mut lockfile = LockFile::new(&opts.path);
+		lockfile.acquire()?;
+
 		// Initialize active and immutable memtables
 		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new())));
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
@@ -163,6 +171,7 @@ impl CoreInner {
 			vlog,
 			wal: wal.map(parking_lot::RwLock::new),
 			versioned_index,
+			lockfile: Mutex::new(lockfile),
 		})
 	}
 
@@ -268,71 +277,6 @@ impl CoreInner {
 		let location = ValueLocation::decode(value)?;
 		location.resolve_value(self.vlog.as_ref())
 	}
-
-	// /// TODO: Still needs work.
-	// /// Cleans expired versions from the versioned index based on retention policy
-	// pub(crate) fn clean_expired_versions(&self) -> Result<()> {
-	// 	if !self.opts.enable_versioning || self.opts.versioned_history_retention_ns == 0 {
-	// 		return Ok(()); // No retention limit or versioned queries disabled
-	// 	}
-
-	// 	if let Some(ref versioned_index) = self.versioned_index {
-	// 		let current_time = std::time::SystemTime::now()
-	// 			.duration_since(std::time::UNIX_EPOCH)
-	// 			.unwrap_or_default()
-	// 			.as_nanos() as u64;
-
-	// 		let cutoff_time = current_time.saturating_sub(self.opts.versioned_history_retention_ns);
-
-	// 		// Create a range query to find all entries older than cutoff_time
-	// 		let start_key = ReverseTimestampKey::new(
-	// 			vec![], // Empty user key for range start
-	// 			0,
-	// 			InternalKeyKind::Set,
-	// 			0, // Start from beginning of time
-	// 		)
-	// 		.encode();
-
-	// 		let end_key = ReverseTimestampKey::new(
-	// 			vec![0xFF; 256], // Max user key for range end
-	// 			u64::MAX,
-	// 			InternalKeyKind::Set,
-	// 			cutoff_time, // End at cutoff time
-	// 		)
-	// 		.encode();
-
-	// 		let mut index_guard = versioned_index.write()?;
-
-	// 		// Get all entries in the time range
-	// 		let range_iter = index_guard.range(&start_key, &end_key)?;
-	// 		let mut keys_to_delete = Vec::new();
-
-	// 		for entry in range_iter {
-	// 			match entry {
-	// 				Ok((key, _value)) => {
-	// 					// Decode the key to check timestamp
-	// 					let reverse_key = ReverseTimestampKey::decode(&key);
-	// 					if reverse_key.timestamp < cutoff_time {
-	// 						keys_to_delete.push(key);
-	// 					}
-	// 				}
-	// 				Err(e) => {
-	// 					eprintln!("Error iterating versioned index: {}", e);
-	// 					break;
-	// 				}
-	// 			}
-	// 		}
-
-	// 		// Delete expired entries
-	// 		for key in keys_to_delete {
-	// 			if let Err(e) = index_guard.delete(&key) {
-	// 				eprintln!("Failed to delete expired version: {}", e);
-	// 			}
-	// 		}
-	// 	}
-
-	// 	Ok(())
-	// }
 }
 
 impl CompactionOperations for CoreInner {
@@ -722,6 +666,10 @@ impl Core {
 
 		// Step 5: Flush all directories to ensure durability
 		sync_directory_structure(&self.inner.opts)?;
+
+		// Step 6: Release the database lock
+		let mut lockfile = self.inner.lockfile.lock()?;
+		lockfile.release()?;
 
 		Ok(())
 	}
