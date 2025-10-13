@@ -37,12 +37,12 @@ pub(crate) fn replay_wal(
 		return Ok((0, None));
 	}
 
-	if list_segment_ids(wal_dir, None)?.is_empty() {
+	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
 		return Ok((0, None));
 	}
 
-	// Get range of segment IDs
-	let (first, last) = match get_segment_range(wal_dir, None) {
+	// Get range of segment IDs (looking for .wal files)
+	let (first, last) = match get_segment_range(wal_dir, Some("wal")) {
 		Ok(range) => range,
 		Err(Error::IO(_)) => return Ok((0, None)),
 		Err(e) => return Err(e.into()),
@@ -62,8 +62,8 @@ pub(crate) fn replay_wal(
 	// Track current segment and offset for reporting corruption location
 	let mut last_valid_offset = 0;
 
-	// Get only the latest segment
-	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, None)?;
+	// Get only the latest segment (with .wal extension)
+	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
 	let latest_segments =
 		all_segments.into_iter().filter(|seg| seg.id == latest_segment_id).collect::<Vec<_>>();
 
@@ -120,19 +120,20 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	use std::fs;
 
 	// Build segment paths
-	let segment_path = wal_dir.join(format!("{segment_id:020}"));
-	let repair_path = wal_dir.join(format!("{segment_id:020}.repair"));
+	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+	let repair_path = wal_dir.join(format!("{segment_id:020}.wal.repair"));
 
 	// Verify the corrupted segment exists
 	if !segment_path.exists() {
 		return Err(crate::error::Error::Other(format!(
-			"WAL segment {segment_id:020} does not exist"
+			"WAL segment {segment_id:020}.wal does not exist"
 		)));
 	}
 
 	// Create a new segment for writing the repaired data
+	// Use .wal.repair as the extension so the final filename is {id:020}.wal.repair
 	let opts = Options {
-		file_extension: Some("repair".to_string()),
+		file_extension: Some("wal.repair".to_string()),
 		..Options::default()
 	};
 	let mut new_segment = Segment::open(wal_dir, segment_id as u64, &opts)?;
@@ -402,7 +403,7 @@ mod tests {
 		segment.close().unwrap();
 
 		// Now manually corrupt the segment to reproduce the exact error
-		let segment_path = wal_dir.join("00000000000000000000");
+		let segment_path = wal_dir.join("00000000000000000000.wal");
 		let mut file =
 			std::fs::OpenOptions::new().read(true).write(true).open(&segment_path).unwrap();
 
@@ -486,7 +487,7 @@ mod tests {
 		segment.close().unwrap();
 
 		// Now manually corrupt the segment by corrupting the third batch
-		let segment_path = wal_dir.join("00000000000000000000");
+		let segment_path = wal_dir.join("00000000000000000000.wal");
 		let mut file =
 			std::fs::OpenOptions::new().read(true).write(true).open(&segment_path).unwrap();
 

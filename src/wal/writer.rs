@@ -46,6 +46,9 @@ impl Wal {
 		// Ensure the directory exists with proper permissions
 		Self::prepare_directory(dir, &opts)?;
 
+		// Clean up any stale .wal.repair files from previous crashed repair attempts
+		Self::cleanup_stale_repair_files(dir)?;
+
 		// Determine the active segment ID
 		let active_segment_id = Self::calculate_active_segment_id(dir)?;
 
@@ -86,12 +89,74 @@ impl Wal {
 	}
 
 	fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
-		let (_, last) = get_segment_range(dir, None)?;
+		let (_, last) = get_segment_range(dir, Some("wal"))?;
 		Ok(if last > 0 {
 			last + 1
 		} else {
 			0
 		})
+	}
+
+	/// Cleans up stale .wal.repair files that may have been left behind
+	/// by crashed repair processes.
+	///
+	/// These files are temporary and should have been either renamed to .wal
+	/// (on success) or deleted (on failure) during the repair process.
+	fn cleanup_stale_repair_files(dir: &Path) -> Result<()> {
+		// Check if the directory exists
+		if !dir.exists() {
+			return Ok(());
+		}
+
+		// Read all files in the WAL directory
+		let entries = match fs::read_dir(dir) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+				return Ok(());
+			}
+			Err(e) => {
+				return Err(Error::IO(IOError::new(
+					io::ErrorKind::Other,
+					&format!("Failed to read WAL directory: {}", e),
+				)));
+			}
+		};
+
+		let mut removed_count = 0;
+
+		// Find and remove all .wal.repair files
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if let Some(filename) = path.file_name() {
+				let filename_str = filename.to_string_lossy();
+
+				if filename_str.ends_with(".wal.repair") {
+					match fs::remove_file(&path) {
+						Ok(()) => {
+							removed_count += 1;
+							log::warn!(
+								"Removed stale repair file from previous crashed repair: {}",
+								filename_str
+							);
+						}
+						Err(e) => {
+							log::error!(
+								"Failed to remove stale repair file {}: {}",
+								filename_str,
+								e
+							);
+							// Don't fail the entire open operation for this
+						}
+					}
+				}
+			}
+		}
+
+		if removed_count > 0 {
+			log::info!("Cleaned up {} stale .wal.repair files", removed_count);
+		}
+
+		Ok(())
 	}
 
 	/// Appends a record to the active segment.
@@ -377,5 +442,41 @@ mod tests {
 
 		// Test closing wal
 		assert!(a.close().is_ok());
+	}
+
+	#[test]
+	fn test_cleanup_stale_repair_files() {
+		use std::fs;
+
+		let temp_dir = create_temp_directory();
+		let wal_dir = temp_dir.path();
+
+		// Create stale .wal.repair files (simulating crashed repair attempts)
+		fs::write(wal_dir.join("00000000000000000000.wal.repair"), b"stale repair 1").unwrap();
+		fs::write(wal_dir.join("00000000000000000001.wal.repair"), b"stale repair 2").unwrap();
+
+		// Verify the stale repair files exist before opening WAL
+		assert!(wal_dir.join("00000000000000000000.wal.repair").exists());
+		assert!(wal_dir.join("00000000000000000001.wal.repair").exists());
+
+		// Open WAL - this should trigger cleanup of stale .wal.repair files
+		let wal = Wal::open(wal_dir, Options::default());
+		assert!(wal.is_ok(), "WAL should open successfully after cleanup");
+
+		// Verify stale .wal.repair files were removed
+		assert!(
+			!wal_dir.join("00000000000000000000.wal.repair").exists(),
+			".wal.repair files should be cleaned up"
+		);
+		assert!(
+			!wal_dir.join("00000000000000000001.wal.repair").exists(),
+			".wal.repair files should be cleaned up"
+		);
+
+		// Verify a new WAL segment was created (since directory was empty of valid segments)
+		assert!(
+			wal_dir.join("00000000000000000000.wal").exists(),
+			"New WAL segment should be created"
+		);
 	}
 }
