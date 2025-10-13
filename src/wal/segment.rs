@@ -206,7 +206,7 @@ impl Default for Options {
 			compression_format: Some(DEFAULT_COMPRESSION_FORMAT), // default compression format
 			compression_level: Some(DEFAULT_COMPRESSION_LEVEL),   // default compression level
 			metadata: None,                                       // default metadata
-			file_extension: None,                                 // default extension
+			file_extension: Some("wal".to_string()),              // default extension
 			max_file_size: DEFAULT_FILE_SIZE,                     // default max file size (20mb)
 		}
 	}
@@ -627,25 +627,24 @@ fn copy_into_dest_from_src(dest: &mut [u8], dest_len: usize, src: &[u8], src_len
 }
 
 fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
-	let parts: Vec<&str> = name.split('.').collect();
+	// Find the first dot to split segment ID from extension
+	if let Some(dot_pos) = name.find('.') {
+		let (id_part, ext_part) = name.split_at(dot_pos);
+		let extension = ext_part.trim_start_matches('.'); // Remove the leading dot
 
-	if parts.is_empty() {
-		return Err(Error::IO(IOError::new(
-			io::ErrorKind::InvalidInput,
-			"Invalid segment name format",
-		)));
+		let index = id_part.parse::<u64>().map_err(|_| {
+			Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid segment name format"))
+		})?;
+
+		return Ok((index, Some(extension.to_string())));
 	}
 
-	let index = parts[0].parse();
-	if let Ok(index) = index {
-		if parts.len() == 1 {
-			return Ok((index, None));
-		} else if parts.len() == 2 {
-			return Ok((index, Some(parts[1].to_string())));
-		}
-	}
+	// No dot found, try to parse as just the segment ID
+	let index = name.parse::<u64>().map_err(|_| {
+		Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid segment name format"))
+	})?;
 
-	Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid segment name format")))
+	Ok((index, None))
 }
 
 pub(crate) fn segment_name(index: u64, ext: &str) -> String {
@@ -1486,6 +1485,27 @@ mod tests {
 	}
 
 	#[test]
+	fn segment_name_with_compound_extension() {
+		// Test generating names with compound extensions
+		let index = 5;
+		let name = segment_name(index, "wal.repair");
+		assert_eq!(name, "00000000000000000005.wal.repair");
+
+		// Test the actual format used during repair
+		let index = 42;
+		let name = segment_name(index, "wal.repair");
+		assert_eq!(name, "00000000000000000042.wal.repair");
+
+		// Verify roundtrip: generate name, then parse it back
+		let original_id = 123;
+		let original_ext = "wal.repair";
+		let generated_name = segment_name(original_id, original_ext);
+		let (parsed_id, parsed_ext) = parse_segment_name(&generated_name).unwrap();
+		assert_eq!(parsed_id, original_id);
+		assert_eq!(parsed_ext, Some(original_ext.to_string()));
+	}
+
+	#[test]
 	fn parse_segment_name_with_extension() {
 		let name = "00000000000000000010.log";
 		let result = parse_segment_name(name).unwrap();
@@ -1500,6 +1520,33 @@ mod tests {
 	}
 
 	#[test]
+	fn parse_segment_name_with_compound_extension() {
+		// Test that compound extensions like "wal.repair" are correctly extracted
+		let name = "00000000000000000010.wal.repair";
+		let result = parse_segment_name(name).unwrap();
+		assert_eq!(
+			result,
+			(10, Some("wal.repair".to_string())),
+			"Should extract full compound extension 'wal.repair'"
+		);
+
+		// Test with multiple dots in extension
+		let name = "00000000000000000042.backup.old.tmp";
+		let result = parse_segment_name(name).unwrap();
+		assert_eq!(
+			result,
+			(42, Some("backup.old.tmp".to_string())),
+			"Should extract full multi-dot extension"
+		);
+
+		// Test actual WAL repair file format
+		let name = "00000000000000000003.wal.repair";
+		let (id, ext) = parse_segment_name(name).unwrap();
+		assert_eq!(id, 3);
+		assert_eq!(ext, Some("wal.repair".to_string()));
+	}
+
+	#[test]
 	fn parse_segment_name_invalid_format() {
 		let name = "invalid_name";
 		let result = parse_segment_name(name);
@@ -1511,7 +1558,7 @@ mod tests {
 		let temp_dir = create_temp_directory();
 		let dir = temp_dir.path().to_path_buf();
 
-		let result = get_segment_range(&dir, None).unwrap();
+		let result = get_segment_range(&dir, Some("wal")).unwrap();
 		assert_eq!(result, (0, 0));
 	}
 
@@ -1527,6 +1574,35 @@ mod tests {
 
 		let result = get_segment_range(&dir, Some("log")).unwrap();
 		assert_eq!(result, (1, 4));
+	}
+
+	#[test]
+	fn test_get_segment_range_with_compound_extension() {
+		let temp_dir = create_temp_directory();
+		let dir = temp_dir.path().to_path_buf();
+
+		// Create files with different extensions including compound extension
+		create_segment_file(&dir, "00000000000000000001.wal");
+		create_segment_file(&dir, "00000000000000000002.wal");
+		create_segment_file(&dir, "00000000000000000003.wal.repair");
+		create_segment_file(&dir, "00000000000000000004.wal.repair");
+		create_segment_file(&dir, "00000000000000000005.wal.repair");
+		create_segment_file(&dir, "00000000000000000006.wal");
+
+		// Test filtering by .wal extension - should get segments 1, 2, 6
+		let result = get_segment_range(&dir, Some("wal")).unwrap();
+		assert_eq!(result, (1, 6), "Should find .wal files with range 1-6");
+
+		// Test filtering by .wal.repair extension - should get segments 3, 4, 5
+		let result = get_segment_range(&dir, Some("wal.repair")).unwrap();
+		assert_eq!(result, (3, 5), "Should find .wal.repair files with range 3-5");
+
+		// Also verify list_segment_ids returns correct segments
+		let wal_segments = list_segment_ids(&dir, Some("wal")).unwrap();
+		assert_eq!(wal_segments, vec![1, 2, 6], "Should list only .wal files");
+
+		let repair_segments = list_segment_ids(&dir, Some("wal.repair")).unwrap();
+		assert_eq!(repair_segments, vec![3, 4, 5], "Should list only .wal.repair files");
 	}
 
 	fn create_temp_directory() -> TempDir {
@@ -2069,7 +2145,7 @@ mod tests {
 		assert!(segment2.close().is_ok());
 		assert!(segment3.close().is_ok());
 
-		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
+		let sr = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 			.expect("should read segments");
 		assert!(sr.len() == 3);
 		assert!(sr[0].id == 4);
@@ -2402,7 +2478,7 @@ mod tests {
 		segment.close().expect("should close segment");
 
 		// Corrupt the segment's metadata by overwriting the first few bytes
-		let segment_path = temp_dir.path().join("00000000000000000000");
+		let segment_path = temp_dir.path().join("00000000000000000000.wal");
 		let corrupted_data = vec![0; 4];
 
 		// Open the file for writing before writing to it

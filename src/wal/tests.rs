@@ -43,7 +43,7 @@ fn test_cleanup_old_segments() {
 	}
 
 	// Get segment IDs and verify we have at least 5
-	let segment_ids_before = list_segment_ids(temp_dir.path(), None).unwrap();
+	let segment_ids_before = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
 	assert!(
 		segment_ids_before.len() >= 5,
 		"Expected at least 5 segments, got {}",
@@ -57,7 +57,7 @@ fn test_cleanup_old_segments() {
 	assert!(removed_count >= 4, "Expected at least 4 segments to be removed, got {removed_count}");
 
 	// Verify only the latest segment remains
-	let remaining_segment_ids = list_segment_ids(temp_dir.path(), None).unwrap();
+	let remaining_segment_ids = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
 
 	// Should have exactly 1 segment remaining
 	assert_eq!(
@@ -118,7 +118,7 @@ fn test_wal_replay_latest_segment_only() {
 	drop(wal);
 
 	// Get segment IDs and verify we have at least 3
-	let segment_ids = list_segment_ids(temp_dir.path(), None).unwrap();
+	let segment_ids = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
 	assert!(segment_ids.len() >= 3, "Expected at least 3 segments, got {}", segment_ids.len());
 
 	// Create a memtable for recovery
@@ -156,7 +156,7 @@ fn test_wal_with_zero_padding_eof_handling() {
 	segment.close().expect("should close segment");
 
 	// Now try to read from the segment using the Reader
-	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
+	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
 	let multi_reader =
@@ -212,7 +212,7 @@ fn test_empty_wal_segment() {
 	drop(segment);
 
 	// Try to read from the empty segment
-	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), None)
+	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
 	let multi_reader =
