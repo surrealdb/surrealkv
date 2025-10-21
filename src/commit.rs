@@ -298,18 +298,19 @@ impl CommitPipeline {
 	}
 
 	fn prepare(&self, batch: &mut Batch, commit_batch: Arc<CommitBatch>) -> Result<u64> {
-		let _guard = self.write_mutex.lock().unwrap();
-
-		// Assign sequence number atomically
+		// Assign sequence number atomically (no lock needed - atomic operation)
 		let count = batch.count() as u64;
 		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-		commit_batch.set_seq_num(seq_num);
 
-		// Set the starting sequence number in the batch for unified sequence number management
+		// Set sequence numbers in batch and commit batch (no lock needed - local mutations)
+		commit_batch.set_seq_num(seq_num);
 		batch.set_starting_seq_num(seq_num);
 
-		// Enqueue in pending queue (single producer operation)
-		self.pending.enqueue(commit_batch.clone());
+		// Only acquire lock for enqueue operation (single producer constraint)
+		{
+			let _guard = self.write_mutex.lock().unwrap();
+			self.pending.enqueue(commit_batch.clone());
+		}
 
 		Ok(seq_num)
 	}

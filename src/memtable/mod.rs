@@ -106,16 +106,19 @@ impl MemTable {
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
 
+		// Pre-allocate empty value Arc for delete operations to avoid repeated allocations
+		let empty_val: Value = Arc::from(vec![].into_boxed_slice());
+
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 
-			// Use the pre-encoded value directly, or create empty ValueLocation for deletes
+			// Use the pre-encoded value directly, or reuse empty value for deletes
 			let val = if let Some(encoded_value) = &entry.value {
 				Arc::from(encoded_value.clone().into_boxed_slice())
 			} else {
-				// For delete operations, no value
-				Arc::from(vec![].into_boxed_slice())
+				// For delete operations, reuse the pre-allocated empty value
+				empty_val.clone()
 			};
 
 			let entry_size = self.insert_into_memtable(&ikey, &val);

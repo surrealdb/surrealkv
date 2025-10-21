@@ -331,7 +331,7 @@ impl CommitEnv for LsmCommitEnv {
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
 		let vlog_threshold = self.core.opts.vlog_value_threshold;
-		let enable_versioning = self.core.opts.enable_versioning;
+		let is_versioning_enabled = self.core.opts.enable_versioning;
 		let has_vlog = self.core.vlog.is_some();
 
 		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -348,7 +348,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if enable_versioning {
+					if is_versioning_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -362,7 +362,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if enable_versioning {
+					if is_versioning_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -370,7 +370,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry
-					if enable_versioning {
+					if is_versioning_enabled {
 						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
 					(None, None)
@@ -397,7 +397,7 @@ impl CommitEnv for LsmCommitEnv {
 		}
 
 		// Write to versioned index if present
-		if enable_versioning {
+		if is_versioning_enabled {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write()?;
 
 			// Single pass: process each entry individually
@@ -438,8 +438,9 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Write to WAL if present
 		if let Some(ref wal) = self.core.wal {
-			let mut wal_guard = wal.write();
+			// Encode batch before acquiring lock to reduce lock hold time
 			let enc_bytes = processed_batch.encode()?;
+			let mut wal_guard = wal.write();
 			wal_guard.append(&enc_bytes)?;
 			if sync {
 				wal_guard.sync()?;

@@ -53,6 +53,7 @@ impl Batch {
 	}
 
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+		// Pre-allocate buffer with estimated size to reduce reallocations
 		let mut encoded = Vec::new();
 
 		// Write version (1 byte)
