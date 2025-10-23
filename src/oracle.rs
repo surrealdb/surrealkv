@@ -10,28 +10,21 @@ use crate::transaction::Transaction;
 use crate::util::LogicalClock;
 
 /// Entry used for tracking transaction operations in the commit queue
-/// Optimized to store only keys (as a Vec) since conflict detection only needs keys
 struct CommitEntry {
-	// Store keys as a sorted Vec for efficient conflict checking
-	// This avoids copying values and reduces memory overhead
 	keys: Arc<Vec<Bytes>>,
 }
 
 impl CommitEntry {
 	/// Returns true if self has no elements in common with other
 	fn is_disjoint_writeset(&self, other: &Arc<CommitEntry>) -> bool {
-		// Quick size checks for early exit
 		if self.keys.is_empty() || other.keys.is_empty() {
 			return true;
 		}
 
-		// Use slice iterators for efficient comparison of sorted key lists
 		let mut a = self.keys.iter();
 		let mut b = other.keys.iter();
-		// Move to the next value in each iterator
 		let mut next_a = a.next();
 		let mut next_b = b.next();
-		// Advance each iterator independently in order
 		while let (Some(ka), Some(kb)) = (next_a, next_b) {
 			match ka.cmp(kb) {
 				std::cmp::Ordering::Less => next_a = a.next(),
@@ -99,10 +92,9 @@ impl Oracle {
 	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
 		// Extract only the keys from the transaction's writeset
 		// Keys are already sorted in the BTreeMap, so we maintain sort order
-		// This avoids copying values and significantly reduces memory allocation
 		let keys: Vec<Bytes> = txn.write_set.keys().cloned().collect();
 
-		// Create commit entry with just the keys
+		// Create commit entry
 		let commit_entry = Arc::new(CommitEntry {
 			keys: Arc::new(keys),
 		});

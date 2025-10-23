@@ -438,7 +438,6 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Write to WAL if present
 		if let Some(ref wal) = self.core.wal {
-			// Encode batch before acquiring lock to reduce lock hold time
 			let enc_bytes = processed_batch.encode()?;
 			let mut wal_guard = wal.write();
 			wal_guard.append(&enc_bytes)?;

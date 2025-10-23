@@ -438,7 +438,7 @@ pub(crate) trait Iterator {
 }
 
 #[derive(Default, Clone, Copy)]
-pub(crate) struct BytewiseComparator {}
+pub struct BytewiseComparator {}
 
 impl BytewiseComparator {}
 

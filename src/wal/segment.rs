@@ -918,14 +918,12 @@ impl Segment {
 
 	fn flush_and_sync(&mut self) -> Result<()> {
 		self.flush()?;
-		self.file.sync_data()?;
+		self.file.sync_all()?;
 
 		Ok(())
 	}
 
 	// Flushes the current block to disk and syncs data.
-	// Uses sync_data instead of sync_all for better performance
-	// as metadata updates are not critical for durability.
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));

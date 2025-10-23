@@ -7,9 +7,6 @@ use crate::wal::segment::{get_segment_range, Error, IOError, Options, Result, Se
 
 /// Write-Ahead Log (Wal) is a data structure used to sequentially
 /// store records in a series of segments.
-///
-/// Note: Synchronization is handled by the outer RwLock<Wal> in CoreInner,
-/// so this struct doesn't need internal locking.
 pub(crate) struct Wal {
 	/// The currently active segment where data is being written.
 	active_segment: Segment,
@@ -185,7 +182,6 @@ impl Wal {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
 		}
 
-		// No internal lock needed - caller holds RwLock<Wal>
 		let (off, _) = self.active_segment.append(rec)?;
 
 		Ok(off)
@@ -230,7 +226,6 @@ impl Wal {
 			return Ok(());
 		}
 		self.closed = true;
-		// No internal lock needed - caller holds RwLock<Wal>
 		self.active_segment.close()?;
 		Ok(())
 	}
@@ -239,7 +234,6 @@ impl Wal {
 		if self.closed {
 			return Ok(());
 		}
-		// No internal lock needed - caller holds RwLock<Wal>
 		self.active_segment.sync()?;
 		Ok(())
 	}
@@ -247,7 +241,6 @@ impl Wal {
 	// Returns the current offset within the segment.
 	#[cfg(test)]
 	fn offset(&self) -> u64 {
-		// No internal lock needed - caller holds RwLock<Wal>
 		self.active_segment.offset()
 	}
 
@@ -264,8 +257,6 @@ impl Wal {
 	///
 	/// The ID of the newly created segment, or an error if something went wrong.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
-		// No internal lock needed - caller holds RwLock<Wal>
-
 		// Sync and close the current active segment
 		self.active_segment.close()?;
 

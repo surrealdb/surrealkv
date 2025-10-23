@@ -795,12 +795,6 @@ impl LeafNode {
 	fn find_split_point(&self, _key: &[u8], _value: &[u8], _compare: &dyn Comparator) -> usize {
 		// Simple O(1) midpoint split - works because overflow pages guarantee
 		// values can always fit with overflow support
-		//
-		// With overflow support:
-		// - Values can be arbitrarily large (use overflow pages)
-		// - No need for complex size calculations or allocations
-		// - Midpoint split is fastest and simplest
-		// - SQLite's algorithm ensures both sides fit in PAGE_SIZE
 		let total_entries = self.keys.len() + 1; // including new entry
 		let mut split_idx = total_entries / 2;
 
@@ -1649,14 +1643,6 @@ impl<F: VfsFile> BPlusTree<F> {
 		_extra_key: &[u8], // Not needed for midpoint split
 		insert_idx: usize,
 	) -> usize {
-		// Simple O(1) midpoint split - works because overflow pages guarantee
-		// both sides will fit in PAGE_SIZE (SQLite's 4-keys-per-page rule)
-		//
-		// With overflow support:
-		// - Each key uses at most 1/4 of the page (SQLite algorithm)
-		// - Insert validation ensures at least 4 keys fit per page
-		// - Therefore, midpoint split always results in 2+ keys per side
-		// - Both sides guaranteed to fit in PAGE_SIZE
 		let total_keys = node.keys.len() + 1; // including extra_key
 		let mut split_idx = total_keys / 2;
 
@@ -2700,7 +2686,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 	fn maybe_sync(&mut self) -> Result<()> {
 		match self.durability {
-			Durability::Always => self.file.sync()?,
+			Durability::Always => self.file.sync_data()?,
 			Durability::Manual => { // Don't sync - only sync on flush() or close()
 			}
 		}

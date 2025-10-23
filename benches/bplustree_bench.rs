@@ -1,38 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::Rng;
-use std::cmp::Ordering;
 use std::sync::Arc;
 use surrealkv::bplustree::tree::new_disk_tree;
-use surrealkv::Comparator;
+use surrealkv::BytewiseComparator;
 use tempfile::TempDir;
-
-// Simple lexicographic comparator for benchmarking
-#[derive(Clone)]
-struct LexicographicComparator;
-
-impl Comparator for LexicographicComparator {
-	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		a.cmp(b)
-	}
-
-	fn separator(&self, from: &[u8], _to: &[u8]) -> Vec<u8> {
-		// Simple separator implementation - just return the 'from' key
-		from.to_vec()
-	}
-
-	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		// Simple successor implementation - increment the last byte
-		let mut result = key.to_vec();
-		if let Some(last) = result.last_mut() {
-			*last = last.wrapping_add(1);
-		}
-		result
-	}
-
-	fn name(&self) -> &str {
-		"lexicographic"
-	}
-}
 
 // Generate test data
 fn generate_test_data(size: usize, key_size: usize, value_size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -59,7 +30,7 @@ fn benchmark_insert_sequential(c: &mut Criterion) {
 			b.iter(|| {
 				let temp_dir = TempDir::new().unwrap();
 				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(LexicographicComparator);
+				let comparator = Arc::new(BytewiseComparator {});
 				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 				let data = generate_test_data(size, 16, 64);
@@ -84,7 +55,7 @@ fn benchmark_insert_random(c: &mut Criterion) {
 			b.iter(|| {
 				let temp_dir = TempDir::new().unwrap();
 				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(LexicographicComparator);
+				let comparator = Arc::new(BytewiseComparator {});
 				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 				let mut data = generate_test_data(size, 16, 64);
@@ -112,7 +83,7 @@ fn benchmark_delete_sequential(c: &mut Criterion) {
 			b.iter(|| {
 				let temp_dir = TempDir::new().unwrap();
 				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(LexicographicComparator);
+				let comparator = Arc::new(BytewiseComparator {});
 				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 				// First insert data
@@ -142,7 +113,7 @@ fn benchmark_delete_random(c: &mut Criterion) {
 			b.iter(|| {
 				let temp_dir = TempDir::new().unwrap();
 				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(LexicographicComparator);
+				let comparator = Arc::new(BytewiseComparator {});
 				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 				// First insert data
@@ -183,7 +154,7 @@ fn benchmark_key_value_sizes(c: &mut Criterion) {
 				b.iter(|| {
 					let temp_dir = TempDir::new().unwrap();
 					let db_path = temp_dir.path().join("test.db");
-					let comparator = Arc::new(LexicographicComparator);
+					let comparator = Arc::new(BytewiseComparator {});
 					let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 					let data = generate_test_data(10000, key_size, value_size);
@@ -209,7 +180,7 @@ fn benchmark_get_operations(c: &mut Criterion) {
 			b.iter(|| {
 				let temp_dir = TempDir::new().unwrap();
 				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(LexicographicComparator);
+				let comparator = Arc::new(BytewiseComparator {});
 				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
 				// Insert data first
