@@ -34,7 +34,6 @@ pub enum BPlusTreeError {
 	CorruptedFreeList(u64),
 	InvalidNodeType,
 	CorruptedTrunkPage(u64),
-	KeyValueTooLarge,
 	Corruption(String),
 }
 
@@ -58,7 +57,6 @@ impl std::fmt::Display for BPlusTreeError {
 			BPlusTreeError::CorruptedTrunkPage(offset) => {
 				write!(f, "Corrupted trunk page at offset {}", offset)
 			}
-			BPlusTreeError::KeyValueTooLarge => write!(f, "Key-value pair too large"),
 			BPlusTreeError::Corruption(msg) => write!(f, "Corruption detected: {}", msg),
 		}
 	}
@@ -94,7 +92,6 @@ const TRUNK_PAGE_MAX_ENTRIES: usize =
 	(PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE - TRUNK_RESERVED_ENTRIES;
 
 // Constants for size calculation
-// const NODE_TYPE_SIZE: usize = 1; // 1 byte for node type
 const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
 const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child_count(4) = 9 bytes
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
@@ -515,12 +512,11 @@ impl Node for InternalNode {
 
 #[derive(Debug, Clone)]
 struct LeafNode {
-	keys: Vec<Vec<u8>>, // Full keys (reconstructed from page + overflow if needed)
-	key_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset
+	keys: Vec<Vec<u8>>,   // Full keys (reconstructed from page + overflow if needed)
 	values: Vec<Vec<u8>>, // Full values (reconstructed from page + overflow if needed)
-	value_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset
-	next_leaf: u64,     // 0 means no next leaf
-	prev_leaf: u64,     // 0 means no previous leaf
+	cell_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for cell (key+value)
+	next_leaf: u64,       // 0 means no next leaf
+	prev_leaf: u64,       // 0 means no previous leaf
 	offset: u64,
 }
 
@@ -528,9 +524,8 @@ impl LeafNode {
 	fn new(offset: u64) -> Self {
 		LeafNode {
 			keys: Vec::new(),
-			key_overflows: Vec::new(),
 			values: Vec::new(),
-			value_overflows: Vec::new(),
+			cell_overflows: Vec::new(),
 			next_leaf: 0,
 			prev_leaf: 0,
 			offset,
@@ -564,77 +559,27 @@ impl LeafNode {
 		let max_per_entry = calculate_max_bytes_per_entry(true);
 
 		let mut keys = Vec::with_capacity(num_keys);
-		let mut key_overflows = Vec::with_capacity(num_keys);
 		let mut values = Vec::with_capacity(num_keys);
-		let mut value_overflows = Vec::with_capacity(num_keys);
+		let mut cell_overflows = Vec::with_capacity(num_keys);
 
 		for _ in 0..num_keys {
-			// Read key with overflow support
+			// Read key length
 			if buffer_slice.len() < 4 {
 				return Err(BPlusTreeError::Deserialization("Truncated key length".into()));
 			}
-			let key_len_total = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+			let key_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
-			// Calculate bytes on page for key
-			let (key_bytes_on_page, key_needs_overflow) =
-				calculate_overflow(key_len_total, max_per_entry);
-
-			if key_bytes_on_page > buffer_slice.len() {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Calculated key bytes on page {} exceeds available buffer size {}",
-					key_bytes_on_page,
-					buffer_slice.len()
-				)));
-			}
-
-			// Read key data from page
-			let mut key_data = buffer_slice[..key_bytes_on_page].to_vec();
-			buffer_slice = &buffer_slice[key_bytes_on_page..];
-
-			// Check if key has overflow
-			let key_overflow_offset = if key_needs_overflow {
-				// Read overflow page offset
-				if buffer_slice.len() < 8 {
-					return Err(BPlusTreeError::Deserialization(
-						"Buffer too small for key overflow pointer".into(),
-					));
-				}
-				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-				buffer_slice = &buffer_slice[8..];
-
-				// Read overflow data and append to key
-				let overflow_data = read_overflow(overflow)?;
-				key_data.extend_from_slice(&overflow_data);
-
-				overflow
-			} else {
-				0
-			};
-
-			// Validate reconstructed key size
-			if key_data.len() != key_len_total {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Reconstructed key size {} doesn't match expected {}",
-					key_data.len(),
-					key_len_total
-				)));
-			}
-
-			keys.push(key_data);
-			key_overflows.push(key_overflow_offset);
-
-			// Read total value length
+			// Read value length
 			if buffer_slice.len() < 4 {
 				return Err(BPlusTreeError::Deserialization("Truncated value length".into()));
 			}
-			let value_len_total =
-				u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+			let value_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
-			// Calculate bytes on page using simple overflow algorithm
-			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(value_len_total, max_per_entry);
+			// Calculate combined payload size and overflow
+			let payload_len = key_len + value_len;
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
 			if bytes_on_page > buffer_slice.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
@@ -644,8 +589,8 @@ impl LeafNode {
 				)));
 			}
 
-			// Read value data from page
-			let mut value_data = buffer_slice[..bytes_on_page].to_vec();
+			// Read cell payload from page (combined key+value)
+			let mut cell_data = buffer_slice[..bytes_on_page].to_vec();
 			buffer_slice = &buffer_slice[bytes_on_page..];
 
 			// Check if there's overflow
@@ -653,39 +598,50 @@ impl LeafNode {
 				// Read overflow page offset
 				if buffer_slice.len() < 8 {
 					return Err(BPlusTreeError::Deserialization(
-						"Buffer too small for overflow pointer".into(),
+						"Buffer too small for cell overflow pointer".into(),
 					));
 				}
 				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
 				buffer_slice = &buffer_slice[8..];
 
-				// Read overflow data and append to value
+				// Read overflow data and append to cell
 				let overflow_data = read_overflow(overflow)?;
-				value_data.extend_from_slice(&overflow_data);
+				cell_data.extend_from_slice(&overflow_data);
 
 				overflow
 			} else {
 				0
 			};
 
-			// Validate reconstructed value size
-			if value_data.len() != value_len_total {
+			// Validate reconstructed cell size
+			if cell_data.len() != payload_len {
 				return Err(BPlusTreeError::Deserialization(format!(
-					"Reconstructed value size {} doesn't match expected {}",
-					value_data.len(),
-					value_len_total
+					"Reconstructed cell size {} doesn't match expected {}",
+					cell_data.len(),
+					payload_len
 				)));
 			}
 
+			// Split cell_data into key and value
+			if cell_data.len() < key_len {
+				return Err(BPlusTreeError::Deserialization(format!(
+					"Cell data too small {} for key length {}",
+					cell_data.len(),
+					key_len
+				)));
+			}
+			let key_data = cell_data[..key_len].to_vec();
+			let value_data = cell_data[key_len..].to_vec();
+
+			keys.push(key_data);
 			values.push(value_data);
-			value_overflows.push(overflow_offset);
+			cell_overflows.push(overflow_offset);
 		}
 
 		Ok(LeafNode {
 			keys,
-			key_overflows,
 			values,
-			value_overflows,
+			cell_overflows,
 			next_leaf,
 			prev_leaf,
 			offset,
@@ -704,16 +660,15 @@ impl LeafNode {
 		if idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Equal {
 			// Key exists, update the value
 			self.values[idx] = value.to_vec();
-			// Reset overflow for this value (will be recalculated on write)
-			if idx < self.value_overflows.len() {
-				self.value_overflows[idx] = 0;
+			// Reset overflow for this cell (will be recalculated on write)
+			if idx < self.cell_overflows.len() {
+				self.cell_overflows[idx] = 0;
 			}
 		} else {
 			// Key doesn't exist, insert new entry
 			self.keys.insert(idx, key.to_vec());
-			self.key_overflows.insert(idx, 0); // New key, no overflow yet
 			self.values.insert(idx, value.to_vec());
-			self.value_overflows.insert(idx, 0); // New value, no overflow yet
+			self.cell_overflows.insert(idx, 0); // New cell, no overflow yet
 		}
 		idx
 	}
@@ -723,12 +678,9 @@ impl LeafNode {
 		let idx = self.keys.iter().position(|k| compare.compare(key, k) == Ordering::Equal)?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
-		// Remove overflow entries as well
-		if idx < self.key_overflows.len() {
-			self.key_overflows.remove(idx);
-		}
-		if idx < self.value_overflows.len() {
-			self.value_overflows.remove(idx);
+		// Remove overflow entry as well
+		if idx < self.cell_overflows.len() {
+			self.cell_overflows.remove(idx);
 		}
 		Some((idx, value))
 	}
@@ -807,22 +759,17 @@ impl LeafNode {
 	// Check if this leaf can fit another key-value pair
 	fn can_fit_entry(&self, key: &[u8], value: &[u8]) -> bool {
 		let max_per_entry = calculate_max_bytes_per_entry(true);
-		let (key_on_page, key_overflow) = calculate_overflow(key.len(), max_per_entry);
-		let (val_on_page, val_overflow) = calculate_overflow(value.len(), max_per_entry);
+		let payload_len = key.len() + value.len();
+		let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
 		let entry_size = KEY_SIZE_PREFIX
-			+ key_on_page
 			+ VALUE_SIZE_PREFIX
-			+ val_on_page
-			+ (if key_overflow {
+			+ bytes_on_page
+			+ (if needs_overflow {
 				8
 			} else {
 				0
-			}) + (if val_overflow {
-			8
-		} else {
-			0
-		});
+			});
 
 		self.current_size() + entry_size <= PAGE_SIZE
 	}
@@ -854,46 +801,33 @@ impl Node for LeafNode {
 		// Calculate max bytes per entry for overflow
 		let max_per_entry = calculate_max_bytes_per_entry(true);
 
-		// 5. Serialize keys and values with overflow support
+		// 5. Serialize cells (key+value pairs) with unified overflow support
 		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
-			// Key serialization with overflow support
-			let key_len_total = key.len();
-			let (key_bytes_on_page, key_needs_overflow) =
-				calculate_overflow(key_len_total, max_per_entry);
+			let key_len = key.len();
+			let value_len = value.len();
+			let payload_len = key_len + value_len;
 
-			// Write total key length
-			buffer.extend_from_slice(&(key_len_total as u32).to_le_bytes());
+			// Write key and value lengths
+			buffer.extend_from_slice(&(key_len as u32).to_le_bytes());
+			buffer.extend_from_slice(&(value_len as u32).to_le_bytes());
 
-			// Write key data that fits on page
-			buffer.extend_from_slice(&key[..key_bytes_on_page]);
+			// Calculate overflow for combined payload
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
-			// Write key overflow page offset if needed
-			if key_needs_overflow {
-				let overflow_offset = if i < self.key_overflows.len() {
-					self.key_overflows[i]
+			// Create combined cell data
+			let mut cell_data = Vec::with_capacity(payload_len);
+			cell_data.extend_from_slice(key);
+			cell_data.extend_from_slice(value);
+
+			// Write cell data that fits on page
+			buffer.extend_from_slice(&cell_data[..bytes_on_page]);
+
+			// Write cell overflow page offset if needed
+			if needs_overflow {
+				let overflow_offset = if i < self.cell_overflows.len() {
+					self.cell_overflows[i]
 				} else {
 					0
-				};
-				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
-			}
-
-			// Value serialization with overflow support
-			let value_len_total = value.len();
-			let (value_bytes_on_page, value_needs_overflow) =
-				calculate_overflow(value_len_total, max_per_entry);
-
-			// Write total value length
-			buffer.extend_from_slice(&(value_len_total as u32).to_le_bytes());
-
-			// Write value data that fits on page
-			buffer.extend_from_slice(&value[..value_bytes_on_page]);
-
-			// Write value overflow page offset if needed
-			if value_needs_overflow {
-				let overflow_offset = if i < self.value_overflows.len() {
-					self.value_overflows[i]
-				} else {
-					0 // Should not happen if properly initialized
 				};
 				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
 			}
@@ -922,23 +856,18 @@ impl Node for LeafNode {
 		// Calculate max bytes per entry for overflow
 		let max_per_entry = calculate_max_bytes_per_entry(true);
 
-		// Size for all keys and values accounting for overflow
-		// We need to calculate what's actually stored on the page, not total payload
+		// Size for all cells accounting for unified overflow
 		for (key, value) in self.keys.iter().zip(&self.values) {
-			// Key size on page
-			let (key_bytes_on_page, key_needs_overflow) =
-				calculate_overflow(key.len(), max_per_entry);
-			size += KEY_SIZE_PREFIX + key_bytes_on_page;
-			if key_needs_overflow {
-				size += 8; // overflow pointer
-			}
+			let payload_len = key.len() + value.len();
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
-			// Value size on page
-			let (value_bytes_on_page, value_needs_overflow) =
-				calculate_overflow(value.len(), max_per_entry);
-			size += VALUE_SIZE_PREFIX + value_bytes_on_page;
-			if value_needs_overflow {
-				size += 8; // overflow pointer
+			// Key and value length prefixes
+			size += KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX;
+			// Cell payload on page
+			size += bytes_on_page;
+			// Overflow pointer if needed
+			if needs_overflow {
+				size += 8;
 			}
 		}
 
@@ -1508,23 +1437,21 @@ impl<F: VfsFile> BPlusTree<F> {
 			// New entry belongs in the left node
 			// Move entries after split_idx to new leaf
 			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.key_overflows = leaf.key_overflows.drain(split_idx..).collect();
 			new_leaf.values = leaf.values.drain(split_idx..).collect();
-			new_leaf.value_overflows = leaf.value_overflows.drain(split_idx..).collect();
+			new_leaf.cell_overflows = leaf.cell_overflows.drain(split_idx..).collect();
 
 			if is_duplicate {
 				// Update existing key-value in left node
 				leaf.values[idx] = value.to_vec();
-				// Reset overflow for updated value
-				if idx < leaf.value_overflows.len() {
-					leaf.value_overflows[idx] = 0;
+				// Reset overflow for updated cell
+				if idx < leaf.cell_overflows.len() {
+					leaf.cell_overflows[idx] = 0;
 				}
 			} else {
 				// Insert the new key-value into leaf
 				leaf.keys.insert(idx, key.to_vec());
-				leaf.key_overflows.insert(idx, 0);
 				leaf.values.insert(idx, value.to_vec());
-				leaf.value_overflows.insert(idx, 0);
+				leaf.cell_overflows.insert(idx, 0);
 			}
 		} else {
 			// New entry belongs in the right node
@@ -1533,23 +1460,21 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			// Move entries after split_idx to new leaf
 			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.key_overflows = leaf.key_overflows.drain(split_idx..).collect();
 			new_leaf.values = leaf.values.drain(split_idx..).collect();
-			new_leaf.value_overflows = leaf.value_overflows.drain(split_idx..).collect();
+			new_leaf.cell_overflows = leaf.cell_overflows.drain(split_idx..).collect();
 
 			if is_duplicate {
 				// Update existing key-value in right node
 				new_leaf.values[right_idx] = value.to_vec();
-				// Reset overflow for updated value
-				if right_idx < new_leaf.value_overflows.len() {
-					new_leaf.value_overflows[right_idx] = 0;
+				// Reset overflow for updated cell
+				if right_idx < new_leaf.cell_overflows.len() {
+					new_leaf.cell_overflows[right_idx] = 0;
 				}
 			} else {
 				// Insert the new key-value into new leaf
 				new_leaf.keys.insert(right_idx, key.to_vec());
-				new_leaf.key_overflows.insert(right_idx, 0);
 				new_leaf.values.insert(right_idx, value.to_vec());
-				new_leaf.value_overflows.insert(right_idx, 0);
+				new_leaf.cell_overflows.insert(right_idx, 0);
 			}
 		}
 
@@ -2388,14 +2313,8 @@ impl<F: VfsFile> BPlusTree<F> {
 				}
 			}
 			NodeType::Leaf(leaf) => {
-				// Free all key overflow chains
-				for &overflow_offset in &leaf.key_overflows {
-					if overflow_offset != 0 {
-						self.free_overflow_chain(overflow_offset)?;
-					}
-				}
-				// Free all value overflow chains
-				for &overflow_offset in &leaf.value_overflows {
+				// Free all cell overflow chains
+				for &overflow_offset in &leaf.cell_overflows {
 					if overflow_offset != 0 {
 						self.free_overflow_chain(overflow_offset)?;
 					}
@@ -2573,58 +2492,39 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	/// Prepare leaf node for writing by creating overflow pages for large keys/values
+	/// Prepare leaf node for writing by creating overflow pages for large cells (key+value)
 	fn prepare_leaf_node_overflow(&mut self, node: &mut LeafNode) -> Result<()> {
 		// Calculate max bytes per entry
 		let max_per_entry = calculate_max_bytes_per_entry(true);
 
-		// Ensure overflow vecs are properly sized
-		while node.key_overflows.len() < node.keys.len() {
-			node.key_overflows.push(0);
-		}
-		while node.value_overflows.len() < node.values.len() {
-			node.value_overflows.push(0);
+		// Ensure overflow vec is properly sized
+		while node.cell_overflows.len() < node.keys.len() {
+			node.cell_overflows.push(0);
 		}
 
-		// Check each key to see if it needs overflow
-		for (i, key) in node.keys.iter().enumerate() {
-			let (bytes_on_page, needs_overflow) = calculate_overflow(key.len(), max_per_entry);
+		// Check each cell (key+value pair) to see if it needs overflow
+		for (i, (key, value)) in node.keys.iter().zip(&node.values).enumerate() {
+			let payload_len = key.len() + value.len();
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
 			if needs_overflow {
-				// Key needs overflow
-				let overflow_data = &key[bytes_on_page..];
-				let existing_overflow = node.key_overflows[i];
+				// Cell needs overflow - combine key+value and store remainder
+				let mut cell_data = Vec::with_capacity(payload_len);
+				cell_data.extend_from_slice(key);
+				cell_data.extend_from_slice(value);
+
+				let overflow_data = &cell_data[bytes_on_page..];
+				let existing_overflow = node.cell_overflows[i];
 
 				// Only create overflow if it doesn't exist
 				if existing_overflow == 0 {
 					let overflow_offset = self.write_overflow_chain(overflow_data)?;
-					node.key_overflows[i] = overflow_offset;
+					node.cell_overflows[i] = overflow_offset;
 				}
-			} else if node.key_overflows[i] != 0 {
-				// Key no longer needs overflow, free old chain
-				self.free_overflow_chain(node.key_overflows[i])?;
-				node.key_overflows[i] = 0;
-			}
-		}
-
-		// Check each value to see if it needs overflow
-		for (i, value) in node.values.iter().enumerate() {
-			let (bytes_on_page, needs_overflow) = calculate_overflow(value.len(), max_per_entry);
-
-			if needs_overflow {
-				// Value needs overflow
-				let overflow_data = &value[bytes_on_page..];
-				let existing_overflow = node.value_overflows[i];
-
-				// Only create overflow if it doesn't exist
-				if existing_overflow == 0 {
-					let overflow_offset = self.write_overflow_chain(overflow_data)?;
-					node.value_overflows[i] = overflow_offset;
-				}
-			} else if node.value_overflows[i] != 0 {
-				// Value no longer needs overflow, free old chain
-				self.free_overflow_chain(node.value_overflows[i])?;
-				node.value_overflows[i] = 0;
+			} else if node.cell_overflows[i] != 0 {
+				// Cell no longer needs overflow, free old chain
+				self.free_overflow_chain(node.cell_overflows[i])?;
+				node.cell_overflows[i] = 0;
 			}
 		}
 
