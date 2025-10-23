@@ -1,5 +1,5 @@
 mod batch;
-mod bplustree;
+pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod commit;
