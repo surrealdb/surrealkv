@@ -1420,7 +1420,7 @@ impl<F: VfsFile> BPlusTree<F> {
 					// Check if adding this entry would put us close to the maximum size
 					let entry_size = KEY_SIZE_PREFIX + promoted_key.len() + CHILD_PTR_SIZE;
 					let would_be_size = parent.current_size() + entry_size;
-					let size_threshold = InternalNode::max_size() - 256; // Leave buffer
+					let size_threshold = InternalNode::max_size();
 
 					if would_be_size <= size_threshold {
 						// Parent has enough space with buffer, insert the new key and child
