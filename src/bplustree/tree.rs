@@ -494,7 +494,19 @@ impl Node for InternalNode {
 			0 // Edge case: both nodes have no keys
 		};
 
-		let with_separator = actual_merged_size + KEY_SIZE_PREFIX + max_key_size;
+		// Calculate separator size accounting for overflow
+		let max_per_entry = calculate_max_bytes_per_entry(false);
+		let (separator_on_page, separator_overflow) =
+			calculate_overflow(max_key_size, max_per_entry);
+		let separator_size = KEY_SIZE_PREFIX
+			+ separator_on_page
+			+ (if separator_overflow {
+				8
+			} else {
+				0
+			});
+
+		let with_separator = actual_merged_size + separator_size;
 
 		// Check if the combined size is within the maximum
 		with_separator <= Self::max_size()
@@ -1418,7 +1430,17 @@ impl<F: VfsFile> BPlusTree<F> {
 					};
 
 					// Check if adding this entry would put us close to the maximum size
-					let entry_size = KEY_SIZE_PREFIX + promoted_key.len() + CHILD_PTR_SIZE;
+					// Use overflow-aware calculation for promoted key
+					let max_per_entry = calculate_max_bytes_per_entry(false);
+					let (key_on_page, key_overflow) =
+						calculate_overflow(promoted_key.len(), max_per_entry);
+					let entry_size = KEY_SIZE_PREFIX
+						+ key_on_page + CHILD_PTR_SIZE
+						+ (if key_overflow {
+							8
+						} else {
+							0
+						});
 					let would_be_size = parent.current_size() + entry_size;
 					let size_threshold = InternalNode::max_size();
 
@@ -1919,12 +1941,32 @@ impl<F: VfsFile> BPlusTree<F> {
 			_ => return Err(BPlusTreeError::InvalidNodeType),
 		};
 
+		// Calculate size of last entry in left node (accounting for overflow)
+		let last_entry_size = if !left_node.keys.is_empty() {
+			let max_per_entry = calculate_max_bytes_per_entry(false);
+			let key_len = left_node.keys.last().unwrap().len();
+			let (key_on_page, key_overflow) = calculate_overflow(key_len, max_per_entry);
+
+			KEY_SIZE_PREFIX
+				+ key_on_page
+				+ CHILD_PTR_SIZE
+				+ (if key_overflow {
+					8
+				} else {
+					0
+				})
+		} else {
+			return Err(BPlusTreeError::Serialization(
+				"Left internal node is unexpectedly empty during redistribution".into(),
+			));
+		};
+
 		// Only redistribute if it would improve balance
 		if Self::should_redistribute_nodes(
 			&left_node,
 			&right_node,
 			left_node.keys.len() - 1,
-			KEY_SIZE_PREFIX + left_node.keys.last().unwrap().len() + CHILD_PTR_SIZE,
+			last_entry_size,
 		) {
 			// Get the current parent key
 			let parent_key = parent.keys[left_idx].clone();
@@ -1961,9 +2003,20 @@ impl<F: VfsFile> BPlusTree<F> {
 			_ => return Err(BPlusTreeError::InvalidNodeType),
 		};
 
-		// Calculate size of first entry in right node
+		// Calculate size of first entry in right node (accounting for overflow)
 		let first_entry_size = if !right_node.keys.is_empty() {
-			KEY_SIZE_PREFIX + right_node.keys[0].len() + CHILD_PTR_SIZE
+			let max_per_entry = calculate_max_bytes_per_entry(false);
+			let key_len = right_node.keys[0].len();
+			let (key_on_page, key_overflow) = calculate_overflow(key_len, max_per_entry);
+
+			KEY_SIZE_PREFIX
+				+ key_on_page
+				+ CHILD_PTR_SIZE
+				+ (if key_overflow {
+					8
+				} else {
+					0
+				})
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Right internal node is unexpectedly empty during redistribution".into(),
@@ -2009,18 +2062,33 @@ impl<F: VfsFile> BPlusTree<F> {
 			_ => return Err(BPlusTreeError::InvalidNodeType),
 		};
 
-		// Get size of last entry in left node
+		// Get size of last entry in left node (accounting for overflow)
 		let last_idx = left_node.keys.len() - 1;
-		let last_entry_size = if last_idx < left_node.keys.len() {
-			KEY_SIZE_PREFIX
-				+ left_node.keys[last_idx].len()
-				+ VALUE_SIZE_PREFIX
-				+ left_node.values[last_idx].len()
-		} else {
-			return Err(BPlusTreeError::Serialization(
-				"Left node is unexpectedly empty during redistribution".into(),
-			));
-		};
+		let last_entry_size =
+			if last_idx < left_node.keys.len() {
+				let max_per_entry = calculate_max_bytes_per_entry(true);
+				let key_len = left_node.keys[last_idx].len();
+				let value_len = left_node.values[last_idx].len();
+
+				let (key_on_page, key_overflow) = calculate_overflow(key_len, max_per_entry);
+				let (val_on_page, val_overflow) = calculate_overflow(value_len, max_per_entry);
+
+				KEY_SIZE_PREFIX
+					+ key_on_page + VALUE_SIZE_PREFIX
+					+ val_on_page + (if key_overflow {
+					8
+				} else {
+					0
+				}) + (if val_overflow {
+					8
+				} else {
+					0
+				})
+			} else {
+				return Err(BPlusTreeError::Serialization(
+					"Left node is unexpectedly empty during redistribution".into(),
+				));
+			};
 
 		// Only redistribute if it would improve balance
 		if Self::should_redistribute_nodes(&left_node, &right_node, last_idx, last_entry_size) {
@@ -2058,17 +2126,32 @@ impl<F: VfsFile> BPlusTree<F> {
 			_ => return Err(BPlusTreeError::InvalidNodeType),
 		};
 
-		// Get size of first entry in right node
-		let first_entry_size = if !right_node.keys.is_empty() {
-			KEY_SIZE_PREFIX
-				+ right_node.keys[0].len()
-				+ VALUE_SIZE_PREFIX
-				+ right_node.values[0].len()
-		} else {
-			return Err(BPlusTreeError::Serialization(
-				"Right node is unexpectedly empty during redistribution".into(),
-			));
-		};
+		// Get size of first entry in right node (accounting for overflow)
+		let first_entry_size =
+			if !right_node.keys.is_empty() {
+				let max_per_entry = calculate_max_bytes_per_entry(true);
+				let key_len = right_node.keys[0].len();
+				let value_len = right_node.values[0].len();
+
+				let (key_on_page, key_overflow) = calculate_overflow(key_len, max_per_entry);
+				let (val_on_page, val_overflow) = calculate_overflow(value_len, max_per_entry);
+
+				KEY_SIZE_PREFIX
+					+ key_on_page + VALUE_SIZE_PREFIX
+					+ val_on_page + (if key_overflow {
+					8
+				} else {
+					0
+				}) + (if val_overflow {
+					8
+				} else {
+					0
+				})
+			} else {
+				return Err(BPlusTreeError::Serialization(
+					"Right node is unexpectedly empty during redistribution".into(),
+				));
+			};
 
 		// Only redistribute if it would improve balance
 		if Self::should_redistribute_nodes(&left_node, &right_node, 0, first_entry_size) {
@@ -2104,14 +2187,25 @@ impl<F: VfsFile> BPlusTree<F> {
 		let before_total_diff = before_left_diff + before_right_diff;
 
 		// Calculate balance metrics after potential redistribution
+		// Guard against underflow
 		let after_left_size = if entry_idx == 0 {
 			left_size + entry_size // Adding from right
 		} else {
-			left_size - entry_size // Taking from left
+			// Taking from left - check for underflow
+			if entry_size > left_size {
+				// Can't redistribute if entry is larger than entire left node
+				return false;
+			}
+			left_size - entry_size
 		};
 
 		let after_right_size = if entry_idx == 0 {
-			right_size - entry_size // Taking from right
+			// Taking from right - check for underflow
+			if entry_size > right_size {
+				// Can't redistribute if entry is larger than entire right node
+				return false;
+			}
+			right_size - entry_size
 		} else {
 			right_size + entry_size // Adding from left
 		};
@@ -4112,8 +4206,7 @@ mod tests {
 	#[test]
 	fn test_insert_with_multiple_key_sizes() {
 		// Define various sizes for testing
-		// let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
 		// Fixed value size
 		let value_size = 128;
@@ -4160,8 +4253,7 @@ mod tests {
 	#[test]
 	fn test_delete_with_multiple_key_sizes() {
 		// Define various sizes for testing
-		// let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
 		// Fixed value size
 		let value_size = 128;
