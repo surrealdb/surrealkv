@@ -739,7 +739,7 @@ impl LeafNode {
 		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
 		// Works because overflow pages guarantee
 		// values can always fit with overflow support
-		(self.keys.len() + 1) / 2
+		self.keys.len().div_ceil(2)
 	}
 
 	// Check if this leaf can fit another key-value pair
@@ -1141,7 +1141,7 @@ pub struct BPlusTree<F: VfsFile> {
 
 impl<F: VfsFile> Drop for BPlusTree<F> {
 	fn drop(&mut self) {
-		if let Err(e) = self.flush() {
+		if let Err(e) = self.close() {
 			log::error!("Error during BPlusTree drop: {}", e);
 		}
 	}
@@ -1216,7 +1216,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Create initial root node
 			let root = LeafNode::new(tree.header.root_offset);
 			tree.write_node(&NodeType::Leaf(root))?;
-			tree.file.sync()?;
+			tree.file.sync_data()?;
 		} else {
 			// Read root node into cache
 			tree.read_node(tree.header.root_offset)?;
@@ -1558,7 +1558,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		_extra_key: &[u8], // Not needed for midpoint split
 		insert_idx: usize,
 	) -> usize {
-		debug_assert!(node.keys.len() >= 1, "Internal node must have at least 1 key to split");
+		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
 
 		let total_keys = node.keys.len() + 1; // including extra_key
 		let split_idx = total_keys / 2;
