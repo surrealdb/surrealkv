@@ -1142,9 +1142,8 @@ fn calculate_overflow(payload_size: usize, max_per_entry: usize) -> (usize, bool
 		(payload_size, false)
 	} else {
 		// Keep half or max_per_entry, whichever is smaller
-		// Ensures we store meaningful data on page while supporting overflow
 		let bytes_on_page = (payload_size / 2).min(max_per_entry);
-		(bytes_on_page.max(256).min(max_per_entry), true)
+		(bytes_on_page, true)
 	}
 }
 
