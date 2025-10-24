@@ -682,20 +682,7 @@ impl LeafNode {
 
 	// Find a key's position in the leaf
 	fn find_key(&self, key: &[u8], compare: &dyn Comparator) -> Option<usize> {
-		// Binary search to find exact match
-		let mut low = 0;
-		let mut high = self.keys.len();
-
-		while low < high {
-			let mid = low + (high - low) / 2;
-			match compare.compare(key, &self.keys[mid]) {
-				Ordering::Less => high = mid,
-				Ordering::Equal => return Some(mid),
-				Ordering::Greater => low = mid + 1,
-			}
-		}
-
-		None
+		self.keys.binary_search_by(|k| compare.compare(k, key)).ok()
 	}
 
 	// Redistributes keys from this leaf to the target leaf
@@ -1586,29 +1573,28 @@ impl<F: VfsFile> BPlusTree<F> {
 
 	#[allow(unused)]
 	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		self.get_internal(self.header.root_offset, key)
-	}
+		let mut current_offset = self.header.root_offset;
 
-	fn get_internal(&self, node_offset: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		match self.read_node(node_offset)? {
-			NodeType::Internal(internal) => {
-				// Find appropriate child
-				let child_idx = internal.find_child_index(key, self.compare.as_ref());
+		loop {
+			let node = self.read_node(current_offset)?;
 
-				// Search in the appropriate child
-				self.get_internal(internal.children[child_idx], key)
-			}
-			NodeType::Leaf(leaf) => {
-				// Search for the key in the leaf
-				match leaf.find_key(key, self.compare.as_ref()) {
-					Some(idx) => Ok(Some(leaf.values[idx].clone())),
-					None => Ok(None),
+			match node {
+				NodeType::Internal(internal) => {
+					let child_idx = internal.find_child_index(key, self.compare.as_ref());
+					current_offset = internal.children[child_idx];
+				}
+				NodeType::Leaf(leaf) => {
+					return Ok(leaf
+						.find_key(key, self.compare.as_ref())
+						.map(|idx| leaf.values[idx].clone()));
+				}
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::Corruption(format!(
+						"Unexpected overflow page in tree traversal at offset {}",
+						current_offset
+					)));
 				}
 			}
-			NodeType::Overflow(_) => Err(BPlusTreeError::Corruption(format!(
-				"Unexpected overflow page in tree traversal at offset {}",
-				node_offset
-			))),
 		}
 	}
 
