@@ -78,7 +78,7 @@ const VERSION: u32 = 1;
 const MAGIC: [u8; 8] = *b"BPTREE01";
 
 // Page constants
-const CACHE_CAPACITY: u64 = 256 * 1024 * 1024; // 256 MiB
+pub const DEFAULT_CACHE_CAPACITY: u64 = 256 * 1024 * 1024; // 256 MiB
 const NODE_TYPE_INTERNAL: u8 = 0;
 const NODE_TYPE_LEAF: u8 = 1;
 const NODE_TYPE_OVERFLOW: u8 = 3;
@@ -87,9 +87,7 @@ const NODE_TYPE_OVERFLOW: u8 = 3;
 const TRUNK_PAGE_TYPE: u8 = 2; // Node type for trunk pages
 const TRUNK_PAGE_HEADER_SIZE: usize = 13; // 1 byte type + 8 bytes next + 4 bytes count
 const TRUNK_PAGE_ENTRY_SIZE: usize = 4; // 4-byte entries
-const TRUNK_RESERVED_ENTRIES: usize = 6; // Reserve last 6 entries
-const TRUNK_PAGE_MAX_ENTRIES: usize =
-	(PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE - TRUNK_RESERVED_ENTRIES;
+const TRUNK_PAGE_MAX_ENTRIES: usize = (PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE;
 
 // Constants for size calculation
 const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
@@ -386,7 +384,7 @@ impl InternalNode {
 	fn is_underflow(&self) -> bool {
 		// Consider a node to be in underflow if it has less than 30% capacity utilized
 		// This is based on my reading from sqllite implementation
-		self.current_size() < Self::max_size() * 30 / 100
+		self.current_size() * 100 < Self::max_size() * 30
 	}
 }
 
@@ -743,17 +741,11 @@ impl LeafNode {
 		self.next_leaf = right.next_leaf;
 	}
 
-	// Find optimal split point - simple midpoint with overflow support
 	fn find_split_point(&self, _key: &[u8], _value: &[u8], _compare: &dyn Comparator) -> usize {
-		// Simple O(1) midpoint split - works because overflow pages guarantee
+		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
+		// Works because overflow pages guarantee
 		// values can always fit with overflow support
-		let total_entries = self.keys.len() + 1; // including new entry
-		let mut split_idx = total_entries / 2;
-
-		// Clamp to valid range
-		split_idx = split_idx.clamp(1, total_entries - 1);
-
-		split_idx
+		(self.keys.len() + 1) / 2
 	}
 
 	// Check if this leaf can fit another key-value pair
@@ -778,7 +770,7 @@ impl LeafNode {
 	fn is_underflow(&self) -> bool {
 		// Consider a node to be in underflow if it has less than 30% capacity utilized
 		// This is based on my reading from sqllite implementation
-		self.current_size() < Self::max_size() * 30 / 100
+		self.current_size() * 100 < Self::max_size() * 30
 	}
 }
 
@@ -1109,8 +1101,6 @@ pub enum Durability {
 	Manual,
 }
 
-// Simple overflow for sequential B+ tree storage
-
 /// Calculate maximum bytes per entry to ensure minimum entries per page
 fn calculate_max_bytes_per_entry(is_leaf: bool) -> usize {
 	let min_entries = if is_leaf {
@@ -1127,7 +1117,7 @@ fn calculate_max_bytes_per_entry(is_leaf: bool) -> usize {
 
 	// Reserve space for: entry metadata (length fields) + overflow pointers
 	let metadata_per_entry = if is_leaf {
-		KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + 16 // +16 for potential overflow ptrs (key+value)
+		KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + 8 // +8 for potential cell overflow ptr
 	} else {
 		KEY_SIZE_PREFIX + CHILD_PTR_SIZE + 8 // +8 for overflow ptr
 	};
@@ -1191,7 +1181,11 @@ impl<F: VfsFile> BPlusTree<F> {
 			};
 
 			// Create cache
-			let cache = Cache::with_weighter(CACHE_CAPACITY as usize, CACHE_CAPACITY, NodeWeighter);
+			let cache = Cache::with_weighter(
+				DEFAULT_CACHE_CAPACITY as usize,
+				DEFAULT_CACHE_CAPACITY,
+				NodeWeighter,
+			);
 
 			(header, cache)
 		} else {
@@ -1200,7 +1194,11 @@ impl<F: VfsFile> BPlusTree<F> {
 			file.read_at(0, &mut buffer)?;
 			let header = Header::deserialize(&buffer)?;
 
-			let cache = Cache::with_weighter(CACHE_CAPACITY as usize, CACHE_CAPACITY, NodeWeighter);
+			let cache = Cache::with_weighter(
+				DEFAULT_CACHE_CAPACITY as usize,
+				DEFAULT_CACHE_CAPACITY,
+				NodeWeighter,
+			);
 
 			(header, cache)
 		};
@@ -1567,11 +1565,10 @@ impl<F: VfsFile> BPlusTree<F> {
 		_extra_key: &[u8], // Not needed for midpoint split
 		insert_idx: usize,
 	) -> usize {
-		let total_keys = node.keys.len() + 1; // including extra_key
-		let mut split_idx = total_keys / 2;
+		debug_assert!(node.keys.len() >= 1, "Internal node must have at least 1 key to split");
 
-		// Clamp to valid range
-		split_idx = split_idx.clamp(1, node.keys.len() - 1);
+		let total_keys = node.keys.len() + 1; // including extra_key
+		let split_idx = total_keys / 2;
 
 		// Adjust for virtual key space (accounting for extra_key insertion)
 		if split_idx > insert_idx {
