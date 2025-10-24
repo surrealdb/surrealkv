@@ -2770,6 +2770,7 @@ pub struct RangeScanIterator<'a, F: VfsFile> {
 	current_leaf: Option<LeafNode>,
 	end_key: Vec<u8>,
 	current_idx: usize,
+	current_end_idx: usize, // Pre-calculated end position in current leaf
 	reached_end: bool,
 }
 
@@ -2782,13 +2783,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		let leaf = loop {
 			match tree.read_node(node_offset)? {
 				NodeType::Internal(internal) => {
-					// Find the child that would contain the key
-					let mut idx = 0;
-					while idx < internal.keys.len()
-						&& tree.compare.compare(start_key, &internal.keys[idx]) >= Ordering::Equal
-					{
-						idx += 1;
-					}
+					let idx = internal.find_child_index(start_key, tree.compare.as_ref());
 					node_offset = internal.children[idx];
 				}
 				NodeType::Leaf(leaf) => {
@@ -2807,11 +2802,16 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		let current_idx =
 			leaf.keys.partition_point(|k| tree.compare.compare(k, start_key) == Ordering::Less);
 
+		// Pre-calculate end index in this leaf
+		let current_end_idx =
+			leaf.keys.partition_point(|k| tree.compare.compare(k, end_key) != Ordering::Greater);
+
 		Ok(RangeScanIterator {
 			tree,
 			current_leaf: Some(leaf),
 			end_key: end_key.to_vec(),
 			current_idx,
+			current_end_idx,
 			reached_end: false,
 		})
 	}
@@ -2827,20 +2827,24 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 			}
 
 			if let Some(leaf) = &self.current_leaf {
-				// Check if we've reached the end of the current leaf
-				if self.current_idx >= leaf.keys.len() {
+				// Check if we've exhausted current leaf
+				if self.current_idx >= self.current_end_idx {
 					// Move to the next leaf if possible
 					if leaf.next_leaf == 0 {
 						self.reached_end = true;
 						return None;
 					}
 
-					// Load the next leaf
+					// Load the next leaf and calculate its end index
 					match self.tree.read_node(leaf.next_leaf) {
 						Ok(NodeType::Leaf(next_leaf)) => {
+							let next_end_idx = next_leaf.keys.partition_point(|k| {
+								self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
+							});
+
 							self.current_leaf = Some(next_leaf);
 							self.current_idx = 0;
-							// Continue the loop
+							self.current_end_idx = next_end_idx;
 							continue;
 						}
 						Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
@@ -2848,16 +2852,9 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 					}
 				}
 
-				// Check if the current key is within range
-				let key = &leaf.keys[self.current_idx];
-				if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
-					self.reached_end = true;
-					return None;
-				}
-
-				// Return the current key-value pair and advance
+				// Return current entry from stored leaf (no range check needed - pre-calculated!)
 				let result = Ok((
-					Arc::from(key.as_ref()),
+					Arc::from(leaf.keys[self.current_idx].as_ref()),
 					Arc::from(leaf.values[self.current_idx].as_ref()),
 				));
 				self.current_idx += 1;
