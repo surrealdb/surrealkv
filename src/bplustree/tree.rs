@@ -369,22 +369,22 @@ impl InternalNode {
 	}
 
 	// Merges right node into this node
-	fn merge_from_right(&mut self, right: &InternalNode, separator: Vec<u8>) {
+	fn merge_from_right(&mut self, mut right: InternalNode, separator: Vec<u8>) {
 		// Add separator key from parent
 		self.keys.push(separator);
 		self.key_overflows.push(0); // Separator from parent, no overflow
 
-		// Append right node's keys and children
-		self.keys.extend(right.keys.clone());
-		self.key_overflows.extend(right.key_overflows.clone());
-		self.children.extend(right.children.clone());
+		// Append right node's keys and children (using append to move instead of clone)
+		self.keys.append(&mut right.keys);
+		self.key_overflows.append(&mut right.key_overflows);
+		self.children.append(&mut right.children);
 	}
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		// Consider a node to be in underflow if it has less than 30% capacity utilized
-		// This is based on my reading from sqllite implementation
-		self.current_size() * 100 < Self::max_size() * 30
+		// Consider a node to be in underflow if it has less than 50% capacity utilized
+		// Using 50% threshold reduces rebalancing frequency compared to 30%
+		self.current_size() * 100 < Self::max_size() * 50
 	}
 }
 
@@ -670,7 +670,7 @@ impl LeafNode {
 
 	// delete a key-value pair from a leaf node
 	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Vec<u8>)> {
-		let idx = self.keys.iter().position(|k| compare.compare(key, k) == Ordering::Equal)?;
+		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).ok()?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
 		// Remove overflow entry as well
@@ -703,12 +703,14 @@ impl LeafNode {
 		// Move last key-value pair from this node to right node
 		let last_key = self.keys.pop().unwrap();
 		let last_value = self.values.pop().unwrap();
+		let last_overflow = self.cell_overflows.pop().unwrap_or(0);
 
-		right.keys.insert(0, last_key.clone());
+		let separator = last_key.clone(); // Clone for return only
+		right.keys.insert(0, last_key);
 		right.values.insert(0, last_value);
+		right.cell_overflows.insert(0, last_overflow);
 
-		// Return the separator key (first key in right node)
-		right.keys[0].clone()
+		separator
 	}
 
 	// Takes keys from right leaf
@@ -716,23 +718,31 @@ impl LeafNode {
 		// Move first key-value pair from right node to this node
 		let first_key = right.keys.remove(0);
 		let first_value = right.values.remove(0);
+		let first_overflow = if !right.cell_overflows.is_empty() {
+			right.cell_overflows.remove(0)
+		} else {
+			0
+		};
 
-		self.keys.push(first_key.clone());
+		self.keys.push(first_key);
 		self.values.push(first_value);
+		self.cell_overflows.push(first_overflow);
 
-		// If right node still has keys, return its first key as the new separator
+		// Return new separator (first key of right if it exists)
 		if !right.keys.is_empty() {
 			right.keys[0].clone()
 		} else {
-			first_key
+			// Right is now empty, use the current last key
+			self.keys.last().unwrap().clone()
 		}
 	}
 
 	// Merges the right node into this node
-	fn merge_from_right(&mut self, right: &LeafNode) {
-		// Append all keys and values from right node
-		self.keys.extend(right.keys.clone());
-		self.values.extend(right.values.clone());
+	fn merge_from_right(&mut self, mut right: LeafNode) {
+		// Append all keys and values from right node (using append to move instead of clone)
+		self.keys.append(&mut right.keys);
+		self.values.append(&mut right.values);
+		self.cell_overflows.append(&mut right.cell_overflows);
 
 		// Update next_leaf pointer
 		self.next_leaf = right.next_leaf;
@@ -765,9 +775,9 @@ impl LeafNode {
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		// Consider a node to be in underflow if it has less than 30% capacity utilized
-		// This is based on my reading from sqllite implementation
-		self.current_size() * 100 < Self::max_size() * 30
+		// Consider a node to be in underflow if it has less than 50% capacity utilized
+		// Using 50% threshold reduces rebalancing frequency compared to 30%
+		self.current_size() * 100 < Self::max_size() * 50
 	}
 }
 
@@ -1626,8 +1636,11 @@ impl<F: VfsFile> BPlusTree<F> {
 					// Found the leaf node, attempt to delete
 					match leaf.delete(key, self.compare.as_ref()) {
 						Some((_, value)) => {
-							// Write updated leaf first
-							self.write_node(&NodeType::Leaf(leaf.clone()))?;
+							// Write updated leaf first using owned to avoid clone
+							let leaf_offset = leaf.offset;
+							let leaf_owned =
+								std::mem::replace(&mut leaf, LeafNode::new(leaf_offset));
+							self.write_node_owned(NodeType::Leaf(leaf_owned))?;
 
 							// Step 2: Handle node underflow from bottom up
 							self.handle_underflows(&mut path)?;
@@ -1666,7 +1679,10 @@ impl<F: VfsFile> BPlusTree<F> {
 					if internal.is_underflow() {
 						// Handle underflow in internal node
 						self.handle_underflow(&mut parent, child_idx, true)?;
-						self.write_node(&NodeType::Internal(parent.clone()))?;
+						let parent_offset = parent.offset;
+						let parent_owned =
+							std::mem::replace(&mut parent, InternalNode::new(parent_offset));
+						self.write_node_owned(NodeType::Internal(parent_owned))?;
 
 						// If the parent itself is now in underflow, continue processing
 						if parent.is_underflow() {
@@ -1686,7 +1702,10 @@ impl<F: VfsFile> BPlusTree<F> {
 					if leaf.is_underflow() {
 						// Handle underflow in leaf node
 						self.handle_underflow(&mut parent, child_idx, false)?;
-						self.write_node(&NodeType::Internal(parent.clone()))?;
+						let parent_offset = parent.offset;
+						let parent_owned =
+							std::mem::replace(&mut parent, InternalNode::new(parent_offset));
+						self.write_node_owned(NodeType::Internal(parent_owned))?;
 
 						// If the parent itself is now in underflow, continue processing
 						if parent.is_underflow() {
@@ -1878,9 +1897,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Update parent key
 			parent.keys[left_idx] = new_parent_key;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Internal(left_node))?;
-			self.write_node(&NodeType::Internal(right_node))?;
+			// Write updated nodes using owned to avoid cloning
+			self.write_node_owned(NodeType::Internal(left_node))?;
+			self.write_node_owned(NodeType::Internal(right_node))?;
 		}
 
 		// Parent will be written by the calling function
@@ -1937,9 +1956,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Update parent key
 			parent.keys[left_idx] = new_parent_key;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Internal(left_node))?;
-			self.write_node(&NodeType::Internal(right_node))?;
+			// Write updated nodes using owned to avoid cloning
+			self.write_node_owned(NodeType::Internal(left_node))?;
+			self.write_node_owned(NodeType::Internal(right_node))?;
 		}
 
 		// Parent will be written by the calling function
@@ -2001,9 +2020,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Update parent key
 			parent.keys[left_idx] = new_separator;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Leaf(left_node))?;
-			self.write_node(&NodeType::Leaf(right_node))?;
+			// Write updated nodes using owned to avoid cloning
+			self.write_node_owned(NodeType::Leaf(left_node))?;
+			self.write_node_owned(NodeType::Leaf(right_node))?;
 		}
 
 		// Parent will be written by the calling function
@@ -2064,9 +2083,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Update parent key
 			parent.keys[left_idx] = new_separator;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Leaf(left_node))?;
-			self.write_node(&NodeType::Leaf(right_node))?;
+			// Write updated nodes using owned to avoid cloning
+			self.write_node_owned(NodeType::Leaf(left_node))?;
+			self.write_node_owned(NodeType::Leaf(right_node))?;
 		}
 
 		// Parent will be written by the calling function
@@ -2152,13 +2171,13 @@ impl<F: VfsFile> BPlusTree<F> {
 		let separator = parent.keys.remove(left_idx);
 
 		// Move separator key from parent into left node as the boundary between subtrees
-		left_node.merge_from_right(&right_node, separator);
+		left_node.merge_from_right(right_node, separator);
 
 		// Remove the right child pointer from parent (the separator was already removed)
 		parent.children.remove(right_idx);
 
-		// Write updated left node
-		self.write_node(&NodeType::Internal(left_node))?;
+		// Write updated left node using owned to avoid cloning
+		self.write_node_owned(NodeType::Internal(left_node))?;
 
 		// Free the right node's page with overflow chains
 		self.free_node_with_overflow(right_offset)?;
@@ -2195,7 +2214,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		// Get next leaf pointer before merging
 		let next_leaf = right_node.next_leaf;
 
-		left_node.merge_from_right(&right_node);
+		left_node.merge_from_right(right_node);
 
 		// Update next leaf's prev pointer if needed
 		if next_leaf != 0 {
@@ -2205,8 +2224,8 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		// Write left node
-		self.write_node(&NodeType::Leaf(left_node))?;
+		// Write left node using owned to avoid cloning
+		self.write_node_owned(NodeType::Leaf(left_node))?;
 
 		// Free the right node's page with overflow chains
 		self.free_node_with_overflow(right_offset)?;
