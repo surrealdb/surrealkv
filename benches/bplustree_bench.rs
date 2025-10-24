@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+	black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use rand::Rng;
 use std::sync::Arc;
 use surrealkv::bplustree::tree::new_disk_tree;
@@ -27,18 +29,24 @@ fn benchmark_insert_sequential(c: &mut Criterion) {
 		group.throughput(Throughput::Elements(*size as u64));
 
 		group.bench_with_input(BenchmarkId::new("insert", size), size, |b, &size| {
-			b.iter(|| {
-				let temp_dir = TempDir::new().unwrap();
-				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(BytewiseComparator {});
-				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
-
-				let data = generate_test_data(size, 16, 64);
-
-				for (key, value) in data {
-					tree.insert(black_box(&key), black_box(&value)).unwrap();
-				}
-			});
+			b.iter_batched(
+				|| {
+					// Setup - not timed
+					let temp_dir = TempDir::new().unwrap();
+					let db_path = temp_dir.path().join("test.db");
+					let comparator = Arc::new(BytewiseComparator {});
+					let tree = new_disk_tree(&db_path, comparator).unwrap();
+					let data = generate_test_data(size, 16, 64);
+					(tree, data, temp_dir)
+				},
+				|(mut tree, data, _temp_dir)| {
+					// Measurement - this is timed
+					for (key, value) in data {
+						tree.insert(black_box(&key), black_box(&value)).unwrap();
+					}
+				},
+				BatchSize::SmallInput,
+			);
 		});
 	}
 
@@ -52,21 +60,27 @@ fn benchmark_insert_random(c: &mut Criterion) {
 		group.throughput(Throughput::Elements(*size as u64));
 
 		group.bench_with_input(BenchmarkId::new("insert", size), size, |b, &size| {
-			b.iter(|| {
-				let temp_dir = TempDir::new().unwrap();
-				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(BytewiseComparator {});
-				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
-
-				let mut data = generate_test_data(size, 16, 64);
-				// Shuffle the data for random insertion order
-				use rand::seq::SliceRandom;
-				data.shuffle(&mut rand::rng());
-
-				for (key, value) in data {
-					tree.insert(black_box(&key), black_box(&value)).unwrap();
-				}
-			});
+			b.iter_batched(
+				|| {
+					// Setup - not timed
+					let temp_dir = TempDir::new().unwrap();
+					let db_path = temp_dir.path().join("test.db");
+					let comparator = Arc::new(BytewiseComparator {});
+					let tree = new_disk_tree(&db_path, comparator).unwrap();
+					let mut data = generate_test_data(size, 16, 64);
+					// Shuffle in setup
+					use rand::seq::SliceRandom;
+					data.shuffle(&mut rand::rng());
+					(tree, data, temp_dir)
+				},
+				|(mut tree, data, _temp_dir)| {
+					// Measurement - this is timed
+					for (key, value) in data {
+						tree.insert(black_box(&key), black_box(&value)).unwrap();
+					}
+				},
+				BatchSize::SmallInput,
+			);
 		});
 	}
 
@@ -80,23 +94,30 @@ fn benchmark_delete_sequential(c: &mut Criterion) {
 		group.throughput(Throughput::Elements(*size as u64));
 
 		group.bench_with_input(BenchmarkId::new("delete", size), size, |b, &size| {
-			b.iter(|| {
-				let temp_dir = TempDir::new().unwrap();
-				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(BytewiseComparator {});
-				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
+			b.iter_batched(
+				|| {
+					// Setup - not timed
+					let temp_dir = TempDir::new().unwrap();
+					let db_path = temp_dir.path().join("test.db");
+					let comparator = Arc::new(BytewiseComparator {});
+					let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
-				// First insert data
-				let data = generate_test_data(size, 16, 64);
-				for (key, value) in &data {
-					tree.insert(key, value).unwrap();
-				}
+					// Insert data in setup
+					let data = generate_test_data(size, 16, 64);
+					for (key, value) in &data {
+						tree.insert(key, value).unwrap();
+					}
 
-				// Then delete all data
-				for (key, _) in data {
-					tree.delete(black_box(&key)).unwrap();
-				}
-			});
+					(tree, data, temp_dir)
+				},
+				|(mut tree, data, _temp_dir)| {
+					// Only measure deletes
+					for (key, _) in data {
+						tree.delete(black_box(&key)).unwrap();
+					}
+				},
+				BatchSize::SmallInput,
+			);
 		});
 	}
 
@@ -110,27 +131,34 @@ fn benchmark_delete_random(c: &mut Criterion) {
 		group.throughput(Throughput::Elements(*size as u64));
 
 		group.bench_with_input(BenchmarkId::new("delete", size), size, |b, &size| {
-			b.iter(|| {
-				let temp_dir = TempDir::new().unwrap();
-				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(BytewiseComparator {});
-				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
+			b.iter_batched(
+				|| {
+					// Setup - not timed
+					let temp_dir = TempDir::new().unwrap();
+					let db_path = temp_dir.path().join("test.db");
+					let comparator = Arc::new(BytewiseComparator {});
+					let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
-				// First insert data
-				let mut data = generate_test_data(size, 16, 64);
-				for (key, value) in &data {
-					tree.insert(key, value).unwrap();
-				}
+					// Insert data in setup
+					let mut data = generate_test_data(size, 16, 64);
+					for (key, value) in &data {
+						tree.insert(key, value).unwrap();
+					}
 
-				// Shuffle for random deletion order
-				use rand::seq::SliceRandom;
-				data.shuffle(&mut rand::rng());
+					// Shuffle for random deletion order
+					use rand::seq::SliceRandom;
+					data.shuffle(&mut rand::rng());
 
-				// Then delete all data
-				for (key, _) in data {
-					tree.delete(black_box(&key)).unwrap();
-				}
-			});
+					(tree, data, temp_dir)
+				},
+				|(mut tree, data, _temp_dir)| {
+					// Only measure deletes
+					for (key, _) in data {
+						tree.delete(black_box(&key)).unwrap();
+					}
+				},
+				BatchSize::SmallInput,
+			);
 		});
 	}
 
@@ -151,18 +179,24 @@ fn benchmark_key_value_sizes(c: &mut Criterion) {
 			BenchmarkId::new("insert", format!("k{}_v{}", key_size, value_size)),
 			&(*key_size, *value_size),
 			|b, &(key_size, value_size)| {
-				b.iter(|| {
-					let temp_dir = TempDir::new().unwrap();
-					let db_path = temp_dir.path().join("test.db");
-					let comparator = Arc::new(BytewiseComparator {});
-					let mut tree = new_disk_tree(&db_path, comparator).unwrap();
-
-					let data = generate_test_data(10000, key_size, value_size);
-
-					for (key, value) in data {
-						tree.insert(black_box(&key), black_box(&value)).unwrap();
-					}
-				});
+				b.iter_batched(
+					|| {
+						// Setup - not timed
+						let temp_dir = TempDir::new().unwrap();
+						let db_path = temp_dir.path().join("test.db");
+						let comparator = Arc::new(BytewiseComparator {});
+						let tree = new_disk_tree(&db_path, comparator).unwrap();
+						let data = generate_test_data(10000, key_size, value_size);
+						(tree, data, temp_dir)
+					},
+					|(mut tree, data, _temp_dir)| {
+						// Measurement - this is timed
+						for (key, value) in data {
+							tree.insert(black_box(&key), black_box(&value)).unwrap();
+						}
+					},
+					BatchSize::SmallInput,
+				);
 			},
 		);
 	}
@@ -177,23 +211,30 @@ fn benchmark_get_operations(c: &mut Criterion) {
 		group.throughput(Throughput::Elements(*size as u64));
 
 		group.bench_with_input(BenchmarkId::new("get", size), size, |b, &size| {
-			b.iter(|| {
-				let temp_dir = TempDir::new().unwrap();
-				let db_path = temp_dir.path().join("test.db");
-				let comparator = Arc::new(BytewiseComparator {});
-				let mut tree = new_disk_tree(&db_path, comparator).unwrap();
+			b.iter_batched(
+				|| {
+					// Setup - not timed
+					let temp_dir = TempDir::new().unwrap();
+					let db_path = temp_dir.path().join("test.db");
+					let comparator = Arc::new(BytewiseComparator {});
+					let mut tree = new_disk_tree(&db_path, comparator).unwrap();
 
-				// Insert data first
-				let data = generate_test_data(size, 16, 64);
-				for (key, value) in &data {
-					tree.insert(key, value).unwrap();
-				}
+					// Insert data in setup
+					let data = generate_test_data(size, 16, 64);
+					for (key, value) in &data {
+						tree.insert(key, value).unwrap();
+					}
 
-				// Then perform get operations
-				for (key, _) in data {
-					let _result = tree.get(black_box(&key)).unwrap();
-				}
-			});
+					(tree, data, temp_dir)
+				},
+				|(tree, data, _temp_dir)| {
+					// Only measure gets
+					for (key, _) in data {
+						let _result = tree.get(black_box(&key)).unwrap();
+					}
+				},
+				BatchSize::SmallInput,
+			);
 		});
 	}
 

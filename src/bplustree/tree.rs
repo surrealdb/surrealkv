@@ -649,10 +649,7 @@ impl LeafNode {
 	// insert a key-value pair into a leaf node at the correct position
 	// If key already exists, update the value (treat as update)
 	fn insert(&mut self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
-		let mut idx = 0;
-		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
-			idx += 1;
-		}
+		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).unwrap_or_else(|idx| idx);
 
 		// Check if key already exists at this position
 		if idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Equal {
@@ -1350,7 +1347,6 @@ impl<F: VfsFile> BPlusTree<F> {
 					};
 
 					// Check if adding this entry would put us close to the maximum size
-					// Use overflow-aware calculation for promoted key
 					let max_per_entry = calculate_max_bytes_per_entry(false);
 					let (key_on_page, key_overflow) =
 						calculate_overflow(promoted_key.len(), max_per_entry);
@@ -1401,7 +1397,9 @@ impl<F: VfsFile> BPlusTree<F> {
 
 	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: &[u8], value: &[u8]) -> Result<()> {
 		leaf.insert(key, value, self.compare.as_ref());
-		self.write_node(&NodeType::Leaf(leaf.clone()))?;
+		// Use write_node_owned to avoid cloning
+		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
+		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
 		Ok(())
 	}
 
@@ -1418,13 +1416,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
 
-		// Find insertion point for the new key-value
-		let mut idx = 0;
-		while idx < leaf.keys.len()
-			&& self.compare.compare(key, &leaf.keys[idx]) == Ordering::Greater
-		{
-			idx += 1;
-		}
+		// Find insertion point for the new key-value using binary search
+		let idx =
+			leaf.keys.binary_search_by(|k| self.compare.compare(k, key)).unwrap_or_else(|idx| idx);
 
 		// Check if key already exists
 		let is_duplicate =
@@ -1433,9 +1427,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		if idx < split_idx {
 			// New entry belongs in the left node
 			// Move entries after split_idx to new leaf
-			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.values = leaf.values.drain(split_idx..).collect();
-			new_leaf.cell_overflows = leaf.cell_overflows.drain(split_idx..).collect();
+			new_leaf.keys = leaf.keys.split_off(split_idx);
+			new_leaf.values = leaf.values.split_off(split_idx);
+			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
 
 			if is_duplicate {
 				// Update existing key-value in left node
@@ -1456,9 +1450,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			let right_idx = idx - split_idx;
 
 			// Move entries after split_idx to new leaf
-			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.values = leaf.values.drain(split_idx..).collect();
-			new_leaf.cell_overflows = leaf.cell_overflows.drain(split_idx..).collect();
+			new_leaf.keys = leaf.keys.split_off(split_idx);
+			new_leaf.values = leaf.values.split_off(split_idx);
+			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
 
 			if is_duplicate {
 				// Update existing key-value in right node
@@ -1492,15 +1486,16 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		let new_leaf_offset = new_leaf.offset;
 
-		// Write both leaves
-		self.write_node(&NodeType::Leaf(leaf.clone()))?;
-		self.write_node(&NodeType::Leaf(new_leaf))?;
+		// Write both leaves using owned to avoid cloning
+		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
+		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
+		self.write_node_owned(NodeType::Leaf(new_leaf))?;
 
 		// Update the next node's prev pointer if needed
 		if let Some(next_offset) = next_leaf_update {
 			if let NodeType::Leaf(mut next_leaf) = self.read_node(next_offset)? {
 				next_leaf.prev_leaf = new_leaf_offset;
-				self.write_node(&NodeType::Leaf(next_leaf))?;
+				self.write_node_owned(NodeType::Leaf(next_leaf))?;
 			}
 		}
 
@@ -1553,9 +1548,10 @@ impl<F: VfsFile> BPlusTree<F> {
 			new_node.children.insert(right_insert_idx + 1, extra_child);
 		}
 
-		// Write both nodes
-		self.write_node(&NodeType::Internal(node.clone()))?;
-		self.write_node(&NodeType::Internal(new_node))?;
+		// Write both nodes using owned to avoid cloning
+		let node_owned = std::mem::replace(node, InternalNode::new(node.offset));
+		self.write_node_owned(NodeType::Internal(node_owned))?;
+		self.write_node_owned(NodeType::Internal(new_node))?;
 
 		Ok((promoted_key, new_node_offset))
 	}
@@ -2426,7 +2422,6 @@ impl<F: VfsFile> BPlusTree<F> {
 			let node_type = buffer[0];
 			match node_type {
 				NODE_TYPE_INTERNAL => {
-					// Use overflow-aware deserialization for internal nodes
 					let internal =
 						InternalNode::deserialize(&buffer, offset, &|overflow_offset| {
 							self.read_overflow_chain(overflow_offset)
@@ -2434,7 +2429,6 @@ impl<F: VfsFile> BPlusTree<F> {
 					NodeType::Internal(internal)
 				}
 				NODE_TYPE_LEAF => {
-					// Use overflow-aware deserialization for leaf nodes
 					let leaf = LeafNode::deserialize(&buffer, offset, &|overflow_offset| {
 						self.read_overflow_chain(overflow_offset)
 					})?;
@@ -2528,19 +2522,19 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	fn write_node(&mut self, node: &NodeType) -> Result<()> {
-		// Prepare node with overflow pages if needed
-		let node = match node {
+		self.write_node_owned(node.clone())
+	}
+
+	fn write_node_owned(&mut self, mut node: NodeType) -> Result<()> {
+		// Prepare node with overflow pages if needed (in-place, no clone!)
+		match &mut node {
 			NodeType::Internal(internal) => {
-				let mut internal = internal.clone();
-				self.prepare_internal_node_overflow(&mut internal)?;
-				NodeType::Internal(internal)
+				self.prepare_internal_node_overflow(internal)?;
 			}
 			NodeType::Leaf(leaf) => {
-				let mut leaf = leaf.clone();
-				self.prepare_leaf_node_overflow(&mut leaf)?;
-				NodeType::Leaf(leaf)
+				self.prepare_leaf_node_overflow(leaf)?;
 			}
-			other => other.clone(),
+			NodeType::Overflow(_) => {}
 		};
 
 		let data = match &node {
@@ -2560,7 +2554,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		self.maybe_sync()?;
 
-		self.cache.insert(offset, node.clone());
+		self.cache.insert(offset, node); // Move instead of clone
 		Ok(())
 	}
 
