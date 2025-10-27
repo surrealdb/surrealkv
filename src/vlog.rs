@@ -9,10 +9,9 @@ use std::{
 	},
 };
 
-use crate::bplustree::tree::{new_disk_tree, DiskBPlusTree};
 use crate::cache::VLogCache;
-use crate::BytewiseComparator;
 use crate::{batch::Batch, discard::DiscardStats, Value};
+use crate::{bplustree::tree::DiskBPlusTree, Tree, TreeBuilder};
 use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -1284,9 +1283,9 @@ impl VLog {
 		Ok(())
 	}
 
-	pub(crate) fn close(&self) -> Result<()> {
+	pub(crate) async fn close(&self) -> Result<()> {
 		self.sync()?;
-		self.delete_list.close()?;
+		self.delete_list.close().await?;
 		Ok(())
 	}
 }
@@ -1392,7 +1391,7 @@ impl VLogGCManager {
 		}
 
 		// Close the VLog
-		if let Err(e) = self.vlog.close() {
+		if let Err(e) = self.vlog.close().await {
 			log::error!("Error closing VLog: {e:?}");
 			return Err(e);
 		}
@@ -1406,18 +1405,26 @@ impl VLogGCManager {
 /// This provides better performance and consistency with the main LSM tree design.
 pub(crate) struct DeleteList {
 	/// B+ tree for storing delete list entries (user_key -> value_size)
-	tree: Arc<RwLock<DiskBPlusTree>>,
+	tree: Arc<Tree>,
 }
 
 impl DeleteList {
 	pub(crate) fn new(delete_list_dir: PathBuf) -> Result<Self> {
-		// Create B+ tree for the delete list with a specific file name
-		let delete_list_file = delete_list_dir.join("delete_list.bpt");
-		let comparator = Arc::new(BytewiseComparator {});
-		let tree = new_disk_tree(delete_list_file, comparator)?;
+		// Create a dedicated LSM tree for the delete list
+		let delete_list_opts = Options {
+			path: delete_list_dir,
+			// Disable VLog for the delete list to avoid circular dependency
+			enable_vlog: false,
+			..Default::default()
+		};
+
+		let delete_list_tree =
+			Arc::new(TreeBuilder::with_options(delete_list_opts).build().map_err(|e| {
+				Error::Other(format!("Failed to create global delete list LSM: {e}"))
+			})?);
 
 		Ok(Self {
-			tree: Arc::new(RwLock::new(tree)),
+			tree: delete_list_tree,
 		})
 	}
 
@@ -1428,32 +1435,42 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write()?;
+		let mut batch = Batch::new(0);
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
 			let seq_key = seq_num.to_be_bytes().to_vec();
 			// Store sequence number -> value_size mapping
-			tree.insert(&seq_key, &value_size.to_be_bytes())?;
+			batch.add_record(
+				crate::sstable::InternalKeyKind::Set,
+				&seq_key,
+				Some(&value_size.to_be_bytes()),
+				0,
+			)?;
 		}
 
-		// Sync the B+ tree to ensure durability
-		tree.sync()?;
+		// Commit the batch to the LSM tree using sync commit
+		self.tree
+			.sync_commit(batch, true)
+			.map_err(|e| Error::Other(format!("Failed to add stale entries: {e}")))?;
 
 		Ok(())
 	}
 
 	/// Checks if a sequence number is in the delete list (stale)
 	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		let tree = self.tree.read()?;
+		let tx = self
+			.tree
+			.begin_with_mode(crate::Mode::ReadOnly)
+			.map_err(|e| Error::Other(format!("Failed to begin transaction: {e}")))?;
 
 		// Convert sequence number to bytes for lookup
 		let seq_key = seq_num.to_be_bytes().to_vec();
 
-		match tree.get(&seq_key) {
+		match tx.get(&seq_key) {
 			Ok(Some(_)) => Ok(true),
 			Ok(None) => Ok(false),
-			Err(e) => Err(Error::BPlusTree(format!("Failed to search delete list: {e}"))),
+			Err(e) => Err(Error::Other(format!("Failed to search delete list: {e}"))),
 		}
 	}
 
@@ -1464,25 +1481,24 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		let mut tree = self.tree.write()?;
+		let mut batch = Batch::new(0);
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			tree.delete(&seq_key)?;
+			batch.add_record(crate::sstable::InternalKeyKind::Delete, &seq_key, None, 0)?;
 		}
 
-		// Sync the B+ tree to ensure durability
-		tree.sync()?;
-
-		Ok(())
+		// Commit the batch to the LSM tree using sync commit
+		self.tree
+			.sync_commit(batch, true)
+			.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
 	}
 
-	fn close(&self) -> Result<()> {
-		let mut tree = self.tree.write()?;
-		tree.sync()?;
-		tree.close()?;
-		Ok(())
+	async fn close(&self) -> Result<()> {
+		// Close the delete list tree (uses Box::pin to avoid async recursion)
+		// The delete list has its own Tree with enable_vlog: false, so no actual infinite recursion
+		Box::pin(self.tree.close()).await
 	}
 }
 #[cfg(test)]
@@ -1677,7 +1693,7 @@ mod tests {
 		);
 
 		// Drop the first VLog to close all file handles
-		drop(vlog1);
+		vlog1.close().await.unwrap();
 
 		// Create a new VLog instance - this should trigger prefill_file_handles
 		let vlog2 = VLog::new(opts.clone(), None).unwrap();
@@ -2046,7 +2062,8 @@ mod tests {
 
 			// Verify writer is set up
 			assert!(vlog1.writer.read().unwrap().is_some(), "Writer should be set up");
-		} // vlog1 is dropped here, simulating shutdown
+			vlog1.close().await.unwrap();
+		}
 
 		// Phase 2: Restart VLog and verify it continues with the last file
 		{
@@ -2183,7 +2200,8 @@ mod tests {
 			highest_file_id = highest_file_id.max(final_pointer.file_id);
 
 			vlog1.sync().unwrap();
-		} // vlog1 is dropped here, simulating shutdown
+			vlog1.close().await.unwrap();
+		}
 
 		// Phase 2: Restart VLog and verify it picks up the correct active writer
 		{

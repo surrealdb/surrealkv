@@ -625,6 +625,11 @@ impl Core {
 		self.commit_pipeline.commit(batch, sync).await
 	}
 
+	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+		// Use the synchronous commit path
+		self.commit_pipeline.sync_commit(batch, sync_wal)
+	}
+
 	pub(crate) fn seq_num(&self) -> u64 {
 		self.commit_pipeline.get_visible_seq_num()
 	}
@@ -662,6 +667,11 @@ impl Core {
 		if let Some(ref wal) = self.inner.wal {
 			let mut wal_guard = wal.write();
 			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {e}")))?;
+		}
+
+		// Ster 5: Close the versioned index if present
+		if let Some(ref versioned_index) = self.inner.versioned_index {
+			versioned_index.write()?.close()?;
 		}
 
 		// Step 5: Flush all directories to ensure durability
@@ -859,6 +869,10 @@ impl Tree {
 	/// Flushes the active memtable to disk
 	pub fn flush(&self) -> Result<()> {
 		self.core.make_room_for_write()
+	}
+
+	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
+		self.core.sync_commit(batch, sync_wal)
 	}
 }
 
