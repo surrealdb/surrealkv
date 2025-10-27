@@ -902,13 +902,6 @@ impl BPlusTree<File> {
 	}
 }
 
-pub fn new_disk_tree<P: AsRef<Path>>(
-	path: P,
-	compare: Arc<dyn Comparator>,
-) -> Result<DiskBPlusTree> {
-	DiskBPlusTree::disk(path, compare)
-}
-
 impl<F: VfsFile> BPlusTree<F> {
 	pub fn with_file(file: F, compare: Arc<dyn Comparator>) -> Result<Self> {
 		let storage_size = file.size()?;
@@ -1327,6 +1320,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
+	#[allow(unused)]
 	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
 		self.get_internal(self.header.root_offset, key)
 	}
