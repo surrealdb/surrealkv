@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{Snapshot, VersionScanResult};
 use crate::sstable::InternalKeyKind;
-use crate::{IterResult, Value};
+use crate::{IterResult, Key, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -425,12 +425,12 @@ impl Transaction {
 
 	/// Creates an iterator that returns only keys in the given range.
 	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
-	pub fn keys<Key: AsRef<[u8]>>(
+	pub fn keys<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
 		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
@@ -439,13 +439,13 @@ impl Transaction {
 
 	/// Gets keys in a key range at a specific timestamp.
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub fn keys_at_version<Key: AsRef<[u8]>>(
+	pub fn keys_at_version<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
 		// Check if versioned queries are enabled
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -453,7 +453,9 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.keys_at_version(start, end, timestamp, limit),
+			Some(snapshot) => Ok(snapshot
+				.keys_at_version(start, end, timestamp, limit)?
+				.map(|vec| Ok(Arc::from(vec)))),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -463,7 +465,7 @@ impl Transaction {
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
 		// Get the start and end keys from options
 		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
 		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
@@ -471,14 +473,15 @@ impl Transaction {
 		// Force keys_only to true for this method
 		let mut options = options.clone();
 		options.keys_only = true;
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)
+		Ok(TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+			.map(|result| result.map(|(key, _)| key)))
 	}
 
 	/// Creates an iterator for a range scan between start (inclusive) and end (exclusive) keys.
-	pub fn range<Key: AsRef<[u8]>>(
+	pub fn range<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		let mut options = ReadOptions::default().with_limit(limit);
@@ -489,10 +492,10 @@ impl Transaction {
 
 	/// Scans key-value pairs in a key range at a specific timestamp.
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub fn range_at_version<Key: AsRef<[u8]>>(
+	pub fn range_at_version<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
@@ -522,10 +525,10 @@ impl Transaction {
 
 	/// Gets all versions of keys in a key range.
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub fn scan_all_versions<Key: AsRef<[u8]>>(
+	pub fn scan_all_versions<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
 		if self.closed {
@@ -1999,11 +2002,9 @@ mod tests {
 			assert_eq!(keys_only.len(), 6);
 
 			// Check the keys are in order
-			for (i, (key, value)) in keys_only.iter().enumerate().take(6) {
+			for (i, key) in keys_only.iter().enumerate().take(6) {
 				let expected_key = format!("key{}", i + 1);
 				assert_eq!(key.as_ref(), expected_key.as_bytes());
-				// Values should be None
-				assert!(value.is_none(), "Value should be None for keys-only scan");
 			}
 
 			// Compare with regular range
@@ -2015,7 +2016,7 @@ mod tests {
 
 			// Keys should match and regular range values should be correct
 			for i in 0..keys_only.len() {
-				assert_eq!(keys_only[i].0, regular_range[i].0, "Keys should match");
+				assert_eq!(keys_only[i], regular_range[i].0, "Keys should match");
 
 				if i < 5 {
 					// For keys from storage, check regular values are correct
@@ -2048,7 +2049,7 @@ mod tests {
 			// Verify key3 is not in the results
 			let key_names: Vec<_> = keys_after_delete
 				.iter()
-				.map(|(k, _)| String::from_utf8_lossy(k.as_ref()).to_string())
+				.map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
 				.collect();
 
 			assert!(!key_names.contains(&"key3".to_string()), "key3 should be removed");
@@ -2406,7 +2407,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().to_vec()).collect();
 
 				assert_eq!(keys[0], b"key3");
 				assert_eq!(keys[1], b"key2");
@@ -3297,34 +3298,37 @@ mod tests {
 
 		// Test keys_at_version at first timestamp
 		let tx = tree.begin().unwrap();
-		let keys_at_ts1 =
-			tx.keys_at_version(b"key1", b"key5", ts1, None).unwrap().collect::<Vec<_>>();
+		let keys_at_ts1: Vec<_> =
+			tx.keys_at_version(b"key1", b"key5", ts1, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts1.len(), 3);
-		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
-		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
-		assert!(keys_at_ts1.contains(&b"key3".to_vec()));
-		assert!(!keys_at_ts1.contains(&b"key4".to_vec())); // key4 didn't exist at ts1
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(!keys_at_ts1.iter().any(|k| k.as_ref() == b"key4")); // key4 didn't exist at ts1
 
 		// Test keys_at_version at second timestamp
-		let keys_at_ts2 =
-			tx.keys_at_version(b"key1", b"key5", ts2, None).unwrap().collect::<Vec<_>>();
+		let keys_at_ts2: Vec<_> =
+			tx.keys_at_version(b"key1", b"key5", ts2, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts2.len(), 4);
-		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key2".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key3".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key4".to_vec()));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key4"));
 
 		// Test with limit
-		let keys_limited =
-			tx.keys_at_version(b"key1", b"key5", ts2, Some(2)).unwrap().collect::<Vec<_>>();
+		let keys_limited: Vec<_> = tx
+			.keys_at_version(b"key1", b"key5", ts2, Some(2))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys_limited.len(), 2);
 
 		// Test with specific key range
-		let keys_range =
-			tx.keys_at_version(b"key2", b"key4", ts2, None).unwrap().collect::<Vec<_>>();
+		let keys_range: Vec<_> =
+			tx.keys_at_version(b"key2", b"key4", ts2, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_range.len(), 2);
-		assert!(keys_range.contains(&b"key2".to_vec()));
-		assert!(keys_range.contains(&b"key3".to_vec()));
+		assert!(keys_range.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_range.iter().any(|k| k.as_ref() == b"key3"));
 	}
 
 	#[test(tokio::test)]
@@ -3350,12 +3354,15 @@ mod tests {
 		// Test keys_at_version with current timestamp
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
-		let keys =
-			tx.keys_at_version(b"key1", b"key4", u64::MAX, None).unwrap().collect::<Vec<_>>();
+		let keys: Vec<_> = tx
+			.keys_at_version(b"key1", b"key4", u64::MAX, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
-		assert!(keys.contains(&b"key1".to_vec()));
-		assert!(!keys.contains(&b"key2".to_vec())); // Hard deleted
-		assert!(!keys.contains(&b"key3".to_vec())); // Soft deleted
+		assert!(keys.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(!keys.iter().any(|k| k.as_ref() == b"key2")); // Hard deleted
+		assert!(!keys.iter().any(|k| k.as_ref() == b"key3")); // Soft deleted
 	}
 
 	#[test(tokio::test)]
