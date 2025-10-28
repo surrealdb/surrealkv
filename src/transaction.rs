@@ -285,6 +285,11 @@ impl Transaction {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
 	}
 
+	/// Soft deletes a key at a specific timestamp
+	pub fn soft_delete_at_version(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
+		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
+	}
+
 	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
 	/// This is similar to a regular set but does not preserve any older versions in the versioned index.
 	pub fn replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
