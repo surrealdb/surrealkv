@@ -205,6 +205,12 @@ impl Transaction {
 		self.durability = durability;
 	}
 
+	/// Sets the durability level for this transaction (builder pattern)
+	pub fn with_durability(mut self, durability: Durability) -> Self {
+		self.durability = durability;
+		self
+	}
+
 	/// Prepare a new transaction in the given mode.
 	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
