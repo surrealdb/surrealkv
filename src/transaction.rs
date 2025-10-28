@@ -446,18 +446,13 @@ impl Transaction {
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => Ok(snapshot
-				.keys_at_version(start, end, timestamp, limit)?
-				.map(|vec| Ok(Arc::from(vec)))),
-			None => Err(Error::NoSnapshot),
-		}
+		let mut options = ReadOptions::default()
+			.with_keys_only(true)
+			.with_limit(limit)
+			.with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.keys_with_options(&options)
 	}
 
 	/// Creates an iterator that returns only keys with custom read options.
@@ -465,16 +460,40 @@ impl Transaction {
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<Key>> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
 
-		// Force keys_only to true for this method
-		let mut options = options.clone();
-		options.keys_only = true;
-		Ok(TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
-			.map(|result| result.map(|(key, _)| key)))
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.keys_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|vec| Ok(Arc::from(vec))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Force keys_only to true for this method
+			let mut options = options.clone();
+			options.keys_only = true;
+			Ok(Box::new(
+				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+					.map(|result| result.map(|(key, _)| key)),
+			))
+		}
 	}
 
 	/// Creates an iterator for a range scan between start (inclusive) and end (exclusive) keys.
@@ -499,18 +518,10 @@ impl Transaction {
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => Ok(snapshot
-				.range_at_version(start, end, timestamp, limit)?
-				.map(|result| result.map(|(k, v)| (k.into(), Some(v))))),
-			None => Err(Error::NoSnapshot),
-		}
+		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.range_with_options(&options)
 	}
 
 	/// Creates an iterator for a range scan with custom read options.
@@ -518,11 +529,35 @@ impl Transaction {
 	pub fn range_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
+	) -> Result<Box<dyn DoubleEndedIterator<Item = IterResult> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.range_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|result| result.map(|(k, v)| (k.into(), Some(v)))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			Ok(Box::new(TransactionRangeIterator::new_with_options(
+				self, start_key, end_key, options,
+			)?))
+		}
 	}
 
 	/// Gets all versions of keys in a key range.
