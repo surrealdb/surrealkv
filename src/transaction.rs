@@ -241,6 +241,11 @@ impl Transaction {
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
+	/// Sets a key-value pair with a specific timestamp
+	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
+	}
+
 	/// Adds a key-value pair to the store with custom write options.
 	pub fn set_with_options(
 		&mut self,
@@ -265,14 +270,26 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Sets a key-value pair with a specific timestamp
-	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
-		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
-	}
-
 	// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
+	}
+
+	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	pub fn delete_with_options(
+		&mut self,
+		key: &[u8],
+		kind: InternalKeyKind,
+		options: &WriteOptions,
+	) -> Result<()> {
+		let write_seqno = self.next_write_seqno();
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(key, None, kind, self.savepoints, write_seqno, timestamp)
+		} else {
+			Entry::new(key, None, kind, self.savepoints, write_seqno)
+		};
+		self.write_with_options(entry, options)?;
+		Ok(())
 	}
 
 	/// Soft delete a key. The key will exist on disk but never be shown in queries.
@@ -280,14 +297,14 @@ impl Transaction {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
 	}
 
-	/// Soft delete a key with custom write options. The key will exist on disk but never be shown in queries.
-	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
-	}
-
 	/// Soft deletes a key at a specific timestamp
 	pub fn soft_delete_at_version(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
+	}
+
+	/// Soft delete a key with custom write options. The key will exist on disk but never be shown in queries.
+	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
 	}
 
 	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
@@ -320,26 +337,14 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options(
-		&mut self,
-		key: &[u8],
-		kind: InternalKeyKind,
-		options: &WriteOptions,
-	) -> Result<()> {
-		let write_seqno = self.next_write_seqno();
-		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(key, None, kind, self.savepoints, write_seqno, timestamp)
-		} else {
-			Entry::new(key, None, kind, self.savepoints, write_seqno)
-		};
-		self.write_with_options(entry, options)?;
-		Ok(())
-	}
-
 	/// Gets a value for a key if it exists.
 	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
 		self.get_with_options(key, &ReadOptions::default())
+	}
+
+	/// Gets a value for a key at a specific timestamp
+	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key if it exists with custom read options.
@@ -396,6 +401,124 @@ impl Transaction {
 		}
 	}
 
+	/// Creates an iterator that returns only keys in the given range.
+	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
+	pub fn keys<Key: AsRef<[u8]>>(
+		&self,
+		start: Key,
+		end: Key,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.keys_with_options(&options)
+	}
+
+	/// Gets keys in a key range at a specific timestamp
+	pub fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
+		key_range: R,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.keys_at_version(key_range, timestamp, limit),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Creates an iterator that returns only keys with custom read options.
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	pub fn keys_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+		// Force keys_only to true for this method
+		let mut options = options.clone();
+		options.keys_only = true;
+		TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)
+	}
+
+	/// Creates an iterator for a range scan between start and end keys (inclusive).
+	pub fn range<Key: AsRef<[u8]>>(
+		&self,
+		start: Key,
+		end: Key,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		let mut options = ReadOptions::default().with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.range_with_options(&options)
+	}
+
+	/// Creates an iterator for a range scan with custom read options.
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	pub fn range_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
+	}
+
+	/// Scans key-value pairs in a key range at a specific timestamp
+	pub fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
+		&'a self,
+		key_range: R,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.range_at_version(key_range, timestamp, limit),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
+	/// Gets all versions of keys in a key range
+	pub fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
+		&self,
+		key_range: R,
+		limit: Option<usize>,
+	) -> Result<Vec<VersionScanResult>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.scan_all_versions(key_range, limit),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
 	/// Writes a value for a key. None is used for deletion.
 	/// Writes a value for a key with custom write options. None is used for deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
@@ -442,61 +565,6 @@ impl Transaction {
 		}
 
 		Ok(())
-	}
-
-	/// Creates an iterator for a range scan between start and end keys (inclusive).
-	pub fn range<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		let mut options = ReadOptions::default().with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.range_with_options(&options)
-	}
-
-	/// Creates an iterator for a range scan with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
-	pub fn range_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
-	}
-
-	/// Creates an iterator that returns only keys in the given range.
-	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
-	pub fn keys<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.keys_with_options(&options)
-	}
-
-	/// Creates an iterator that returns only keys with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
-	pub fn keys_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
-		// Force keys_only to true for this method
-		let mut options = options.clone();
-		options.keys_only = true;
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
@@ -561,6 +629,20 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Rolls back the transaction by removing all updated entries.
+	pub fn rollback(&mut self) {
+		// Only unregister mutable transactions since only they get registered
+		if !self.closed && self.mode.mutable() {
+			self.core.oracle.unregister_txn_start(self.start_commit_id);
+		}
+
+		self.closed = true;
+		self.write_set.clear();
+		self.snapshot.take();
+		self.savepoints = 0;
+		self.write_seqno = 0;
+	}
+
 	/// After calling this method the subsequent modifications within this
 	/// transaction can be rolled back by calling [`rollback_to_savepoint`].
 	///
@@ -617,88 +699,6 @@ impl Transaction {
 		self.savepoints -= 1;
 
 		Ok(())
-	}
-
-	/// Rolls back the transaction by removing all updated entries.
-	pub fn rollback(&mut self) {
-		// Only unregister mutable transactions since only they get registered
-		if !self.closed && self.mode.mutable() {
-			self.core.oracle.unregister_txn_start(self.start_commit_id);
-		}
-
-		self.closed = true;
-		self.write_set.clear();
-		self.snapshot.take();
-		self.savepoints = 0;
-		self.write_seqno = 0;
-	}
-
-	/// Gets a value for a key at a specific timestamp
-	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
-	}
-
-	/// Gets keys in a key range at a specific timestamp
-	pub fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.keys_at_version(key_range, timestamp, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Scans key-value pairs in a key range at a specific timestamp
-	pub fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.range_at_version(key_range, timestamp, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Gets all versions of keys in a key range
-	pub fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
-		&self,
-		key_range: R,
-		limit: Option<usize>,
-	) -> Result<Vec<VersionScanResult>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(key_range, limit),
-			None => Err(Error::NoSnapshot),
-		}
 	}
 }
 
