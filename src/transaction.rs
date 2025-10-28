@@ -201,11 +201,12 @@ impl Transaction {
 		self.write_seqno
 	}
 
+	/// Sets the durability level for this transaction
 	pub fn set_durability(&mut self, durability: Durability) {
 		self.durability = durability;
 	}
 
-	/// Sets the durability level for this transaction (builder pattern)
+	/// Sets the durability level for this transaction
 	pub fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
 		self
@@ -242,17 +243,17 @@ impl Transaction {
 		})
 	}
 
-	/// Adds a key-value pair to the store.
+	/// Inserts a key-value pair into the store.
 	pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Sets a key-value pair with a specific timestamp
+	/// Inserts a key-value pair at with a specific timestamp.
 	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
 		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
-	/// Adds a key-value pair to the store with custom write options.
+	/// Inserts a key-value pair to the store, with custom write options.
 	pub fn set_with_options(
 		&mut self,
 		key: &[u8],
@@ -276,7 +277,7 @@ impl Transaction {
 		Ok(())
 	}
 
-	// Delete all the versions of a key. This is a hard delete.
+	/// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
 	}
@@ -298,28 +299,27 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Soft delete a key. The key will exist on disk but never be shown in queries.
+	/// Soft delete a key. This will add a tombstone at the current timestamp.
 	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
 	}
 
-	/// Soft deletes a key at a specific timestamp
+	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
 	pub fn soft_delete_at_version(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
-	/// Soft delete a key with custom write options. The key will exist on disk but never be shown in queries.
+	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
 	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
 	}
 
-	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
-	/// This is similar to a regular set but does not preserve any older versions in the versioned index.
+	/// Inserts a key-value pairm removing all previous versions.
 	pub fn replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Sets a key-value pair with Replace and custom write options.
+	/// Inserts a key-value pair, removing all previous versions, with custom write options.
 	pub fn replace_with_options(
 		&mut self,
 		key: &[u8],
@@ -348,12 +348,12 @@ impl Transaction {
 		self.get_with_options(key, &ReadOptions::default())
 	}
 
-	/// Gets a value for a key at a specific timestamp
+	/// Gets a value for a key at a specific timestamp.
 	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
-	/// Gets a value for a key if it exists with custom read options.
+	/// Gets a value for a key, with custom read options.
 	pub fn get_with_options(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
 		if self.closed {
@@ -469,18 +469,6 @@ impl Transaction {
 		self.range_with_options(&options)
 	}
 
-	/// Creates an iterator for a range scan with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
-	pub fn range_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
-	}
-
 	/// Scans key-value pairs in a key range at a specific timestamp
 	pub fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
@@ -498,6 +486,18 @@ impl Transaction {
 			Some(snapshot) => snapshot.range_at_version(key_range, timestamp, limit),
 			None => Err(Error::NoSnapshot),
 		}
+	}
+
+	/// Creates an iterator for a range scan with custom read options.
+	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	pub fn range_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
 	}
 
 	/// Gets all versions of keys in a key range
