@@ -423,8 +423,17 @@ impl Transaction {
 		}
 	}
 
-	/// Creates an iterator that returns only keys in the given range.
-	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
+	/// Gets keys in a key range at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
 	pub fn keys<K: AsRef<[u8]>>(
 		&self,
 		start: K,
@@ -438,7 +447,16 @@ impl Transaction {
 	}
 
 	/// Gets keys in a key range at a specific timestamp.
-	/// Range is [start, end) - start is inclusive, end is exclusive.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
 	pub fn keys_at_version<K: AsRef<[u8]>>(
 		&self,
 		start: K,
@@ -455,8 +473,17 @@ impl Transaction {
 		self.keys_with_options(&options)
 	}
 
-	/// Creates an iterator that returns only keys with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	/// Gets keys in a key range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
@@ -496,7 +523,14 @@ impl Transaction {
 		}
 	}
 
-	/// Creates an iterator for a range scan between start (inclusive) and end (exclusive) keys.
+	/// Gets keys and values in a range, at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
 	pub fn range<K: AsRef<[u8]>>(
 		&self,
 		start: K,
@@ -509,8 +543,14 @@ impl Transaction {
 		self.range_with_options(&options)
 	}
 
-	/// Scans key-value pairs in a key range at a specific timestamp.
-	/// Range is [start, end) - start is inclusive, end is exclusive.
+	/// Gets keys and values in a range, at a specific timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
 	pub fn range_at_version<K: AsRef<[u8]>>(
 		&self,
 		start: K,
@@ -524,8 +564,14 @@ impl Transaction {
 		self.range_with_options(&options)
 	}
 
-	/// Creates an iterator for a range scan with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
+	/// Gets keys and values in a range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
 	pub fn range_with_options(
 		&self,
 		options: &ReadOptions,
@@ -560,8 +606,7 @@ impl Transaction {
 		}
 	}
 
-	/// Gets all versions of keys in a key range.
-	/// Range is [start, end) - start is inclusive, end is exclusive.
+	/// Gets all versions of keys in a range.
 	pub fn scan_all_versions<K: AsRef<[u8]>>(
 		&self,
 		start: K,
@@ -587,7 +632,6 @@ impl Transaction {
 		}
 	}
 
-	/// Writes a value for a key. None is used for deletion.
 	/// Writes a value for a key with custom write options. None is used for deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
