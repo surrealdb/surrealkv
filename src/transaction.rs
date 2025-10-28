@@ -498,7 +498,7 @@ impl Transaction {
 		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
 		// Check if versioned queries are enabled
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -506,7 +506,9 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.range_at_version(start, end, timestamp, limit),
+			Some(snapshot) => Ok(snapshot
+				.range_at_version(start, end, timestamp, limit)?
+				.map(|result| result.map(|(k, v)| (k.into(), Some(v))))),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -3098,7 +3100,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
-		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
+		assert_eq!(version_at_ts1[0].1.as_ref().unwrap().as_ref(), b"value1");
 
 		let version_at_ts2 = tx
 			.range_at_version(b"key1", b"key2", ts2, None)
@@ -3106,7 +3108,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
-		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
+		assert_eq!(version_at_ts2[0].1.as_ref().unwrap().as_ref(), b"value2");
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
@@ -3402,10 +3404,10 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts1 {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2"),
+				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3425,11 +3427,11 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts2 {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
-				b"key4" => assert_eq!(value.as_ref(), b"value4"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
+				b"key4" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value4"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3511,8 +3513,8 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_result {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
