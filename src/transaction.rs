@@ -279,21 +279,23 @@ impl Transaction {
 
 	/// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
+		self.delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options(
-		&mut self,
-		key: &[u8],
-		kind: InternalKeyKind,
-		options: &WriteOptions,
-	) -> Result<()> {
+	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(key, None, kind, self.savepoints, write_seqno, timestamp)
+			Entry::new_with_timestamp(
+				key,
+				None,
+				InternalKeyKind::Delete,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
 		} else {
-			Entry::new(key, None, kind, self.savepoints, write_seqno)
+			Entry::new(key, None, InternalKeyKind::Delete, self.savepoints, write_seqno)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -301,7 +303,7 @@ impl Transaction {
 
 	/// Soft delete a key. This will add a tombstone at the current timestamp.
 	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
+		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
@@ -311,7 +313,21 @@ impl Transaction {
 
 	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
 	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
+		let write_seqno = self.next_write_seqno();
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				None,
+				InternalKeyKind::SoftDelete,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, None, InternalKeyKind::SoftDelete, self.savepoints, write_seqno)
+		};
+		self.write_with_options(entry, options)?;
+		Ok(())
 	}
 
 	/// Inserts a key-value pairm removing all previous versions.
