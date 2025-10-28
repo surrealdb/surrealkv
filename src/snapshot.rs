@@ -244,12 +244,15 @@ impl Snapshot {
 
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
+	/// Range is [start, end) - start is inclusive, end is exclusive.
+	pub(crate) fn keys_at_version<Key: AsRef<[u8]>>(
+		&self,
+		start: Key,
+		end: Key,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
+	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
+		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -267,12 +270,15 @@ impl Snapshot {
 
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
+	/// Range is [start, end) - start is inclusive, end is exclusive.
+	pub(crate) fn range_at_version<Key: AsRef<[u8]>>(
+		&self,
+		start: Key,
+		end: Key,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
+		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -292,15 +298,18 @@ impl Snapshot {
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// The limit currently is on the unique keys, not the total number of results
-	pub(crate) fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
+	/// Range is [start, end) - start is inclusive, end is exclusive.
+	pub(crate) fn scan_all_versions<Key: AsRef<[u8]>>(
 		&self,
-		key_range: R,
+		start: Key,
+		end: Key,
 		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
 
+		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
