@@ -384,16 +384,8 @@ impl Snapshot {
 				)
 				.encode(),
 				Bound::Excluded(key) => {
-					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
-					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(
-						next_key,
-						params.snapshot_seq_num,
-						InternalKeyKind::Max,
-						params.end_ts,
-					)
-					.encode()
+					// For excluded bounds, use minimal InternalKey properties so range stops just before this key
+					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode()
 				}
 				Bound::Unbounded => InternalKey::new(
 					vec![0xff],
