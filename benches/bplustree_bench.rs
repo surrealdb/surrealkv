@@ -165,45 +165,6 @@ fn benchmark_delete_random(c: &mut Criterion) {
 	group.finish();
 }
 
-fn benchmark_key_value_sizes(c: &mut Criterion) {
-	let mut group = c.benchmark_group("bplustree_key_value_sizes");
-
-	let key_value_sizes = [
-		(8, 32),    // Small keys and values
-		(32, 512),  // Medium keys and values
-		(64, 1024), // Large keys and values
-	];
-
-	for (key_size, value_size) in key_value_sizes.iter() {
-		group.bench_with_input(
-			BenchmarkId::new("insert", format!("k{}_v{}", key_size, value_size)),
-			&(*key_size, *value_size),
-			|b, &(key_size, value_size)| {
-				b.iter_batched(
-					|| {
-						// Setup - not timed
-						let temp_dir = TempDir::new().unwrap();
-						let db_path = temp_dir.path().join("test.db");
-						let comparator = Arc::new(BytewiseComparator {});
-						let tree = new_disk_tree(&db_path, comparator).unwrap();
-						let data = generate_test_data(10000, key_size, value_size);
-						(tree, data, temp_dir)
-					},
-					|(mut tree, data, _temp_dir)| {
-						// Measurement - this is timed
-						for (key, value) in data {
-							tree.insert(black_box(&key), black_box(&value)).unwrap();
-						}
-					},
-					BatchSize::SmallInput,
-				);
-			},
-		);
-	}
-
-	group.finish();
-}
-
 fn benchmark_get_operations(c: &mut Criterion) {
 	let mut group = c.benchmark_group("bplustree_get_operations");
 
@@ -247,7 +208,6 @@ criterion_group!(
 	benchmark_insert_random,
 	benchmark_delete_sequential,
 	benchmark_delete_random,
-	benchmark_key_value_sizes,
 	benchmark_get_operations
 );
 criterion_main!(benches);
