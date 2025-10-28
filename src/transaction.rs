@@ -64,12 +64,15 @@ pub enum Durability {
 pub struct WriteOptions {
 	/// Durability level for the write operation
 	pub durability: Durability,
+	/// Optional timestamp for the write operation. If None, uses the current timestamp.
+	pub timestamp: Option<u64>,
 }
 
 impl Default for WriteOptions {
 	fn default() -> Self {
 		Self {
 			durability: Durability::Eventual,
+			timestamp: None,
 		}
 	}
 }
@@ -83,6 +86,12 @@ impl WriteOptions {
 	/// Sets the durability level for write operations
 	pub fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
+		self
+	}
+
+	/// Sets the timestamp for write operations
+	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
 		self
 	}
 }
@@ -100,6 +109,8 @@ pub struct ReadOptions {
 	pub iterate_lower_bound: Option<Vec<u8>>,
 	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
 	pub iterate_upper_bound: Option<Vec<u8>>,
+	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
+	pub timestamp: Option<u64>,
 }
 
 impl ReadOptions {
@@ -139,6 +150,12 @@ impl ReadOptions {
 	/// Sets the upper bound for iteration (exclusive) - builder pattern
 	pub fn with_iterate_upper_bound(mut self, bound: Option<Vec<u8>>) -> Self {
 		self.iterate_upper_bound = bound;
+		self
+	}
+
+	/// Sets the timestamp for point-in-time reads
+	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
 		self
 	}
 }
@@ -232,37 +249,25 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry =
-			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno);
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				Some(value),
+				InternalKeyKind::Set,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
+		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
 
 	/// Sets a key-value pair with a specific timestamp
 	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
-		self.set_at_version_with_options(key, value, timestamp, &WriteOptions::default())
-	}
-
-	/// Sets a key-value pair with a specific timestamp and custom write options
-	pub fn set_at_version_with_options(
-		&mut self,
-		key: &[u8],
-		value: &[u8],
-		timestamp: u64,
-		options: &WriteOptions,
-	) -> Result<()> {
-		let seqno = self.next_write_seqno();
-		self.write_with_options(
-			Entry::new_with_timestamp(
-				key,
-				Some(value),
-				InternalKeyKind::Set,
-				self.savepoints,
-				seqno,
-				timestamp,
-			),
-			options,
-		)
+		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	// Delete all the versions of a key. This is a hard delete.
@@ -273,6 +278,11 @@ impl Transaction {
 	/// Soft delete a key. The key will exist on disk but never be shown in queries.
 	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
 		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
+	}
+
+	/// Soft delete a key with custom write options. The key will exist on disk but never be shown in queries.
+	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+		self.delete_with_options(key, InternalKeyKind::SoftDelete, options)
 	}
 
 	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
@@ -289,8 +299,18 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry =
-			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno);
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				Some(value),
+				InternalKeyKind::Replace,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
+		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -303,7 +323,11 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry = Entry::new(key, None, kind, self.savepoints, write_seqno);
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(key, None, kind, self.savepoints, write_seqno, timestamp)
+		} else {
+			Entry::new(key, None, kind, self.savepoints, write_seqno)
+		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -314,7 +338,7 @@ impl Transaction {
 	}
 
 	/// Gets a value for a key if it exists with custom read options.
-	pub fn get_with_options(&self, key: &[u8], _options: &ReadOptions) -> Result<Option<Value>> {
+	pub fn get_with_options(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -327,6 +351,20 @@ impl Transaction {
 		// Do not allow reads if it is a write-only transaction
 		if self.mode.is_write_only() {
 			return Err(Error::TransactionWriteOnly);
+		}
+
+		// If a timestamp is provided, use versioned read
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Query the versioned index through the snapshot
+			return match &self.snapshot {
+				Some(snapshot) => snapshot.get_at_version(key, timestamp),
+				None => Err(Error::NoSnapshot),
+			};
 		}
 
 		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
@@ -592,26 +630,7 @@ impl Transaction {
 
 	/// Gets a value for a key at a specific timestamp
 	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.get_at_version(key, timestamp),
-			None => Err(Error::NoSnapshot),
-		}
+		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets keys in a key range at a specific timestamp
@@ -621,13 +640,6 @@ impl Transaction {
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
 		// Check if versioned queries are enabled
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -647,13 +659,6 @@ impl Transaction {
 		timestamp: u64,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
 		// Check if versioned queries are enabled
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -3111,6 +3116,63 @@ mod tests {
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0].2, custom_timestamp); // Check the timestamp
 		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
+	}
+
+	#[test(tokio::test)]
+	async fn test_timestamp_via_write_options() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Test setting a value with timestamp via WriteOptions
+		let custom_timestamp = 100;
+		let mut tx = tree.begin().unwrap();
+		tx.set_with_options(
+			b"key1",
+			b"value1",
+			&WriteOptions::default().with_timestamp(Some(custom_timestamp)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+
+		// Verify we can read it at that timestamp
+		let tx = tree.begin().unwrap();
+		let value = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+
+		// Test soft_delete_with_options with timestamp
+		let delete_timestamp = 200;
+		let mut tx = tree.begin().unwrap();
+		tx.soft_delete_with_options(
+			b"key1",
+			&WriteOptions::default().with_timestamp(Some(delete_timestamp)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+
+		// Verify the value exists at the earlier timestamp but not at the delete timestamp
+		let tx = tree.begin().unwrap();
+		let value_before = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value_before, Some(Arc::from(b"value1" as &[u8])));
+
+		let value_after = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value_after, None);
 	}
 
 	#[test(tokio::test)]
