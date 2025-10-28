@@ -923,9 +923,7 @@ impl Segment {
 		Ok(())
 	}
 
-	// Flushes the current block to disk.
-	// This method also synchronize file metadata to the filesystem
-	// hence it is a bit slower than fdatasync (sync_data).
+	// Flushes the current block to disk and syncs data.
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));

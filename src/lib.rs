@@ -1,5 +1,5 @@
 mod batch;
-mod bplustree;
+pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod commit;
@@ -438,7 +438,7 @@ pub(crate) trait Iterator {
 }
 
 #[derive(Default, Clone, Copy)]
-pub(crate) struct BytewiseComparator {}
+pub struct BytewiseComparator {}
 
 impl BytewiseComparator {}
 

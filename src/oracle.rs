@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
@@ -11,19 +11,20 @@ use crate::util::LogicalClock;
 
 /// Entry used for tracking transaction operations in the commit queue
 struct CommitEntry {
-	writeset: Arc<BTreeMap<Bytes, Option<Bytes>>>,
+	keys: Arc<Vec<Bytes>>,
 }
 
 impl CommitEntry {
 	/// Returns true if self has no elements in common with other
 	fn is_disjoint_writeset(&self, other: &Arc<CommitEntry>) -> bool {
-		// Create a key iterator for each writeset
-		let mut a = self.writeset.keys();
-		let mut b = other.writeset.keys();
-		// Move to the next value in each iterator
+		if self.keys.is_empty() || other.keys.is_empty() {
+			return true;
+		}
+
+		let mut a = self.keys.iter();
+		let mut b = other.keys.iter();
 		let mut next_a = a.next();
 		let mut next_b = b.next();
-		// Advance each iterator independently in order
 		while let (Some(ka), Some(kb)) = (next_a, next_b) {
 			match ka.cmp(kb) {
 				std::cmp::Ordering::Less => next_a = a.next(),
@@ -89,17 +90,13 @@ impl Oracle {
 
 	/// Prepares a transaction for commit by checking conflicts and assigning a transaction ID.
 	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
-		// Convert transaction writeset to BTreeMap<Bytes, Option<Bytes>>
-		let mut writeset = BTreeMap::new();
-		for (key, entries) in &txn.write_set {
-			// Get the latest entry (last in the vector)
-			let value = entries.last().and_then(|e| e.value.clone());
-			writeset.insert(key.clone(), value);
-		}
+		// Extract only the keys from the transaction's writeset
+		// Keys are already sorted in the BTreeMap, so we maintain sort order
+		let keys: Vec<Bytes> = txn.write_set.keys().cloned().collect();
 
 		// Create commit entry
 		let commit_entry = Arc::new(CommitEntry {
-			writeset: Arc::new(writeset),
+			keys: Arc::new(keys),
 		});
 
 		// Insert into queue with version
@@ -142,10 +139,16 @@ impl Oracle {
 			}
 
 			// Contention detected, back off and retry
-			spins += 1;
+			// Ensure the thread backs off when under contention
 			if spins > 10 {
+				std::hint::spin_loop();
+			} else if spins < 100 {
 				std::thread::yield_now();
+			} else {
+				std::thread::park_timeout(Duration::from_micros(10));
 			}
+			// Increase the number loop spins we have attempted
+			spins += 1;
 		}
 	}
 

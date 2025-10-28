@@ -2,15 +2,34 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use quick_cache::{sync::Cache, Weighter};
 
 use crate::vfs::File as VfsFile;
 use crate::{Comparator, Key, Value};
 
+/// Cached max entry bytes to avoid recalculation
+static MAX_INTERNAL_ENTRY_BYTES: OnceLock<usize> = OnceLock::new();
+static MAX_LEAF_ENTRY_BYTES: OnceLock<usize> = OnceLock::new();
+
+fn get_max_internal_entry_bytes() -> usize {
+	*MAX_INTERNAL_ENTRY_BYTES.get_or_init(|| calculate_max_bytes_per_entry(false))
+}
+
+fn get_max_leaf_entry_bytes() -> usize {
+	*MAX_LEAF_ENTRY_BYTES.get_or_init(|| calculate_max_bytes_per_entry(true))
+}
+
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<File>;
+
+pub fn new_disk_tree<P: AsRef<Path>>(
+	path: P,
+	compare: Arc<dyn Comparator>,
+) -> Result<DiskBPlusTree> {
+	DiskBPlusTree::disk(path, compare)
+}
 
 #[derive(Clone)]
 struct NodeWeighter;
@@ -20,6 +39,7 @@ impl Weighter<u64, NodeType> for NodeWeighter {
 		match value {
 			NodeType::Internal(internal) => internal.current_size() as u64,
 			NodeType::Leaf(leaf) => leaf.current_size() as u64,
+			NodeType::Overflow(overflow) => (13 + overflow.data.len()) as u64,
 		}
 	}
 }
@@ -33,7 +53,13 @@ pub enum BPlusTreeError {
 	CorruptedFreeList(u64),
 	InvalidNodeType,
 	CorruptedTrunkPage(u64),
-	KeyValueTooLarge,
+	UnexpectedOverflowPage(u64),
+	InvalidOverflowChain(u64),
+	InvalidRootNode(u64),
+	InconsistentFreePageCount {
+		claimed: u32,
+		actual: u32,
+	},
 	Corruption(String),
 }
 
@@ -57,7 +83,25 @@ impl std::fmt::Display for BPlusTreeError {
 			BPlusTreeError::CorruptedTrunkPage(offset) => {
 				write!(f, "Corrupted trunk page at offset {}", offset)
 			}
-			BPlusTreeError::KeyValueTooLarge => write!(f, "Key-value pair too large"),
+			BPlusTreeError::UnexpectedOverflowPage(offset) => {
+				write!(f, "Unexpected overflow page in tree traversal at offset {}", offset)
+			}
+			BPlusTreeError::InvalidOverflowChain(offset) => {
+				write!(f, "Expected overflow page at offset {}, found different node type", offset)
+			}
+			BPlusTreeError::InvalidRootNode(offset) => {
+				write!(f, "Root node is an overflow page at offset {}", offset)
+			}
+			BPlusTreeError::InconsistentFreePageCount {
+				claimed,
+				actual,
+			} => {
+				write!(
+					f,
+					"Inconsistent free page count: header claims {} but found {}",
+					claimed, actual
+				)
+			}
 			BPlusTreeError::Corruption(msg) => write!(f, "Corruption detected: {}", msg),
 		}
 	}
@@ -79,20 +123,18 @@ const VERSION: u32 = 1;
 const MAGIC: [u8; 8] = *b"BPTREE01";
 
 // Page constants
-const CACHE_CAPACITY: u64 = 256 * 1024 * 1024; // 256 MiB
+pub const DEFAULT_CACHE_CAPACITY: u64 = 256 * 1024 * 1024; // 256 MiB
 const NODE_TYPE_INTERNAL: u8 = 0;
 const NODE_TYPE_LEAF: u8 = 1;
+const NODE_TYPE_OVERFLOW: u8 = 3;
 
 // Constants for trunk page system
 const TRUNK_PAGE_TYPE: u8 = 2; // Node type for trunk pages
 const TRUNK_PAGE_HEADER_SIZE: usize = 13; // 1 byte type + 8 bytes next + 4 bytes count
 const TRUNK_PAGE_ENTRY_SIZE: usize = 4; // 4-byte entries
-const TRUNK_RESERVED_ENTRIES: usize = 6; // Reserve last 6 entries
-const TRUNK_PAGE_MAX_ENTRIES: usize =
-	(PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE - TRUNK_RESERVED_ENTRIES;
+const TRUNK_PAGE_MAX_ENTRIES: usize = (PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRUNK_PAGE_ENTRY_SIZE;
 
 // Constants for size calculation
-// const NODE_TYPE_SIZE: usize = 1; // 1 byte for node type
 const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
 const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child_count(4) = 9 bytes
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
@@ -163,7 +205,6 @@ impl Header {
 trait Node {
 	fn serialize(&self) -> Result<Vec<u8>>;
 	fn current_size(&self) -> usize;
-	fn would_fit(&self, key: &[u8], value: Option<&[u8]>) -> bool;
 	fn max_size() -> usize {
 		PAGE_SIZE
 	}
@@ -173,8 +214,16 @@ trait Node {
 }
 
 #[derive(Debug, Clone)]
+/// Internal node in the B+ tree
+///
+/// OVERFLOW OWNERSHIP INVARIANT:
+/// - key_overflows contains overflow chains for keys stored in this node
+/// - Each key owns its overflow chain, including keys used as separators in parents
+/// - Overflows are freed when the owning node is freed via free_node_with_overflow()
+/// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
-	keys: Vec<Vec<u8>>,
+	keys: Vec<Vec<u8>>, // Full keys (reconstructed from page + overflow if needed)
+	key_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for THIS node's keys
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -183,12 +232,16 @@ impl InternalNode {
 	fn new(offset: u64) -> Self {
 		InternalNode {
 			keys: Vec::new(),
+			key_overflows: Vec::new(),
 			children: Vec::new(),
 			offset,
 		}
 	}
 
-	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
+	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
+	where
+		F: Fn(u64) -> Result<Vec<u8>>,
+	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Invalid node size {} (expected {})",
@@ -202,21 +255,62 @@ impl InternalNode {
 		let num_keys = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 		buffer_slice = &buffer_slice[4..];
 
+		let max_per_entry = get_max_internal_entry_bytes();
+
 		let mut keys = Vec::with_capacity(num_keys);
+		let mut key_overflows = Vec::with_capacity(num_keys);
 
 		for _ in 0..num_keys {
-			// Read key
-			let key_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+			// Read total key length
+			let key_len_total = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
-			if key_len > buffer_slice.len() {
+
+			// Calculate bytes on page using simple overflow algorithm
+			let (bytes_on_page, needs_overflow) = calculate_overflow(key_len_total, max_per_entry);
+
+			if bytes_on_page > buffer_slice.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
-					"Key length {} exceeds available buffer size {}",
-					key_len,
+					"Calculated bytes on page {} exceeds available buffer size {}",
+					bytes_on_page,
 					buffer_slice.len()
 				)));
 			}
-			keys.push(buffer_slice[..key_len].to_vec());
-			buffer_slice = &buffer_slice[key_len..];
+
+			// Read key data from page
+			let mut key_data = buffer_slice[..bytes_on_page].to_vec();
+			buffer_slice = &buffer_slice[bytes_on_page..];
+
+			// Check if there's overflow
+			let overflow_offset = if needs_overflow {
+				// Read overflow page offset
+				if buffer_slice.len() < 8 {
+					return Err(BPlusTreeError::Deserialization(
+						"Buffer too small for overflow pointer".into(),
+					));
+				}
+				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
+				buffer_slice = &buffer_slice[8..];
+
+				// Read overflow data and append to key
+				let overflow_data = read_overflow(overflow)?;
+				key_data.extend_from_slice(&overflow_data);
+
+				overflow
+			} else {
+				0
+			};
+
+			// Validate reconstructed key size
+			if key_data.len() != key_len_total {
+				return Err(BPlusTreeError::Deserialization(format!(
+					"Reconstructed key size {} doesn't match expected {}",
+					key_data.len(),
+					key_len_total
+				)));
+			}
+
+			keys.push(key_data);
+			key_overflows.push(overflow_offset);
 		}
 
 		let num_children = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
@@ -244,6 +338,7 @@ impl InternalNode {
 
 		Ok(InternalNode {
 			keys,
+			key_overflows,
 			children,
 			offset,
 		})
@@ -251,7 +346,6 @@ impl InternalNode {
 
 	// Find the appropriate child index for a key
 	fn find_child_index(&self, key: &[u8], compare: &dyn Comparator) -> usize {
-		// Binary search implementation
 		let mut low = 0;
 		let mut high = self.keys.len();
 
@@ -270,66 +364,153 @@ impl InternalNode {
 		low
 	}
 
-	// Insert a key and child pointer at the correct position
-	fn insert_key_child(&mut self, key: &[u8], child_offset: u64, compare: &dyn Comparator) {
+	/// Atomically removes a key and its overflow metadata at the given index.
+	/// Returns (key, overflow_offset) or None if index is out of bounds.
+	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Vec<u8>, u64)> {
+		if idx >= self.keys.len() {
+			return None;
+		}
+		let key = self.keys.remove(idx);
+		let overflow = if idx < self.key_overflows.len() {
+			self.key_overflows.remove(idx)
+		} else {
+			0
+		};
+		Some((key, overflow))
+	}
+
+	/// Atomically extracts and returns the key+overflow at idx from parent.
+	/// This is used when a parent key needs to be moved into a child node.
+	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Vec<u8>, u64) {
+		let key = parent.keys[idx].clone();
+		let overflow = parent.get_overflow_at(idx);
+		(key, overflow)
+	}
+
+	/// Insert a key and child pointer with explicit overflow metadata
+	fn insert_key_child_with_overflow(
+		&mut self,
+		key: &[u8],
+		overflow: u64,
+		child_offset: u64,
+		compare: &dyn Comparator,
+	) {
 		let mut idx = 0;
 		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
-
 		self.keys.insert(idx, key.to_vec());
+		self.key_overflows.insert(idx, overflow); // Use provided overflow
 		self.children.insert(idx + 1, child_offset);
 	}
 
-	// Redistributes a key and child from this node to the right node
-	fn redistribute_to_right(&mut self, right: &mut InternalNode, parent_key: Vec<u8>) -> Vec<u8> {
-		// Move parent key down to right node
-		right.keys.insert(0, parent_key);
+	/// Safely gets the overflow offset for a key at the given index
+	fn get_overflow_at(&self, idx: usize) -> u64 {
+		if idx < self.key_overflows.len() {
+			self.key_overflows[idx]
+		} else {
+			0
+		}
+	}
 
-		// Move last key from this node to be the new parent key
-		let new_parent_key = self.keys.pop().unwrap();
+	/// Sets the overflow offset for a key at the given index
+	fn set_overflow_at(&mut self, idx: usize, overflow: u64) {
+		// Ensure vector is large enough
+		while self.key_overflows.len() <= idx {
+			self.key_overflows.push(0);
+		}
+		self.key_overflows[idx] = overflow;
+	}
 
-		// Move last child from this node to right node
+	/// Extracts key+overflow for transferring to another node (removes from this node)
+	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Vec<u8>, u64)> {
+		if idx >= self.keys.len() {
+			return None;
+		}
+		let key = self.keys.remove(idx);
+		let overflow = if idx < self.key_overflows.len() {
+			self.key_overflows.remove(idx)
+		} else {
+			0
+		};
+		Some((key, overflow))
+	}
+
+	/// Inserts a key with its overflow at a specific position
+	fn insert_key_with_overflow(&mut self, idx: usize, key: Vec<u8>, overflow: u64) {
+		self.keys.insert(idx, key);
+		self.key_overflows.insert(idx, overflow);
+	}
+
+	fn redistribute_to_right(
+		&mut self,
+		right: &mut InternalNode,
+		parent_key: Vec<u8>,
+		parent_overflow: u64,
+	) -> (Vec<u8>, u64) {
+		right.insert_key_with_overflow(0, parent_key, parent_overflow);
+
+		let (new_parent_key, new_parent_overflow) =
+			self.extract_key_with_overflow(self.keys.len() - 1).unwrap();
+
 		if !self.children.is_empty() {
 			right.children.insert(0, self.children.pop().unwrap());
 		}
 
-		// Return the new parent key
-		new_parent_key
+		(new_parent_key, new_parent_overflow)
 	}
 
-	// Takes a key and child from the right node
-	fn take_from_right(&mut self, right: &mut InternalNode, parent_key: Vec<u8>) -> Vec<u8> {
-		// Move parent key down to this node
+	fn take_from_right(
+		&mut self,
+		right: &mut InternalNode,
+		parent_key: Vec<u8>,
+		parent_overflow: u64,
+	) -> (Vec<u8>, u64) {
 		self.keys.push(parent_key);
+		self.key_overflows.push(parent_overflow);
 
-		// Move first key from right node to be the new parent key
-		let new_parent_key = right.keys.remove(0);
+		let (new_parent_key, new_parent_overflow) = right.extract_key_with_overflow(0).unwrap();
 
-		// Move first child from right node to this node
 		if !right.children.is_empty() {
 			self.children.push(right.children.remove(0));
 		}
 
-		// Return the new parent key
-		new_parent_key
+		(new_parent_key, new_parent_overflow)
 	}
 
-	// Merges right node into this node
-	fn merge_from_right(&mut self, right: &InternalNode, separator: Vec<u8>) {
-		// Add separator key from parent
+	fn merge_from_right(
+		&mut self,
+		mut right: InternalNode,
+		separator: Vec<u8>,
+		separator_overflow: u64,
+	) {
 		self.keys.push(separator);
+		self.key_overflows.push(separator_overflow);
 
-		// Append right node's keys and children
-		self.keys.extend(right.keys.clone());
-		self.children.extend(right.children.clone());
+		self.keys.append(&mut right.keys);
+		self.key_overflows.append(&mut right.key_overflows);
+		self.children.append(&mut right.children);
 	}
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		// Consider a node to be in underflow if it has less than 30% capacity utilized
-		// This is based on my reading from sqllite implementation
-		self.current_size() < Self::max_size() * 30 / 100
+		self.current_size() * 100 < Self::max_size() * 50
+	}
+
+	fn calculate_size_and_max_key(&self) -> (usize, usize) {
+		let max_per_entry = get_max_internal_entry_bytes();
+		let mut size = INTERNAL_HEADER_SIZE + self.children.len() * CHILD_PTR_SIZE;
+		let mut max_key_len = 0;
+
+		for key in &self.keys {
+			let key_len = key.len();
+			max_key_len = max_key_len.max(key_len);
+
+			let (key_bytes_on_page, needs_overflow) = calculate_overflow(key_len, max_per_entry);
+			size += KEY_SIZE_PREFIX + key_bytes_on_page + overflow_ptr_size(needs_overflow);
+		}
+
+		(size, max_key_len)
 	}
 }
 
@@ -343,11 +524,26 @@ impl Node for InternalNode {
 		// 2. Number of keys (4 bytes)
 		buffer.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
 
-		// 3. Serialize keys with length prefixes
-		for key in &self.keys {
-			// Key serialization (4 + key_len bytes)
-			buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
-			buffer.extend_from_slice(key);
+		let max_per_entry = get_max_internal_entry_bytes();
+
+		// 3. Serialize keys with overflow support
+		for (i, key) in self.keys.iter().enumerate() {
+			let key_len_total = key.len();
+
+			// Determine how much to store on page
+			let (bytes_on_page, needs_overflow) = calculate_overflow(key_len_total, max_per_entry);
+
+			// Write total key length
+			buffer.extend_from_slice(&(key_len_total as u32).to_le_bytes());
+
+			// Write key data that fits on page
+			buffer.extend_from_slice(&key[..bytes_on_page]);
+
+			// Write overflow page offset if needed (only if there's overflow)
+			if needs_overflow {
+				let overflow_offset = self.get_overflow_at(i);
+				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
+			}
 		}
 
 		// 4. Number of children (4 bytes)
@@ -378,9 +574,13 @@ impl Node for InternalNode {
 		// Base size for internal node header
 		let mut size = INTERNAL_HEADER_SIZE;
 
-		// Size for all keys with their length prefixes
+		let max_per_entry = get_max_internal_entry_bytes();
+
+		// Size for all keys accounting for overflow
 		for key in &self.keys {
-			size += KEY_SIZE_PREFIX + key.len();
+			let (key_bytes_on_page, needs_overflow) = calculate_overflow(key.len(), max_per_entry);
+			size += KEY_SIZE_PREFIX + key_bytes_on_page;
+			size += overflow_ptr_size(needs_overflow);
 		}
 
 		// Size for all child pointers
@@ -389,43 +589,40 @@ impl Node for InternalNode {
 		size
 	}
 
-	fn would_fit(&self, key: &[u8], _value: Option<&[u8]>) -> bool {
-		// Calculate size with additional key and child pointer
-		let additional_size = KEY_SIZE_PREFIX + key.len() + CHILD_PTR_SIZE;
-		self.current_size() + additional_size <= Self::max_size()
-	}
-
 	fn can_merge_with(&self, other: &Self) -> bool {
-		let combined_size = self.current_size() + other.current_size();
+		let (self_size, self_max_key) = self.calculate_size_and_max_key();
+		let (other_size, other_max_key) = other.calculate_size_and_max_key();
+
+		let combined_size = self_size + other_size;
 		let actual_merged_size = combined_size - INTERNAL_HEADER_SIZE;
+		let max_key_size = self_max_key.max(other_max_key);
 
-		// We also need to add space for the separator key from parent
-		// Use the maximum key size instead of average to be safe
-		let max_key_size = if !self.keys.is_empty() && !other.keys.is_empty() {
-			let self_max = self.keys.iter().map(|k| k.len()).max().unwrap_or(0);
-			let other_max = other.keys.iter().map(|k| k.len()).max().unwrap_or(0);
-			self_max.max(other_max)
-		} else if !self.keys.is_empty() {
-			self.keys.iter().map(|k| k.len()).max().unwrap_or(0)
-		} else if !other.keys.is_empty() {
-			other.keys.iter().map(|k| k.len()).max().unwrap_or(0)
-		} else {
-			0 // Edge case: both nodes have no keys
-		};
+		let max_per_entry = get_max_internal_entry_bytes();
+		let (separator_on_page, separator_overflow) =
+			calculate_overflow(max_key_size, max_per_entry);
+		let separator_size =
+			KEY_SIZE_PREFIX + separator_on_page + overflow_ptr_size(separator_overflow);
 
-		let with_separator = actual_merged_size + KEY_SIZE_PREFIX + max_key_size;
+		let with_separator = actual_merged_size + separator_size;
 
-		// Check if the combined size is within the maximum
 		with_separator <= Self::max_size()
 	}
 }
 
 #[derive(Debug, Clone)]
+/// Leaf node in the B+ tree
+///
+/// OVERFLOW OWNERSHIP INVARIANT:
+/// - cell_overflows contains overflow chains for the key+value pairs stored in THIS leaf
+/// - Each leaf node owns the overflows for its cells
+/// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
+/// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Vec<u8>>,
-	values: Vec<Vec<u8>>,
-	next_leaf: u64, // 0 means no next leaf
-	prev_leaf: u64, // 0 means no previous leaf
+	keys: Vec<Vec<u8>>,   // Full keys (reconstructed from page + overflow if needed)
+	values: Vec<Vec<u8>>, // Full values (reconstructed from page + overflow if needed)
+	cell_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for cell (key+value)
+	next_leaf: u64,       // 0 means no next leaf
+	prev_leaf: u64,       // 0 means no previous leaf
 	offset: u64,
 }
 
@@ -434,13 +631,17 @@ impl LeafNode {
 		LeafNode {
 			keys: Vec::new(),
 			values: Vec::new(),
+			cell_overflows: Vec::new(),
 			next_leaf: 0,
 			prev_leaf: 0,
 			offset,
 		}
 	}
 
-	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
+	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
+	where
+		F: Fn(u64) -> Result<Vec<u8>>,
+	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Invalid node size {} (expected {})",
@@ -460,49 +661,92 @@ impl LeafNode {
 		let prev_leaf = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
 		buffer_slice = &buffer_slice[8..];
 
-		// We validate by size
+		let max_per_entry = get_max_leaf_entry_bytes();
+
 		let mut keys = Vec::with_capacity(num_keys);
 		let mut values = Vec::with_capacity(num_keys);
+		let mut cell_overflows = Vec::with_capacity(num_keys);
 
 		for _ in 0..num_keys {
-			// Read key
+			// Read key length
 			if buffer_slice.len() < 4 {
 				return Err(BPlusTreeError::Deserialization("Truncated key length".into()));
 			}
 			let key_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
-			if key_len > buffer_slice.len() {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Key length {} exceeds available buffer size {}",
-					key_len,
-					buffer_slice.len()
-				)));
-			}
-			keys.push(buffer_slice[..key_len].to_vec());
-			buffer_slice = &buffer_slice[key_len..];
-
-			// Read value
+			// Read value length
 			if buffer_slice.len() < 4 {
 				return Err(BPlusTreeError::Deserialization("Truncated value length".into()));
 			}
 			let value_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
-			if value_len > buffer_slice.len() {
+			// Calculate combined payload size and overflow
+			let payload_len = key_len + value_len;
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+
+			if bytes_on_page > buffer_slice.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
-					"Value length {} exceeds available buffer size {}",
-					value_len,
+					"Calculated bytes on page {} exceeds available buffer size {}",
+					bytes_on_page,
 					buffer_slice.len()
 				)));
 			}
-			values.push(buffer_slice[..value_len].to_vec());
-			buffer_slice = &buffer_slice[value_len..];
+
+			// Read cell payload from page (combined key+value)
+			let mut cell_data = buffer_slice[..bytes_on_page].to_vec();
+			buffer_slice = &buffer_slice[bytes_on_page..];
+
+			// Check if there's overflow
+			let overflow_offset = if needs_overflow {
+				// Read overflow page offset
+				if buffer_slice.len() < 8 {
+					return Err(BPlusTreeError::Deserialization(
+						"Buffer too small for cell overflow pointer".into(),
+					));
+				}
+				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
+				buffer_slice = &buffer_slice[8..];
+
+				// Read overflow data and append to cell
+				let overflow_data = read_overflow(overflow)?;
+				cell_data.extend_from_slice(&overflow_data);
+
+				overflow
+			} else {
+				0
+			};
+
+			// Validate reconstructed cell size
+			if cell_data.len() != payload_len {
+				return Err(BPlusTreeError::Deserialization(format!(
+					"Reconstructed cell size {} doesn't match expected {}",
+					cell_data.len(),
+					payload_len
+				)));
+			}
+
+			// Split cell_data into key and value
+			if cell_data.len() < key_len {
+				return Err(BPlusTreeError::Deserialization(format!(
+					"Cell data too small {} for key length {}",
+					cell_data.len(),
+					key_len
+				)));
+			}
+			let key_data = cell_data[..key_len].to_vec();
+			let value_data = cell_data[key_len..].to_vec();
+
+			keys.push(key_data);
+			values.push(value_data);
+			cell_overflows.push(overflow_offset);
 		}
 
 		Ok(LeafNode {
 			keys,
 			values,
+			cell_overflows,
 			next_leaf,
 			prev_leaf,
 			offset,
@@ -511,48 +755,85 @@ impl LeafNode {
 
 	// insert a key-value pair into a leaf node at the correct position
 	// If key already exists, update the value (treat as update)
-	fn insert(&mut self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
-		let mut idx = 0;
-		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
-			idx += 1;
+	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was updated, None if new
+	fn insert(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		compare: &dyn Comparator,
+	) -> (usize, Option<u64>) {
+		match self.keys.binary_search_by(|k| compare.compare(k, key)) {
+			Ok(idx) => {
+				// Key exists - update
+				let old_overflow = self.get_overflow_at(idx);
+				self.values[idx] = value.to_vec();
+				self.set_overflow_at(idx, 0);
+				(
+					idx,
+					if old_overflow != 0 {
+						Some(old_overflow)
+					} else {
+						None
+					},
+				)
+			}
+			Err(idx) => {
+				// Key not found - insert
+				self.insert_cell_with_overflow(idx, key.to_vec(), value.to_vec(), 0);
+				(idx, None)
+			}
 		}
-
-		// Check if key already exists at this position
-		if idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Equal {
-			// Key exists, update the value
-			self.values[idx] = value.to_vec();
-		} else {
-			// Key doesn't exist, insert new entry
-			self.keys.insert(idx, key.to_vec());
-			self.values.insert(idx, value.to_vec());
-		}
-		idx
 	}
 
 	// delete a key-value pair from a leaf node
-	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Vec<u8>)> {
-		let idx = self.keys.iter().position(|k| compare.compare(key, k) == Ordering::Equal)?;
+	// Returns (index, value, overflow_offset) so caller can free the overflow chain
+	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Vec<u8>, u64)> {
+		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).ok()?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
-		Some((idx, value))
+		// Remove overflow entry and return it so caller can free it
+		let overflow = if idx < self.cell_overflows.len() {
+			self.cell_overflows.remove(idx)
+		} else {
+			0
+		};
+		Some((idx, value, overflow))
 	}
 
 	// Find a key's position in the leaf
 	fn find_key(&self, key: &[u8], compare: &dyn Comparator) -> Option<usize> {
-		// Binary search to find exact match
-		let mut low = 0;
-		let mut high = self.keys.len();
+		self.keys.binary_search_by(|k| compare.compare(k, key)).ok()
+	}
 
-		while low < high {
-			let mid = low + (high - low) / 2;
-			match compare.compare(key, &self.keys[mid]) {
-				Ordering::Less => high = mid,
-				Ordering::Equal => return Some(mid),
-				Ordering::Greater => low = mid + 1,
-			}
+	/// Safely gets the overflow offset for a cell at the given index
+	fn get_overflow_at(&self, idx: usize) -> u64 {
+		if idx < self.cell_overflows.len() {
+			self.cell_overflows[idx]
+		} else {
+			0
 		}
+	}
 
-		None
+	/// Sets the overflow offset for a cell at the given index
+	fn set_overflow_at(&mut self, idx: usize, overflow: u64) {
+		// Ensure vector is large enough
+		while self.cell_overflows.len() <= idx {
+			self.cell_overflows.push(0);
+		}
+		self.cell_overflows[idx] = overflow;
+	}
+
+	/// Inserts a cell (key+value) with overflow at a specific position
+	fn insert_cell_with_overflow(
+		&mut self,
+		idx: usize,
+		key: Vec<u8>,
+		value: Vec<u8>,
+		overflow: u64,
+	) {
+		self.keys.insert(idx, key);
+		self.values.insert(idx, value);
+		self.cell_overflows.insert(idx, overflow);
 	}
 
 	// Redistributes keys from this leaf to the target leaf
@@ -560,12 +841,14 @@ impl LeafNode {
 		// Move last key-value pair from this node to right node
 		let last_key = self.keys.pop().unwrap();
 		let last_value = self.values.pop().unwrap();
+		let last_overflow = self.cell_overflows.pop().unwrap_or(0);
 
-		right.keys.insert(0, last_key.clone());
+		let separator = last_key.clone();
+		right.keys.insert(0, last_key);
 		right.values.insert(0, last_value);
+		right.cell_overflows.insert(0, last_overflow);
 
-		// Return the separator key (first key in right node)
-		right.keys[0].clone()
+		separator
 	}
 
 	// Takes keys from right leaf
@@ -573,83 +856,53 @@ impl LeafNode {
 		// Move first key-value pair from right node to this node
 		let first_key = right.keys.remove(0);
 		let first_value = right.values.remove(0);
+		let first_overflow = if !right.cell_overflows.is_empty() {
+			right.cell_overflows.remove(0)
+		} else {
+			0
+		};
 
-		self.keys.push(first_key.clone());
+		self.keys.push(first_key);
 		self.values.push(first_value);
+		self.cell_overflows.push(first_overflow);
 
-		// If right node still has keys, return its first key as the new separator
+		// Return new separator (first key of right if it exists)
 		if !right.keys.is_empty() {
 			right.keys[0].clone()
 		} else {
-			first_key
+			// Right is now empty, use the current last key
+			self.keys.last().unwrap().clone()
 		}
 	}
 
-	// Merges the right node into this node
-	fn merge_from_right(&mut self, right: &LeafNode) {
-		// Append all keys and values from right node
-		self.keys.extend(right.keys.clone());
-		self.values.extend(right.values.clone());
+	fn merge_from_right(&mut self, mut right: LeafNode) {
+		self.keys.append(&mut right.keys);
+		self.values.append(&mut right.values);
+		self.cell_overflows.append(&mut right.cell_overflows);
 
-		// Update next_leaf pointer
 		self.next_leaf = right.next_leaf;
 	}
 
-	// Find optimal split point based on size
-	fn find_split_point(&self, key: &[u8], value: &[u8], compare: &dyn Comparator) -> usize {
-		// Find where the new key would go
-		let mut insert_idx = 0;
-		while insert_idx < self.keys.len()
-			&& compare.compare(key, &self.keys[insert_idx]) == Ordering::Greater
-		{
-			insert_idx += 1;
-		}
-
-		// Create temporary arrays to simulate the insertion
-		let mut temp_keys = self.keys.clone();
-		let mut temp_values = self.values.clone();
-
-		temp_keys.insert(insert_idx, key.to_vec());
-		temp_values.insert(insert_idx, value.to_vec());
-
-		// Calculate target size (approximately half the total)
-		let total_size =
-			self.current_size() + KEY_SIZE_PREFIX + key.len() + VALUE_SIZE_PREFIX + value.len();
-		let target_size = total_size / 2;
-
-		// Find split point that results in approximately balanced sizes
-		let mut current_size = LEAF_HEADER_SIZE;
-		let mut split_idx = 0;
-
-		for (i, (key, value)) in temp_keys.iter().zip(&temp_values).enumerate() {
-			let entry_size = KEY_SIZE_PREFIX + key.len() + VALUE_SIZE_PREFIX + value.len();
-
-			if current_size + entry_size > target_size && i > 0 {
-				split_idx = i;
-				break;
-			}
-
-			current_size += entry_size;
-		}
-
-		// Ensure we don't split at the end
-		if split_idx == 0 || split_idx >= temp_keys.len() - 1 {
-			split_idx = temp_keys.len() / 2;
-		}
-
-		split_idx
+	fn find_split_point(&self) -> usize {
+		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
+		self.keys.len().div_ceil(2)
 	}
 
 	// Check if this leaf can fit another key-value pair
 	fn can_fit_entry(&self, key: &[u8], value: &[u8]) -> bool {
-		self.would_fit(key, Some(value))
+		let max_per_entry = get_max_leaf_entry_bytes();
+		let payload_len = key.len() + value.len();
+		let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+
+		let entry_size =
+			KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow);
+
+		self.current_size() + entry_size <= PAGE_SIZE
 	}
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		// Consider a node to be in underflow if it has less than 30% capacity utilized
-		// This is based on my reading from sqllite implementation
-		self.current_size() < Self::max_size() * 30 / 100
+		self.current_size() * 100 < Self::max_size() * 50
 	}
 }
 
@@ -669,15 +922,34 @@ impl Node for LeafNode {
 		// 4. Previous leaf pointer (8 bytes)
 		buffer.extend_from_slice(&self.prev_leaf.to_le_bytes());
 
-		// 5. Serialize keys and values
-		for (key, value) in self.keys.iter().zip(&self.values) {
-			// Key serialization (4 + key_len bytes)
-			buffer.extend_from_slice(&(key.len() as u32).to_le_bytes());
-			buffer.extend_from_slice(key);
+		let max_per_entry = get_max_leaf_entry_bytes();
 
-			// Value serialization (4 + value_len bytes)
-			buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
-			buffer.extend_from_slice(value);
+		// 5. Serialize cells (key+value pairs) with overflow support
+		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
+			let key_len = key.len();
+			let value_len = value.len();
+			let payload_len = key_len + value_len;
+
+			// Write key and value lengths
+			buffer.extend_from_slice(&(key_len as u32).to_le_bytes());
+			buffer.extend_from_slice(&(value_len as u32).to_le_bytes());
+
+			// Calculate overflow for combined payload
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+
+			// Create combined cell data
+			let mut cell_data = Vec::with_capacity(payload_len);
+			cell_data.extend_from_slice(key);
+			cell_data.extend_from_slice(value);
+
+			// Write cell data that fits on page
+			buffer.extend_from_slice(&cell_data[..bytes_on_page]);
+
+			// Write cell overflow page offset if needed
+			if needs_overflow {
+				let overflow_offset = self.get_overflow_at(i);
+				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
+			}
 		}
 
 		// 6. Calculate total space used
@@ -700,21 +972,24 @@ impl Node for LeafNode {
 		// Base size for leaf node header
 		let mut size = LEAF_HEADER_SIZE;
 
-		// Size for all keys and values with their length prefixes
+		let max_per_entry = get_max_leaf_entry_bytes();
+
+		// Size for all cells accounting for overflow
 		for (key, value) in self.keys.iter().zip(&self.values) {
-			size += KEY_SIZE_PREFIX + key.len() + VALUE_SIZE_PREFIX + value.len();
+			let payload_len = key.len() + value.len();
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+
+			// Key and value length prefixes
+			size += KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX;
+			// Cell payload on page
+			size += bytes_on_page;
+			// Overflow pointer if needed
+			if needs_overflow {
+				size += 8;
+			}
 		}
 
 		size
-	}
-
-	fn would_fit(&self, key: &[u8], value: Option<&[u8]>) -> bool {
-		// Ensure value is provided for leaf nodes
-		let value = value.expect("Value must be provided for leaf nodes");
-
-		// Calculate size with additional key-value pair
-		let additional_size = KEY_SIZE_PREFIX + key.len() + VALUE_SIZE_PREFIX + value.len();
-		self.current_size() + additional_size <= Self::max_size()
 	}
 
 	fn can_merge_with(&self, other: &Self) -> bool {
@@ -845,26 +1120,101 @@ impl TrunkPage {
 	}
 }
 
+// Overflow page structure for storing large keys/values that don't fit on a single page
+#[derive(Debug, Clone)]
+struct OverflowPage {
+	next_overflow: u64, // 0 means last in chain
+	data: Vec<u8>,      // Payload data
+	offset: u64,        // Offset of this overflow page
+}
+
+impl OverflowPage {
+	fn new(offset: u64) -> Self {
+		OverflowPage {
+			next_overflow: 0,
+			data: Vec::new(),
+			offset,
+		}
+	}
+
+	fn serialize(&self) -> Result<Vec<u8>> {
+		let mut buffer = Vec::with_capacity(PAGE_SIZE);
+
+		// 1. Page type (1 byte)
+		buffer.push(NODE_TYPE_OVERFLOW);
+
+		// 2. Next overflow pointer (8 bytes)
+		buffer.extend_from_slice(&self.next_overflow.to_le_bytes());
+
+		// 3. Data length (4 bytes)
+		buffer.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+
+		// 4. Data
+		buffer.extend_from_slice(&self.data);
+
+		// 5. Validate size
+		if buffer.len() > PAGE_SIZE {
+			return Err(BPlusTreeError::Serialization(format!(
+				"Overflow page data too large: {} bytes (max {})",
+				buffer.len(),
+				PAGE_SIZE
+			)));
+		}
+
+		// 6. Pad to fill page
+		buffer.resize(PAGE_SIZE, 0);
+
+		Ok(buffer)
+	}
+
+	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
+		if buffer.len() != PAGE_SIZE {
+			return Err(BPlusTreeError::Deserialization(format!(
+				"Invalid overflow page size: {} (expected {})",
+				buffer.len(),
+				PAGE_SIZE
+			)));
+		}
+
+		if buffer[0] != NODE_TYPE_OVERFLOW {
+			return Err(BPlusTreeError::Deserialization("Not an overflow page".into()));
+		}
+
+		// Read next overflow pointer (8 bytes)
+		let next_overflow = u64::from_le_bytes(buffer[1..9].try_into().unwrap());
+
+		// Read data length (4 bytes)
+		let data_len = u32::from_le_bytes(buffer[9..13].try_into().unwrap()) as usize;
+
+		// Validate data length
+		if data_len > PAGE_SIZE - 13 {
+			return Err(BPlusTreeError::Deserialization(format!(
+				"Invalid overflow data length: {}",
+				data_len
+			)));
+		}
+
+		// Read data
+		let data = buffer[13..13 + data_len].to_vec();
+
+		Ok(OverflowPage {
+			next_overflow,
+			data,
+			offset,
+		})
+	}
+
+	// Maximum data that can be stored in a single overflow page
+	fn max_data_size() -> usize {
+		PAGE_SIZE - 13 // 1 byte type + 8 bytes next_overflow + 4 bytes data_len
+	}
+}
+
 #[derive(Clone)]
 enum NodeType {
 	Internal(InternalNode),
 	Leaf(LeafNode),
-}
-
-impl NodeType {
-	fn deserialize(buffer: &[u8], offset: u64) -> Result<Self> {
-		if buffer.is_empty() {
-			return Err(BPlusTreeError::Deserialization("Empty buffer".into()));
-		}
-
-		match buffer[0] {
-			NODE_TYPE_INTERNAL => {
-				Ok(NodeType::Internal(InternalNode::deserialize(buffer, offset)?))
-			}
-			NODE_TYPE_LEAF => Ok(NodeType::Leaf(LeafNode::deserialize(buffer, offset)?)),
-			_ => Err(BPlusTreeError::InvalidNodeType),
-		}
-	}
+	Overflow(OverflowPage),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -877,6 +1227,72 @@ pub enum Durability {
 	Manual,
 }
 
+/// Calculate maximum bytes per entry to ensure minimum entries per page
+fn calculate_max_bytes_per_entry(is_leaf: bool) -> usize {
+	let min_entries = if is_leaf {
+		3
+	} else {
+		4
+	};
+	let header_size = if is_leaf {
+		LEAF_HEADER_SIZE
+	} else {
+		INTERNAL_HEADER_SIZE
+	};
+	let usable = PAGE_SIZE - header_size;
+
+	// Reserve space for: entry metadata (length fields) + overflow pointers
+	let metadata_per_entry = if is_leaf {
+		KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + 8 // +8 for potential cell overflow ptr
+	} else {
+		KEY_SIZE_PREFIX + CHILD_PTR_SIZE + 8 // +8 for overflow ptr
+	};
+
+	(usable / min_entries).saturating_sub(metadata_per_entry)
+}
+
+/// Calculate how much of payload to store on page
+/// Returns (bytes_on_page, needs_overflow)
+fn calculate_overflow(payload_size: usize, max_per_entry: usize) -> (usize, bool) {
+	if payload_size <= max_per_entry {
+		(payload_size, false)
+	} else {
+		// Keep half or max_per_entry, whichever is smaller
+		let bytes_on_page = (payload_size / 2).min(max_per_entry);
+		(bytes_on_page, true)
+	}
+}
+
+/// Size of an overflow pointer
+const OVERFLOW_PTR_SIZE: usize = 8;
+
+/// Size of overflow pointer if needed
+#[inline]
+const fn overflow_ptr_size(needs_overflow: bool) -> usize {
+	if needs_overflow {
+		OVERFLOW_PTR_SIZE
+	} else {
+		0
+	}
+}
+
+/// Calculate the on-page size for an internal node entry (key + child pointer + overflow)
+#[inline]
+fn internal_entry_size(key: &[u8]) -> usize {
+	let max_per_entry = get_max_internal_entry_bytes();
+	let (key_on_page, needs_overflow) = calculate_overflow(key.len(), max_per_entry);
+	KEY_SIZE_PREFIX + key_on_page + CHILD_PTR_SIZE + overflow_ptr_size(needs_overflow)
+}
+
+/// Calculate the on-page size for a leaf node entry (key+value + overflow)
+#[inline]
+fn leaf_entry_size(key: &[u8], value: &[u8]) -> usize {
+	let max_per_entry = get_max_leaf_entry_bytes();
+	let payload_len = key.len() + value.len();
+	let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+	KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow)
+}
+
 pub struct BPlusTree<F: VfsFile> {
 	file: F,
 	header: Header,
@@ -887,7 +1303,7 @@ pub struct BPlusTree<F: VfsFile> {
 
 impl<F: VfsFile> Drop for BPlusTree<F> {
 	fn drop(&mut self) {
-		if let Err(e) = self.flush() {
+		if let Err(e) = self.close() {
 			log::error!("Error during BPlusTree drop: {}", e);
 		}
 	}
@@ -921,7 +1337,11 @@ impl<F: VfsFile> BPlusTree<F> {
 			};
 
 			// Create cache
-			let cache = Cache::with_weighter(CACHE_CAPACITY as usize, CACHE_CAPACITY, NodeWeighter);
+			let cache = Cache::with_weighter(
+				DEFAULT_CACHE_CAPACITY as usize,
+				DEFAULT_CACHE_CAPACITY,
+				NodeWeighter,
+			);
 
 			(header, cache)
 		} else {
@@ -930,7 +1350,11 @@ impl<F: VfsFile> BPlusTree<F> {
 			file.read_at(0, &mut buffer)?;
 			let header = Header::deserialize(&buffer)?;
 
-			let cache = Cache::with_weighter(CACHE_CAPACITY as usize, CACHE_CAPACITY, NodeWeighter);
+			let cache = Cache::with_weighter(
+				DEFAULT_CACHE_CAPACITY as usize,
+				DEFAULT_CACHE_CAPACITY,
+				NodeWeighter,
+			);
 
 			(header, cache)
 		};
@@ -954,7 +1378,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			// Create initial root node
 			let root = LeafNode::new(tree.header.root_offset);
 			tree.write_node(&NodeType::Leaf(root))?;
-			tree.file.sync()?;
+			tree.file.sync_data()?;
 		} else {
 			// Read root node into cache
 			tree.read_node(tree.header.root_offset)?;
@@ -985,20 +1409,10 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-		// Check if combined size of key and value would ever fit in a node
-		// TODO: This has to be replaced using overflow pages
-		let min_entry_size = KEY_SIZE_PREFIX + key.len() + VALUE_SIZE_PREFIX + value.len();
-		if min_entry_size > LeafNode::max_size() - LEAF_HEADER_SIZE {
-			return Err(BPlusTreeError::KeyValueTooLarge);
-		}
-
-		// Using a stack to track the path from root to leaf
-		// Each entry contains (node_offset, parent_offset)
 		let mut path = Vec::new();
 		let mut current_offset = self.header.root_offset;
 		let mut parent_offset = None;
 
-		// Traverse down to the leaf node where key should be inserted
 		loop {
 			let node_type = if let Some(node) = self.cache.get(&current_offset) {
 				node.clone()
@@ -1008,32 +1422,32 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			match node_type {
 				NodeType::Internal(internal) => {
-					// Push current node to path before moving to child
 					path.push((current_offset, parent_offset));
 
-					// Find the appropriate child
 					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					parent_offset = Some(current_offset);
 					current_offset = internal.children[child_idx];
-
-					// Continue to next iteration (deeper in the tree)
 				}
 				NodeType::Leaf(mut leaf) => {
-					// Found the leaf node where key should be inserted
 					if leaf.can_fit_entry(key, value) {
-						// Simple case: leaf has space
 						self.insert_into_leaf(&mut leaf, key, value)?;
 						return Ok(());
 					} else {
-						// Leaf is full, need to split
-						// First perform the split
-						let (promoted_key, new_leaf_offset) =
+						let (promoted_key, promoted_overflow, new_leaf_offset) =
 							self.split_leaf(&mut leaf, key, value)?;
 
-						// Process the split upwards
-						self.handle_splits(parent_offset, promoted_key, new_leaf_offset, path)?;
+						self.handle_splits(
+							parent_offset,
+							promoted_key,
+							promoted_overflow,
+							new_leaf_offset,
+							path,
+						)?;
 						return Ok(());
 					}
+				}
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::UnexpectedOverflowPage(current_offset));
 				}
 			}
 		}
@@ -1043,79 +1457,71 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		mut parent_offset: Option<u64>,
 		mut promoted_key: Vec<u8>,
+		mut promoted_overflow: u64,
 		mut new_node_offset: u64,
 		mut path: Vec<(u64, Option<u64>)>,
 	) -> Result<()> {
 		loop {
 			match parent_offset {
 				None => {
-					// No parent means we need a new root
 					let new_root_offset = self.allocate_page()?;
 					let mut new_root = InternalNode::new(new_root_offset);
 
-					// Set up the new root with the old root and new node
 					new_root.keys.push(promoted_key);
+					new_root.key_overflows.push(promoted_overflow);
 					new_root.children.push(if path.is_empty() {
-						// If path is empty, we're splitting the root leaf
 						self.header.root_offset
 					} else {
-						// Otherwise, the last node offset in the path is the current root
 						path.last().unwrap().0
 					});
 					new_root.children.push(new_node_offset);
 
-					// Update tree header and write the new root
 					self.header.root_offset = new_root_offset;
 					self.write_header()?;
 					self.write_node(&NodeType::Internal(new_root))?;
 
-					// We're done when we create a new root
 					return Ok(());
 				}
 				Some(offset) => {
-					// Get the parent node
 					let mut parent = match self.cache.get(&offset) {
 						Some(NodeType::Internal(ref node)) => node.clone(),
-						_ => match self.read_node(offset)? {
-							NodeType::Internal(node) => node,
-							_ => return Err(BPlusTreeError::InvalidNodeType),
-						},
+						_ => self.read_internal_node(offset)?,
 					};
 
-					// Check if adding this entry would put us close to the maximum size
-					let entry_size = KEY_SIZE_PREFIX + promoted_key.len() + CHILD_PTR_SIZE;
+					let max_per_entry = get_max_internal_entry_bytes();
+					let (key_on_page, key_overflow) =
+						calculate_overflow(promoted_key.len(), max_per_entry);
+					let entry_size = KEY_SIZE_PREFIX
+						+ key_on_page + CHILD_PTR_SIZE
+						+ overflow_ptr_size(key_overflow);
 					let would_be_size = parent.current_size() + entry_size;
-					let size_threshold = InternalNode::max_size() - 256; // Leave buffer
+					let size_threshold = InternalNode::max_size();
 
 					if would_be_size <= size_threshold {
-						// Parent has enough space with buffer, insert the new key and child
-						parent.insert_key_child(
+						parent.insert_key_child_with_overflow(
 							&promoted_key,
+							promoted_overflow,
 							new_node_offset,
 							self.compare.as_ref(),
 						);
 						self.write_node(&NodeType::Internal(parent))?;
 
-						// Done when we find a parent with enough space
 						return Ok(());
 					} else {
-						// Parent is also full, split it and continue upward
-						let (next_promoted_key, next_new_node_offset) = self
-							.split_internal_with_child(
+						let (next_promoted_key, next_promoted_overflow, next_new_node_offset) =
+							self.split_internal_with_child(
 								&mut parent,
 								&promoted_key,
+								promoted_overflow,
 								new_node_offset,
 							)?;
 
-						// Pop the next level off the path stack
 						let (_, next_parent) = path.pop().unwrap_or_default();
 
-						// Move up one level in the tree
 						promoted_key = next_promoted_key;
+						promoted_overflow = next_promoted_overflow;
 						new_node_offset = next_new_node_offset;
 						parent_offset = next_parent;
-
-						// Continue to next iteration (process grandparent)
 					}
 				}
 			}
@@ -1123,8 +1529,12 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: &[u8], value: &[u8]) -> Result<()> {
-		leaf.insert(key, value, self.compare.as_ref());
-		self.write_node(&NodeType::Leaf(leaf.clone()))?;
+		let (_idx, old_overflow) = leaf.insert(key, value, self.compare.as_ref());
+		if let Some(overflow) = old_overflow {
+			self.free_overflow_chain(overflow)?;
+		}
+		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
+		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
 		Ok(())
 	}
 
@@ -1133,68 +1543,57 @@ impl<F: VfsFile> BPlusTree<F> {
 		leaf: &mut LeafNode,
 		key: &[u8],
 		value: &[u8],
-	) -> Result<(Vec<u8>, u64)> {
-		// Find optimal split point
-		let split_idx = leaf.find_split_point(key, value, self.compare.as_ref());
+	) -> Result<(Vec<u8>, u64, u64)> {
+		let split_idx = leaf.find_split_point();
 
-		// Create new leaf
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
 
-		// Find insertion point for the new key-value
-		let mut idx = 0;
-		while idx < leaf.keys.len()
-			&& self.compare.compare(key, &leaf.keys[idx]) == Ordering::Greater
-		{
-			idx += 1;
-		}
+		let idx =
+			leaf.keys.binary_search_by(|k| self.compare.compare(k, key)).unwrap_or_else(|idx| idx);
 
-		// Check if key already exists
 		let is_duplicate =
 			idx < leaf.keys.len() && self.compare.compare(key, &leaf.keys[idx]) == Ordering::Equal;
 
 		if idx < split_idx {
-			// New entry belongs in the left node
-			// Move entries after split_idx to new leaf
-			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.values = leaf.values.drain(split_idx..).collect();
+			new_leaf.keys = leaf.keys.split_off(split_idx);
+			new_leaf.values = leaf.values.split_off(split_idx);
+			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
 
 			if is_duplicate {
-				// Update existing key-value in left node
+				if leaf.get_overflow_at(idx) != 0 {
+					self.free_overflow_chain(leaf.get_overflow_at(idx))?;
+				}
 				leaf.values[idx] = value.to_vec();
+				leaf.set_overflow_at(idx, 0);
 			} else {
-				// Insert the new key-value into leaf
-				leaf.keys.insert(idx, key.to_vec());
-				leaf.values.insert(idx, value.to_vec());
+				leaf.insert_cell_with_overflow(idx, key.to_vec(), value.to_vec(), 0);
 			}
 		} else {
-			// New entry belongs in the right node
-			// Adjust index for the right node
 			let right_idx = idx - split_idx;
 
-			// Move entries after split_idx to new leaf
-			new_leaf.keys = leaf.keys.drain(split_idx..).collect();
-			new_leaf.values = leaf.values.drain(split_idx..).collect();
+			new_leaf.keys = leaf.keys.split_off(split_idx);
+			new_leaf.values = leaf.values.split_off(split_idx);
+			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
 
 			if is_duplicate {
-				// Update existing key-value in right node
+				if new_leaf.get_overflow_at(right_idx) != 0 {
+					self.free_overflow_chain(new_leaf.get_overflow_at(right_idx))?;
+				}
 				new_leaf.values[right_idx] = value.to_vec();
+				new_leaf.set_overflow_at(right_idx, 0);
 			} else {
-				// Insert the new key-value into new leaf
-				new_leaf.keys.insert(right_idx, key.to_vec());
-				new_leaf.values.insert(right_idx, value.to_vec());
+				new_leaf.insert_cell_with_overflow(right_idx, key.to_vec(), value.to_vec(), 0);
 			}
 		}
 
-		// Update leaf pointers for linked list
 		new_leaf.next_leaf = leaf.next_leaf;
 		new_leaf.prev_leaf = leaf.offset;
 		leaf.next_leaf = new_leaf.offset;
 
-		// Get the promoted key (first key of right node)
 		let promoted_key = new_leaf.keys[0].clone();
+		let promoted_overflow = 0;
 
-		// If the new leaf has a next leaf, update its prev pointer
 		let next_leaf_update = if new_leaf.next_leaf != 0 {
 			Some(new_leaf.next_leaf)
 		} else {
@@ -1203,115 +1602,75 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		let new_leaf_offset = new_leaf.offset;
 
-		// Write both leaves
-		self.write_node(&NodeType::Leaf(leaf.clone()))?;
-		self.write_node(&NodeType::Leaf(new_leaf))?;
+		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
+		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
+		self.write_node_owned(NodeType::Leaf(new_leaf))?;
 
-		// Update the next node's prev pointer if needed
 		if let Some(next_offset) = next_leaf_update {
 			if let NodeType::Leaf(mut next_leaf) = self.read_node(next_offset)? {
 				next_leaf.prev_leaf = new_leaf_offset;
-				self.write_node(&NodeType::Leaf(next_leaf))?;
+				self.write_node_owned(NodeType::Leaf(next_leaf))?;
 			}
 		}
 
-		// Return the key that will be promoted to the parent and the new leaf offset
-		Ok((promoted_key, new_leaf_offset))
+		Ok((promoted_key, promoted_overflow, new_leaf_offset))
 	}
 
 	fn split_internal_with_child(
 		&mut self,
 		node: &mut InternalNode,
 		extra_key: &[u8],
+		extra_overflow: u64,
 		extra_child: u64,
-	) -> Result<(Vec<u8>, u64)> {
-		// Find where the extra key would be inserted
+	) -> Result<(Vec<u8>, u64, u64)> {
 		let insert_idx = node
 			.keys
 			.binary_search_by(|key| self.compare.compare(key, extra_key))
 			.unwrap_or_else(|idx| idx);
 
-		let mut split_idx = Self::find_size_based_split_point(node, extra_key, insert_idx);
+		let mut split_idx = Self::find_split_point(node, insert_idx);
 
-		// Just bounds check the split_idx before using it
 		split_idx = split_idx.min(node.keys.len() - 1);
 
-		// Create new internal node
 		let new_node_offset = self.allocate_page()?;
 		let mut new_node = InternalNode::new(new_node_offset);
 
-		// Key to be promoted to parent
 		let promoted_key = node.keys[split_idx].clone();
+		let promoted_overflow = node.get_overflow_at(split_idx);
 
-		// Move keys and children after split point to new node
 		new_node.keys = node.keys.split_off(split_idx + 1);
+		new_node.key_overflows = node.key_overflows.split_off(split_idx + 1);
 		new_node.children = node.children.split_off(split_idx + 1);
 
-		// Remove the middle key from the original node (it gets promoted)
 		node.keys.truncate(split_idx);
+		node.key_overflows.truncate(split_idx);
 
-		// NOW insert the extra key/child into the appropriate node
 		if insert_idx <= split_idx {
-			// Extra key goes to left node (original)
-			node.insert_key_child(extra_key, extra_child, self.compare.as_ref());
+			node.insert_key_child_with_overflow(
+				extra_key,
+				extra_overflow,
+				extra_child,
+				self.compare.as_ref(),
+			);
 		} else {
-			// Extra key goes to right node (new)
 			let right_insert_idx = insert_idx - split_idx - 1;
 			new_node.keys.insert(right_insert_idx, extra_key.to_vec());
+			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
 			new_node.children.insert(right_insert_idx + 1, extra_child);
 		}
 
-		// Write both nodes
-		self.write_node(&NodeType::Internal(node.clone()))?;
-		self.write_node(&NodeType::Internal(new_node))?;
+		let node_owned = std::mem::replace(node, InternalNode::new(node.offset));
+		self.write_node_owned(NodeType::Internal(node_owned))?;
+		self.write_node_owned(NodeType::Internal(new_node))?;
 
-		Ok((promoted_key, new_node_offset))
+		Ok((promoted_key, promoted_overflow, new_node_offset))
 	}
 
-	fn find_size_based_split_point(
-		node: &InternalNode,
-		extra_key: &[u8],
-		insert_idx: usize,
-	) -> usize {
-		// Create a virtual view of what the keys would look like after insertion
-		// (without actually inserting to avoid overflow)
-		let mut virtual_keys = Vec::with_capacity(node.keys.len() + 1);
+	fn find_split_point(node: &InternalNode, insert_idx: usize) -> usize {
+		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
 
-		for (i, key) in node.keys.iter().enumerate() {
-			if i == insert_idx {
-				virtual_keys.push(extra_key);
-			}
-			virtual_keys.push(key);
-		}
-		if insert_idx >= node.keys.len() {
-			virtual_keys.push(extra_key);
-		}
-
-		// Calculate target size (approximately half)
-		let current_size = node.current_size();
-		let extra_size = KEY_SIZE_PREFIX + extra_key.len() + CHILD_PTR_SIZE;
-		let total_size = current_size + extra_size;
-		let target_size = total_size / 2;
-
-		// Find split point that results in approximately balanced sizes
-		let mut current_size = INTERNAL_HEADER_SIZE;
-		let mut split_idx = 0;
-
-		for (i, key) in virtual_keys.iter().enumerate() {
-			let entry_size = KEY_SIZE_PREFIX + key.len() + CHILD_PTR_SIZE;
-
-			if current_size + entry_size > target_size && i > 0 {
-				split_idx = i;
-				break;
-			}
-
-			current_size += entry_size;
-		}
-
-		// Ensure we don't split at the end
-		if split_idx == 0 || split_idx >= virtual_keys.len() - 1 {
-			split_idx = virtual_keys.len() / 2;
-		}
+		let total_keys = node.keys.len() + 1;
+		let split_idx = total_keys / 2;
 
 		if split_idx > insert_idx {
 			split_idx - 1
@@ -1322,34 +1681,32 @@ impl<F: VfsFile> BPlusTree<F> {
 
 	#[allow(unused)]
 	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		self.get_internal(self.header.root_offset, key)
-	}
+		let mut current_offset = self.header.root_offset;
 
-	fn get_internal(&self, node_offset: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		match self.read_node(node_offset)? {
-			NodeType::Internal(internal) => {
-				// Find appropriate child
-				let child_idx = internal.find_child_index(key, self.compare.as_ref());
+		loop {
+			let node = self.read_node(current_offset)?;
 
-				// Search in the appropriate child
-				self.get_internal(internal.children[child_idx], key)
-			}
-			NodeType::Leaf(leaf) => {
-				// Search for the key in the leaf
-				match leaf.find_key(key, self.compare.as_ref()) {
-					Some(idx) => Ok(Some(leaf.values[idx].clone())),
-					None => Ok(None),
+			match node {
+				NodeType::Internal(internal) => {
+					let child_idx = internal.find_child_index(key, self.compare.as_ref());
+					current_offset = internal.children[child_idx];
+				}
+				NodeType::Leaf(leaf) => {
+					return Ok(leaf
+						.find_key(key, self.compare.as_ref())
+						.map(|idx| leaf.values[idx].clone()));
+				}
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::UnexpectedOverflowPage(current_offset));
 				}
 			}
 		}
 	}
 
 	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-		// Start with the root node
 		let mut node_offset = self.header.root_offset;
-		let mut path = Vec::new(); // Track path from root to leaf
+		let mut path = Vec::new();
 
-		// Step 1: Traverse to the leaf containing the key (or where it should be)
 		loop {
 			let node_type = if let Some(node) = self.cache.get(&node_offset) {
 				node.clone()
@@ -1359,28 +1716,36 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			match node_type {
 				NodeType::Internal(internal) => {
-					// Find child index and push current node to path
 					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					path.push((node_offset, child_idx));
 					node_offset = internal.children[child_idx];
 				}
-				NodeType::Leaf(mut leaf) => {
-					// Found the leaf node, attempt to delete
-					match leaf.delete(key, self.compare.as_ref()) {
-						Some((_, value)) => {
-							// Write updated leaf first
-							self.write_node(&NodeType::Leaf(leaf.clone()))?;
-
-							// Step 2: Handle node underflow from bottom up
-							self.handle_underflows(&mut path)?;
-
-							// Step 3: Handle potentially empty root
-							self.handle_empty_root()?;
-
-							return Ok(Some(value));
+				NodeType::Leaf(mut leaf) => match leaf.delete(key, self.compare.as_ref()) {
+					Some((_, value, overflow)) => {
+						if overflow != 0 {
+							self.free_overflow_chain(overflow)?;
 						}
-						None => return Ok(None), // Key not found
+
+						let leaf_offset = leaf.offset;
+						let is_underflow = leaf.is_underflow();
+
+						let leaf_owned = std::mem::replace(&mut leaf, LeafNode::new(leaf_offset));
+						self.write_node_owned(NodeType::Leaf(leaf_owned))?;
+
+						if is_underflow && !path.is_empty() {
+							self.handle_underflows(&mut path)?;
+						}
+
+						self.handle_empty_root()?;
+
+						return Ok(Some(value));
 					}
+					None => {
+						return Ok(None);
+					}
+				},
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::UnexpectedOverflowPage(node_offset));
 				}
 			}
 		}
@@ -1389,10 +1754,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn handle_underflows(&mut self, path: &mut Vec<(u64, usize)>) -> Result<()> {
 		// Process path from leaf up to root
 		while let Some((parent_offset, child_idx)) = path.pop() {
-			let mut parent = match self.read_node(parent_offset)? {
-				NodeType::Internal(internal) => internal,
-				_ => return Err(BPlusTreeError::InvalidNodeType),
-			};
+			let mut parent = self.read_internal_node(parent_offset)?;
 
 			let child_offset = parent.children[child_idx];
 
@@ -1402,7 +1764,10 @@ impl<F: VfsFile> BPlusTree<F> {
 					if internal.is_underflow() {
 						// Handle underflow in internal node
 						self.handle_underflow(&mut parent, child_idx, true)?;
-						self.write_node(&NodeType::Internal(parent.clone()))?;
+						let parent_offset = parent.offset;
+						let parent_owned =
+							std::mem::replace(&mut parent, InternalNode::new(parent_offset));
+						self.write_node_owned(NodeType::Internal(parent_owned))?;
 
 						// If the parent itself is now in underflow, continue processing
 						if parent.is_underflow() {
@@ -1422,7 +1787,10 @@ impl<F: VfsFile> BPlusTree<F> {
 					if leaf.is_underflow() {
 						// Handle underflow in leaf node
 						self.handle_underflow(&mut parent, child_idx, false)?;
-						self.write_node(&NodeType::Internal(parent.clone()))?;
+						let parent_offset = parent.offset;
+						let parent_owned =
+							std::mem::replace(&mut parent, InternalNode::new(parent_offset));
+						self.write_node_owned(NodeType::Internal(parent_owned))?;
 
 						// If the parent itself is now in underflow, continue processing
 						if parent.is_underflow() {
@@ -1437,6 +1805,9 @@ impl<F: VfsFile> BPlusTree<F> {
 						// Child is fine, no need to continue
 						break;
 					}
+				}
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::UnexpectedOverflowPage(child_offset));
 				}
 			}
 		}
@@ -1527,23 +1898,21 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	// Handles the case where the root might be empty after deletion
 	fn handle_empty_root(&mut self) -> Result<()> {
 		match self.read_node(self.header.root_offset)? {
 			NodeType::Internal(internal) => {
 				if internal.keys.is_empty() && internal.children.len() == 1 {
-					// The root is empty, make its only child the new root
 					let old_root_offset = self.header.root_offset;
-					self.header.root_offset = internal.children[0];
+					let new_root_offset = internal.children[0];
+					self.header.root_offset = new_root_offset;
 					self.write_header()?;
 
-					// Free the old root
-					self.free_page(old_root_offset)?;
+					self.free_node_with_overflow(old_root_offset)?;
 				}
 			}
-			NodeType::Leaf(_) => {
-				// If the root is a leaf - we don't remove it even if empty
-				// This makes the tree always have a root
+			NodeType::Leaf(_) => {}
+			NodeType::Overflow(_) => {
+				return Err(BPlusTreeError::InvalidRootNode(self.header.root_offset));
 			}
 		}
 		Ok(())
@@ -1558,36 +1927,34 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let mut left_node = match self.read_node(left_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
+		let mut left_node = self.read_internal_node(left_offset)?;
+		let mut right_node = self.read_internal_node(right_offset)?;
+
+		let last_entry_size = if !left_node.keys.is_empty() {
+			let last_key = left_node.keys.last().unwrap();
+			internal_entry_size(last_key)
+		} else {
+			return Err(BPlusTreeError::Serialization(
+				"Left internal node is unexpectedly empty during redistribution".into(),
+			));
 		};
 
-		let mut right_node = match self.read_node(right_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
+		// Calculate sizes once
+		let left_size = left_node.current_size();
+		let right_size = right_node.current_size();
 
-		// Only redistribute if it would improve balance
-		if Self::should_redistribute_nodes(
-			&left_node,
-			&right_node,
-			left_node.keys.len() - 1,
-			KEY_SIZE_PREFIX + left_node.keys.last().unwrap().len() + CHILD_PTR_SIZE,
-		) {
-			// Get the current parent key
-			let parent_key = parent.keys[left_idx].clone();
-			let new_parent_key = left_node.redistribute_to_right(&mut right_node, parent_key);
+		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
+			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
+			let (new_parent_key, new_parent_overflow) =
+				left_node.redistribute_to_right(&mut right_node, parent_key, parent_overflow);
 
-			// Update parent key
 			parent.keys[left_idx] = new_parent_key;
+			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			// Write updated nodes
-			self.write_node(&NodeType::Internal(left_node))?;
-			self.write_node(&NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node))?;
+			self.write_node_owned(NodeType::Internal(right_node))?;
 		}
 
-		// Parent will be written by the calling function
 		Ok(())
 	}
 
@@ -1600,42 +1967,34 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let mut left_node = match self.read_node(left_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
+		let mut left_node = self.read_internal_node(left_offset)?;
+		let mut right_node = self.read_internal_node(right_offset)?;
 
-		let mut right_node = match self.read_node(right_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
-
-		// Calculate size of first entry in right node
 		let first_entry_size = if !right_node.keys.is_empty() {
-			KEY_SIZE_PREFIX + right_node.keys[0].len() + CHILD_PTR_SIZE
+			internal_entry_size(&right_node.keys[0])
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Right internal node is unexpectedly empty during redistribution".into(),
 			));
 		};
 
-		// Only redistribute if it would improve balance
-		if Self::should_redistribute_nodes(&left_node, &right_node, 0, first_entry_size) {
-			// Get the parent key
-			let parent_key = parent.keys[left_idx].clone();
+		// Calculate sizes once
+		let left_size = left_node.current_size();
+		let right_size = right_node.current_size();
 
-			// Move first key from right node to parent
-			let new_parent_key = left_node.take_from_right(&mut right_node, parent_key);
+		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
+			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
 
-			// Update parent key
+			let (new_parent_key, new_parent_overflow) =
+				left_node.take_from_right(&mut right_node, parent_key, parent_overflow);
+
 			parent.keys[left_idx] = new_parent_key;
+			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			// Write updated nodes
-			self.write_node(&NodeType::Internal(left_node))?;
-			self.write_node(&NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node))?;
+			self.write_node_owned(NodeType::Internal(right_node))?;
 		}
 
-		// Parent will be written by the calling function
 		Ok(())
 	}
 
@@ -1648,43 +2007,31 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let mut left_node = match self.read_node(left_offset)? {
-			NodeType::Leaf(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
+		let mut left_node = self.read_leaf_node(left_offset)?;
+		let mut right_node = self.read_leaf_node(right_offset)?;
 
-		let mut right_node = match self.read_node(right_offset)? {
-			NodeType::Leaf(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
-
-		// Get size of last entry in left node
 		let last_idx = left_node.keys.len() - 1;
 		let last_entry_size = if last_idx < left_node.keys.len() {
-			KEY_SIZE_PREFIX
-				+ left_node.keys[last_idx].len()
-				+ VALUE_SIZE_PREFIX
-				+ left_node.values[last_idx].len()
+			leaf_entry_size(&left_node.keys[last_idx], &left_node.values[last_idx])
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Left node is unexpectedly empty during redistribution".into(),
 			));
 		};
 
-		// Only redistribute if it would improve balance
-		if Self::should_redistribute_nodes(&left_node, &right_node, last_idx, last_entry_size) {
-			// Move last key-value pair from left to right
+		// Calculate sizes once
+		let left_size = left_node.current_size();
+		let right_size = right_node.current_size();
+
+		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
 			let new_separator = left_node.redistribute_to_right(&mut right_node);
 
-			// Update parent key
 			parent.keys[left_idx] = new_separator;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Leaf(left_node))?;
-			self.write_node(&NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node))?;
+			self.write_node_owned(NodeType::Leaf(right_node))?;
 		}
 
-		// Parent will be written by the calling function
 		Ok(())
 	}
 
@@ -1697,79 +2044,62 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let mut left_node = match self.read_node(left_offset)? {
-			NodeType::Leaf(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
+		let mut left_node = self.read_leaf_node(left_offset)?;
+		let mut right_node = self.read_leaf_node(right_offset)?;
 
-		let mut right_node = match self.read_node(right_offset)? {
-			NodeType::Leaf(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
-
-		// Get size of first entry in right node
 		let first_entry_size = if !right_node.keys.is_empty() {
-			KEY_SIZE_PREFIX
-				+ right_node.keys[0].len()
-				+ VALUE_SIZE_PREFIX
-				+ right_node.values[0].len()
+			leaf_entry_size(&right_node.keys[0], &right_node.values[0])
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Right node is unexpectedly empty during redistribution".into(),
 			));
 		};
 
-		// Only redistribute if it would improve balance
-		if Self::should_redistribute_nodes(&left_node, &right_node, 0, first_entry_size) {
-			// Move first key-value pair from right to left
+		// Calculate sizes once
+		let left_size = left_node.current_size();
+		let right_size = right_node.current_size();
+
+		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
 			let new_separator = left_node.take_from_right(&mut right_node);
 
-			// Update parent key
 			parent.keys[left_idx] = new_separator;
 
-			// Write updated nodes
-			self.write_node(&NodeType::Leaf(left_node))?;
-			self.write_node(&NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node))?;
+			self.write_node_owned(NodeType::Leaf(right_node))?;
 		}
 
-		// Parent will be written by the calling function
 		Ok(())
 	}
 
-	fn should_redistribute_nodes<T: Node>(
-		left_node: &T,
-		right_node: &T,
-		entry_idx: usize,
+	fn should_redistribute_with_sizes(
+		left_size: usize,
+		right_size: usize,
 		entry_size: usize,
+		taking_from_left: bool,
 	) -> bool {
-		let left_size = left_node.current_size();
-		let right_size = right_node.current_size();
 		let total_size = left_size + right_size;
 		let target_size = total_size / 2;
 
-		// Calculate balance metrics before redistribution
 		let before_left_diff = ((left_size as i64) - (target_size as i64)).abs();
 		let before_right_diff = ((right_size as i64) - (target_size as i64)).abs();
 		let before_total_diff = before_left_diff + before_right_diff;
 
-		// Calculate balance metrics after potential redistribution
-		let after_left_size = if entry_idx == 0 {
-			left_size + entry_size // Adding from right
+		let (after_left_size, after_right_size) = if taking_from_left {
+			if entry_size > left_size {
+				return false;
+			}
+			(left_size - entry_size, right_size + entry_size)
 		} else {
-			left_size - entry_size // Taking from left
-		};
-
-		let after_right_size = if entry_idx == 0 {
-			right_size - entry_size // Taking from right
-		} else {
-			right_size + entry_size // Adding from left
+			if entry_size > right_size {
+				return false;
+			}
+			(left_size + entry_size, right_size - entry_size)
 		};
 
 		let after_left_diff = ((after_left_size as i64) - (target_size as i64)).abs();
 		let after_right_diff = ((after_right_size as i64) - (target_size as i64)).abs();
 		let after_total_diff = after_left_diff + after_right_diff;
 
-		// Only redistribute if it would improve balance
 		after_total_diff < before_total_diff
 	}
 
@@ -1782,40 +2112,23 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let mut left_node = match self.read_node(left_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
+		let mut left_node = self.read_internal_node(left_offset)?;
+		let right_node = self.read_internal_node(right_offset)?;
 
-		let right_node = match self.read_node(right_offset)? {
-			NodeType::Internal(node) => node,
-			_ => return Err(BPlusTreeError::InvalidNodeType),
-		};
-
-		// Check if nodes can be merged
 		if !left_node.can_merge_with(&right_node) {
-			// If they can't be merged, we keep the nodes in their current state
-			// This is safe but may lead to lower space utilization
 			return Ok(());
 		}
 
-		// Take the separator key from parent - this becomes the middle key
-		// between the left node's last key and the right node's first key
-		let separator = parent.keys.remove(left_idx);
+		let (separator, separator_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 
-		// Move separator key from parent into left node as the boundary between subtrees
-		left_node.merge_from_right(&right_node, separator);
+		left_node.merge_from_right(right_node, separator, separator_overflow);
 
-		// Remove the right child pointer from parent (the separator was already removed)
 		parent.children.remove(right_idx);
 
-		// Write updated left node
-		self.write_node(&NodeType::Internal(left_node))?;
+		self.write_node_owned(NodeType::Internal(left_node))?;
 
-		// Free the right node's page
 		self.free_page(right_offset)?;
 
-		// Parent node will be written by the calling function
 		Ok(())
 	}
 
@@ -1828,28 +2141,24 @@ impl<F: VfsFile> BPlusTree<F> {
 		let left_offset = parent.children[left_idx];
 		let right_offset = parent.children[right_idx];
 
-		let (mut left_node, right_node) =
-			match (self.read_node(left_offset)?, self.read_node(right_offset)?) {
-				(NodeType::Leaf(left), NodeType::Leaf(right)) => (left, right),
-				_ => return Err(BPlusTreeError::InvalidNodeType),
-			};
+		let mut left_node = self.read_leaf_node(left_offset)?;
+		let right_node = self.read_leaf_node(right_offset)?;
 
-		// Check if nodes can be merged
 		if !left_node.can_merge_with(&right_node) {
-			// If they can't be merged, we keep the nodes in their current state
 			return Ok(());
 		}
 
-		// Update parent in-memory
-		parent.keys.remove(left_idx);
+		let (_removed_key, removed_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 		parent.children.remove(right_idx);
 
-		// Get next leaf pointer before merging
+		if removed_overflow != 0 {
+			self.free_overflow_chain(removed_overflow)?;
+		}
+
 		let next_leaf = right_node.next_leaf;
 
-		left_node.merge_from_right(&right_node);
+		left_node.merge_from_right(right_node);
 
-		// Update next leaf's prev pointer if needed
 		if next_leaf != 0 {
 			if let NodeType::Leaf(mut next_leaf_node) = self.read_node(next_leaf)? {
 				next_leaf_node.prev_leaf = left_offset;
@@ -1857,23 +2166,14 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		// Write left node
-		self.write_node(&NodeType::Leaf(left_node))?;
+		self.write_node_owned(NodeType::Leaf(left_node))?;
 
-		// Free the right node's page
 		self.free_page(right_offset)?;
 
 		Ok(())
 	}
 
-	// Disk management methods
 	fn allocate_page(&mut self) -> Result<u64> {
-		// This function follows SQLite's approach (or at least what I understand of it) for page allocation:
-
-		// Fast path: No free pages in any trunk, allocate new page
-		// This happens when either:
-		// - There are no trunk pages (trunk_page_head is 0)
-		// - Or there are trunk pages but they're all empty (free_page_count is 0)
 		if self.header.trunk_page_head == 0 || self.header.free_page_count == 0 {
 			let offset = self.header.total_pages * PAGE_SIZE as u64;
 			self.header.total_pages += 1;
@@ -1881,16 +2181,12 @@ impl<F: VfsFile> BPlusTree<F> {
 			return Ok(offset);
 		}
 
-		// Traverse the trunk chain to find a non-empty trunk
-		// prev_trunk_offset tracks the previous trunk page in the chain
-		// current_trunk_offset points to the current trunk page being examined
 		let mut prev_trunk_offset = 0;
 		let mut current_trunk_offset = self.header.trunk_page_head;
 
 		while current_trunk_offset != 0 {
 			let mut trunk = self.read_trunk_page(current_trunk_offset)?;
 
-			// Found a trunk with free pages - allocate one of them
 			if !trunk.is_empty() {
 				let page_offset = trunk.get_free_page().unwrap();
 				self.write_trunk_page(&trunk)?;
@@ -1899,103 +2195,95 @@ impl<F: VfsFile> BPlusTree<F> {
 				return Ok(page_offset);
 			}
 
-			// This trunk is empty, check if it has a next trunk
 			let next_trunk = trunk.next_trunk;
 
 			if next_trunk != 0 {
-				// We have a next trunk, so we can reuse this empty trunk page
-				// Before returning this trunk page as newly allocated space,
-				// we need to update the trunk chain
-
 				if prev_trunk_offset == 0 {
-					// This is the head trunk - update the header to point to the next trunk
 					self.header.trunk_page_head = next_trunk;
 				} else {
-					// This is a trunk in the middle or end of the chain
-					// Update the previous trunk's next_trunk pointer to skip this trunk
-					// and point directly to this trunk's next trunk
 					let mut prev_trunk = self.read_trunk_page(prev_trunk_offset)?;
 					prev_trunk.next_trunk = next_trunk;
 					self.write_trunk_page(&prev_trunk)?;
 				}
 
-				// Update the header with the new trunk_page_head value
 				self.write_header()?;
 
-				// Return this empty trunk page as the newly allocated page
 				return Ok(current_trunk_offset);
 			}
 
-			// Move to the next trunk in the chain
 			prev_trunk_offset = current_trunk_offset;
 			current_trunk_offset = trunk.next_trunk;
 		}
 
-		// If we get here, we've traversed all trunks and they're all empty
-		// with no free pages, but free_page_count > 0.
-		// This is a database corruption
-		Err(BPlusTreeError::Corruption(format!(
-			"Inconsistent free page count: header says {} free pages but none found in trunk chain",
-			self.header.free_page_count
-		)))
+		Err(BPlusTreeError::InconsistentFreePageCount {
+			claimed: self.header.free_page_count,
+			actual: 0,
+		})
 	}
 
-	// Free page management methods with free_page_count tracking
+	fn free_node_with_overflow(&mut self, offset: u64) -> Result<()> {
+		let node = self.read_node(offset)?;
+
+		match &node {
+			NodeType::Internal(internal) => {
+				for &overflow_offset in &internal.key_overflows {
+					if overflow_offset != 0 {
+						self.free_overflow_chain(overflow_offset)?;
+					}
+				}
+			}
+			NodeType::Leaf(leaf) => {
+				for &overflow_offset in &leaf.cell_overflows {
+					if overflow_offset != 0 {
+						self.free_overflow_chain(overflow_offset)?;
+					}
+				}
+			}
+			NodeType::Overflow(_) => {}
+		}
+
+		self.free_page(offset)
+	}
 	fn free_page(&mut self, offset: u64) -> Result<()> {
-		// Validate offset
 		if offset < PAGE_SIZE as u64 || offset >= self.header.total_pages * PAGE_SIZE as u64 {
 			return Err(BPlusTreeError::InvalidOffset);
 		}
 
-		// Remove from cache
 		self.cache.remove(&offset);
 
-		// Add to trunk page system
 		if self.header.trunk_page_head == 0 {
-			// No trunk pages yet, so create one by turning this freed page into a trunk page
 			let trunk = TrunkPage::new(offset);
 
-			// Update header
 			self.header.trunk_page_head = offset;
-			// Don't increment free_page_count - this page is now a trunk, not a free page
 			self.write_header()?;
 
-			// Write the empty trunk page
 			self.write_trunk_page(&trunk)?;
 		} else {
-			// Find a trunk with space
 			let mut current_trunk_offset = self.header.trunk_page_head;
 
 			loop {
 				let mut trunk = self.read_trunk_page(current_trunk_offset)?;
 
 				if !trunk.is_full() {
-					// Found space, add the page
 					trunk.add_free_page(offset);
 					self.write_trunk_page(&trunk)?;
 
-					// Update free page count
 					self.header.free_page_count += 1;
 					self.write_header()?;
 					break;
 				}
 
 				if trunk.next_trunk == 0 {
-					// No next trunk, create new one by turning this freed page into a trunk
 					let new_trunk = TrunkPage::new(offset);
 
-					// Link to current trunk
 					trunk.next_trunk = offset;
 
-					// Write the updated trunk
 					self.write_trunk_page(&trunk)?;
 					self.write_trunk_page(&new_trunk)?;
 
-					// No need to update free_page_count - page is used as trunk, not a free page
 					break;
 				}
 
-				// Move to next trunk
 				current_trunk_offset = trunk.next_trunk;
 			}
 		}
@@ -2035,22 +2323,159 @@ impl<F: VfsFile> BPlusTree<F> {
 		let mut buffer = vec![0; PAGE_SIZE];
 		self.file.read_at(offset, &mut buffer)?;
 
-		// Deserialize directly from the full page
-		let node = NodeType::deserialize(&buffer, offset)?;
-		self.cache.insert(offset, node.clone());
+		// Deserialize based on node type, with overflow support
+		let node = if buffer.is_empty() {
+			return Err(BPlusTreeError::Deserialization("Empty buffer".into()));
+		} else {
+			let node_type = buffer[0];
+			match node_type {
+				NODE_TYPE_INTERNAL => {
+					let internal =
+						InternalNode::deserialize(&buffer, offset, &|overflow_offset| {
+							self.read_overflow_chain(overflow_offset)
+						})?;
+					NodeType::Internal(internal)
+				}
+				NODE_TYPE_LEAF => {
+					let leaf = LeafNode::deserialize(&buffer, offset, &|overflow_offset| {
+						self.read_overflow_chain(overflow_offset)
+					})?;
+					NodeType::Leaf(leaf)
+				}
+				NODE_TYPE_OVERFLOW => {
+					NodeType::Overflow(OverflowPage::deserialize(&buffer, offset)?)
+				}
+				_ => {
+					return Err(BPlusTreeError::InvalidNodeType);
+				}
+			}
+		};
 
+		self.cache.insert(offset, node.clone());
 		Ok(node)
 	}
 
+	/// Extract internal node from offset
+	fn read_internal_node(&self, offset: u64) -> Result<InternalNode> {
+		match self.read_node(offset)? {
+			NodeType::Internal(node) => Ok(node),
+			_ => Err(BPlusTreeError::InvalidNodeType),
+		}
+	}
+
+	/// Extract leaf node from offset
+	fn read_leaf_node(&self, offset: u64) -> Result<LeafNode> {
+		match self.read_node(offset)? {
+			NodeType::Leaf(node) => Ok(node),
+			_ => Err(BPlusTreeError::InvalidNodeType),
+		}
+	}
+
+	/// Prepare internal node for writing by creating overflow pages for large keys
+	fn prepare_internal_node_overflow(&mut self, node: &mut InternalNode) -> Result<()> {
+		// Calculate max bytes per entry
+		let max_per_entry = get_max_internal_entry_bytes();
+
+		// Ensure key_overflows vec is properly sized
+		while node.key_overflows.len() < node.keys.len() {
+			node.key_overflows.push(0);
+		}
+
+		// Check each key to see if it needs overflow
+		for (i, key) in node.keys.iter().enumerate() {
+			let (bytes_on_page, needs_overflow) = calculate_overflow(key.len(), max_per_entry);
+
+			if needs_overflow {
+				let overflow_data = &key[bytes_on_page..];
+				let existing_overflow = if i < node.key_overflows.len() {
+					node.key_overflows[i]
+				} else {
+					0
+				};
+
+				if existing_overflow == 0 {
+					let overflow_offset = self.write_overflow_chain(overflow_data)?;
+					while node.key_overflows.len() <= i {
+						node.key_overflows.push(0);
+					}
+					node.key_overflows[i] = overflow_offset;
+				}
+			} else if i < node.key_overflows.len() {
+				node.key_overflows[i] = 0;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Prepare leaf node for writing by creating overflow pages for large cells (key+value)
+	fn prepare_leaf_node_overflow(&mut self, node: &mut LeafNode) -> Result<()> {
+		// Calculate max bytes per entry
+		let max_per_entry = get_max_leaf_entry_bytes();
+
+		// Ensure overflow vec is properly sized
+		while node.cell_overflows.len() < node.keys.len() {
+			node.cell_overflows.push(0);
+		}
+
+		// Check each cell (key+value pair) to see if it needs overflow
+		for (i, (key, value)) in node.keys.iter().zip(&node.values).enumerate() {
+			let payload_len = key.len() + value.len();
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+
+			if needs_overflow {
+				let mut cell_data = Vec::with_capacity(payload_len);
+				cell_data.extend_from_slice(key);
+				cell_data.extend_from_slice(value);
+
+				let overflow_data = &cell_data[bytes_on_page..];
+				let existing_overflow = if i < node.cell_overflows.len() {
+					node.cell_overflows[i]
+				} else {
+					0
+				};
+
+				if existing_overflow == 0 {
+					let overflow_offset = self.write_overflow_chain(overflow_data)?;
+					while node.cell_overflows.len() <= i {
+						node.cell_overflows.push(0);
+					}
+					node.cell_overflows[i] = overflow_offset;
+				}
+			} else if i < node.cell_overflows.len() {
+				node.cell_overflows[i] = 0;
+			}
+		}
+
+		Ok(())
+	}
+
 	fn write_node(&mut self, node: &NodeType) -> Result<()> {
-		let data = match node {
-			NodeType::Internal(internal) => internal.serialize()?,
-			NodeType::Leaf(leaf) => leaf.serialize()?,
+		self.write_node_owned(node.clone())
+	}
+
+	fn write_node_owned(&mut self, mut node: NodeType) -> Result<()> {
+		// Prepare overflow pages
+		match &mut node {
+			NodeType::Internal(internal) => {
+				self.prepare_internal_node_overflow(internal)?;
+			}
+			NodeType::Leaf(leaf) => {
+				self.prepare_leaf_node_overflow(leaf)?;
+			}
+			NodeType::Overflow(_) => {}
 		};
 
-		let offset = match node {
+		let data = match &node {
+			NodeType::Internal(internal) => internal.serialize()?,
+			NodeType::Leaf(leaf) => leaf.serialize()?,
+			NodeType::Overflow(overflow) => overflow.serialize()?,
+		};
+
+		let offset = match &node {
 			NodeType::Internal(internal) => internal.offset,
 			NodeType::Leaf(leaf) => leaf.offset,
+			NodeType::Overflow(overflow) => overflow.offset,
 		};
 
 		// Write data directly to storage
@@ -2058,7 +2483,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		self.maybe_sync()?;
 
-		self.cache.insert(offset, node.clone());
+		self.cache.insert(offset, node);
 		Ok(())
 	}
 
@@ -2080,10 +2505,109 @@ impl<F: VfsFile> BPlusTree<F> {
 
 	fn maybe_sync(&mut self) -> Result<()> {
 		match self.durability {
-			Durability::Always => self.file.sync()?,
+			Durability::Always => self.file.sync_data()?,
 			Durability::Manual => { // Don't sync - only sync on flush() or close()
 			}
 		}
+		Ok(())
+	}
+
+	fn write_overflow_chain(&mut self, data: &[u8]) -> Result<u64> {
+		if data.is_empty() {
+			return Err(BPlusTreeError::Serialization(
+				"Cannot create overflow chain for empty data".into(),
+			));
+		}
+
+		let max_data_per_page = OverflowPage::max_data_size();
+
+		let mut remaining_data = data;
+		let mut first_page_offset = 0u64;
+		let mut prev_page_offset = 0u64;
+
+		while !remaining_data.is_empty() {
+			// Allocate a new overflow page
+			let page_offset = self.allocate_page()?;
+
+			if first_page_offset == 0 {
+				first_page_offset = page_offset;
+			}
+
+			// Determine how much data to store in this page
+			let chunk_size = remaining_data.len().min(max_data_per_page);
+			let chunk_data = &remaining_data[..chunk_size];
+			remaining_data = &remaining_data[chunk_size..];
+
+			// Create and write the overflow page
+			let mut overflow_page = OverflowPage::new(page_offset);
+			overflow_page.data = chunk_data.to_vec();
+			overflow_page.next_overflow = 0; // Will be updated if there's more data
+
+			self.write_node(&NodeType::Overflow(overflow_page.clone()))?;
+
+			// If this is not the first page, update the previous page to point to this one
+			if prev_page_offset != 0 {
+				let prev_node = self.read_node(prev_page_offset)?;
+				if let NodeType::Overflow(mut prev_overflow) = prev_node {
+					prev_overflow.next_overflow = page_offset;
+					self.write_node(&NodeType::Overflow(prev_overflow))?;
+				}
+			}
+
+			prev_page_offset = page_offset;
+		}
+
+		self.maybe_sync()?;
+		Ok(first_page_offset)
+	}
+
+	/// Read data from an overflow chain starting at the given offset
+	fn read_overflow_chain(&self, first_page: u64) -> Result<Vec<u8>> {
+		if first_page == 0 {
+			return Ok(Vec::new());
+		}
+
+		let mut result = Vec::new();
+		let mut current_offset = first_page;
+
+		while current_offset != 0 {
+			let node = self.read_node(current_offset)?;
+			match node {
+				NodeType::Overflow(overflow) => {
+					result.extend_from_slice(&overflow.data);
+					current_offset = overflow.next_overflow;
+				}
+				_ => {
+					return Err(BPlusTreeError::InvalidOverflowChain(current_offset));
+				}
+			}
+		}
+
+		Ok(result)
+	}
+
+	fn free_overflow_chain(&mut self, first_page: u64) -> Result<()> {
+		if first_page == 0 {
+			return Ok(());
+		}
+
+		let mut current_offset = first_page;
+
+		while current_offset != 0 {
+			let node = self.read_node(current_offset)?;
+			match node {
+				NodeType::Overflow(overflow) => {
+					let next_offset = overflow.next_overflow;
+					self.free_page(current_offset)?;
+					current_offset = next_offset;
+				}
+				_ => {
+					return Err(BPlusTreeError::InvalidOverflowChain(current_offset));
+				}
+			}
+		}
+
+		self.maybe_sync()?;
 		Ok(())
 	}
 
@@ -2134,32 +2658,22 @@ impl<F: VfsFile> BPlusTree<F> {
 
 				Ok((max_height, total_nodes, total_keys, leaf_count))
 			}
+			NodeType::Overflow(_) => Err(BPlusTreeError::UnexpectedOverflowPage(node_offset)),
 		}
 	}
 
-	// Print basic tree statistics
 	#[cfg(test)]
 	fn print_tree_stats(&mut self) -> Result<()> {
-		let (height, node_count, total_keys, leaf_nodes) = self.calculate_tree_stats()?;
-
-		println!("B+ Tree Statistics:");
-		println!("-------------------");
-		println!("Tree Height: {}", height);
-		println!("Total Nodes: {}", node_count);
-		println!("Total Keys: {}", total_keys);
-		println!("Leaf Nodes: {}", leaf_nodes);
-		println!("Internal Nodes: {}", node_count - leaf_nodes);
-		println!("-------------------");
-
 		Ok(())
 	}
 }
 
-pub(crate) struct RangeScanIterator<'a, F: VfsFile> {
+pub struct RangeScanIterator<'a, F: VfsFile> {
 	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
 	end_key: Vec<u8>,
 	current_idx: usize,
+	current_end_idx: usize, // Pre-calculated end position in current leaf
 	reached_end: bool,
 }
 
@@ -2172,17 +2686,14 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		let leaf = loop {
 			match tree.read_node(node_offset)? {
 				NodeType::Internal(internal) => {
-					// Find the child that would contain the key
-					let mut idx = 0;
-					while idx < internal.keys.len()
-						&& tree.compare.compare(start_key, &internal.keys[idx]) >= Ordering::Equal
-					{
-						idx += 1;
-					}
+					let idx = internal.find_child_index(start_key, tree.compare.as_ref());
 					node_offset = internal.children[idx];
 				}
 				NodeType::Leaf(leaf) => {
 					break leaf;
+				}
+				NodeType::Overflow(_) => {
+					return Err(BPlusTreeError::UnexpectedOverflowPage(node_offset));
 				}
 			}
 		};
@@ -2191,11 +2702,16 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		let current_idx =
 			leaf.keys.partition_point(|k| tree.compare.compare(k, start_key) == Ordering::Less);
 
+		// Pre-calculate end index in this leaf
+		let current_end_idx =
+			leaf.keys.partition_point(|k| tree.compare.compare(k, end_key) != Ordering::Greater);
+
 		Ok(RangeScanIterator {
 			tree,
 			current_leaf: Some(leaf),
 			end_key: end_key.to_vec(),
 			current_idx,
+			current_end_idx,
 			reached_end: false,
 		})
 	}
@@ -2211,20 +2727,24 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 			}
 
 			if let Some(leaf) = &self.current_leaf {
-				// Check if we've reached the end of the current leaf
-				if self.current_idx >= leaf.keys.len() {
+				// Check if we've exhausted current leaf
+				if self.current_idx >= self.current_end_idx {
 					// Move to the next leaf if possible
 					if leaf.next_leaf == 0 {
 						self.reached_end = true;
 						return None;
 					}
 
-					// Load the next leaf
+					// Load the next leaf and calculate its end index
 					match self.tree.read_node(leaf.next_leaf) {
 						Ok(NodeType::Leaf(next_leaf)) => {
+							let next_end_idx = next_leaf.keys.partition_point(|k| {
+								self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
+							});
+
 							self.current_leaf = Some(next_leaf);
 							self.current_idx = 0;
-							// Continue the loop
+							self.current_end_idx = next_end_idx;
 							continue;
 						}
 						Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
@@ -2232,16 +2752,9 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 					}
 				}
 
-				// Check if the current key is within range
-				let key = &leaf.keys[self.current_idx];
-				if self.tree.compare.compare(key, &self.end_key) == Ordering::Greater {
-					self.reached_end = true;
-					return None;
-				}
-
-				// Return the current key-value pair and advance
+				// Return current entry from stored leaf (no range check needed - pre-calculated!)
 				let result = Ok((
-					Arc::from(key.as_ref()),
+					Arc::from(leaf.keys[self.current_idx].as_ref()),
 					Arc::from(leaf.values[self.current_idx].as_ref()),
 				));
 				self.current_idx += 1;
@@ -2443,9 +2956,7 @@ mod tests {
 		let keys = generate_sequential_keys(TEST_SIZE);
 		let values = generate_random_values(TEST_SIZE, 100);
 
-		// Insert and immediately verify each key-value pair
 		for i in 0..TEST_SIZE {
-			// println!("Inserting key {}", i);
 			tree.insert(&keys[i], &values[i]).unwrap();
 
 			let retrieved = tree.get(&keys[i]).unwrap();
@@ -2498,8 +3009,6 @@ mod tests {
 			}
 		}
 
-		// Final verification of all keys
-		println!("\nFinal verification:");
 		for i in 0..TEST_SIZE {
 			let retrieved = tree.get(&keys[i]).unwrap();
 			if i % 2 == 0 {
@@ -2787,7 +3296,6 @@ mod tests {
 		// Delete all in reverse order
 		for i in (0..(max_keys * 3)).rev() {
 			let key = format!("key{}", i).into_bytes();
-			// println!("Deleting key: {:?}", String::from_utf8_lossy(&key));
 			assert!(tree.delete(&key).unwrap().is_some());
 		}
 
@@ -3471,8 +3979,7 @@ mod tests {
 	#[test]
 	fn test_insert_with_multiple_key_sizes() {
 		// Define various sizes for testing
-		// let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
 		// Fixed value size
 		let value_size = 128;
@@ -3519,8 +4026,7 @@ mod tests {
 	#[test]
 	fn test_delete_with_multiple_key_sizes() {
 		// Define various sizes for testing
-		// let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
-		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+		let key_sizes = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
 		// Fixed value size
 		let value_size = 128;
@@ -3571,8 +4077,6 @@ mod tests {
 				);
 				assert_eq!(result.unwrap(), fixed_value);
 			}
-
-			println!("Testing deletion for key size {}", key_size);
 
 			// Delete every other key (evens)
 			for (idx, key) in all_keys.iter().enumerate() {
@@ -3627,9 +4131,7 @@ mod tests {
 		let mut all_keys = vec![];
 		let mut active_keys = std::collections::HashSet::new();
 
-		// Phase 1: Insert many keys of varying sizes
 		let num_initial = 100;
-		println!("Phase 1: Inserting {} initial keys", num_initial);
 
 		for i in 0..num_initial {
 			// Create key with sequence number and random size
@@ -3651,9 +4153,7 @@ mod tests {
 			}
 		}
 
-		// Phase 2: Delete random keys
 		let num_deletions = 40;
-		println!("Phase 2: Deleting {} random keys", num_deletions);
 
 		let mut keys_to_delete = active_keys.iter().cloned().collect::<Vec<_>>();
 		for _ in 0..num_deletions {
@@ -3664,7 +4164,6 @@ mod tests {
 			let idx = rng.random_range(0..keys_to_delete.len());
 			let key = keys_to_delete.swap_remove(idx);
 
-			// println!("Deleting key of size {}", key.len());
 			tree.delete(&key).unwrap();
 			active_keys.remove(&key);
 
@@ -3674,9 +4173,7 @@ mod tests {
 			}
 		}
 
-		// Phase 3: Insert more keys, some very large
 		let num_additional = 30;
-		println!("Phase 3: Inserting {} additional keys, some very large", num_additional);
 
 		for i in 0..num_additional {
 			// Every 3rd key is very large
@@ -3705,9 +4202,6 @@ mod tests {
 
 		// Final flush
 		tree.flush().unwrap();
-
-		// Verification phase
-		println!("Verification: Checking all remaining keys can be found");
 
 		// Verify all active keys can be found
 		for key in &active_keys {
@@ -3962,10 +4456,12 @@ mod tests {
 		let result = btree.allocate_page();
 		assert!(result.is_err());
 
-		// Verify the error is a corruption error
+		// Verify the error is an inconsistent free page count error
 		match result {
-			Err(BPlusTreeError::Corruption(_)) => (),
-			_ => panic!("Expected corruption error, got {:?}", result),
+			Err(BPlusTreeError::InconsistentFreePageCount {
+				..
+			}) => (),
+			_ => panic!("Expected InconsistentFreePageCount error, got {:?}", result),
 		}
 	}
 
@@ -4014,5 +4510,55 @@ mod tests {
 		let page_offset = btree.allocate_page().unwrap();
 		assert_eq!(page_offset, 6 * PAGE_SIZE as u64); // This should be page 6, not 5 again
 		assert_eq!(btree.header.total_pages, 7); // Total pages should now be 7
+	}
+
+	#[test]
+	fn test_no_overflow_page_leak() {
+		// Deterministic test: Repeating identical operations should use identical pages
+		// If cycle 2 uses more pages than cycle 1, there's a leak
+		let file = NamedTempFile::new().unwrap();
+		let mut tree = BPlusTree::disk(file.path(), Arc::new(TestComparator)).unwrap();
+
+		let large_key_size = 2000; // Requires overflow in internal nodes
+		let test_count = 100;
+
+		for i in 0..test_count {
+			let key = vec![i as u8; large_key_size];
+			let value = vec![i as u8; large_key_size];
+			tree.insert(&key, &value).unwrap();
+		}
+
+		for i in 0..test_count {
+			let key = vec![i as u8; large_key_size];
+			tree.delete(&key).unwrap();
+		}
+
+		let pages_after_cycle1 = tree.header.total_pages;
+		let free_after_cycle1 = tree.header.free_page_count;
+
+		for i in 0..test_count {
+			let key = vec![i as u8; large_key_size];
+			let value = vec![i as u8; large_key_size];
+			tree.insert(&key, &value).unwrap();
+		}
+
+		for i in 0..test_count {
+			let key = vec![i as u8; large_key_size];
+			tree.delete(&key).unwrap();
+		}
+
+		let pages_after_cycle2 = tree.header.total_pages;
+		let free_after_cycle2 = tree.header.free_page_count;
+
+		let in_use_cycle1 = pages_after_cycle1 - free_after_cycle1 as u64;
+		let in_use_cycle2 = pages_after_cycle2 - free_after_cycle2 as u64;
+
+		assert_eq!(
+			in_use_cycle2, in_use_cycle1,
+			"Page leak detected! Cycle 1: {} in use, Cycle 2: {} in use",
+			in_use_cycle1, in_use_cycle2
+		);
+
+		tree.close().unwrap();
 	}
 }

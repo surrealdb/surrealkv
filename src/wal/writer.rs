@@ -3,8 +3,6 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-use parking_lot::RwLock;
-
 use crate::wal::segment::{get_segment_range, Error, IOError, Options, Result, Segment};
 
 /// Write-Ahead Log (Wal) is a data structure used to sequentially
@@ -24,9 +22,6 @@ pub(crate) struct Wal {
 
 	/// A flag indicating whether the WAL instance is closed or not.
 	closed: bool,
-
-	/// A read-write lock used to synchronize concurrent access to the WAL instance.
-	mutex: RwLock<()>, // TODO: Lock only the active segment
 }
 
 impl Wal {
@@ -61,7 +56,6 @@ impl Wal {
 			dir: dir.to_path_buf(),
 			opts,
 			closed: false,
-			mutex: RwLock::new(()),
 		})
 	}
 
@@ -188,8 +182,6 @@ impl Wal {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
 		}
 
-		let _lock = self.mutex.write();
-
 		let (off, _) = self.active_segment.append(rec)?;
 
 		Ok(off)
@@ -234,7 +226,6 @@ impl Wal {
 			return Ok(());
 		}
 		self.closed = true;
-		let _lock = self.mutex.write();
 		self.active_segment.close()?;
 		Ok(())
 	}
@@ -243,7 +234,6 @@ impl Wal {
 		if self.closed {
 			return Ok(());
 		}
-		let _lock = self.mutex.write();
 		self.active_segment.sync()?;
 		Ok(())
 	}
@@ -251,7 +241,6 @@ impl Wal {
 	// Returns the current offset within the segment.
 	#[cfg(test)]
 	fn offset(&self) -> u64 {
-		let _lock = self.mutex.read();
 		self.active_segment.offset()
 	}
 
@@ -268,8 +257,6 @@ impl Wal {
 	///
 	/// The ID of the newly created segment, or an error if something went wrong.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
-		let _lock = self.mutex.write();
-
 		// Sync and close the current active segment
 		self.active_segment.close()?;
 
