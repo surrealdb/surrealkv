@@ -2621,32 +2621,32 @@ mod tests {
 
 		// Test specific timestamp queries to verify which versions were deleted
 		let scan_at_ts1 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 1000, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 1000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts2 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 2000, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 2000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts3 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 3000, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 3000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts4 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 4000, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 4000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts5 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 6000, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 6000, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts6 = tx
-			.scan_at_version(user_key.to_vec()..=user_key.to_vec(), 6001, None)
+			.range_at_version(user_key.to_vec()..=user_key.to_vec(), 6001, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();

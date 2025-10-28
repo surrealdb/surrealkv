@@ -653,7 +653,7 @@ impl Transaction {
 	}
 
 	/// Scans key-value pairs in a key range at a specific timestamp
-	pub fn scan_at_version<'a, R: RangeBounds<Vec<u8>>>(
+	pub fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
@@ -666,7 +666,7 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_at_version(key_range, timestamp, limit),
+			Some(snapshot) => snapshot.range_at_version(key_range, timestamp, limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -3057,9 +3057,9 @@ mod tests {
 		assert_eq!(val1.1.as_ref(), b"value1");
 		assert_eq!(val2.1.as_ref(), b"value2");
 
-		// Test scan_at_version with specific timestamp to get point-in-time view
+		// Test range_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
+			.range_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3067,7 +3067,7 @@ mod tests {
 		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
 
 		let version_at_ts2 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
+			.range_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3076,7 +3076,7 @@ mod tests {
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
+			.range_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3336,7 +3336,7 @@ mod tests {
 	}
 
 	#[test(tokio::test)]
-	async fn test_scan_at_version() {
+	async fn test_range_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3359,10 +3359,10 @@ mod tests {
 		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
 		tx2.commit().await.unwrap();
 
-		// Test scan_at_version at first timestamp
+		// Test range_at_version at first timestamp
 		let tx = tree.begin().unwrap();
 		let scan_at_ts1 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.range_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3384,9 +3384,9 @@ mod tests {
 		assert!(found_keys.contains(&b"key3".as_ref()));
 		assert!(!found_keys.contains(&b"key4".as_ref())); // key4 didn't exist at ts1
 
-		// Test scan_at_version at second timestamp
+		// Test range_at_version at second timestamp
 		let scan_at_ts2 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.range_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3410,7 +3410,7 @@ mod tests {
 
 		// Test with limit
 		let scan_limited = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.range_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3418,7 +3418,7 @@ mod tests {
 
 		// Test with specific key range
 		let scan_range = tx
-			.scan_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.range_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3432,7 +3432,7 @@ mod tests {
 	}
 
 	#[test(tokio::test)]
-	async fn test_scan_at_version_with_deletes() {
+	async fn test_range_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3449,7 +3449,7 @@ mod tests {
 		// Query at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
 		let scan_before = tx_before
-			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
+			.range_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3462,7 +3462,7 @@ mod tests {
 		tx2.commit().await.unwrap();
 		let ts_after_deletes = now();
 
-		// Test scan_at_version at a time after the deletes
+		// Test range_at_version at a time after the deletes
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
 
@@ -3472,7 +3472,7 @@ mod tests {
 
 		// Perform scan at timestamp after deletes
 		let scan_result = tx
-			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
+			.range_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3630,7 +3630,7 @@ mod tests {
 		// Test that versioned queries fail when versioning is disabled
 		let tx = tree.begin().unwrap();
 		assert!(tx.keys_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
-		assert!(tx.scan_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
+		assert!(tx.range_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
 		assert!(tx.scan_all_versions(b"key1".to_vec()..=b"key2".to_vec(), None).is_err());
 	}
 

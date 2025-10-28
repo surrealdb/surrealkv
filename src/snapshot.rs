@@ -267,7 +267,7 @@ impl Snapshot {
 
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	pub(crate) fn scan_at_version<'a, R: RangeBounds<Vec<u8>>>(
+	pub(crate) fn range_at_version<'a, R: RangeBounds<Vec<u8>>>(
 		&'a self,
 		key_range: R,
 		timestamp: u64,
