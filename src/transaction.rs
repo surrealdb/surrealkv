@@ -675,12 +675,66 @@ impl Transaction {
 	///
 	/// For versioned queries (when timestamp is specified), this requires
 	/// versioning to be enabled in the database options.
+	///
+	/// This method is optimized to avoid creating full iterators and resolving values
+	/// from the value log, making it much faster than manually counting iterator results.
 	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
-		// Get the keys iterator with the provided options
-		let keys_iter = self.keys_with_options(options)?;
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
 
-		// Count the keys (respecting any limit in the options)
-		Ok(keys_iter.count())
+		// Get the start and end keys from options
+		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+		// For versioned queries, use the keys iterator approach
+		// (versioned index has different structure)
+		if let Some(timestamp) = options.timestamp {
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			let keys_iter = self.keys_at_version(start_key, end_key, timestamp, options.limit)?;
+			return Ok(keys_iter.count());
+		}
+
+		// Fast path: get count from snapshot without creating iterators
+		let mut count = match &self.snapshot {
+			Some(snapshot) => snapshot.count_in_range(start_key.clone(), end_key.clone())?,
+			None => return Err(Error::NoSnapshot),
+		};
+
+		// Apply write-set adjustments for uncommitted changes in this transaction
+		for (key, entries) in &self.write_set {
+			// Check if key is in range
+			if key.as_ref() >= start_key.as_slice() && key.as_ref() < end_key.as_slice() {
+				if let Some(latest_entry) = entries.last() {
+					// Check what the key's state was in the snapshot
+					let snapshot_had_key =
+						self.snapshot.as_ref().unwrap().get(key.as_ref())?.is_some();
+
+					// Determine current state from write-set
+					let write_set_has_key = !latest_entry.is_tombstone();
+
+					// Adjust count based on state transition
+					match (snapshot_had_key, write_set_has_key) {
+						(false, true) => count += 1,                      // New key added
+						(true, false) => count = count.saturating_sub(1), // Key deleted
+						_ => {}                                           // No change (update or still deleted)
+					}
+				}
+			}
+		}
+
+		// Apply limit if specified
+		if let Some(limit) = options.limit {
+			count = count.min(limit);
+		}
+
+		Ok(count)
 	}
 
 	/// Writes a value for a key with custom write options. None is used for deletion.

@@ -140,6 +140,59 @@ impl Snapshot {
 		}
 	}
 
+	/// Collects the iterator state from all LSM components
+	/// This is a helper method used by both iterators and optimized operations like count
+	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
+		let active = guardian::ArcRwLockReadGuardian::take(self.core.active_memtable.clone())?;
+		let immutable =
+			guardian::ArcRwLockReadGuardian::take(self.core.immutable_memtables.clone())?;
+		let manifest = guardian::ArcRwLockReadGuardian::take(self.core.level_manifest.clone())?;
+
+		Ok(IterState {
+			active: active.clone(),
+			immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+			levels: manifest.levels.clone(),
+		})
+	}
+
+	/// Optimized count operation for a key range
+	///
+	/// This method efficiently counts keys in the range [start, end) without:
+	/// - Creating a full iterator
+	/// - Resolving values from the value log
+	/// - Allocating result structures
+	///
+	/// It only counts the latest version of each key and skips tombstones.
+	pub(crate) fn count_in_range(&self, start: Vec<u8>, end: Vec<u8>) -> Result<usize> {
+		let mut count = 0usize;
+		let mut last_key: Option<Vec<u8>> = None;
+
+		let iter_state = self.collect_iter_state()?;
+		let range = (Bound::Included(start), Bound::Excluded(end));
+		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range);
+
+		for (key, _value) in merge_iter {
+			// Skip tombstones
+			if key.kind() == InternalKeyKind::Delete || key.kind() == InternalKeyKind::SoftDelete {
+				last_key = Some(key.user_key.as_ref().to_vec());
+				continue;
+			}
+
+			// Only count latest version of each key
+			match &last_key {
+				Some(prev_key) if prev_key == key.user_key.as_ref() => {
+					continue; // Skip older version
+				}
+				_ => {
+					count += 1;
+					last_key = Some(key.user_key.as_ref().to_vec());
+				}
+			}
+		}
+
+		Ok(count)
+	}
+
 	/// Gets a single key from the snapshot.
 	///
 	/// # Read Path in LSM Trees
@@ -945,20 +998,12 @@ impl SnapshotIterator<'_> {
 	where
 		R: RangeBounds<Vec<u8>>,
 	{
-		// Collect iterator from active memtable
-		let active = guardian::ArcRwLockReadGuardian::take(core.active_memtable.clone()).unwrap();
-
-		// Collect iterators from immutable memtables
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(core.immutable_memtables.clone()).unwrap();
-
-		// Collect iterators from all tables in all levels
-		let manifest = guardian::ArcRwLockReadGuardian::take(core.level_manifest.clone()).unwrap();
-		let iter_state = IterState {
-			active: active.clone(),
-			immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
-			levels: manifest.levels.clone(),
+		// Create a temporary snapshot to use the helper method
+		let snapshot = Snapshot {
+			core: core.clone(),
+			seq_num,
 		};
+		let iter_state = snapshot.collect_iter_state()?;
 
 		// Convert bounds to owned for passing to merge iterator
 		let start = range.start_bound().map(|v| v.clone());
@@ -979,7 +1024,7 @@ impl SnapshotIterator<'_> {
 
 		Ok(Self {
 			pipeline,
-			core: core.clone(),
+			core,
 			keys_only,
 		})
 	}
