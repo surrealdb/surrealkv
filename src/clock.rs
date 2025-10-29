@@ -160,12 +160,12 @@ impl LogicalClock for DefaultLogicalClock {
 				version = current + 1;
 			}
 			// Try to update the timestamp
-			if let Ok(_) = self.inner.timestamp.compare_exchange_weak(
-				current,
-				version,
-				Ordering::AcqRel,
-				Ordering::Acquire,
-			) {
+			if self
+				.inner
+				.timestamp
+				.compare_exchange_weak(current, version, Ordering::AcqRel, Ordering::Acquire)
+				.is_ok()
+			{
 				return version;
 			}
 			// Ensure the thread backs off when under contention
