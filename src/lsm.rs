@@ -1580,9 +1580,9 @@ mod tests {
 		// Test range scan BEFORE flushing (should work from memtables)
 		let txn = tree.begin().unwrap();
 		let range_before_flush: Vec<_> =
-			txn.range(b"a", b"c", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			txn.range(b"a", b"d", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
-		// Should return keys "a", "b", "c" (inclusive range)
+		// Should return keys "a", "b", "c" ([a, d) range)
 		assert_eq!(range_before_flush.len(), 3, "Range scan before flush should return 3 items");
 
 		// Verify the keys and values are correct
@@ -1603,7 +1603,7 @@ mod tests {
 		// Test range scan AFTER flushing (should work from SSTables)
 		let txn = tree.begin().unwrap();
 		let range_after_flush: Vec<_> =
-			txn.range(b"a", b"c", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			txn.range(b"a", b"d", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 		// Should return the same keys after flush
 		assert_eq!(range_after_flush.len(), 3, "Range scan after flush should return 3 items");
@@ -1697,9 +1697,9 @@ mod tests {
 			);
 		}
 
-		// Test 2: Partial range scan - first 100 items
+		// Test 2: Partial range scan - first 100 items ([key_000000, key_000100) range)
 		let partial_start = "key_000000".as_bytes();
-		let partial_end = "key_000099".as_bytes();
+		let partial_end = "key_000100".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let partial_result: Vec<_> = txn
@@ -1730,7 +1730,7 @@ mod tests {
 
 		// Test 3: Middle range scan - items 5000-5099
 		let middle_start = "key_005000".as_bytes();
-		let middle_end = "key_005099".as_bytes();
+		let middle_end = "key_005100".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let middle_result: Vec<_> = txn
@@ -1762,7 +1762,7 @@ mod tests {
 
 		// Test 4: End range scan - last 100 items
 		let end_start = "key_009900".as_bytes();
-		let end_end = "key_009999".as_bytes();
+		let end_end = "key_010000".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let end_result: Vec<_> =
@@ -1791,7 +1791,7 @@ mod tests {
 
 		// Test 5: Single item range scan
 		let single_start = "key_004567".as_bytes();
-		let single_end = "key_004567".as_bytes();
+		let single_end = "key_004568".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let single_result: Vec<_> = txn

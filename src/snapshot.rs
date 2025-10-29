@@ -213,8 +213,8 @@ impl Snapshot {
 		end: Key,
 		keys_only: bool,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
-		// Create a range from start (inclusive) to end (inclusive)
-		let range = start.as_ref().to_vec()..=end.as_ref().to_vec();
+		// Create a range from start (inclusive) to end (exclusive)
+		let range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		SnapshotIterator::new_from(self.core.clone(), self.seq_num, range, keys_only)
 	}
 
@@ -1107,7 +1107,7 @@ mod tests {
 
 		// The read transaction should only see the initial data
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key9", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1139,7 +1139,7 @@ mod tests {
 
 		// The read transaction should see the old values
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key9", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v1");
@@ -1148,7 +1148,7 @@ mod tests {
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
 		let range: Vec<_> =
-			new_tx.range(b"key0", b"key9", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v2");
@@ -1180,7 +1180,7 @@ mod tests {
 
 		// The first read transaction should still see all three keys
 		let range: Vec<_> =
-			read_tx1.range(b"key0", b"key9", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx1.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1190,7 +1190,7 @@ mod tests {
 		// A new transaction should not see the deleted key
 		let read_tx2 = store.begin().unwrap();
 		let range: Vec<_> =
-			read_tx2.range(b"key0", b"key9", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx2.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1434,8 +1434,8 @@ mod tests {
 		let tx = store.begin().unwrap();
 		let tx = tx.snapshot.as_ref().unwrap();
 
-		// Get keys only
-		let keys_only_iter = tx.range(b"key1", b"key5", true).unwrap();
+		// Get keys only ([key1, key6) to include key5)
+		let keys_only_iter = tx.range(b"key1", b"key6", true).unwrap();
 		let keys_only: Vec<_> = keys_only_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Verify we got all 5 keys
@@ -1450,8 +1450,8 @@ mod tests {
 			assert!(value.is_none(), "Value should be None for keys-only scan");
 		}
 
-		// Compare with regular range scan
-		let regular_range_iter = tx.range(b"key1", b"key5", false).unwrap();
+		// Compare with regular range scan ([key1, key6) to include key5)
+		let regular_range_iter = tx.range(b"key1", b"key6", false).unwrap();
 		let regular_range: Vec<_> = regular_range_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(regular_range.len(), keys_only.len());
@@ -1536,16 +1536,16 @@ mod tests {
 		let tx = store.begin().unwrap();
 		let tx = tx.snapshot.as_ref().unwrap();
 
-		// Test forward iteration
-		let forward_iter = tx.range(b"key1", b"key5", false).unwrap();
+		// Test forward iteration ([key1, key6) to include key5)
+		let forward_iter = tx.range(b"key1", b"key6", false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(forward_items.len(), 5);
 		assert_eq!(forward_items[0].0.as_ref(), b"key1");
 		assert_eq!(forward_items[4].0.as_ref(), b"key5");
 
-		// Test backward iteration
-		let backward_iter = tx.range(b"key1", b"key5", false).unwrap();
+		// Test backward iteration ([key1, key6) to include key5)
+		let backward_iter = tx.range(b"key1", b"key6", false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(backward_items.len(), 5);
@@ -1586,23 +1586,23 @@ mod tests {
 
 		// Test forward iteration on first snapshot (should see all keys)
 		let tx1_ref = tx1.snapshot.as_ref().unwrap();
-		let forward_iter1 = tx1_ref.range(b"key1", b"key3", false).unwrap();
+		let forward_iter1 = tx1_ref.range(b"key1", b"key4", false).unwrap();
 		let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items1.len(), 3);
 
 		// Test backward iteration on first snapshot
-		let backward_iter1 = tx1_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_iter1 = tx1_ref.range(b"key1", b"key4", false).unwrap();
 		let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items1.len(), 3);
 
 		// Test forward iteration on second snapshot (should not see deleted key)
 		let tx2_ref = tx2.snapshot.as_ref().unwrap();
-		let forward_iter2 = tx2_ref.range(b"key1", b"key3", false).unwrap();
+		let forward_iter2 = tx2_ref.range(b"key1", b"key4", false).unwrap();
 		let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items2.len(), 2);
 
 		// Test backward iteration on second snapshot
-		let backward_iter2 = tx2_ref.range(b"key1", b"key3", false).unwrap();
+		let backward_iter2 = tx2_ref.range(b"key1", b"key4", false).unwrap();
 		let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items2.len(), 2);
 
@@ -1679,7 +1679,7 @@ mod tests {
 		// Test forward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let forward_iter = snapshot_ref.range(b"key1", b"key5", false).unwrap();
+			let forward_iter = snapshot_ref.range(b"key1", b"key6", false).unwrap();
 			let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 			assert_eq!(forward_items.len(), 3); // key1, key3, key5
@@ -1691,7 +1691,7 @@ mod tests {
 		// Test backward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let backward_iter = snapshot_ref.range(b"key1", b"key5", false).unwrap();
+			let backward_iter = snapshot_ref.range(b"key1", b"key6", false).unwrap();
 			let backward_items: Vec<_> =
 				backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -1734,7 +1734,7 @@ mod tests {
 		{
 			let tx1_ref = tx1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx1_ref
-				.range(b"key1", b"key4", false)
+				.range(b"key1", b"key5", false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1745,7 +1745,7 @@ mod tests {
 		{
 			let tx2_ref = tx2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx2_ref
-				.range(b"key1", b"key4", false)
+				.range(b"key1", b"key5", false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1775,11 +1775,11 @@ mod tests {
 
 		// Test forward iteration
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let forward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let forward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Test backward iteration
-		let backward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let backward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Both should have 10 items
