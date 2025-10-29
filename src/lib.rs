@@ -94,7 +94,7 @@ impl Default for Options {
 		let clock = Arc::new(DefaultLogicalClock::new());
 
 		Self {
-			block_size: 1 << 10,
+			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
 			comparator: Arc::new(crate::BytewiseComparator {}),
 			compression: CompressionType::None,

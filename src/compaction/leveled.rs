@@ -2085,12 +2085,12 @@ mod tests {
 		assert_eq!(props.tombstone_count, expected_tombstones);
 		assert_eq!(props.data_size, 2975);
 		assert_eq!(props.global_seq_num, 0);
-		assert_eq!(props.num_data_blocks, 3);
+		assert_eq!(props.num_data_blocks, 1);
 		assert_eq!(props.top_level_index_size, 0);
 		assert!(props.created_at > 0);
-		assert_eq!(props.file_size, 3218);
-		assert_eq!(props.block_size, 1029);
-		assert_eq!(props.block_count, 3);
+		assert_eq!(props.file_size, 3102);
+		assert_eq!(props.block_size, 2757);
+		assert_eq!(props.block_count, 1);
 		assert_eq!(props.compression, CompressionType::None);
 		assert_eq!(props.seqnos.0, 1000);
 		assert_eq!(props.seqnos.1, 1099);
