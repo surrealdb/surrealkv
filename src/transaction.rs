@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{Snapshot, VersionScanResult};
 use crate::sstable::InternalKeyKind;
-use crate::{IterResult, Value};
+use crate::{IterResult, Key, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,12 +64,15 @@ pub enum Durability {
 pub struct WriteOptions {
 	/// Durability level for the write operation
 	pub durability: Durability,
+	/// Optional timestamp for the write operation. If None, uses the current timestamp.
+	pub timestamp: Option<u64>,
 }
 
 impl Default for WriteOptions {
 	fn default() -> Self {
 		Self {
 			durability: Durability::Eventual,
+			timestamp: None,
 		}
 	}
 }
@@ -83,6 +86,12 @@ impl WriteOptions {
 	/// Sets the durability level for write operations
 	pub fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
+		self
+	}
+
+	/// Sets the timestamp for write operations
+	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
 		self
 	}
 }
@@ -100,6 +109,8 @@ pub struct ReadOptions {
 	pub iterate_lower_bound: Option<Vec<u8>>,
 	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
 	pub iterate_upper_bound: Option<Vec<u8>>,
+	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
+	pub timestamp: Option<u64>,
 }
 
 impl ReadOptions {
@@ -139,6 +150,12 @@ impl ReadOptions {
 	/// Sets the upper bound for iteration (exclusive) - builder pattern
 	pub fn with_iterate_upper_bound(mut self, bound: Option<Vec<u8>>) -> Self {
 		self.iterate_upper_bound = bound;
+		self
+	}
+
+	/// Sets the timestamp for point-in-time reads
+	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
 		self
 	}
 }
@@ -184,8 +201,15 @@ impl Transaction {
 		self.write_seqno
 	}
 
+	/// Sets the durability level for this transaction
 	pub fn set_durability(&mut self, durability: Durability) {
 		self.durability = durability;
+	}
+
+	/// Sets the durability level for this transaction
+	pub fn with_durability(mut self, durability: Durability) -> Self {
+		self.durability = durability;
+		self
 	}
 
 	/// Prepare a new transaction in the given mode.
@@ -219,12 +243,17 @@ impl Transaction {
 		})
 	}
 
-	/// Adds a key-value pair to the store.
+	/// Inserts a key-value pair into the store.
 	pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Adds a key-value pair to the store with custom write options.
+	/// Inserts a key-value pair at with a specific timestamp.
+	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
+	}
+
+	/// Inserts a key-value pair to the store, with custom write options.
 	pub fn set_with_options(
 		&mut self,
 		key: &[u8],
@@ -232,56 +261,81 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry =
-			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno);
-		self.write_with_options(entry, options)?;
-		Ok(())
-	}
-
-	/// Sets a key-value pair with a specific timestamp
-	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
-		self.set_at_version_with_options(key, value, timestamp, &WriteOptions::default())
-	}
-
-	/// Sets a key-value pair with a specific timestamp and custom write options
-	pub fn set_at_version_with_options(
-		&mut self,
-		key: &[u8],
-		value: &[u8],
-		timestamp: u64,
-		options: &WriteOptions,
-	) -> Result<()> {
-		let seqno = self.next_write_seqno();
-		self.write_with_options(
+		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
 				key,
 				Some(value),
 				InternalKeyKind::Set,
 				self.savepoints,
-				seqno,
+				write_seqno,
 				timestamp,
-			),
-			options,
-		)
+			)
+		} else {
+			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
+		};
+		self.write_with_options(entry, options)?;
+		Ok(())
 	}
 
-	// Delete all the versions of a key. This is a hard delete.
+	/// Delete all the versions of a key. This is a hard delete.
 	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::Delete, &WriteOptions::default())
+		self.delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Soft delete a key. The key will exist on disk but never be shown in queries.
+	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+		let write_seqno = self.next_write_seqno();
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				None,
+				InternalKeyKind::Delete,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, None, InternalKeyKind::Delete, self.savepoints, write_seqno)
+		};
+		self.write_with_options(entry, options)?;
+		Ok(())
+	}
+
+	/// Soft delete a key. This will add a tombstone at the current timestamp.
 	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
-		self.delete_with_options(key, InternalKeyKind::SoftDelete, &WriteOptions::default())
+		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Sets a key-value pair and replaces all previous versions when versioning is enabled.
-	/// This is similar to a regular set but does not preserve any older versions in the versioned index.
+	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
+	pub fn soft_delete_at_version(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
+		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
+	}
+
+	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
+	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+		let write_seqno = self.next_write_seqno();
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				None,
+				InternalKeyKind::SoftDelete,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, None, InternalKeyKind::SoftDelete, self.savepoints, write_seqno)
+		};
+		self.write_with_options(entry, options)?;
+		Ok(())
+	}
+
+	/// Inserts a key-value pairm removing all previous versions.
 	pub fn replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Sets a key-value pair with Replace and custom write options.
+	/// Inserts a key-value pair, removing all previous versions, with custom write options.
 	pub fn replace_with_options(
 		&mut self,
 		key: &[u8],
@@ -289,21 +343,18 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
-		let entry =
-			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno);
-		self.write_with_options(entry, options)?;
-		Ok(())
-	}
-
-	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options(
-		&mut self,
-		key: &[u8],
-		kind: InternalKeyKind,
-		options: &WriteOptions,
-	) -> Result<()> {
-		let write_seqno = self.next_write_seqno();
-		let entry = Entry::new(key, None, kind, self.savepoints, write_seqno);
+		let entry = if let Some(timestamp) = options.timestamp {
+			Entry::new_with_timestamp(
+				key,
+				Some(value),
+				InternalKeyKind::Replace,
+				self.savepoints,
+				write_seqno,
+				timestamp,
+			)
+		} else {
+			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
+		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
@@ -313,8 +364,13 @@ impl Transaction {
 		self.get_with_options(key, &ReadOptions::default())
 	}
 
-	/// Gets a value for a key if it exists with custom read options.
-	pub fn get_with_options(&self, key: &[u8], _options: &ReadOptions) -> Result<Option<Value>> {
+	/// Gets a value for a key at a specific timestamp.
+	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
+	}
+
+	/// Gets a value for a key, with custom read options.
+	pub fn get_with_options(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -327,6 +383,20 @@ impl Transaction {
 		// Do not allow reads if it is a write-only transaction
 		if self.mode.is_write_only() {
 			return Err(Error::TransactionWriteOnly);
+		}
+
+		// If a timestamp is provided, use versioned read
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Query the versioned index through the snapshot
+			return match &self.snapshot {
+				Some(snapshot) => snapshot.get_at_version(key, timestamp),
+				None => Err(Error::NoSnapshot),
+			};
 		}
 
 		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
@@ -353,7 +423,215 @@ impl Transaction {
 		}
 	}
 
-	/// Writes a value for a key. None is used for deletion.
+	/// Gets keys in a key range at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
+		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.keys_with_options(&options)
+	}
+
+	/// Gets keys in a key range at a specific timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys_at_version<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
+		let mut options = ReadOptions::default()
+			.with_keys_only(true)
+			.with_limit(limit)
+			.with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.keys_with_options(&options)
+	}
+
+	/// Gets keys in a key range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<Key>> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.keys_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|vec| Ok(Arc::from(vec))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Force keys_only to true for this method
+			let mut options = options.clone();
+			options.keys_only = true;
+			Ok(Box::new(
+				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+					.map(|result| result.map(|(key, _)| key)),
+			))
+		}
+	}
+
+	/// Gets keys and values in a range, at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		let mut options = ReadOptions::default().with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.range_with_options(&options)
+	}
+
+	/// Gets keys and values in a range, at a specific timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range_at_version<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.range_with_options(&options)
+	}
+
+	/// Gets keys and values in a range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = IterResult> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.range_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|result| result.map(|(k, v)| (k.into(), Some(v)))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			Ok(Box::new(TransactionRangeIterator::new_with_options(
+				self, start_key, end_key, options,
+			)?))
+		}
+	}
+
+	/// Gets all versions of keys in a range.
+	pub fn scan_all_versions<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<Vec<VersionScanResult>> {
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
+			None => Err(Error::NoSnapshot),
+		}
+	}
+
 	/// Writes a value for a key with custom write options. None is used for deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
@@ -399,61 +677,6 @@ impl Transaction {
 		}
 
 		Ok(())
-	}
-
-	/// Creates an iterator for a range scan between start and end keys (inclusive).
-	pub fn range<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		let mut options = ReadOptions::default().with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.range_with_options(&options)
-	}
-
-	/// Creates an iterator for a range scan with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
-	pub fn range_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, options)
-	}
-
-	/// Creates an iterator that returns only keys in the given range.
-	/// This is faster than `range()` as it doesn't fetch or resolve values from disk.
-	pub fn keys<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.keys_with_options(&options)
-	}
-
-	/// Creates an iterator that returns only keys with custom read options.
-	/// The range bounds are taken from the ReadOptions (iterate_lower_bound and iterate_upper_bound).
-	pub fn keys_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
-		// Force keys_only to true for this method
-		let mut options = options.clone();
-		options.keys_only = true;
-		TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
@@ -518,6 +741,20 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Rolls back the transaction by removing all updated entries.
+	pub fn rollback(&mut self) {
+		// Only unregister mutable transactions since only they get registered
+		if !self.closed && self.mode.mutable() {
+			self.core.oracle.unregister_txn_start(self.start_commit_id);
+		}
+
+		self.closed = true;
+		self.write_set.clear();
+		self.snapshot.take();
+		self.savepoints = 0;
+		self.write_seqno = 0;
+	}
+
 	/// After calling this method the subsequent modifications within this
 	/// transaction can be rolled back by calling [`rollback_to_savepoint`].
 	///
@@ -574,121 +811,6 @@ impl Transaction {
 		self.savepoints -= 1;
 
 		Ok(())
-	}
-
-	/// Rolls back the transaction by removing all updated entries.
-	pub fn rollback(&mut self) {
-		// Only unregister mutable transactions since only they get registered
-		if !self.closed && self.mode.mutable() {
-			self.core.oracle.unregister_txn_start(self.start_commit_id);
-		}
-
-		self.closed = true;
-		self.write_set.clear();
-		self.snapshot.take();
-		self.savepoints = 0;
-		self.write_seqno = 0;
-	}
-
-	/// Gets a value for a key at a specific timestamp
-	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if key.is_empty() {
-			return Err(Error::EmptyKey);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.get_at_version(key, timestamp),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Gets keys in a key range at a specific timestamp
-	pub fn keys_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + 'a> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.keys_at_version(key_range, timestamp, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Scans key-value pairs in a key range at a specific timestamp
-	pub fn scan_at_version<'a, R: RangeBounds<Vec<u8>>>(
-		&'a self,
-		key_range: R,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + 'a> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_at_version(key_range, timestamp, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Gets all versions of keys in a key range
-	pub fn scan_all_versions<R: RangeBounds<Vec<u8>>>(
-		&self,
-		key_range: R,
-		limit: Option<usize>,
-	) -> Result<Vec<VersionScanResult>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(key_range, limit),
-			None => Err(Error::NoSnapshot),
-		}
 	}
 }
 
@@ -1961,11 +2083,9 @@ mod tests {
 			assert_eq!(keys_only.len(), 6);
 
 			// Check the keys are in order
-			for (i, (key, value)) in keys_only.iter().enumerate().take(6) {
+			for (i, key) in keys_only.iter().enumerate().take(6) {
 				let expected_key = format!("key{}", i + 1);
 				assert_eq!(key.as_ref(), expected_key.as_bytes());
-				// Values should be None
-				assert!(value.is_none(), "Value should be None for keys-only scan");
 			}
 
 			// Compare with regular range
@@ -1977,7 +2097,7 @@ mod tests {
 
 			// Keys should match and regular range values should be correct
 			for i in 0..keys_only.len() {
-				assert_eq!(keys_only[i].0, regular_range[i].0, "Keys should match");
+				assert_eq!(keys_only[i], regular_range[i].0, "Keys should match");
 
 				if i < 5 {
 					// For keys from storage, check regular values are correct
@@ -2010,7 +2130,7 @@ mod tests {
 			// Verify key3 is not in the results
 			let key_names: Vec<_> = keys_after_delete
 				.iter()
-				.map(|(k, _)| String::from_utf8_lossy(k.as_ref()).to_string())
+				.map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
 				.collect();
 
 			assert!(!key_names.contains(&"key3".to_string()), "key3 should be removed");
@@ -2368,7 +2488,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().to_vec()).collect();
 
 				assert_eq!(keys[0], b"key3");
 				assert_eq!(keys[1], b"key2");
@@ -2991,7 +3111,7 @@ mod tests {
 		assert_eq!(value, Some(Arc::from(b"value1_v2" as &[u8])));
 
 		// Get all versions to verify timestamps and values
-		let versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 		assert_eq!(versions.len(), 2);
 
 		// Find versions by timestamp
@@ -3042,7 +3162,7 @@ mod tests {
 		assert_eq!(value, None);
 
 		// Test scan_all_versions to get all versions including tombstones
-		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		let all_versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 		assert_eq!(all_versions.len(), 3);
 
 		// Check values by timestamp
@@ -3052,26 +3172,26 @@ mod tests {
 		assert_eq!(val1.1.as_ref(), b"value1");
 		assert_eq!(val2.1.as_ref(), b"value2");
 
-		// Test scan_at_version with specific timestamp to get point-in-time view
+		// Test range_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts1, None)
+			.range_at_version(b"key1", b"key2", ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
-		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
+		assert_eq!(version_at_ts1[0].1.as_ref().unwrap().as_ref(), b"value1");
 
 		let version_at_ts2 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts2, None)
+			.range_at_version(b"key1", b"key2", ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
-		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
+		assert_eq!(version_at_ts2[0].1.as_ref().unwrap().as_ref(), b"value2");
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key1".to_vec(), ts3, None)
+			.range_at_version(b"key1", b"key2", ts3, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3107,10 +3227,67 @@ mod tests {
 		assert_eq!(value, None);
 
 		// Verify using scan_all_versions to check the timestamp
-		let versions = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
+		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0].2, custom_timestamp); // Check the timestamp
 		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
+	}
+
+	#[test(tokio::test)]
+	async fn test_timestamp_via_write_options() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Test setting a value with timestamp via WriteOptions
+		let custom_timestamp = 100;
+		let mut tx = tree.begin().unwrap();
+		tx.set_with_options(
+			b"key1",
+			b"value1",
+			&WriteOptions::default().with_timestamp(Some(custom_timestamp)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+
+		// Verify we can read it at that timestamp
+		let tx = tree.begin().unwrap();
+		let value = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+
+		// Test soft_delete_with_options with timestamp
+		let delete_timestamp = 200;
+		let mut tx = tree.begin().unwrap();
+		tx.soft_delete_with_options(
+			b"key1",
+			&WriteOptions::default().with_timestamp(Some(delete_timestamp)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+
+		// Verify the value exists at the earlier timestamp but not at the delete timestamp
+		let tx = tree.begin().unwrap();
+		let value_before = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value_before, Some(Arc::from(b"value1" as &[u8])));
+
+		let value_after = tx
+			.get_with_options(
+				b"key1",
+				&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
+			)
+			.unwrap();
+		assert_eq!(value_after, None);
 	}
 
 	#[test(tokio::test)]
@@ -3129,9 +3306,9 @@ mod tests {
 
 		// All keys should have the same timestamp
 		let tx = tree.begin().unwrap();
-		let versions1 = tx.scan_all_versions(b"key1".to_vec()..=b"key1".to_vec(), None).unwrap();
-		let versions2 = tx.scan_all_versions(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
-		let versions3 = tx.scan_all_versions(b"key3".to_vec()..=b"key3".to_vec(), None).unwrap();
+		let versions1 = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
+		let versions2 = tx.scan_all_versions(b"key2", b"key3", None).unwrap();
+		let versions3 = tx.scan_all_versions(b"key3", b"key4", None).unwrap();
 
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
@@ -3153,9 +3330,9 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let tx = tree.begin().unwrap();
-		let versions4 = tx.scan_all_versions(b"key4".to_vec()..=b"key4".to_vec(), None).unwrap();
-		let versions5 = tx.scan_all_versions(b"key5".to_vec()..=b"key5".to_vec(), None).unwrap();
-		let versions6 = tx.scan_all_versions(b"key6".to_vec()..=b"key6".to_vec(), None).unwrap();
+		let versions4 = tx.scan_all_versions(b"key4", b"key5", None).unwrap();
+		let versions5 = tx.scan_all_versions(b"key5", b"key6", None).unwrap();
+		let versions6 = tx.scan_all_versions(b"key6", b"key7", None).unwrap();
 
 		assert_eq!(versions4.len(), 1);
 		assert_eq!(versions5.len(), 1);
@@ -3202,42 +3379,37 @@ mod tests {
 
 		// Test keys_at_version at first timestamp
 		let tx = tree.begin().unwrap();
-		let keys_at_ts1 = tx
-			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
-			.unwrap()
-			.collect::<Vec<_>>();
+		let keys_at_ts1: Vec<_> =
+			tx.keys_at_version(b"key1", b"key5", ts1, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts1.len(), 3);
-		assert!(keys_at_ts1.contains(&b"key1".to_vec()));
-		assert!(keys_at_ts1.contains(&b"key2".to_vec()));
-		assert!(keys_at_ts1.contains(&b"key3".to_vec()));
-		assert!(!keys_at_ts1.contains(&b"key4".to_vec())); // key4 didn't exist at ts1
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(!keys_at_ts1.iter().any(|k| k.as_ref() == b"key4")); // key4 didn't exist at ts1
 
 		// Test keys_at_version at second timestamp
-		let keys_at_ts2 = tx
-			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
-			.unwrap()
-			.collect::<Vec<_>>();
+		let keys_at_ts2: Vec<_> =
+			tx.keys_at_version(b"key1", b"key5", ts2, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts2.len(), 4);
-		assert!(keys_at_ts2.contains(&b"key1".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key2".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key3".to_vec()));
-		assert!(keys_at_ts2.contains(&b"key4".to_vec()));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key4"));
 
 		// Test with limit
-		let keys_limited = tx
-			.keys_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+		let keys_limited: Vec<_> = tx
+			.keys_at_version(b"key1", b"key5", ts2, Some(2))
 			.unwrap()
-			.collect::<Vec<_>>();
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys_limited.len(), 2);
 
 		// Test with specific key range
-		let keys_range = tx
-			.keys_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
-			.unwrap()
-			.collect::<Vec<_>>();
+		let keys_range: Vec<_> =
+			tx.keys_at_version(b"key2", b"key4", ts2, None).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_range.len(), 2);
-		assert!(keys_range.contains(&b"key2".to_vec()));
-		assert!(keys_range.contains(&b"key3".to_vec()));
+		assert!(keys_range.iter().any(|k| k.as_ref() == b"key2"));
+		assert!(keys_range.iter().any(|k| k.as_ref() == b"key3"));
 	}
 
 	#[test(tokio::test)]
@@ -3263,18 +3435,19 @@ mod tests {
 		// Test keys_at_version with current timestamp
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
-		let keys = tx
-			.keys_at_version(b"key1".to_vec()..=b"key3".to_vec(), u64::MAX, None)
+		let keys: Vec<_> = tx
+			.keys_at_version(b"key1", b"key4", u64::MAX, None)
 			.unwrap()
-			.collect::<Vec<_>>();
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
-		assert!(keys.contains(&b"key1".to_vec()));
-		assert!(!keys.contains(&b"key2".to_vec())); // Hard deleted
-		assert!(!keys.contains(&b"key3".to_vec())); // Soft deleted
+		assert!(keys.iter().any(|k| k.as_ref() == b"key1"));
+		assert!(!keys.iter().any(|k| k.as_ref() == b"key2")); // Hard deleted
+		assert!(!keys.iter().any(|k| k.as_ref() == b"key3")); // Soft deleted
 	}
 
 	#[test(tokio::test)]
-	async fn test_scan_at_version() {
+	async fn test_range_at_version() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3297,10 +3470,10 @@ mod tests {
 		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
 		tx2.commit().await.unwrap();
 
-		// Test scan_at_version at first timestamp
+		// Test range_at_version at first timestamp
 		let tx = tree.begin().unwrap();
 		let scan_at_ts1 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts1, None)
+			.range_at_version(b"key1", b"key5", ts1, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3310,10 +3483,10 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts1 {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2"),
+				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3322,9 +3495,9 @@ mod tests {
 		assert!(found_keys.contains(&b"key3".as_ref()));
 		assert!(!found_keys.contains(&b"key4".as_ref())); // key4 didn't exist at ts1
 
-		// Test scan_at_version at second timestamp
+		// Test range_at_version at second timestamp
 		let scan_at_ts2 = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, None)
+			.range_at_version(b"key1", b"key5", ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3333,11 +3506,11 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts2 {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
-				b"key4" => assert_eq!(value.as_ref(), b"value4"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
+				b"key4" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value4"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3348,7 +3521,7 @@ mod tests {
 
 		// Test with limit
 		let scan_limited = tx
-			.scan_at_version(b"key1".to_vec()..=b"key4".to_vec(), ts2, Some(2))
+			.range_at_version(b"key1", b"key5", ts2, Some(2))
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3356,7 +3529,7 @@ mod tests {
 
 		// Test with specific key range
 		let scan_range = tx
-			.scan_at_version(b"key2".to_vec()..=b"key3".to_vec(), ts2, None)
+			.range_at_version(b"key2", b"key4", ts2, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3370,7 +3543,7 @@ mod tests {
 	}
 
 	#[test(tokio::test)]
-	async fn test_scan_at_version_with_deletes() {
+	async fn test_range_at_version_with_deletes() {
 		let temp_dir = create_temp_directory();
 		let opts: Options =
 			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
@@ -3387,7 +3560,7 @@ mod tests {
 		// Query at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
 		let scan_before = tx_before
-			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_insert, None)
+			.range_at_version(b"key1", b"key4", ts_after_insert, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3400,17 +3573,17 @@ mod tests {
 		tx2.commit().await.unwrap();
 		let ts_after_deletes = now();
 
-		// Test scan_at_version at a time after the deletes
+		// Test range_at_version at a time after the deletes
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
 
 		// Verify key2 is completely gone (hard deleted)
-		let versions2 = tx.scan_all_versions(b"key2".to_vec()..=b"key2".to_vec(), None).unwrap();
+		let versions2 = tx.scan_all_versions(b"key2", b"key3", None).unwrap();
 		assert_eq!(versions2.len(), 0, "Hard deleted key should have no versions");
 
 		// Perform scan at timestamp after deletes
 		let scan_result = tx
-			.scan_at_version(b"key1".to_vec()..=b"key3".to_vec(), ts_after_deletes, None)
+			.range_at_version(b"key1", b"key4", ts_after_deletes, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3419,8 +3592,8 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_result {
 			found_keys.insert(key.as_ref());
-			match key.as_slice() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+			match key.as_ref() {
+				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3454,7 +3627,7 @@ mod tests {
 
 		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
-		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key4".to_vec(), None).unwrap();
+		let all_versions = tx.scan_all_versions(b"key1", b"key5", None).unwrap();
 
 		// Should get all versions of all keys in the range
 		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
@@ -3497,13 +3670,11 @@ mod tests {
 		assert!(!key4_versions[0].2); // Not tombstone
 
 		// Test with limit
-		let limited_versions =
-			tx.scan_all_versions(b"key1".to_vec()..=b"key4".to_vec(), Some(4)).unwrap();
+		let limited_versions = tx.scan_all_versions(b"key1", b"key5", Some(4)).unwrap();
 		assert_eq!(limited_versions.len(), 6);
 
 		// Test with specific key range
-		let range_versions =
-			tx.scan_all_versions(b"key2".to_vec()..=b"key3".to_vec(), None).unwrap();
+		let range_versions = tx.scan_all_versions(b"key2", b"key4", None).unwrap();
 		assert_eq!(range_versions.len(), 3); // 2 versions of key2 + 1 version of key3
 	}
 
@@ -3532,7 +3703,7 @@ mod tests {
 
 		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
-		let all_versions = tx.scan_all_versions(b"key1".to_vec()..=b"key2".to_vec(), None).unwrap();
+		let all_versions = tx.scan_all_versions(b"key1", b"key3", None).unwrap();
 
 		// Should get all versions including soft delete markers, exclude hard-deleted keys
 		assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
@@ -3567,9 +3738,9 @@ mod tests {
 
 		// Test that versioned queries fail when versioning is disabled
 		let tx = tree.begin().unwrap();
-		assert!(tx.keys_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
-		assert!(tx.scan_at_version(b"key1".to_vec()..=b"key2".to_vec(), 123456789, None).is_err());
-		assert!(tx.scan_all_versions(b"key1".to_vec()..=b"key2".to_vec(), None).is_err());
+		assert!(tx.keys_at_version(b"key1", b"key3", 123456789, None).is_err());
+		assert!(tx.range_at_version(b"key1", b"key3", 123456789, None).is_err());
+		assert!(tx.scan_all_versions(b"key1", b"key3", None).is_err());
 	}
 
 	// Version management tests
@@ -3602,8 +3773,9 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> =
-				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
+			let mut end_key = key.as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			// Verify that the output contains all the versions of the key
 			assert_eq!(results.len(), values.len());
@@ -3631,8 +3803,9 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> =
-				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
+			let mut end_key = key.as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			// Verify that the output contains all the versions of the key
 			assert_eq!(results.len(), values.len());
@@ -3657,13 +3830,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					None,
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), keys.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
@@ -3690,13 +3860,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					None,
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
 
 			let mut expected_results = Vec::new();
 			for key in &keys {
@@ -3732,8 +3899,9 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> =
-				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
+			let mut end_key = key.as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 2);
 			let (k, v, version, is_deleted) = &results[0];
@@ -3767,13 +3935,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					None,
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), keys.len() * 2);
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
@@ -3813,13 +3978,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					None,
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
 
 			let mut expected_results = Vec::new();
 			for key in &keys {
@@ -3862,8 +4024,9 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> =
-				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
+			let mut end_key = key.as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 0);
 		}
@@ -3882,13 +4045,10 @@ mod tests {
 
 			// Inclusive range
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					None,
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
 			assert_eq!(results.len(), keys.len());
 		}
 
@@ -3905,13 +4065,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					Some(2),
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
 
 			assert_eq!(results.len(), 2);
 		}
@@ -3927,8 +4084,9 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> =
-				txn.scan_all_versions(key.as_ref().to_vec()..=key.as_ref().to_vec(), None).unwrap();
+			let mut end_key = key.as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 1);
 			let (k, v, version, is_deleted) = &results[0];
@@ -3955,13 +4113,10 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let results: Vec<_> = txn
-				.scan_all_versions(
-					keys.first().unwrap().as_ref().to_vec()
-						..=keys.last().unwrap().as_ref().to_vec(),
-					Some(2),
-				)
-				.unwrap();
+			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			end_key.push(0);
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
 			assert_eq!(results.len(), 6); // 3 versions for each of 2 keys
 
 			// Collect unique keys from the results
@@ -4020,8 +4175,9 @@ mod tests {
 			// Scan each subset and collect versions
 			for subset in subsets {
 				let txn = store.begin().unwrap();
-				let results: Vec<_> =
-					txn.scan_all_versions(subset.0.to_vec()..=subset.1.to_vec(), None).unwrap();
+				let mut end_key = subset.1.to_vec();
+				end_key.push(0);
+				let results: Vec<_> = txn.scan_all_versions(subset.0, &end_key, None).unwrap();
 
 				// Collect unique keys from the results
 				let unique_keys: HashSet<_> =
@@ -4062,7 +4218,7 @@ mod tests {
 
 			// Test 1: Unbounded range should return all keys
 			let txn = store.begin().unwrap();
-			let results = txn.scan_all_versions(.., None).unwrap();
+			let results = txn.scan_all_versions(&b""[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
 			assert_eq!(results.len(), 5); // 5 total versions (only latest per key)
 								 // Check if the results are correct
 			assert_eq!(
@@ -4077,19 +4233,18 @@ mod tests {
 			);
 
 			// Test 2: Range from key2 (inclusive) should exclude key1
-			let results = txn.scan_all_versions(b"key2".to_vec().., None).unwrap();
+			let results =
+				txn.scan_all_versions(&b"key2"[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
 			assert_eq!(results.len(), 4); // key2, key3, key4, key5 versions
 
 			// Test 3: Range excluding key2 should exclude key2 but include others
-			let results = txn
-				.scan_all_versions((Bound::Excluded(b"key2".to_vec()), Bound::Unbounded), None)
-				.unwrap();
+			let results =
+				txn.scan_all_versions(&b"key2\x00"[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
 			assert_eq!(results.len(), 3); // key3, key4, key5 versions
 
 			// Test 4: Range excluding key5 should exclude key5
-			let results = txn
-				.scan_all_versions((Bound::Excluded(b"key5".to_vec()), Bound::Unbounded), None)
-				.unwrap();
+			let results =
+				txn.scan_all_versions(&b"key5\x00"[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
 			assert_eq!(results.len(), 0); // Should be empty!
 		}
 
@@ -4136,15 +4291,19 @@ mod tests {
 				loop {
 					let txn = store.begin().unwrap();
 
-					// Create range using a clone of last_key
-					let range = if first_iteration {
-						(Bound::Unbounded, Bound::Unbounded)
+					// Create range using start and end keys
+					let (start_key, end_key): (Vec<u8>, Vec<u8>) = if first_iteration {
+						(Vec::new(), b"\xff\xff\xff\xff".to_vec())
 					} else {
-						(Bound::Excluded(last_key.clone()), Bound::Unbounded)
+						// For Excluded(last_key), start from just after last_key
+						let mut start = last_key.clone();
+						start.push(0);
+						(start, b"\xff\xff\xff\xff".to_vec())
 					};
 
 					let mut batch_results = Vec::new();
-					let results = txn.scan_all_versions(range, Some(batch_size)).unwrap();
+					let results =
+						txn.scan_all_versions(&start_key, &end_key, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
 						// Convert borrowed key to owned immediately
 						let key_bytes = Bytes::copy_from_slice(k.as_ref());
