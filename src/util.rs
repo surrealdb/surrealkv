@@ -1,9 +1,9 @@
 use std::fmt::Debug;
-#[cfg(test)]
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 
@@ -22,23 +22,28 @@ pub trait LogicalClock: Debug + Send + Sync {
 /// and fast monotonic `Instant::now()` for high-performance time queries
 /// between syncs to avoid expensive syscalls on every commit.
 pub struct DefaultLogicalClock {
-	/// Monotonic counter for logical time
-	timestamp: Arc<AtomicU64>,
-	/// Reference time when oracle was last synced with system clock
-	reference: Arc<ArcSwap<(u64, Instant)>>,
-	/// Background sync control
-	resync_enabled: Arc<AtomicBool>,
-	resync_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-	resync_interval: Duration,
+	/// The inner strcuture of this clock
+	inner: Arc<DefaultLogicalClockInner>,
 }
 
-impl std::fmt::Debug for DefaultLogicalClock {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("DefaultLogicalClock")
-			.field("timestamp", &self.timestamp.load(AtomicOrdering::Relaxed))
-			.field("resync_interval", &self.resync_interval)
-			.finish()
+impl Drop for DefaultLogicalClock {
+	fn drop(&mut self) {
+		self.shutdown();
 	}
+}
+
+/// The inner structure of the timestamp oracle
+pub struct DefaultLogicalClockInner {
+	/// The latest monotonic counter for this oracle
+	timestamp: AtomicU64,
+	/// Reference time when this clock was last synced with system clock
+	reference: ArcSwap<(u64, Instant)>,
+	/// Specifies whether timestamp syncing is enabled in the background
+	resync_enabled: AtomicBool,
+	/// Stores a handle to the current timestamp syncing background thread
+	resync_handle: Mutex<Option<JoinHandle<()>>>,
+	/// Interval at which the clock resyncs with the system clock
+	resync_interval: Duration,
 }
 
 impl Default for DefaultLogicalClock {
@@ -47,80 +52,132 @@ impl Default for DefaultLogicalClock {
 	}
 }
 
+impl std::fmt::Debug for DefaultLogicalClock {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("DefaultLogicalClock")
+			.field("current_timestamp", &self.current_timestamp())
+			.field("current_unix_ns", &Self::current_unix_ns())
+			.field("current_time_ns", &self.current_time_ns())
+			.finish()
+	}
+}
+
 impl DefaultLogicalClock {
 	pub fn new() -> Self {
+		// Get the current unix time in nanoseconds
 		let reference_unix = Self::current_unix_ns();
+		// Get a new monotonically increasing clock
 		let reference_time = Instant::now();
-
+		// Return the current timestamp clock
 		let clock = Self {
-			timestamp: Arc::new(AtomicU64::new(reference_unix)),
-			reference: Arc::new(ArcSwap::new(Arc::new((reference_unix, reference_time)))),
-			resync_enabled: Arc::new(AtomicBool::new(true)),
-			resync_handle: std::sync::Mutex::new(None),
-			resync_interval: Duration::from_secs(1), // Resync every 1s
+			inner: Arc::new(DefaultLogicalClockInner {
+				timestamp: AtomicU64::new(reference_unix),
+				reference: ArcSwap::new(Arc::new((reference_unix, reference_time))),
+				resync_enabled: AtomicBool::new(true),
+				resync_handle: Mutex::new(None),
+				resync_interval: Duration::from_secs(1),
+			}),
 		};
-
-		clock.start_resync_thread();
+		// Start up the resyncing thread
+		clock.spawn_clock_sync();
+		// Return the clock
 		clock
 	}
 
+	/// Returns the current timestamp for this oracle
 	#[inline]
-	fn current_unix_ns() -> u64 {
-		SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos()
-			as u64
+	pub fn current_timestamp(&self) -> u64 {
+		self.inner.timestamp.load(Ordering::Acquire)
 	}
 
-	fn start_resync_thread(&self) {
-		let timestamp = Arc::clone(&self.timestamp);
-		let reference = Arc::clone(&self.reference);
-		let resync_enabled = Arc::clone(&self.resync_enabled);
-		let interval = self.resync_interval;
+	/// Gets the current system time in nanoseconds since the Unix epoch
+	#[inline]
+	pub(crate) fn current_unix_ns() -> u64 {
+		// Get the current system time
+		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH);
+		// Count the nanoseconds since the Unix epoch
+		timestamp.unwrap_or_default().as_nanos() as u64
+	}
 
+	/// Gets the current estimated time in nanoseconds since the Unix epoch
+	#[inline]
+	pub(crate) fn current_time_ns(&self) -> u64 {
+		// Get the current reference time
+		let reference = self.inner.reference.load();
+		// Calculate the nanoseconds since the Unix epoch
+		reference.0 + reference.1.elapsed().as_nanos() as u64
+	}
+
+	/// Shutdown the oracle resync, waiting for background threads to exit
+	fn shutdown(&self) {
+		// Disable timestamp resyncing
+		self.inner.resync_enabled.store(false, Ordering::Release);
+		// Wait for the timestamp resyncing thread to exit
+		if let Some(handle) = self.inner.resync_handle.lock().unwrap().take() {
+			handle.thread().unpark();
+			handle.join().unwrap();
+		}
+	}
+
+	/// Start the resyncing thread after creating the oracle
+	fn spawn_clock_sync(&self) {
+		// Clone the underlying clock inner
+		let inner = Arc::clone(&self.inner);
+		// Store the resync interval for the thread
+		let interval = inner.resync_interval;
+		// Spawn a new thread to handle timestamp resyncing
 		let handle = std::thread::spawn(move || {
-			while resync_enabled.load(AtomicOrdering::Acquire) {
+			// Check whether the timestamp resync process is enabled
+			while inner.resync_enabled.load(Ordering::Acquire) {
+				// Wait for a specified time interval
 				std::thread::park_timeout(interval);
-
-				// Check flag again after waking to ensure immediate shutdown
-				if !resync_enabled.load(AtomicOrdering::Acquire) {
-					break;
-				}
-
+				// Get the current unix time in nanoseconds
 				let reference_unix = Self::current_unix_ns();
+				// Get a new monotonically increasing clock
 				let reference_time = Instant::now();
-
-				// Update reference point
-				reference.store(Arc::new((reference_unix, reference_time)));
-
-				// Ensure timestamp is monotonic
-				timestamp.fetch_max(reference_unix, AtomicOrdering::SeqCst);
+				// Store the timestamp and monotonic instant
+				inner.reference.store(Arc::new((reference_unix, reference_time)));
 			}
 		});
-
-		*self.resync_handle.lock().unwrap() = Some(handle);
+		// Store and track the thread handle
+		*self.inner.resync_handle.lock().unwrap() = Some(handle);
 	}
 }
 
 impl LogicalClock for DefaultLogicalClock {
 	#[inline]
 	fn now(&self) -> u64 {
-		// Load the reference point
-		let reference = self.reference.load();
-
-		// Calculate elapsed time using monotonic clock (no syscall!)
-		let estimated_ts = reference.0 + reference.1.elapsed().as_nanos() as u64;
-
-		// Ensure monotonicity
-		self.timestamp.fetch_max(estimated_ts, AtomicOrdering::SeqCst);
-		self.timestamp.load(AtomicOrdering::SeqCst)
-	}
-}
-
-impl Drop for DefaultLogicalClock {
-	fn drop(&mut self) {
-		self.resync_enabled.store(false, AtomicOrdering::Release);
-		if let Some(handle) = self.resync_handle.lock().unwrap().take() {
-			handle.thread().unpark();
-			let _ = handle.join();
+		// Store the number of spins
+		let mut spins = 0;
+		// Loop until we reach the next incremental timestamp
+		loop {
+			// Get current time estimate
+			let mut version = self.current_time_ns();
+			// Ensure monotonicity via compare-and-swap loop
+			let current = self.inner.timestamp.load(Ordering::Acquire);
+			// Ensure version is greater than last timestamp
+			if version <= current {
+				version = current + 1;
+			}
+			// Try to update the timestamp
+			if let Ok(_) = self.inner.timestamp.compare_exchange_weak(
+				current,
+				version,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				return version;
+			}
+			// Ensure the thread backs off when under contention
+			if spins < 10 {
+				std::hint::spin_loop();
+			} else if spins < 100 {
+				std::thread::yield_now();
+			} else {
+				std::thread::park_timeout(Duration::from_micros(10));
+			}
+			// Increase the number loop spins we have attempted
+			spins += 1;
 		}
 	}
 }
@@ -129,7 +186,7 @@ impl Drop for DefaultLogicalClock {
 #[cfg(test)]
 #[derive(Debug)]
 pub struct MockLogicalClock {
-	current_tick: AtomicI64,
+	current_tick: std::sync::atomic::AtomicI64,
 }
 
 #[cfg(test)]
@@ -143,25 +200,25 @@ impl Default for MockLogicalClock {
 impl MockLogicalClock {
 	pub fn new() -> Self {
 		Self {
-			current_tick: AtomicI64::new(i64::MIN),
+			current_tick: std::sync::atomic::AtomicI64::new(i64::MIN),
 		}
 	}
 
 	pub fn with_timestamp(timestamp: u64) -> Self {
 		Self {
-			current_tick: AtomicI64::new(timestamp as i64),
+			current_tick: std::sync::atomic::AtomicI64::new(timestamp as i64),
 		}
 	}
 
 	pub fn set_time(&self, timestamp: u64) {
-		self.current_tick.store(timestamp as i64, AtomicOrdering::SeqCst);
+		self.current_tick.store(timestamp as i64, Ordering::SeqCst);
 	}
 }
 
 #[cfg(test)]
 impl LogicalClock for MockLogicalClock {
 	fn now(&self) -> u64 {
-		self.current_tick.load(AtomicOrdering::SeqCst) as u64
+		self.current_tick.load(Ordering::SeqCst) as u64
 	}
 }
 
