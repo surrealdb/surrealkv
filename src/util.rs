@@ -269,4 +269,107 @@ mod tests {
 		let ts2 = clock.now();
 		assert!(ts2 > ts1, "Clock did not progress over time: {} >= {}", ts1, ts2);
 	}
+
+	#[test]
+	fn test_default_clock_concurrent_monotonicity() {
+		use std::sync::Mutex as StdMutex;
+
+		let clock = Arc::new(DefaultLogicalClock::new());
+		let all_values = Arc::new(StdMutex::new(Vec::new()));
+		let mut handles = vec![];
+
+		// Spawn 10 threads, each getting 100 timestamps
+		for i in 0..10 {
+			let clock = Arc::clone(&clock);
+			let all_values = Arc::clone(&all_values);
+
+			let handle = std::thread::spawn(move || {
+				for _ in 0..100 {
+					let ts = clock.now();
+					all_values.lock().unwrap().push((i, ts));
+				}
+			});
+
+			handles.push(handle);
+		}
+
+		// Wait for all threads
+		for handle in handles {
+			handle.join().unwrap();
+		}
+
+		// Check that all values are unique and monotonically increasing when sorted
+		let mut values = all_values.lock().unwrap();
+		values.sort_by_key(|(_, ts)| *ts);
+
+		let mut last = 0;
+		for (thread_id, ts) in values.iter() {
+			assert!(
+				*ts > last,
+				"Clock not monotonic: thread {} got {}, but previous was {}",
+				thread_id,
+				ts,
+				last
+			);
+			last = *ts;
+		}
+	}
+
+	#[test]
+	fn test_default_clock_no_duplicates() {
+		use std::collections::HashSet;
+
+		let clock = Arc::new(DefaultLogicalClock::new());
+		let seen = Arc::new(Mutex::new(HashSet::new()));
+		let mut handles = vec![];
+
+		// Spawn multiple threads to detect any duplicate timestamps
+		for _ in 0..5 {
+			let clock = Arc::clone(&clock);
+			let seen = Arc::clone(&seen);
+
+			let handle = std::thread::spawn(move || {
+				for _ in 0..1000 {
+					let ts = clock.now();
+					let mut seen_guard = seen.lock().unwrap();
+					assert!(seen_guard.insert(ts), "Duplicate timestamp: {}", ts);
+				}
+			});
+
+			handles.push(handle);
+		}
+
+		for handle in handles {
+			handle.join().unwrap();
+		}
+	}
+
+	#[test]
+	fn test_default_clock_stays_close_to_wall_time() {
+		let clock = DefaultLogicalClock::new();
+
+		// Get a timestamp
+		let ts1 = clock.now();
+		let wall1 = DefaultLogicalClock::current_unix_ns();
+
+		// Clock should be within 1 second of wall time
+		let diff1 = ts1.abs_diff(wall1);
+		assert!(diff1 < 1_000_000_000, "Clock too far from wall time: {} ns difference", diff1);
+
+		// Even after many calls under contention
+		for _ in 0..10000 {
+			clock.now();
+		}
+
+		let ts2 = clock.now();
+		let wall2 = DefaultLogicalClock::current_unix_ns();
+		let diff2 = ts2.abs_diff(wall2);
+
+		// Should still be reasonably close (within 100ms even with forced increments)
+		assert!(
+			diff2 < 100_000_000,
+			"Clock drifted too far from wall time: {} ns difference",
+			diff2
+		);
+	}
 }
