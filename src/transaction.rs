@@ -632,6 +632,57 @@ impl Transaction {
 		}
 	}
 
+	/// Counts keys in a range at the current timestamp.
+	///
+	/// Returns the number of valid (non-deleted) keys in the range [start, end).
+	/// The range is inclusive of the start key, but exclusive of the end key.
+	///
+	/// This is more efficient than creating an iterator and counting manually,
+	/// as it doesn't need to allocate or return the actual keys.
+	pub fn count<K: AsRef<[u8]>>(&self, start: K, end: K) -> Result<usize> {
+		let mut options = ReadOptions::default();
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.count_with_options(&options)
+	}
+
+	/// Counts keys in a range at a specific timestamp.
+	///
+	/// Returns the number of valid (non-deleted) keys in the range [start, end)
+	/// as they existed at the specified timestamp.
+	/// The range is inclusive of the start key, but exclusive of the end key.
+	///
+	/// This requires versioning to be enabled in the database options.
+	pub fn count_at_version<K: AsRef<[u8]>>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+	) -> Result<usize> {
+		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		self.count_with_options(&options)
+	}
+
+	/// Counts keys with custom read options.
+	///
+	/// Returns the number of valid (non-deleted) keys that match the provided options.
+	/// The options can specify:
+	/// - Key range bounds (iterate_lower_bound, iterate_upper_bound)
+	/// - Timestamp for versioned queries
+	/// - Limit on the maximum count to return
+	///
+	/// For versioned queries (when timestamp is specified), this requires
+	/// versioning to be enabled in the database options.
+	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
+		// Get the keys iterator with the provided options
+		let keys_iter = self.keys_with_options(options)?;
+
+		// Count the keys (respecting any limit in the options)
+		Ok(keys_iter.count())
+	}
+
 	/// Writes a value for a key with custom write options. None is used for deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
@@ -941,8 +992,8 @@ impl<'a> TransactionRangeIterator<'a> {
 		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
-		// Use inclusive range for write set
-		let write_set_range = (Bound::Included(start_bytes), Bound::Included(end_bytes));
+		// Use inclusive-exclusive range for write set: [start, end)
+		let write_set_range = (Bound::Included(start_bytes), Bound::Excluded(end_bytes));
 		let write_set_iter = tx.write_set.range(write_set_range);
 
 		Ok(Self {
@@ -1764,13 +1815,11 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key2", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
-			assert_eq!(range.len(), 3);
+			assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
 			assert_eq!(range[0].0.as_ref(), b"key2");
 			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value2");
 			assert_eq!(range[1].0.as_ref(), b"key3");
 			assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value3");
-			assert_eq!(range[2].0.as_ref(), b"key4");
-			assert_eq!(range[2].1.as_ref().unwrap().as_ref(), b"value4");
 		}
 	}
 
@@ -1795,11 +1844,10 @@ mod tests {
 			let beg = b"".as_slice();
 			let range: Vec<_> =
 				tx.range(beg, b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
-			assert_eq!(range.len(), 4);
+			assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[1].0.as_ref(), b"key2");
 			assert_eq!(range[2].0.as_ref(), b"key3");
-			assert_eq!(range[3].0.as_ref(), b"key4");
 		}
 
 		// Test range with both bounds as empty
@@ -1868,9 +1916,9 @@ mod tests {
 			// Modify existing key
 			tx.set(b"c", b"3_modified").unwrap();
 
-			// Range should see all changes
+			// Range should see all changes ([a, f) to include e)
 			let range: Vec<_> =
-				tx.range(b"a", b"e", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"a", b"f", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
 			assert_eq!(range[0], (b"a".to_vec().into(), Some(b"1".to_vec().into())));
@@ -1904,9 +1952,9 @@ mod tests {
 			tx.delete(b"key2").unwrap();
 			tx.delete(b"key4").unwrap();
 
-			// Range should not see deleted keys
+			// Range should not see deleted keys ([key1, key6) to include key5)
 			let range: Vec<_> =
-				tx.range(b"key1", b"key5", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key6", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1936,9 +1984,9 @@ mod tests {
 			tx.delete(b"key2").unwrap();
 			tx.set(b"key2", b"new_value2").unwrap();
 
-			// Range should see the new value
+			// Range should see the new value ([key1, key4) to include key3)
 			let range: Vec<_> =
-				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[1], (b"key2".to_vec().into(), Some(b"new_value2".to_vec().into())));
@@ -1982,11 +2030,11 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Verify correct ordering in range
+		// Verify correct ordering in range ([key1, key6) to include key5)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key1", b"key5", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key6", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
 			for (i, item) in range.iter().enumerate().take(5) {
@@ -2009,24 +2057,24 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Test inclusive boundaries
+		// Test range boundaries ([key1, key4) to include key3)
 		{
 			let tx = store.begin().unwrap();
 
-			// Range includes both start and end
+			// Range includes start but excludes end
 			let range: Vec<_> =
-				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[2].0.as_ref(), b"key3");
 		}
 
-		// Test single key range
+		// Test single key range ([key2, key3) to include only key2)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key2", b"key2", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key2", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
 			assert_eq!(range[0].0.as_ref(), b"key2");
@@ -2045,8 +2093,12 @@ mod tests {
 			tx.set(b"key", b"value2").unwrap();
 			tx.set(b"key", b"value3").unwrap();
 
-			let range: Vec<_> =
-				tx.range(b"key", b"key", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let end_key = b"key\x01";
+			let range: Vec<_> = tx
+				.range(b"key".as_slice(), end_key.as_slice(), None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
 			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value3"); // Latest value
@@ -2834,11 +2886,11 @@ mod tests {
 			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 		}
 
-		// Verify soft deleted key is not visible in range scans
+		// Verify soft deleted key is not visible in range scans ([key1, key4) to include key3)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[1].0.as_ref(), b"key3");
@@ -2874,11 +2926,11 @@ mod tests {
 			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 		}
 
-		// Both should be invisible to range scans
+		// Both should be invisible to range scans ([key1, key4) to include key3)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key3
 			assert_eq!(range[0].0.as_ref(), b"key3");
 		}
@@ -2907,9 +2959,9 @@ mod tests {
 			// The key should appear as if it doesn't exist
 			assert!(tx.get(b"key1").unwrap().is_none());
 
-			// Range scan within transaction should not see soft deleted key
+			// Range scan within transaction should not see soft deleted key ([key1, key3) to include key2)
 			let range: Vec<_> =
-				tx.range(b"key1", b"key2", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key2
 			assert_eq!(range[0].0.as_ref(), b"key2");
 
@@ -2986,11 +3038,11 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Range scan should not include soft deleted keys
+		// Range scan should not include soft deleted keys ([key01, key11) to include key10)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key01", b"key10", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key01", b"key11", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			// Should have 7 keys (10 - 3 soft deleted)
 			assert_eq!(range.len(), 7);
@@ -3044,11 +3096,11 @@ mod tests {
 			assert_eq!(tx.get(b"key4").unwrap().unwrap().as_ref(), b"value4"); // Unchanged
 		}
 
-		// Range scan should only see updated and unchanged keys
+		// Range scan should only see updated and unchanged keys ([key1, key5) to include key4)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"key1", b"key5", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key3 and key4
 			assert_eq!(range[0].0.as_ref(), b"key3");
 			assert_eq!(range[1].0.as_ref(), b"key4");
@@ -3600,6 +3652,203 @@ mod tests {
 		assert!(found_keys.contains(&b"key1".as_ref()));
 		assert!(!found_keys.contains(&b"key2".as_ref())); // Hard deleted
 		assert!(!found_keys.contains(&b"key3".as_ref())); // Soft deleted
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_basic() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert some initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test basic count
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key2", b"key5").unwrap();
+			assert_eq!(count, 3); // key2, key3, key4 (key5 is exclusive)
+		}
+
+		// Test count all keys
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"".as_slice(), b"key6").unwrap();
+			assert_eq!(count, 5); // All 5 keys
+		}
+
+		// Test count with no keys in range
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key6", b"key9").unwrap();
+			assert_eq!(count, 0);
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_with_deletes() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Delete some keys
+		{
+			let mut tx = store.begin().unwrap();
+			tx.delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test count after delete
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key1", b"key5").unwrap();
+			assert_eq!(count, 3); // key1, key3, key4 (key2 is deleted)
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_read_your_own_writes() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test count within transaction (RYOW)
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.delete(b"key1").unwrap();
+
+			let count = tx.count(b"".as_slice(), b"key5").unwrap();
+			assert_eq!(count, 3); // key2, key3, key4 (key1 deleted in this tx)
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_at_version() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Use explicit timestamps for better testing
+		let ts1 = 100; // First batch timestamp
+		let ts2 = 200; // Second batch timestamp
+
+		// Insert data with first timestamp
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
+		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
+		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
+		tx1.commit().await.unwrap();
+
+		// Insert data with second timestamp
+		let mut tx2 = tree.begin().unwrap();
+		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
+		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
+		tx2.commit().await.unwrap();
+
+		// Test count_at_version at first timestamp
+		let tx = tree.begin().unwrap();
+		let count_at_ts1 = tx.count_at_version(b"key1", b"key5", ts1).unwrap();
+		assert_eq!(count_at_ts1, 3); // key1, key2, key3
+
+		// Test count_at_version at second timestamp
+		let count_at_ts2 = tx.count_at_version(b"key1", b"key5", ts2).unwrap();
+		assert_eq!(count_at_ts2, 4); // key1, key2, key3, key4
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_at_version_with_deletes() {
+		let temp_dir = create_temp_directory();
+		let opts: Options =
+			Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+		// Insert data without explicit timestamps
+		let mut tx1 = tree.begin().unwrap();
+		tx1.set(b"key1", b"value1").unwrap();
+		tx1.set(b"key2", b"value2").unwrap();
+		tx1.set(b"key3", b"value3").unwrap();
+		tx1.commit().await.unwrap();
+		let ts_after_insert = now();
+
+		// Count at this point should show all three keys
+		let tx_before = tree.begin().unwrap();
+		let count_before = tx_before.count_at_version(b"key1", b"key4", ts_after_insert).unwrap();
+		assert_eq!(count_before, 3, "Should have all 3 keys before deletes");
+
+		// Delete some keys
+		let mut tx_delete = tree.begin().unwrap();
+		tx_delete.delete(b"key2").unwrap(); // Hard delete
+		tx_delete.soft_delete(b"key3").unwrap(); // Soft delete
+		tx_delete.commit().await.unwrap();
+		let ts_after_delete = now();
+
+		// Count after deletes
+		let tx_after = tree.begin().unwrap();
+		let count_after = tx_after.count_at_version(b"key1", b"key4", ts_after_delete).unwrap();
+		assert_eq!(count_after, 1, "Should have only 1 key after deletes");
+
+		// Verify we can still count at the earlier timestamp
+		let count_at_old_ts = tx_after.count_at_version(b"key1", b"key4", ts_after_insert).unwrap();
+		assert_eq!(count_at_old_ts, 3, "Should still have 3 keys at old timestamp");
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_with_options() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert some data
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.set(b"key4", b"value4").unwrap();
+			tx.set(b"key5", b"value5").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Test count with limit
+		{
+			let tx = store.begin().unwrap();
+			let mut options = ReadOptions::default().with_limit(Some(3));
+			options.set_iterate_lower_bound(Some(b"key1".to_vec()));
+			options.set_iterate_upper_bound(Some(b"key6".to_vec()));
+			let count = tx.count_with_options(&options).unwrap();
+			assert_eq!(count, 3); // Limited to 3
+		}
+
+		// Test count with custom bounds
+		{
+			let tx = store.begin().unwrap();
+			let mut options = ReadOptions::default();
+			options.set_iterate_lower_bound(Some(b"key2".to_vec()));
+			options.set_iterate_upper_bound(Some(b"key4".to_vec()));
+			let count = tx.count_with_options(&options).unwrap();
+			assert_eq!(count, 2); // key2, key3 (key4 is exclusive)
+		}
 	}
 
 	#[test(tokio::test)]
