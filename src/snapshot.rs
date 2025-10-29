@@ -1775,11 +1775,11 @@ mod tests {
 
 		// Test forward iteration
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let forward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let forward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Test backward iteration
-		let backward_iter = snapshot_ref.range(b"key01", b"key10", false).unwrap();
+		let backward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Both should have 10 items

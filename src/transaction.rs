@@ -2250,7 +2250,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 
 			let range_results: Vec<_> =
-				txn.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				txn.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
 
@@ -2307,7 +2307,7 @@ mod tests {
 			// Test reverse iteration
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2352,7 +2352,7 @@ mod tests {
 				tx.set(b"key4", b"new_value4").unwrap();
 				tx.set(b"key6", b"new_value6").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key7", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2399,7 +2399,7 @@ mod tests {
 				tx.delete(b"key2").unwrap();
 				tx.delete(b"key4").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2447,7 +2447,7 @@ mod tests {
 				tx.soft_delete(b"key2").unwrap();
 				tx.soft_delete(b"key4").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key5", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2490,7 +2490,7 @@ mod tests {
 			// Test reverse iteration with limit
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key01", b"key10", Some(3)).unwrap();
+				let mut iter = tx.range(b"key01", b"key11", Some(3)).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2527,7 +2527,7 @@ mod tests {
 			// Test reverse iteration with keys only
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.keys(b"key1", b"key3", None).unwrap();
+				let mut iter = tx.keys(b"key1", b"key4", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2574,7 +2574,7 @@ mod tests {
 				tx.soft_delete(b"key4").unwrap(); // Soft delete existing
 				tx.set(b"key6", b"new_value6").unwrap(); // New key
 
-				let mut iter = tx.range(b"key0", b"key6", None).unwrap();
+				let mut iter = tx.range(b"key0", b"key7", None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2616,7 +2616,7 @@ mod tests {
 			// Test reverse iteration on empty range
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key2", b"key4", None).unwrap();
+				let mut iter = tx.range(b"key2", b"key5", None).unwrap();
 
 				// Should get no results
 				assert!(iter.next_back().is_none());

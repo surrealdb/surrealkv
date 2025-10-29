@@ -1762,7 +1762,7 @@ mod tests {
 
 		// Test 4: End range scan - last 100 items
 		let end_start = "key_009900".as_bytes();
-		let end_end = "key_009999".as_bytes();
+		let end_end = "key_010000".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let end_result: Vec<_> =
@@ -1791,7 +1791,7 @@ mod tests {
 
 		// Test 5: Single item range scan
 		let single_start = "key_004567".as_bytes();
-		let single_end = "key_004567".as_bytes();
+		let single_end = "key_004568".as_bytes();
 
 		let txn = tree.begin().unwrap();
 		let single_result: Vec<_> = txn
