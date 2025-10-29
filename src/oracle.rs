@@ -7,7 +7,7 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::error::{Error, Result};
 use crate::transaction::Transaction;
-use crate::util::LogicalClock;
+use crate::clock::LogicalClock;
 
 /// Entry used for tracking transaction operations in the commit queue
 struct CommitEntry {

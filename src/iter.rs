@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
-use crate::util::LogicalClock;
+use crate::clock::LogicalClock;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{sstable::InternalKey, Key, Value};
@@ -429,7 +429,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		sstable::{InternalKey, InternalKeyKind},
-		util::MockLogicalClock,
+		clock::MockLogicalClock,
 		Options, VLogChecksumLevel, Value,
 	};
 	use std::sync::Arc;
