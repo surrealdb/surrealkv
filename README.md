@@ -4,17 +4,16 @@
 
 > **⚠️ Development Status**: SurrealKV is currently under active development and is not feature complete. The API and implementation may change significantly between versions. Use with caution in production environments.
 
-surrealkv is a versioned, low-level, persistent, embedded key-value database implemented in Rust using an LSM (Log-Structured Merge) tree architecture. It offers the following features:
+SurrealKV is a versioned, low-level, persistent, embedded key-value database implemented in Rust using an LSM (Log-Structured Merge) tree architecture with built-in support for time-travel queries.
 
 ## Features
 
 - **ACID Compliance**: Full support for Atomicity, Consistency, Isolation, and Durability
-- **Rich Transaction Support**: Atomic operations for multiple inserts, updates, and deletes
-- **Isolation Level**: Supports Snapshot Isolation
-- **Durability Guaranteed**: Persistent storage with protection against system failures
-- **Embedded Database**: Easily integrate into your Rust applications
-- **MVCC Support**: Non-blocking concurrent reads and writes with snapshot isolation
-- [TODO] **Built-in Versioning**: Track and access historical versions of your data
+- **Snapshot Isolation**: MVCC support with non-blocking concurrent reads and writes
+- **Durability Levels**: Immediate and Eventual durability modes
+- **Time-Travel Queries**: Built-in versioning with point-in-time reads and historical queries
+- **Checkpoint and Restore**: Create consistent snapshots for backup and recovery
+- **Value Log (Wisckey)**: Ability to store large values separately, with garbage collection
 
 ## Quick Start
 
@@ -32,9 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut txn = tree.begin()?;
 
     // Set some key-value pairs
-    let key = b"hello";
-    let value = b"world";
-    txn.set(key, value)?;
+    txn.set(b"hello", b"world")?;
 
     // Commit the transaction (async)
     txn.commit().await?;
@@ -47,47 +44,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 SurrealKV can be configured through various options when creating a new LSM tree:
 
+### Basic Configuration
+
 ```rust
-use surrealkv::{Tree, TreeBuilder};
+use surrealkv::TreeBuilder;
 
 let tree = TreeBuilder::new()
-    .with_path("path/to/db".into())                    // Database directory path
-    .with_max_memtable_size(100 * 1024 * 1024)         // 100MB memtable size
-    .with_block_size(4096)                             // 4KB block size
-    .with_level_count(1)                               // Number of levels in LSM tree
-    .with_vlog_max_file_size(128 * 1024 * 1024)        // 128MB VLog file size
-    .with_enable_vlog(true)                            // Enable/disable VLog
-    .build()?
+    .with_path("path/to/db".into())           // Database directory path
+    .with_max_memtable_size(100 * 1024 * 1024) // 100MB memtable size
+    .with_block_size(4096)                    // 4KB block size
+    .with_level_count(7)                      // Number of levels in LSM tree
+    .build()?;
 ```
 
-### Storage Options
+**Options:**
+- `with_path()` - Database directory where SSTables and WAL files are stored
+- `with_max_memtable_size()` - Size threshold for memtable before flushing to SSTable
+- `with_block_size()` - Size of data blocks in SSTables (affects read performance)
+- `with_level_count()` - Number of levels in the LSM tree structure
 
-- `path`: Database directory path where SSTables and WAL files are stored
-- `max_memtable_size`: Size threshold for memtable before flushing to SSTable
-- `block_size`: Size of data blocks in SSTables (affects read performance)
-- `level_count`: Number of levels in the LSM tree structure
+### Value Log Configuration
 
-### VLog Options
+The Value Log (VLog) separates large values from the LSM tree for more efficient storage and compaction.
 
-- `vlog_max_file_size`: Maximum size of VLog files before rotation
-- `with_enable_vlog()`: Enable/disable Value Log for large value storage
-- `vlog_gc_discard_ratio`: Threshold for triggering VLog garbage collection
+```rust
+let tree = TreeBuilder::new()
+    .with_path("path/to/db".into())
+    .with_enable_vlog(true)                    // Enable VLog
+    .with_vlog_max_file_size(256 * 1024 * 1024) // 256MB VLog file size
+    .with_vlog_gc_discard_ratio(0.5)           // Trigger GC at 50% garbage
+    .with_vlog_checksum_verification(VLogChecksumLevel::Full)
+    .build()?;
+```
 
-### Performance Options
+**Options:**
+- `with_enable_vlog()` - Enable/disable Value Log for large value storage
+- `with_vlog_max_file_size()` - Maximum size of VLog files before rotation
+- `with_vlog_gc_discard_ratio()` - Threshold (0.0-1.0) for triggering VLog garbage collection
+- `with_vlog_checksum_verification()` - Checksum verification level (`Disabled` or `Full`)
 
-- `block_cache`: Cache for frequently accessed data blocks
-- `vlog_cache`: Cache for VLog entries to reduce disk I/O
+
+### Versioning Configuration
+
+Enable time-travel queries to read historical versions of your data:
+
+```rust
+use surrealkv::{Options, TreeBuilder};
+
+let opts = Options::new()
+    .with_path("path/to/db".into())
+    .with_versioning(true, 0);  // Enable versioning, retention_ns = 0 means no limit
+
+let tree = TreeBuilder::with_options(opts).build()?;
+```
+
+**Note:** Versioning requires VLog to be enabled. When you call `with_versioning(true, retention_ns)`, VLog is automatically enabled and configured appropriately.
 
 ## Transaction Operations
 
 ### Basic Operations
 
 ```rust
-use surrealkv::{Tree, TreeBuilder};
+use surrealkv::TreeBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the LSM tree using TreeBuilder
     let tree = TreeBuilder::new()
         .with_path("path/to/db".into())
         .build()?;
@@ -97,8 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = tree.begin()?;
         
         // Set multiple key-value pairs
-        txn.set(b"foo1", b"bar")?;
-        txn.set(b"foo2", b"bar")?;
+        txn.set(b"foo1", b"bar1")?;
+        txn.set(b"foo2", b"bar2")?;
         
         // Commit changes (async)
         txn.commit().await?;
@@ -117,17 +138,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Range Operations
+### Transaction Modes
+
+SurrealKV supports three transaction modes for different use cases:
 
 ```rust
-// Range scan between keys
+use surrealkv::Mode;
+
+// Read-write transaction (default)
+let mut txn = tree.begin()?;
+
+// Read-only transaction - prevents any writes
+let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+
+// Write-only transaction - optimized for writes, no reads allowed
+let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
+```
+
+### Range Operations
+
+Range operations support efficient iteration over key ranges with optional limits:
+
+```rust
+// Range scan between keys (inclusive start, exclusive end)
 let mut txn = tree.begin()?;
 let range: Vec<_> = txn.range(b"key1", b"key5", None)?
     .map(|r| r.unwrap())
     .collect();
 
-// Keys-only scan (more efficient for large values)
+// Keys-only scan (faster, doesn't fetch values when vlog is enabled)
 let keys: Vec<_> = txn.keys(b"key1", b"key5", None)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Range with limit
+let limited: Vec<_> = txn.range(b"key1", b"key9", Some(10))?
     .map(|r| r.unwrap())
     .collect();
 
@@ -136,38 +181,192 @@ txn.delete(b"key1")?;
 txn.commit().await?;
 ```
 
-### Transaction Control
-
-```rust
-// Read-only transaction
-let txn = tree.begin_with_mode(Mode::ReadOnly)?;
-
-// Write-only transaction
-let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
-
-// Rollback transaction
-txn.rollback();
-
-// Set durability level
-txn.set_durability(Durability::Immediate);
-```
-
-## Features
+**Note:** Range iterators are double-ended, supporting both forward and backward iteration.
 
 ### Durability Levels
 
-The `Durability` enum provides two levels of durability for transactions:
-
-- `Eventual`: Commits with this durability level are guaranteed to be persistent eventually. The data is written to the kernel buffer, but it is not fsynced before returning from `Transaction::commit`. This is the default durability level.
-- `Immediate`: Commits with this durability level are guaranteed to be persistent as soon as `Transaction::commit` returns. Data is fsynced to disk before returning from `Transaction::commit`. This is the slowest durability level, but it is the safest.
+Control the durability guarantees for your transactions:
 
 ```rust
-// Set transaction durability to Eventual (default)
-tx.set_durability(Durability::Eventual);
+use surrealkv::Durability;
 
-// Set transaction durability to Immediate
-tx.set_durability(Durability::Immediate);
+let mut txn = tree.begin()?;
+
+// Eventual durability (default) - faster, data written to OS buffer
+txn.set_durability(Durability::Eventual);
+
+// Immediate durability - slower, fsync before commit returns
+txn.set_durability(Durability::Immediate);
+
+txn.set(b"key", b"value")?;
+txn.commit().await?;
 ```
+
+**Durability Levels:**
+- `Eventual`: Commits are guaranteed to be persistent eventually. Data is written to the kernel buffer but not fsynced before returning from `commit()`. This is the default and provides the best performance.
+- `Immediate`: Commits are guaranteed to be persistent as soon as `commit()` returns. Data is fsynced to disk before returning. This is slower but provides the strongest durability guarantees.
+
+
+## Time-Travel Queries
+
+Time-travel queries allow you to read historical versions of your data at specific points in time.
+
+### Enabling Versioning
+
+```rust
+use surrealkv::{Options, TreeBuilder};
+
+let opts = Options::new()
+    .with_path("path/to/db".into())
+    .with_versioning(true, 0);  // retention_ns = 0 means no retention limit
+
+let tree = TreeBuilder::with_options(opts).build()?;
+```
+
+### Writing Versioned Data
+
+```rust
+// Write data with explicit timestamps
+let mut tx = tree.begin()?;
+tx.set_at_version(b"key1", b"value_v1", 100)?;
+tx.commit().await?;
+
+// Update with a new version at a later timestamp
+let mut tx = tree.begin()?;
+tx.set_at_version(b"key1", b"value_v2", 200)?;
+tx.commit().await?;
+```
+
+### Point-in-Time Reads
+
+Query data as it existed at a specific timestamp:
+
+```rust
+let tx = tree.begin()?;
+
+// Get value at specific timestamp
+let value = tx.get_at_version(b"key1", 100)?;
+assert_eq!(value.unwrap().as_ref(), b"value_v1");
+
+// Get value at later timestamp
+let value = tx.get_at_version(b"key1", 200)?;
+assert_eq!(value.unwrap().as_ref(), b"value_v2");
+
+// Range query at specific timestamp
+let range: Vec<_> = tx.range_at_version(b"key1", b"key9", 150, None)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Keys-only query at timestamp (faster, when vlog enabled)
+let keys: Vec<_> = tx.keys_at_version(b"key1", b"key9", 150, None)?
+    .map(|r| r.unwrap())
+    .collect();
+```
+
+### Retrieving All Versions
+
+Get all historical versions of keys in a range:
+
+```rust
+let tx = tree.begin()?;
+let versions = tx.scan_all_versions(b"key1", b"key2", None)?;
+
+for (key, value, timestamp, is_tombstone) in versions {
+    if is_tombstone {
+        println!("Key {:?} deleted at timestamp {}", key, timestamp);
+    } else {
+        println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
+    }
+}
+```
+
+## Advanced Read Options
+
+Use `ReadOptions` for fine-grained control over read operations:
+
+```rust
+use surrealkv::ReadOptions;
+
+let tx = tree.begin()?;
+
+// Range query with limit and bounds
+let options = ReadOptions::new()
+    .with_limit(Some(10))
+    .with_iterate_lower_bound(Some(b"a".to_vec()))
+    .with_iterate_upper_bound(Some(b"z".to_vec()));
+
+let results: Vec<_> = tx.range_with_options(&options)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Keys-only iteration (faster, doesn't fetch values from disk when vlog is enabled)
+let options = ReadOptions::new()
+    .with_keys_only(true)
+    .with_limit(Some(100))
+    .with_iterate_lower_bound(Some(b"a".to_vec()))
+    .with_iterate_upper_bound(Some(b"z".to_vec()));
+
+let keys: Vec<_> = tx.keys_with_options(&options)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Point-in-time read with options (requires versioning enabled)
+let options = ReadOptions::new()
+    .with_timestamp(Some(12345))
+    .with_limit(Some(50))
+    .with_iterate_lower_bound(Some(b"a".to_vec()))
+    .with_iterate_upper_bound(Some(b"z".to_vec()));
+
+let historical_data: Vec<_> = tx.range_with_options(&options)?
+    .map(|r| r.unwrap())
+    .collect();
+```
+
+## Checkpoint and Restore
+
+Create consistent point-in-time snapshots of your database for backup and recovery.
+
+### Creating Checkpoints
+
+```rust
+let tree = TreeBuilder::new()
+    .with_path("path/to/db".into())
+    .build()?;
+
+// Insert some data
+let mut txn = tree.begin()?;
+txn.set(b"key1", b"value1")?;
+txn.set(b"key2", b"value2")?;
+txn.commit().await?;
+
+// Create checkpoint
+let checkpoint_dir = "path/to/checkpoint";
+let metadata = tree.create_checkpoint(&checkpoint_dir)?;
+
+println!("Checkpoint created at timestamp: {}", metadata.timestamp);
+println!("Sequence number: {}", metadata.sequence_number);
+println!("SSTable count: {}", metadata.sstable_count);
+println!("Total size: {} bytes", metadata.total_size);
+```
+
+### Restoring from Checkpoint
+
+```rust
+// Restore database to checkpoint state
+tree.restore_from_checkpoint(&checkpoint_dir)?;
+
+// Data is now restored to the checkpoint state
+// Any data written after checkpoint creation is discarded
+```
+
+**What's included in a checkpoint:**
+- All SSTables from all levels
+- Current WAL segments
+- Level manifest
+- VLog directories (if VLog is enabled)
+- Checkpoint metadata
+
+**Note:** Restoring from a checkpoint discards any pending writes in the active memtable and returns the database to the exact state when the checkpoint was created.
 
 ## Platform Compatibility
 
@@ -206,10 +405,10 @@ The VART-based design had fundamental scalability limitations:
 ### Current Design (LSM Tree)
 The new LSM (Log-Structured Merge) tree architecture provides:
 
-- **Efficient Compaction**: Leveled compaction strategy for optimal space utilization
+- **Compaction**: Leveled compaction strategy for space utilization
 - **Better Scalability**: Supports datasets much larger than available memory
 
-This architectural change enables SurrealKV to handle large-scale datasets while maintaining ACID properties and high performance.
+This architectural change enables SurrealKV to handle larger then memory datasets.
 
 ## License
 
