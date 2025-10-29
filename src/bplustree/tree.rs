@@ -220,6 +220,8 @@ trait Node {
 /// - key_overflows contains overflow chains for keys stored in this node
 /// - Each key owns its overflow chain, including keys used as separators in parents
 /// - Overflows are freed when the owning node is freed via free_node_with_overflow()
+/// - EXCEPTION: After merge operations, the merged-away node is freed with free_page() only,
+///   because its overflows were transferred to the merged node via append()
 /// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
 	keys: Vec<Vec<u8>>, // Full keys (reconstructed from page + overflow if needed)
