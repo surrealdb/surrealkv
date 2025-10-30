@@ -2,8 +2,8 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
+use crate::clock::LogicalClock;
 use crate::error::Result;
-use crate::util::LogicalClock;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{sstable::InternalKey, Key, Value};
@@ -428,8 +428,8 @@ impl Iterator for CompactionIterator<'_> {
 mod tests {
 	use super::*;
 	use crate::{
+		clock::MockLogicalClock,
 		sstable::{InternalKey, InternalKeyKind},
-		util::MockLogicalClock,
 		Options, VLogChecksumLevel, Value,
 	};
 	use std::sync::Arc;

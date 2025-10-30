@@ -2513,9 +2513,9 @@ mod tests {
 
 	#[test(tokio::test)]
 	async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
+		use crate::clock::MockLogicalClock;
 		use crate::compaction::leveled::Strategy;
 		use crate::lsm::{CompactionOperations, TreeBuilder};
-		use crate::util::MockLogicalClock;
 
 		// Create test environment
 		let temp_dir = TempDir::new().unwrap();

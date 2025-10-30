@@ -2,6 +2,7 @@ mod batch;
 pub mod bplustree;
 mod cache;
 mod checkpoint;
+mod clock;
 mod commit;
 mod compaction;
 mod discard;
@@ -16,16 +17,15 @@ mod snapshot;
 mod sstable;
 mod task;
 mod transaction;
-mod util;
 mod vfs;
 mod vlog;
 mod wal;
 
+use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
 use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
-use crate::util::{DefaultLogicalClock, LogicalClock};
 
 /// Type alias for version/timestamp values
 pub type Version = u64;
