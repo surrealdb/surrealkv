@@ -34,9 +34,9 @@ pub fn new_disk_tree<P: AsRef<Path>>(
 #[derive(Clone)]
 struct NodeWeighter;
 
-impl Weighter<u64, NodeType> for NodeWeighter {
-	fn weight(&self, _key: &u64, value: &NodeType) -> u64 {
-		match value {
+impl Weighter<u64, Arc<NodeType>> for NodeWeighter {
+	fn weight(&self, _key: &u64, value: &Arc<NodeType>) -> u64 {
+		match value.as_ref() {
 			NodeType::Internal(internal) => internal.current_size() as u64,
 			NodeType::Leaf(leaf) => leaf.current_size() as u64,
 			NodeType::Overflow(overflow) => (13 + overflow.data.len()) as u64,
@@ -1298,7 +1298,7 @@ fn leaf_entry_size(key: &[u8], value: &[u8]) -> usize {
 pub struct BPlusTree<F: VfsFile> {
 	file: F,
 	header: Header,
-	cache: Cache<u64, NodeType, NodeWeighter>,
+	cache: Cache<u64, Arc<NodeType>, NodeWeighter>,
 	compare: Arc<dyn Comparator>,
 	durability: Durability,
 }
@@ -1416,13 +1416,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		let mut parent_offset = None;
 
 		loop {
-			let node_type = if let Some(node) = self.cache.get(&current_offset) {
-				node.clone()
-			} else {
-				self.read_node(current_offset)?
-			};
+			let node = self.read_node(current_offset)?;
 
-			match node_type {
+			match node.as_ref() {
 				NodeType::Internal(internal) => {
 					path.push((current_offset, parent_offset));
 
@@ -1430,7 +1426,10 @@ impl<F: VfsFile> BPlusTree<F> {
 					parent_offset = Some(current_offset);
 					current_offset = internal.children[child_idx];
 				}
-				NodeType::Leaf(mut leaf) => {
+				NodeType::Leaf(_) => {
+					// Need to modify the leaf - extract it from Arc
+					let mut leaf = self.extract_leaf_mut(node);
+
 					if leaf.can_fit_entry(key, value) {
 						self.insert_into_leaf(&mut leaf, key, value)?;
 						return Ok(());
@@ -1485,10 +1484,7 @@ impl<F: VfsFile> BPlusTree<F> {
 					return Ok(());
 				}
 				Some(offset) => {
-					let mut parent = match self.cache.get(&offset) {
-						Some(NodeType::Internal(ref node)) => node.clone(),
-						_ => self.read_internal_node(offset)?,
-					};
+					let mut parent = self.read_internal_node(offset)?;
 
 					let max_per_entry = get_max_internal_entry_bytes();
 					let (key_on_page, key_overflow) =
@@ -1609,7 +1605,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		self.write_node_owned(NodeType::Leaf(new_leaf))?;
 
 		if let Some(next_offset) = next_leaf_update {
-			if let NodeType::Leaf(mut next_leaf) = self.read_node(next_offset)? {
+			let next_node = self.read_node(next_offset)?;
+			if matches!(next_node.as_ref(), NodeType::Leaf(_)) {
+				let mut next_leaf = self.extract_leaf_mut(next_node);
 				next_leaf.prev_leaf = new_leaf_offset;
 				self.write_node_owned(NodeType::Leaf(next_leaf))?;
 			}
@@ -1688,7 +1686,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		loop {
 			let node = self.read_node(current_offset)?;
 
-			match node {
+			match node.as_ref() {
 				NodeType::Internal(internal) => {
 					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					current_offset = internal.children[child_idx];
@@ -1710,42 +1708,44 @@ impl<F: VfsFile> BPlusTree<F> {
 		let mut path = Vec::new();
 
 		loop {
-			let node_type = if let Some(node) = self.cache.get(&node_offset) {
-				node.clone()
-			} else {
-				self.read_node(node_offset)?
-			};
+			let node = self.read_node(node_offset)?;
 
-			match node_type {
+			match node.as_ref() {
 				NodeType::Internal(internal) => {
 					let child_idx = internal.find_child_index(key, self.compare.as_ref());
 					path.push((node_offset, child_idx));
 					node_offset = internal.children[child_idx];
 				}
-				NodeType::Leaf(mut leaf) => match leaf.delete(key, self.compare.as_ref()) {
-					Some((_, value, overflow)) => {
-						if overflow != 0 {
-							self.free_overflow_chain(overflow)?;
+				NodeType::Leaf(_) => {
+					// Need to modify the leaf - extract it from Arc
+					let mut leaf = self.extract_leaf_mut(node);
+
+					match leaf.delete(key, self.compare.as_ref()) {
+						Some((_, value, overflow)) => {
+							if overflow != 0 {
+								self.free_overflow_chain(overflow)?;
+							}
+
+							let leaf_offset = leaf.offset;
+							let is_underflow = leaf.is_underflow();
+
+							let leaf_owned =
+								std::mem::replace(&mut leaf, LeafNode::new(leaf_offset));
+							self.write_node_owned(NodeType::Leaf(leaf_owned))?;
+
+							if is_underflow && !path.is_empty() {
+								self.handle_underflows(&mut path)?;
+							}
+
+							self.handle_empty_root()?;
+
+							return Ok(Some(value));
 						}
-
-						let leaf_offset = leaf.offset;
-						let is_underflow = leaf.is_underflow();
-
-						let leaf_owned = std::mem::replace(&mut leaf, LeafNode::new(leaf_offset));
-						self.write_node_owned(NodeType::Leaf(leaf_owned))?;
-
-						if is_underflow && !path.is_empty() {
-							self.handle_underflows(&mut path)?;
+						None => {
+							return Ok(None);
 						}
-
-						self.handle_empty_root()?;
-
-						return Ok(Some(value));
 					}
-					None => {
-						return Ok(None);
-					}
-				},
+				}
 				NodeType::Overflow(_) => {
 					return Err(BPlusTreeError::UnexpectedOverflowPage(node_offset));
 				}
@@ -1761,7 +1761,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			let child_offset = parent.children[child_idx];
 
 			// Check if child needs rebalancing
-			match self.read_node(child_offset)? {
+			match self.read_node(child_offset)?.as_ref() {
 				NodeType::Internal(internal) => {
 					if internal.is_underflow() {
 						// Handle underflow in internal node
@@ -1830,7 +1830,8 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(left_node) = self.read_node(left_sibling_offset)? {
+				if let NodeType::Internal(left_node) = self.read_node(left_sibling_offset)?.as_ref()
+				{
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
 						self.redistribute_internal_from_left(parent, child_idx - 1, child_idx)?;
@@ -1839,7 +1840,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(left_node) = self.read_node(left_sibling_offset)? {
+				if let NodeType::Leaf(left_node) = self.read_node(left_sibling_offset)?.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
 						self.redistribute_leaf_from_left(parent, child_idx - 1, child_idx)?;
@@ -1855,7 +1856,9 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(right_node) = self.read_node(right_sibling_offset)? {
+				if let NodeType::Internal(right_node) =
+					self.read_node(right_sibling_offset)?.as_ref()
+				{
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
 						self.redistribute_internal_from_right(parent, child_idx, child_idx + 1)?;
@@ -1864,7 +1867,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(right_node) = self.read_node(right_sibling_offset)? {
+				if let NodeType::Leaf(right_node) = self.read_node(right_sibling_offset)?.as_ref() {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
 						self.redistribute_leaf_from_right(parent, child_idx, child_idx + 1)?;
@@ -1901,7 +1904,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	fn handle_empty_root(&mut self) -> Result<()> {
-		match self.read_node(self.header.root_offset)? {
+		match self.read_node(self.header.root_offset)?.as_ref() {
 			NodeType::Internal(internal) => {
 				if internal.keys.is_empty() && internal.children.len() == 1 {
 					let old_root_offset = self.header.root_offset;
@@ -2162,7 +2165,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node.merge_from_right(right_node);
 
 		if next_leaf != 0 {
-			if let NodeType::Leaf(mut next_leaf_node) = self.read_node(next_leaf)? {
+			let next_node = self.read_node(next_leaf)?;
+			if matches!(next_node.as_ref(), NodeType::Leaf(_)) {
+				let mut next_leaf_node = self.extract_leaf_mut(next_node);
 				next_leaf_node.prev_leaf = left_offset;
 				self.write_node(&NodeType::Leaf(next_leaf_node))?;
 			}
@@ -2226,7 +2231,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn free_node_with_overflow(&mut self, offset: u64) -> Result<()> {
 		let node = self.read_node(offset)?;
 
-		match &node {
+		match node.as_ref() {
 			NodeType::Internal(internal) => {
 				for &overflow_offset in &internal.key_overflows {
 					if overflow_offset != 0 {
@@ -2315,10 +2320,10 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	fn read_node(&self, offset: u64) -> Result<NodeType> {
+	fn read_node(&self, offset: u64) -> Result<Arc<NodeType>> {
 		// Check if the node is in the cache first
-		if let Some(node) = self.cache.get(&offset) {
-			return Ok(node.clone());
+		if let Some(arc_node) = self.cache.get(&offset) {
+			return Ok(Arc::clone(&arc_node));
 		}
 
 		// Read from disk
@@ -2353,23 +2358,54 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		};
 
-		self.cache.insert(offset, node.clone());
-		Ok(node)
+		let arc_node = Arc::new(node);
+		self.cache.insert(offset, Arc::clone(&arc_node));
+		Ok(arc_node)
 	}
 
 	/// Extract internal node from offset
 	fn read_internal_node(&self, offset: u64) -> Result<InternalNode> {
-		match self.read_node(offset)? {
-			NodeType::Internal(node) => Ok(node),
+		match self.read_node(offset)?.as_ref() {
+			NodeType::Internal(node) => Ok(node.clone()),
 			_ => Err(BPlusTreeError::InvalidNodeType),
 		}
 	}
 
 	/// Extract leaf node from offset
 	fn read_leaf_node(&self, offset: u64) -> Result<LeafNode> {
-		match self.read_node(offset)? {
-			NodeType::Leaf(node) => Ok(node),
+		match self.read_node(offset)?.as_ref() {
+			NodeType::Leaf(node) => Ok(node.clone()),
 			_ => Err(BPlusTreeError::InvalidNodeType),
+		}
+	}
+
+	/// Extract a mutable LeafNode from Arc<NodeType>
+	/// Unwraps if possible (no other refs), otherwise clones
+	fn extract_leaf_mut(&self, arc_node: Arc<NodeType>) -> LeafNode {
+		match Arc::try_unwrap(arc_node) {
+			Ok(node_type) => match node_type {
+				NodeType::Leaf(node) => node,
+				_ => panic!("Expected Leaf node"),
+			},
+			Err(arc) => match arc.as_ref() {
+				NodeType::Leaf(node) => node.clone(),
+				_ => panic!("Expected Leaf node"),
+			},
+		}
+	}
+
+	/// Extract a mutable OverflowPage from Arc<NodeType>
+	/// Unwraps if possible (no other refs), otherwise clones
+	fn extract_overflow_mut(&self, arc_node: Arc<NodeType>) -> OverflowPage {
+		match Arc::try_unwrap(arc_node) {
+			Ok(node_type) => match node_type {
+				NodeType::Overflow(node) => node,
+				_ => panic!("Expected Overflow node"),
+			},
+			Err(arc) => match arc.as_ref() {
+				NodeType::Overflow(node) => node.clone(),
+				_ => panic!("Expected Overflow node"),
+			},
 		}
 	}
 
@@ -2485,7 +2521,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		self.maybe_sync()?;
 
-		self.cache.insert(offset, node);
+		self.cache.insert(offset, Arc::new(node));
 		Ok(())
 	}
 
@@ -2550,10 +2586,9 @@ impl<F: VfsFile> BPlusTree<F> {
 			// If this is not the first page, update the previous page to point to this one
 			if prev_page_offset != 0 {
 				let prev_node = self.read_node(prev_page_offset)?;
-				if let NodeType::Overflow(mut prev_overflow) = prev_node {
-					prev_overflow.next_overflow = page_offset;
-					self.write_node(&NodeType::Overflow(prev_overflow))?;
-				}
+				let mut prev_overflow = self.extract_overflow_mut(prev_node);
+				prev_overflow.next_overflow = page_offset;
+				self.write_node(&NodeType::Overflow(prev_overflow))?;
 			}
 
 			prev_page_offset = page_offset;
@@ -2574,7 +2609,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		while current_offset != 0 {
 			let node = self.read_node(current_offset)?;
-			match node {
+			match node.as_ref() {
 				NodeType::Overflow(overflow) => {
 					result.extend_from_slice(&overflow.data);
 					current_offset = overflow.next_overflow;
@@ -2597,7 +2632,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		while current_offset != 0 {
 			let node = self.read_node(current_offset)?;
-			match node {
+			match node.as_ref() {
 				NodeType::Overflow(overflow) => {
 					let next_offset = overflow.next_overflow;
 					self.free_page(current_offset)?;
@@ -2633,7 +2668,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		node_offset: u64,
 		current_level: usize,
 	) -> Result<(usize, usize, usize, usize)> {
-		match self.read_node(node_offset)? {
+		match self.read_node(node_offset)?.as_ref() {
 			NodeType::Leaf(leaf) => {
 				// For leaf nodes:
 				// - Height is current level
@@ -2686,13 +2721,13 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 
 		// Traverse the tree to find the starting leaf
 		let leaf = loop {
-			match tree.read_node(node_offset)? {
+			match tree.read_node(node_offset)?.as_ref() {
 				NodeType::Internal(internal) => {
 					let idx = internal.find_child_index(start_key, tree.compare.as_ref());
 					node_offset = internal.children[idx];
 				}
 				NodeType::Leaf(leaf) => {
-					break leaf;
+					break leaf.clone();
 				}
 				NodeType::Overflow(_) => {
 					return Err(BPlusTreeError::UnexpectedOverflowPage(node_offset));
@@ -2739,17 +2774,19 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 
 					// Load the next leaf and calculate its end index
 					match self.tree.read_node(leaf.next_leaf) {
-						Ok(NodeType::Leaf(next_leaf)) => {
-							let next_end_idx = next_leaf.keys.partition_point(|k| {
-								self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
-							});
+						Ok(arc_node) => match arc_node.as_ref() {
+							NodeType::Leaf(next_leaf) => {
+								let next_end_idx = next_leaf.keys.partition_point(|k| {
+									self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
+								});
 
-							self.current_leaf = Some(next_leaf);
-							self.current_idx = 0;
-							self.current_end_idx = next_end_idx;
-							continue;
-						}
-						Ok(_) => return Some(Err(BPlusTreeError::InvalidNodeType)),
+								self.current_leaf = Some(next_leaf.clone());
+								self.current_idx = 0;
+								self.current_end_idx = next_end_idx;
+								continue;
+							}
+							_ => return Some(Err(BPlusTreeError::InvalidNodeType)),
+						},
 						Err(e) => return Some(Err(e)),
 					}
 				}

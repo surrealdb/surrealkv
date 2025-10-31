@@ -28,6 +28,7 @@ Temporary Items
 **/*.rs.bk
 *.db
 *.sw?
+*.gz
 
 # -----------------------------------
 # Folders
@@ -54,3 +55,6 @@ test_data/
 # Added by cargo
 
 /target
+/.cursor
+
+
