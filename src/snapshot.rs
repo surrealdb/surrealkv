@@ -406,7 +406,7 @@ impl Snapshot {
 		let mut results = Vec::new();
 
 		if let Some(ref versioned_index) = self.core.versioned_index {
-			let index_guard = versioned_index.read()?;
+			let index_guard = versioned_index.read();
 
 			// Extract start and end bounds from the RangeBounds
 			let start_bound = params.key_range.start_bound();

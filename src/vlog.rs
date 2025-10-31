@@ -5,7 +5,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
-		Arc, Mutex, RwLock,
+		Arc,
 	},
 };
 
@@ -16,6 +16,7 @@ use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
+use parking_lot::{Mutex, RwLock};
 
 use crate::commit::CommitPipeline;
 use crate::error::{Error, Result};
@@ -595,7 +596,7 @@ impl VLog {
 	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
-			let mut writer = self.writer.write()?;
+			let mut writer = self.writer.write();
 
 			if writer.is_none() || writer.as_ref().unwrap().size() >= self.max_file_size {
 				// Create new file
@@ -622,7 +623,7 @@ impl VLog {
 		};
 
 		// Now append the key+value pair
-		let mut writer = self.writer.write()?;
+		let mut writer = self.writer.write();
 		let writer = writer.as_mut().unwrap();
 
 		let pointer = writer.append(key, value)?;
@@ -639,8 +640,8 @@ impl VLog {
 
 		let mut max_file_id: Option<u32> = None;
 		let mut max_file_path: Option<PathBuf> = None;
-		let mut file_handles = self.file_handles.write()?;
-		let mut files_map = self.files_map.write()?;
+		let mut file_handles = self.file_handles.write();
+		let mut files_map = self.files_map.write();
 
 		for entry in entries {
 			let entry = entry?;
@@ -699,7 +700,7 @@ impl VLog {
 				self.opts.compression as u8,
 			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
-			*self.writer.write()? = Some(writer);
+			*self.writer.write() = Some(writer);
 		}
 
 		// println!(
@@ -714,7 +715,7 @@ impl VLog {
 	/// Retrieves (and caches) an open file handle for the given file ID
 	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
 		{
-			let handles = self.file_handles.read()?;
+			let handles = self.file_handles.read();
 			if let Some(handle) = handles.get(&file_id) {
 				return Ok(handle.clone());
 			}
@@ -745,7 +746,7 @@ impl VLog {
 
 		let handle = Arc::new(file);
 
-		let mut handles = self.file_handles.write()?;
+		let mut handles = self.file_handles.write();
 		// Another thread might have inserted it while we were opening the file
 		let entry = handles.entry(file_id).or_insert_with(|| handle.clone());
 		Ok(entry.clone())
@@ -847,9 +848,9 @@ impl VLog {
 
 	/// Deletes files that were marked for deletion when no iterators were active
 	fn delete_pending_files(&self) -> Result<()> {
-		let mut files_to_delete = self.files_to_be_deleted.write()?;
-		let mut files_map = self.files_map.write()?;
-		let mut file_handles = self.file_handles.write()?;
+		let mut files_to_delete = self.files_to_be_deleted.write();
+		let mut files_map = self.files_map.write();
+		let mut file_handles = self.file_handles.write();
 
 		for file_id in files_to_delete.drain(..) {
 			file_handles.remove(&file_id);
@@ -885,7 +886,7 @@ impl VLog {
 
 		// Get all files with discardable bytes, sorted by discard bytes (descending)
 		let candidates = {
-			let discard_stats = self.discard_stats.lock().unwrap();
+			let discard_stats = self.discard_stats.lock();
 			discard_stats.get_gc_candidates()
 		};
 
@@ -915,10 +916,9 @@ impl VLog {
 			}
 
 			// Skip if file is already marked for deletion
-			if let Ok(files_to_delete) = self.files_to_be_deleted.read() {
-				if files_to_delete.contains(file_id) {
-					return false;
-				}
+			let files_to_delete = self.files_to_be_deleted.read();
+			if files_to_delete.contains(file_id) {
+				return false;
 			}
 
 			true
@@ -952,8 +952,8 @@ impl VLog {
 			// Schedule for safe deletion based on iterator count
 			if self.iterator_count() == 0 {
 				// No active iterators, safe to delete immediately
-				let mut files_map = self.files_map.write()?;
-				let mut file_handles = self.file_handles.write()?;
+				let mut files_map = self.files_map.write();
+				let mut file_handles = self.file_handles.write();
 				file_handles.remove(&file_id);
 				if let Some(vlog_file) = files_map.remove(&file_id) {
 					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
@@ -963,9 +963,9 @@ impl VLog {
 				}
 			} else {
 				// There are active iterators, defer deletion
-				let mut files_to_delete = self.files_to_be_deleted.write()?;
+				let mut files_to_delete = self.files_to_be_deleted.write();
 				files_to_delete.push(file_id);
-				self.file_handles.write()?.remove(&file_id);
+				self.file_handles.write().remove(&file_id);
 			}
 		}
 
@@ -1121,7 +1121,7 @@ impl VLog {
 
 			// Update discard stats (file will be deleted, so reset stats)
 			{
-				let mut discard_stats = self.discard_stats.lock().unwrap();
+				let mut discard_stats = self.discard_stats.lock();
 				discard_stats.remove_file(file_id);
 			}
 
@@ -1134,17 +1134,17 @@ impl VLog {
 
 	/// Syncs all data to disk
 	pub(crate) fn sync(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write()? {
+		if let Some(ref mut writer) = *self.writer.write() {
 			writer.sync()?;
 		}
 
-		self.discard_stats.lock().unwrap().sync()?;
+		self.discard_stats.lock().sync()?;
 
 		Ok(())
 	}
 
 	pub(crate) fn flush(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write()? {
+		if let Some(ref mut writer) = *self.writer.write() {
 			writer.flush()?;
 		}
 
@@ -1153,7 +1153,7 @@ impl VLog {
 
 	/// Gets statistics for a specific file
 	fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
-		let discard_stats = self.discard_stats.lock().unwrap();
+		let discard_stats = self.discard_stats.lock();
 		let discard_bytes = discard_stats.get_file_stats(file_id);
 
 		// Get file size from filesystem
@@ -1175,7 +1175,7 @@ impl VLog {
 
 	/// Registers a VLog file in the files map for tracking
 	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
-		let mut files_map = self.files_map.write().unwrap();
+		let mut files_map = self.files_map.write();
 		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
 	}
 
@@ -1208,7 +1208,7 @@ impl VLog {
 	/// Updates discard statistics for a file
 	/// This should be called during LSM compaction when outdated VLog pointers are found
 	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
-		let mut discard_stats = self.discard_stats.lock().unwrap();
+		let mut discard_stats = self.discard_stats.lock();
 
 		for (file_id, discard_bytes) in stats {
 			discard_stats.update(*file_id, *discard_bytes);
@@ -1260,7 +1260,7 @@ impl VLog {
 
 		if let Some(ref versioned_index) = self.versioned_index {
 			// Take write lock and delete the specific versions
-			let mut write_index = versioned_index.write()?;
+			let mut write_index = versioned_index.write();
 			let mut total_deleted = 0;
 
 			for internal_key in deleted_keys {
@@ -1359,7 +1359,7 @@ impl VLogGCManager {
 			}
 		});
 
-		*self.task_handle.lock().unwrap() = Some(handle);
+		*self.task_handle.lock() = Some(handle);
 	}
 
 	/// Stops the VLog GC background task
@@ -1379,7 +1379,7 @@ impl VLogGCManager {
 		// Now it's safe to wait for the task to complete
 		// Get the handle outside the await to avoid holding the lock across await
 		let handle_opt = {
-			let mut lock = self.task_handle.lock().unwrap();
+			let mut lock = self.task_handle.lock();
 			lock.take()
 		};
 
@@ -1740,7 +1740,7 @@ mod tests {
 		);
 
 		// Check that file handles are properly cached
-		let file_handles = vlog2.file_handles.read().unwrap();
+		let file_handles = vlog2.file_handles.read();
 		assert!(
 			file_handles.len() >= unique_file_ids.len(),
 			"Should have cached handles for all existing files"
@@ -2061,7 +2061,7 @@ mod tests {
 			);
 
 			// Verify writer is set up
-			assert!(vlog1.writer.read().unwrap().is_some(), "Writer should be set up");
+			assert!(vlog1.writer.read().is_some(), "Writer should be set up");
 			vlog1.close().await.unwrap();
 		}
 
@@ -2078,7 +2078,7 @@ mod tests {
 
 			// Check that writer is set up
 			assert!(
-				vlog2.writer.read().unwrap().is_some(),
+				vlog2.writer.read().is_some(),
 				"After restart, writer should be set up for the last file"
 			);
 
@@ -2216,7 +2216,7 @@ mod tests {
 
 			// Check that writer is set up
 			assert!(
-				vlog2.writer.read().unwrap().is_some(),
+				vlog2.writer.read().is_some(),
 				"After restart, writer should be set up for the last file"
 			);
 

@@ -1,10 +1,10 @@
 use std::{
 	fs::{File, OpenOptions},
 	path::Path,
-	sync::Mutex,
 };
 
 use memmap2::{MmapMut, MmapOptions};
+use parking_lot::Mutex;
 
 use crate::error::Result;
 
@@ -60,7 +60,7 @@ impl DiscardStats {
 		} else {
 			// Find the next empty slot
 			let next_slot = stats.find_next_empty_slot();
-			*stats.next_empty_slot.lock().unwrap() = next_slot;
+			*stats.next_empty_slot.lock() = next_slot;
 		}
 
 		// Sort entries to ensure binary search works
@@ -137,7 +137,7 @@ impl DiscardStats {
 
 	/// Sorts entries by file_id
 	fn sort_entries(&mut self) {
-		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
+		let next_empty_slot = *self.next_empty_slot.lock();
 
 		// Create a vector of (file_id, discard_bytes) tuples
 		let mut entries: Vec<(u32, u64)> = Vec::with_capacity(next_empty_slot);
@@ -163,7 +163,7 @@ impl DiscardStats {
 	/// - If discard_bytes is positive, adds to current discard bytes
 	pub(crate) fn update(&mut self, file_id: u32, discard_bytes: i64) -> u64 {
 		// Binary search for the file_id
-		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
+		let next_empty_slot = *self.next_empty_slot.lock();
 		let idx = self.binary_search(file_id, next_empty_slot);
 
 		if let Some(slot) = idx {
@@ -191,7 +191,7 @@ impl DiscardStats {
 
 		// Add new entry - need to check and update next_empty_slot atomically
 		let slot = {
-			let next_slot_guard = self.next_empty_slot.lock().unwrap();
+			let next_slot_guard = self.next_empty_slot.lock();
 			let slot = *next_slot_guard;
 
 			// Check if we need to expand the mmap
@@ -213,7 +213,7 @@ impl DiscardStats {
 
 		// Update next_empty_slot and zero out the new next slot
 		{
-			let mut next_slot_guard = self.next_empty_slot.lock().unwrap();
+			let mut next_slot_guard = self.next_empty_slot.lock();
 			*next_slot_guard += 1;
 			let next_slot = *next_slot_guard;
 			drop(next_slot_guard); // Release lock before zero_out_slot
@@ -273,7 +273,7 @@ impl DiscardStats {
 	/// Returns all files with discard bytes, sorted by discard bytes (descending)
 	/// Returns a vector of (file_id, discard_bytes) tuples
 	pub(crate) fn get_gc_candidates(&self) -> Vec<(u32, u64)> {
-		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
+		let next_empty_slot = *self.next_empty_slot.lock();
 
 		let mut candidates = Vec::new();
 
@@ -294,7 +294,7 @@ impl DiscardStats {
 
 	/// Gets discard bytes for a specific file
 	pub(crate) fn get_file_stats(&self, file_id: u32) -> u64 {
-		let next_empty_slot = *self.next_empty_slot.lock().unwrap();
+		let next_empty_slot = *self.next_empty_slot.lock();
 
 		if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
 			self.get_discard_bytes(slot)
@@ -306,7 +306,7 @@ impl DiscardStats {
 	/// Removes statistics for a file
 	pub(crate) fn remove_file(&mut self, file_id: u32) {
 		let (slot_to_remove, next_empty_slot) = {
-			let next_empty_slot_guard = self.next_empty_slot.lock().unwrap();
+			let next_empty_slot_guard = self.next_empty_slot.lock();
 			let next_empty_slot = *next_empty_slot_guard;
 			let slot_to_remove = self.binary_search(file_id, next_empty_slot);
 			(slot_to_remove, next_empty_slot)
@@ -323,7 +323,7 @@ impl DiscardStats {
 
 			// Clear the last slot and update next_empty_slot
 			{
-				let mut next_empty_slot_guard = self.next_empty_slot.lock().unwrap();
+				let mut next_empty_slot_guard = self.next_empty_slot.lock();
 				*next_empty_slot_guard -= 1;
 				let new_next_slot = *next_empty_slot_guard;
 				drop(next_empty_slot_guard);

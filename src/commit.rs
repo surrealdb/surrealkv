@@ -2,9 +2,10 @@
 
 use std::sync::{
 	atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-	Arc, Mutex,
+	Arc,
 };
 
+use parking_lot::Mutex;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::{
@@ -62,10 +63,9 @@ impl CommitBatch {
 	}
 
 	fn complete(&self, result: Result<()>) {
-		if let Ok(mut guard) = self.complete_tx.try_lock() {
-			if let Some(tx) = guard.take() {
-				let _ = tx.send(result);
-			}
+		let mut guard = self.complete_tx.lock();
+		if let Some(tx) = guard.take() {
+			let _ = tx.send(result);
 		}
 	}
 }
@@ -218,7 +218,7 @@ impl CommitPipeline {
 		}
 
 		// Acquire write lock to ensure serialization
-		let _guard = self.write_mutex.lock().unwrap();
+		let _guard = self.write_mutex.lock();
 
 		// Assign sequence number
 		let count = batch.count() as u64;
@@ -299,7 +299,7 @@ impl CommitPipeline {
 
 	fn prepare(&self, batch: &mut Batch, commit_batch: Arc<CommitBatch>) -> Result<u64> {
 		// Assign sequence number atomically
-		let _guard = self.write_mutex.lock().unwrap();
+		let _guard = self.write_mutex.lock();
 
 		let count = batch.count() as u64;
 		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
