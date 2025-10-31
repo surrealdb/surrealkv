@@ -113,7 +113,7 @@ pub(crate) struct CoreInner {
 
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
-	pub(crate) versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
+	pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
 
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
@@ -150,7 +150,7 @@ impl CoreInner {
 				user_comparator: Arc::new(BytewiseComparator {}),
 			});
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
-			Some(Arc::new(RwLock::new(tree)))
+			Some(Arc::new(parking_lot::RwLock::new(tree)))
 		} else {
 			None
 		};
@@ -398,7 +398,7 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Write to versioned index if present
 		if is_versioning_enabled {
-			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write()?;
+			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
 			// Single pass: process each entry individually
 			for (encoded_key, encoded_value) in timestamp_entries {
@@ -671,7 +671,7 @@ impl Core {
 
 		// Ster 5: Close the versioned index if present
 		if let Some(ref versioned_index) = self.inner.versioned_index {
-			versioned_index.write()?.close()?;
+			versioned_index.write().close()?;
 		}
 
 		// Step 5: Flush all directories to ensure durability
