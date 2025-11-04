@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, Value, Version};
+use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -592,7 +592,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
 		K: IntoBytes,
 	{
@@ -619,7 +619,7 @@ impl Transaction {
 		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
 		K: IntoBytes,
 	{
@@ -646,7 +646,7 @@ impl Transaction {
 	pub fn keys_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<Key>> + '_>> {
+	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
 			// Check if versioned queries are enabled
@@ -695,7 +695,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>
+	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
 		K: IntoBytes,
 	{
@@ -719,7 +719,7 @@ impl Transaction {
 		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>
+	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
 		K: IntoBytes,
 	{
@@ -740,7 +740,7 @@ impl Transaction {
 	pub fn range_with_options(
 		&self,
 		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>> {
+	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
 			// Check if versioned queries are enabled
@@ -757,7 +757,7 @@ impl Transaction {
 				Some(snapshot) => Ok(Box::new(
 					snapshot
 						.range_at_version(start_key, end_key, timestamp, options.limit)?
-						.map(|result| result.map(|(k, v)| (k.into(), Some(v)))),
+						.map(|result| result.map(|(k, v)| (k.into(), v))),
 				)),
 				None => Err(Error::NoSnapshot),
 			}
@@ -765,9 +765,18 @@ impl Transaction {
 			// Get the start and end keys from options
 			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
 			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(TransactionRangeIterator::new_with_options(
-				self, start_key, end_key, options,
-			)?))
+			Ok(Box::new(
+				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
+					|result| {
+						result.and_then(|(k, v)| {
+							v.ok_or_else(|| {
+								Error::InvalidArgument("Expected value for range query".to_string())
+							})
+							.map(|value| (k, value))
+						})
+					},
+				),
+			))
 		}
 	}
 
@@ -1929,9 +1938,9 @@ mod tests {
 
 			assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
 			assert_eq!(range[0].0.as_ref(), b"key2");
-			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value2");
+			assert_eq!(range[0].1.as_ref(), b"value2");
 			assert_eq!(range[1].0.as_ref(), b"key3");
-			assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value3");
+			assert_eq!(range[1].1.as_ref(), b"value3");
 		}
 	}
 
@@ -2033,14 +2042,11 @@ mod tests {
 				tx.range(b"a", b"f", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
-			assert_eq!(range[0], (Bytes::from_static(b"a"), Some(Bytes::from_static(b"1"))));
-			assert_eq!(range[1], (Bytes::from_static(b"b"), Some(Bytes::from_static(b"2"))));
-			assert_eq!(
-				range[2],
-				(Bytes::from_static(b"c"), Some(Bytes::from_static(b"3_modified")))
-			);
-			assert_eq!(range[3], (Bytes::from_static(b"d"), Some(Bytes::from_static(b"4"))));
-			assert_eq!(range[4], (Bytes::from_static(b"e"), Some(Bytes::from_static(b"5"))));
+			assert_eq!(range[0], (Bytes::from_static(b"a"), Bytes::from_static(b"1")));
+			assert_eq!(range[1], (Bytes::from_static(b"b"), Bytes::from_static(b"2")));
+			assert_eq!(range[2], (Bytes::from_static(b"c"), Bytes::from_static(b"3_modified")));
+			assert_eq!(range[3], (Bytes::from_static(b"d"), Bytes::from_static(b"4")));
+			assert_eq!(range[4], (Bytes::from_static(b"e"), Bytes::from_static(b"5")));
 		}
 	}
 
@@ -2104,10 +2110,7 @@ mod tests {
 				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(
-				range[1],
-				(Bytes::from_static(b"key2"), Some(Bytes::from_static(b"new_value2")))
-			);
+			assert_eq!(range[1], (Bytes::from_static(b"key2"), Bytes::from_static(b"new_value2")));
 		}
 	}
 
@@ -2219,7 +2222,7 @@ mod tests {
 				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value3"); // Latest value
+			assert_eq!(range[0].1.as_ref(), b"value3"); // Latest value
 		}
 	}
 
@@ -2271,17 +2274,15 @@ mod tests {
 
 				if i < 5 {
 					// For keys from storage, check regular values are correct
-					assert!(regular_range[i].1.is_some(), "Regular range should have values");
 					assert_eq!(
-						regular_range[i].1.as_ref().unwrap().as_ref(),
+						regular_range[i].1.as_ref(),
 						format!("value{}", i + 1).as_bytes(),
 						"Regular range should have correct values from storage"
 					);
 				} else {
 					// For the key from write set
-					assert!(regular_range[i].1.is_some(), "Regular range should have values");
 					assert_eq!(
-						regular_range[i].1.as_ref().unwrap().as_ref(),
+						regular_range[i].1.as_ref(),
 						b"value6",
 						"Regular range should have correct value from write set"
 					);
@@ -2390,9 +2391,8 @@ mod tests {
 				assert_eq!(returned_key.as_ref(), expected_key, "Key mismatch in range result");
 
 				// The returned value should be the actual value, not a value pointer
-				assert!(returned_value.is_some(), "Range should return resolved values, not None");
 				assert_eq!(
-					returned_value.as_ref().unwrap().as_ref(),
+					returned_value.as_ref(),
 					expected_value.as_bytes(),
 					"Range should return resolved values, not value pointers. \
                      Expected actual value of {} bytes, but got a different value",
@@ -2893,7 +2893,7 @@ mod tests {
 				txn1.range(b"k1", b"k3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1);
 			assert_eq!(range[0].0.as_ref(), k1.as_ref());
-			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), value.as_ref());
+			assert_eq!(range[0].1.as_ref(), value.as_ref());
 		}
 
 		#[test(tokio::test)]
@@ -3349,7 +3349,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
-		assert_eq!(version_at_ts1[0].1.as_ref().unwrap().as_ref(), b"value1");
+		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
 
 		let version_at_ts2 = tx
 			.range_at_version(b"key1", b"key2", ts2, None)
@@ -3357,7 +3357,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
-		assert_eq!(version_at_ts2[0].1.as_ref().unwrap().as_ref(), b"value2");
+		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
@@ -3654,9 +3654,9 @@ mod tests {
 		for (key, value) in &scan_at_ts1 {
 			found_keys.insert(key.as_ref());
 			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2"),
-				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref(), b"value2"),
+				b"key3" => assert_eq!(value.as_ref(), b"value3"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3677,10 +3677,10 @@ mod tests {
 		for (key, value) in &scan_at_ts2 {
 			found_keys.insert(key.as_ref());
 			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value2_updated"),
-				b"key3" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value3"),
-				b"key4" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value4"),
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+				b"key4" => assert_eq!(value.as_ref(), b"value4"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3763,7 +3763,7 @@ mod tests {
 		for (key, value) in &scan_result {
 			found_keys.insert(key.as_ref());
 			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref().unwrap().as_ref(), b"value1"),
+				b"key1" => assert_eq!(value.as_ref(), b"value1"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}

@@ -1589,7 +1589,7 @@ mod tests {
 		let expected_before = [("a", "a"), ("b", "b"), ("c", "c")];
 		for (idx, (key, value)) in range_before_flush.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 			assert_eq!(key_str, expected_before[idx].0, "Key mismatch at index {idx} before flush");
 			assert_eq!(
 				value_str, expected_before[idx].1,
@@ -1612,7 +1612,7 @@ mod tests {
 		let expected_after = [("a", "a"), ("b", "b"), ("c", "c")];
 		for (idx, (key, value)) in range_after_flush.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 			assert_eq!(key_str, expected_after[idx].0, "Key mismatch at index {idx} after flush");
 			assert_eq!(
 				value_str, expected_after[idx].1,
@@ -1682,7 +1682,7 @@ mod tests {
 		// Verify each item is correct and in order
 		for (idx, (key, value)) in range_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_key = &expected_items[idx].0;
 			let expected_value = &expected_items[idx].1;
@@ -1713,7 +1713,7 @@ mod tests {
 		// Verify each item in partial range
 		for (idx, (key, value)) in partial_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_key = &expected_items[idx].0;
 			let expected_value = &expected_items[idx].1;
@@ -1744,7 +1744,7 @@ mod tests {
 		// Verify each item in middle range
 		for (idx, (key, value)) in middle_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -1773,7 +1773,7 @@ mod tests {
 		// Verify each item in end range
 		for (idx, (key, value)) in end_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 9900 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -1804,7 +1804,7 @@ mod tests {
 
 		let (key, value) = &single_result[0];
 		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 		assert_eq!(key_str, "key_004567");
 		assert_eq!(value_str, "value_004567_content_data_9134");
@@ -1864,7 +1864,7 @@ mod tests {
 
 		for (idx, (key, value)) in range_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -1941,7 +1941,7 @@ mod tests {
 
 		for (idx, (key, value)) in range_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -2007,7 +2007,7 @@ mod tests {
 
 		for (idx, (key, value)) in limited_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_key = &expected_items[idx].0;
 			let expected_value = &expected_items[idx].1;
@@ -2034,7 +2034,7 @@ mod tests {
 
 		for (idx, (key, value)) in limited_result_1000.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_key = &expected_items[idx].0;
 			let expected_value = &expected_items[idx].1;
@@ -2075,7 +2075,7 @@ mod tests {
 
 		let (key, value) = &single_result[0];
 		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 		assert_eq!(key_str, "key_000000");
 		assert_eq!(value_str, "value_000000_content_data_0");
@@ -2143,7 +2143,7 @@ mod tests {
 
 		for (idx, (key, value)) in unlimited_range_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -2176,7 +2176,7 @@ mod tests {
 
 		for (idx, (key, value)) in large_limit_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -2210,7 +2210,7 @@ mod tests {
 
 		for (idx, (key, value)) in res.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 
 			let expected_idx = 5000 + idx;
 			let expected_key = &expected_items[expected_idx].0;
@@ -3284,7 +3284,7 @@ mod tests {
 			// Should contain the other key
 			assert_eq!(range_result.len(), 1);
 			assert_eq!(range_result[0].0.as_ref(), b"other_key");
-			assert_eq!(range_result[0].1.as_ref().unwrap().as_ref(), b"other_value");
+			assert_eq!(range_result[0].1.as_ref(), b"other_value");
 
 			// Test that we can reinsert the same key after soft delete
 			let mut txn = tree.begin().unwrap();

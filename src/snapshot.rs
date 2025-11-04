@@ -1188,8 +1188,8 @@ mod tests {
 			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v1");
-		assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value2_v1");
+		assert_eq!(range[0].1.as_ref(), b"value1_v1");
+		assert_eq!(range[1].1.as_ref(), b"value2_v1");
 
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
@@ -1197,8 +1197,8 @@ mod tests {
 			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v2");
-		assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value2_v2");
+		assert_eq!(range[0].1.as_ref(), b"value1_v2");
+		assert_eq!(range[1].1.as_ref(), b"value2_v2");
 	}
 
 	#[test(tokio::test)]
@@ -1328,7 +1328,7 @@ mod tests {
 			let expected_key = format!("key{:02}", i + 1);
 			let expected_value = format!("value{}", i + 1);
 			assert_eq!(key.as_ref(), expected_key.as_bytes());
-			assert_eq!(value.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+			assert_eq!(value.as_ref(), expected_value.as_bytes());
 		}
 
 		// tx2 should see updated data with deletions
@@ -1350,7 +1350,7 @@ mod tests {
 			if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
 				if num % 2 == 0 {
 					let expected_value = format!("value{num}_updated");
-					assert_eq!(value.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+					assert_eq!(value.as_ref(), expected_value.as_bytes());
 				}
 			}
 		}
@@ -1509,7 +1509,6 @@ mod tests {
 
 			// Regular range should have actual values
 			let expected_value = format!("value{}", i + 1);
-			assert!(regular_range[i].1.is_some(), "Regular range should have values");
 			assert_eq!(
 				regular_range[i].1.as_ref().unwrap().as_ref(),
 				expected_value.as_bytes(),

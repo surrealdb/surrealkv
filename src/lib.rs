@@ -154,6 +154,12 @@ pub type Value = Bytes;
 /// Type alias for version/timestamp values
 pub type Version = u64;
 
+/// Type alias for iterator results containing only keys
+pub type KeysResult = Result<Key>;
+
+/// Type alias for iterator results containing keys and values
+pub type RangeResult = Result<(Key, Value)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VLogChecksumLevel {
 	/// No checksum verification - fastest but no data integrity protection
