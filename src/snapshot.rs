@@ -126,7 +126,7 @@ pub(crate) struct Snapshot {
 
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
-	seq_num: u64,
+	pub(crate) seq_num: u64,
 }
 
 impl Snapshot {
@@ -200,11 +200,10 @@ impl Snapshot {
 	/// The read path checks multiple locations in order:
 	/// 1. **Active Memtable**: Most recent writes, in memory
 	/// 2. **Immutable Memtables**: Recent writes being flushed
-	/// 3. **Level**: From SSTables
+	/// 3. **Levels**: From SSTables
 	///
 	/// The search stops at the first version found with seq_num <= snapshot seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
 		let memtable_lock = self.core.active_memtable.read()?;
 
@@ -1136,7 +1135,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Start a read transaction (captures snapshot)
@@ -1147,7 +1146,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// The read transaction should only see the initial data
@@ -1168,7 +1167,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1_v1").unwrap();
 			tx.set(b"key2", b"value2_v1").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Start a read transaction
@@ -1179,7 +1178,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1_v2").unwrap();
 			tx.set(b"key2", b"value2_v2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// The read transaction should see the old values
@@ -1210,7 +1209,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Start a read transaction
@@ -1220,7 +1219,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// The first read transaction should still see all three keys
@@ -1250,7 +1249,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"version1").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx1 = store.begin().unwrap();
@@ -1258,7 +1257,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"version2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx2 = store.begin().unwrap();
@@ -1266,7 +1265,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"version3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx3 = store.begin().unwrap();
@@ -1294,7 +1293,7 @@ mod tests {
 				let value = format!("value{i}");
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx1 = store.begin().unwrap();
@@ -1312,7 +1311,7 @@ mod tests {
 			tx.delete(b"key03").unwrap();
 			tx.delete(b"key06").unwrap();
 			tx.delete(b"key09").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx2 = store.begin().unwrap();
@@ -1363,7 +1362,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"counter", b"0").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Create multiple snapshots at different points
@@ -1377,7 +1376,7 @@ mod tests {
 			{
 				let mut tx = store.begin().unwrap();
 				tx.set(b"counter", i.to_string().as_bytes()).unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 		}
 
@@ -1410,7 +1409,7 @@ mod tests {
 				let key = format!("mix{i}key");
 				tx.set(key.as_bytes(), b"mixed").unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx = store.begin().unwrap();
@@ -1439,7 +1438,7 @@ mod tests {
 			for key in keys {
 				tx.set(key.as_bytes(), key.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		let tx = store.begin().unwrap();
@@ -1472,7 +1471,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Create snapshot via transaction
@@ -1517,8 +1516,8 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_range_skips_non_overlapping_tables() {
+	#[test(tokio::test)]
+	async fn test_range_skips_non_overlapping_tables() {
 		fn build_table(data: Vec<(&'static [u8], &'static [u8])>) -> Arc<Table> {
 			let opts = Arc::new(Options::new());
 			let mut buf = Vec::new();
@@ -1574,7 +1573,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Create snapshot via transaction
@@ -1613,7 +1612,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take a snapshot before deletion
@@ -1623,7 +1622,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take another snapshot after deletion
@@ -1666,7 +1665,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take a snapshot before soft delete
@@ -1676,7 +1675,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take another snapshot after soft delete
@@ -1707,7 +1706,7 @@ mod tests {
 				let value = format!("value{i}");
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Soft delete key2 and key4
@@ -1715,7 +1714,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key2").unwrap();
 			tx.soft_delete(b"key4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take snapshot after soft delete
@@ -1758,7 +1757,7 @@ mod tests {
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take snapshot before any deletes
@@ -1769,7 +1768,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key1").unwrap(); // Soft delete
 			tx.delete(b"key2").unwrap(); // Hard delete
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take snapshot after deletes
@@ -1812,7 +1811,7 @@ mod tests {
 				let value = format!("value{i}");
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Take a snapshot

@@ -175,7 +175,6 @@ impl Batch {
 	}
 
 	/// Get entries for VLog processing
-	#[cfg(test)]
 	pub(crate) fn entries(&self) -> &[BatchEntry] {
 		&self.entries
 	}

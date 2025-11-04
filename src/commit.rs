@@ -1,20 +1,21 @@
-// This commit pipeline is inspired by Pebble's commit pipeline.
+// Lock-free commit pipeline using atomic SkipMap-based queues.
 
 use std::sync::{
-	atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+	atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 	Arc,
 };
+use std::time::Duration;
 
-use parking_lot::Mutex;
-use tokio::sync::{oneshot, Semaphore};
+use crossbeam_skiplist::SkipMap;
+
+use bytes::Bytes;
 
 use crate::{
 	batch::Batch,
+	clock::LogicalClock,
 	error::{Error, Result},
+	transaction::Entry,
 };
-
-const MAX_CONCURRENT_COMMITS: usize = 16;
-const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
@@ -26,338 +27,349 @@ pub trait CommitEnv: Send + Sync + 'static {
 	fn apply(&self, batch: &Batch) -> Result<()>;
 }
 
-// Lock-free commit queue entry
-struct CommitBatch {
-	seq_num: AtomicU64,
-	count: u32, // Number of entries in the batch
-	applied: AtomicBool,
-	complete_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
+// Entry in the commit queue for ordering and conflict detection
+pub(crate) struct Commit {
+	pub(crate) batch: Arc<Batch>,
+	pub(crate) id: u64,
 }
 
-impl CommitBatch {
-	fn new(count: u32) -> (Arc<Self>, oneshot::Receiver<Result<()>>) {
-		let (tx, rx) = oneshot::channel();
-		let commit = Arc::new(Self {
-			seq_num: AtomicU64::new(0),
-			count,
-			applied: AtomicBool::new(false),
-			complete_tx: Mutex::new(Some(tx)),
-		});
-		(commit, rx)
-	}
+impl Commit {
+	/// Check if two writesets have overlapping keys (conflict detection)
+	/// Extracts keys from batches and uses two-pointer algorithm for O(n+m) complexity
+	fn is_disjoint_writeset(&self, other: &Commit) -> bool {
+		// Extract keys from both batches
+		let keys_a: Vec<Bytes> =
+			self.batch.as_ref().entries().iter().map(|e| Bytes::copy_from_slice(&e.key)).collect();
+		let keys_b: Vec<Bytes> =
+			other.batch.as_ref().entries().iter().map(|e| Bytes::copy_from_slice(&e.key)).collect();
 
-	fn set_seq_num(&self, seq: u64) {
-		self.seq_num.store(seq, Ordering::Release);
-	}
-
-	fn get_seq_num(&self) -> u64 {
-		self.seq_num.load(Ordering::Acquire)
-	}
-
-	fn mark_applied(&self) {
-		self.applied.store(true, Ordering::Release);
-	}
-
-	fn is_applied(&self) -> bool {
-		self.applied.load(Ordering::Acquire)
-	}
-
-	fn complete(&self, result: Result<()>) {
-		let mut guard = self.complete_tx.lock();
-		if let Some(tx) = guard.take() {
-			let _ = tx.send(result);
+		if keys_a.is_empty() || keys_b.is_empty() {
+			return true;
 		}
+
+		let mut a = keys_a.iter();
+		let mut b = keys_b.iter();
+		let mut next_a = a.next();
+		let mut next_b = b.next();
+
+		while let (Some(ka), Some(kb)) = (next_a, next_b) {
+			match ka.cmp(kb) {
+				std::cmp::Ordering::Less => next_a = a.next(),
+				std::cmp::Ordering::Greater => next_b = b.next(),
+				std::cmp::Ordering::Equal => return false, // Overlap found!
+			}
+		}
+		true // No overlap
 	}
 }
 
-// Lock-free single-producer, multi-consumer commit queue
-//
-// commitQueue is a lock-free fixed-size single-producer, multi-consumer
-// queue. The single producer can enqueue (push) to the head, and consumers can
-// dequeue (pop) from the tail.
-struct CommitQueue {
-	// Head and tail packed into single atomic
-	// head = index of next slot to fill (high 32 bits)
-	// tail = index of oldest data in queue (low 32 bits)
-	head_tail: AtomicU64,
-	slots: [AtomicPtr<CommitBatch>; MAX_CONCURRENT_COMMITS],
+// Entry in the merge queue for data versioning
+pub(crate) struct Merge {
+	pub(crate) batch: Arc<Batch>,
+	pub(crate) id: u64,
 }
 
-impl CommitQueue {
-	fn new() -> Self {
-		Self {
-			head_tail: AtomicU64::new(0),
-			slots: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
-		}
-	}
-
-	fn unpack(&self, ptrs: u64) -> (u32, u32) {
-		let head = (ptrs >> DEQUEUE_BITS) as u32;
-		let tail = ptrs as u32;
-		(head, tail)
-	}
-
-	fn pack(&self, head: u32, tail: u32) -> u64 {
-		((head as u64) << DEQUEUE_BITS) | (tail as u64)
-	}
-
-	// Single producer enqueue
-	fn enqueue(&self, batch: Arc<CommitBatch>) {
-		let ptrs = self.head_tail.load(Ordering::Acquire);
-		let (head, tail) = self.unpack(ptrs);
-
-		// Check if queue is full
-		if tail.wrapping_add(MAX_CONCURRENT_COMMITS as u32) == head {
-			// Queue is full. This should never be reached because the semaphore
-			// limits the number of concurrent operations.
-			panic!("commit queue overflow - should not be reached");
-		}
-
-		let slot_idx = (head & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
-		let slot = &self.slots[slot_idx];
-
-		// Check if the head slot has been released by dequeueApplied
-		while !slot.load(Ordering::Acquire).is_null() {
-			// Another thread is still cleaning up the tail, so the queue is
-			// actually still full.
-			std::hint::spin_loop();
-		}
-
-		// The head slot is free
-		let batch_ptr = Arc::into_raw(batch);
-		slot.store(batch_ptr as *mut CommitBatch, Ordering::Release);
-
-		// Increment head
-		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
-	}
-
-	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is applied
-	fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
-		loop {
-			let ptrs = self.head_tail.load(Ordering::Acquire);
-			let (head, tail) = self.unpack(ptrs);
-
-			if tail == head {
-				// Queue is empty
-				return None;
-			}
-
-			let slot_idx = (tail & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
-			let slot = &self.slots[slot_idx];
-			let batch_ptr = slot.load(Ordering::Acquire);
-
-			if batch_ptr.is_null() {
-				// The batch is not ready to be dequeued, or another thread has
-				// already dequeued it.
-				return None;
-			}
-
-			// Check if batch is applied (safely through raw pointer)
-			let is_applied = unsafe { (*batch_ptr).is_applied() };
-			if !is_applied {
-				return None;
-			}
-
-			let new_ptrs = self.pack(head, tail.wrapping_add(1));
-			if self
-				.head_tail
-				.compare_exchange_weak(ptrs, new_ptrs, Ordering::Release, Ordering::Relaxed)
-				.is_ok()
-			{
-				// We now own slot.
-				slot.store(std::ptr::null_mut(), Ordering::Release);
-
-				let batch = unsafe { Arc::from_raw(batch_ptr) };
-				return Some(batch);
-			}
-			// CAS failed, retry the whole loop
-		}
-	}
-}
-
+// Lock-free commit pipeline using atomic SkipMap queues
 pub(crate) struct CommitPipeline {
 	env: Arc<dyn CommitEnv>,
-	log_seq_num: AtomicU64,
-	visible_seq_num: Arc<AtomicU64>,
-	// Single producer - only one thread can write to WAL at a time
-	write_mutex: Mutex<()>,
-	// Lock-free single-producer, multi-consumer commit queue
-	pending: CommitQueue,
-	// Semaphore for flow control
-	commit_sem: Arc<Semaphore>,
+
+	// SkipMap-based queues (no fixed size limit)
+	// Made public for read access from transactions
+	pub(crate) commit_queue: SkipMap<u64, Arc<Commit>>,
+	pub(crate) merge_queue: SkipMap<u64, Arc<Merge>>,
+
+	// Atomic counters for commit/merge versioning
+	commit_id: AtomicU64,
+	merge_id: AtomicU64, // Sequence number counter for data versioning
+
+	// Unique ID generators for CAS operations
+	transaction_queue_id: AtomicU64,
+	transaction_merge_id: AtomicU64,
+
+	// Track active transactions for cleanup
+	active_txn_starts: SkipMap<u64, AtomicUsize>,
+
+	// Maximum entries in commit_queue before cleanup
+	max_queue_size: usize,
+
+	// Logical clock for timestamp generation
+	clock: Arc<dyn LogicalClock>,
+
 	shutdown: AtomicBool,
 }
 
 impl CommitPipeline {
-	pub(crate) fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
+	pub(crate) fn new(env: Arc<dyn CommitEnv>, clock: Arc<dyn LogicalClock>) -> Arc<Self> {
 		Arc::new(Self {
 			env,
-			log_seq_num: AtomicU64::new(1),
-			visible_seq_num: Arc::new(AtomicU64::new(0)),
-			write_mutex: Mutex::new(()),
-			pending: CommitQueue::new(),
-			commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
+			commit_queue: SkipMap::new(),
+			merge_queue: SkipMap::new(),
+			commit_id: AtomicU64::new(0),
+			merge_id: AtomicU64::new(0), // Start at 0 so first seq_num is 1
+			transaction_queue_id: AtomicU64::new(0),
+			transaction_merge_id: AtomicU64::new(0),
+			active_txn_starts: SkipMap::new(),
+			max_queue_size: 10000,
+			clock,
 			shutdown: AtomicBool::new(false),
 		})
 	}
 
 	pub(crate) fn set_seq_num(&self, seq_num: u64) {
 		if seq_num > 0 {
-			self.visible_seq_num.store(seq_num, Ordering::Release);
-			self.log_seq_num.store(seq_num + 1, Ordering::Release);
+			self.merge_id.store(seq_num, Ordering::Release);
 		}
 	}
 
-	pub fn sync_commit(&self, mut batch: Batch, sync_wal: bool) -> Result<()> {
+	/// Register a new transaction start for conflict detection
+	pub(crate) fn register_txn_start(&self, start_commit_id: u64) {
+		let entry =
+			self.active_txn_starts.get_or_insert_with(start_commit_id, || AtomicUsize::new(0));
+		entry.value().fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Unregister a transaction when it commits or aborts
+	pub(crate) fn unregister_txn_start(&self, start_commit_id: u64) {
+		if let Some(entry) = self.active_txn_starts.get(&start_commit_id) {
+			let prev_count = entry.value().fetch_sub(1, Ordering::Relaxed);
+
+			// Only remove if we decremented from 1 to 0
+			if prev_count == 1 {
+				// Double-check by trying to remove only if counter is 0
+				if entry.value().load(Ordering::Relaxed) == 0 {
+					self.active_txn_starts.remove(&start_commit_id);
+				}
+			}
+		}
+	}
+
+	/// Get the current commit ID for new transactions
+	pub(crate) fn get_commit_id(&self) -> u64 {
+		self.commit_id.load(Ordering::Acquire)
+	}
+
+	/// Commit a transaction's writeset (unified commit API)
+	/// Handles batch creation, timestamp assignment, conflict detection, and WAL writing
+	pub(crate) fn commit(
+		&self,
+		latest_writes: Vec<Entry>,
+		sync: bool,
+		start_commit_id: u64,
+	) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
 
+		if latest_writes.is_empty() {
+			return Ok(());
+		}
+
+		// Create batch with timestamps
+		let mut batch = Batch::new(0);
+		let commit_timestamp = self.clock.now();
+
+		for entry in latest_writes {
+			let timestamp = if entry.timestamp != 0 {
+				entry.timestamp
+			} else {
+				commit_timestamp
+			};
+			batch.add_record(
+				entry.kind,
+				&entry.key,
+				entry.value.as_ref().map(|bytes| bytes.as_ref()),
+				timestamp,
+			)?;
+		}
+
+		let batch_arc = Arc::new(batch);
+
+		// Insert into commit queue for ordering
+		let (commit_version, commit_entry) = self.atomic_commit(Commit {
+			batch: batch_arc.clone(),
+			id: self.transaction_queue_id.fetch_add(1, Ordering::AcqRel) + 1,
+		})?;
+
+		// Check for write-write conflicts
+		for tx in self.commit_queue.range((start_commit_id + 1)..commit_version) {
+			if !tx.value().is_disjoint_writeset(&commit_entry) {
+				self.commit_queue.remove(&commit_version);
+				return Err(Error::TransactionWriteConflict);
+			}
+		}
+
+		// Insert into merge queue and write to WAL (serialized by CAS)
+		let (seq_num, processed_batch) = self.atomic_merge(
+			Merge {
+				batch: batch_arc,
+				id: self.transaction_merge_id.fetch_add(1, Ordering::AcqRel) + 1,
+			},
+			sync,
+		)?;
+
+		// Apply to memtable
+		self.env.apply(&processed_batch)?;
+
+		// Update visible sequence number
+		let count = processed_batch.count() as u64;
+		self.update_visible_seq_num(seq_num, count);
+
+		// Cleanup old entries
+		self.cleanup_commit_queue();
+		self.merge_queue.remove(&seq_num);
+
+		Ok(())
+	}
+
+	/// Commit a batch directly (for internal operations like VLog GC)
+	/// Converts batch to Entry vector and uses unified commit API
+	pub(crate) fn commit_batch(&self, batch: Batch, sync: bool) -> Result<()> {
 		if batch.is_empty() {
 			return Ok(());
 		}
 
-		// Acquire write lock to ensure serialization
-		let _guard = self.write_mutex.lock();
+		// Capture start point for proper conflict detection
+		let start_commit_id = self.get_commit_id();
 
-		// Assign sequence number
-		let count = batch.count() as u64;
-		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+		// Convert batch entries to Entry vector
+		let entries: Vec<Entry> = batch
+			.entries()
+			.iter()
+			.map(|e| Entry {
+				key: Bytes::copy_from_slice(&e.key),
+				value: e.value.clone().map(|v| Bytes::copy_from_slice(&v)),
+				kind: e.kind,
+				savepoint_no: 0,
+				seqno: 0,
+				timestamp: e.timestamp,
+			})
+			.collect();
 
-		// Set the starting sequence number in the batch
-		batch.set_starting_seq_num(seq_num);
+		// Use proper start_commit_id for snapshot isolation semantics
+		self.commit(entries, sync, start_commit_id)
+	}
 
-		// Write to WAL and get processed batch
-		let processed_batch = self.env.write(&batch, seq_num, sync_wal)?;
+	/// Atomically insert into commit queue
+	fn atomic_commit(&self, updates: Commit) -> Result<(u64, Arc<Commit>)> {
+		let mut spins = 0;
+		let id = updates.id;
+		let updates = Arc::new(updates);
 
-		// Apply processed batch to memtable
-		self.env.apply(&processed_batch)?;
+		loop {
+			let version = self.commit_id.load(Ordering::Acquire) + 1;
 
-		// Update visible sequence number
-		let new_visible = seq_num + count - 1;
-		let mut current = self.visible_seq_num.load(Ordering::Acquire);
-		while new_visible > current {
-			match self.visible_seq_num.compare_exchange_weak(
+			let entry = self.commit_queue.get_or_insert_with(version, || Arc::clone(&updates));
+
+			if id == entry.value().id {
+				self.commit_id.fetch_add(1, Ordering::Release);
+				return Ok((version, entry.value().clone()));
+			}
+
+			// Backoff strategy
+			if spins < 10 {
+				std::hint::spin_loop();
+			} else if spins < 100 {
+				std::thread::yield_now();
+			} else {
+				std::thread::park_timeout(Duration::from_micros(10));
+			}
+			spins += 1;
+		}
+	}
+
+	/// Clean up the commit queue based on active transactions
+	fn cleanup_commit_queue(&self) {
+		// Only clean up if we have too many entries
+		if self.commit_queue.len() <= self.max_queue_size {
+			return;
+		}
+
+		// Find the oldest active transaction start point
+		let oldest_active = match self.active_txn_starts.iter().next() {
+			Some(entry) => {
+				// There are active transactions - we can safely clean up entries
+				// older than the oldest active transaction's start point
+				*entry.key()
+			}
+			None => {
+				// No active transactions currently.
+				// New transactions will get start_commit_id = current commit_id
+				// So we can safely clean up entries older than the current commit ID
+				// since no future transaction will have a start_commit_id older than this
+				self.commit_id.load(Ordering::Acquire)
+			}
+		};
+
+		// Only remove entries that are not needed for conflict detection
+		let keys_to_remove: Vec<u64> =
+			self.commit_queue.range(..oldest_active).map(|e| *e.key()).collect();
+
+		for key in keys_to_remove {
+			self.commit_queue.remove(&key);
+		}
+	}
+
+	/// Atomically insert into merge queue and write to WAL
+	/// The winning thread (that claims the seq_num) writes to WAL - guarantees sequential order
+	fn atomic_merge(&self, updates: Merge, sync: bool) -> Result<(u64, Batch)> {
+		let mut spins = 0;
+		let id = updates.id;
+		let batch = (*updates.batch).clone(); // Clone batch before Arc
+		let updates = Arc::new(updates);
+
+		loop {
+			// Get next sequence number
+			let seq_num = self.merge_id.load(Ordering::Acquire) + 1;
+
+			let entry = self.merge_queue.get_or_insert_with(seq_num, || Arc::clone(&updates));
+
+			if id == entry.value().id {
+				// CAS winner writes to WAL with assigned sequence number
+				let mut batch_with_seq = batch.clone();
+				batch_with_seq.set_starting_seq_num(seq_num);
+				let processed_batch = self.env.write(&batch_with_seq, seq_num, sync)?;
+
+				self.merge_id.fetch_add(1, Ordering::Release);
+				return Ok((seq_num, processed_batch));
+			}
+
+			// Backoff strategy
+			if spins < 10 {
+				std::hint::spin_loop();
+			} else if spins < 100 {
+				std::thread::yield_now();
+			} else {
+				std::thread::park_timeout(Duration::from_micros(10));
+			}
+			spins += 1;
+		}
+	}
+
+	pub(crate) fn get_visible_seq_num(&self) -> u64 {
+		// Returns the highest sequence number that has been assigned and applied
+		// Updated by update_visible_seq_num after each batch is applied
+		self.merge_id.load(Ordering::Acquire)
+	}
+
+	/// Update visible sequence number after applying a batch
+	fn update_visible_seq_num(&self, seq_num: u64, count: u64) {
+		// Calculate highest seq used: seq_num + count - 1
+		// We need to track this for correct snapshot isolation
+		let highest_seq = seq_num + count - 1;
+
+		// Update merge_id to reflect highest used
+		let mut current = self.merge_id.load(Ordering::Acquire);
+		while highest_seq > current {
+			match self.merge_id.compare_exchange_weak(
 				current,
-				new_visible,
+				highest_seq,
 				Ordering::Release,
-				Ordering::Relaxed,
+				Ordering::Acquire, // Must use Acquire on failure to see other thread's update
 			) {
 				Ok(_) => break,
 				Err(actual) => current = actual,
 			}
 		}
-
-		Ok(())
-	}
-
-	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool) -> Result<()> {
-		if self.shutdown.load(Ordering::Acquire) {
-			return Err(Error::PipelineStall);
-		}
-
-		if batch.is_empty() {
-			return Ok(());
-		}
-
-		// Acquire permit for flow control
-		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
-
-		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
-
-		// Phase 1: Prepare (single producer) - assign sequence number
-		let seq_num = self.prepare(&mut batch, commit_batch.clone())?;
-
-		// Phase 2: Write to WAL and process VLog (synchronous)
-		let processed_batch = {
-			let env = self.env.clone();
-			env.write(&batch, seq_num, sync)?
-		};
-
-		// Phase 3: Apply to memtable (can be concurrent)
-		let apply_result = {
-			let env = self.env.clone();
-			env.apply(&processed_batch)
-		};
-
-		match apply_result {
-			Ok(_) => {
-				commit_batch.mark_applied();
-				// Phase 4: Publish (multi-consumer)
-				self.publish();
-			}
-			Err(e) => {
-				let err = Error::CommitFail(e.to_string());
-				commit_batch.complete(Err(err.clone()));
-				return Err(err);
-			}
-		}
-
-		// Wait for completion
-		complete_rx.await.map_err(|_| Error::PipelineStall)?
-	}
-
-	fn prepare(&self, batch: &mut Batch, commit_batch: Arc<CommitBatch>) -> Result<u64> {
-		// Assign sequence number atomically
-		let _guard = self.write_mutex.lock();
-
-		let count = batch.count() as u64;
-		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-
-		// Set sequence numbers in batch and commit batch
-		commit_batch.set_seq_num(seq_num);
-		batch.set_starting_seq_num(seq_num);
-
-		// Enqueue operation (single producer)
-		self.pending.enqueue(commit_batch.clone());
-
-		Ok(seq_num)
-	}
-
-	fn publish(&self) {
-		// Multi-consumer publish loop
-		loop {
-			let dequeued = self.pending.dequeue_applied();
-
-			match dequeued {
-				Some(batch) => {
-					// Publish this batch's sequence number
-					let new_visible = batch.get_seq_num() + batch.count as u64 - 1;
-
-					loop {
-						let current = self.visible_seq_num.load(Ordering::Acquire);
-						if new_visible <= current {
-							// Already published by another thread
-							break;
-						}
-
-						if self
-							.visible_seq_num
-							.compare_exchange_weak(
-								current,
-								new_visible,
-								Ordering::Release,
-								Ordering::Relaxed,
-							)
-							.is_ok()
-						{
-							break;
-						}
-					}
-
-					// Complete this batch
-					batch.complete(Ok(()));
-				}
-				None => {
-					// No more applied batches, done
-					break;
-				}
-			}
-		}
-	}
-
-	pub(crate) fn get_visible_seq_num(&self) -> u64 {
-		self.visible_seq_num.load(Ordering::Acquire)
 	}
 
 	pub(crate) fn shutdown(&self) {
@@ -373,10 +385,9 @@ impl Drop for CommitPipeline {
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
 	use test_log::test;
 
-	use crate::sstable::InternalKeyKind;
+	use crate::{clock::MockLogicalClock, sstable::InternalKeyKind};
 
 	use super::*;
 
@@ -402,14 +413,14 @@ mod tests {
 		}
 	}
 
-	#[test(tokio::test)]
-	async fn test_single_commit() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+	#[test]
+	fn test_single_commit() {
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), Arc::new(MockLogicalClock::new()));
 
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
 
-		let result = pipeline.commit(batch, false).await;
+		let result = pipeline.commit_batch(batch, false);
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
@@ -421,9 +432,9 @@ mod tests {
 		pipeline.shutdown();
 	}
 
-	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-	async fn test_sequential_commits() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+	#[test]
+	fn test_sequential_commits() {
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), Arc::new(MockLogicalClock::new()));
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
@@ -436,7 +447,7 @@ mod tests {
 					i,
 				)
 				.unwrap();
-			let result = pipeline.commit(batch, false).await;
+			let result = pipeline.commit_batch(batch, false);
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
 		}
 
@@ -445,14 +456,15 @@ mod tests {
 		pipeline.shutdown();
 	}
 
-	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-	async fn test_concurrent_commits() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+	#[test]
+	fn test_concurrent_commits() {
+		let pipeline =
+			Arc::new(CommitPipeline::new(Arc::new(MockEnv), Arc::new(MockLogicalClock::new())));
 
 		let mut handles = vec![];
 		for i in 0..10 {
 			let pipeline = pipeline.clone();
-			let handle = tokio::spawn(async move {
+			let handle = std::thread::spawn(move || {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
@@ -462,23 +474,17 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				pipeline.commit_batch(batch, false)
 			});
 			handles.push(handle);
 		}
 
 		for (i, handle) in handles.into_iter().enumerate() {
-			let result = handle.await.unwrap();
+			let result = handle.join().unwrap();
 			assert!(result.is_ok(), "Commit {i} failed: {result:?}");
 		}
 
-		// Give time for all publishing to complete
-		let start = std::time::Instant::now();
-		while pipeline.get_visible_seq_num() < 10 && start.elapsed() < Duration::from_secs(5) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-
-		// Verify sequence numbers are published correctly
+		// Verify all batches were published
 		assert_eq!(pipeline.get_visible_seq_num(), 10, "Not all batches were published");
 
 		// Shutdown the pipeline
@@ -515,14 +521,17 @@ mod tests {
 		}
 	}
 
-	#[test(tokio::test(flavor = "multi_thread"))]
-	async fn test_concurrent_commits_with_delays() {
-		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv));
+	#[test]
+	fn test_concurrent_commits_with_delays() {
+		let pipeline = Arc::new(CommitPipeline::new(
+			Arc::new(DelayedMockEnv),
+			Arc::new(MockLogicalClock::new()),
+		));
 
 		let mut handles = vec![];
 		for i in 0..5 {
 			let pipeline = pipeline.clone();
-			let handle = tokio::spawn(async move {
+			let handle = std::thread::spawn(move || {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
@@ -532,13 +541,13 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				pipeline.commit_batch(batch, false)
 			});
 			handles.push(handle);
 		}
 
 		for handle in handles {
-			assert!(handle.await.unwrap().is_ok());
+			assert!(handle.join().unwrap().is_ok());
 		}
 
 		// Verify sequence numbers are published correctly
@@ -546,114 +555,6 @@ mod tests {
 
 		// Shutdown the pipeline
 		pipeline.shutdown();
-	}
-
-	// ===== Sync Commit Tests =====
-
-	#[test]
-	fn test_sync_commit_single() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-
-		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
-
-		let result = pipeline.sync_commit(batch, false);
-		assert!(result.is_ok(), "Sync commit failed: {result:?}");
-
-		let visible = pipeline.get_visible_seq_num();
-		assert_eq!(visible, 1, "Expected visible=1 after sync commit");
-
-		pipeline.shutdown();
-	}
-
-	#[test]
-	fn test_sync_commit_multiple_sequential() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-
-		// Test multiple sequential sync commits
-		for i in 0..5 {
-			let mut batch = Batch::new(0);
-			batch
-				.add_record(
-					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
-					i as u64,
-				)
-				.unwrap();
-
-			let result = pipeline.sync_commit(batch, false);
-			assert!(result.is_ok(), "Sync commit {i} failed: {result:?}");
-		}
-
-		// Verify final sequence number
-		assert_eq!(pipeline.get_visible_seq_num(), 5);
-
-		pipeline.shutdown();
-	}
-
-	#[test]
-	fn test_sync_commit_empty_batch() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-
-		let batch = Batch::new(0);
-		let result = pipeline.sync_commit(batch, false);
-		assert!(result.is_ok(), "Empty batch sync commit should succeed");
-
-		// Sequence number should not change for empty batch
-		assert_eq!(pipeline.get_visible_seq_num(), 0);
-
-		pipeline.shutdown();
-	}
-
-	#[test]
-	fn test_sync_commit_with_sync_wal() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-
-		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
-
-		let result = pipeline.sync_commit(batch, true); // sync_wal = true
-		assert!(result.is_ok(), "Sync commit with sync_wal failed: {result:?}");
-
-		pipeline.shutdown();
-	}
-
-	#[test]
-	fn test_sync_commit_sequence_number_consistency() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-
-		// Set initial sequence number
-		pipeline.set_seq_num(100);
-
-		let mut batch1 = Batch::new(0);
-		batch1.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
-
-		let mut batch2 = Batch::new(0);
-		batch2.add_record(InternalKeyKind::Set, b"key2", Some(b"value2"), 1).unwrap();
-		batch2.add_record(InternalKeyKind::Set, b"key3", Some(b"value3"), 2).unwrap();
-
-		// Commit first batch
-		pipeline.sync_commit(batch1, false).unwrap();
-		assert_eq!(pipeline.get_visible_seq_num(), 101); // 100 + 1 - 1
-
-		// Commit second batch (2 records)
-		pipeline.sync_commit(batch2, false).unwrap();
-		assert_eq!(pipeline.get_visible_seq_num(), 103); // 101 + 2 - 1
-
-		pipeline.shutdown();
-	}
-
-	#[test]
-	fn test_sync_commit_after_shutdown() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
-		pipeline.shutdown();
-
-		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
-
-		let result = pipeline.sync_commit(batch, false);
-		assert!(result.is_err(), "Sync commit after shutdown should fail");
 	}
 
 	// Mock environment that tracks calls for testing
@@ -710,9 +611,9 @@ mod tests {
 	}
 
 	#[test]
-	fn test_sync_commit_calls_write_and_apply() {
+	fn test_commit_calls_write_and_apply() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(env.clone(), Arc::new(MockLogicalClock::new()));
 
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
@@ -721,8 +622,8 @@ mod tests {
 		assert_eq!(env.write_calls(), 0);
 		assert_eq!(env.apply_calls(), 0);
 
-		// Perform sync commit
-		pipeline.sync_commit(batch, true).unwrap();
+		// Perform commit
+		pipeline.commit_batch(batch, true).unwrap();
 
 		// Verify both write and apply were called
 		assert_eq!(env.write_calls(), 1);
@@ -733,9 +634,9 @@ mod tests {
 	}
 
 	#[test]
-	fn test_sync_commit_multiple_batches_tracking() {
+	fn test_commit_multiple_batches_tracking() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(env.clone(), Arc::new(MockLogicalClock::new()));
 
 		// Commit multiple batches
 		for i in 0..3 {
@@ -749,7 +650,7 @@ mod tests {
 				)
 				.unwrap();
 
-			pipeline.sync_commit(batch, i % 2 == 0).unwrap(); // Alternate sync_wal
+			pipeline.commit_batch(batch, i % 2 == 0).unwrap(); // Alternate sync_wal
 		}
 
 		// Verify correct number of calls
@@ -760,12 +661,12 @@ mod tests {
 	}
 
 	#[test]
-	fn test_sync_commit_concurrent_access() {
+	fn test_commit_concurrent_access() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline_clone = CommitPipeline::new(env.clone());
-		let pipeline = Arc::new(pipeline_clone);
+		let pipeline =
+			Arc::new(CommitPipeline::new(env.clone(), Arc::new(MockLogicalClock::new())));
 
-		// Test concurrent access to sync_commit
+		// Test concurrent access to commit
 		let mut handles = vec![];
 		let num_threads = 8;
 		let batches_per_thread = 5;
@@ -786,8 +687,8 @@ mod tests {
 						)
 						.unwrap();
 
-					// This should be safe even under concurrency due to write_mutex
-					pipeline.sync_commit(batch, false).unwrap();
+					// This should be safe even under concurrency due to lock-free design
+					pipeline.commit_batch(batch, false).unwrap();
 				}
 			});
 			handles.push(handle);
@@ -808,5 +709,17 @@ mod tests {
 		assert_eq!(final_visible, expected_calls);
 
 		pipeline.shutdown();
+	}
+
+	#[test]
+	fn test_commit_after_shutdown() {
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), Arc::new(MockLogicalClock::new()));
+		pipeline.shutdown();
+
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+
+		let result = pipeline.commit_batch(batch, false);
+		assert!(result.is_err(), "Commit after shutdown should fail");
 	}
 }

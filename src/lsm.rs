@@ -19,7 +19,6 @@ use crate::{
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	lockfile::LockFile,
 	memtable::{ImmutableMemtables, MemTable},
-	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
 	sstable::{table::Table, InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX},
 	task::TaskManager,
@@ -101,10 +100,6 @@ pub(crate) struct CoreInner {
 	/// Snapshots provide consistent point-in-time views of the data.
 	pub(crate) snapshot_counter: SnapshotCounter,
 
-	/// Oracle managing transaction timestamps for MVCC.
-	/// Provides monotonic timestamps for transaction ordering and conflict resolution.
-	pub(crate) oracle: Arc<Oracle>,
-
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
 
@@ -129,11 +124,6 @@ impl CoreInner {
 		// Initialize active and immutable memtables
 		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new())));
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
-
-		// TODO: Add a way to recover from the WAL or level manifest
-		// Initialize the transaction oracle for MVCC support
-		// The oracle provides monotonic timestamps for transaction ordering
-		let oracle = Oracle::new(opts.clock.clone());
 
 		// Initialize WAL and level manifest
 		let wal_path = opts.wal_dir();
@@ -167,7 +157,6 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_counter: SnapshotCounter::default(),
-			oracle: Arc::new(oracle),
 			vlog,
 			wal: wal.map(parking_lot::RwLock::new),
 			versioned_index,
@@ -487,7 +476,7 @@ pub(crate) struct Core {
 	inner: Arc<CoreInner>,
 
 	/// The commit pipeline that handles write batches
-	commit_pipeline: Arc<CommitPipeline>,
+	pub(crate) commit_pipeline: Arc<CommitPipeline>,
 
 	/// Task manager for background operations (stored in Option so we can take it for shutdown)
 	task_manager: Mutex<Option<Arc<TaskManager>>>,
@@ -583,7 +572,7 @@ impl Core {
 
 		let commit_env = Arc::new(LsmCommitEnv::new(inner.clone(), task_manager.clone())?);
 
-		let commit_pipeline = CommitPipeline::new(commit_env);
+		let commit_pipeline = CommitPipeline::new(commit_env, opts.clock.clone());
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -620,14 +609,19 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
-		// Commit the batch using the commit pipeline
-		self.commit_pipeline.commit(batch, sync).await
+	pub(crate) fn commit(
+		&self,
+		latest_writes: Vec<crate::transaction::Entry>,
+		sync: bool,
+		start_commit_id: u64,
+	) -> Result<()> {
+		// Commit transaction writeset with conflict detection
+		self.commit_pipeline.commit(latest_writes, sync, start_commit_id)
 	}
 
-	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
-		// Use the synchronous commit path
-		self.commit_pipeline.sync_commit(batch, sync_wal)
+	pub(crate) fn commit_batch(&self, batch: Batch, sync: bool) -> Result<()> {
+		// Commit batch directly (for internal operations)
+		self.commit_pipeline.commit_batch(batch, sync)
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -872,7 +866,7 @@ impl Tree {
 	}
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
-		self.core.sync_commit(batch, sync_wal)
+		self.core.commit_batch(batch, sync_wal)
 	}
 }
 
@@ -1186,7 +1180,7 @@ mod tests {
 		let value = "world";
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Read back the key-value pair
 		let txn = tree.begin().unwrap();
@@ -1213,7 +1207,7 @@ mod tests {
 			// Insert key-value pair in a new transaction
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Ensure the active memtable is flushed to disk
@@ -1247,14 +1241,14 @@ mod tests {
 			// Insert key-value pair in a new transaction
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Delete the key
 		{
 			let mut txn = tree.begin().unwrap();
 			txn.delete(key.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Ensure the active memtable is flushed to disk
@@ -1300,7 +1294,7 @@ mod tests {
 				// Insert in a new transaction
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -1360,7 +1354,7 @@ mod tests {
 					// Insert in a new transaction
 					let mut txn = tree.begin().unwrap();
 					txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
@@ -1425,7 +1419,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure data is on disk
@@ -1454,7 +1448,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure the new data is also on disk
@@ -1509,7 +1503,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure data is on disk
@@ -1527,7 +1521,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Verify the pending writes are in memory but not yet flushed
@@ -1574,7 +1568,7 @@ mod tests {
 		for key in keys.iter() {
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), key.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Test range scan BEFORE flushing (should work from memtables)
@@ -1659,7 +1653,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure all data is on disk
@@ -1839,7 +1833,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -1914,7 +1908,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -1978,7 +1972,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -2106,7 +2100,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -2242,7 +2236,7 @@ mod tests {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(small_key.as_bytes(), small_value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Test 2: Large values should be stored in VLog
 		let large_key = "large_key";
@@ -2250,7 +2244,7 @@ mod tests {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(large_key.as_bytes(), large_value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Force memtable flush to persist to SSTables
 		tree.flush().unwrap();
@@ -2291,12 +2285,11 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure all data is persisted
 		tree.flush().unwrap();
-		tree.close().await.unwrap();
 
 		let tree = Arc::new(tree);
 
@@ -2349,7 +2342,7 @@ mod tests {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush
@@ -2405,7 +2398,7 @@ mod tests {
 			let key = format!("key_{i}");
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), &large_value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to create VLog files and initialize discard stats
@@ -2513,7 +2506,7 @@ mod tests {
 			let value = format!("value-{}-v1", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2522,7 +2515,7 @@ mod tests {
 			let value = format!("value-{}-v2", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2538,7 +2531,7 @@ mod tests {
 		for key in keys.iter() {
 			let mut tx = tree.begin().unwrap();
 			tx.delete(key).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Flush memtable
@@ -2604,7 +2597,7 @@ mod tests {
 			let value = format!("value-{}-v1", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2613,7 +2606,7 @@ mod tests {
 			let value = format!("value-{}-v2", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2622,7 +2615,7 @@ mod tests {
 			let value = format!("value-{}-v3", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2631,7 +2624,7 @@ mod tests {
 			let value = format!("value-{}-v4", i + 1);
 			let mut tx = tree.begin().unwrap();
 			tx.set(key, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2649,7 +2642,7 @@ mod tests {
 		for key in keys.iter() {
 			let mut tx = tree.begin().unwrap();
 			tx.delete(key).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Flush memtable
@@ -2714,7 +2707,7 @@ mod tests {
 			let value = format!("value1_version_{i}").repeat(10); // Large value to fill VLog
 			let mut tx = tree.begin().unwrap();
 			tx.set(&key1, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2724,13 +2717,13 @@ mod tests {
 			// Insert key2
 			let mut tx = tree.begin().unwrap();
 			tx.set(&key2, b"value2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Delete key2
 			let mut tx = tree.begin().unwrap();
 			tx.delete(&key2).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2749,7 +2742,7 @@ mod tests {
 			let value = format!("value2_version_{i}").repeat(10); // Large values
 			let mut tx = tree.begin().unwrap();
 			tx.set(&key3, value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -2757,7 +2750,7 @@ mod tests {
 		{
 			let mut tx = tree.begin().unwrap();
 			tx.set(&key1, "final_value_key1".repeat(10).as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -2811,7 +2804,7 @@ mod tests {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Force first flush
@@ -2824,7 +2817,7 @@ mod tests {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Force second flush
@@ -2890,7 +2883,7 @@ mod tests {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Force first flush to create first table
@@ -2903,7 +2896,7 @@ mod tests {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Force second flush to create second table
@@ -2971,7 +2964,7 @@ mod tests {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Force flush to create the 3rd table
@@ -3061,7 +3054,7 @@ mod tests {
 		}
 	}
 
-	#[test(tokio::test(flavor = "multi_thread"))]
+	#[test(tokio::test)]
 	async fn test_vlog_prefill_on_reopen() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -3084,7 +3077,7 @@ mod tests {
 
 			let mut tx = tree1.begin().unwrap();
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 
 			// Verify the data was written immediately
 			let tx = tree1.begin().unwrap();
@@ -3127,7 +3120,7 @@ mod tests {
 
 		let mut tx = tree2.begin().unwrap();
 		tx.set(new_key.as_bytes(), new_value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Verify the new data can be read
 		let tx = tree2.begin().unwrap();
@@ -3167,7 +3160,7 @@ mod tests {
 		// Test basic operations
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let txn = tree.begin().unwrap();
 		let result = txn.get(b"test_key").unwrap().unwrap();
@@ -3185,7 +3178,7 @@ mod tests {
 		// Test basic operations on the second tree
 		let mut txn = tree2.begin().unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let txn = tree2.begin().unwrap();
 		let result = txn.get(b"key2").unwrap().unwrap();
@@ -3210,7 +3203,7 @@ mod tests {
 				let value = format!("value_v{}", version);
 				let mut txn = tree.begin().unwrap();
 				txn.set(b"test_key", value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Verify the latest version exists
@@ -3221,7 +3214,7 @@ mod tests {
 			// Soft delete the key
 			let mut txn = tree.begin().unwrap();
 			txn.soft_delete(b"test_key").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the key is now invisible (soft deleted)
 			let txn = tree.begin().unwrap();
@@ -3231,7 +3224,7 @@ mod tests {
 			// Add a new different key
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"other_key", b"other_value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the new key exists
 			let txn = tree.begin().unwrap();
@@ -3289,7 +3282,7 @@ mod tests {
 			// Test that we can reinsert the same key after soft delete
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"test_key", b"new_value_after_soft_delete").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the new value is visible
 			let txn = tree.begin().unwrap();
@@ -3320,7 +3313,7 @@ mod tests {
 			let key = format!("key_{i}");
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), &large_value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to create VLog files and initialize discard stats
@@ -3381,7 +3374,7 @@ mod tests {
 			let key = format!("key_{i}");
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), &large_value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure the new data is also on disk

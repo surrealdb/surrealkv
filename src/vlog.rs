@@ -926,7 +926,7 @@ impl VLog {
 
 		// If we found a candidate, try to compact it
 		if let Some((file_id, _)) = candidate_to_compact {
-			let compacted = self.compact_vlog_file_safe(file_id, commit_pipeline.clone()).await?;
+			let compacted = self.compact_vlog_file_safe(file_id, commit_pipeline.clone())?;
 
 			if compacted {
 				Ok(vec![file_id])
@@ -940,13 +940,13 @@ impl VLog {
 	}
 
 	/// Compacts a single value log file
-	async fn compact_vlog_file_safe(
+	fn compact_vlog_file_safe(
 		&self,
 		file_id: u32,
 		commit_pipeline: Arc<CommitPipeline>,
 	) -> Result<bool> {
 		// Perform the actual compaction
-		let compacted = self.compact_vlog_file(file_id, commit_pipeline.clone()).await?;
+		let compacted = self.compact_vlog_file(file_id, commit_pipeline.clone())?;
 
 		if compacted {
 			// Schedule for safe deletion based on iterator count
@@ -973,7 +973,7 @@ impl VLog {
 	}
 
 	/// Compacts a single value log file, copying only live values
-	async fn compact_vlog_file(
+	fn compact_vlog_file(
 		&self,
 		file_id: u32,
 		commit_pipeline: Arc<CommitPipeline>,
@@ -1081,7 +1081,7 @@ impl VLog {
 				// If batch is full, commit it
 				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
 					// Commit the batch to LSM (and VLog for large values)
-					commit_pipeline.commit(batch, true).await?;
+					commit_pipeline.commit_batch(batch, true)?;
 
 					// Reset batch
 					batch = Batch::default();
@@ -1094,7 +1094,7 @@ impl VLog {
 
 		// Commit any remaining entries in the batch
 		if !batch.is_empty() {
-			commit_pipeline.commit(batch, true).await?;
+			commit_pipeline.commit_batch(batch, true)?;
 		}
 
 		// Clean up versioned index BEFORE cleaning delete list
@@ -1528,16 +1528,16 @@ mod tests {
 		(vlog, temp_dir, opts)
 	}
 
-	#[test]
-	fn test_value_pointer_encoding() {
+	#[test(tokio::test)]
+	async fn test_value_pointer_encoding() {
 		let pointer = ValuePointer::new(123, 456, 111, 789, 0xdeadbeef);
 		let encoded = pointer.encode();
 		let decoded = ValuePointer::decode(&encoded).unwrap();
 		assert_eq!(pointer, decoded);
 	}
 
-	#[test]
-	fn test_value_pointer_utility_methods() {
+	#[test(tokio::test)]
+	async fn test_value_pointer_utility_methods() {
 		let pointer = ValuePointer::new(123, 456, 11, 789, 42);
 		let encoded = pointer.encode();
 
@@ -1556,8 +1556,8 @@ mod tests {
 		let _ = ValuePointer::decode(&random_data);
 	}
 
-	#[test]
-	fn test_discard_stats_operations() {
+	#[test(tokio::test)]
+	async fn test_discard_stats_operations() {
 		let temp_dir = TempDir::new().unwrap();
 		// Create a vlog subdirectory and use its parent for discard stats
 		let vlog_dir = temp_dir.path().join("vlog");
@@ -1580,8 +1580,8 @@ mod tests {
 		assert_eq!(max_discard, 300);
 	}
 
-	#[test]
-	fn test_gc_threshold_with_discard_stats() {
+	#[test(tokio::test)]
+	async fn test_gc_threshold_with_discard_stats() {
 		let temp_dir = TempDir::new().unwrap();
 		// Create a vlog subdirectory and use its parent for discard stats
 		let vlog_dir = temp_dir.path().join("vlog");
@@ -1754,8 +1754,8 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_value_pointer_encode_into_decode() {
+	#[test(tokio::test)]
+	async fn test_value_pointer_encode_into_decode() {
 		let pointer = ValuePointer::new(123, 456, 111, 789, 0xdeadbeef);
 
 		// Test encode
@@ -1767,8 +1767,8 @@ mod tests {
 		assert_eq!(pointer, decoded);
 	}
 
-	#[test]
-	fn test_value_pointer_codec() {
+	#[test(tokio::test)]
+	async fn test_value_pointer_codec() {
 		let pointer = ValuePointer::new(1, 2, 3, 4, 0);
 
 		// Test with zero values
@@ -1783,15 +1783,15 @@ mod tests {
 		assert_eq!(max_pointer, decoded);
 	}
 
-	#[test]
-	fn test_value_pointer_decode_insufficient_data() {
+	#[test(tokio::test)]
+	async fn test_value_pointer_decode_insufficient_data() {
 		let incomplete_data = vec![0u8; VALUE_POINTER_SIZE - 1];
 		let result = ValuePointer::decode(&incomplete_data);
 		assert!(result.is_err());
 	}
 
-	#[test]
-	fn test_value_location_inline_encoding() {
+	#[test(tokio::test)]
+	async fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
 		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 
@@ -1810,8 +1810,8 @@ mod tests {
 		assert!(!decoded.is_value_pointer());
 	}
 
-	#[test]
-	fn test_value_location_vlog_encoding() {
+	#[test(tokio::test)]
+	async fn test_value_location_vlog_encoding() {
 		let pointer = ValuePointer::new(1, 1024, 8, 256, 0x12345678);
 		let location = ValueLocation::with_pointer(pointer.clone());
 
@@ -1832,8 +1832,8 @@ mod tests {
 		assert_eq!(pointer, decoded_pointer);
 	}
 
-	#[test]
-	fn test_value_location_encode_into_decode() {
+	#[test(tokio::test)]
+	async fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
 			ValueLocation::with_inline_value(Arc::from(b"small data".as_slice())),
 			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
@@ -1852,8 +1852,8 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_value_location_size_calculation() {
+	#[test(tokio::test)]
+	async fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
 		let inline_location = ValueLocation::with_inline_value(Arc::from(inline_data.as_slice()));
@@ -1893,8 +1893,8 @@ mod tests {
 		assert_eq!(&*resolved, value);
 	}
 
-	#[test]
-	fn test_value_location_from_encoded_value_inline() {
+	#[test(tokio::test)]
+	async fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
 		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
 		let encoded = location.encode();
@@ -1927,8 +1927,8 @@ mod tests {
 		assert!(result.is_err());
 	}
 
-	#[test]
-	fn test_value_location_edge_cases() {
+	#[test(tokio::test)]
+	async fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
 		let location = ValueLocation::with_inline_value(Arc::from(max_inline.as_slice()));
@@ -1944,8 +1944,8 @@ mod tests {
 		assert_eq!(location, decoded);
 	}
 
-	#[test]
-	fn test_vlog_file_header_encoding() {
+	#[test(tokio::test)]
+	async fn test_vlog_file_header_encoding() {
 		let opts = Options::default();
 		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let encoded = header.encode();
@@ -1961,8 +1961,8 @@ mod tests {
 		assert!(decoded.is_compatible());
 	}
 
-	#[test]
-	fn test_vlog_file_header_invalid_magic() {
+	#[test(tokio::test)]
+	async fn test_vlog_file_header_invalid_magic() {
 		let opts = Options::default();
 		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.magic = 0x12345678; // Invalid magic
@@ -1971,8 +1971,8 @@ mod tests {
 		assert!(VLogFileHeader::decode(&encoded).is_err());
 	}
 
-	#[test]
-	fn test_vlog_file_header_invalid_size() {
+	#[test(tokio::test)]
+	async fn test_vlog_file_header_invalid_size() {
 		let opts = Options::default();
 		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		let mut encoded = header.encode().to_vec();
@@ -1981,8 +1981,8 @@ mod tests {
 		assert!(VLogFileHeader::decode(&encoded).is_err());
 	}
 
-	#[test]
-	fn test_vlog_file_header_version_compatibility() {
+	#[test(tokio::test)]
+	async fn test_vlog_file_header_version_compatibility() {
 		let opts = Options::default();
 		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
 		header.version = VLOG_FORMAT_VERSION;
@@ -2547,7 +2547,7 @@ mod tests {
 			let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
 			let mut tx = tree.begin().unwrap();
 			tx.set_at_version(user_key, value.as_bytes(), *ts).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap(); // Force flush after each version
 		}
 
@@ -2555,13 +2555,13 @@ mod tests {
 		{
 			let mut tx = tree.begin().unwrap();
 			tx.set_at_version(b"other_key", &b"other_value_large_data".repeat(50), 5000).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Delete other_key to make it stale
 			let mut tx = tree.begin().unwrap();
 			tx.delete(b"other_key").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 

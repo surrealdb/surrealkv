@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -6,7 +5,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
-use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{Snapshot, VersionScanResult};
@@ -216,13 +214,13 @@ impl Transaction {
 	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
 		let read_ts = core.seq_num();
 
-		let start_commit_id =
-			core.oracle.transaction_commit_id.load(std::sync::atomic::Ordering::Acquire);
+		// Get start_commit_id from CommitPipeline
+		let start_commit_id = core.commit_pipeline.get_commit_id();
 
-		// Only register mutable transactions with the oracle for conflict detection
+		// Only register mutable transactions with the commit pipeline for conflict detection
 		// Read-only transactions don't need conflict detection since they don't write
 		if mode.mutable() {
-			core.oracle.register_txn_start(start_commit_id);
+			core.commit_pipeline.register_txn_start(start_commit_id);
 		}
 
 		let mut snapshot = None;
@@ -369,6 +367,41 @@ impl Transaction {
 		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
+	/// Check merge queue for recently committed but not-yet-applied data
+	fn check_merge_queue(&self, key: &[u8]) -> Result<Option<(Value, u64)>> {
+		let merge_queue = &self.core.commit_pipeline.merge_queue;
+		let snapshot_seq = self.snapshot.as_ref().unwrap().seq_num;
+
+		// Iterate through entries up to our snapshot sequence number, newest first
+		for entry in merge_queue.range(..=snapshot_seq).rev() {
+			let batch = &entry.value().batch;
+
+			// Search through batch entries for this key
+			for (_, batch_entry, seq_num, _timestamp) in batch.entries_with_seq_nums()? {
+				if batch_entry.key.as_slice() == key && seq_num <= snapshot_seq {
+					// Found the key in merge queue
+					// Check if it's a tombstone (delete marker)
+					if matches!(
+						batch_entry.kind,
+						crate::sstable::InternalKeyKind::Delete
+							| crate::sstable::InternalKeyKind::SoftDelete
+							| crate::sstable::InternalKeyKind::RangeDelete
+					) {
+						return Ok(None);
+					}
+					if let Some(value) = &batch_entry.value {
+						// Convert Vec<u8> to Value (Arc<[u8]>)
+						return Ok(Some((Arc::from(value.clone().into_boxed_slice()), seq_num)));
+					}
+					return Ok(None);
+				}
+			}
+		}
+
+		// Not found in merge queue
+		Ok(None)
+	}
+
 	/// Gets a value for a key, with custom read options.
 	pub fn get_with_options(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
@@ -412,7 +445,14 @@ impl Transaction {
 			return Ok(None);
 		}
 
-		// The value is not in the write set, so attempt to get it from the snapshot.
+		// Check merge queue for committed but not-yet-applied writes
+		if let Some((value, _seq)) = self.check_merge_queue(key)? {
+			// Resolve the value reference through VLog if needed
+			let resolved_value = self.core.resolve_value(&value)?;
+			return Ok(Some(resolved_value));
+		}
+
+		// Finally, check the snapshot (pure LSM tree read)
 		match self.snapshot.as_ref().unwrap().get(key)? {
 			Some(val) => {
 				// Resolve the value reference through VLog if needed
@@ -785,7 +825,7 @@ impl Transaction {
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
-	pub async fn commit(&mut self) -> Result<()> {
+	pub fn commit(&mut self) -> Result<()> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -802,44 +842,17 @@ impl Transaction {
 			return Ok(());
 		}
 
-		// Prepare for commit - uses the new Oracle method
-		let _ = self.core.oracle.prepare_commit(self)?;
-
-		// Unregister the transaction start point
-		self.core.oracle.unregister_txn_start(self.start_commit_id);
-
-		// Create and prepare batch directly
-		let mut batch = Batch::new(0);
-
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.
 		let mut latest_writes: Vec<Entry> =
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
 		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
 
-		// Generate a single timestamp for this commit
-		let commit_timestamp = self.core.opts.clock.now();
-
-		// Add all entries to the batch
-		for entry in latest_writes {
-			// Use the entry's timestamp if it was explicitly set (via set_at_version),
-			// otherwise use the commit timestamp
-			let timestamp = if entry.timestamp != 0 {
-				entry.timestamp
-			} else {
-				commit_timestamp
-			};
-			batch.add_record(
-				entry.kind,
-				&entry.key,
-				entry.value.as_ref().map(|bytes| bytes.as_ref()),
-				timestamp,
-			)?;
-		}
-
-		// Write the batch to storage
+		// Pass writeset to commit pipeline - it handles everything
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync).await?;
+		self.core.commit(latest_writes, should_sync, self.start_commit_id)?;
+
+		// DON'T unregister here - Drop will handle it
 
 		// Mark the transaction as closed
 		self.closed = true;
@@ -848,11 +861,7 @@ impl Transaction {
 
 	/// Rolls back the transaction by removing all updated entries.
 	pub fn rollback(&mut self) {
-		// Only unregister mutable transactions since only they get registered
-		if !self.closed && self.mode.mutable() {
-			self.core.oracle.unregister_txn_start(self.start_commit_id);
-		}
-
+		// DON'T unregister here - Drop will handle it
 		self.closed = true;
 		self.write_set.clear();
 		self.snapshot.take();
@@ -921,6 +930,13 @@ impl Transaction {
 
 impl Drop for Transaction {
 	fn drop(&mut self) {
+		// Unregister from CommitPipeline if we registered
+		// This must happen before rollback to ensure proper cleanup ordering
+		if !self.closed && self.mode.mutable() {
+			self.core.commit_pipeline.unregister_txn_start(self.start_commit_id);
+		}
+
+		// Then rollback
 		self.rollback();
 	}
 }
@@ -997,13 +1013,16 @@ impl Entry {
 	}
 }
 
-/// An iterator that performs a merging scan over a transaction's snapshot and write set.
+/// An iterator that performs a merging scan over a transaction's snapshot, merge queue, and write set.
 pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
 	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<Entry>>>,
+
+	/// Iterator over merge queue entries (pre-fetched and materialized)
+	merge_queue_iter: DoubleEndedPeekable<btree_map::IntoIter<Bytes, Option<Value>>>,
 
 	/// Maximum number of items to return (usize::MAX for unlimited)
 	limit: usize,
@@ -1038,6 +1057,31 @@ impl<'a> TransactionRangeIterator<'a> {
 			None => return Err(Error::NoSnapshot),
 		};
 
+		// Collect merge queue entries in range
+		let mut merge_queue_entries = BTreeMap::new();
+		let merge_queue = &tx.core.commit_pipeline.merge_queue;
+		let snapshot_seq = snapshot.seq_num;
+
+		// Iterate through merge queue entries up to snapshot sequence number
+		for entry in merge_queue.range(..=snapshot_seq).rev() {
+			let batch = &entry.value().batch;
+
+			// Scan batch for keys in range
+			for (_, batch_entry, seq_num, _timestamp) in batch.entries_with_seq_nums()? {
+				let key = batch_entry.key.as_ref();
+				if key >= start_key.as_slice()
+					&& key < end_key.as_slice()
+					&& seq_num <= snapshot_seq
+				{
+					// Only insert if not already present (we're iterating newest first)
+					merge_queue_entries.entry(Bytes::copy_from_slice(key)).or_insert_with(|| {
+						// Convert Vec<u8> to Value (Arc<[u8]>)
+						batch_entry.value.clone().map(|v| Arc::from(v.into_boxed_slice()))
+					});
+				}
+			}
+		}
+
 		// Convert range bounds to Bytes for the write set range
 		let start_bytes = Bytes::copy_from_slice(&start_key);
 		let end_bytes = Bytes::copy_from_slice(&end_key);
@@ -1053,6 +1097,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		Ok(Self {
 			snapshot_iter: boxed_iter.double_ended_peekable(),
 			write_set_iter: write_set_iter.double_ended_peekable(),
+			merge_queue_iter: merge_queue_entries.into_iter().double_ended_peekable(),
 			limit: options.limit.unwrap_or(usize::MAX),
 			count: 0,
 			keys_only: options.keys_only,
@@ -1098,63 +1143,91 @@ impl<'a> TransactionRangeIterator<'a> {
 		}
 		None
 	}
+
+	/// Reads from the merge queue and skips deleted entries
+	fn read_from_merge_queue(&mut self) -> Option<IterResult> {
+		if let Some((mq_key, value_opt)) = self.merge_queue_iter.next() {
+			if value_opt.is_none() {
+				// Deleted key, skip it by recursively getting the next entry
+				return self.next();
+			}
+
+			if self.keys_only {
+				// For keys-only mode, return None for the value to avoid allocations
+				return Some(Ok((mq_key.to_vec().into(), None)));
+			} else if let Some(value) = value_opt {
+				return Some(Ok((mq_key.to_vec().into(), Some(value))));
+			}
+		}
+		None
+	}
+
+	/// Reads from the merge queue in reverse order and skips deleted entries
+	fn read_from_merge_queue_back(&mut self) -> Option<IterResult> {
+		if let Some((mq_key, value_opt)) = self.merge_queue_iter.next_back() {
+			if value_opt.is_none() {
+				// Deleted key, skip it by recursively getting the next entry
+				return self.next_back();
+			}
+
+			if self.keys_only {
+				// For keys-only mode, return None for the value to avoid allocations
+				return Some(Ok((mq_key.to_vec().into(), None)));
+			} else if let Some(value) = value_opt {
+				return Some(Ok((mq_key.to_vec().into(), Some(value))));
+			}
+		}
+		None
+	}
 }
 
 impl Iterator for TransactionRangeIterator<'_> {
 	type Item = IterResult;
 
-	/// Merges results from write set and snapshot in key order
+	/// Merges results from write set, merge queue, and snapshot in key order
+	/// Priority: write_set > merge_queue > snapshot
 	fn next(&mut self) -> Option<Self::Item> {
 		if self.count >= self.limit {
 			return None;
 		}
 
-		// Fast path: if write set is empty, just use snapshot
-		if self.write_set_iter.peek().is_none() {
-			let result = self.snapshot_iter.next();
-			if result.is_some() {
-				self.count += 1;
-			}
-			return result;
-		}
+		// Get keys from each source (if available)
+		let ws_key = self.write_set_iter.peek().map(|(k, _)| k.as_ref());
+		let mq_key = self.merge_queue_iter.peek().map(|(k, _)| k.as_ref());
+		let snap_key =
+			self.snapshot_iter.peek().and_then(|r| r.as_ref().ok().map(|(k, _)| k.as_ref()));
 
-		// Fast path: if snapshot is empty, just use write set
-		if self.snapshot_iter.peek().is_none() {
-			let result = self.read_from_write_set();
-			if result.is_some() {
-				self.count += 1;
-			}
-			return result;
-		}
+		// Find the minimum key among all sources
+		let min_key = [ws_key, mq_key, snap_key].iter().filter_map(|&k| k).min_by(|a, b| a.cmp(b));
 
-		// Merge results from both iterators
-		let has_snap = self.snapshot_iter.peek().is_some();
-		let has_ws = self.write_set_iter.peek().is_some();
+		let result = match min_key {
+			None => None, // All iterators exhausted
+			Some(min) => {
+				// Determine which source(s) have this key and consume accordingly
+				let ws_has = ws_key.map_or(false, |k| k == min);
+				let mq_has = mq_key.map_or(false, |k| k == min);
+				let snap_has = snap_key.map_or(false, |k| k == min);
 
-		let result = match (has_snap, has_ws) {
-			(false, false) => None,
-			(true, false) => self.snapshot_iter.next(),
-			(false, true) => self.read_from_write_set(),
-			(true, true) => {
-				// Compare keys to determine which comes first
-				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
-					(self.snapshot_iter.peek(), self.write_set_iter.peek())
-				{
-					match snap_key.as_ref().cmp(ws_key.as_ref()) {
-						Ordering::Less => self.snapshot_iter.next(),
-						Ordering::Greater => self.read_from_write_set(),
-						Ordering::Equal => {
-							// Same key - prioritize write set and skip snapshot
-							self.snapshot_iter.next();
-							self.read_from_write_set()
-						}
+				// Priority: write_set > merge_queue > snapshot
+				// Skip lower priority sources if they have the same key
+				if ws_has {
+					// Skip merge_queue and snapshot if they have the same key
+					if mq_has {
+						self.merge_queue_iter.next();
 					}
-				} else if self.snapshot_iter.peek().is_some() {
-					// Snapshot has error, propagate it
-					self.snapshot_iter.next()
+					if snap_has {
+						self.snapshot_iter.next();
+					}
+					self.read_from_write_set()
+				} else if mq_has {
+					// Skip snapshot if it has the same key
+					if snap_has {
+						self.snapshot_iter.next();
+					}
+					self.read_from_merge_queue()
 				} else {
-					// This should never happen since we checked above
-					None
+					// Only snapshot has this key
+					self.snapshot_iter.next()
 				}
 			}
 		};
@@ -1168,58 +1241,50 @@ impl Iterator for TransactionRangeIterator<'_> {
 }
 
 impl DoubleEndedIterator for TransactionRangeIterator<'_> {
-	/// Merges results from write set and snapshot in reverse key order
+	/// Merges results from write set, merge queue, and snapshot in reverse key order
+	/// Priority: write_set > merge_queue > snapshot
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if self.count >= self.limit {
 			return None;
 		}
 
-		// Fast path: if write set is empty, just use snapshot
-		if self.write_set_iter.peek_back().is_none() {
-			let result = self.snapshot_iter.next_back();
-			if result.is_some() {
-				self.count += 1;
-			}
-			return result;
-		}
+		// Get keys from each source (if available)
+		let ws_key = self.write_set_iter.peek_back().map(|(k, _)| k.as_ref());
+		let mq_key = self.merge_queue_iter.peek_back().map(|(k, _)| k.as_ref());
+		let snap_key =
+			self.snapshot_iter.peek_back().and_then(|r| r.as_ref().ok().map(|(k, _)| k.as_ref()));
 
-		// Fast path: if snapshot is empty, just use write set
-		if self.snapshot_iter.peek_back().is_none() {
-			let result = self.read_from_write_set_back();
-			if result.is_some() {
-				self.count += 1;
-			}
-			return result;
-		}
+		// Find the maximum key among all sources (for reverse iteration)
+		let max_key = [ws_key, mq_key, snap_key].iter().filter_map(|&k| k).max_by(|a, b| a.cmp(b));
 
-		// Merge results from both iterators
-		let has_snap = self.snapshot_iter.peek_back().is_some();
-		let has_ws = self.write_set_iter.peek_back().is_some();
+		let result = match max_key {
+			None => None, // All iterators exhausted
+			Some(max) => {
+				// Determine which source(s) have this key and consume accordingly
+				let ws_has = ws_key.map_or(false, |k| k == max);
+				let mq_has = mq_key.map_or(false, |k| k == max);
+				let snap_has = snap_key.map_or(false, |k| k == max);
 
-		let result = match (has_snap, has_ws) {
-			(false, false) => None,
-			(true, false) => self.snapshot_iter.next_back(),
-			(false, true) => self.read_from_write_set_back(),
-			(true, true) => {
-				// Compare keys to determine which comes last
-				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
-					(self.snapshot_iter.peek_back(), self.write_set_iter.peek_back())
-				{
-					match snap_key.as_ref().cmp(ws_key.as_ref()) {
-						Ordering::Greater => self.snapshot_iter.next_back(),
-						Ordering::Less => self.read_from_write_set_back(),
-						Ordering::Equal => {
-							// Same key - prioritize write set and skip snapshot
-							self.snapshot_iter.next_back();
-							self.read_from_write_set_back()
-						}
+				// Priority: write_set > merge_queue > snapshot
+				// Skip lower priority sources if they have the same key
+				if ws_has {
+					// Skip merge_queue and snapshot if they have the same key
+					if mq_has {
+						self.merge_queue_iter.next_back();
 					}
-				} else if self.snapshot_iter.peek_back().is_some() {
-					// Snapshot has error, propagate it
-					self.snapshot_iter.next_back()
+					if snap_has {
+						self.snapshot_iter.next_back();
+					}
+					self.read_from_write_set_back()
+				} else if mq_has {
+					// Skip snapshot if it has the same key
+					if snap_has {
+						self.snapshot_iter.next_back();
+					}
+					self.read_from_merge_queue_back()
 				} else {
-					// This should never happen since we checked above
-					None
+					// Only snapshot has this key
+					self.snapshot_iter.next_back()
 				}
 			}
 		};
@@ -1278,7 +1343,7 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&key1, &value1).unwrap();
 			txn1.set(&key2, &value1).unwrap();
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 		}
 
 		{
@@ -1293,7 +1358,7 @@ mod tests {
 			let mut txn2 = store.begin().unwrap();
 			txn2.set(&key1, &value2).unwrap();
 			txn2.set(&key2, &value2).unwrap();
-			txn2.commit().await.unwrap();
+			txn2.commit().unwrap();
 		}
 
 		// Start a read-only transaction (txn4)
@@ -1319,11 +1384,11 @@ mod tests {
 			let mut txn2 = store.begin().unwrap();
 
 			txn1.set(&key1, &value1).unwrap();
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 
 			assert!(txn2.get(&key2).unwrap().is_none());
 			txn2.set(&key2, &value2).unwrap();
-			txn2.commit().await.unwrap();
+			txn2.commit().unwrap();
 		}
 
 		// blind writes should succeed if key wasn't read first
@@ -1334,8 +1399,8 @@ mod tests {
 			txn1.set(&key1, &value1).unwrap();
 			txn2.set(&key1, &value2).unwrap();
 
-			txn1.commit().await.unwrap();
-			assert!(match txn2.commit().await {
+			txn1.commit().unwrap();
+			assert!(match txn2.commit() {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
 				}
@@ -1353,11 +1418,11 @@ mod tests {
 			let mut txn2 = store.begin().unwrap();
 
 			txn1.set(&key, &value1).unwrap();
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 
 			assert!(txn2.get(&key).unwrap().is_none());
 			txn2.set(&key, &value1).unwrap();
-			assert!(match txn2.commit().await {
+			assert!(match txn2.commit() {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
 				}
@@ -1384,13 +1449,13 @@ mod tests {
 			txn1.delete(&key1).unwrap();
 			let res = txn1.get(&key1).unwrap();
 			assert!(res.is_none());
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 		}
 
 		{
 			let mut txn = store.begin().unwrap();
 			txn.set(&key1, &value1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		{
@@ -1401,12 +1466,12 @@ mod tests {
 			assert!(txn.get(&key3).unwrap().is_none());
 			txn.set(&key2, &value1).unwrap();
 			assert_eq!(txn.get(&key2).unwrap().unwrap().as_ref(), value1.as_ref());
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 	}
 
 	// Common setup logic for creating a store
-	async fn create_hermitage_store() -> Tree {
+	fn create_hermitage_store() -> Tree {
 		let (store, _) = create_store();
 
 		let key1 = Bytes::from("k1");
@@ -1417,7 +1482,7 @@ mod tests {
 		let mut txn = store.begin().unwrap();
 		txn.set(&key1, &value1).unwrap();
 		txn.set(&key2, &value2).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		store
 	}
@@ -1428,7 +1493,7 @@ mod tests {
 	// G0: Write Cycles (dirty writes)
 	#[test(tokio::test)]
 	async fn g0_tests() {
-		let store = create_hermitage_store().await;
+		let store = create_hermitage_store();
 		let key1 = Bytes::from("k1");
 		let key2 = Bytes::from("k2");
 		let value3 = Bytes::from("v3");
@@ -1450,10 +1515,10 @@ mod tests {
 
 			txn1.set(&key2, &value5).unwrap();
 
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 
 			txn2.set(&key2, &value6).unwrap();
-			assert!(match txn2.commit().await {
+			assert!(match txn2.commit() {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
 				}
@@ -1473,7 +1538,7 @@ mod tests {
 	// P4: Lost Update
 	#[test(tokio::test)]
 	async fn p4() {
-		let store = create_hermitage_store().await;
+		let store = create_hermitage_store();
 
 		let key1 = Bytes::from("k1");
 		let value3 = Bytes::from("v3");
@@ -1488,9 +1553,9 @@ mod tests {
 			txn1.set(&key1, &value3).unwrap();
 			txn2.set(&key1, &value3).unwrap();
 
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 
-			assert!(match txn2.commit().await {
+			assert!(match txn2.commit() {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
 				}
@@ -1500,8 +1565,8 @@ mod tests {
 	}
 
 	// G-single: Single Anti-dependency Cycles (read skew)
-	async fn g_single_tests() {
-		let store = create_hermitage_store().await;
+	fn g_single_tests() {
+		let store = create_hermitage_store();
 
 		let key1 = Bytes::from("k1");
 		let key2 = Bytes::from("k2");
@@ -1520,16 +1585,16 @@ mod tests {
 			txn2.set(&key1, &value3).unwrap();
 			txn2.set(&key2, &value4).unwrap();
 
-			txn2.commit().await.unwrap();
+			txn2.commit().unwrap();
 
 			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 		}
 	}
 
 	#[test(tokio::test)]
 	async fn g_single() {
-		g_single_tests().await;
+		g_single_tests();
 	}
 
 	fn require_send<T: Send>(_: T) {}
@@ -1594,7 +1659,7 @@ mod tests {
 	#[test(tokio::test)]
 	#[ignore]
 	async fn insert_large_txn_and_get() {
-		let store = create_hermitage_store().await;
+		let store = create_hermitage_store();
 
 		let mut rng = make_rng();
 
@@ -1603,7 +1668,7 @@ mod tests {
 			let (key, value) = gen_pair(&mut rng);
 			txn.set(&key, &value).unwrap();
 		}
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		drop(txn);
 
 		// Read the keys from the store
@@ -1635,7 +1700,7 @@ mod tests {
 			let mut txn = store.begin().unwrap();
 			txn.set(&key1, &value1).unwrap();
 			txn.set(&key2, &value1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let key3 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -1643,7 +1708,7 @@ mod tests {
 			// Start a new read-write transaction (txn)
 			let mut txn = store.begin().unwrap();
 			txn.set(&key3, &value1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -1720,7 +1785,7 @@ mod tests {
 			]))
 			.unwrap();
 
-			txn2.commit().await.unwrap();
+			txn2.commit().unwrap();
 		}
 
 		{
@@ -1762,7 +1827,7 @@ mod tests {
 				&value1,
 			)
 			.unwrap();
-			txn3.commit().await.unwrap();
+			txn3.commit().unwrap();
 		}
 	}
 
@@ -1780,14 +1845,14 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&key1, &value).unwrap();
 			txn1.set(&key2, &value).unwrap();
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 		}
 
 		{
 			// Start another read-write transaction (txn2)
 			let mut txn2 = store.begin().unwrap();
 			txn2.delete(&key1).unwrap();
-			txn2.commit().await.unwrap();
+			txn2.commit().unwrap();
 		}
 
 		{
@@ -1820,20 +1885,20 @@ mod tests {
 		{
 			let mut txn = store.begin().unwrap();
 			txn.set(&key, &value1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		{
 			let mut txn = store.begin().unwrap();
 			txn.set(&key, &value2).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Clear the key in a separate transaction
 		{
 			let mut txn = store.begin().unwrap();
 			txn.delete(&key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Read the key in a new transaction to verify it does not exist
@@ -1855,7 +1920,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test basic range scan
@@ -1884,7 +1949,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test range with start bound as empty
@@ -1922,7 +1987,7 @@ mod tests {
 				let value = format!("value{i}");
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test with limit
@@ -1951,7 +2016,7 @@ mod tests {
 			tx.set(b"a", b"1").unwrap();
 			tx.set(b"c", b"3").unwrap();
 			tx.set(b"e", b"5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test RYOW - uncommitted writes should be visible in range
@@ -1990,7 +2055,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test range with deletes in write set
@@ -2022,7 +2087,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test delete followed by set
@@ -2051,7 +2116,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"a", b"1").unwrap();
 			tx.set(b"z", b"26").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Query range with no data
@@ -2076,7 +2141,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify correct ordering in range ([key1, key6) to include key5)
@@ -2103,7 +2168,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test range boundaries ([key1, key4) to include key3)
@@ -2166,7 +2231,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test with RYOW - add a key in the current transaction
@@ -2263,7 +2328,7 @@ mod tests {
 			txn.set(key1, large_value1.as_bytes()).unwrap();
 			txn.set(key2, large_value2.as_bytes()).unwrap();
 			txn.set(key3, large_value3.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to ensure data goes to SSTables (and VLog)
@@ -2350,7 +2415,7 @@ mod tests {
 				tx.set(b"key3", b"value3").unwrap();
 				tx.set(b"key4", b"value4").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration
@@ -2389,7 +2454,7 @@ mod tests {
 				tx.set(b"key1", b"value1").unwrap();
 				tx.set(b"key3", b"value3").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with transaction writes
@@ -2437,7 +2502,7 @@ mod tests {
 				tx.set(b"key3", b"value3").unwrap();
 				tx.set(b"key4", b"value4").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with deletes in transaction
@@ -2485,7 +2550,7 @@ mod tests {
 				tx.set(b"key3", b"value3").unwrap();
 				tx.set(b"key4", b"value4").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with soft deletes in transaction
@@ -2533,7 +2598,7 @@ mod tests {
 					let value = format!("value{}", i);
 					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 				}
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with limit
@@ -2570,7 +2635,7 @@ mod tests {
 				tx.set(b"key1", b"value1").unwrap();
 				tx.set(b"key2", b"value2").unwrap();
 				tx.set(b"key3", b"value3").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with keys only
@@ -2609,7 +2674,7 @@ mod tests {
 				tx.set(b"key3", b"value3").unwrap();
 				tx.set(b"key4", b"value4").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration with mixed operations in transaction
@@ -2659,7 +2724,7 @@ mod tests {
 				let mut tx = store.begin().unwrap();
 				tx.set(b"key1", b"value1").unwrap();
 				tx.set(b"key5", b"value5").unwrap();
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test reverse iteration on empty range
@@ -2684,7 +2749,7 @@ mod tests {
 					let value = format!("value{}", i);
 					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 				}
-				tx.commit().await.unwrap();
+				tx.commit().unwrap();
 			}
 
 			// Test that reverse iteration gives same results as forward iteration reversed
@@ -2775,7 +2840,7 @@ mod tests {
 			));
 
 			// Commit the transaction.
-			txn1.commit().await.unwrap();
+			txn1.commit().unwrap();
 			drop(txn1);
 
 			// Start another transaction and check again for the keys.
@@ -2909,7 +2974,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify data is visible
@@ -2924,7 +2989,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify soft deleted key is not visible in reads
@@ -2956,7 +3021,7 @@ mod tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Soft delete key1, hard delete key2
@@ -2964,7 +3029,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key1").unwrap();
 			tx.delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Both should be invisible to reads
@@ -2994,7 +3059,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Start a transaction and soft delete within it
@@ -3014,7 +3079,7 @@ mod tests {
 			assert_eq!(range.len(), 1); // Only key2
 			assert_eq!(range[0].0.as_ref(), b"key2");
 
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// After commit, soft deleted key should still be invisible
@@ -3033,14 +3098,14 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Soft delete the key
 		{
 			let mut tx = store.begin().unwrap();
 			tx.soft_delete(b"key1").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify it's not visible
@@ -3053,7 +3118,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1_new").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify the new value is visible
@@ -3075,7 +3140,7 @@ mod tests {
 				let value = format!("value{i}");
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Soft delete some keys
@@ -3084,7 +3149,7 @@ mod tests {
 			tx.soft_delete(b"key02").unwrap();
 			tx.soft_delete(b"key05").unwrap();
 			tx.soft_delete(b"key08").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Range scan should not include soft deleted keys ([key01, key11) to include key10)
@@ -3123,7 +3188,7 @@ mod tests {
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Mix of operations in one transaction
@@ -3133,7 +3198,7 @@ mod tests {
 			tx.delete(b"key2").unwrap(); // Hard delete
 			tx.set(b"key3", b"value3_updated").unwrap(); // Update
 												// key4 remains unchanged
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Verify results
@@ -3164,7 +3229,7 @@ mod tests {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Start transaction and soft delete, then rollback
@@ -3200,11 +3265,11 @@ mod tests {
 		// Insert data with explicit timestamps
 		let mut tx1 = tree.begin().unwrap();
 		tx1.set_at_version(b"key1", b"value1_v1", ts1).unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set_at_version(b"key1", b"value1_v2", ts2).unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		// Test regular get (should return latest)
 		let tx = tree.begin().unwrap();
@@ -3242,19 +3307,19 @@ mod tests {
 		// Insert first version
 		let mut tx1 = tree.begin().unwrap();
 		tx1.set(b"key1", b"value1").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 		let ts1 = opts.clock.now();
 
 		// Update with second version
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set(b"key1", b"value2").unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 		let ts2 = opts.clock.now();
 
 		// Delete the key
 		let mut tx3 = tree.begin().unwrap();
 		tx3.soft_delete(b"key1").unwrap(); // Hard delete
-		tx3.commit().await.unwrap();
+		tx3.commit().unwrap();
 		let ts3 = opts.clock.now();
 
 		// Test regular get (should return None due to delete)
@@ -3310,7 +3375,7 @@ mod tests {
 		let custom_timestamp = 10;
 		let mut tx = tree.begin().unwrap();
 		tx.set_at_version(b"key1", b"value1", custom_timestamp).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Verify we can get the value at that timestamp
 		let tx = tree.begin().unwrap();
@@ -3350,7 +3415,7 @@ mod tests {
 			&WriteOptions::default().with_timestamp(Some(custom_timestamp)),
 		)
 		.unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Verify we can read it at that timestamp
 		let tx = tree.begin().unwrap();
@@ -3370,7 +3435,7 @@ mod tests {
 			&WriteOptions::default().with_timestamp(Some(delete_timestamp)),
 		)
 		.unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Verify the value exists at the earlier timestamp but not at the delete timestamp
 		let tx = tree.begin().unwrap();
@@ -3403,7 +3468,7 @@ mod tests {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// All keys should have the same timestamp
 		let tx = tree.begin().unwrap();
@@ -3428,7 +3493,7 @@ mod tests {
 		tx.set(b"key4", b"value4").unwrap(); // Will get commit timestamp
 		tx.set_at_version(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
 		tx.set(b"key6", b"value6").unwrap(); // Will get commit timestamp
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		let tx = tree.begin().unwrap();
 		let versions4 = tx.scan_all_versions(b"key4", b"key5", None).unwrap();
@@ -3470,13 +3535,13 @@ mod tests {
 		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
 		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
 		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		// Insert data with second timestamp
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
 		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		// Test keys_at_version at first timestamp
 		let tx = tree.begin().unwrap();
@@ -3525,13 +3590,13 @@ mod tests {
 		tx1.set(b"key1", b"value1").unwrap();
 		tx1.set(b"key2", b"value2").unwrap();
 		tx1.set(b"key3", b"value3").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		// Delete key2 (hard delete) and soft delete key3
 		let mut tx2 = tree.begin().unwrap();
 		tx2.delete(b"key2").unwrap();
 		tx2.soft_delete(b"key3").unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		// Test keys_at_version with current timestamp
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
@@ -3563,13 +3628,13 @@ mod tests {
 		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
 		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
 		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		// Insert data with second timestamp
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
 		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		// Test range_at_version at first timestamp
 		let tx = tree.begin().unwrap();
@@ -3655,7 +3720,7 @@ mod tests {
 		tx1.set(b"key1", b"value1").unwrap();
 		tx1.set(b"key2", b"value2").unwrap();
 		tx1.set(b"key3", b"value3").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 		let ts_after_insert = opts.clock.now();
 
 		// Query at this point should show all three keys
@@ -3671,7 +3736,7 @@ mod tests {
 		let mut tx2 = tree.begin().unwrap();
 		tx2.delete(b"key2").unwrap();
 		tx2.soft_delete(b"key3").unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 		let ts_after_deletes = opts.clock.now();
 
 		// Test range_at_version at a time after the deletes
@@ -3715,7 +3780,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test basic count
@@ -3751,14 +3816,14 @@ mod tests {
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Delete some keys
 		{
 			let mut tx = store.begin().unwrap();
 			tx.delete(b"key2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test count after delete
@@ -3778,7 +3843,7 @@ mod tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test count within transaction (RYOW)
@@ -3809,13 +3874,13 @@ mod tests {
 		tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
 		tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
 		tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		// Insert data with second timestamp
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
 		tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		// Test count_at_version at first timestamp
 		let tx = tree.begin().unwrap();
@@ -3839,7 +3904,7 @@ mod tests {
 		tx1.set(b"key1", b"value1").unwrap();
 		tx1.set(b"key2", b"value2").unwrap();
 		tx1.set(b"key3", b"value3").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 		let ts_after_insert = opts.clock.now();
 
 		// Count at this point should show all three keys
@@ -3851,7 +3916,7 @@ mod tests {
 		let mut tx_delete = tree.begin().unwrap();
 		tx_delete.delete(b"key2").unwrap(); // Hard delete
 		tx_delete.soft_delete(b"key3").unwrap(); // Soft delete
-		tx_delete.commit().await.unwrap();
+		tx_delete.commit().unwrap();
 		let ts_after_delete = opts.clock.now();
 
 		// Count after deletes
@@ -3876,7 +3941,7 @@ mod tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test count with limit
@@ -3911,17 +3976,17 @@ mod tests {
 		let mut tx1 = tree.begin().unwrap();
 		tx1.set(b"key1", b"value1_v1").unwrap();
 		tx1.set(b"key2", b"value2_v1").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set(b"key1", b"value1_v2").unwrap();
 		tx2.set(b"key3", b"value3_v1").unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		let mut tx3 = tree.begin().unwrap();
 		tx3.set(b"key2", b"value2_v2").unwrap();
 		tx3.set(b"key4", b"value4_v1").unwrap();
-		tx3.commit().await.unwrap();
+		tx3.commit().unwrap();
 
 		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
@@ -3987,17 +4052,17 @@ mod tests {
 		let mut tx1 = tree.begin().unwrap();
 		tx1.set(b"key1", b"value1_v1").unwrap();
 		tx1.set(b"key2", b"value2_v1").unwrap();
-		tx1.commit().await.unwrap();
+		tx1.commit().unwrap();
 
 		let mut tx2 = tree.begin().unwrap();
 		tx2.set(b"key1", b"value1_v2").unwrap();
 		tx2.set(b"key2", b"value2_v2").unwrap();
-		tx2.commit().await.unwrap();
+		tx2.commit().unwrap();
 
 		let mut tx3 = tree.begin().unwrap();
 		tx3.delete(b"key1").unwrap(); // Hard delete
 		tx3.soft_delete(b"key2").unwrap(); // Soft delete
-		tx3.commit().await.unwrap();
+		tx3.commit().unwrap();
 
 		// Test scan_all_versions
 		let tx = tree.begin().unwrap();
@@ -4067,7 +4132,7 @@ mod tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64; // Incremental version
 				txn.set_at_version(&key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4097,7 +4162,7 @@ mod tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64; // Incremental version
 				txn.set_at_version(&key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4124,7 +4189,7 @@ mod tests {
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.set_at_version(key, &value, 1).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4153,7 +4218,7 @@ mod tests {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
 					txn.set_at_version(key, value, version).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
@@ -4190,11 +4255,11 @@ mod tests {
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let mut txn = store.begin().unwrap();
 			txn.soft_delete(&key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let txn = store.begin().unwrap();
 			let mut end_key = key.as_ref().to_vec();
@@ -4223,13 +4288,13 @@ mod tests {
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.set_at_version(key, &value, 1).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.soft_delete(key).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4265,14 +4330,14 @@ mod tests {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
 					txn.set_at_version(key, value, version).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.soft_delete(key).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4311,15 +4376,15 @@ mod tests {
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let mut txn = store.begin().unwrap();
 			txn.soft_delete(&key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let mut txn = store.begin().unwrap();
 			txn.delete(&key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let txn = store.begin().unwrap();
 			let mut end_key = key.as_ref().to_vec();
@@ -4338,7 +4403,7 @@ mod tests {
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.set_at_version(key, &value, 1).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Inclusive range
@@ -4359,7 +4424,7 @@ mod tests {
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
 				txn.set_at_version(key, &value, 1).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			let txn = store.begin().unwrap();
@@ -4379,7 +4444,7 @@ mod tests {
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			let txn = store.begin().unwrap();
 			let mut end_key = key.as_ref().to_vec();
@@ -4406,7 +4471,7 @@ mod tests {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
 					txn.set_at_version(key, value, version).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
@@ -4457,7 +4522,7 @@ mod tests {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
 					txn.set_at_version(key, value, version).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
@@ -4512,7 +4577,7 @@ mod tests {
 			txn.set_at_version(b"key4", b"value4", 1).unwrap();
 			txn.set_at_version(b"key5", b"value5", 1).unwrap();
 
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Test 1: Unbounded range should return all keys
 			let txn = store.begin().unwrap();
@@ -4570,7 +4635,7 @@ mod tests {
 					let mut txn = store.begin().unwrap();
 					let version = (i + 1) as u64;
 					txn.set_at_version(key, value, version).unwrap();
-					txn.commit().await.unwrap();
+					txn.commit().unwrap();
 				}
 			}
 
@@ -4663,7 +4728,7 @@ mod tests {
 			// Test basic Replace functionality
 			let mut txn = store.begin().unwrap();
 			txn.replace(b"test_key", b"test_value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the value exists
 			let txn = store.begin().unwrap();
@@ -4674,7 +4739,7 @@ mod tests {
 			let mut txn = store.begin().unwrap();
 			txn.replace_with_options(b"test_key2", b"test_value2", &WriteOptions::default())
 				.unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the second value exists
 			let txn = store.begin().unwrap();
@@ -4691,7 +4756,7 @@ mod tests {
 				let value = format!("value_v{}", version);
 				let mut txn = store.begin().unwrap();
 				txn.set(b"test_key", value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Verify the latest version exists
@@ -4702,7 +4767,7 @@ mod tests {
 			// Use Replace to replace all previous versions
 			let mut txn = store.begin().unwrap();
 			txn.replace(b"test_key", b"replaced_value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the new value exists
 			let txn = store.begin().unwrap();
@@ -4719,7 +4784,7 @@ mod tests {
 			txn.set(b"key1", b"regular_value1").unwrap();
 			txn.replace(b"key2", b"replace_value2").unwrap();
 			txn.set(b"key3", b"regular_value3").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify all values exist
 			let txn = store.begin().unwrap();
@@ -4730,7 +4795,7 @@ mod tests {
 			// Update key2 with regular set
 			let mut txn = store.begin().unwrap();
 			txn.set(b"key2", b"updated_regular_value2").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the updated value
 			let txn = store.begin().unwrap();
@@ -4739,7 +4804,7 @@ mod tests {
 			// Use replace on key1
 			let mut txn = store.begin().unwrap();
 			txn.replace(b"key1", b"final_set_with_delete_value1").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			// Verify the final value
 			let txn = store.begin().unwrap();
