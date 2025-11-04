@@ -244,27 +244,29 @@ impl Transaction {
 	}
 
 	/// Inserts a key-value pair into the store.
-	pub fn set<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
+	pub fn set<K, V>(&mut self, key: K, value: V) -> Result<()>
+	where
+		K: IntoBytes,
+		V: IntoBytes,
+	{
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
 	/// Inserts a key-value pair at with a specific timestamp.
-	pub fn set_at_version<K: IntoBytes, V: IntoBytes>(
-		&mut self,
-		key: K,
-		value: V,
-		timestamp: u64,
-	) -> Result<()> {
+	pub fn set_at_version<K, V>(&mut self, key: K, value: V, timestamp: u64) -> Result<()>
+	where
+		K: IntoBytes,
+		V: IntoBytes,
+	{
 		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Inserts a key-value pair to the store, with custom write options.
-	pub fn set_with_options<K: IntoBytes, V: IntoBytes>(
-		&mut self,
-		key: K,
-		value: V,
-		options: &WriteOptions,
-	) -> Result<()> {
+	pub fn set_with_options<K, V>(&mut self, key: K, value: V, options: &WriteOptions) -> Result<()>
+	where
+		K: IntoBytes,
+		V: IntoBytes,
+	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
@@ -283,16 +285,18 @@ impl Transaction {
 	}
 
 	/// Delete all the versions of a key. This is a hard delete.
-	pub fn delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
+	pub fn delete<K>(&mut self, key: K) -> Result<()>
+	where
+		K: IntoBytes,
+	{
 		self.delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options<K: IntoBytes>(
-		&mut self,
-		key: K,
-		options: &WriteOptions,
-	) -> Result<()> {
+	pub fn delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
+	where
+		K: IntoBytes,
+	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
@@ -311,21 +315,26 @@ impl Transaction {
 	}
 
 	/// Soft delete a key. This will add a tombstone at the current timestamp.
-	pub fn soft_delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
+	pub fn soft_delete<K>(&mut self, key: K) -> Result<()>
+	where
+		K: IntoBytes,
+	{
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
-	pub fn soft_delete_at_version<K: IntoBytes>(&mut self, key: K, timestamp: u64) -> Result<()> {
+	pub fn soft_delete_at_version<K>(&mut self, key: K, timestamp: u64) -> Result<()>
+	where
+		K: IntoBytes,
+	{
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
-	pub fn soft_delete_with_options<K: IntoBytes>(
-		&mut self,
-		key: K,
-		options: &WriteOptions,
-	) -> Result<()> {
+	pub fn soft_delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
+	where
+		K: IntoBytes,
+	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
@@ -350,17 +359,25 @@ impl Transaction {
 	}
 
 	/// Inserts a key-value pairm removing all previous versions.
-	pub fn replace<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
+	pub fn replace<K, V>(&mut self, key: K, value: V) -> Result<()>
+	where
+		K: IntoBytes,
+		V: IntoBytes,
+	{
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
 	/// Inserts a key-value pair, removing all previous versions, with custom write options.
-	pub fn replace_with_options<K: IntoBytes, V: IntoBytes>(
+	pub fn replace_with_options<K, V>(
 		&mut self,
 		key: K,
 		value: V,
 		options: &WriteOptions,
-	) -> Result<()> {
+	) -> Result<()>
+	where
+		K: IntoBytes,
+		V: IntoBytes,
+	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
@@ -379,21 +396,26 @@ impl Transaction {
 	}
 
 	/// Gets a value for a key if it exists.
-	pub fn get<K: IntoBytes>(&self, key: K) -> Result<Option<Value>> {
+	pub fn get<K>(&self, key: K) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
 		self.get_with_options(key, &ReadOptions::default())
 	}
 
 	/// Gets a value for a key at a specific timestamp.
-	pub fn get_at_version<K: IntoBytes>(&self, key: K, timestamp: u64) -> Result<Option<Value>> {
+	pub fn get_at_version<K>(&self, key: K, timestamp: u64) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
 		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key, with custom read options.
-	pub fn get_with_options<K: IntoBytes>(
-		&self,
-		key: K,
-		options: &ReadOptions,
-	) -> Result<Option<Value>> {
+	pub fn get_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -459,12 +481,15 @@ impl Transaction {
 	///
 	/// This function is faster than `range()` as it doesn't
 	/// fetch or resolve values from disk.
-	pub fn keys<K: AsRef<[u8]>>(
+	pub fn keys<K>(
 		&self,
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	where
+		K: AsRef<[u8]>,
+	{
 		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
@@ -482,13 +507,16 @@ impl Transaction {
 	///
 	/// This function is faster than `range()` as it doesn't
 	/// fetch or resolve values from disk.
-	pub fn keys_at_version<K: AsRef<[u8]>>(
+	pub fn keys_at_version<K>(
 		&self,
 		start: K,
 		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	where
+		K: AsRef<[u8]>,
+	{
 		let mut options = ReadOptions::default()
 			.with_keys_only(true)
 			.with_limit(limit)
@@ -556,12 +584,15 @@ impl Transaction {
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range<K: AsRef<[u8]>>(
+	pub fn range<K>(
 		&self,
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_>
+	where
+		K: AsRef<[u8]>,
+	{
 		let mut options = ReadOptions::default().with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
@@ -576,13 +607,16 @@ impl Transaction {
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range_at_version<K: AsRef<[u8]>>(
+	pub fn range_at_version<K>(
 		&self,
 		start: K,
 		end: K,
 		timestamp: u64,
 		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_> {
+	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_>
+	where
+		K: AsRef<[u8]>,
+	{
 		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
 		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
