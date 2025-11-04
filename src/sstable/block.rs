@@ -6,6 +6,7 @@ use crate::{
 	sstable::InternalKey,
 	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Options, Value,
 };
+use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 pub(crate) type BlockData = Vec<u8>;
@@ -381,8 +382,10 @@ impl Iterator for BlockIterator {
 			return None;
 		}
 		Some((
-			self.current_key[..].into(),
-			self.block[self.current_value_offset_start..self.current_value_offset_end].into(),
+			Bytes::copy_from_slice(&self.current_key[..]),
+			Bytes::copy_from_slice(
+				&self.block[self.current_value_offset_start..self.current_value_offset_end],
+			),
 		))
 	}
 }
@@ -394,8 +397,10 @@ impl DoubleEndedIterator for BlockIterator {
 		}
 
 		Some((
-			self.current_key[..].into(),
-			self.block[self.current_value_offset_start..self.current_value_offset_end].into(),
+			Bytes::copy_from_slice(&self.current_key[..]),
+			Bytes::copy_from_slice(
+				&self.block[self.current_value_offset_start..self.current_value_offset_end],
+			),
 		))
 	}
 }
@@ -508,7 +513,9 @@ impl LSMIterator for BlockIterator {
 
 	// Get the current value
 	fn value(&self) -> Value {
-		self.block[self.current_value_offset_start..self.current_value_offset_end].into()
+		Bytes::copy_from_slice(
+			&self.block[self.current_value_offset_start..self.current_value_offset_end],
+		)
 	}
 }
 
@@ -578,7 +585,7 @@ mod tests {
 		let mut i = 0;
 		while block_iter.advance() {
 			assert_eq!(block_iter.key().user_key.as_ref(), data[i].0);
-			assert_eq!(block_iter.value(), data[i].1.into());
+			assert_eq!(block_iter.value(), Bytes::copy_from_slice(data[i].1));
 			i += 1;
 		}
 
@@ -600,7 +607,7 @@ mod tests {
 
 		iter.next();
 		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), "value1".as_bytes().into());
+		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
 
 		iter.next();
 		assert!(iter.valid());
@@ -608,7 +615,7 @@ mod tests {
 		iter.prev();
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), "value1".as_bytes().into());
+		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
 
 		// Go to the last entry
 		while iter.advance() {}
@@ -616,7 +623,7 @@ mod tests {
 		iter.prev();
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key.as_ref(), "pkey2".as_bytes());
-		assert_eq!(iter.value(), "value".as_bytes().into());
+		assert_eq!(iter.value(), Bytes::from_static(b"value"));
 	}
 
 	#[test]
@@ -689,12 +696,12 @@ mod tests {
 			block_iter.seek_to_last();
 			assert!(block_iter.valid());
 			assert_eq!(block_iter.key().user_key.as_ref(), "pkey3".as_bytes());
-			assert_eq!(block_iter.value(), "value".as_bytes().into());
+			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
 
 			block_iter.seek_to_first();
 			assert!(block_iter.valid());
 			assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
-			assert_eq!(block_iter.value(), "value1".as_bytes().into());
+			assert_eq!(block_iter.value(), Bytes::from_static(b"value1"));
 
 			block_iter.next();
 			assert!(block_iter.valid());
@@ -704,7 +711,7 @@ mod tests {
 			assert!(block_iter.valid());
 
 			assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
-			assert_eq!(block_iter.value(), "value".as_bytes().into());
+			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
 		}
 	}
 }

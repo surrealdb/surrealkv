@@ -34,6 +34,7 @@ use crate::{
 	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
 	VLogChecksumLevel, Value,
 };
+use bytes::Bytes;
 
 use async_trait::async_trait;
 
@@ -356,9 +357,8 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				Some(value) => {
 					// Small value or no VLog: store inline
-					let value_location = ValueLocation::with_inline_value(Arc::from(
-						value.clone().into_boxed_slice(),
-					));
+					let value_location =
+						ValueLocation::with_inline_value(Bytes::copy_from_slice(value));
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
@@ -1191,7 +1191,7 @@ mod tests {
 		// Read back the key-value pair
 		let txn = tree.begin().unwrap();
 		let result = txn.get(key.as_bytes()).unwrap().unwrap();
-		assert_eq!(result, value.as_bytes().into());
+		assert_eq!(result, Bytes::copy_from_slice(value.as_bytes()));
 	}
 
 	#[test(tokio::test)]
@@ -1224,7 +1224,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			let expected_value = values.last().unwrap();
-			assert_eq!(result, expected_value.as_bytes().into());
+			assert_eq!(result, Bytes::copy_from_slice(expected_value.as_bytes()));
 		}
 	}
 
@@ -1313,7 +1313,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				expected_value.as_bytes().into(),
+				Bytes::copy_from_slice(expected_value.as_bytes()),
 				"Key '{key}' should have final value '{expected_value}'"
 			);
 		}
@@ -1398,7 +1398,7 @@ mod tests {
 				let value = result.unwrap();
 				assert_eq!(
 					value,
-					expected_value.as_bytes().into(),
+					Bytes::copy_from_slice(expected_value.as_bytes()),
 					"Key '{}' has incorrect value after reopening. Expected '{}', got '{:?}'",
 					key,
 					expected_value,
@@ -1479,7 +1479,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			let result = txn.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key '{key}' should exist after restore");
-			assert_eq!(result.unwrap(), expected_value.as_bytes().into());
+			assert_eq!(result.unwrap(), Bytes::copy_from_slice(expected_value.as_bytes()));
 		}
 
 		// Verify the newer keys don't exist after restore
@@ -1537,7 +1537,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				format!("pending_value_{i:03}").as_bytes().into(),
+				Bytes::copy_from_slice(format!("pending_value_{i:03}").as_bytes()),
 				"Expected pending value before restore"
 			);
 		}
@@ -1554,7 +1554,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				expected_value.as_bytes().into(),
+				Bytes::copy_from_slice(expected_value.as_bytes()),
 				"Key '{key}' should have checkpoint value '{expected_value}', not pending value"
 			);
 		}
@@ -2259,10 +2259,10 @@ mod tests {
 		let txn = tree.begin().unwrap();
 
 		let retrieved_small = txn.get(small_key.as_bytes()).unwrap().unwrap();
-		assert_eq!(retrieved_small, small_value.as_bytes().into());
+		assert_eq!(retrieved_small, Bytes::copy_from_slice(small_value.as_bytes()));
 
 		let retrieved_large = txn.get(large_key.as_bytes()).unwrap().unwrap();
-		assert_eq!(retrieved_large, large_value.as_bytes().into());
+		assert_eq!(retrieved_large, Bytes::copy_from_slice(large_value.as_bytes()));
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -2311,7 +2311,7 @@ mod tests {
 						let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
 						assert_eq!(
 							retrieved,
-							expected_value.as_bytes().into(),
+							Bytes::copy_from_slice(expected_value.as_bytes()),
 							"Reader {reader_id} failed to get correct value for key {key}"
 						);
 					}
@@ -2378,7 +2378,7 @@ mod tests {
 			let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				retrieved,
-				expected_value.as_bytes().into(),
+				Bytes::copy_from_slice(expected_value.as_bytes()),
 				"Key {key} has incorrect value across file rotation"
 			);
 		}
@@ -2512,7 +2512,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v1", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2521,7 +2521,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v2", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2529,7 +2529,7 @@ mod tests {
 		// Verify the latest values before delete
 		for (i, key) in keys.iter().enumerate() {
 			let tx = tree.begin().unwrap();
-			let result = tx.get(key).unwrap();
+			let result = tx.get(*key).unwrap();
 			let expected = format!("value-{}-v2", i + 1);
 			assert_eq!(result.map(|v| v.to_vec()), Some(expected.as_bytes().to_vec()));
 		}
@@ -2537,7 +2537,7 @@ mod tests {
 		// Delete all keys
 		for key in keys.iter() {
 			let mut tx = tree.begin().unwrap();
-			tx.delete(key).unwrap();
+			tx.delete(*key).unwrap();
 			tx.commit().await.unwrap();
 		}
 
@@ -2557,7 +2557,7 @@ mod tests {
 		// Verify all keys are gone after compaction
 		for key in keys.iter() {
 			let tx = tree.begin().unwrap();
-			let result = tx.get(key).unwrap();
+			let result = tx.get(*key).unwrap();
 			assert_eq!(result, None);
 		}
 
@@ -2603,7 +2603,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v1", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2612,7 +2612,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v2", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2621,7 +2621,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v3", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2630,7 +2630,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let value = format!("value-{}-v4", i + 1);
 			let mut tx = tree.begin().unwrap();
-			tx.set(key, value.as_bytes()).unwrap();
+			tx.set(*key, value.as_bytes()).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 		}
@@ -2638,7 +2638,7 @@ mod tests {
 		// Verify the latest values before delete
 		for (i, key) in keys.iter().enumerate() {
 			let tx = tree.begin().unwrap();
-			let result = tx.get(key).unwrap();
+			let result = tx.get(*key).unwrap();
 			assert_eq!(
 				result.map(|v| v.to_vec()),
 				Some(format!("value-{}-v4", i + 1).as_bytes().to_vec())
@@ -2648,7 +2648,7 @@ mod tests {
 		// Delete all keys
 		for key in keys.iter() {
 			let mut tx = tree.begin().unwrap();
-			tx.delete(key).unwrap();
+			tx.delete(*key).unwrap();
 			tx.commit().await.unwrap();
 		}
 
@@ -2668,7 +2668,7 @@ mod tests {
 		// Verify all keys are gone after compaction
 		for key in keys.iter() {
 			let tx = tree.begin().unwrap();
-			let result = tx.get(key).unwrap();
+			let result = tx.get(*key).unwrap();
 			assert_eq!(result, None);
 		}
 
@@ -3171,7 +3171,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let result = txn.get(b"test_key").unwrap().unwrap();
-		assert_eq!(result, Arc::from(b"test_value".as_slice()));
+		assert_eq!(result, Bytes::from_static(b"test_value"));
 
 		// Test build_with_options
 		let (tree2, opts) = TreeBuilder::new()
@@ -3189,7 +3189,7 @@ mod tests {
 
 		let txn = tree2.begin().unwrap();
 		let result = txn.get(b"key2").unwrap().unwrap();
-		assert_eq!(result, Arc::from(b"value2".as_slice()));
+		assert_eq!(result, Bytes::from_static(b"value2"));
 	}
 
 	#[test(tokio::test)]

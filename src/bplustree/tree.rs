@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
 use quick_cache::{sync::Cache, Weighter};
 
 use crate::vfs::File as VfsFile;
@@ -2793,8 +2794,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 
 				// Return current entry from stored leaf (no range check needed - pre-calculated!)
 				let result = Ok((
-					Arc::from(leaf.keys[self.current_idx].as_ref()),
-					Arc::from(leaf.values[self.current_idx].as_ref()),
+					Bytes::copy_from_slice(&leaf.keys[self.current_idx]),
+					Bytes::copy_from_slice(&leaf.values[self.current_idx]),
 				));
 				self.current_idx += 1;
 				return Some(result);
@@ -3777,11 +3778,11 @@ mod tests {
 		let mut iter = tree.range(b"key2", b"key3").unwrap();
 		assert_eq!(
 			iter.next().unwrap().unwrap(),
-			(Arc::from(b"key2" as &[u8]), Arc::from(b"value2" as &[u8]))
+			(Bytes::from_static(b"key2"), Bytes::from_static(b"value2"))
 		);
 		assert_eq!(
 			iter.next().unwrap().unwrap(),
-			(Arc::from(b"key3" as &[u8]), Arc::from(b"value3" as &[u8]))
+			(Bytes::from_static(b"key3"), Bytes::from_static(b"value3"))
 		);
 		assert!(iter.next().is_none());
 	}
@@ -3814,7 +3815,7 @@ mod tests {
 			let expected_value = format!("value_{:05}", i).into_bytes();
 			assert_eq!(
 				iter.next().unwrap().unwrap(),
-				(Arc::from(expected_key.as_slice()), Arc::from(expected_value.as_slice()))
+				(Bytes::from(expected_key), Bytes::from(expected_value))
 			);
 		}
 		assert!(iter.next().is_none());

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use std::{
 	fs::File as SysFile,
@@ -106,8 +107,8 @@ impl MemTable {
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
 
-		// Pre-allocate empty value Arc for delete operations to avoid repeated allocations
-		let empty_val: Value = Arc::from(vec![].into_boxed_slice());
+		// Pre-allocate empty value Bytes for delete operations to avoid repeated allocations
+		let empty_val: Value = Bytes::new();
 
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -115,7 +116,7 @@ impl MemTable {
 
 			// Use the pre-encoded value directly, or reuse empty value for deletes
 			let val = if let Some(encoded_value) = &entry.value {
-				Arc::from(encoded_value.clone().into_boxed_slice())
+				Bytes::copy_from_slice(encoded_value)
 			} else {
 				// For delete operations, reuse the pre-allocated empty value
 				empty_val.clone()
@@ -196,7 +197,7 @@ impl MemTable {
 		self.map.iter().map(|entry| {
 			let key = entry.key().clone();
 			let value = entry.value().clone();
-			(Arc::from(key), value)
+			(Arc::new(key), value)
 		})
 	}
 
@@ -249,7 +250,7 @@ impl MemTable {
 		self.map.range((start_bound, end_bound)).map(|entry| {
 			let key = entry.key().clone();
 			let value = entry.value().clone();
-			(Arc::from(key), value)
+			(Arc::new(key), value)
 		})
 	}
 }
@@ -577,9 +578,9 @@ mod tests {
 			*key_counts.entry(user_key).or_insert(0) += 1;
 		}
 
-		assert_eq!(key_counts[&Arc::from(b"key1".to_vec().into_boxed_slice())], 1);
-		assert_eq!(key_counts[&Arc::from(b"key2".to_vec().into_boxed_slice())], 2); // Original + tombstone
-		assert_eq!(key_counts[&Arc::from(b"key3".to_vec().into_boxed_slice())], 1);
+		assert_eq!(key_counts[&Bytes::from_static(b"key1")], 1);
+		assert_eq!(key_counts[&Bytes::from_static(b"key2")], 2); // Original + tombstone
+		assert_eq!(key_counts[&Bytes::from_static(b"key3")], 1);
 	}
 
 	#[test]

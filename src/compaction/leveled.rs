@@ -329,6 +329,8 @@ mod tests {
 		fs::File,
 		sync::{atomic::AtomicU64, Arc, RwLock},
 	};
+
+	use bytes::Bytes;
 	use test_log::test;
 
 	use tempfile::TempDir;
@@ -414,8 +416,7 @@ mod tests {
 
 	/// Helper function to create encoded inline values for testing
 	fn create_inline_value(value: &[u8]) -> Vec<u8> {
-		let location =
-			ValueLocation::with_inline_value(Arc::from(value.to_vec().into_boxed_slice()));
+		let location = ValueLocation::with_inline_value(Bytes::copy_from_slice(value));
 		location.encode().to_vec()
 	}
 
@@ -536,8 +537,8 @@ mod tests {
 	/// Verifies all expected key-value pairs are present after compaction
 	fn verify_keys_after_compaction(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashSet<(Arc<[u8]>, Vec<u8>)>,
-	) -> (usize, HashMap<Arc<[u8]>, Vec<u8>>) {
+		expected_keys: &HashSet<(Bytes, Vec<u8>)>,
+	) -> (usize, HashMap<Bytes, Vec<u8>>) {
 		let manifest_guard = manifest.read().unwrap();
 		let levels = manifest_guard.levels.get_levels();
 
@@ -575,7 +576,7 @@ mod tests {
 	/// Verifies that all expected keys are present with correct values
 	fn verify_all_keys_present(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashMap<Arc<[u8]>, Vec<u8>>,
+		expected_keys: &HashMap<Bytes, Vec<u8>>,
 	) -> bool {
 		let manifest_guard = manifest.read().unwrap();
 
@@ -1505,7 +1506,7 @@ mod tests {
 				// Update expected value if this is a higher sequence number
 				if i == 0 {
 					// First table has highest sequence numbers, so these should win
-					expected_final_values.insert(Arc::from(key.into_boxed_slice()), raw_value);
+					expected_final_values.insert(Bytes::from(key), raw_value);
 				}
 			}
 
@@ -2088,7 +2089,7 @@ mod tests {
 		assert_eq!(props.num_data_blocks, 1);
 		assert_eq!(props.top_level_index_size, 0);
 		assert!(props.created_at > 0);
-		assert_eq!(props.file_size, 3102);
+		assert_eq!(props.file_size, 3182);
 		assert_eq!(props.block_size, 2757);
 		assert_eq!(props.block_count, 1);
 		assert_eq!(props.compression, CompressionType::None);
