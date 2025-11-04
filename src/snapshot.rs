@@ -10,12 +10,12 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
+use crate::{IntoBytes, Key, Value};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
-use crate::{Key, Value};
 use bytes::Bytes;
 
 /// Type alias for version scan results
-pub type VersionScanResult = (Vec<u8>, Value, u64, bool);
+pub type VersionScanResult = (Key, Value, u64, bool);
 
 use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
@@ -353,7 +353,7 @@ impl Snapshot {
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// The limit currently is on the unique keys, not the total number of results
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub(crate) fn scan_all_versions<Key: AsRef<[u8]>>(
+	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
 		end: Key,
@@ -363,7 +363,7 @@ impl Snapshot {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
 
-		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
+		let key_range = start.as_slice().to_vec()..end.as_slice().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -383,7 +383,7 @@ impl Snapshot {
 				self.core.resolve_value(&encoded_value)?
 			};
 			results.push((
-				internal_key.user_key.as_ref().to_vec(),
+				Bytes::from(internal_key.user_key.as_ref().to_vec()),
 				value,
 				internal_key.timestamp,
 				is_tombstone,
@@ -1188,8 +1188,8 @@ mod tests {
 			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v1");
-		assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value2_v1");
+		assert_eq!(range[0].1.as_ref(), b"value1_v1");
+		assert_eq!(range[1].1.as_ref(), b"value2_v1");
 
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
@@ -1197,8 +1197,8 @@ mod tests {
 			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v2");
-		assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"value2_v2");
+		assert_eq!(range[0].1.as_ref(), b"value1_v2");
+		assert_eq!(range[1].1.as_ref(), b"value2_v2");
 	}
 
 	#[test(tokio::test)]
@@ -1328,7 +1328,7 @@ mod tests {
 			let expected_key = format!("key{:02}", i + 1);
 			let expected_value = format!("value{}", i + 1);
 			assert_eq!(key.as_ref(), expected_key.as_bytes());
-			assert_eq!(value.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+			assert_eq!(value.as_ref(), expected_value.as_bytes());
 		}
 
 		// tx2 should see updated data with deletions
@@ -1350,7 +1350,7 @@ mod tests {
 			if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
 				if num % 2 == 0 {
 					let expected_value = format!("value{num}_updated");
-					assert_eq!(value.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+					assert_eq!(value.as_ref(), expected_value.as_bytes());
 				}
 			}
 		}
@@ -1509,7 +1509,6 @@ mod tests {
 
 			// Regular range should have actual values
 			let expected_value = format!("value{}", i + 1);
-			assert!(regular_range[i].1.is_some(), "Regular range should have values");
 			assert_eq!(
 				regular_range[i].1.as_ref().unwrap().as_ref(),
 				expected_value.as_bytes(),
