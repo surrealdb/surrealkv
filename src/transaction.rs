@@ -9,9 +9,9 @@ pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::{Snapshot, VersionScanResult};
+use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, Value};
+use crate::{IntoBytes, IterResult, Key, Value, Version};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -470,227 +470,6 @@ impl Transaction {
 		}
 	}
 
-	/// Gets keys in a key range at the current timestamp.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys<K>(
-		&self,
-		start: K,
-		end: K,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
-	where
-		K: AsRef<[u8]>,
-	{
-		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.keys_with_options(&options)
-	}
-
-	/// Gets keys in a key range at a specific timestamp.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys_at_version<K>(
-		&self,
-		start: K,
-		end: K,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
-	where
-		K: AsRef<[u8]>,
-	{
-		let mut options = ReadOptions::default()
-			.with_keys_only(true)
-			.with_limit(limit)
-			.with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.keys_with_options(&options)
-	}
-
-	/// Gets keys in a key range, with custom read options.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<Key>> + '_>> {
-		// If timestamp is specified, use versioned query
-		if let Some(timestamp) = options.timestamp {
-			// Check if versioned queries are enabled
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
-			// Query the versioned index through the snapshot
-			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.keys_at_version(start_key, end_key, timestamp, options.limit)?
-						.map(|vec| Ok(Bytes::from(vec))),
-				)),
-				None => Err(Error::NoSnapshot),
-			}
-		} else {
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
-			// Force keys_only to true for this method
-			let mut options = options.clone();
-			options.keys_only = true;
-			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
-					.map(|result| result.map(|(key, _)| key)),
-			))
-		}
-	}
-
-	/// Gets keys and values in a range, at the current timestamp.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
-	pub fn range<K>(
-		&self,
-		start: K,
-		end: K,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_>
-	where
-		K: AsRef<[u8]>,
-	{
-		let mut options = ReadOptions::default().with_limit(limit);
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.range_with_options(&options)
-	}
-
-	/// Gets keys and values in a range, at a specific timestamp.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
-	pub fn range_at_version<K>(
-		&self,
-		start: K,
-		end: K,
-		timestamp: u64,
-		limit: Option<usize>,
-	) -> Result<impl DoubleEndedIterator<Item = IterResult> + '_>
-	where
-		K: AsRef<[u8]>,
-	{
-		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
-		self.range_with_options(&options)
-	}
-
-	/// Gets keys and values in a range, with custom read options.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
-	pub fn range_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = IterResult> + '_>> {
-		// If timestamp is specified, use versioned query
-		if let Some(timestamp) = options.timestamp {
-			// Check if versioned queries are enabled
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
-			// Query the versioned index through the snapshot
-			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.range_at_version(start_key, end_key, timestamp, options.limit)?
-						.map(|result| result.map(|(k, v)| (k.into(), Some(v)))),
-				)),
-				None => Err(Error::NoSnapshot),
-			}
-		} else {
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(TransactionRangeIterator::new_with_options(
-				self, start_key, end_key, options,
-			)?))
-		}
-	}
-
-	/// Gets all versions of keys in a range.
-	pub fn scan_all_versions<K: AsRef<[u8]>>(
-		&self,
-		start: K,
-		end: K,
-		limit: Option<usize>,
-	) -> Result<Vec<VersionScanResult>> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
 	/// Counts keys in a range at the current timestamp.
 	///
 	/// Returns the number of valid (non-deleted) keys in the range [start, end).
@@ -698,10 +477,13 @@ impl Transaction {
 	///
 	/// This is more efficient than creating an iterator and counting manually,
 	/// as it doesn't need to allocate or return the actual keys.
-	pub fn count<K: AsRef<[u8]>>(&self, start: K, end: K) -> Result<usize> {
+	pub fn count<K>(&self, start: K, end: K) -> Result<usize>
+	where
+		K: IntoBytes,
+	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
 	}
 
@@ -712,15 +494,13 @@ impl Transaction {
 	/// The range is inclusive of the start key, but exclusive of the end key.
 	///
 	/// This requires versioning to be enabled in the database options.
-	pub fn count_at_version<K: AsRef<[u8]>>(
-		&self,
-		start: K,
-		end: K,
-		timestamp: u64,
-	) -> Result<usize> {
+	pub fn count_at_version<K>(&self, start: K, end: K, timestamp: u64) -> Result<usize>
+	where
+		K: IntoBytes,
+	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_ref().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_ref().to_vec()));
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
 	}
 
@@ -794,6 +574,230 @@ impl Transaction {
 		}
 
 		Ok(count)
+	}
+
+	/// Gets keys in a key range at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys<K>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	where
+		K: IntoBytes,
+	{
+		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		self.keys_with_options(&options)
+	}
+
+	/// Gets keys in a key range at a specific timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys_at_version<K>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<Key>> + '_>
+	where
+		K: IntoBytes,
+	{
+		let mut options = ReadOptions::default()
+			.with_keys_only(true)
+			.with_limit(limit)
+			.with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		self.keys_with_options(&options)
+	}
+
+	/// Gets keys in a key range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys in the
+	/// range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys in the range,
+	/// inclusive of the start key, but not the end key.
+	///
+	/// This function is faster than `range()` as it doesn't
+	/// fetch or resolve values from disk.
+	pub fn keys_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<Key>> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.keys_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|vec| Ok(Bytes::from(vec))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Force keys_only to true for this method
+			let mut options = options.clone();
+			options.keys_only = true;
+			Ok(Box::new(
+				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+					.map(|result| result.map(|(key, _)| key)),
+			))
+		}
+	}
+
+	/// Gets keys and values in a range, at the current timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range<K>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>
+	where
+		K: IntoBytes,
+	{
+		let mut options = ReadOptions::default().with_limit(limit);
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		self.range_with_options(&options)
+	}
+
+	/// Gets keys and values in a range, at a specific timestamp.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range_at_version<K>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<impl DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>
+	where
+		K: IntoBytes,
+	{
+		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
+		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
+		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		self.range_with_options(&options)
+	}
+
+	/// Gets keys and values in a range, with custom read options.
+	///
+	/// The returned iterator is a double ended iterator
+	/// that can be used to iterate over the keys and values
+	/// in the range in both forward and backward directions.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = Result<(Key, Option<Value>)>> + '_>> {
+		// If timestamp is specified, use versioned query
+		if let Some(timestamp) = options.timestamp {
+			// Check if versioned queries are enabled
+			if !self.core.opts.enable_versioning {
+				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+			}
+
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+
+			// Query the versioned index through the snapshot
+			match &self.snapshot {
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.range_at_version(start_key, end_key, timestamp, options.limit)?
+						.map(|result| result.map(|(k, v)| (k.into(), Some(v)))),
+				)),
+				None => Err(Error::NoSnapshot),
+			}
+		} else {
+			// Get the start and end keys from options
+			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
+			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			Ok(Box::new(TransactionRangeIterator::new_with_options(
+				self, start_key, end_key, options,
+			)?))
+		}
+	}
+
+	/// Gets all versions of keys in a range.
+	pub fn scan_all_versions<K>(
+		&self,
+		start: K,
+		end: K,
+		limit: Option<usize>,
+	) -> Result<Vec<(Key, Value, Version, bool)>>
+	where
+		K: IntoBytes,
+	{
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
+			None => Err(Error::NoSnapshot),
+		}
 	}
 
 	/// Writes a value for a key with custom write options. None is used for deletion.
@@ -1311,7 +1315,7 @@ mod tests {
 	/// Type alias for a map of keys to their version information
 	/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
 	#[allow(dead_code)]
-	type KeyVersionsMap = HashMap<Vec<u8>, Vec<(Vec<u8>, u64, bool)>>;
+	type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
 
 	// Common setup logic for creating a store
 	fn create_store() -> (Tree, TempDir) {
@@ -4002,7 +4006,7 @@ mod tests {
 		}
 
 		// Verify key1 has 2 versions
-		let key1_versions = key_versions.get_mut(b"key1".as_slice()).unwrap();
+		let key1_versions = key_versions.get_mut(&Bytes::from_static(b"key1")).unwrap();
 		assert_eq!(key1_versions.len(), 2);
 		// Sort by timestamp to get chronological order
 		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
@@ -4012,7 +4016,7 @@ mod tests {
 		assert!(!key1_versions[1].2); // Not tombstone
 
 		// Verify key2 has 2 versions
-		let key2_versions = key_versions.get_mut(b"key2".as_slice()).unwrap();
+		let key2_versions = key_versions.get_mut(&Bytes::from_static(b"key2")).unwrap();
 		assert_eq!(key2_versions.len(), 2);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
@@ -4021,13 +4025,13 @@ mod tests {
 		assert!(!key2_versions[1].2); // Not tombstone
 
 		// Verify key3 has 1 version
-		let key3_versions = key_versions.get(b"key3".as_slice()).unwrap();
+		let key3_versions = key_versions.get(&Bytes::from_static(b"key3")).unwrap();
 		assert_eq!(key3_versions.len(), 1);
 		assert_eq!(key3_versions[0].0, b"value3_v1");
 		assert!(!key3_versions[0].2); // Not tombstone
 
 		// Verify key4 has 1 version
-		let key4_versions = key_versions.get(b"key4".as_slice()).unwrap();
+		let key4_versions = key_versions.get(&Bytes::from_static(b"key4")).unwrap();
 		assert_eq!(key4_versions.len(), 1);
 		assert_eq!(key4_versions[0].0, b"value4_v1");
 		assert!(!key4_versions[0].2); // Not tombstone
@@ -4078,10 +4082,10 @@ mod tests {
 		}
 
 		// Verify key1 is not present (hard deleted)
-		assert!(!key_versions.contains_key(b"key1".as_slice()));
+		assert!(!key_versions.contains_key(&Bytes::from_static(b"key1")));
 
 		// Verify key2 has 3 versions (2 regular values + 1 soft delete marker)
-		let key2_versions = key_versions.get_mut(b"key2".as_slice()).unwrap();
+		let key2_versions = key_versions.get_mut(&Bytes::from_static(b"key2")).unwrap();
 		assert_eq!(key2_versions.len(), 3);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
@@ -4587,11 +4591,11 @@ mod tests {
 			assert_eq!(
 				results,
 				vec![
-					(b"key1".to_vec(), Bytes::from_static(b"value1_v2"), 2, false),
-					(b"key2".to_vec(), Bytes::from_static(b"value2_v2"), 2, false),
-					(b"key3".to_vec(), Bytes::from_static(b"value3"), 1, false),
-					(b"key4".to_vec(), Bytes::from_static(b"value4"), 1, false),
-					(b"key5".to_vec(), Bytes::from_static(b"value5"), 1, false),
+					(Bytes::from_static(b"key1"), Bytes::from_static(b"value1_v2"), 2, false),
+					(Bytes::from_static(b"key2"), Bytes::from_static(b"value2_v2"), 2, false),
+					(Bytes::from_static(b"key3"), Bytes::from_static(b"value3"), 1, false),
+					(Bytes::from_static(b"key4"), Bytes::from_static(b"value4"), 1, false),
+					(Bytes::from_static(b"key5"), Bytes::from_static(b"value5"), 1, false),
 				]
 			);
 

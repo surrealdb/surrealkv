@@ -27,9 +27,6 @@ pub use crate::lsm::{Tree, TreeBuilder};
 use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
-/// Type alias for version/timestamp values
-pub type Version = u64;
-
 use bytes::Bytes;
 use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
 use std::{borrow::Cow, cmp::Ordering, path::PathBuf, sync::Arc};
@@ -153,6 +150,9 @@ pub type Key = Bytes;
 
 /// The Value type used throughout the LSM tree  
 pub type Value = Bytes;
+
+/// Type alias for version/timestamp values
+pub type Version = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VLogChecksumLevel {
