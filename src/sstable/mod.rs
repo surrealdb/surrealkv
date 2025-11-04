@@ -5,6 +5,7 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
 
+use bytes::Bytes;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -93,7 +94,7 @@ impl From<u8> for InternalKeyKind {
 /// It includes a timestamp field for versioned queries
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InternalKey {
-	pub(crate) user_key: Arc<[u8]>,
+	pub(crate) user_key: Bytes,
 	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
 	pub(crate) trailer: u64,   // (seq_num << 8) | kind
 }
@@ -106,7 +107,7 @@ impl InternalKey {
 		timestamp: u64,
 	) -> Self {
 		Self {
-			user_key: Arc::from(user_key.into_boxed_slice()),
+			user_key: Bytes::from(user_key),
 			timestamp,
 			trailer: (seq_num << 8) | kind as u64,
 		}
@@ -120,7 +121,7 @@ impl InternalKey {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
 		let timestamp = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
-		let user_key = Arc::<[u8]>::from(&encoded_key[..n]);
+		let user_key = Bytes::copy_from_slice(&encoded_key[..n]);
 
 		Self {
 			user_key,
@@ -190,7 +191,7 @@ impl PartialOrd for InternalKey {
 impl Default for InternalKey {
 	fn default() -> Self {
 		Self {
-			user_key: Arc::from([]),
+			user_key: Bytes::new(),
 			timestamp: 0,
 			trailer: 0,
 		}

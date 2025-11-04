@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{Snapshot, VersionScanResult};
 use crate::sstable::InternalKeyKind;
-use crate::{IterResult, Key, Value};
+use crate::{IntoBytes, IterResult, Key, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,20 +244,25 @@ impl Transaction {
 	}
 
 	/// Inserts a key-value pair into the store.
-	pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub fn set<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
 	/// Inserts a key-value pair at with a specific timestamp.
-	pub fn set_at_version(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+	pub fn set_at_version<K: IntoBytes, V: IntoBytes>(
+		&mut self,
+		key: K,
+		value: V,
+		timestamp: u64,
+	) -> Result<()> {
 		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Inserts a key-value pair to the store, with custom write options.
-	pub fn set_with_options(
+	pub fn set_with_options<K: IntoBytes, V: IntoBytes>(
 		&mut self,
-		key: &[u8],
-		value: &[u8],
+		key: K,
+		value: V,
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
@@ -278,68 +283,82 @@ impl Transaction {
 	}
 
 	/// Delete all the versions of a key. This is a hard delete.
-	pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+	pub fn delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
 		self.delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Delete all the versions of a key with custom write options. This is a hard delete.
-	pub fn delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+	pub fn delete_with_options<K: IntoBytes>(
+		&mut self,
+		key: K,
+		options: &WriteOptions,
+	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
 				key,
-				None,
+				None::<&[u8]>,
 				InternalKeyKind::Delete,
 				self.savepoints,
 				write_seqno,
 				timestamp,
 			)
 		} else {
-			Entry::new(key, None, InternalKeyKind::Delete, self.savepoints, write_seqno)
+			Entry::new(key, None::<&[u8]>, InternalKeyKind::Delete, self.savepoints, write_seqno)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
 
 	/// Soft delete a key. This will add a tombstone at the current timestamp.
-	pub fn soft_delete(&mut self, key: &[u8]) -> Result<()> {
+	pub fn soft_delete<K: IntoBytes>(&mut self, key: K) -> Result<()> {
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
 	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
-	pub fn soft_delete_at_version(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
+	pub fn soft_delete_at_version<K: IntoBytes>(&mut self, key: K, timestamp: u64) -> Result<()> {
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
-	pub fn soft_delete_with_options(&mut self, key: &[u8], options: &WriteOptions) -> Result<()> {
+	pub fn soft_delete_with_options<K: IntoBytes>(
+		&mut self,
+		key: K,
+		options: &WriteOptions,
+	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
 				key,
-				None,
+				None::<&[u8]>,
 				InternalKeyKind::SoftDelete,
 				self.savepoints,
 				write_seqno,
 				timestamp,
 			)
 		} else {
-			Entry::new(key, None, InternalKeyKind::SoftDelete, self.savepoints, write_seqno)
+			Entry::new(
+				key,
+				None::<&[u8]>,
+				InternalKeyKind::SoftDelete,
+				self.savepoints,
+				write_seqno,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
 	}
 
 	/// Inserts a key-value pairm removing all previous versions.
-	pub fn replace(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub fn replace<K: IntoBytes, V: IntoBytes>(&mut self, key: K, value: V) -> Result<()> {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
 	/// Inserts a key-value pair, removing all previous versions, with custom write options.
-	pub fn replace_with_options(
+	pub fn replace_with_options<K: IntoBytes, V: IntoBytes>(
 		&mut self,
-		key: &[u8],
-		value: &[u8],
+		key: K,
+		value: V,
 		options: &WriteOptions,
 	) -> Result<()> {
 		let write_seqno = self.next_write_seqno();
@@ -360,23 +379,27 @@ impl Transaction {
 	}
 
 	/// Gets a value for a key if it exists.
-	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+	pub fn get<K: IntoBytes>(&self, key: K) -> Result<Option<Value>> {
 		self.get_with_options(key, &ReadOptions::default())
 	}
 
 	/// Gets a value for a key at a specific timestamp.
-	pub fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+	pub fn get_at_version<K: IntoBytes>(&self, key: K, timestamp: u64) -> Result<Option<Value>> {
 		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key, with custom read options.
-	pub fn get_with_options(&self, key: &[u8], options: &ReadOptions) -> Result<Option<Value>> {
+	pub fn get_with_options<K: IntoBytes>(
+		&self,
+		key: K,
+		options: &ReadOptions,
+	) -> Result<Option<Value>> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
 		// If the key is empty, return an error.
-		if key.as_ref().is_empty() {
+		if key.as_slice().is_empty() {
 			return Err(Error::EmptyKey);
 		}
 
@@ -394,26 +417,28 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			return match &self.snapshot {
-				Some(snapshot) => snapshot.get_at_version(key, timestamp),
+				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
 			};
 		}
 
 		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
-		if let Some(last_entry) = self.write_set.get(key).and_then(|entries| entries.last()) {
+		if let Some(last_entry) =
+			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
+		{
 			// If the entry is a tombstone, return None.
 			if last_entry.is_tombstone() {
 				return Ok(None);
 			}
 			if let Some(v) = &last_entry.value {
-				return Ok(Some(Arc::from(v.to_vec())));
+				return Ok(Some(v.clone()));
 			}
 			// If the entry has no value, it means the key was deleted in this transaction.
 			return Ok(None);
 		}
 
 		// The value is not in the write set, so attempt to get it from the snapshot.
-		match self.snapshot.as_ref().unwrap().get(key)? {
+		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
 			Some(val) => {
 				// Resolve the value reference through VLog if needed
 				let resolved_value = self.core.resolve_value(&val.0)?;
@@ -504,7 +529,7 @@ impl Transaction {
 				Some(snapshot) => Ok(Box::new(
 					snapshot
 						.keys_at_version(start_key, end_key, timestamp, options.limit)?
-						.map(|vec| Ok(Arc::from(vec))),
+						.map(|vec| Ok(Bytes::from(vec))),
 				)),
 				None => Err(Error::NoSnapshot),
 			}
@@ -948,16 +973,16 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	fn new(
-		key: &[u8],
-		value: Option<&[u8]>,
+	fn new<K: IntoBytes, V: IntoBytes>(
+		key: K,
+		value: Option<V>,
 		kind: InternalKeyKind,
 		savepoint_no: u32,
 		seqno: u32,
 	) -> Entry {
 		Entry {
-			key: Bytes::copy_from_slice(key),
-			value: value.map(Bytes::copy_from_slice),
+			key: key.into_bytes(),
+			value: value.map(|v| v.into_bytes()),
 			kind,
 			savepoint_no,
 			seqno,
@@ -965,17 +990,17 @@ impl Entry {
 		}
 	}
 
-	fn new_with_timestamp(
-		key: &[u8],
-		value: Option<&[u8]>,
+	fn new_with_timestamp<K: IntoBytes, V: IntoBytes>(
+		key: K,
+		value: Option<V>,
 		kind: InternalKeyKind,
 		savepoint_no: u32,
 		seqno: u32,
 		timestamp: u64,
 	) -> Entry {
 		Entry {
-			key: Bytes::copy_from_slice(key),
-			value: value.map(Bytes::copy_from_slice),
+			key: key.into_bytes(),
+			value: value.map(|v| v.into_bytes()),
 			kind,
 			savepoint_no,
 			seqno,
@@ -1070,9 +1095,9 @@ impl<'a> TransactionRangeIterator<'a> {
 
 				if self.keys_only {
 					// For keys-only mode, return None for the value to avoid allocations
-					return Some(Ok((ws_key.to_vec().into(), None)));
+					return Some(Ok((ws_key.clone(), None)));
 				} else if let Some(value) = &last_entry.value {
-					return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+					return Some(Ok((ws_key.clone(), Some(value.clone()))));
 				}
 			}
 		}
@@ -1090,9 +1115,9 @@ impl<'a> TransactionRangeIterator<'a> {
 
 				if self.keys_only {
 					// For keys-only mode, return None for the value to avoid allocations
-					return Some(Ok((ws_key.to_vec().into(), None)));
+					return Some(Ok((ws_key.clone(), None)));
 				} else if let Some(value) = &last_entry.value {
-					return Some(Ok((ws_key.to_vec().into(), Some(value.to_vec().into()))));
+					return Some(Ok((ws_key.clone(), Some(value.clone()))));
 				}
 			}
 		}
@@ -1652,38 +1677,38 @@ mod tests {
 
 		{
 			let mut txn2 = store.begin().unwrap();
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
 			]))
 			.unwrap();
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
 			]))
 			.unwrap();
 			txn2.set(
-				&Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]),
+				Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]),
 				&value1,
 			)
 			.unwrap();
 
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
 			txn2.set(
-				&Bytes::copy_from_slice(&[
+				Bytes::copy_from_slice(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
 					72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
 					69, 0,
@@ -1692,20 +1717,20 @@ mod tests {
 			)
 			.unwrap();
 
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
 			txn2.set(
-				&Bytes::copy_from_slice(&[
+				Bytes::copy_from_slice(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71,
 					72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 					42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
@@ -1714,7 +1739,7 @@ mod tests {
 			)
 			.unwrap();
 
-			txn2.get(&Bytes::copy_from_slice(&[
+			txn2.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
@@ -1725,36 +1750,36 @@ mod tests {
 
 		{
 			let mut txn3 = store.begin().unwrap();
-			txn3.get(&Bytes::copy_from_slice(&[
+			txn3.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
-			txn3.get(&Bytes::copy_from_slice(&[
+			txn3.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn3.delete(&Bytes::copy_from_slice(&[
+			txn3.delete(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
-			txn3.get(&Bytes::copy_from_slice(&[
+			txn3.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
-			txn3.get(&Bytes::copy_from_slice(&[
+			txn3.get(Bytes::copy_from_slice(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
 			txn3.set(
-				&Bytes::copy_from_slice(&[
+				Bytes::copy_from_slice(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
 					72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
 					69, 0,
@@ -1970,11 +1995,14 @@ mod tests {
 				tx.range(b"a", b"f", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
-			assert_eq!(range[0], (b"a".to_vec().into(), Some(b"1".to_vec().into())));
-			assert_eq!(range[1], (b"b".to_vec().into(), Some(b"2".to_vec().into())));
-			assert_eq!(range[2], (b"c".to_vec().into(), Some(b"3_modified".to_vec().into())));
-			assert_eq!(range[3], (b"d".to_vec().into(), Some(b"4".to_vec().into())));
-			assert_eq!(range[4], (b"e".to_vec().into(), Some(b"5".to_vec().into())));
+			assert_eq!(range[0], (Bytes::from_static(b"a"), Some(Bytes::from_static(b"1"))));
+			assert_eq!(range[1], (Bytes::from_static(b"b"), Some(Bytes::from_static(b"2"))));
+			assert_eq!(
+				range[2],
+				(Bytes::from_static(b"c"), Some(Bytes::from_static(b"3_modified")))
+			);
+			assert_eq!(range[3], (Bytes::from_static(b"d"), Some(Bytes::from_static(b"4"))));
+			assert_eq!(range[4], (Bytes::from_static(b"e"), Some(Bytes::from_static(b"5"))));
 		}
 	}
 
@@ -2038,7 +2066,10 @@ mod tests {
 				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[1], (b"key2".to_vec().into(), Some(b"new_value2".to_vec().into())));
+			assert_eq!(
+				range[1],
+				(Bytes::from_static(b"key2"), Some(Bytes::from_static(b"new_value2")))
+			);
 		}
 	}
 
@@ -3209,7 +3240,7 @@ mod tests {
 		// Test regular get (should return latest)
 		let tx = tree.begin().unwrap();
 		let value = tx.get(b"key1").unwrap();
-		assert_eq!(value, Some(Arc::from(b"value1_v2" as &[u8])));
+		assert_eq!(value, Some(Bytes::from_static(b"value1_v2")));
 
 		// Get all versions to verify timestamps and values
 		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
@@ -3225,11 +3256,11 @@ mod tests {
 
 		// Test get at specific timestamp (earlier version)
 		let value_at_ts1 = tx.get_at_version(b"key1", ts1).unwrap();
-		assert_eq!(value_at_ts1, Some(Arc::from(b"value1_v1" as &[u8])));
+		assert_eq!(value_at_ts1, Some(Bytes::from_static(b"value1_v1")));
 
 		// Test get at later timestamp (should return latest version as of that time)
 		let value_at_ts2 = tx.get_at_version(b"key1", ts2).unwrap();
-		assert_eq!(value_at_ts2, Some(Arc::from(b"value1_v2" as &[u8])));
+		assert_eq!(value_at_ts2, Some(Bytes::from_static(b"value1_v2")));
 	}
 
 	#[test(tokio::test)]
@@ -3315,12 +3346,12 @@ mod tests {
 		// Verify we can get the value at that timestamp
 		let tx = tree.begin().unwrap();
 		let value = tx.get_at_version(b"key1", custom_timestamp).unwrap();
-		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+		assert_eq!(value, Some(Bytes::from_static(b"value1")));
 
 		// Verify we can get the value at a later timestamp
 		let later_timestamp = custom_timestamp + 1000000;
 		let value = tx.get_at_version(b"key1", later_timestamp).unwrap();
-		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+		assert_eq!(value, Some(Bytes::from_static(b"value1")));
 
 		// Verify we can't get the value at an earlier timestamp
 		let earlier_timestamp = custom_timestamp - 5;
@@ -3360,7 +3391,7 @@ mod tests {
 				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
-		assert_eq!(value, Some(Arc::from(b"value1" as &[u8])));
+		assert_eq!(value, Some(Bytes::from_static(b"value1")));
 
 		// Test soft_delete_with_options with timestamp
 		let delete_timestamp = 200;
@@ -3380,7 +3411,7 @@ mod tests {
 				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
-		assert_eq!(value_before, Some(Arc::from(b"value1" as &[u8])));
+		assert_eq!(value_before, Some(Bytes::from_static(b"value1")));
 
 		let value_after = tx
 			.get_with_options(
@@ -4522,11 +4553,11 @@ mod tests {
 			assert_eq!(
 				results,
 				vec![
-					(b"key1".to_vec(), Arc::from(b"value1_v2".as_slice()), 2, false),
-					(b"key2".to_vec(), Arc::from(b"value2_v2".as_slice()), 2, false),
-					(b"key3".to_vec(), Arc::from(b"value3".as_slice()), 1, false),
-					(b"key4".to_vec(), Arc::from(b"value4".as_slice()), 1, false),
-					(b"key5".to_vec(), Arc::from(b"value5".as_slice()), 1, false),
+					(b"key1".to_vec(), Bytes::from_static(b"value1_v2"), 2, false),
+					(b"key2".to_vec(), Bytes::from_static(b"value2_v2"), 2, false),
+					(b"key3".to_vec(), Bytes::from_static(b"value3"), 1, false),
+					(b"key4".to_vec(), Bytes::from_static(b"value4"), 1, false),
+					(b"key5".to_vec(), Bytes::from_static(b"value5"), 1, false),
 				]
 			);
 

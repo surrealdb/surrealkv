@@ -13,6 +13,7 @@ use crate::cache::VLogCache;
 use crate::{batch::Batch, discard::DiscardStats, Value};
 use crate::{bplustree::tree::DiskBPlusTree, Tree, TreeBuilder};
 use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
+use bytes::Bytes;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -219,7 +220,7 @@ impl ValueLocation {
 	/// Creates a ValueLocation that points to a value in VLog
 	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
 		let encoded_pointer = pointer.encode();
-		Self::new(BIT_VALUE_POINTER, Arc::from(encoded_pointer), VALUE_LOCATION_VERSION)
+		Self::new(BIT_VALUE_POINTER, Bytes::from(encoded_pointer), VALUE_LOCATION_VERSION)
 	}
 
 	/// Creates a ValueLocation with inline value
@@ -277,7 +278,7 @@ impl ValueLocation {
 		let mut value = Vec::new();
 		reader.read_to_end(&mut value)?;
 
-		Ok(Self::new(meta, Arc::from(value), version))
+		Ok(Self::new(meta, Bytes::from(value), version))
 	}
 
 	/// Resolves the actual value, handling both inline and pointer cases
@@ -817,7 +818,7 @@ impl VLog {
 		}
 
 		// Cache the value for future reads
-		let value_bytes: Value = value.into();
+		let value_bytes: Value = Bytes::copy_from_slice(value);
 		self.cache.insert(pointer.file_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)
@@ -1654,7 +1655,7 @@ mod tests {
 		// Verify that the cache contains the value
 		let cached_value = vlog.cache.get(pointer.file_id, pointer.offset);
 		assert!(cached_value.is_some());
-		assert_eq!(cached_value.unwrap(), value.into());
+		assert_eq!(cached_value.unwrap(), Bytes::from(value));
 	}
 
 	#[test(tokio::test)]
@@ -1793,7 +1794,7 @@ mod tests {
 	#[test]
 	fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
-		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
+		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
 
 		// Test encode
 		let encoded = location.encode();
@@ -1835,9 +1836,9 @@ mod tests {
 	#[test]
 	fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
-			ValueLocation::with_inline_value(Arc::from(b"small data".as_slice())),
+			ValueLocation::with_inline_value(Bytes::from_static(b"small data")),
 			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
-			ValueLocation::with_inline_value(Arc::from(b"".as_slice())), // empty data
+			ValueLocation::with_inline_value(Bytes::new()), // empty data
 		];
 
 		for location in test_cases {
@@ -1856,7 +1857,7 @@ mod tests {
 	fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
-		let inline_location = ValueLocation::with_inline_value(Arc::from(inline_data.as_slice()));
+		let inline_location = ValueLocation::with_inline_value(Bytes::from_static(inline_data));
 		assert_eq!(inline_location.encoded_size(), 1 + 1 + inline_data.len()); // meta + version + data
 
 		// Test VLog size
@@ -1870,7 +1871,7 @@ mod tests {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
-		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
+		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
 
 		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
@@ -1896,7 +1897,7 @@ mod tests {
 	#[test]
 	fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
-		let location = ValueLocation::with_inline_value(Arc::from(test_data.as_slice()));
+		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
 		let encoded = location.encode();
 
 		// Should work without VLog for inline data
@@ -1931,7 +1932,7 @@ mod tests {
 	fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
-		let location = ValueLocation::with_inline_value(Arc::from(max_inline.as_slice()));
+		let location = ValueLocation::with_inline_value(Bytes::from(max_inline));
 		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
@@ -2554,7 +2555,7 @@ mod tests {
 		// Insert and delete a different key to create stale entries
 		{
 			let mut tx = tree.begin().unwrap();
-			tx.set_at_version(b"other_key", &b"other_value_large_data".repeat(50), 5000).unwrap();
+			tx.set_at_version(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
 			tx.commit().await.unwrap();
 			tree.flush().unwrap();
 

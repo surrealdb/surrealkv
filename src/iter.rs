@@ -120,7 +120,7 @@ impl Iterator for MergeIterator<'_> {
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
 				None => true,
-				Some(current) => &user_key != current,
+				Some(current) => user_key != current,
 			};
 
 			if is_new_key {
@@ -396,7 +396,7 @@ impl Iterator for CompactionIterator<'_> {
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
 				None => true,
-				Some(current) => &user_key != current,
+				Some(current) => user_key != current,
 			};
 
 			if is_new_key {
@@ -432,6 +432,7 @@ mod tests {
 		sstable::{InternalKey, InternalKeyKind},
 		Options, VLogChecksumLevel, Value,
 	};
+	use bytes::Bytes;
 	use std::sync::Arc;
 	use tempfile::TempDir;
 	use test_log::test;
@@ -1228,12 +1229,12 @@ mod tests {
 
 		// Create items for testing
 		let items1 = vec![
-			(key1_recent_delete, Arc::from(Vec::new())), // DELETE operation
+			(key1_recent_delete, Bytes::new()), // DELETE operation
 			(key1_old_set, val1_old),
 			(key1_recent_set, val1_recent),
 		];
 		let items2 = vec![
-			(key2_old_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_old_delete, Bytes::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
@@ -1405,12 +1406,12 @@ mod tests {
 
 		// Create items for testing
 		let items1 = vec![
-			(key1_recent_delete, Arc::from(Vec::new())), // DELETE operation - should be dropped
+			(key1_recent_delete, Bytes::new()), // DELETE operation - should be dropped
 			(key1_old_set, val1_old),
 			(key1_recent_set, val1_recent),
 		];
 		let items2 = vec![
-			(key2_delete, Arc::from(Vec::new())), // DELETE only - entire key disappears
+			(key2_delete, Bytes::new()), // DELETE only - entire key disappears
 		];
 		let items3 = vec![
 			(key3_recent_set, val3_recent),
@@ -1418,7 +1419,7 @@ mod tests {
 			(key3_very_old_set1, val3_very_old1),
 		];
 		let items4 = vec![
-			(key4_very_old_delete, Arc::from(Vec::new())), // Very old DELETE - dropped
+			(key4_very_old_delete, Bytes::new()), // Very old DELETE - dropped
 			(key4_old_set, val4_old),
 		];
 
@@ -1584,11 +1585,11 @@ mod tests {
 			(key1_very_old_set, val1_very_old),
 		];
 		let items2 = vec![
-			(key2_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_delete, Bytes::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
-		let items3 = vec![(key3_delete, Arc::from(Vec::new()))]; // DELETE only
+		let items3 = vec![(key3_delete, Bytes::new())]; // DELETE only
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1728,11 +1729,11 @@ mod tests {
 			(key1_very_old_set, val1_very_old),
 		];
 		let items2 = vec![
-			(key2_delete, Arc::from(Vec::new())), // DELETE operation
+			(key2_delete, Bytes::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
-		let items3 = vec![(key3_delete, Arc::from(Vec::new()))]; // DELETE only
+		let items3 = vec![(key3_delete, Bytes::new())]; // DELETE only
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));

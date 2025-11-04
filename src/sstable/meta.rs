@@ -145,7 +145,7 @@ impl Properties {
 			let first_element = buf.copy_to_bytes(size_first_element);
 			let size_second_element = buf.get_u64() as usize;
 			let second_element = buf.copy_to_bytes(size_second_element);
-			let range = (first_element.as_ref().into(), second_element.as_ref().into());
+			let range = (first_element, second_element);
 			Some(KeyRange::new(range))
 		} else {
 			None

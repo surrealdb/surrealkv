@@ -12,6 +12,7 @@ use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
 use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::{Key, Value};
+use bytes::Bytes;
 
 /// Type alias for version scan results
 pub type VersionScanResult = (Vec<u8>, Value, u64, bool);
@@ -683,7 +684,7 @@ impl<'a> KMergeIterator<'a> {
 					Bound::Included(v) | Bound::Excluded(v) => v.clone(),
 					Bound::Unbounded => vec![0xff],
 				};
-				KeyRange::new((Arc::from(low), Arc::from(high)))
+				KeyRange::new((Bytes::from(low), Bytes::from(high)))
 			};
 
 			// Active memtable with range
