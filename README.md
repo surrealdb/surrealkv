@@ -138,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+**Note:** The transaction API accepts flexible key and value types through the `IntoBytes` trait. You can use `&[u8]`, `&str`, `String`, `Vec<u8>`, or `Bytes` for both keys and values.
+
 ### Transaction Modes
 
 SurrealKV supports three transaction modes for different use cases:
@@ -182,6 +184,27 @@ txn.commit().await?;
 ```
 
 **Note:** Range iterators are double-ended, supporting both forward and backward iteration.
+
+### Counting Keys
+
+Efficiently count keys in a range without iterating through all values:
+
+```rust
+let mut txn = tree.begin()?;
+
+// Count all keys between "key1" and "key9"
+let count = txn.count(b"key1", b"key9")?;
+println!("Found {} keys", count);
+
+// Count with custom options (limit, bounds, etc.)
+let options = ReadOptions::new()
+    .with_limit(Some(100))
+    .with_iterate_lower_bound(Some(b"a".to_vec()))
+    .with_iterate_upper_bound(Some(b"z".to_vec()));
+let count = txn.count_with_options(&options)?;
+```
+
+**Note:** The `count()` operation is optimized and more efficient than manually counting iterator results, as it doesn't need to fetch or resolve values from the value log.
 
 ### Durability Levels
 
@@ -261,6 +284,10 @@ let range: Vec<_> = tx.range_at_version(b"key1", b"key9", 150, None)?
 let keys: Vec<_> = tx.keys_at_version(b"key1", b"key9", 150, None)?
     .map(|r| r.unwrap())
     .collect();
+
+// Count keys at a specific timestamp
+let count = tx.count_at_version(b"key1", b"key9", 150)?;
+println!("Found {} keys at timestamp 150", count);
 ```
 
 ### Retrieving All Versions
