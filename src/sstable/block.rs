@@ -93,7 +93,11 @@ pub(crate) struct Block {
 
 impl Block {
 	pub(crate) fn iter(&self) -> BlockIterator {
-		BlockIterator::new(self.opts.clone(), self.block.clone())
+		BlockIterator::new(self.opts.clone(), self.block.clone(), false)
+	}
+
+	pub(crate) fn iter_with_mode(&self, keys_only: bool) -> BlockIterator {
+		BlockIterator::new(self.opts.clone(), self.block.clone(), keys_only)
 	}
 
 	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
@@ -285,11 +289,13 @@ pub(crate) struct BlockIterator {
 	current_value_offset_end: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
+	/// When true, skip reading values to improve performance
+	keys_only: bool,
 }
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
+	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>, keys_only: bool) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -313,6 +319,7 @@ impl BlockIterator {
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
 			internal_cmp: internal_comparator,
+			keys_only,
 		}
 	}
 
@@ -381,12 +388,14 @@ impl Iterator for BlockIterator {
 		if !self.advance() {
 			return None;
 		}
-		Some((
-			Bytes::copy_from_slice(&self.current_key[..]),
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
 			Bytes::copy_from_slice(
 				&self.block[self.current_value_offset_start..self.current_value_offset_end],
-			),
-		))
+			)
+		};
+		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
@@ -396,12 +405,14 @@ impl DoubleEndedIterator for BlockIterator {
 			return None;
 		}
 
-		Some((
-			Bytes::copy_from_slice(&self.current_key[..]),
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
 			Bytes::copy_from_slice(
 				&self.block[self.current_value_offset_start..self.current_value_offset_end],
-			),
-		))
+			)
+		};
+		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
@@ -513,9 +524,13 @@ impl LSMIterator for BlockIterator {
 
 	// Get the current value
 	fn value(&self) -> Value {
-		Bytes::copy_from_slice(
-			&self.block[self.current_value_offset_start..self.current_value_offset_end],
-		)
+		if self.keys_only {
+			Bytes::new()
+		} else {
+			Bytes::copy_from_slice(
+				&self.block[self.current_value_offset_start..self.current_value_offset_end],
+			)
+		}
 	}
 }
 

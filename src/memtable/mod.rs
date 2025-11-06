@@ -204,6 +204,7 @@ impl MemTable {
 	pub(crate) fn range<R>(
 		&self,
 		range: R,
+		keys_only: bool,
 	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_
 	where
 		R: RangeBounds<Vec<u8>>,
@@ -247,9 +248,13 @@ impl MemTable {
 			Bound::Unbounded => Bound::Unbounded,
 		};
 
-		self.map.range((start_bound, end_bound)).map(|entry| {
+		self.map.range((start_bound, end_bound)).map(move |entry| {
 			let key = entry.key().clone();
-			let value = entry.value().clone();
+			let value = if keys_only {
+				Bytes::new()
+			} else {
+				entry.value().clone()
+			};
 			(Arc::new(key), value)
 		})
 	}
@@ -648,7 +653,7 @@ mod tests {
 		]);
 
 		// Test inclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..=s2b("k")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("c")..=s2b("k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -660,7 +665,7 @@ mod tests {
 		assert_eq!(user_keys[4].as_ref(), b"k");
 
 		// Test exclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..s2b("k")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("c")..s2b("k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -683,7 +688,7 @@ mod tests {
 		]);
 
 		// Perform a range query from "a" to "f"
-		let range_entries: Vec<_> = memtable.range(s2b("a")..s2b("f")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("a")..s2b("f"), false).collect::<Vec<_>>();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();

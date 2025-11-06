@@ -782,6 +782,10 @@ impl Table {
 	}
 
 	pub(crate) fn iter(&self) -> TableIterator {
+		self.iter_with_mode(false)
+	}
+
+	pub(crate) fn iter_with_mode(&self, keys_only: bool) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
@@ -806,6 +810,7 @@ impl Table {
 			exhausted: false,
 			current_partition_index: 0,
 			current_partition_iter: None,
+			keys_only,
 		}
 	}
 
@@ -842,6 +847,8 @@ pub(crate) struct TableIterator {
 	// For partitioned index support
 	current_partition_index: usize,
 	current_partition_iter: Option<BlockIterator>,
+	/// When true, skip reading values to improve performance
+	keys_only: bool,
 }
 
 impl TableIterator {
@@ -902,7 +909,7 @@ impl TableIterator {
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
 		let block = self.table.read_block(handle)?;
-		let mut block_iter = block.iter();
+		let mut block_iter = block.iter_with_mode(self.keys_only);
 
 		// Position at first entry in the new block
 		block_iter.seek_to_first();
