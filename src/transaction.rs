@@ -103,6 +103,8 @@ impl WriteOptions {
 pub struct ReadOptions {
 	/// Whether to return only keys without values (for range operations)
 	pub keys_only: bool,
+	/// Whether to skip key allocation entirely (for count operations)
+	pub count_only: bool,
 	/// Maximum number of items to return (for range operations)
 	pub limit: Option<usize>,
 	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
@@ -122,6 +124,12 @@ impl ReadOptions {
 	/// Sets whether to return only keys without values
 	pub fn with_keys_only(mut self, keys_only: bool) -> Self {
 		self.keys_only = keys_only;
+		self
+	}
+
+	/// Sets whether to skip key allocation entirely (for count operations)
+	pub fn with_count_only(mut self, count_only: bool) -> Self {
+		self.count_only = count_only;
 		self
 	}
 
@@ -477,11 +485,11 @@ impl Transaction {
 	///
 	/// This is more efficient than creating an iterator and counting manually,
 	/// as it doesn't need to allocate or return the actual keys.
-	pub fn count<K>(&self, start: K, end: K) -> Result<usize>
+	pub fn count<K>(&self, start: K, end: K, limit: Option<usize>) -> Result<usize>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default();
+		let mut options = ReadOptions::default().with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
@@ -494,11 +502,17 @@ impl Transaction {
 	/// The range is inclusive of the start key, but exclusive of the end key.
 	///
 	/// This requires versioning to be enabled in the database options.
-	pub fn count_at_version<K>(&self, start: K, end: K, timestamp: u64) -> Result<usize>
+	pub fn count_at_version<K>(
+		&self,
+		start: K,
+		end: K,
+		timestamp: u64,
+		limit: Option<usize>,
+	) -> Result<usize>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
+		let mut options = ReadOptions::default().with_timestamp(Some(timestamp)).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
@@ -530,47 +544,46 @@ impl Transaction {
 		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
 
 		// For versioned queries, use the keys iterator approach
-		// (versioned index has different structure)
 		if let Some(timestamp) = options.timestamp {
 			if !self.core.opts.enable_versioning {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
-
 			let keys_iter = self.keys_at_version(start_key, end_key, timestamp, options.limit)?;
 			return Ok(keys_iter.count());
 		}
 
-		// Fast path: get count from snapshot without creating iterators
+		// When a limit is specified, use iterator approach with count-only optimization
+		if options.limit.is_some() {
+			let mut count_options =
+				ReadOptions::default().with_limit(options.limit).with_count_only(true);
+			count_options.set_iterate_lower_bound(Some(start_key));
+			count_options.set_iterate_upper_bound(Some(end_key));
+
+			let keys_iter = self.keys_with_options(&count_options)?;
+			return Ok(keys_iter.count());
+		}
+
+		// Fast path for unlimited count: use optimized count_in_range
 		let mut count = match &self.snapshot {
 			Some(snapshot) => snapshot.count_in_range(start_key.clone(), end_key.clone())?,
 			None => return Err(Error::NoSnapshot),
 		};
 
-		// Apply write-set adjustments for uncommitted changes in this transaction
+		// Apply write-set adjustments for uncommitted changes
 		for (key, entries) in &self.write_set {
-			// Check if key is in range
 			if key.as_ref() >= start_key.as_slice() && key.as_ref() < end_key.as_slice() {
 				if let Some(latest_entry) = entries.last() {
-					// Check what the key's state was in the snapshot
 					let snapshot_had_key =
 						self.snapshot.as_ref().unwrap().get(key.as_ref())?.is_some();
-
-					// Determine current state from write-set
 					let write_set_has_key = !latest_entry.is_tombstone();
 
-					// Adjust count based on state transition
 					match (snapshot_had_key, write_set_has_key) {
-						(false, true) => count += 1,                      // New key added
-						(true, false) => count = count.saturating_sub(1), // Key deleted
-						_ => {}                                           // No change (update or still deleted)
+						(false, true) => count += 1,
+						(true, false) => count = count.saturating_sub(1),
+						_ => {}
 					}
 				}
 			}
-		}
-
-		// Apply limit if specified
-		if let Some(limit) = options.limit {
-			count = count.min(limit);
 		}
 
 		Ok(count)
@@ -1115,8 +1128,13 @@ impl<'a> TransactionRangeIterator<'a> {
 		let end_bytes = Bytes::copy_from_slice(&end_key);
 
 		// Create a snapshot iterator for the range
-		let iter =
-			snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only, options.limit)?;
+		let iter = snapshot.range(
+			start_bytes.clone(),
+			end_bytes.clone(),
+			options.keys_only,
+			options.count_only,
+			options.limit,
+		)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)
@@ -3791,21 +3809,21 @@ mod tests {
 		// Test basic count
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key2", b"key5").unwrap();
+			let count = tx.count(b"key2", b"key5", None).unwrap();
 			assert_eq!(count, 3); // key2, key3, key4 (key5 is exclusive)
 		}
 
 		// Test count all keys
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"".as_slice(), b"key6").unwrap();
+			let count = tx.count(b"".as_slice(), b"key6", None).unwrap();
 			assert_eq!(count, 5); // All 5 keys
 		}
 
 		// Test count with no keys in range
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key6", b"key9").unwrap();
+			let count = tx.count(b"key6", b"key9", None).unwrap();
 			assert_eq!(count, 0);
 		}
 	}
@@ -3834,7 +3852,7 @@ mod tests {
 		// Test count after delete
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key1", b"key5").unwrap();
+			let count = tx.count(b"key1", b"key5", None).unwrap();
 			assert_eq!(count, 3); // key1, key3, key4 (key2 is deleted)
 		}
 	}
@@ -3858,8 +3876,59 @@ mod tests {
 			tx.set(b"key4", b"value4").unwrap();
 			tx.delete(b"key1").unwrap();
 
-			let count = tx.count(b"".as_slice(), b"key5").unwrap();
+			let count = tx.count(b"".as_slice(), b"key5", None).unwrap();
 			assert_eq!(count, 3); // key2, key3, key4 (key1 deleted in this tx)
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_count_with_limit() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert test data
+		{
+			let mut tx = store.begin().unwrap();
+			for i in 1..=10 {
+				let key = format!("key{:02}", i);
+				let value = format!("value{}", i);
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		// Test count with limit less than total
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key01", b"key99", Some(5)).unwrap();
+			assert_eq!(count, 5); // Limited to 5 even though there are 10 keys
+		}
+
+		// Test count with limit equal to total
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key01", b"key99", Some(10)).unwrap();
+			assert_eq!(count, 10);
+		}
+
+		// Test count with limit greater than total
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key01", b"key99", Some(20)).unwrap();
+			assert_eq!(count, 10); // Only 10 keys exist
+		}
+
+		// Test count with no limit
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key01", b"key99", None).unwrap();
+			assert_eq!(count, 10);
+		}
+
+		// Test count with limit of 0
+		{
+			let tx = store.begin().unwrap();
+			let count = tx.count(b"key01", b"key99", Some(0)).unwrap();
+			assert_eq!(count, 0);
 		}
 	}
 
@@ -3889,11 +3958,11 @@ mod tests {
 
 		// Test count_at_version at first timestamp
 		let tx = tree.begin().unwrap();
-		let count_at_ts1 = tx.count_at_version(b"key1", b"key5", ts1).unwrap();
+		let count_at_ts1 = tx.count_at_version(b"key1", b"key5", ts1, None).unwrap();
 		assert_eq!(count_at_ts1, 3); // key1, key2, key3
 
 		// Test count_at_version at second timestamp
-		let count_at_ts2 = tx.count_at_version(b"key1", b"key5", ts2).unwrap();
+		let count_at_ts2 = tx.count_at_version(b"key1", b"key5", ts2, None).unwrap();
 		assert_eq!(count_at_ts2, 4); // key1, key2, key3, key4
 	}
 
@@ -3914,7 +3983,8 @@ mod tests {
 
 		// Count at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
-		let count_before = tx_before.count_at_version(b"key1", b"key4", ts_after_insert).unwrap();
+		let count_before =
+			tx_before.count_at_version(b"key1", b"key4", ts_after_insert, None).unwrap();
 		assert_eq!(count_before, 3, "Should have all 3 keys before deletes");
 
 		// Delete some keys
@@ -3926,11 +3996,13 @@ mod tests {
 
 		// Count after deletes
 		let tx_after = tree.begin().unwrap();
-		let count_after = tx_after.count_at_version(b"key1", b"key4", ts_after_delete).unwrap();
+		let count_after =
+			tx_after.count_at_version(b"key1", b"key4", ts_after_delete, None).unwrap();
 		assert_eq!(count_after, 1, "Should have only 1 key after deletes");
 
 		// Verify we can still count at the earlier timestamp
-		let count_at_old_ts = tx_after.count_at_version(b"key1", b"key4", ts_after_insert).unwrap();
+		let count_at_old_ts =
+			tx_after.count_at_version(b"key1", b"key4", ts_after_insert, None).unwrap();
 		assert_eq!(count_at_old_ts, 3, "Should still have 3 keys at old timestamp");
 	}
 

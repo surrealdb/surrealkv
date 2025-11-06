@@ -266,11 +266,19 @@ impl Snapshot {
 		start: Key,
 		end: Key,
 		keys_only: bool,
+		count_only: bool,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
 		// Create a range from start (inclusive) to end (exclusive)
 		let range = start.as_ref().to_vec()..end.as_ref().to_vec();
-		SnapshotIterator::new_from(self.core.clone(), self.seq_num, range, keys_only, limit)
+		SnapshotIterator::new_from(
+			self.core.clone(),
+			self.seq_num,
+			range,
+			keys_only,
+			count_only,
+			limit,
+		)
 	}
 
 	/// Queries the versioned index for a specific key at a specific timestamp
@@ -992,6 +1000,8 @@ pub(crate) struct SnapshotIterator<'a> {
 	core: Arc<Core>,
 	/// When true, only return keys without resolving values
 	keys_only: bool,
+	/// When true, skip key allocation entirely (for count operations)
+	count_only: bool,
 	/// Maximum number of items to return
 	limit: usize,
 	/// Current count of items returned
@@ -1005,6 +1015,7 @@ impl SnapshotIterator<'_> {
 		seq_num: u64,
 		range: R,
 		keys_only: bool,
+		count_only: bool,
 		limit: Option<usize>,
 	) -> Result<Self>
 	where
@@ -1038,6 +1049,7 @@ impl SnapshotIterator<'_> {
 			pipeline,
 			core,
 			keys_only,
+			count_only,
 			limit: limit.unwrap_or(usize::MAX),
 			count: 0,
 		})
@@ -1054,6 +1066,12 @@ impl Iterator for SnapshotIterator<'_> {
 
 		if let Some((key, value)) = self.pipeline.next() {
 			self.count += 1;
+
+			if self.count_only {
+				// For count-only mode, return empty Bytes to avoid any allocation
+				return Some(Ok((Bytes::new(), None)));
+			}
+
 			if self.keys_only {
 				// For keys-only mode, return None for the value to avoid allocations
 				Some(Ok((key.user_key.clone(), None)))
@@ -1078,6 +1096,12 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 
 		if let Some((key, value)) = self.pipeline.next_back() {
 			self.count += 1;
+
+			if self.count_only {
+				// For count-only mode, return empty Bytes to avoid any allocation
+				return Some(Ok((Bytes::new(), None)));
+			}
+
 			if self.keys_only {
 				// For keys-only mode, return None for the value to avoid allocations
 				Some(Ok((key.user_key.clone(), None)))
@@ -1504,7 +1528,7 @@ mod tests {
 		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Get keys only ([key1, key6) to include key5)
-		let keys_only_iter = tx.range(b"key1", b"key6", true, None).unwrap();
+		let keys_only_iter = tx.range(b"key1", b"key6", true, false, None).unwrap();
 		let keys_only: Vec<_> = keys_only_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Verify we got all 5 keys
@@ -1520,7 +1544,7 @@ mod tests {
 		}
 
 		// Compare with regular range scan ([key1, key6) to include key5)
-		let regular_range_iter = tx.range(b"key1", b"key6", false, None).unwrap();
+		let regular_range_iter = tx.range(b"key1", b"key6", false, false, None).unwrap();
 		let regular_range: Vec<_> = regular_range_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(regular_range.len(), keys_only.len());
@@ -1605,7 +1629,7 @@ mod tests {
 		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Test forward iteration ([key1, key6) to include key5)
-		let forward_iter = tx.range(b"key1", b"key6", false, None).unwrap();
+		let forward_iter = tx.range(b"key1", b"key6", false, false, None).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(forward_items.len(), 5);
@@ -1613,7 +1637,7 @@ mod tests {
 		assert_eq!(forward_items[4].0.as_ref(), b"key5");
 
 		// Test backward iteration ([key1, key6) to include key5)
-		let backward_iter = tx.range(b"key1", b"key6", false, None).unwrap();
+		let backward_iter = tx.range(b"key1", b"key6", false, false, None).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(backward_items.len(), 5);
@@ -1654,23 +1678,23 @@ mod tests {
 
 		// Test forward iteration on first snapshot (should see all keys)
 		let tx1_ref = tx1.snapshot.as_ref().unwrap();
-		let forward_iter1 = tx1_ref.range(b"key1", b"key4", false, None).unwrap();
+		let forward_iter1 = tx1_ref.range(b"key1", b"key4", false, false, None).unwrap();
 		let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items1.len(), 3);
 
 		// Test backward iteration on first snapshot
-		let backward_iter1 = tx1_ref.range(b"key1", b"key4", false, None).unwrap();
+		let backward_iter1 = tx1_ref.range(b"key1", b"key4", false, false, None).unwrap();
 		let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items1.len(), 3);
 
 		// Test forward iteration on second snapshot (should not see deleted key)
 		let tx2_ref = tx2.snapshot.as_ref().unwrap();
-		let forward_iter2 = tx2_ref.range(b"key1", b"key4", false, None).unwrap();
+		let forward_iter2 = tx2_ref.range(b"key1", b"key4", false, false, None).unwrap();
 		let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items2.len(), 2);
 
 		// Test backward iteration on second snapshot
-		let backward_iter2 = tx2_ref.range(b"key1", b"key4", false, None).unwrap();
+		let backward_iter2 = tx2_ref.range(b"key1", b"key4", false, false, None).unwrap();
 		let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items2.len(), 2);
 
@@ -1747,7 +1771,7 @@ mod tests {
 		// Test forward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let forward_iter = snapshot_ref.range(b"key1", b"key6", false, None).unwrap();
+			let forward_iter = snapshot_ref.range(b"key1", b"key6", false, false, None).unwrap();
 			let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 			assert_eq!(forward_items.len(), 3); // key1, key3, key5
@@ -1759,7 +1783,7 @@ mod tests {
 		// Test backward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let backward_iter = snapshot_ref.range(b"key1", b"key6", false, None).unwrap();
+			let backward_iter = snapshot_ref.range(b"key1", b"key6", false, false, None).unwrap();
 			let backward_items: Vec<_> =
 				backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -1802,7 +1826,7 @@ mod tests {
 		{
 			let tx1_ref = tx1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx1_ref
-				.range(b"key1", b"key5", false, None)
+				.range(b"key1", b"key5", false, false, None)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1813,7 +1837,7 @@ mod tests {
 		{
 			let tx2_ref = tx2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx2_ref
-				.range(b"key1", b"key5", false, None)
+				.range(b"key1", b"key5", false, false, None)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1843,11 +1867,11 @@ mod tests {
 
 		// Test forward iteration
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let forward_iter = snapshot_ref.range(b"key01", b"key11", false, None).unwrap();
+		let forward_iter = snapshot_ref.range(b"key01", b"key11", false, false, None).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Test backward iteration
-		let backward_iter = snapshot_ref.range(b"key01", b"key11", false, None).unwrap();
+		let backward_iter = snapshot_ref.range(b"key01", b"key11", false, false, None).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Both should have 10 items
