@@ -1115,7 +1115,8 @@ impl<'a> TransactionRangeIterator<'a> {
 		let end_bytes = Bytes::copy_from_slice(&end_key);
 
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
+		let iter =
+			snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only, options.limit)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)
