@@ -833,6 +833,16 @@ impl Table {
 			.map(|range| range.overlaps(other_range))
 			.unwrap_or(false)
 	}
+
+	/// Checks if this table is entirely before the given user key
+	/// Returns true if all keys in this table are less than the given key
+	pub(crate) fn is_entirely_before(&self, user_key: &[u8]) -> bool {
+		if let Some(ref range) = self.meta.properties.key_range {
+			self.opts.comparator.compare(&range.high, user_key) == Ordering::Less
+		} else {
+			false // If no key range is defined, we can't determine if it's before
+		}
+	}
 }
 
 pub(crate) struct TableIterator {

@@ -698,10 +698,11 @@ impl<'a> KMergeIterator<'a> {
 			};
 
 			// Active memtable with range
-			let active_iter = state_ref.active.range(range.clone(), keys_only).filter(move |item| {
-				// Filter out items that are not visible in this snapshot
-				item.0.seq_num() <= snapshot_seq_num
-			});
+			let active_iter =
+				state_ref.active.range(range.clone(), keys_only).filter(move |item| {
+					// Filter out items that are not visible in this snapshot
+					item.0.seq_num() <= snapshot_seq_num
+				});
 			iterators.push(Box::new(active_iter));
 
 			// Immutable memtables with range
@@ -719,6 +720,17 @@ impl<'a> KMergeIterator<'a> {
 					if !table.overlaps_with_range(&query_range) {
 						continue;
 					}
+
+					// Skip tables entirely before the start bound
+					match &range.0 {
+						Bound::Included(start_key) | Bound::Excluded(start_key) => {
+							if table.is_entirely_before(start_key) {
+								continue; // This entire table is before our start key
+							}
+						}
+						Bound::Unbounded => {}
+					}
+
 					let mut table_iter = table.iter_with_mode(keys_only);
 					// Seek to start if unbounded
 					match &range.0 {
