@@ -1580,7 +1580,7 @@ mod tests {
 		// Test range scan BEFORE flushing (should work from memtables)
 		let txn = tree.begin().unwrap();
 		let range_before_flush: Vec<_> =
-			txn.range(b"a", b"d", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			txn.range(b"a", b"d", None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 		// Should return keys "a", "b", "c" ([a, d) range)
 		assert_eq!(range_before_flush.len(), 3, "Range scan before flush should return 3 items");
@@ -1603,7 +1603,7 @@ mod tests {
 		// Test range scan AFTER flushing (should work from SSTables)
 		let txn = tree.begin().unwrap();
 		let range_after_flush: Vec<_> =
-			txn.range(b"a", b"d", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			txn.range(b"a", b"d", None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 		// Should return the same keys after flush
 		assert_eq!(range_after_flush.len(), 3, "Range scan after flush should return 3 items");
@@ -1670,8 +1670,11 @@ mod tests {
 		let end_key = "key_999999".as_bytes();
 
 		let txn = tree.begin().unwrap();
-		let range_result: Vec<_> =
-			txn.range(start_key, end_key, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range_result: Vec<_> = txn
+			.range(start_key, end_key, None, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect::<Vec<_>>();
 
 		assert_eq!(
 			range_result.len(),
@@ -1703,7 +1706,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let partial_result: Vec<_> = txn
-			.range(partial_start, partial_end, None)
+			.range(partial_start, partial_end, None, None)
 			.unwrap()
 			.map(|r| r.unwrap())
 			.collect::<Vec<_>>();
@@ -1734,7 +1737,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let middle_result: Vec<_> = txn
-			.range(middle_start, middle_end, None)
+			.range(middle_start, middle_end, None, None)
 			.unwrap()
 			.map(|r| r.unwrap())
 			.collect::<Vec<_>>();
@@ -1765,8 +1768,11 @@ mod tests {
 		let end_end = "key_010000".as_bytes();
 
 		let txn = tree.begin().unwrap();
-		let end_result: Vec<_> =
-			txn.range(end_start, end_end, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let end_result: Vec<_> = txn
+			.range(end_start, end_end, None, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect::<Vec<_>>();
 
 		assert_eq!(end_result.len(), 100, "End range scan should return 100 items");
 
@@ -1795,7 +1801,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let single_result: Vec<_> = txn
-			.range(single_start, single_end, None)
+			.range(single_start, single_end, None, None)
 			.unwrap()
 			.map(|r| r.unwrap())
 			.collect::<Vec<_>>();
@@ -1814,7 +1820,7 @@ mod tests {
 		let empty_end = "key_888888".as_bytes(); // end < start, should be empty
 
 		let txn = tree.begin().unwrap();
-		let empty_result: Vec<_> = txn.range(empty_start, empty_end, None).unwrap().collect();
+		let empty_result: Vec<_> = txn.range(empty_start, empty_end, None, None).unwrap().collect();
 
 		assert_eq!(empty_result.len(), 0, "Empty range scan should return 0 items");
 	}
@@ -1849,7 +1855,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let range_result: Vec<_> = txn
-			.range(start_key, end_key, None)
+			.range(start_key, end_key, None, None)
 			.unwrap()
 			.skip(5000)
 			.take(100)
@@ -1926,7 +1932,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let range_result: Vec<_> = txn
-			.range(&beg, &end, None)
+			.range(&beg, &end, None, None)
 			.unwrap()
 			.skip(5000)
 			.take(100)
@@ -1959,6 +1965,101 @@ mod tests {
 	}
 
 	#[test(tokio::test)]
+	async fn test_native_skip_parameter() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_small_memtable_options(path.clone());
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Insert 100,000 records to match crud-bench scenario
+		const TOTAL_ITEMS: usize = 100_000;
+
+		for i in 0..TOTAL_ITEMS {
+			let key = format!("key_{i:06}");
+			let value = format!("value_{i:06}");
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		tree.flush().unwrap();
+
+		let start_key = "key_000000".as_bytes();
+		let end_key = "key_999999".as_bytes();
+
+		// Test native skip parameter: skip 5000, return 100
+		let txn = tree.begin().unwrap();
+		let results: Vec<_> = txn
+			.keys(start_key, end_key, Some(5000), Some(100))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
+
+		assert_eq!(results.len(), 100, "Native skip(5000) with limit(100) should return 100 items");
+
+		// Verify the results are items 5000-5099
+		for (idx, key) in results.iter().enumerate() {
+			let expected_idx = 5000 + idx;
+			let expected_key = format!("key_{expected_idx:06}");
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			assert_eq!(
+				key_str, expected_key,
+				"Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
+			);
+		}
+
+		// Test with range() instead of keys()
+		let txn = tree.begin().unwrap();
+		let range_results: Vec<_> = txn
+			.range(start_key, end_key, Some(5000), Some(100))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
+
+		assert_eq!(
+			range_results.len(),
+			100,
+			"Native skip(5000) with limit(100) on range() should return 100 items"
+		);
+
+		// Verify the results match
+		for (idx, (key, value)) in range_results.iter().enumerate() {
+			let expected_idx = 5000 + idx;
+			let expected_key = format!("key_{expected_idx:06}");
+			let expected_value = format!("value_{expected_idx:06}");
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
+			assert_eq!(key_str, expected_key);
+			assert_eq!(value_str, expected_value);
+		}
+
+		// Test with count()
+		let txn = tree.begin().unwrap();
+		let count = txn.count(start_key, end_key, Some(5000), Some(100)).unwrap();
+		assert_eq!(count, 100, "Native skip(5000) with limit(100) on count() should return 100");
+
+		// Test skip beyond available data
+		let txn = tree.begin().unwrap();
+		let empty_results: Vec<_> = txn
+			.keys(start_key, end_key, Some(150_000), Some(100))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
+		assert_eq!(empty_results.len(), 0, "Skip beyond data should return 0 items");
+
+		// Test skip at boundary
+		let txn = tree.begin().unwrap();
+		let boundary_results: Vec<_> = txn
+			.keys(start_key, end_key, Some(99_900), Some(100))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
+		assert_eq!(boundary_results.len(), 100, "Skip near end should return remaining items");
+	}
+
+	#[test(tokio::test)]
 	async fn test_range_limit_functionality() {
 		let temp_dir = create_temp_directory();
 		let path = temp_dir.path().to_path_buf();
@@ -1988,7 +2089,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let limited_result: Vec<_> = txn
-			.range(&beg, &end, Some(100))
+			.range(&beg, &end, None, Some(100))
 			.unwrap()
 			.map(|r| match r {
 				Ok(kv) => kv,
@@ -2023,8 +2124,11 @@ mod tests {
 		}
 
 		let txn = tree.begin().unwrap();
-		let limited_result_1000: Vec<_> =
-			txn.range(&beg, &end, Some(1000)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let limited_result_1000: Vec<_> = txn
+			.range(&beg, &end, None, Some(1000))
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect::<Vec<_>>();
 
 		assert_eq!(
 			limited_result_1000.len(),
@@ -2050,7 +2154,8 @@ mod tests {
 		}
 
 		let txn = tree.begin().unwrap();
-		let limited_result_large: Vec<_> = txn.range(&beg, &end, Some(15000)).unwrap().collect();
+		let limited_result_large: Vec<_> =
+			txn.range(&beg, &end, None, Some(15000)).unwrap().collect();
 
 		assert_eq!(
 			limited_result_large.len(),
@@ -2059,7 +2164,7 @@ mod tests {
 		);
 
 		let txn = tree.begin().unwrap();
-		let unlimited_result: Vec<_> = txn.range(&beg, &end, None).unwrap().collect();
+		let unlimited_result: Vec<_> = txn.range(&beg, &end, None, None).unwrap().collect();
 
 		assert_eq!(
 			unlimited_result.len(),
@@ -2069,7 +2174,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let single_result: Vec<_> =
-			txn.range(&beg, &end, Some(1)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			txn.range(&beg, &end, None, Some(1)).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 		assert_eq!(single_result.len(), 1, "Range scan with limit 1 should return exactly 1 item");
 
@@ -2081,7 +2186,7 @@ mod tests {
 		assert_eq!(value_str, "value_000000_content_data_0");
 
 		let txn = tree.begin().unwrap();
-		let zero_result: Vec<_> = txn.range(&beg, &end, Some(0)).unwrap().collect();
+		let zero_result: Vec<_> = txn.range(&beg, &end, None, Some(0)).unwrap().collect();
 
 		assert_eq!(zero_result.len(), 0, "Range scan with limit 0 should return no items");
 	}
@@ -2115,7 +2220,7 @@ mod tests {
 		let end = [255u8].to_vec();
 
 		let txn = tree.begin().unwrap();
-		let iter = txn.range(&beg, &end, Some(100)).unwrap();
+		let iter = txn.range(&beg, &end, None, Some(100)).unwrap();
 		let iter = iter.into_iter();
 
 		let range_result: Vec<_> = iter.skip(5000).take(100).collect();
@@ -2128,7 +2233,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let unlimited_range_result: Vec<_> = txn
-			.range(&beg, &end, None)
+			.range(&beg, &end, None, None)
 			.unwrap()
 			.skip(5000)
 			.take(100)
@@ -2161,7 +2266,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let large_limit_result: Vec<_> = txn
-			.range(&beg, &end, Some(10000))
+			.range(&beg, &end, None, Some(10000))
 			.unwrap()
 			.skip(5000)
 			.take(100)
@@ -2195,7 +2300,7 @@ mod tests {
 		// Case: limit larger than total items, but skip is large
 		let txn = tree.begin().unwrap();
 		let res: Vec<_> = txn
-			.range(&beg, &end, Some(5050))
+			.range(&beg, &end, None, Some(5050))
 			.unwrap()
 			.skip(5000)
 			.take(100)
@@ -3265,7 +3370,7 @@ mod tests {
 			// Test range scan to ensure soft deleted key doesn't appear
 			let txn = tree.begin().unwrap();
 			let range_result: Vec<_> = txn
-				.range(b"test".as_slice(), b"testz".as_slice(), None)
+				.range(b"test".as_slice(), b"testz".as_slice(), None, None)
 				.unwrap()
 				.map(|r| r.unwrap())
 				.collect::<Vec<_>>();
@@ -3276,7 +3381,7 @@ mod tests {
 			// Test range scan that includes the other key
 			let txn = tree.begin().unwrap();
 			let range_result: Vec<_> = txn
-				.range(b"other".as_slice(), b"otherz".as_slice(), None)
+				.range(b"other".as_slice(), b"otherz".as_slice(), None, None)
 				.unwrap()
 				.map(|r| r.unwrap())
 				.collect::<Vec<_>>();

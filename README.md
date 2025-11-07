@@ -162,17 +162,22 @@ Range operations support efficient iteration over key ranges with optional limit
 ```rust
 // Range scan between keys (inclusive start, exclusive end)
 let mut txn = tree.begin()?;
-let range: Vec<_> = txn.range(b"key1", b"key5", None)?
+let range: Vec<_> = txn.range(b"key1", b"key5", None, None)?
     .map(|r| r.unwrap())
     .collect();
 
 // Keys-only scan (faster, doesn't fetch values when vlog is enabled)
-let keys: Vec<_> = txn.keys(b"key1", b"key5", None)?
+let keys: Vec<_> = txn.keys(b"key1", b"key5", None, None)?
     .map(|r| r.unwrap())
     .collect();
 
 // Range with limit
-let limited: Vec<_> = txn.range(b"key1", b"key9", Some(10))?
+let limited: Vec<_> = txn.range(b"key1", b"key9", None, Some(10))?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Efficient pagination with skip (fetch records 5000-6000)
+let page: Vec<_> = txn.range(b"key1", b"key9", Some(5000), Some(1000))?
     .map(|r| r.unwrap())
     .collect();
 
@@ -191,11 +196,11 @@ Efficiently count keys in a range without iterating through all values:
 let mut txn = tree.begin()?;
 
 // Count all keys between "key1" and "key9"
-let count = txn.count(b"key1", b"key9", None)?;
+let count = txn.count(b"key1", b"key9", None, None)?;
 println!("Found {} keys", count);
 
 // Count with a limit (useful for "at least N" checks)
-let count = txn.count(b"key1", b"key9", Some(100))?;
+let count = txn.count(b"key1", b"key9", None, Some(100))?;
 println!("Found at least {} keys (limited to 100)", count.min(100));
 
 // Count with custom options (limit, bounds, etc.)
@@ -351,6 +356,18 @@ let options = ReadOptions::new()
     .with_iterate_upper_bound(Some(b"z".to_vec()));
 
 let historical_data: Vec<_> = tx.range_with_options(&options)?
+    .map(|r| r.unwrap())
+    .collect();
+
+// Efficient pagination with skip (e.g., page 6 with 1000 items per page)
+// Skip is optimized to avoid materializing skipped entries
+let options = ReadOptions::new()
+    .with_skip(Some(5000))
+    .with_limit(Some(1000))
+    .with_iterate_lower_bound(Some(b"a".to_vec()))
+    .with_iterate_upper_bound(Some(b"z".to_vec()));
+
+let page_results: Vec<_> = tx.range_with_options(&options)?
     .map(|r| r.unwrap())
     .collect();
 ```

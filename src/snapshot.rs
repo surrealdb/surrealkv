@@ -1183,7 +1183,7 @@ mod tests {
 
 		// Range scan should return empty
 		let range: Vec<_> =
-			tx.range(b"a", b"z", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx.range(b"a", b"z", None, None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert!(range.is_empty());
 	}
@@ -1212,8 +1212,11 @@ mod tests {
 		}
 
 		// The read transaction should only see the initial data
-		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = read_tx
+			.range(b"key0", b"key:", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1244,8 +1247,11 @@ mod tests {
 		}
 
 		// The read transaction should see the old values
-		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = read_tx
+			.range(b"key0", b"key:", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v1");
@@ -1253,8 +1259,11 @@ mod tests {
 
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
-		let range: Vec<_> =
-			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = new_tx
+			.range(b"key0", b"key:", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v2");
@@ -1285,8 +1294,11 @@ mod tests {
 		}
 
 		// The first read transaction should still see all three keys
-		let range: Vec<_> =
-			read_tx1.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = read_tx1
+			.range(b"key0", b"key:", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1295,8 +1307,11 @@ mod tests {
 
 		// A new transaction should not see the deleted key
 		let read_tx2 = store.begin().unwrap();
-		let range: Vec<_> =
-			read_tx2.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = read_tx2
+			.range(b"key0", b"key:", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1379,8 +1394,11 @@ mod tests {
 		let tx2 = store.begin().unwrap();
 
 		// tx1 should see all original data
-		let range1: Vec<_> =
-			tx1.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range1: Vec<_> = tx1
+			.range(b"key00", b"key99", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range1.len(), 10);
 		for (i, item) in range1.iter().enumerate() {
@@ -1392,8 +1410,11 @@ mod tests {
 		}
 
 		// tx2 should see updated data with deletions
-		let range2: Vec<_> =
-			tx2.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range2: Vec<_> = tx2
+			.range(b"key00", b"key99", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -1477,13 +1498,14 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Test different range queries
-		let numeric_range: Vec<_> = tx.range(b"000", b"999", None).unwrap().collect::<Vec<_>>();
+		let numeric_range: Vec<_> =
+			tx.range(b"000", b"999", None, None).unwrap().collect::<Vec<_>>();
 		assert_eq!(numeric_range.len(), 10);
 
-		let alpha_range: Vec<_> = tx.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
+		let alpha_range: Vec<_> = tx.range(b"a", b"z", None, None).unwrap().collect::<Vec<_>>();
 		assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-		let mixed_range: Vec<_> = tx.range(b"mix", b"miy", None).unwrap().collect::<Vec<_>>();
+		let mixed_range: Vec<_> = tx.range(b"mix", b"miy", None, None).unwrap().collect::<Vec<_>>();
 		assert_eq!(mixed_range.len(), 5);
 	}
 
@@ -1506,8 +1528,11 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Range scan should return keys in sorted order
-		let range: Vec<_> =
-			tx.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = tx
+			.range(b"key00", b"key99", None, None)
+			.unwrap()
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
 
 		assert_eq!(range.len(), 9);
 

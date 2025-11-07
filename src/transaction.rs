@@ -107,6 +107,8 @@ pub struct ReadOptions {
 	pub count_only: bool,
 	/// Maximum number of items to return (for range operations)
 	pub limit: Option<usize>,
+	/// Number of entries to skip before returning results (for pagination)
+	pub skip: Option<usize>,
 	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
 	pub iterate_lower_bound: Option<Vec<u8>>,
 	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
@@ -136,6 +138,12 @@ impl ReadOptions {
 	/// Sets the maximum number of items to return
 	pub fn with_limit(mut self, limit: Option<usize>) -> Self {
 		self.limit = limit;
+		self
+	}
+
+	/// Sets the number of entries to skip before returning results
+	pub fn with_skip(mut self, skip: Option<usize>) -> Self {
+		self.skip = skip;
 		self
 	}
 
@@ -485,11 +493,17 @@ impl Transaction {
 	///
 	/// This is more efficient than creating an iterator and counting manually,
 	/// as it doesn't need to allocate or return the actual keys.
-	pub fn count<K>(&self, start: K, end: K, limit: Option<usize>) -> Result<usize>
+	pub fn count<K>(
+		&self,
+		start: K,
+		end: K,
+		skip: Option<usize>,
+		limit: Option<usize>,
+	) -> Result<usize>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_limit(limit);
+		let mut options = ReadOptions::default().with_skip(skip).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
@@ -507,12 +521,16 @@ impl Transaction {
 		start: K,
 		end: K,
 		timestamp: u64,
+		skip: Option<usize>,
 		limit: Option<usize>,
 	) -> Result<usize>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_timestamp(Some(timestamp)).with_limit(limit);
+		let mut options = ReadOptions::default()
+			.with_timestamp(Some(timestamp))
+			.with_skip(skip)
+			.with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.count_with_options(&options)
@@ -548,7 +566,8 @@ impl Transaction {
 			if !self.core.opts.enable_versioning {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
-			let keys_iter = self.keys_at_version(start_key, end_key, timestamp, options.limit)?;
+			let keys_iter =
+				self.keys_at_version(start_key, end_key, timestamp, options.skip, options.limit)?;
 			return Ok(keys_iter.count());
 		}
 
@@ -604,12 +623,14 @@ impl Transaction {
 		&self,
 		start: K,
 		end: K,
+		skip: Option<usize>,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_keys_only(true).with_limit(limit);
+		let mut options =
+			ReadOptions::default().with_keys_only(true).with_skip(skip).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.keys_with_options(&options)
@@ -631,6 +652,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		timestamp: u64,
+		skip: Option<usize>,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
@@ -638,6 +660,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default()
 			.with_keys_only(true)
+			.with_skip(skip)
 			.with_limit(limit)
 			.with_timestamp(Some(timestamp));
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
@@ -707,12 +730,13 @@ impl Transaction {
 		&self,
 		start: K,
 		end: K,
+		skip: Option<usize>,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_limit(limit);
+		let mut options = ReadOptions::default().with_skip(skip).with_limit(limit);
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.range_with_options(&options)
@@ -731,12 +755,16 @@ impl Transaction {
 		start: K,
 		end: K,
 		timestamp: u64,
+		skip: Option<usize>,
 		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
 		K: IntoBytes,
 	{
-		let mut options = ReadOptions::default().with_limit(limit).with_timestamp(Some(timestamp));
+		let mut options = ReadOptions::default()
+			.with_skip(skip)
+			.with_limit(limit)
+			.with_timestamp(Some(timestamp));
 		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
 		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
 		self.range_with_options(&options)
@@ -1098,6 +1126,9 @@ pub(crate) struct TransactionRangeIterator<'a> {
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
+
+	/// Number of entries left to skip before returning results
+	skip_remaining: usize,
 }
 
 impl<'a> TransactionRangeIterator<'a> {
@@ -1128,12 +1159,19 @@ impl<'a> TransactionRangeIterator<'a> {
 		let end_bytes = Bytes::copy_from_slice(&end_key);
 
 		// Create a snapshot iterator for the range
+		// Note: Adjust the limit passed to snapshot to account for entries that will be skipped
+		// TransactionRangeIterator handles skip at the top level
+		let snapshot_limit = match (options.skip, options.limit) {
+			(Some(skip), Some(limit)) => Some(skip.saturating_add(limit)),
+			(Some(_skip), None) => None, // No limit means unlimited
+			(None, limit) => limit,
+		};
 		let iter = snapshot.range(
 			start_bytes.clone(),
 			end_bytes.clone(),
 			options.keys_only,
 			options.count_only,
-			options.limit,
+			snapshot_limit,
 		)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
@@ -1147,6 +1185,7 @@ impl<'a> TransactionRangeIterator<'a> {
 			limit: options.limit.unwrap_or(usize::MAX),
 			count: 0,
 			keys_only: options.keys_only,
+			skip_remaining: options.skip.unwrap_or(0),
 		})
 	}
 
@@ -1189,13 +1228,9 @@ impl<'a> TransactionRangeIterator<'a> {
 		}
 		None
 	}
-}
 
-impl Iterator for TransactionRangeIterator<'_> {
-	type Item = IterResult;
-
-	/// Merges results from write set and snapshot in key order
-	fn next(&mut self) -> Option<Self::Item> {
+	/// Internal method that performs the actual iteration logic without skip handling
+	fn next_internal(&mut self) -> Option<IterResult> {
 		if self.count >= self.limit {
 			return None;
 		}
@@ -1256,11 +1291,9 @@ impl Iterator for TransactionRangeIterator<'_> {
 
 		result
 	}
-}
 
-impl DoubleEndedIterator for TransactionRangeIterator<'_> {
-	/// Merges results from write set and snapshot in reverse key order
-	fn next_back(&mut self) -> Option<Self::Item> {
+	/// Internal method that performs the actual reverse iteration logic without skip handling
+	fn next_back_internal(&mut self) -> Option<IterResult> {
 		if self.count >= self.limit {
 			return None;
 		}
@@ -1320,6 +1353,68 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 		}
 
 		result
+	}
+}
+
+impl Iterator for TransactionRangeIterator<'_> {
+	type Item = IterResult;
+
+	/// Merges results from write set and snapshot in key order
+	fn next(&mut self) -> Option<Self::Item> {
+		// Handle skip phase - iterate without returning results
+		while self.skip_remaining > 0 {
+			// Temporarily decrease limit and count to not affect skip iteration
+			let saved_count = self.count;
+			self.count = 0;
+			let saved_limit = self.limit;
+			self.limit = usize::MAX;
+
+			let result = self.next_internal();
+
+			// Restore count and limit
+			self.count = saved_count;
+			self.limit = saved_limit;
+
+			if result.is_some() {
+				self.skip_remaining -= 1;
+			} else {
+				// No more items to skip, we've reached the end
+				return None;
+			}
+		}
+
+		// Normal iteration after skip phase
+		self.next_internal()
+	}
+}
+
+impl DoubleEndedIterator for TransactionRangeIterator<'_> {
+	/// Merges results from write set and snapshot in reverse key order
+	fn next_back(&mut self) -> Option<Self::Item> {
+		// Handle skip phase - iterate without returning results
+		while self.skip_remaining > 0 {
+			// Temporarily decrease limit and count to not affect skip iteration
+			let saved_count = self.count;
+			self.count = 0;
+			let saved_limit = self.limit;
+			self.limit = usize::MAX;
+
+			let result = self.next_back_internal();
+
+			// Restore count and limit
+			self.count = saved_count;
+			self.limit = saved_limit;
+
+			if result.is_some() {
+				self.skip_remaining -= 1;
+			} else {
+				// No more items to skip, we've reached the end
+				return None;
+			}
+		}
+
+		// Normal iteration after skip phase
+		self.next_back_internal()
 	}
 }
 
@@ -1952,8 +2047,11 @@ mod tests {
 		// Test basic range scan
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key2", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key2", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
 			assert_eq!(range[0].0.as_ref(), b"key2");
@@ -1983,7 +2081,7 @@ mod tests {
 			let tx = store.begin().unwrap();
 			let beg = b"".as_slice();
 			let range: Vec<_> =
-				tx.range(beg, b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(beg, b"key4", None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[1].0.as_ref(), b"key2");
@@ -1996,7 +2094,7 @@ mod tests {
 			let beg = b"".as_slice();
 			let end = b"".as_slice();
 			let range: Vec<_> =
-				tx.range(beg, end, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(beg, end, None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 0);
 		}
 	}
@@ -2020,7 +2118,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> = tx
-				.range(b"key01", b"key10", Some(3))
+				.range(b"key01", b"key10", None, Some(3))
 				.unwrap()
 				.map(|r| r.unwrap())
 				.collect::<Vec<_>>();
@@ -2058,7 +2156,7 @@ mod tests {
 
 			// Range should see all changes ([a, f) to include e)
 			let range: Vec<_> =
-				tx.range(b"a", b"f", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"a", b"f", None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
 			assert_eq!(range[0], (Bytes::from_static(b"a"), Bytes::from_static(b"1")));
@@ -2093,8 +2191,11 @@ mod tests {
 			tx.delete(b"key4").unwrap();
 
 			// Range should not see deleted keys ([key1, key6) to include key5)
-			let range: Vec<_> =
-				tx.range(b"key1", b"key6", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key6", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2125,8 +2226,11 @@ mod tests {
 			tx.set(b"key2", b"new_value2").unwrap();
 
 			// Range should see the new value ([key1, key4) to include key3)
-			let range: Vec<_> =
-				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[1], (Bytes::from_static(b"key2"), Bytes::from_static(b"new_value2")));
@@ -2149,7 +2253,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
-				tx.range(b"m", b"n", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+				tx.range(b"m", b"n", None, None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 0);
 		}
@@ -2173,8 +2277,11 @@ mod tests {
 		// Verify correct ordering in range ([key1, key6) to include key5)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key1", b"key6", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key6", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
 			for (i, item) in range.iter().enumerate().take(5) {
@@ -2202,8 +2309,11 @@ mod tests {
 			let tx = store.begin().unwrap();
 
 			// Range includes start but excludes end
-			let range: Vec<_> =
-				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2213,8 +2323,11 @@ mod tests {
 		// Test single key range ([key2, key3) to include only key2)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key2", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key2", b"key3", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
 			assert_eq!(range[0].0.as_ref(), b"key2");
@@ -2235,7 +2348,7 @@ mod tests {
 
 			let end_key = b"key\x01";
 			let range: Vec<_> = tx
-				.range(b"key".as_slice(), end_key.as_slice(), None)
+				.range(b"key".as_slice(), end_key.as_slice(), None, None)
 				.unwrap()
 				.map(|r| r.unwrap())
 				.collect::<Vec<_>>();
@@ -2268,8 +2381,11 @@ mod tests {
 			tx.set(b"key6", b"value6").unwrap();
 
 			// Get keys only
-			let keys_only: Vec<_> =
-				tx.keys(b"key1", b"key9", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let keys_only: Vec<_> = tx
+				.keys(b"key1", b"key9", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			// Verify we got all 6 keys (5 from storage + 1 from write set)
 			assert_eq!(keys_only.len(), 6);
@@ -2281,8 +2397,11 @@ mod tests {
 			}
 
 			// Compare with regular range
-			let regular_range: Vec<_> =
-				tx.range(b"key1", b"key9", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let regular_range: Vec<_> = tx
+				.range(b"key1", b"key9", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			// Should have same number of items
 			assert_eq!(regular_range.len(), keys_only.len());
@@ -2311,8 +2430,11 @@ mod tests {
 			// Test with a deleted key
 			tx.delete(b"key3").unwrap();
 
-			let keys_after_delete: Vec<_> =
-				tx.keys(b"key1", b"key9", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let keys_after_delete: Vec<_> = tx
+				.keys(b"key1", b"key9", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			// Should have 5 keys now (key3 is deleted)
 			assert_eq!(keys_after_delete.len(), 5);
@@ -2387,8 +2509,11 @@ mod tests {
 		{
 			let txn = tree.begin().unwrap();
 
-			let range_results: Vec<_> =
-				txn.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range_results: Vec<_> = txn
+				.range(b"key1", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
 
@@ -2444,7 +2569,7 @@ mod tests {
 			// Test reverse iteration
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2489,7 +2614,7 @@ mod tests {
 				tx.set(b"key4", b"new_value4").unwrap();
 				tx.set(b"key6", b"new_value6").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key7", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key7", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2536,7 +2661,7 @@ mod tests {
 				tx.delete(b"key2").unwrap();
 				tx.delete(b"key4").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2584,7 +2709,7 @@ mod tests {
 				tx.soft_delete(b"key2").unwrap();
 				tx.soft_delete(b"key4").unwrap();
 
-				let mut iter = tx.range(b"key1", b"key6", None).unwrap();
+				let mut iter = tx.range(b"key1", b"key6", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2627,7 +2752,7 @@ mod tests {
 			// Test reverse iteration with limit
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key01", b"key11", Some(3)).unwrap();
+				let mut iter = tx.range(b"key01", b"key11", None, Some(3)).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2664,7 +2789,7 @@ mod tests {
 			// Test reverse iteration with keys only
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.keys(b"key1", b"key4", None).unwrap();
+				let mut iter = tx.keys(b"key1", b"key4", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2711,7 +2836,7 @@ mod tests {
 				tx.soft_delete(b"key4").unwrap(); // Soft delete existing
 				tx.set(b"key6", b"new_value6").unwrap(); // New key
 
-				let mut iter = tx.range(b"key0", b"key7", None).unwrap();
+				let mut iter = tx.range(b"key0", b"key7", None, None).unwrap();
 
 				// Collect in reverse order
 				let mut reverse_results = Vec::new();
@@ -2753,7 +2878,7 @@ mod tests {
 			// Test reverse iteration on empty range
 			{
 				let tx = store.begin().unwrap();
-				let mut iter = tx.range(b"key2", b"key5", None).unwrap();
+				let mut iter = tx.range(b"key2", b"key5", None, None).unwrap();
 
 				// Should get no results
 				assert!(iter.next_back().is_none());
@@ -2780,10 +2905,11 @@ mod tests {
 				let tx = store.begin().unwrap();
 
 				// Forward iteration
-				let forward_results: Vec<_> = tx.range(b"key1", b"key5", None).unwrap().collect();
+				let forward_results: Vec<_> =
+					tx.range(b"key1", b"key5", None, None).unwrap().collect();
 
 				// Reverse iteration
-				let mut reverse_iter = tx.range(b"key1", b"key5", None).unwrap();
+				let mut reverse_iter = tx.range(b"key1", b"key5", None, None).unwrap();
 				let mut reverse_results = Vec::new();
 				while let Some(result) = reverse_iter.next_back() {
 					reverse_results.push(result);
@@ -2908,8 +3034,11 @@ mod tests {
 			txn1.rollback_to_savepoint().unwrap();
 
 			// The scanned value should be the one before the savepoint.
-			let range: Vec<_> =
-				txn1.range(b"k1", b"k3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = txn1
+				.range(b"k1", b"k3", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 			assert_eq!(range.len(), 1);
 			assert_eq!(range[0].0.as_ref(), k1.as_ref());
 			assert_eq!(range[0].1.as_ref(), value.as_ref());
@@ -3026,8 +3155,11 @@ mod tests {
 		// Verify soft deleted key is not visible in range scans ([key1, key4) to include key3)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[1].0.as_ref(), b"key3");
@@ -3066,8 +3198,11 @@ mod tests {
 		// Both should be invisible to range scans ([key1, key4) to include key3)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key1", b"key4", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key4", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key3
 			assert_eq!(range[0].0.as_ref(), b"key3");
 		}
@@ -3097,8 +3232,11 @@ mod tests {
 			assert!(tx.get(b"key1").unwrap().is_none());
 
 			// Range scan within transaction should not see soft deleted key ([key1, key3) to include key2)
-			let range: Vec<_> =
-				tx.range(b"key1", b"key3", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key3", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key2
 			assert_eq!(range[0].0.as_ref(), b"key2");
 
@@ -3178,8 +3316,11 @@ mod tests {
 		// Range scan should not include soft deleted keys ([key01, key11) to include key10)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key01", b"key11", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key01", b"key11", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 
 			// Should have 7 keys (10 - 3 soft deleted)
 			assert_eq!(range.len(), 7);
@@ -3236,8 +3377,11 @@ mod tests {
 		// Range scan should only see updated and unchanged keys ([key1, key5) to include key4)
 		{
 			let tx = store.begin().unwrap();
-			let range: Vec<_> =
-				tx.range(b"key1", b"key5", None).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			let range: Vec<_> = tx
+				.range(b"key1", b"key5", None, None)
+				.unwrap()
+				.map(|r| r.unwrap())
+				.collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key3 and key4
 			assert_eq!(range[0].0.as_ref(), b"key3");
 			assert_eq!(range[1].0.as_ref(), b"key4");
@@ -3363,7 +3507,7 @@ mod tests {
 
 		// Test range_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
-			.range_at_version(b"key1", b"key2", ts1, None)
+			.range_at_version(b"key1", b"key2", ts1, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3371,7 +3515,7 @@ mod tests {
 		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
 
 		let version_at_ts2 = tx
-			.range_at_version(b"key1", b"key2", ts2, None)
+			.range_at_version(b"key1", b"key2", ts2, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3380,7 +3524,7 @@ mod tests {
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
-			.range_at_version(b"key1", b"key2", ts3, None)
+			.range_at_version(b"key1", b"key2", ts3, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3568,8 +3712,11 @@ mod tests {
 
 		// Test keys_at_version at first timestamp
 		let tx = tree.begin().unwrap();
-		let keys_at_ts1: Vec<_> =
-			tx.keys_at_version(b"key1", b"key5", ts1, None).unwrap().map(|r| r.unwrap()).collect();
+		let keys_at_ts1: Vec<_> = tx
+			.keys_at_version(b"key1", b"key5", ts1, None, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys_at_ts1.len(), 3);
 		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key1"));
 		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key2"));
@@ -3577,8 +3724,11 @@ mod tests {
 		assert!(!keys_at_ts1.iter().any(|k| k.as_ref() == b"key4")); // key4 didn't exist at ts1
 
 		// Test keys_at_version at second timestamp
-		let keys_at_ts2: Vec<_> =
-			tx.keys_at_version(b"key1", b"key5", ts2, None).unwrap().map(|r| r.unwrap()).collect();
+		let keys_at_ts2: Vec<_> = tx
+			.keys_at_version(b"key1", b"key5", ts2, None, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys_at_ts2.len(), 4);
 		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key1"));
 		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key2"));
@@ -3587,15 +3737,18 @@ mod tests {
 
 		// Test with limit
 		let keys_limited: Vec<_> = tx
-			.keys_at_version(b"key1", b"key5", ts2, Some(2))
+			.keys_at_version(b"key1", b"key5", ts2, None, Some(2))
 			.unwrap()
 			.map(|r| r.unwrap())
 			.collect();
 		assert_eq!(keys_limited.len(), 2);
 
 		// Test with specific key range
-		let keys_range: Vec<_> =
-			tx.keys_at_version(b"key2", b"key4", ts2, None).unwrap().map(|r| r.unwrap()).collect();
+		let keys_range: Vec<_> = tx
+			.keys_at_version(b"key2", b"key4", ts2, None, None)
+			.unwrap()
+			.map(|r| r.unwrap())
+			.collect();
 		assert_eq!(keys_range.len(), 2);
 		assert!(keys_range.iter().any(|k| k.as_ref() == b"key2"));
 		assert!(keys_range.iter().any(|k| k.as_ref() == b"key3"));
@@ -3625,7 +3778,7 @@ mod tests {
 		// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
 		let tx = tree.begin().unwrap();
 		let keys: Vec<_> = tx
-			.keys_at_version(b"key1", b"key4", u64::MAX, None)
+			.keys_at_version(b"key1", b"key4", u64::MAX, None, None)
 			.unwrap()
 			.map(|r| r.unwrap())
 			.collect();
@@ -3662,7 +3815,7 @@ mod tests {
 		// Test range_at_version at first timestamp
 		let tx = tree.begin().unwrap();
 		let scan_at_ts1 = tx
-			.range_at_version(b"key1", b"key5", ts1, None)
+			.range_at_version(b"key1", b"key5", ts1, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3686,7 +3839,7 @@ mod tests {
 
 		// Test range_at_version at second timestamp
 		let scan_at_ts2 = tx
-			.range_at_version(b"key1", b"key5", ts2, None)
+			.range_at_version(b"key1", b"key5", ts2, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3710,7 +3863,7 @@ mod tests {
 
 		// Test with limit
 		let scan_limited = tx
-			.range_at_version(b"key1", b"key5", ts2, Some(2))
+			.range_at_version(b"key1", b"key5", ts2, None, Some(2))
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3718,7 +3871,7 @@ mod tests {
 
 		// Test with specific key range
 		let scan_range = tx
-			.range_at_version(b"key2", b"key4", ts2, None)
+			.range_at_version(b"key2", b"key4", ts2, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3749,7 +3902,7 @@ mod tests {
 		// Query at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
 		let scan_before = tx_before
-			.range_at_version(b"key1", b"key4", ts_after_insert, None)
+			.range_at_version(b"key1", b"key4", ts_after_insert, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3772,7 +3925,7 @@ mod tests {
 
 		// Perform scan at timestamp after deletes
 		let scan_result = tx
-			.range_at_version(b"key1", b"key4", ts_after_deletes, None)
+			.range_at_version(b"key1", b"key4", ts_after_deletes, None, None)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
@@ -3809,21 +3962,21 @@ mod tests {
 		// Test basic count
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key2", b"key5", None).unwrap();
+			let count = tx.count(b"key2", b"key5", None, None).unwrap();
 			assert_eq!(count, 3); // key2, key3, key4 (key5 is exclusive)
 		}
 
 		// Test count all keys
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"".as_slice(), b"key6", None).unwrap();
+			let count = tx.count(b"".as_slice(), b"key6", None, None).unwrap();
 			assert_eq!(count, 5); // All 5 keys
 		}
 
 		// Test count with no keys in range
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key6", b"key9", None).unwrap();
+			let count = tx.count(b"key6", b"key9", None, None).unwrap();
 			assert_eq!(count, 0);
 		}
 	}
@@ -3852,7 +4005,7 @@ mod tests {
 		// Test count after delete
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key1", b"key5", None).unwrap();
+			let count = tx.count(b"key1", b"key5", None, None).unwrap();
 			assert_eq!(count, 3); // key1, key3, key4 (key2 is deleted)
 		}
 	}
@@ -3876,7 +4029,7 @@ mod tests {
 			tx.set(b"key4", b"value4").unwrap();
 			tx.delete(b"key1").unwrap();
 
-			let count = tx.count(b"".as_slice(), b"key5", None).unwrap();
+			let count = tx.count(b"".as_slice(), b"key5", None, None).unwrap();
 			assert_eq!(count, 3); // key2, key3, key4 (key1 deleted in this tx)
 		}
 	}
@@ -3899,35 +4052,35 @@ mod tests {
 		// Test count with limit less than total
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key01", b"key99", Some(5)).unwrap();
+			let count = tx.count(b"key01", b"key99", None, Some(5)).unwrap();
 			assert_eq!(count, 5); // Limited to 5 even though there are 10 keys
 		}
 
 		// Test count with limit equal to total
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key01", b"key99", Some(10)).unwrap();
+			let count = tx.count(b"key01", b"key99", None, Some(10)).unwrap();
 			assert_eq!(count, 10);
 		}
 
 		// Test count with limit greater than total
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key01", b"key99", Some(20)).unwrap();
+			let count = tx.count(b"key01", b"key99", None, Some(20)).unwrap();
 			assert_eq!(count, 10); // Only 10 keys exist
 		}
 
 		// Test count with no limit
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key01", b"key99", None).unwrap();
+			let count = tx.count(b"key01", b"key99", None, None).unwrap();
 			assert_eq!(count, 10);
 		}
 
 		// Test count with limit of 0
 		{
 			let tx = store.begin().unwrap();
-			let count = tx.count(b"key01", b"key99", Some(0)).unwrap();
+			let count = tx.count(b"key01", b"key99", None, Some(0)).unwrap();
 			assert_eq!(count, 0);
 		}
 	}
@@ -3958,11 +4111,11 @@ mod tests {
 
 		// Test count_at_version at first timestamp
 		let tx = tree.begin().unwrap();
-		let count_at_ts1 = tx.count_at_version(b"key1", b"key5", ts1, None).unwrap();
+		let count_at_ts1 = tx.count_at_version(b"key1", b"key5", ts1, None, None).unwrap();
 		assert_eq!(count_at_ts1, 3); // key1, key2, key3
 
 		// Test count_at_version at second timestamp
-		let count_at_ts2 = tx.count_at_version(b"key1", b"key5", ts2, None).unwrap();
+		let count_at_ts2 = tx.count_at_version(b"key1", b"key5", ts2, None, None).unwrap();
 		assert_eq!(count_at_ts2, 4); // key1, key2, key3, key4
 	}
 
@@ -3984,7 +4137,7 @@ mod tests {
 		// Count at this point should show all three keys
 		let tx_before = tree.begin().unwrap();
 		let count_before =
-			tx_before.count_at_version(b"key1", b"key4", ts_after_insert, None).unwrap();
+			tx_before.count_at_version(b"key1", b"key4", ts_after_insert, None, None).unwrap();
 		assert_eq!(count_before, 3, "Should have all 3 keys before deletes");
 
 		// Delete some keys
@@ -3997,12 +4150,12 @@ mod tests {
 		// Count after deletes
 		let tx_after = tree.begin().unwrap();
 		let count_after =
-			tx_after.count_at_version(b"key1", b"key4", ts_after_delete, None).unwrap();
+			tx_after.count_at_version(b"key1", b"key4", ts_after_delete, None, None).unwrap();
 		assert_eq!(count_after, 1, "Should have only 1 key after deletes");
 
 		// Verify we can still count at the earlier timestamp
 		let count_at_old_ts =
-			tx_after.count_at_version(b"key1", b"key4", ts_after_insert, None).unwrap();
+			tx_after.count_at_version(b"key1", b"key4", ts_after_insert, None, None).unwrap();
 		assert_eq!(count_at_old_ts, 3, "Should still have 3 keys at old timestamp");
 	}
 
@@ -4178,8 +4331,8 @@ mod tests {
 
 		// Test that versioned queries fail when versioning is disabled
 		let tx = tree.begin().unwrap();
-		assert!(tx.keys_at_version(b"key1", b"key3", 123456789, None).is_err());
-		assert!(tx.range_at_version(b"key1", b"key3", 123456789, None).is_err());
+		assert!(tx.keys_at_version(b"key1", b"key3", 123456789, None, None).is_err());
+		assert!(tx.range_at_version(b"key1", b"key3", 123456789, None, None).is_err());
 		assert!(tx.scan_all_versions(b"key1", b"key3", None).is_err());
 	}
 
