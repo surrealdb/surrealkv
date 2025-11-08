@@ -479,9 +479,9 @@ pub(crate) fn compress_block(raw_block: &[u8], compression: CompressionType) -> 
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
 			}
-			Ok(buffer)
+			Ok(Bytes::from(buffer))
 		}
-		CompressionType::None => Ok(Vec::from(raw_block)),
+		CompressionType::None => Ok(Bytes::copy_from_slice(raw_block)),
 	}
 }
 
@@ -576,7 +576,7 @@ pub(crate) fn read_table_block(
 
 	let block = decompress_block(&buf, CompressionType::from(compress[0]))?;
 
-	Ok(Block::new(block, opt))
+	Ok(Block::new(Bytes::from(block), opt))
 }
 
 /// Verify checksum of block
