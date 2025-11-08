@@ -653,16 +653,18 @@ impl LeafNode {
 			)));
 		}
 
-		let mut buffer_slice = &buffer[1..]; // Skip node type
+		// Convert buffer to Bytes once for zero-copy slicing
+		let buffer_bytes = Bytes::copy_from_slice(buffer);
+		let mut pos = 1; // Skip node type
 
-		let num_keys = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-		buffer_slice = &buffer_slice[4..];
+		let num_keys = u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+		pos += 4;
 
 		// Next and prev leaf pointers
-		let next_leaf = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-		buffer_slice = &buffer_slice[8..];
-		let prev_leaf = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-		buffer_slice = &buffer_slice[8..];
+		let next_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		pos += 8;
+		let prev_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		pos += 8;
 
 		let max_per_entry = get_max_leaf_entry_bytes();
 
@@ -672,77 +674,102 @@ impl LeafNode {
 
 		for _ in 0..num_keys {
 			// Read key length
-			if buffer_slice.len() < 4 {
+			if pos + 4 > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization("Truncated key length".into()));
 			}
-			let key_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-			buffer_slice = &buffer_slice[4..];
+			let key_len =
+				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+			pos += 4;
 
 			// Read value length
-			if buffer_slice.len() < 4 {
+			if pos + 4 > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization("Truncated value length".into()));
 			}
-			let value_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-			buffer_slice = &buffer_slice[4..];
+			let value_len =
+				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+			pos += 4;
 
 			// Calculate combined payload size and overflow
 			let payload_len = key_len + value_len;
 			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
-			if bytes_on_page > buffer_slice.len() {
+			if pos + bytes_on_page > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
 					"Calculated bytes on page {} exceeds available buffer size {}",
 					bytes_on_page,
-					buffer_slice.len()
+					buffer_bytes.len() - pos
 				)));
 			}
 
-			// Read cell payload from page (combined key+value)
-			let mut cell_data = buffer_slice[..bytes_on_page].to_vec();
-			buffer_slice = &buffer_slice[bytes_on_page..];
-
 			// Check if there's overflow
 			let overflow_offset = if needs_overflow {
+				// Read cell payload from page
+				let cell_start = pos;
+				pos += bytes_on_page;
+
 				// Read overflow page offset
-				if buffer_slice.len() < 8 {
+				if pos + 8 > buffer_bytes.len() {
 					return Err(BPlusTreeError::Deserialization(
 						"Buffer too small for cell overflow pointer".into(),
 					));
 				}
-				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-				buffer_slice = &buffer_slice[8..];
+				let overflow = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+				pos += 8;
 
-				// Read overflow data and append to cell
+				// For overflow case, we need to allocate and combine
+				let mut cell_data = Vec::with_capacity(payload_len);
+				cell_data.extend_from_slice(&buffer_bytes[cell_start..cell_start + bytes_on_page]);
 				let overflow_data = read_overflow(overflow)?;
 				cell_data.extend_from_slice(&overflow_data);
 
+				// Validate reconstructed cell size
+				if cell_data.len() != payload_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Reconstructed cell size {} doesn't match expected {}",
+						cell_data.len(),
+						payload_len
+					)));
+				}
+
+				// Split cell_data into key and value
+				if cell_data.len() < key_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Cell data too small {} for key length {}",
+						cell_data.len(),
+						key_len
+					)));
+				}
+				let key_data = Bytes::copy_from_slice(&cell_data[..key_len]);
+				let value_data = Bytes::copy_from_slice(&cell_data[key_len..]);
+
+				keys.push(key_data);
+				values.push(value_data);
+
 				overflow
 			} else {
+				// No overflow - use zero-copy slicing directly from buffer
+				let cell_start = pos;
+				let cell_end = pos + bytes_on_page;
+				pos = cell_end;
+
+				// Validate cell size
+				if bytes_on_page != payload_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Cell size {} doesn't match expected payload {}",
+						bytes_on_page, payload_len
+					)));
+				}
+
+				// Zero-copy slice for key and value
+				let key_data = buffer_bytes.slice(cell_start..cell_start + key_len);
+				let value_data = buffer_bytes.slice(cell_start + key_len..cell_end);
+
+				keys.push(key_data);
+				values.push(value_data);
+
 				0
 			};
 
-			// Validate reconstructed cell size
-			if cell_data.len() != payload_len {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Reconstructed cell size {} doesn't match expected {}",
-					cell_data.len(),
-					payload_len
-				)));
-			}
-
-			// Split cell_data into key and value
-			if cell_data.len() < key_len {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Cell data too small {} for key length {}",
-					cell_data.len(),
-					key_len
-				)));
-			}
-			let key_data = Bytes::copy_from_slice(&cell_data[..key_len]);
-			let value_data = Bytes::copy_from_slice(&cell_data[key_len..]);
-
-			keys.push(key_data);
-			values.push(value_data);
 			cell_overflows.push(overflow_offset);
 		}
 
