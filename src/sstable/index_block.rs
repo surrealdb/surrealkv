@@ -98,7 +98,7 @@ impl TopLevelIndexWriter {
 		compression_type: CompressionType,
 		offset: usize,
 	) -> Result<(BlockHandle, usize)> {
-		let compressed_block = compress_block(&block, compression_type)?;
+		let compressed_block = compress_block(block, compression_type)?;
 		write_block_at_offset(writer, compressed_block, compression_type, offset)
 	}
 

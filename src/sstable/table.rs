@@ -288,7 +288,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Finalize the current block and compress it.
 		let contents = block.finish();
-		let handle = self.write_compressed_block(&contents, self.opts.compression)?;
+		let handle = self.write_compressed_block(contents, self.opts.compression)?;
 
 		// Encode the block handle and add it to the index block.
 		let sep_key = InternalKey::new(
@@ -333,12 +333,12 @@ impl<W: Write> TableWriter<W> {
 		if let Some(fblock) = self.filter_block.take() {
 			let filter_key = format!("filter.{}", fblock.filter_name());
 
-			let fblock_data = fblock.finish();
+			let fblock_data = Bytes::from(fblock.finish());
 
 			// Only write if we have actual filter data
 			if !fblock_data.is_empty() {
 				let fblock_handle =
-					self.write_compressed_block(&fblock_data, CompressionType::None)?;
+					self.write_compressed_block(fblock_data, CompressionType::None)?;
 
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
@@ -358,7 +358,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Write meta_index block
 		let meta_block = meta_ix_block.finish();
-		let meta_ix_handle = self.write_compressed_block(&meta_block, self.opts.compression)?;
+		let meta_ix_handle = self.write_compressed_block(meta_block, self.opts.compression)?;
 		// println!("meta block: {:?}", meta_block);
 
 		// Write the index block
@@ -387,7 +387,7 @@ impl<W: Write> TableWriter<W> {
 	// Writes a block to the underlying writer and updates the offset.
 	fn write_compressed_block(
 		&mut self,
-		block_data: &[u8],
+		block_data: BlockData,
 		compression_type: CompressionType,
 	) -> Result<BlockHandle> {
 		let compressed_block = compress_block(block_data, compression_type)?;
@@ -470,18 +470,21 @@ pub(crate) fn write_block_at_offset<W: Write>(
 }
 
 // Compresses a block of data using the specified compression type.
-pub(crate) fn compress_block(raw_block: &[u8], compression: CompressionType) -> Result<BlockData> {
+pub(crate) fn compress_block(
+	raw_block: BlockData,
+	compression: CompressionType,
+) -> Result<BlockData> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut enc = snap::raw::Encoder::new();
 			let mut buffer = vec![0; max_compress_len(raw_block.len())];
-			match enc.compress(raw_block, buffer.as_mut_slice()) {
+			match enc.compress(&raw_block, buffer.as_mut_slice()) {
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
 			}
 			Ok(Bytes::from(buffer))
 		}
-		CompressionType::None => Ok(Bytes::copy_from_slice(raw_block)),
+		CompressionType::None => Ok(raw_block),
 	}
 }
 
