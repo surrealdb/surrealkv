@@ -540,7 +540,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
+		InternalKey::new(Bytes::copy_from_slice(key), 0, kind, 0).encode()
 	}
 
 	#[test]
@@ -634,7 +634,7 @@ mod tests {
 
 		let mut block_iter = Block::new(block_contents, o.clone()).iter();
 
-		let key = InternalKey::new("pkey2".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey2"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -642,7 +642,7 @@ mod tests {
 			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey0".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey0"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -650,7 +650,7 @@ mod tests {
 			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("key1".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"key1"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -658,7 +658,7 @@ mod tests {
 			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey3".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey3"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -666,7 +666,7 @@ mod tests {
 			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey8".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey8"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(!block_iter.valid());
 	}

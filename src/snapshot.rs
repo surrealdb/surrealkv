@@ -238,8 +238,12 @@ impl Snapshot {
 		// Check the tables in each level for the key
 		for level in &level_manifest.levels {
 			for table in level.tables.iter() {
-				let ikey =
-					InternalKey::new(key.as_ref().to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+				let ikey = InternalKey::new(
+					Bytes::copy_from_slice(key),
+					self.seq_num,
+					InternalKeyKind::Set,
+					0,
+				);
 
 				if !table.is_key_in_key_range(&ikey) {
 					continue; // Skip this table if the key is not in its range
@@ -415,23 +419,34 @@ impl Snapshot {
 
 			// Convert to InternalKey format for the B+ tree query
 			let start_key = match start_bound {
-				Bound::Included(key) => {
-					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
+				Bound::Included(key) => InternalKey::new(
+					Bytes::copy_from_slice(key),
+					0,
+					InternalKeyKind::Set,
+					params.start_ts,
+				)
+				.encode(),
 				Bound::Excluded(key) => {
 					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
+					let mut next_key = key.to_vec();
 					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
+					InternalKey::new(
+						Bytes::from(next_key),
+						0,
+						InternalKeyKind::Set,
+						params.start_ts,
+					)
+					.encode()
 				}
 				Bound::Unbounded => {
-					InternalKey::new(Vec::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
+					InternalKey::new(Bytes::new(), 0, InternalKeyKind::Set, params.start_ts)
+						.encode()
 				}
 			};
 
 			let end_key = match end_bound {
 				Bound::Included(key) => InternalKey::new(
-					key.clone(),
+					Bytes::copy_from_slice(key),
 					params.snapshot_seq_num,
 					InternalKeyKind::Max,
 					params.end_ts,
@@ -439,10 +454,11 @@ impl Snapshot {
 				.encode(),
 				Bound::Excluded(key) => {
 					// For excluded bounds, use minimal InternalKey properties so range stops just before this key
-					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode()
+					InternalKey::new(Bytes::copy_from_slice(key), 0, InternalKeyKind::Set, 0)
+						.encode()
 				}
 				Bound::Unbounded => InternalKey::new(
-					vec![0xff],
+					Bytes::from_static(&[0xff]),
 					params.snapshot_seq_num,
 					InternalKeyKind::Max,
 					params.end_ts,
@@ -714,7 +730,7 @@ impl<'a> KMergeIterator<'a> {
 					match &range.0 {
 						Bound::Included(key) => {
 							let ikey = InternalKey::new(
-								key.clone(),
+								Bytes::copy_from_slice(key),
 								INTERNAL_KEY_SEQ_NUM_MAX,
 								InternalKeyKind::Max,
 								0,
@@ -722,7 +738,12 @@ impl<'a> KMergeIterator<'a> {
 							table_iter.seek(&ikey.encode());
 						}
 						Bound::Excluded(key) => {
-							let ikey = InternalKey::new(key.clone(), 0, InternalKeyKind::Delete, 0);
+							let ikey = InternalKey::new(
+								Bytes::copy_from_slice(key),
+								0,
+								InternalKeyKind::Delete,
+								0,
+							);
 							table_iter.seek(&ikey.encode());
 							// If we're at the excluded key, advance once
 							if table_iter.valid() {
@@ -1086,6 +1107,7 @@ impl Drop for SnapshotIterator<'_> {
 mod tests {
 	use crate::TreeBuilder;
 	use crate::{Options, Tree};
+	use bytes::Bytes;
 	use std::collections::HashSet;
 	use std::sync::Arc;
 	use test_log::test;
@@ -1525,7 +1547,8 @@ mod tests {
 			{
 				let mut w = TableWriter::new(&mut buf, 0, opts.clone());
 				for (k, v) in data {
-					let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
+					let ikey =
+						InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0);
 					w.add(ikey.into(), v).unwrap();
 				}
 				w.finish().unwrap();

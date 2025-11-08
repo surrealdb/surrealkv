@@ -13,9 +13,9 @@ use std::{
 use crate::{error::Error, sstable::table::Table, vfs::File, Options, Result};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use iter::LevelManifestIterator;
 use rand::Rng;
 
-use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 
 /// Current manifest format version
@@ -415,6 +415,7 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::{table::TableWriter, InternalKey, InternalKeyKind};
+	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
@@ -437,8 +438,12 @@ mod tests {
 			let key = format!("key_{i:05}");
 			let value = format!("value_{i:05}");
 
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			writer.add(internal_key.into(), value.as_bytes())?;
 		}
@@ -803,8 +808,12 @@ mod tests {
 			let key = format!("key_{seq_num:05}");
 			let value = format!("value_{seq_num:05}");
 
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				seq_num,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			writer.add(internal_key.into(), value.as_bytes())?;
 		}

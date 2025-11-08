@@ -691,7 +691,7 @@ impl Comparator for InternalKeyComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					sep,
+					Bytes::from(sep),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					key_a.kind(),
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -700,7 +700,8 @@ impl Comparator for InternalKeyComparator {
 			}
 
 			// Otherwise use original sequence number
-			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp);
+			let result =
+				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
 			return result.encode();
 		}
 
@@ -714,7 +715,7 @@ impl Comparator for InternalKeyComparator {
 
 		// Create a new internal key with the successor user key and original sequence/kind
 		let result = InternalKey::new(
-			user_key_succ,
+			Bytes::from(user_key_succ),
 			internal_key.seq_num(),
 			internal_key.kind(),
 			internal_key.timestamp,
@@ -764,7 +765,7 @@ impl Comparator for TimestampComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					sep,
+					Bytes::from(sep),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					key_a.kind(),
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -773,7 +774,8 @@ impl Comparator for TimestampComparator {
 			}
 
 			// Otherwise use original timestamp
-			let result = InternalKey::new(sep, key_a.seq_num(), key_a.kind(), key_a.timestamp);
+			let result =
+				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
 			return result.encode();
 		}
 
@@ -787,7 +789,7 @@ impl Comparator for TimestampComparator {
 
 		// Create a new internal key with the successor user key and original timestamp/kind
 		let result = InternalKey::new(
-			user_key_succ,
+			Bytes::from(user_key_succ),
 			internal_key.seq_num(),
 			internal_key.kind(),
 			internal_key.timestamp,

@@ -406,11 +406,11 @@ impl CommitEnv for LsmCommitEnv {
 
 				if ikey.is_replace() {
 					// For Replace: first delete all existing entries for this user key
-					let user_key = ikey.user_key.as_ref().to_vec();
+					let user_key = ikey.user_key.clone();
 					let start_key =
 						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
 					let end_key = InternalKey::new(
-						user_key.clone(),
+						user_key,
 						seq_num,
 						InternalKeyKind::Max,
 						INTERNAL_KEY_TIMESTAMP_MAX,

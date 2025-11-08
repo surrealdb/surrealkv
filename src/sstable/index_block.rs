@@ -232,6 +232,7 @@ mod tests {
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::Iterator;
+	use bytes::Bytes;
 	use std::sync::Arc;
 	use test_log::test;
 
@@ -240,7 +241,7 @@ mod tests {
 	}
 
 	fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
-		InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
+		InternalKey::new(Bytes::from(user_key), sequence, InternalKeyKind::Set, 0).encode()
 	}
 
 	#[test]
