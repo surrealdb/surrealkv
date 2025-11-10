@@ -158,6 +158,7 @@ impl FilterBlockReader {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::{bloom::LevelDBBloomFilter, InternalKey, InternalKeyKind};
+	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
@@ -266,7 +267,7 @@ mod tests {
 			// Create internal key
 			let user_key = format!("key_{i:05}");
 			let internal_key = InternalKey::new(
-				user_key.as_bytes().to_vec(),
+				Bytes::copy_from_slice(user_key.as_bytes()),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -297,8 +298,12 @@ mod tests {
 		for i in 0..num_samples {
 			// Use values outside the range of existing keys
 			let user_key = format!("nonexistent_{:05}", i + num_items);
-			let internal_key =
-				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(user_key.as_bytes()),
+				i as u64,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			let encoded_key = internal_key.encode();
 

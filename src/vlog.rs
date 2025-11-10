@@ -767,14 +767,22 @@ impl VLog {
 		let value_len = pointer.value_size;
 		let total_size = pointer.total_entry_size();
 
-		let mut entry_data = vec![0u8; total_size as usize];
-		vfs::File::read_at(&*file, pointer.offset, &mut entry_data)?;
+		let mut entry_data_vec = vec![0u8; total_size as usize];
+		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec)?;
 
 		// Verify header sizes
-		let header_key_len =
-			u32::from_be_bytes([entry_data[0], entry_data[1], entry_data[2], entry_data[3]]);
-		let header_value_len =
-			u32::from_be_bytes([entry_data[4], entry_data[5], entry_data[6], entry_data[7]]);
+		let header_key_len = u32::from_be_bytes([
+			entry_data_vec[0],
+			entry_data_vec[1],
+			entry_data_vec[2],
+			entry_data_vec[3],
+		]);
+		let header_value_len = u32::from_be_bytes([
+			entry_data_vec[4],
+			entry_data_vec[5],
+			entry_data_vec[6],
+			entry_data_vec[7],
+		]);
 
 		if header_key_len != key_len || header_value_len != value_len {
 			return Err(Error::Corruption(format!(
@@ -782,18 +790,16 @@ impl VLog {
             )));
 		}
 
-		// Parse from the buffer
+		// Parse offsets from the buffer
 		let key_start = 8;
 		let value_start = key_start + key_len as usize;
 		let crc_start = value_start + value_len as usize;
 
-		let key = &entry_data[key_start..value_start];
-		let value = &entry_data[value_start..crc_start];
 		let stored_crc32 = u32::from_be_bytes([
-			entry_data[crc_start],
-			entry_data[crc_start + 1],
-			entry_data[crc_start + 2],
-			entry_data[crc_start + 3],
+			entry_data_vec[crc_start],
+			entry_data_vec[crc_start + 1],
+			entry_data_vec[crc_start + 2],
+			entry_data_vec[crc_start + 3],
 		]);
 
 		// Checksum verification
@@ -805,6 +811,8 @@ impl VLog {
 		}
 
 		if self.checksum_level == VLogChecksumLevel::Full {
+			let key = &entry_data_vec[key_start..value_start];
+			let value = &entry_data_vec[value_start..crc_start];
 			let mut hasher = Hasher::new();
 			hasher.update(key);
 			hasher.update(value);
@@ -817,8 +825,11 @@ impl VLog {
 			}
 		}
 
+		// Convert to Bytes once, then use zero-copy slice for value
+		let entry_data = Bytes::from(entry_data_vec);
+		let value_bytes = entry_data.slice(value_start..crc_start);
+
 		// Cache the value for future reads
-		let value_bytes: Value = Bytes::copy_from_slice(value);
 		self.cache.insert(pointer.file_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)

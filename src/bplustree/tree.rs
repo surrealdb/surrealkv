@@ -225,7 +225,7 @@ trait Node {
 ///   because its overflows were transferred to the merged node via append()
 /// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
-	keys: Vec<Vec<u8>>, // Full keys (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>,        // Full keys (reconstructed from page + overflow if needed)
 	key_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for THIS node's keys
 	children: Vec<u64>,
 	offset: u64,
@@ -312,7 +312,7 @@ impl InternalNode {
 				)));
 			}
 
-			keys.push(key_data);
+			keys.push(Bytes::from(key_data));
 			key_overflows.push(overflow_offset);
 		}
 
@@ -369,7 +369,7 @@ impl InternalNode {
 
 	/// Atomically removes a key and its overflow metadata at the given index.
 	/// Returns (key, overflow_offset) or None if index is out of bounds.
-	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Vec<u8>, u64)> {
+	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -384,7 +384,7 @@ impl InternalNode {
 
 	/// Atomically extracts and returns the key+overflow at idx from parent.
 	/// This is used when a parent key needs to be moved into a child node.
-	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Vec<u8>, u64) {
+	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Bytes, u64) {
 		let key = parent.keys[idx].clone();
 		let overflow = parent.get_overflow_at(idx);
 		(key, overflow)
@@ -402,7 +402,7 @@ impl InternalNode {
 		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
-		self.keys.insert(idx, key.to_vec());
+		self.keys.insert(idx, Bytes::copy_from_slice(key));
 		self.key_overflows.insert(idx, overflow); // Use provided overflow
 		self.children.insert(idx + 1, child_offset);
 	}
@@ -426,7 +426,7 @@ impl InternalNode {
 	}
 
 	/// Extracts key+overflow for transferring to another node (removes from this node)
-	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Vec<u8>, u64)> {
+	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -440,7 +440,7 @@ impl InternalNode {
 	}
 
 	/// Inserts a key with its overflow at a specific position
-	fn insert_key_with_overflow(&mut self, idx: usize, key: Vec<u8>, overflow: u64) {
+	fn insert_key_with_overflow(&mut self, idx: usize, key: Bytes, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.key_overflows.insert(idx, overflow);
 	}
@@ -448,9 +448,9 @@ impl InternalNode {
 	fn redistribute_to_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Vec<u8>,
+		parent_key: Bytes,
 		parent_overflow: u64,
-	) -> (Vec<u8>, u64) {
+	) -> (Bytes, u64) {
 		right.insert_key_with_overflow(0, parent_key, parent_overflow);
 
 		let (new_parent_key, new_parent_overflow) =
@@ -466,9 +466,9 @@ impl InternalNode {
 	fn take_from_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Vec<u8>,
+		parent_key: Bytes,
 		parent_overflow: u64,
-	) -> (Vec<u8>, u64) {
+	) -> (Bytes, u64) {
 		self.keys.push(parent_key);
 		self.key_overflows.push(parent_overflow);
 
@@ -484,7 +484,7 @@ impl InternalNode {
 	fn merge_from_right(
 		&mut self,
 		mut right: InternalNode,
-		separator: Vec<u8>,
+		separator: Bytes,
 		separator_overflow: u64,
 	) {
 		self.keys.push(separator);
@@ -540,7 +540,7 @@ impl Node for InternalNode {
 			buffer.extend_from_slice(&(key_len_total as u32).to_le_bytes());
 
 			// Write key data that fits on page
-			buffer.extend_from_slice(&key[..bytes_on_page]);
+			buffer.extend_from_slice(&key.as_ref()[..bytes_on_page]);
 
 			// Write overflow page offset if needed (only if there's overflow)
 			if needs_overflow {
@@ -621,11 +621,11 @@ impl Node for InternalNode {
 /// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
 /// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Vec<u8>>,   // Full keys (reconstructed from page + overflow if needed)
-	values: Vec<Vec<u8>>, // Full values (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>,         // Full keys (reconstructed from page + overflow if needed)
+	values: Vec<Bytes>,       // Full values (reconstructed from page + overflow if needed)
 	cell_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for cell (key+value)
-	next_leaf: u64,       // 0 means no next leaf
-	prev_leaf: u64,       // 0 means no previous leaf
+	next_leaf: u64,           // 0 means no next leaf
+	prev_leaf: u64,           // 0 means no previous leaf
 	offset: u64,
 }
 
@@ -653,16 +653,18 @@ impl LeafNode {
 			)));
 		}
 
-		let mut buffer_slice = &buffer[1..]; // Skip node type
+		// Convert buffer to Bytes once for zero-copy slicing
+		let buffer_bytes = Bytes::copy_from_slice(buffer);
+		let mut pos = 1; // Skip node type
 
-		let num_keys = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-		buffer_slice = &buffer_slice[4..];
+		let num_keys = u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+		pos += 4;
 
 		// Next and prev leaf pointers
-		let next_leaf = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-		buffer_slice = &buffer_slice[8..];
-		let prev_leaf = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-		buffer_slice = &buffer_slice[8..];
+		let next_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		pos += 8;
+		let prev_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		pos += 8;
 
 		let max_per_entry = get_max_leaf_entry_bytes();
 
@@ -672,77 +674,102 @@ impl LeafNode {
 
 		for _ in 0..num_keys {
 			// Read key length
-			if buffer_slice.len() < 4 {
+			if pos + 4 > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization("Truncated key length".into()));
 			}
-			let key_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-			buffer_slice = &buffer_slice[4..];
+			let key_len =
+				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+			pos += 4;
 
 			// Read value length
-			if buffer_slice.len() < 4 {
+			if pos + 4 > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization("Truncated value length".into()));
 			}
-			let value_len = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
-			buffer_slice = &buffer_slice[4..];
+			let value_len =
+				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+			pos += 4;
 
 			// Calculate combined payload size and overflow
 			let payload_len = key_len + value_len;
 			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
 
-			if bytes_on_page > buffer_slice.len() {
+			if pos + bytes_on_page > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
 					"Calculated bytes on page {} exceeds available buffer size {}",
 					bytes_on_page,
-					buffer_slice.len()
+					buffer_bytes.len() - pos
 				)));
 			}
 
-			// Read cell payload from page (combined key+value)
-			let mut cell_data = buffer_slice[..bytes_on_page].to_vec();
-			buffer_slice = &buffer_slice[bytes_on_page..];
-
 			// Check if there's overflow
 			let overflow_offset = if needs_overflow {
+				// Read cell payload from page
+				let cell_start = pos;
+				pos += bytes_on_page;
+
 				// Read overflow page offset
-				if buffer_slice.len() < 8 {
+				if pos + 8 > buffer_bytes.len() {
 					return Err(BPlusTreeError::Deserialization(
 						"Buffer too small for cell overflow pointer".into(),
 					));
 				}
-				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
-				buffer_slice = &buffer_slice[8..];
+				let overflow = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+				pos += 8;
 
-				// Read overflow data and append to cell
+				// For overflow case, we need to allocate and combine
+				let mut cell_data = Vec::with_capacity(payload_len);
+				cell_data.extend_from_slice(&buffer_bytes[cell_start..cell_start + bytes_on_page]);
 				let overflow_data = read_overflow(overflow)?;
 				cell_data.extend_from_slice(&overflow_data);
 
+				// Validate reconstructed cell size
+				if cell_data.len() != payload_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Reconstructed cell size {} doesn't match expected {}",
+						cell_data.len(),
+						payload_len
+					)));
+				}
+
+				// Split cell_data into key and value
+				if cell_data.len() < key_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Cell data too small {} for key length {}",
+						cell_data.len(),
+						key_len
+					)));
+				}
+				let key_data = Bytes::copy_from_slice(&cell_data[..key_len]);
+				let value_data = Bytes::copy_from_slice(&cell_data[key_len..]);
+
+				keys.push(key_data);
+				values.push(value_data);
+
 				overflow
 			} else {
+				// No overflow - use zero-copy slicing directly from buffer
+				let cell_start = pos;
+				let cell_end = pos + bytes_on_page;
+				pos = cell_end;
+
+				// Validate cell size
+				if bytes_on_page != payload_len {
+					return Err(BPlusTreeError::Deserialization(format!(
+						"Cell size {} doesn't match expected payload {}",
+						bytes_on_page, payload_len
+					)));
+				}
+
+				// Zero-copy slice for key and value
+				let key_data = buffer_bytes.slice(cell_start..cell_start + key_len);
+				let value_data = buffer_bytes.slice(cell_start + key_len..cell_end);
+
+				keys.push(key_data);
+				values.push(value_data);
+
 				0
 			};
 
-			// Validate reconstructed cell size
-			if cell_data.len() != payload_len {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Reconstructed cell size {} doesn't match expected {}",
-					cell_data.len(),
-					payload_len
-				)));
-			}
-
-			// Split cell_data into key and value
-			if cell_data.len() < key_len {
-				return Err(BPlusTreeError::Deserialization(format!(
-					"Cell data too small {} for key length {}",
-					cell_data.len(),
-					key_len
-				)));
-			}
-			let key_data = cell_data[..key_len].to_vec();
-			let value_data = cell_data[key_len..].to_vec();
-
-			keys.push(key_data);
-			values.push(value_data);
 			cell_overflows.push(overflow_offset);
 		}
 
@@ -769,7 +796,7 @@ impl LeafNode {
 			Ok(idx) => {
 				// Key exists - update
 				let old_overflow = self.get_overflow_at(idx);
-				self.values[idx] = value.to_vec();
+				self.values[idx] = Bytes::copy_from_slice(value);
 				self.set_overflow_at(idx, 0);
 				(
 					idx,
@@ -782,7 +809,12 @@ impl LeafNode {
 			}
 			Err(idx) => {
 				// Key not found - insert
-				self.insert_cell_with_overflow(idx, key.to_vec(), value.to_vec(), 0);
+				self.insert_cell_with_overflow(
+					idx,
+					Bytes::copy_from_slice(key),
+					Bytes::copy_from_slice(value),
+					0,
+				);
 				(idx, None)
 			}
 		}
@@ -790,7 +822,7 @@ impl LeafNode {
 
 	// delete a key-value pair from a leaf node
 	// Returns (index, value, overflow_offset) so caller can free the overflow chain
-	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Vec<u8>, u64)> {
+	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Bytes, u64)> {
 		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).ok()?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
@@ -827,20 +859,14 @@ impl LeafNode {
 	}
 
 	/// Inserts a cell (key+value) with overflow at a specific position
-	fn insert_cell_with_overflow(
-		&mut self,
-		idx: usize,
-		key: Vec<u8>,
-		value: Vec<u8>,
-		overflow: u64,
-	) {
+	fn insert_cell_with_overflow(&mut self, idx: usize, key: Bytes, value: Bytes, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.values.insert(idx, value);
 		self.cell_overflows.insert(idx, overflow);
 	}
 
 	// Redistributes keys from this leaf to the target leaf
-	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Vec<u8> {
+	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Bytes {
 		// Move last key-value pair from this node to right node
 		let last_key = self.keys.pop().unwrap();
 		let last_value = self.values.pop().unwrap();
@@ -855,7 +881,7 @@ impl LeafNode {
 	}
 
 	// Takes keys from right leaf
-	fn take_from_right(&mut self, right: &mut LeafNode) -> Vec<u8> {
+	fn take_from_right(&mut self, right: &mut LeafNode) -> Bytes {
 		// Move first key-value pair from right node to this node
 		let first_key = right.keys.remove(0);
 		let first_value = right.values.remove(0);
@@ -942,8 +968,8 @@ impl Node for LeafNode {
 
 			// Create combined cell data
 			let mut cell_data = Vec::with_capacity(payload_len);
-			cell_data.extend_from_slice(key);
-			cell_data.extend_from_slice(value);
+			cell_data.extend_from_slice(key.as_ref());
+			cell_data.extend_from_slice(value.as_ref());
 
 			// Write cell data that fits on page
 			buffer.extend_from_slice(&cell_data[..bytes_on_page]);
@@ -1458,7 +1484,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn handle_splits(
 		&mut self,
 		mut parent_offset: Option<u64>,
-		mut promoted_key: Vec<u8>,
+		mut promoted_key: Bytes,
 		mut promoted_overflow: u64,
 		mut new_node_offset: u64,
 		mut path: Vec<(u64, Option<u64>)>,
@@ -1542,7 +1568,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		leaf: &mut LeafNode,
 		key: &[u8],
 		value: &[u8],
-	) -> Result<(Vec<u8>, u64, u64)> {
+	) -> Result<(Bytes, u64, u64)> {
 		let split_idx = leaf.find_split_point();
 
 		let new_leaf_offset = self.allocate_page()?;
@@ -1563,10 +1589,15 @@ impl<F: VfsFile> BPlusTree<F> {
 				if leaf.get_overflow_at(idx) != 0 {
 					self.free_overflow_chain(leaf.get_overflow_at(idx))?;
 				}
-				leaf.values[idx] = value.to_vec();
+				leaf.values[idx] = Bytes::copy_from_slice(value);
 				leaf.set_overflow_at(idx, 0);
 			} else {
-				leaf.insert_cell_with_overflow(idx, key.to_vec(), value.to_vec(), 0);
+				leaf.insert_cell_with_overflow(
+					idx,
+					Bytes::copy_from_slice(key),
+					Bytes::copy_from_slice(value),
+					0,
+				);
 			}
 		} else {
 			let right_idx = idx - split_idx;
@@ -1579,10 +1610,15 @@ impl<F: VfsFile> BPlusTree<F> {
 				if new_leaf.get_overflow_at(right_idx) != 0 {
 					self.free_overflow_chain(new_leaf.get_overflow_at(right_idx))?;
 				}
-				new_leaf.values[right_idx] = value.to_vec();
+				new_leaf.values[right_idx] = Bytes::copy_from_slice(value);
 				new_leaf.set_overflow_at(right_idx, 0);
 			} else {
-				new_leaf.insert_cell_with_overflow(right_idx, key.to_vec(), value.to_vec(), 0);
+				new_leaf.insert_cell_with_overflow(
+					right_idx,
+					Bytes::copy_from_slice(key),
+					Bytes::copy_from_slice(value),
+					0,
+				);
 			}
 		}
 
@@ -1623,7 +1659,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		extra_key: &[u8],
 		extra_overflow: u64,
 		extra_child: u64,
-	) -> Result<(Vec<u8>, u64, u64)> {
+	) -> Result<(Bytes, u64, u64)> {
 		let insert_idx = node
 			.keys
 			.binary_search_by(|key| self.compare.compare(key, extra_key))
@@ -1655,7 +1691,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			);
 		} else {
 			let right_insert_idx = insert_idx - split_idx - 1;
-			new_node.keys.insert(right_insert_idx, extra_key.to_vec());
+			new_node.keys.insert(right_insert_idx, Bytes::copy_from_slice(extra_key));
 			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
 			new_node.children.insert(right_insert_idx + 1, extra_child);
 		}
@@ -1681,7 +1717,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	#[allow(unused)]
-	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+	pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut current_offset = self.header.root_offset;
 
 		loop {
@@ -1704,7 +1740,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut node_offset = self.header.root_offset;
 		let mut path = Vec::new();
 
@@ -2794,8 +2830,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 
 				// Return current entry from stored leaf (no range check needed - pre-calculated!)
 				let result = Ok((
-					Bytes::copy_from_slice(&leaf.keys[self.current_idx]),
-					Bytes::copy_from_slice(&leaf.values[self.current_idx]),
+					leaf.keys[self.current_idx].clone(),
+					leaf.values[self.current_idx].clone(),
 				));
 				self.current_idx += 1;
 				return Some(result);
@@ -2924,15 +2960,15 @@ mod tests {
 		tree.insert(b"key3", b"value3").unwrap();
 
 		// Test retrievals
-		assert_eq!(tree.get(b"key1").unwrap().unwrap(), b"value1");
-		assert_eq!(tree.get(b"key2").unwrap().unwrap(), b"value2");
-		assert_eq!(tree.get(b"key3").unwrap().unwrap(), b"value3");
+		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+		assert_eq!(tree.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		assert_eq!(tree.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 
 		// Test non-existent key
 		assert!(tree.get(b"nonexistent").unwrap().is_none());
 
 		// Test deletions
-		assert_eq!(tree.delete(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tree.delete(b"key2").unwrap().unwrap().as_ref(), b"value2");
 		assert!(tree.get(b"key2").unwrap().is_none());
 	}
 
@@ -3242,7 +3278,7 @@ mod tests {
 	fn test_single_insert_search() {
 		let mut tree = create_test_tree(true);
 		tree.insert(b"key1", b"value1").unwrap();
-		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
 	}
 
 	#[test]
@@ -3258,9 +3294,9 @@ mod tests {
 		tree.insert(b"key2", b"updated_value2").unwrap();
 
 		// Verify the update
-		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(tree.get(b"key2").unwrap(), Some(b"updated_value2".to_vec()));
-		assert_eq!(tree.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
+		assert_eq!(tree.get(b"key2").unwrap().as_deref(), Some(b"updated_value2".as_ref()));
+		assert_eq!(tree.get(b"key3").unwrap().as_deref(), Some(b"value3".as_ref()));
 	}
 
 	#[test]
@@ -3269,17 +3305,17 @@ mod tests {
 
 		// Insert initial key
 		tree.insert(b"key", b"value1").unwrap();
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value1".as_ref()));
 
 		// Update multiple times
 		tree.insert(b"key", b"value2").unwrap();
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value2".as_ref()));
 
 		tree.insert(b"key", b"value3").unwrap();
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value3".as_ref()));
 
 		tree.insert(b"key", b"final_value").unwrap();
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"final_value".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"final_value".as_ref()));
 	}
 
 	#[test]
@@ -3311,9 +3347,9 @@ mod tests {
 		assert_eq!(keys_before, keys_after, "Key count should not change");
 
 		// Verify values were actually updated
-		assert_eq!(tree.get(b"key1").unwrap(), Some(b"updated_value1".to_vec()));
-		assert_eq!(tree.get(b"key2").unwrap(), Some(b"updated_value2".to_vec()));
-		assert_eq!(tree.get(b"key3").unwrap(), Some(b"updated_value3".to_vec()));
+		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"updated_value1".as_ref()));
+		assert_eq!(tree.get(b"key2").unwrap().as_deref(), Some(b"updated_value2".as_ref()));
+		assert_eq!(tree.get(b"key3").unwrap().as_deref(), Some(b"updated_value3".as_ref()));
 	}
 
 	#[test]
@@ -3418,7 +3454,7 @@ mod tests {
 			for (key, value) in &test_data {
 				assert_eq!(
 					tree.get(key)?,
-					Some(value.clone()),
+					Some(Bytes::from(value.clone())),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -3431,7 +3467,7 @@ mod tests {
 			tree.insert(b"mango", b"orange")?;
 			assert_eq!(
 				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				Some(Bytes::from_static(b"orange")),
 				"New insertion failed after reopening"
 			);
 		}
@@ -3441,7 +3477,7 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(
 				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				Some(Bytes::from_static(b"orange")),
 				"New data didn't persist across openings"
 			);
 		}
@@ -3465,7 +3501,7 @@ mod tests {
 		// Delete and verify
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
-			assert_eq!(tree.delete(b"two")?, Some(b"2".to_vec()));
+			assert_eq!(tree.delete(b"two")?.as_deref(), Some(b"2".as_ref()));
 			assert_eq!(tree.get(b"two")?, None);
 		}
 
@@ -3475,7 +3511,7 @@ mod tests {
 			assert_eq!(tree.get(b"two")?, None, "Deleted key still exists after reopening");
 			assert_eq!(
 				tree.get(b"one")?,
-				Some(b"1".to_vec()),
+				Some(Bytes::from_static(b"1")),
 				"Existing key missing after deletion"
 			);
 		}
@@ -3490,7 +3526,7 @@ mod tests {
 		tree.insert(b"key", b"v1").unwrap();
 		tree.delete(b"key").unwrap();
 		tree.insert(b"key", b"v2").unwrap();
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"v2".to_vec()));
+		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"v2".as_ref()));
 	}
 
 	#[test]
@@ -3509,7 +3545,7 @@ mod tests {
 		// Verify data post drop
 		{
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-			assert_eq!(tree.get(b"test").unwrap(), Some(b"value".to_vec()));
+			assert_eq!(tree.get(b"test").unwrap().as_deref(), Some(b"value".as_ref()));
 		}
 	}
 
@@ -3615,7 +3651,7 @@ mod tests {
 			for (key, value) in &test_data {
 				assert_eq!(
 					tree.get(key).unwrap(),
-					Some(value.clone()),
+					Some(Bytes::from(value.clone())),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);

@@ -9,7 +9,7 @@ use crate::{
 use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
-pub(crate) type BlockData = Vec<u8>;
+pub(crate) type BlockData = Bytes;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
 pub(crate) struct BlockHandle {
@@ -87,7 +87,7 @@ impl BlockHandle {
 ///
 #[derive(Clone)]
 pub(crate) struct Block {
-	pub(crate) block: Arc<BlockData>,
+	pub(crate) block: BlockData,
 	opts: Arc<Options>,
 }
 
@@ -99,7 +99,7 @@ impl Block {
 	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
 		assert!(data.len() > 4);
 		Block {
-			block: Arc::new(data),
+			block: data,
 			opts,
 		}
 	}
@@ -257,7 +257,7 @@ impl BlockWriter {
 		// 2. Append N_RESTARTS
 		self.buffer.write_fixedint(self.restart_points.len() as u32).expect("block write failed");
 
-		self.buffer
+		Bytes::from(self.buffer)
 	}
 
 	// Estimates the current size of the block
@@ -272,7 +272,7 @@ impl BlockWriter {
 }
 
 pub(crate) struct BlockIterator {
-	block: Arc<BlockData>,
+	block: BlockData,
 	restart_points: Vec<u32>,
 	offset: usize,
 	current_key: Vec<u8>,
@@ -289,7 +289,7 @@ pub(crate) struct BlockIterator {
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options>, block: Arc<BlockData>) -> Self {
+	pub(crate) fn new(options: Arc<Options>, block: BlockData) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -383,9 +383,7 @@ impl Iterator for BlockIterator {
 		}
 		Some((
 			Bytes::copy_from_slice(&self.current_key[..]),
-			Bytes::copy_from_slice(
-				&self.block[self.current_value_offset_start..self.current_value_offset_end],
-			),
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end),
 		))
 	}
 }
@@ -398,9 +396,7 @@ impl DoubleEndedIterator for BlockIterator {
 
 		Some((
 			Bytes::copy_from_slice(&self.current_key[..]),
-			Bytes::copy_from_slice(
-				&self.block[self.current_value_offset_start..self.current_value_offset_end],
-			),
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end),
 		))
 	}
 }
@@ -513,9 +509,7 @@ impl LSMIterator for BlockIterator {
 
 	// Get the current value
 	fn value(&self) -> Value {
-		Bytes::copy_from_slice(
-			&self.block[self.current_value_offset_start..self.current_value_offset_end],
-		)
+		self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 	}
 }
 
@@ -546,7 +540,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
+		InternalKey::new(Bytes::copy_from_slice(key), 0, kind, 0).encode()
 	}
 
 	#[test]
@@ -556,7 +550,7 @@ mod tests {
 
 		let blockc = builder.finish();
 		assert_eq!(blockc.len(), 8);
-		assert_eq!(blockc, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+		assert_eq!(blockc.as_ref(), &[0, 0, 0, 0, 1, 0, 0, 0]);
 
 		let mut block_iter = Block::new(blockc, o).iter();
 
@@ -640,7 +634,7 @@ mod tests {
 
 		let mut block_iter = Block::new(block_contents, o.clone()).iter();
 
-		let key = InternalKey::new("pkey2".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey2"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -648,7 +642,7 @@ mod tests {
 			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey0".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey0"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -656,7 +650,7 @@ mod tests {
 			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("key1".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"key1"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -664,7 +658,7 @@ mod tests {
 			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey3".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey3"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -672,7 +666,7 @@ mod tests {
 			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new("pkey8".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"pkey8"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(!block_iter.valid());
 	}

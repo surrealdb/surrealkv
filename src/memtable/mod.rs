@@ -70,7 +70,7 @@ impl MemTable {
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let range = InternalKey::new(
-			key.to_vec(),
+			Bytes::copy_from_slice(key),
 			seq_no,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
@@ -114,9 +114,9 @@ impl MemTable {
 		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 
-			// Use the pre-encoded value directly, or reuse empty value for deletes
+			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
 			let val = if let Some(encoded_value) = &entry.value {
-				Bytes::copy_from_slice(encoded_value)
+				encoded_value.clone()
 			} else {
 				// For delete operations, reuse the pre-allocated empty value
 				empty_val.clone()
@@ -214,7 +214,7 @@ impl MemTable {
 				// Since internal keys are sorted as (user_key asc, seq_num desc),
 				// we use the highest possible sequence number to get the first entry
 				Bound::Included(InternalKey::new(
-					key.clone(),
+					Bytes::copy_from_slice(key),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -223,7 +223,12 @@ impl MemTable {
 			Bound::Excluded(key) => {
 				// For exclusive start, we want to skip all versions of this user key
 				// We use the lowest sequence number to position after all real entries
-				Bound::Excluded(InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0))
+				Bound::Excluded(InternalKey::new(
+					Bytes::copy_from_slice(key),
+					0,
+					InternalKeyKind::Set,
+					0,
+				))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -232,13 +237,18 @@ impl MemTable {
 			Bound::Included(key) => {
 				// For inclusive end, we want to include all versions of this user key
 				// We use the lowest sequence number to include the last entry
-				Bound::Included(InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0))
+				Bound::Included(InternalKey::new(
+					Bytes::copy_from_slice(key),
+					0,
+					InternalKeyKind::Set,
+					0,
+				))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive end, we want to exclude all versions of this user key
 				// We use the highest sequence number to stop before any real entries
 				Bound::Excluded(InternalKey::new(
-					key.clone(),
+					Bytes::copy_from_slice(key),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,

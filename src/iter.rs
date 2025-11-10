@@ -442,7 +442,7 @@ mod tests {
 		sequence: u64,
 		kind: InternalKeyKind,
 	) -> Arc<InternalKey> {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0).into()
+		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0).into()
 	}
 
 	fn create_internal_key_with_timestamp(
@@ -451,7 +451,8 @@ mod tests {
 		kind: InternalKeyKind,
 		timestamp: u64,
 	) -> Arc<InternalKey> {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp).into()
+		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, timestamp)
+			.into()
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {

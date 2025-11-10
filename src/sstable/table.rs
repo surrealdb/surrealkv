@@ -288,11 +288,11 @@ impl<W: Write> TableWriter<W> {
 
 		// Finalize the current block and compress it.
 		let contents = block.finish();
-		let handle = self.write_compressed_block(&contents, self.opts.compression)?;
+		let handle = self.write_compressed_block(contents, self.opts.compression)?;
 
 		// Encode the block handle and add it to the index block.
 		let sep_key = InternalKey::new(
-			separator_key,
+			Bytes::from(separator_key),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			INTERNAL_KEY_TIMESTAMP_MAX,
@@ -333,32 +333,36 @@ impl<W: Write> TableWriter<W> {
 		if let Some(fblock) = self.filter_block.take() {
 			let filter_key = format!("filter.{}", fblock.filter_name());
 
-			let fblock_data = fblock.finish();
+			let fblock_data = Bytes::from(fblock.finish());
 
 			// Only write if we have actual filter data
 			if !fblock_data.is_empty() {
 				let fblock_handle =
-					self.write_compressed_block(&fblock_data, CompressionType::None)?;
+					self.write_compressed_block(fblock_data, CompressionType::None)?;
 
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
 				// TODO: Add this as part of property as the current trailer will mark it as deleted
-				let filter_key =
-					InternalKey::new(filter_key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+				let filter_key = InternalKey::new(
+					Bytes::copy_from_slice(filter_key.as_bytes()),
+					0,
+					InternalKeyKind::Set,
+					0,
+				);
 
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
 
 		// Write meta properties to the meta index block
-		let meta_key = InternalKey::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+		let meta_key = InternalKey::new(Bytes::from_static(b"meta"), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
 		// Write meta_index block
 		let meta_block = meta_ix_block.finish();
-		let meta_ix_handle = self.write_compressed_block(&meta_block, self.opts.compression)?;
+		let meta_ix_handle = self.write_compressed_block(meta_block, self.opts.compression)?;
 		// println!("meta block: {:?}", meta_block);
 
 		// Write the index block
@@ -387,7 +391,7 @@ impl<W: Write> TableWriter<W> {
 	// Writes a block to the underlying writer and updates the offset.
 	fn write_compressed_block(
 		&mut self,
-		block_data: &[u8],
+		block_data: BlockData,
 		compression_type: CompressionType,
 	) -> Result<BlockHandle> {
 		let compressed_block = compress_block(block_data, compression_type)?;
@@ -470,18 +474,21 @@ pub(crate) fn write_block_at_offset<W: Write>(
 }
 
 // Compresses a block of data using the specified compression type.
-pub(crate) fn compress_block(raw_block: &[u8], compression: CompressionType) -> Result<BlockData> {
+pub(crate) fn compress_block(
+	raw_block: BlockData,
+	compression: CompressionType,
+) -> Result<BlockData> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut enc = snap::raw::Encoder::new();
 			let mut buffer = vec![0; max_compress_len(raw_block.len())];
-			match enc.compress(raw_block, buffer.as_mut_slice()) {
+			match enc.compress(&raw_block, buffer.as_mut_slice()) {
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
 			}
-			Ok(buffer)
+			Ok(Bytes::from(buffer))
 		}
-		CompressionType::None => Ok(Vec::from(raw_block)),
+		CompressionType::None => Ok(raw_block),
 	}
 }
 
@@ -535,7 +542,7 @@ pub(crate) fn read_filter_block(
 
 fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
 	let meta_key =
-		InternalKey::new("meta".as_bytes().to_vec(), 0, InternalKeyKind::Set, 0).encode();
+		InternalKey::new(Bytes::from_static(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter();
@@ -576,7 +583,7 @@ pub(crate) fn read_table_block(
 
 	let block = decompress_block(&buf, CompressionType::from(compress[0]))?;
 
-	Ok(Block::new(block, opt))
+	Ok(Block::new(Bytes::from(block), opt))
 }
 
 /// Verify checksum of block
@@ -1320,12 +1327,24 @@ mod tests {
 
 		for i in 0..data.len() {
 			b.add(
-				InternalKey::new(data[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
+				InternalKey::new(
+					Bytes::copy_from_slice(data[i].0.as_bytes()),
+					1,
+					InternalKeyKind::Set,
+					0,
+				)
+				.into(),
 				data[i].1.as_bytes(),
 			)
 			.unwrap();
 			b.add(
-				InternalKey::new(data2[i].0.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
+				InternalKey::new(
+					Bytes::copy_from_slice(data2[i].0.as_bytes()),
+					1,
+					InternalKeyKind::Set,
+					0,
+				)
+				.into(),
 				data2[i].1.as_bytes(),
 			)
 			.unwrap();
@@ -1348,7 +1367,8 @@ mod tests {
 
 		for &(k, v) in data.iter() {
 			b.add(
-				InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
+				InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, InternalKeyKind::Set, 0)
+					.into(),
 				v.as_bytes(),
 			)
 			.unwrap();
@@ -1386,7 +1406,13 @@ mod tests {
 
 			for &(k, v) in data.iter() {
 				b.add(
-					InternalKey::new(k.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0).into(),
+					InternalKey::new(
+						Bytes::copy_from_slice(k.as_bytes()),
+						1,
+						InternalKeyKind::Set,
+						0,
+					)
+					.into(),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1411,22 +1437,22 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 		let mut iter = table.iter();
 
-		let key = InternalKey::new("bcd".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
-		let key = InternalKey::new("abc".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"abc"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
 		// Seek-past-last invalidates.
-		let key = InternalKey::new("{{{".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"{{{"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(!iter.valid());
 
-		let key = InternalKey::new("bbb".as_bytes().to_vec(), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::from_static(b"bbb"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
 	}
@@ -1491,7 +1517,7 @@ mod tests {
 			items.push((key.clone(), value.clone()));
 
 			let internal_key = InternalKey::new(
-				key.as_bytes().to_vec(),
+				Bytes::copy_from_slice(key.as_bytes()),
 				i + 2, // Descending sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -1515,8 +1541,12 @@ mod tests {
 
 		// Verify all items can be retrieved
 		for (key, value) in &items {
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), num_items + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				num_items + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			let result = table.get(internal_key).unwrap();
 
@@ -1562,8 +1592,12 @@ mod tests {
 			let value = format!("value_{i:05}");
 			items.push((key.clone(), value.clone()));
 
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			writer.add(internal_key.into(), value.as_bytes()).unwrap();
 		}
@@ -1610,7 +1644,10 @@ mod tests {
 		seq: u64,
 		value: &[u8],
 	) -> Result<()> {
-		writer.add(Arc::new(InternalKey::new(key.to_vec(), seq, InternalKeyKind::Set, 0)), value)
+		writer.add(
+			Arc::new(InternalKey::new(Bytes::copy_from_slice(key), seq, InternalKeyKind::Set, 0)),
+			value,
+		)
 	}
 
 	#[test]
@@ -1928,13 +1965,13 @@ mod tests {
 
 		// Also verify that we can use the range for querying
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			expected_low.to_vec(),
+			Bytes::copy_from_slice(expected_low),
 			1,
 			InternalKeyKind::Set,
 			0
 		)));
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			expected_high.to_vec(),
+			Bytes::copy_from_slice(expected_high),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -1943,7 +1980,7 @@ mod tests {
 		// A key before the range should not be in the range
 		let before_range = "aaa".as_bytes();
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
-			before_range.to_vec(),
+			Bytes::copy_from_slice(before_range),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -1952,7 +1989,7 @@ mod tests {
 		// A key after the range should not be in the range
 		let after_range = "zzzz".as_bytes();
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
-			after_range.to_vec(),
+			Bytes::copy_from_slice(after_range),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -1961,7 +1998,7 @@ mod tests {
 		// Test a key in the middle of the range
 		let middle_key = "bsr".as_bytes(); // This is in the test data
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			middle_key.to_vec(),
+			Bytes::copy_from_slice(middle_key),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -1997,7 +2034,7 @@ mod tests {
 		// Test keys in the gaps to ensure the is_key_in_key_range function works properly
 		let in_first_gap = "ccc".as_bytes(); // Between bbb and ppp
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			in_first_gap.to_vec(),
+			Bytes::copy_from_slice(in_first_gap),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2005,7 +2042,7 @@ mod tests {
 
 		let in_second_gap = "xxx".as_bytes(); // Between qqq and zzz
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			in_second_gap.to_vec(),
+			Bytes::copy_from_slice(in_second_gap),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2048,7 +2085,7 @@ mod tests {
 		for idx in [0, 10, 25, 49] {
 			let key = format!("key_{idx:03}");
 			assert!(table.is_key_in_key_range(&InternalKey::new(
-				key.as_bytes().to_vec(),
+				Bytes::copy_from_slice(key.as_bytes()),
 				1,
 				InternalKeyKind::Set,
 				0
@@ -2100,8 +2137,11 @@ mod tests {
 					InternalKeyKind::Set
 				};
 
-				b.add(InternalKey::new(k.as_bytes().to_vec(), 1, kind, 0).into(), v.as_bytes())
-					.unwrap();
+				b.add(
+					InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, kind, 0).into(),
+					v.as_bytes(),
+				)
+				.unwrap();
 			}
 
 			b.finish().unwrap();
@@ -2359,8 +2399,12 @@ mod tests {
 		for (seek_key, expected_start_index) in test_cases {
 			let mut iter = table.iter();
 
-			let internal_key =
-				InternalKey::new(seek_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(seek_key.as_bytes()),
+				1,
+				InternalKeyKind::Set,
+				0,
+			);
 			iter.seek(&internal_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to '{seek_key}'");
@@ -2421,7 +2465,7 @@ mod tests {
 		{
 			let mut iter = table.iter();
 			let seek_key =
-				InternalKey::new("key_005".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+				InternalKey::new(Bytes::from_static(b"key_005"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
@@ -2454,7 +2498,7 @@ mod tests {
 		{
 			let mut iter = table.iter();
 			let seek_key =
-				InternalKey::new("key_003".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+				InternalKey::new(Bytes::from_static(b"key_003"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
@@ -2467,7 +2511,7 @@ mod tests {
 		{
 			let mut iter = table.iter();
 			let seek_key =
-				InternalKey::new("key_999".as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+				InternalKey::new(Bytes::from_static(b"key_999"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 
 			assert!(!iter.valid(), "Iterator should be invalid after seeking past end");
@@ -2502,7 +2546,7 @@ mod tests {
 		for i in (0..1000).step_by(100) {
 			let mut iter = table.iter();
 			let seek_key = InternalKey::new(
-				format!("key_{i:06}").as_bytes().to_vec(),
+				Bytes::from(format!("key_{i:06}").into_bytes()),
 				1,
 				InternalKeyKind::Set,
 				0,
@@ -2740,8 +2784,12 @@ mod tests {
 		for i in 0..100 {
 			let key = format!("key_{i:03}");
 			let value = format!("value_{i:03}");
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
 		}
 
@@ -2763,7 +2811,7 @@ mod tests {
 			let key = format!("key_{i:03}");
 			let expected_value = format!("value_{i:03}");
 			let internal_key = InternalKey::new(
-				key.as_bytes().to_vec(),
+				Bytes::copy_from_slice(key.as_bytes()),
 				i + 2, // Higher seq number for lookup
 				InternalKeyKind::Set,
 				0,
