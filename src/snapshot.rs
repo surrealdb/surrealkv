@@ -107,6 +107,7 @@ struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
 	start_ts: u64,
 	end_ts: u64,
 	snapshot_seq_num: u64,
+	limit: Option<usize>,
 	include_tombstones: bool,
 	include_latest_only: bool, // When true, only include the latest version of each key
 }
@@ -286,6 +287,7 @@ impl Snapshot {
 			start_ts: 0, // Start from beginning of time
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
+			limit: None,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -313,6 +315,7 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
+			limit: None,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -337,6 +340,7 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
+			limit: None,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -371,17 +375,13 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: u64::MAX,
 			snapshot_seq_num: self.seq_num,
+			limit,
 			include_tombstones: true,
 			include_latest_only: false, // Include all versions for scan_all_versions
 		})?;
 
 		let mut results = Vec::new();
 		for (internal_key, encoded_value) in versioned_iter {
-			if let Some(limit) = limit {
-				if results.len() >= limit {
-					break;
-				}
-			}
 			let is_tombstone = internal_key.is_tombstone();
 			let value = if is_tombstone {
 				Value::default() // Use default value for soft delete markers
@@ -499,7 +499,16 @@ impl Snapshot {
 			});
 
 			// Process each key's versions
-			for (_user_key, mut versions) in key_versions.into_iter() {
+			let max_unique_keys = params.limit.unwrap_or(usize::MAX);
+
+			for (unique_key_count, (_user_key, mut versions)) in
+				key_versions.into_iter().enumerate()
+			{
+				// Check if we've reached the limit of unique keys
+				if unique_key_count >= max_unique_keys {
+					break;
+				}
+
 				// If include_latest_only is true, keep only the latest version (highest timestamp)
 				if params.include_latest_only && !versions.is_empty() {
 					// B+tree already provides entries in timestamp order, so just take the last element (highest timestamp)

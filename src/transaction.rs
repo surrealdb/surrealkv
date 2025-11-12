@@ -4372,12 +4372,8 @@ mod tests {
 			let txn = store.begin().unwrap();
 			let mut end_key = keys.last().unwrap().as_ref().to_vec();
 			end_key.push(0);
-			let results: Vec<_> = txn
-				.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None)
-				.unwrap()
-				.into_iter()
-				.take(2)
-				.collect();
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
 
 			assert_eq!(results.len(), 2);
 		}
@@ -4424,18 +4420,14 @@ mod tests {
 			let txn = store.begin().unwrap();
 			let mut end_key = keys.last().unwrap().as_ref().to_vec();
 			end_key.push(0);
-			let results: Vec<_> = txn
-				.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None)
-				.unwrap()
-				.into_iter()
-				.take(6)
-				.collect();
+			let results: Vec<_> =
+				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
 			assert_eq!(results.len(), 6); // Take 6 results
 
-			// Collect unique keys from the results (should be 2 keys)
+			// Collect unique keys from the results
 			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
 
-			// Verify that we got results for 2 keys
+			// Verify that the number of unique keys is equal to the limit
 			assert_eq!(unique_keys.len(), 2);
 
 			// Verify that the results contain all versions for each key
@@ -4615,7 +4607,7 @@ mod tests {
 					};
 
 					let mut batch_results = Vec::new();
-					let results: Vec<_> =
+					let results =
 						txn.scan_all_versions(&start_key, &end_key, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
 						// Convert borrowed key to owned immediately
@@ -4642,25 +4634,23 @@ mod tests {
 			let all_results = scan_in_batches(&store, batch_size);
 
 			// Verify the results
-			// Note: The batching logic skips remaining versions of a key when moving to next batch
-			// due to the last_key + "\0" approach, so each batch gets exactly batch_size versions
 			let expected_results = [
 				vec![
 					(Bytes::from("key1"), Bytes::from("v1"), 1, false),
 					(Bytes::from("key1"), Bytes::from("v2"), 2, false),
-				],
-				vec![
+					(Bytes::from("key1"), Bytes::from("v3"), 3, false),
+					(Bytes::from("key1"), Bytes::from("v4"), 4, false),
 					(Bytes::from("key2"), Bytes::from("v1"), 1, false),
 					(Bytes::from("key2"), Bytes::from("v2"), 2, false),
 				],
 				vec![
 					(Bytes::from("key3"), Bytes::from("v1"), 1, false),
 					(Bytes::from("key3"), Bytes::from("v2"), 2, false),
-				],
-				vec![
+					(Bytes::from("key3"), Bytes::from("v3"), 3, false),
+					(Bytes::from("key3"), Bytes::from("v4"), 4, false),
 					(Bytes::from("key4"), Bytes::from("v1"), 1, false),
-					(Bytes::from("key5"), Bytes::from("v1"), 1, false),
 				],
+				vec![(Bytes::from("key5"), Bytes::from("v1"), 1, false)],
 			];
 
 			assert_eq!(all_results.len(), expected_results.len());
