@@ -2581,7 +2581,7 @@ mod tests {
 		let tx = tree.begin().unwrap();
 		let mut end_key = user_key.to_vec();
 		end_key.push(0);
-		let scan_all = tx.scan_all_versions(user_key.as_ref(), &end_key).unwrap();
+		let scan_all = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
 		assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
 
 		drop(tx);
@@ -2620,7 +2620,7 @@ mod tests {
 		let tx = tree.begin().unwrap();
 		let mut end_key = user_key.to_vec();
 		end_key.push(0);
-		let scan_after = tx.scan_all_versions(user_key.as_ref(), &end_key).unwrap();
+		let scan_after = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
 
 		// We should have at least some versions remaining
 		assert!(!scan_after.is_empty(), "Should have at least some versions remaining");

@@ -350,10 +350,16 @@ impl Snapshot {
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// Range is [start, end) - start is inclusive, end is exclusive.
+	/// 
+	/// # Arguments
+	/// * `start` - Start key (inclusive)
+	/// * `end` - End key (exclusive)
+	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
 	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
 		end: Key,
+		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -371,6 +377,11 @@ impl Snapshot {
 
 		let mut results = Vec::new();
 		for (internal_key, encoded_value) in versioned_iter {
+			if let Some(limit) = limit {
+				if results.len() >= limit {
+					break;
+				}
+			}
 			let is_tombstone = internal_key.is_tombstone();
 			let value = if is_tombstone {
 				Value::default() // Use default value for soft delete markers
