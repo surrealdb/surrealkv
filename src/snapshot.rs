@@ -170,7 +170,7 @@ impl Snapshot {
 
 		let iter_state = self.collect_iter_state()?;
 		let range = (Bound::Included(start), Bound::Excluded(end));
-		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range, false);
+		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range, true);
 
 		for (key, _value) in merge_iter {
 			// Skip tombstones
