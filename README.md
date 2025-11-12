@@ -316,35 +316,35 @@ use surrealkv::ReadOptions;
 
 let tx = tree.begin()?;
 
-// Range query with limit and bounds
+// Range query with bounds
 let options = ReadOptions::new()
-    .with_limit(Some(10))
     .with_iterate_lower_bound(Some(b"a".to_vec()))
     .with_iterate_upper_bound(Some(b"z".to_vec()));
 
 let results: Vec<_> = tx.range_with_options(&options)?
+    .take(10)  // Use .take() to limit results
     .map(|r| r.unwrap())
     .collect();
 
 // Keys-only iteration (faster, doesn't fetch values from disk when vlog is enabled)
 let options = ReadOptions::new()
     .with_keys_only(true)
-    .with_limit(Some(100))
     .with_iterate_lower_bound(Some(b"a".to_vec()))
     .with_iterate_upper_bound(Some(b"z".to_vec()));
 
 let keys: Vec<_> = tx.keys_with_options(&options)?
+    .take(100)  // Use .take() to limit results
     .map(|r| r.unwrap())
     .collect();
 
 // Point-in-time read with options (requires versioning enabled)
 let options = ReadOptions::new()
     .with_timestamp(Some(12345))
-    .with_limit(Some(50))
     .with_iterate_lower_bound(Some(b"a".to_vec()))
     .with_iterate_upper_bound(Some(b"z".to_vec()));
 
 let historical_data: Vec<_> = tx.range_with_options(&options)?
+    .take(50)  // Use .take() to limit results
     .map(|r| r.unwrap())
     .collect();
 ```

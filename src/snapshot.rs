@@ -107,7 +107,6 @@ struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
 	start_ts: u64,
 	end_ts: u64,
 	snapshot_seq_num: u64,
-	limit: Option<usize>,
 	include_tombstones: bool,
 	include_latest_only: bool, // When true, only include the latest version of each key
 }
@@ -286,9 +285,8 @@ impl Snapshot {
 			key_range: &key_range,
 			start_ts: 0, // Start from beginning of time
 			end_ts: timestamp,
-			limit: None,               // No limit for single key lookup
-			include_tombstones: false, // Don't include tombstones
 			snapshot_seq_num: self.seq_num,
+			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
 
@@ -308,7 +306,6 @@ impl Snapshot {
 		start: Key,
 		end: Key,
 		timestamp: u64,
-		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
 		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
@@ -316,7 +313,6 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
-			limit,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -334,7 +330,6 @@ impl Snapshot {
 		start: Key,
 		end: Key,
 		timestamp: u64,
-		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
 		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
@@ -342,7 +337,6 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
-			limit,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -355,13 +349,11 @@ impl Snapshot {
 
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	/// The limit currently is on the unique keys, not the total number of results
 	/// Range is [start, end) - start is inclusive, end is exclusive.
 	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
 		end: Key,
-		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
@@ -373,7 +365,6 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: u64::MAX,
 			snapshot_seq_num: self.seq_num,
-			limit,
 			include_tombstones: true,
 			include_latest_only: false, // Include all versions for scan_all_versions
 		})?;
@@ -497,16 +488,7 @@ impl Snapshot {
 			});
 
 			// Process each key's versions
-			let max_unique_keys = params.limit.unwrap_or(usize::MAX);
-
-			for (unique_key_count, (_user_key, mut versions)) in
-				key_versions.into_iter().enumerate()
-			{
-				// Check if we've reached the limit of unique keys
-				if unique_key_count >= max_unique_keys {
-					break;
-				}
-
+			for (_user_key, mut versions) in key_versions.into_iter() {
 				// If include_latest_only is true, keep only the latest version (highest timestamp)
 				if params.include_latest_only && !versions.is_empty() {
 					// B+tree already provides entries in timestamp order, so just take the last element (highest timestamp)
@@ -1203,8 +1185,7 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Range scan should return empty
-		let range: Vec<_> =
-			tx.range(b"a", b"z", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert!(range.is_empty());
 	}
@@ -1234,7 +1215,7 @@ mod tests {
 
 		// The read transaction should only see the initial data
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1266,7 +1247,7 @@ mod tests {
 
 		// The read transaction should see the old values
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v1");
@@ -1275,7 +1256,7 @@ mod tests {
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
 		let range: Vec<_> =
-			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			new_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v2");
@@ -1307,7 +1288,7 @@ mod tests {
 
 		// The first read transaction should still see all three keys
 		let range: Vec<_> =
-			read_tx1.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx1.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1317,7 +1298,7 @@ mod tests {
 		// A new transaction should not see the deleted key
 		let read_tx2 = store.begin().unwrap();
 		let range: Vec<_> =
-			read_tx2.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx2.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1401,7 +1382,7 @@ mod tests {
 
 		// tx1 should see all original data
 		let range1: Vec<_> =
-			tx1.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx1.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range1.len(), 10);
 		for (i, item) in range1.iter().enumerate() {
@@ -1414,7 +1395,7 @@ mod tests {
 
 		// tx2 should see updated data with deletions
 		let range2: Vec<_> =
-			tx2.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx2.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -1498,13 +1479,13 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Test different range queries
-		let numeric_range: Vec<_> = tx.range(b"000", b"999", None).unwrap().collect::<Vec<_>>();
+		let numeric_range: Vec<_> = tx.range(b"000", b"999").unwrap().collect::<Vec<_>>();
 		assert_eq!(numeric_range.len(), 10);
 
-		let alpha_range: Vec<_> = tx.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
+		let alpha_range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Vec<_>>();
 		assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-		let mixed_range: Vec<_> = tx.range(b"mix", b"miy", None).unwrap().collect::<Vec<_>>();
+		let mixed_range: Vec<_> = tx.range(b"mix", b"miy").unwrap().collect::<Vec<_>>();
 		assert_eq!(mixed_range.len(), 5);
 	}
 
@@ -1528,7 +1509,7 @@ mod tests {
 
 		// Range scan should return keys in sorted order
 		let range: Vec<_> =
-			tx.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 9);
 
