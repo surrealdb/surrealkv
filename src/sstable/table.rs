@@ -835,6 +835,28 @@ impl Table {
 			.map(|range| range.overlaps(other_range))
 			.unwrap_or(false)
 	}
+
+	/// Checks if this table is completely before the given range
+	/// Returns true if table's highest key is less than the range's lowest key
+	pub(crate) fn is_before_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
+		self.meta
+			.properties
+			.key_range
+			.as_ref()
+			.map(|range| self.opts.comparator.compare(&range.high, &other_range.low) == Ordering::Less)
+			.unwrap_or(false)
+	}
+
+	/// Checks if this table is completely after the given range
+	/// Returns true if table's lowest key is greater than the range's highest key
+	pub(crate) fn is_after_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
+		self.meta
+			.properties
+			.key_range
+			.as_ref()
+			.map(|range| self.opts.comparator.compare(&range.low, &other_range.high) == Ordering::Greater)
+			.unwrap_or(false)
+	}
 }
 
 pub(crate) struct TableIterator {
