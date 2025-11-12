@@ -159,22 +159,23 @@ let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
 
 ### Range Operations
 
-Range operations support efficient iteration over key ranges with optional limits:
+Range operations support efficient iteration over key ranges:
 
 ```rust
 // Range scan between keys (inclusive start, exclusive end)
 let mut txn = tree.begin()?;
-let range: Vec<_> = txn.range(b"key1", b"key5", None)?
+let range: Vec<_> = txn.range(b"key1", b"key5")?
     .map(|r| r.unwrap())
     .collect();
 
 // Keys-only scan (faster, doesn't fetch values when vlog is enabled)
-let keys: Vec<_> = txn.keys(b"key1", b"key5", None)?
+let keys: Vec<_> = txn.keys(b"key1", b"key5")?
     .map(|r| r.unwrap())
     .collect();
 
-// Range with limit
-let limited: Vec<_> = txn.range(b"key1", b"key9", Some(10))?
+// Range with limit using .take()
+let limited: Vec<_> = txn.range(b"key1", b"key9")?
+    .take(10)
     .map(|r| r.unwrap())
     .collect();
 
@@ -196,9 +197,8 @@ let mut txn = tree.begin()?;
 let count = txn.count(b"key1", b"key9")?;
 println!("Found {} keys", count);
 
-// Count with custom options (limit, bounds, etc.)
+// Count with custom options (bounds, timestamp, etc.)
 let options = ReadOptions::new()
-    .with_limit(Some(100))
     .with_iterate_lower_bound(Some(b"a".to_vec()))
     .with_iterate_upper_bound(Some(b"z".to_vec()));
 let count = txn.count_with_options(&options)?;
