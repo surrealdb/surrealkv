@@ -761,15 +761,15 @@ impl Transaction {
 	}
 
 	/// Gets all versions of keys in a range.
-	/// 
+	///
 	/// Returns all historical versions of keys within the specified range, including tombstones.
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	/// 
+	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
 	/// * `end` - End key (exclusive)
 	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
-	/// 
+	///
 	/// # Returns
 	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for each version found.
 	pub fn scan_all_versions<K>(
@@ -4546,7 +4546,8 @@ mod tests {
 			);
 
 			// Test 2: Range from key2 (inclusive) should exclude key1
-			let results = txn.scan_all_versions(&b"key2"[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
+			let results =
+				txn.scan_all_versions(&b"key2"[..], &b"\xff\xff\xff\xff"[..], None).unwrap();
 			assert_eq!(results.len(), 4); // key2, key3, key4, key5 versions
 
 			// Test 3: Range excluding key2 should exclude key2 but include others
@@ -4613,10 +4614,9 @@ mod tests {
 						(start, b"\xff\xff\xff\xff".to_vec())
 					};
 
-				let mut batch_results = Vec::new();
-				let results: Vec<_> = txn
-					.scan_all_versions(&start_key, &end_key, Some(batch_size))
-					.unwrap();
+					let mut batch_results = Vec::new();
+					let results: Vec<_> =
+						txn.scan_all_versions(&start_key, &end_key, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
 						// Convert borrowed key to owned immediately
 						let key_bytes = Bytes::copy_from_slice(k.as_ref());
@@ -4638,30 +4638,30 @@ mod tests {
 				all_results
 			}
 
-		// Scan in batches and collect the results
-		let all_results = scan_in_batches(&store, batch_size);
+			// Scan in batches and collect the results
+			let all_results = scan_in_batches(&store, batch_size);
 
-		// Verify the results
-		// Note: The batching logic skips remaining versions of a key when moving to next batch
-		// due to the last_key + "\0" approach, so each batch gets exactly batch_size versions
-		let expected_results = [
-			vec![
-				(Bytes::from("key1"), Bytes::from("v1"), 1, false),
-				(Bytes::from("key1"), Bytes::from("v2"), 2, false),
-			],
-			vec![
-				(Bytes::from("key2"), Bytes::from("v1"), 1, false),
-				(Bytes::from("key2"), Bytes::from("v2"), 2, false),
-			],
-			vec![
-				(Bytes::from("key3"), Bytes::from("v1"), 1, false),
-				(Bytes::from("key3"), Bytes::from("v2"), 2, false),
-			],
-			vec![
-				(Bytes::from("key4"), Bytes::from("v1"), 1, false),
-				(Bytes::from("key5"), Bytes::from("v1"), 1, false),
-			],
-		];
+			// Verify the results
+			// Note: The batching logic skips remaining versions of a key when moving to next batch
+			// due to the last_key + "\0" approach, so each batch gets exactly batch_size versions
+			let expected_results = [
+				vec![
+					(Bytes::from("key1"), Bytes::from("v1"), 1, false),
+					(Bytes::from("key1"), Bytes::from("v2"), 2, false),
+				],
+				vec![
+					(Bytes::from("key2"), Bytes::from("v1"), 1, false),
+					(Bytes::from("key2"), Bytes::from("v2"), 2, false),
+				],
+				vec![
+					(Bytes::from("key3"), Bytes::from("v1"), 1, false),
+					(Bytes::from("key3"), Bytes::from("v2"), 2, false),
+				],
+				vec![
+					(Bytes::from("key4"), Bytes::from("v1"), 1, false),
+					(Bytes::from("key5"), Bytes::from("v1"), 1, false),
+				],
+			];
 
 			assert_eq!(all_results.len(), expected_results.len());
 
