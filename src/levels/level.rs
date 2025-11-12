@@ -71,17 +71,14 @@ impl Level {
 	/// Returns the index of the first table to check, or tables.len() if all tables are before the range.
 	pub(crate) fn find_first_overlapping_table(&self, key_range: &KeyRange) -> usize {
 		// Binary search to find first table that is NOT completely before the range
-		self.tables
-			.partition_point(|table| table.is_before_range(key_range))
+		self.tables.partition_point(|table| table.is_before_range(key_range))
 	}
 
 	/// Finds the index after the last table that could potentially overlap with the given range.
 	/// Returns the exclusive end index for iteration.
 	pub(crate) fn find_last_overlapping_table(&self, key_range: &KeyRange) -> usize {
 		// Find the first table that is completely after the range
-		let first_after = self.tables
-			.partition_point(|table| !table.is_after_range(key_range));
-		first_after
+		self.tables.partition_point(|table| !table.is_after_range(key_range))
 	}
 }
 

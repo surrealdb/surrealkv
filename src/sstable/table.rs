@@ -545,7 +545,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 		InternalKey::new(Bytes::from_static(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
-	let mut metaindexiter = metaix.iter();
+	let mut metaindexiter = metaix.iter(false);
 	metaindexiter.seek(&meta_key);
 
 	if metaindexiter.valid() {
@@ -677,7 +677,7 @@ impl Table {
 			.as_bytes()
 			.to_vec();
 
-		let mut metaindexiter = metaix.iter();
+		let mut metaindexiter = metaix.iter(false);
 		metaindexiter.seek(&filter_name);
 
 		if metaindexiter.valid() {
@@ -745,7 +745,8 @@ impl Table {
 				};
 
 				// Then search within the partition
-				let mut partition_iter = partition_block.iter();
+				// Note: Index blocks always need full key-value pairs to decode block handles
+				let mut partition_iter = partition_block.iter(false);
 				partition_iter.seek(key_encoded);
 
 				if partition_iter.valid() {
@@ -771,7 +772,7 @@ impl Table {
 
 		// Read block (potentially from cache)
 		let tb = self.read_block(&handle)?;
-		let mut iter = tb.iter();
+		let mut iter = tb.iter(false);
 
 		// Go to entry and check if it's the wanted entry.
 		iter.seek(key_encoded);
@@ -788,18 +789,19 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(&self) -> TableIterator {
+	pub(crate) fn iter(&self, keys_only: bool) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
+				// Note: Index blocks always need full key-value pairs to decode block handles
 				if let Ok(first_block) = partitioned_index.first_partition() {
-					first_block.iter()
+					first_block.iter(false)
 				} else {
 					// If there are no partitions, create a proper empty block
 					let empty_writer = BlockWriter::new(self.opts.clone());
 					let empty_block_data = empty_writer.finish();
 					let empty_block = Block::new(empty_block_data, self.opts.clone());
-					empty_block.iter()
+					empty_block.iter(false)
 				}
 			}
 		};
@@ -813,6 +815,7 @@ impl Table {
 			exhausted: false,
 			current_partition_index: 0,
 			current_partition_iter: None,
+			keys_only,
 		}
 	}
 
@@ -843,7 +846,9 @@ impl Table {
 			.properties
 			.key_range
 			.as_ref()
-			.map(|range| self.opts.comparator.compare(&range.high, &other_range.low) == Ordering::Less)
+			.map(|range| {
+				self.opts.comparator.compare(&range.high, &other_range.low) == Ordering::Less
+			})
 			.unwrap_or(false)
 	}
 
@@ -854,7 +859,9 @@ impl Table {
 			.properties
 			.key_range
 			.as_ref()
-			.map(|range| self.opts.comparator.compare(&range.low, &other_range.high) == Ordering::Greater)
+			.map(|range| {
+				self.opts.comparator.compare(&range.low, &other_range.high) == Ordering::Greater
+			})
 			.unwrap_or(false)
 	}
 }
@@ -871,6 +878,8 @@ pub(crate) struct TableIterator {
 	// For partitioned index support
 	current_partition_index: usize,
 	current_partition_iter: Option<BlockIterator>,
+	/// When true, only return keys without allocating values
+	keys_only: bool,
 }
 
 impl TableIterator {
@@ -903,7 +912,8 @@ impl TableIterator {
 
 		let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 		let partition_block = partitioned_index.load_block(partition_handle)?;
-		let mut partition_iter = partition_block.iter();
+		// Note: Index blocks always need full key-value pairs to decode block handles
+		let mut partition_iter = partition_block.iter(false);
 		partition_iter.seek_to_first();
 
 		if partition_iter.valid() {
@@ -931,7 +941,7 @@ impl TableIterator {
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
 		let block = self.table.read_block(handle)?;
-		let mut block_iter = block.iter();
+		let mut block_iter = block.iter(self.keys_only);
 
 		// Position at first entry in the new block
 		block_iter.seek_to_first();
@@ -1000,7 +1010,8 @@ impl TableIterator {
 			let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 
 			if let Ok(partition_block) = partitioned_index.load_block(partition_handle) {
-				let mut partition_iter = partition_block.iter();
+				// Note: Index blocks always need full key-value pairs to decode block handles
+				let mut partition_iter = partition_block.iter(false);
 				partition_iter.seek_to_last();
 
 				if partition_iter.valid() {
@@ -1080,7 +1091,8 @@ impl LSMIterator for TableIterator {
 		if !partitioned_index.blocks.is_empty() {
 			let partition_handle = &partitioned_index.blocks[0];
 			if let Ok(partition_block) = partitioned_index.load_block(partition_handle) {
-				let mut partition_iter = partition_block.iter();
+				// Note: Index blocks always need full key-value pairs to decode block handles
+				let mut partition_iter = partition_block.iter(false);
 				partition_iter.seek_to_first();
 
 				if partition_iter.valid() {
@@ -1115,7 +1127,8 @@ impl LSMIterator for TableIterator {
 			let last_partition_handle = &partitioned_index.blocks[last_partition_index];
 
 			if let Ok(last_partition_block) = partitioned_index.load_block(last_partition_handle) {
-				let mut partition_iter = last_partition_block.iter();
+				// Note: Index blocks always need full key-value pairs to decode block handles
+				let mut partition_iter = last_partition_block.iter(false);
 				partition_iter.seek_to_last();
 
 				if partition_iter.valid() {
@@ -1168,7 +1181,8 @@ impl LSMIterator for TableIterator {
 			}
 
 			if let Ok(partition_block) = partitioned_index.load_block(block_handle) {
-				let mut partition_iter = partition_block.iter();
+				// Note: Index blocks always need full key-value pairs to decode block handles
+				let mut partition_iter = partition_block.iter(false);
 				partition_iter.seek(target);
 
 				if partition_iter.valid() {
@@ -1457,7 +1471,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
-		let mut iter = table.iter();
+		let mut iter = table.iter(false);
 
 		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
@@ -1485,7 +1499,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
-		let mut iter = table.iter();
+		let mut iter = table.iter(false);
 
 		iter.advance();
 		assert!(iter.valid());
@@ -1637,7 +1651,7 @@ mod tests {
 			"Table should contain num_items entries"
 		);
 
-		let iter = table.iter();
+		let iter = table.iter(false);
 		for (item, (key, value)) in iter.enumerate() {
 			let expected_key = format!("key_{item:05}");
 			let expected_value = format!("value_{item:05}");
@@ -2187,7 +2201,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-		let iter = table.iter();
+		let iter = table.iter(false);
 		let mut collected_items = Vec::new();
 
 		for (key, value) in iter {
@@ -2233,7 +2247,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-		let mut iter = table.iter();
+		let mut iter = table.iter(false);
 		let mut seen_keys = Vec::new();
 		let mut iteration_count = 0;
 
@@ -2290,7 +2304,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-		let mut iter = table.iter();
+		let mut iter = table.iter(false);
 
 		for expected_index in 0..data.len() {
 			let advance_result = iter.advance();
@@ -2345,7 +2359,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let collected: Vec<_> = table.iter().collect();
+			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
 			let key_str = std::str::from_utf8(&collected[0].0.user_key).unwrap();
@@ -2361,7 +2375,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let collected: Vec<_> = table.iter().collect();
+			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
 			let keys: Vec<String> = collected
@@ -2383,7 +2397,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let collected: Vec<_> = table.iter().collect();
+			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
 			let mut seen_keys = std::collections::HashSet::new();
@@ -2419,7 +2433,7 @@ mod tests {
 		let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
 		for (seek_key, expected_start_index) in test_cases {
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 
 			let internal_key = InternalKey::new(
 				Bytes::copy_from_slice(seek_key.as_bytes()),
@@ -2485,7 +2499,7 @@ mod tests {
 
 		// Test seek to existing key
 		{
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_005"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2518,7 +2532,7 @@ mod tests {
 
 		// Test seek to non-existing key (should find next key)
 		{
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_003"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2531,7 +2545,7 @@ mod tests {
 
 		// Test seek past end
 		{
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_999"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2557,7 +2571,7 @@ mod tests {
 		use std::time::Instant;
 
 		let start = Instant::now();
-		let count = table.iter().count();
+		let count = table.iter(false).count();
 		let duration = start.elapsed();
 
 		assert_eq!(count, 1000, "Should iterate through all 1000 items");
@@ -2566,7 +2580,7 @@ mod tests {
 
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 			let seek_key = InternalKey::new(
 				Bytes::from(format!("key_{i:06}").into_bytes()),
 				1,
@@ -2591,7 +2605,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-		let mut iter = table.iter();
+		let mut iter = table.iter(false);
 		iter.seek_to_first();
 
 		while iter.valid() {
@@ -2627,7 +2641,7 @@ mod tests {
 
 		// Create multiple iterators and verify they work independently
 		for iteration in 0..3 {
-			let collected: Vec<_> = table.iter().collect();
+			let collected: Vec<_> = table.iter(false).collect();
 
 			assert_eq!(
 				collected.len(),
@@ -2664,7 +2678,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 
 			let result = iter.advance();
 			assert!(!result, "advance() on empty table should return false");
@@ -2681,7 +2695,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 
 			assert!(iter.advance(), "First advance should succeed on single-item table");
 			assert!(iter.valid(), "Iterator should be valid after first advance");
@@ -2697,7 +2711,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-			let mut iter = table.iter();
+			let mut iter = table.iter(false);
 
 			// Exhaust the iterator
 			while iter.advance() {
@@ -2722,7 +2736,7 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Test with manual advance() loop - need to position first
-		let mut iter1 = table.iter();
+		let mut iter1 = table.iter(false);
 		iter1.seek_to_first();
 		let mut collected_via_advance = Vec::new();
 		while iter1.valid() {
@@ -2733,7 +2747,7 @@ mod tests {
 		}
 
 		// Test with standard iterator interface
-		let iter2 = table.iter();
+		let iter2 = table.iter(false);
 		let mut collected_via_next = Vec::new();
 		for (key, value) in iter2 {
 			collected_via_next.push((key, value));
@@ -2775,7 +2789,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
-		let collected: Vec<_> = table.iter().collect();
+		let collected: Vec<_> = table.iter(false).collect();
 
 		assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
 
@@ -2853,7 +2867,7 @@ mod tests {
 		}
 
 		// Test full iteration
-		let iter = table.iter();
+		let iter = table.iter(false);
 		let collected: Vec<_> = iter.collect();
 		assert_eq!(collected.len(), 100, "Should iterate through all entries");
 

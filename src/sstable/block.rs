@@ -92,8 +92,8 @@ pub(crate) struct Block {
 }
 
 impl Block {
-	pub(crate) fn iter(&self) -> BlockIterator {
-		BlockIterator::new(self.opts.clone(), self.block.clone())
+	pub(crate) fn iter(&self, keys_only: bool) -> BlockIterator {
+		BlockIterator::new(self.opts.clone(), self.block.clone(), keys_only)
 	}
 
 	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
@@ -285,11 +285,13 @@ pub(crate) struct BlockIterator {
 	current_value_offset_end: usize,
 	/// internal key comparator
 	internal_cmp: Arc<dyn Comparator>,
+	/// When true, only return keys without allocating values
+	keys_only: bool,
 }
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options>, block: BlockData) -> Self {
+	pub(crate) fn new(options: Arc<Options>, block: BlockData, keys_only: bool) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -313,6 +315,7 @@ impl BlockIterator {
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
 			internal_cmp: internal_comparator,
+			keys_only,
 		}
 	}
 
@@ -381,10 +384,12 @@ impl Iterator for BlockIterator {
 		if !self.advance() {
 			return None;
 		}
-		Some((
-			Bytes::copy_from_slice(&self.current_key[..]),
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end),
-		))
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+		};
+		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
@@ -394,10 +399,12 @@ impl DoubleEndedIterator for BlockIterator {
 			return None;
 		}
 
-		Some((
-			Bytes::copy_from_slice(&self.current_key[..]),
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end),
-		))
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+		};
+		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
@@ -552,7 +559,7 @@ mod tests {
 		assert_eq!(blockc.len(), 8);
 		assert_eq!(blockc.as_ref(), &[0, 0, 0, 0, 1, 0, 0, 0]);
 
-		let mut block_iter = Block::new(blockc, o).iter();
+		let mut block_iter = Block::new(blockc, o).iter(false);
 
 		let mut i = 0;
 		while block_iter.advance() {
@@ -574,7 +581,7 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, o.clone()).iter();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
 
 		let mut i = 0;
 		while block_iter.advance() {
@@ -597,7 +604,7 @@ mod tests {
 		}
 
 		let block_contents = builder.finish();
-		let mut iter = Block::new(block_contents, o.clone()).iter();
+		let mut iter = Block::new(block_contents, o.clone()).iter(false);
 
 		iter.next();
 		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
@@ -632,7 +639,7 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, o.clone()).iter();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
 
 		let key = InternalKey::new(Bytes::from_static(b"pkey2"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
@@ -685,7 +692,7 @@ mod tests {
 
 			let block_contents = builder.finish();
 
-			let mut block_iter = Block::new(block_contents, o.clone()).iter();
+			let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
 
 			block_iter.seek_to_last();
 			assert!(block_iter.valid());

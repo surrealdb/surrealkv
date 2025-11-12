@@ -548,7 +548,7 @@ mod tests {
 
 		for level in levels {
 			for table in &level.tables {
-				let iter = table.iter();
+				let iter = table.iter(false);
 
 				for result in iter {
 					count += 1;
@@ -587,7 +587,7 @@ mod tests {
 		// Collect all keys from all tables across all levels
 		for level in levels {
 			for table in &level.tables {
-				let iter = table.iter();
+				let iter = table.iter(false);
 				for result in iter {
 					all_key_values.insert(result.0.user_key.clone(), result.1.to_vec());
 				}
@@ -885,7 +885,7 @@ mod tests {
 			let mut total_keys = 0;
 			for table in &levels.get_levels()[0].tables {
 				let mut table_keys = 0;
-				let iter = table.iter();
+				let iter = table.iter(false);
 				for _ in iter {
 					table_keys += 1;
 				}
@@ -1179,7 +1179,7 @@ mod tests {
 					let mut min_key = None;
 					let mut max_key = None;
 
-					for (key, _) in table.iter() {
+					for (key, _) in table.iter(false) {
 						if min_key.is_none() {
 							min_key = Some(key.user_key.as_ref().to_vec());
 						}
@@ -1554,7 +1554,7 @@ mod tests {
 		let mut all_keys = HashMap::new();
 		for level in levels {
 			for table in &level.tables {
-				let iter = table.iter();
+				let iter = table.iter(false);
 				for result in iter {
 					// Decode the ValueLocation before comparing
 					let encoded_value = result.1.clone();
@@ -1637,7 +1637,7 @@ mod tests {
 		let mut remaining_keys = Vec::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, _) in table.iter() {
+				for (key, _) in table.iter(false) {
 					if key.kind() == InternalKeyKind::Set {
 						let key_str = String::from_utf8_lossy(&key.user_key);
 						remaining_keys.push(key_str.to_string());
@@ -1732,7 +1732,7 @@ mod tests {
 		let mut tombstones = HashMap::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, encoded_value) in table.iter() {
+				for (key, encoded_value) in table.iter(false) {
 					match key.kind() {
 						InternalKeyKind::Set => {
 							// Decode the ValueLocation
@@ -1857,7 +1857,7 @@ mod tests {
 		let mut survivors = HashMap::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, encoded_value) in table.iter() {
+				for (key, encoded_value) in table.iter(false) {
 					if key.kind() == InternalKeyKind::Set {
 						// Decode the ValueLocation
 						let location = ValueLocation::decode(&encoded_value).unwrap();
@@ -1979,7 +1979,7 @@ mod tests {
 		let mut tombstones = 0;
 		let mut values = 0;
 		for table in &levels[3].tables {
-			for (key, _) in table.iter() {
+			for (key, _) in table.iter(false) {
 				match key.kind() {
 					InternalKeyKind::Delete => tombstones += 1,
 					InternalKeyKind::Set => values += 1,
@@ -2020,8 +2020,8 @@ mod tests {
 
 		// Test non-bottom level compaction
 		let iterators: Vec<_> = vec![
-			Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
-			Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
+			Box::new(tombstone_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
+			Box::new(value_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
 		let comp_iter_non_bottom = MergeIterator::new(iterators, false);
 		let non_bottom_result: Vec<_> = comp_iter_non_bottom.collect();
@@ -2038,8 +2038,8 @@ mod tests {
 
 		// Test bottom level compaction
 		let iterators: Vec<_> = vec![
-			Box::new(tombstone_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
-			Box::new(value_table.iter()) as Box<dyn DoubleEndedIterator<Item = _>>,
+			Box::new(tombstone_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
+			Box::new(value_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
 		let comp_iter_bottom = MergeIterator::new(iterators, true);
 		let bottom_result: Vec<_> = comp_iter_bottom.collect();
@@ -2219,7 +2219,7 @@ mod tests {
 
 		// Count entries in L1 (bottom level) after compaction
 		for table in &levels[1].tables {
-			for (key, _) in table.iter() {
+			for (key, _) in table.iter(false) {
 				match key.kind() {
 					InternalKeyKind::SoftDelete => soft_deletes += 1,
 					InternalKeyKind::Delete => regular_deletes += 1,
@@ -2240,7 +2240,7 @@ mod tests {
 		// Verify that values are the latest and correct
 		let mut found_keys = HashSet::new();
 		for table in &levels[1].tables {
-			for (key, value) in table.iter() {
+			for (key, value) in table.iter(false) {
 				match key.kind() {
 					InternalKeyKind::Set => {
 						let key_str = String::from_utf8(key.user_key.to_vec()).unwrap();

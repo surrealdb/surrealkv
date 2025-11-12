@@ -170,7 +170,7 @@ impl Snapshot {
 
 		let iter_state = self.collect_iter_state()?;
 		let range = (Bound::Included(start), Bound::Excluded(end));
-		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range);
+		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range, false);
 
 		for (key, _value) in merge_iter {
 			// Skip tombstones
@@ -684,6 +684,7 @@ impl<'a> KMergeIterator<'a> {
 		iter_state: IterState,
 		snapshot_seq_num: u64,
 		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+		keys_only: bool,
 	) -> Self {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
@@ -733,7 +734,7 @@ impl<'a> KMergeIterator<'a> {
 						if !table.overlaps_with_range(&query_range) {
 							continue;
 						}
-						let mut table_iter = table.iter();
+						let mut table_iter = table.iter(keys_only);
 						// Seek to start if unbounded
 						match &range.0 {
 							Bound::Included(key) => {
@@ -782,7 +783,7 @@ impl<'a> KMergeIterator<'a> {
 						if !table.overlaps_with_range(&query_range) {
 							continue;
 						}
-						let mut table_iter = table.iter();
+						let mut table_iter = table.iter(keys_only);
 						// Seek to start if unbounded
 						match &range.0 {
 							Bound::Included(key) => {
@@ -1096,7 +1097,7 @@ impl SnapshotIterator<'_> {
 
 		// Build the pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
 		let merge_iter: KMergeIterator<'_> =
-			KMergeIterator::new_from(iter_state, seq_num, (start, end));
+			KMergeIterator::new_from(iter_state, seq_num, (start, end), keys_only);
 		let filter_iter = FilterIter::new(merge_iter);
 		let pipeline = Box::new(filter_iter.filter(|(key, _value)| {
 			key.kind() != InternalKeyKind::Delete && key.kind() != InternalKeyKind::SoftDelete
@@ -1635,7 +1636,7 @@ mod tests {
 		// Range that only overlaps with table2
 		let range = (Bound::Included(b"z0".to_vec()), Bound::Included(b"zz".to_vec()));
 
-		let merge_iter = KMergeIterator::new_from(iter_state, 1, range);
+		let merge_iter = KMergeIterator::new_from(iter_state, 1, range, false);
 
 		let items: Vec<_> = merge_iter.collect();
 		assert_eq!(items.len(), 2);

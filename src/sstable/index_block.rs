@@ -160,7 +160,7 @@ impl TopLevelIndex {
 		location: &BlockHandle,
 	) -> Result<Self> {
 		let block = read_table_block(opt.clone(), f.clone(), location)?;
-		let iter = block.iter();
+		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
 			// Extract user key from the encoded internal key
@@ -424,7 +424,7 @@ mod tests {
 
 			// Verify the block contains the expected handle by checking if we can find it
 			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
-			let mut block_iter = block.iter();
+			let mut block_iter = block.iter(false);
 			block_iter.seek(&internal_key);
 			assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
 		}
