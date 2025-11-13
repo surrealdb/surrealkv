@@ -80,7 +80,7 @@ impl Compactor {
 
 			let iterators: Vec<BoxedIterator<'_>> = to_merge
 				.into_iter()
-				.map(|table| Box::new(table.iter()) as BoxedIterator<'_>)
+				.map(|table| Box::new(table.iter(false)) as BoxedIterator<'_>)
 				.collect();
 
 			// Hide tables that are being merged

@@ -2639,32 +2639,32 @@ mod tests {
 		let mut end_key = user_key.to_vec();
 		end_key.push(0);
 		let scan_at_ts1 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 1000, None)
+			.range_at_version(user_key.as_ref(), &end_key, 1000)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts2 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 2000, None)
+			.range_at_version(user_key.as_ref(), &end_key, 2000)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts3 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 3000, None)
+			.range_at_version(user_key.as_ref(), &end_key, 3000)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts4 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 4000, None)
+			.range_at_version(user_key.as_ref(), &end_key, 4000)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts5 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 6000, None)
+			.range_at_version(user_key.as_ref(), &end_key, 6000)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		let scan_at_ts6 = tx
-			.range_at_version(user_key.as_ref(), &end_key, 6001, None)
+			.range_at_version(user_key.as_ref(), &end_key, 6001)
 			.unwrap()
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();

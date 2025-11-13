@@ -170,7 +170,7 @@ impl Snapshot {
 
 		let iter_state = self.collect_iter_state()?;
 		let range = (Bound::Included(start), Bound::Excluded(end));
-		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range);
+		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range, true);
 
 		for (key, _value) in merge_iter {
 			// Skip tombstones
@@ -286,9 +286,9 @@ impl Snapshot {
 			key_range: &key_range,
 			start_ts: 0, // Start from beginning of time
 			end_ts: timestamp,
-			limit: None,               // No limit for single key lookup
-			include_tombstones: false, // Don't include tombstones
 			snapshot_seq_num: self.seq_num,
+			limit: None,
+			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
 
@@ -308,7 +308,6 @@ impl Snapshot {
 		start: Key,
 		end: Key,
 		timestamp: u64,
-		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
 		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
@@ -316,7 +315,7 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
-			limit,
+			limit: None,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -334,7 +333,6 @@ impl Snapshot {
 		start: Key,
 		end: Key,
 		timestamp: u64,
-		limit: Option<usize>,
 	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
 		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
@@ -342,7 +340,7 @@ impl Snapshot {
 			start_ts: 0,
 			end_ts: timestamp,
 			snapshot_seq_num: self.seq_num,
-			limit,
+			limit: None,
 			include_tombstones: false, // Don't include tombstones
 			include_latest_only: true,
 		})?;
@@ -355,8 +353,12 @@ impl Snapshot {
 
 	/// Gets all versions of keys in a key range
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	/// The limit currently is on the unique keys, not the total number of results
 	/// Range is [start, end) - start is inclusive, end is exclusive.
+	///
+	/// # Arguments
+	/// * `start` - Start key (inclusive)
+	/// * `end` - End key (exclusive)
+	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
 	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
@@ -684,6 +686,7 @@ impl<'a> KMergeIterator<'a> {
 		iter_state: IterState,
 		snapshot_seq_num: u64,
 		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
+		keys_only: bool,
 	) -> Self {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
@@ -720,49 +723,107 @@ impl<'a> KMergeIterator<'a> {
 			}
 
 			// Tables - these have native seek support
-			for level in &state_ref.levels {
-				for table in &level.tables {
-					if !table.overlaps_with_range(&query_range) {
-						continue;
-					}
-					let mut table_iter = table.iter();
-					// Seek to start if unbounded
-					match &range.0 {
-						Bound::Included(key) => {
-							let ikey = InternalKey::new(
-								Bytes::copy_from_slice(key),
-								INTERNAL_KEY_SEQ_NUM_MAX,
-								InternalKeyKind::Max,
-								0,
-							);
-							table_iter.seek(&ikey.encode());
+			for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
+				// Optimization: Skip tables that are completely outside the query range
+				if level_idx == 0 {
+					// Level 0: Tables can overlap, so we check all but skip those completely outside range
+					for table in &level.tables {
+						// Skip tables completely before or after the range
+						if table.is_before_range(&query_range) || table.is_after_range(&query_range)
+						{
+							continue;
 						}
-						Bound::Excluded(key) => {
-							let ikey = InternalKey::new(
-								Bytes::copy_from_slice(key),
-								0,
-								InternalKeyKind::Delete,
-								0,
-							);
-							table_iter.seek(&ikey.encode());
-							// If we're at the excluded key, advance once
-							if table_iter.valid() {
-								let current = &table_iter.key();
-								if current.user_key.as_ref() == key.as_slice() {
-									table_iter.advance();
+						if !table.overlaps_with_range(&query_range) {
+							continue;
+						}
+						let mut table_iter = table.iter(keys_only);
+						// Seek to start if unbounded
+						match &range.0 {
+							Bound::Included(key) => {
+								let ikey = InternalKey::new(
+									Bytes::copy_from_slice(key),
+									INTERNAL_KEY_SEQ_NUM_MAX,
+									InternalKeyKind::Max,
+									0,
+								);
+								table_iter.seek(&ikey.encode());
+							}
+							Bound::Excluded(key) => {
+								let ikey = InternalKey::new(
+									Bytes::copy_from_slice(key),
+									0,
+									InternalKeyKind::Delete,
+									0,
+								);
+								table_iter.seek(&ikey.encode());
+								// If we're at the excluded key, advance once
+								if table_iter.valid() {
+									let current = &table_iter.key();
+									if current.user_key.as_ref() == key.as_slice() {
+										table_iter.advance();
+									}
 								}
 							}
+							Bound::Unbounded => {
+								table_iter.seek_to_first();
+							}
 						}
-						Bound::Unbounded => {
-							table_iter.seek_to_first();
+
+						if table_iter.valid() {
+							iterators.push(Box::new(table_iter.filter(move |item| {
+								// Filter out items that are not visible in this snapshot
+								item.0.seq_num() <= snapshot_seq_num
+							})));
 						}
 					}
+				} else {
+					// Level 1+: Tables have non-overlapping key ranges, use binary search
+					let start_idx = level.find_first_overlapping_table(&query_range);
+					let end_idx = level.find_last_overlapping_table(&query_range);
 
-					if table_iter.valid() {
-						iterators.push(Box::new(table_iter.filter(move |item| {
-							// Filter out items that are not visible in this snapshot
-							item.0.seq_num() <= snapshot_seq_num
-						})));
+					for table in &level.tables[start_idx..end_idx] {
+						if !table.overlaps_with_range(&query_range) {
+							continue;
+						}
+						let mut table_iter = table.iter(keys_only);
+						// Seek to start if unbounded
+						match &range.0 {
+							Bound::Included(key) => {
+								let ikey = InternalKey::new(
+									Bytes::copy_from_slice(key),
+									INTERNAL_KEY_SEQ_NUM_MAX,
+									InternalKeyKind::Max,
+									0,
+								);
+								table_iter.seek(&ikey.encode());
+							}
+							Bound::Excluded(key) => {
+								let ikey = InternalKey::new(
+									Bytes::copy_from_slice(key),
+									0,
+									InternalKeyKind::Delete,
+									0,
+								);
+								table_iter.seek(&ikey.encode());
+								// If we're at the excluded key, advance once
+								if table_iter.valid() {
+									let current = &table_iter.key();
+									if current.user_key.as_ref() == key.as_slice() {
+										table_iter.advance();
+									}
+								}
+							}
+							Bound::Unbounded => {
+								table_iter.seek_to_first();
+							}
+						}
+
+						if table_iter.valid() {
+							iterators.push(Box::new(table_iter.filter(move |item| {
+								// Filter out items that are not visible in this snapshot
+								item.0.seq_num() <= snapshot_seq_num
+							})));
+						}
 					}
 				}
 			}
@@ -1038,7 +1099,7 @@ impl SnapshotIterator<'_> {
 
 		// Build the pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
 		let merge_iter: KMergeIterator<'_> =
-			KMergeIterator::new_from(iter_state, seq_num, (start, end));
+			KMergeIterator::new_from(iter_state, seq_num, (start, end), keys_only);
 		let filter_iter = FilterIter::new(merge_iter);
 		let pipeline = Box::new(filter_iter.filter(|(key, _value)| {
 			key.kind() != InternalKeyKind::Delete && key.kind() != InternalKeyKind::SoftDelete
@@ -1144,8 +1205,7 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Range scan should return empty
-		let range: Vec<_> =
-			tx.range(b"a", b"z", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+		let range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert!(range.is_empty());
 	}
@@ -1175,7 +1235,7 @@ mod tests {
 
 		// The read transaction should only see the initial data
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1207,7 +1267,7 @@ mod tests {
 
 		// The read transaction should see the old values
 		let range: Vec<_> =
-			read_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v1");
@@ -1216,7 +1276,7 @@ mod tests {
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
 		let range: Vec<_> =
-			new_tx.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			new_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].1.as_ref(), b"value1_v2");
@@ -1248,7 +1308,7 @@ mod tests {
 
 		// The first read transaction should still see all three keys
 		let range: Vec<_> =
-			read_tx1.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx1.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1258,7 +1318,7 @@ mod tests {
 		// A new transaction should not see the deleted key
 		let read_tx2 = store.begin().unwrap();
 		let range: Vec<_> =
-			read_tx2.range(b"key0", b"key:", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			read_tx2.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
 		assert_eq!(range[0].0.as_ref(), b"key1");
@@ -1342,7 +1402,7 @@ mod tests {
 
 		// tx1 should see all original data
 		let range1: Vec<_> =
-			tx1.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx1.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range1.len(), 10);
 		for (i, item) in range1.iter().enumerate() {
@@ -1355,7 +1415,7 @@ mod tests {
 
 		// tx2 should see updated data with deletions
 		let range2: Vec<_> =
-			tx2.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx2.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -1439,13 +1499,13 @@ mod tests {
 		let tx = store.begin().unwrap();
 
 		// Test different range queries
-		let numeric_range: Vec<_> = tx.range(b"000", b"999", None).unwrap().collect::<Vec<_>>();
+		let numeric_range: Vec<_> = tx.range(b"000", b"999").unwrap().collect::<Vec<_>>();
 		assert_eq!(numeric_range.len(), 10);
 
-		let alpha_range: Vec<_> = tx.range(b"a", b"z", None).unwrap().collect::<Vec<_>>();
+		let alpha_range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Vec<_>>();
 		assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-		let mixed_range: Vec<_> = tx.range(b"mix", b"miy", None).unwrap().collect::<Vec<_>>();
+		let mixed_range: Vec<_> = tx.range(b"mix", b"miy").unwrap().collect::<Vec<_>>();
 		assert_eq!(mixed_range.len(), 5);
 	}
 
@@ -1469,7 +1529,7 @@ mod tests {
 
 		// Range scan should return keys in sorted order
 		let range: Vec<_> =
-			tx.range(b"key00", b"key99", None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+			tx.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 9);
 
@@ -1577,7 +1637,7 @@ mod tests {
 		// Range that only overlaps with table2
 		let range = (Bound::Included(b"z0".to_vec()), Bound::Included(b"zz".to_vec()));
 
-		let merge_iter = KMergeIterator::new_from(iter_state, 1, range);
+		let merge_iter = KMergeIterator::new_from(iter_state, 1, range, false);
 
 		let items: Vec<_> = merge_iter.collect();
 		assert_eq!(items.len(), 2);
