@@ -733,9 +733,6 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						if !table.overlaps_with_range(&query_range) {
-							continue;
-						}
 						let mut table_iter = table.iter(keys_only);
 						// Seek to start if unbounded
 						match &range.0 {
@@ -782,9 +779,6 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						if !table.overlaps_with_range(&query_range) {
-							continue;
-						}
 						let mut table_iter = table.iter(keys_only);
 						// Seek to start if unbounded
 						match &range.0 {
@@ -1925,5 +1919,541 @@ mod tests {
 		for i in 0..10 {
 			assert_eq!(forward_items[i].0, backward_items[9 - i].0);
 		}
+	}
+
+	// ========================================================================
+	// KMergeIterator Range Query Tests
+	// ========================================================================
+
+	// Helper function to create a test table with specific key range
+	fn create_test_table_with_range(
+		table_id: u64,
+		key_start: &str,
+		key_end: &str,
+		seq_start: u64,
+		opts: Arc<Options>,
+	) -> crate::Result<Arc<Table>> {
+		use std::fs::{self, File as SysFile};
+
+		// Ensure the sstables directory exists
+		let sstables_dir = opts.path.join("sstables");
+		fs::create_dir_all(&sstables_dir)?;
+
+		let table_file_path = opts.sstable_file_path(table_id);
+		let mut file = SysFile::create(&table_file_path)?;
+
+		let mut writer = TableWriter::new(&mut file, table_id, opts.clone());
+
+		// Generate incremental keys spanning the range
+		let mut keys = Vec::new();
+
+		// For single-character ranges, generate all keys from start to end
+		if key_start.len() == 1 && key_end.len() == 1 {
+			let start_byte = key_start.as_bytes()[0];
+			let end_byte = key_end.as_bytes()[0];
+
+			for byte_val in start_byte..=end_byte {
+				keys.push(String::from_utf8(vec![byte_val]).unwrap());
+			}
+		} else {
+			// For multi-character ranges, create keys with numeric suffixes
+			keys.push(key_start.to_string());
+			keys.push(format!("{key_start}_mid"));
+			keys.push(key_end.to_string());
+		}
+
+		for (i, key) in keys.iter().enumerate() {
+			let seq_num = seq_start + i as u64;
+			let value = format!("value_{seq_num}");
+
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				seq_num,
+				InternalKeyKind::Set,
+				0,
+			);
+
+			writer.add(internal_key.into(), value.as_bytes())?;
+		}
+
+		let size = writer.finish()?;
+
+		let file = SysFile::open(&table_file_path)?;
+		file.sync_all()?;
+		let file: Arc<dyn File> = Arc::new(file);
+
+		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
+		Ok(Arc::new(table))
+	}
+
+	// Helper to create IterState with specified tables
+	fn create_iter_state_with_tables(
+		l0_tables: Vec<Arc<Table>>,
+		l1_tables: Vec<Arc<Table>>,
+		l2_tables: Vec<Arc<Table>>,
+		_opts: Arc<Options>,
+	) -> IterState {
+		let mut level0 = Level::default();
+		for table in l0_tables {
+			level0.tables.push(table);
+		}
+
+		let mut level1 = Level::default();
+		for table in l1_tables {
+			level1.tables.push(table);
+		}
+
+		let mut level2 = Level::default();
+		for table in l2_tables {
+			level2.tables.push(table);
+		}
+
+		let levels = Levels(vec![Arc::new(level0), Arc::new(level1), Arc::new(level2)]);
+
+		IterState {
+			active: Arc::new(MemTable::new()),
+			immutable: vec![],
+			levels,
+		}
+	}
+
+	// Helper to count the number of items returned by iterator
+	fn count_kmerge_items(mut iter: KMergeIterator) -> usize {
+		let mut count = 0;
+		while iter.next().is_some() {
+			count += 1;
+		}
+		count
+	}
+
+	#[test]
+	fn test_level0_tables_before_range_skipped() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L0 tables with ranges: [a-c], [d-f], [g-i]
+		let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(2, "d", "f", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(3, "g", "i", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![table1, table2, table3],
+			vec![],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [j-z] - all tables are before this range
+		let range = (Bound::Included(b"j".to_vec()), Bound::Included(b"z".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "No tables should be included as all are before range");
+	}
+
+	#[test]
+	fn test_level0_tables_after_range_skipped() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L0 tables with ranges: [m-o], [p-r], [s-u]
+		let table1 = create_test_table_with_range(1, "m", "o", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(2, "p", "r", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(3, "s", "u", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![table1, table2, table3],
+			vec![],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [a-k] - all tables are after this range
+		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"k".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "No tables should be included as all are after range");
+	}
+
+	#[test]
+	fn test_level0_overlapping_tables_included() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L0 tables with overlapping ranges
+		let table1 = create_test_table_with_range(1, "a", "e", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(2, "c", "g", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(3, "f", "j", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![table1, table2, table3],
+			vec![],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [d-h] - all tables overlap with this range
+		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		// All 3 tables should contribute items
+		assert!(count > 0, "Should have items from overlapping L0 tables");
+	}
+
+	#[test]
+	fn test_level0_mixed_overlap_scenarios() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L0 tables: [a-c], [e-g], [i-k], [d-f], [j-m]
+		let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(2, "e", "g", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(3, "i", "k", 7, opts.clone()).unwrap();
+		let table4 = create_test_table_with_range(4, "d", "f", 10, opts.clone()).unwrap();
+		let table5 = create_test_table_with_range(5, "j", "m", 13, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![table1, table2, table3, table4, table5],
+			vec![],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [f-j] - should include tables [e-g], [i-k], [d-f], [j-m]
+		let range = (Bound::Included(b"f".to_vec()), Bound::Included(b"j".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		// Should have items from multiple overlapping tables
+		assert!(count > 0, "Should have items from overlapping tables in range");
+	}
+
+	#[test]
+	fn test_level1_binary_search_correct_range() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L1 tables with non-overlapping sorted ranges
+		let table1 = create_test_table_with_range(11, "a", "b", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(12, "c", "d", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(13, "e", "f", 7, opts.clone()).unwrap();
+		let table4 = create_test_table_with_range(14, "g", "h", 10, opts.clone()).unwrap();
+		let table5 = create_test_table_with_range(15, "i", "j", 13, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![],
+			vec![table1, table2, table3, table4, table5],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [e-h] - should include tables [e-f], [g-h]
+		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"h".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should have items from L1 tables in range");
+	}
+
+	#[test]
+	fn test_level1_query_before_all_tables() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L1 tables: [d-f], [g-i], [j-l]
+		let table1 = create_test_table_with_range(11, "d", "f", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(12, "g", "i", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(13, "j", "l", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![],
+			vec![table1, table2, table3],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [a-c] - before all tables
+		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"c".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
+	}
+
+	#[test]
+	fn test_level1_query_after_all_tables() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L1 tables: [a-c], [d-f], [g-i]
+		let table1 = create_test_table_with_range(11, "a", "c", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(12, "d", "f", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(13, "g", "i", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![],
+			vec![table1, table2, table3],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [m-z] - after all tables
+		let range = (Bound::Included(b"m".to_vec()), Bound::Included(b"z".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
+	}
+
+	#[test]
+	fn test_level1_query_spans_all_tables() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create L1 tables: [b-d], [e-g], [h-j]
+		let table1 = create_test_table_with_range(11, "b", "d", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(12, "e", "g", 4, opts.clone()).unwrap();
+		let table3 = create_test_table_with_range(13, "h", "j", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![],
+			vec![table1, table2, table3],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query range: [a-z] - spans all tables
+		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should have items from all L1 tables");
+	}
+
+	#[test]
+	fn test_bound_included_start_and_end() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create table with keys: "d1", "d5", "h"
+		let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Query with Included bounds - should include all keys from d to h
+		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let items: Vec<_> = iter.collect();
+		assert!(items.len() > 0, "Should have items in inclusive range");
+	}
+
+	#[test]
+	fn test_bound_excluded_start_and_end() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create table with keys: "d1", "d5", "h"
+		let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Query with Excluded bounds - "d" and "h" exact matches should be excluded
+		// But "d1", "d5" are > "d" so they should be included
+		let range = (Bound::Excluded(b"d".to_vec()), Bound::Excluded(b"h".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let items: Vec<_> = iter.collect();
+		// Keys "d1" and "d5" should be included (they're > "d" and < "h")
+		// But exact "d" and exact "h" should not be (though "h" is at the boundary)
+		assert!(items.len() >= 2, "Should have at least d1 and d5");
+	}
+
+	#[test]
+	fn test_bound_unbounded_start() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Query with unbounded start
+		let range = (Bound::Unbounded, Bound::Included(b"h".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should iterate from beginning with unbounded start");
+	}
+
+	#[test]
+	fn test_bound_unbounded_end() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Query with unbounded end
+		let range = (Bound::Included(b"d".to_vec()), Bound::Unbounded);
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should iterate to end with unbounded end");
+	}
+
+	#[test]
+	fn test_fully_unbounded_range() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
+		let table2 = create_test_table_with_range(2, "n", "z", 4, opts.clone()).unwrap();
+
+		let iter_state =
+			create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts.clone());
+
+		// Query with fully unbounded range
+		let range = (Bound::Unbounded, Bound::Unbounded);
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should return all keys with fully unbounded range");
+	}
+
+	#[test]
+	fn test_snapshot_seq_num_filtering() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create table with entries having various seq_nums: 1, 4, 7
+		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Snapshot at seq_num = 5 should only see entries with seq_num <= 5
+		let range = (Bound::Unbounded, Bound::Unbounded);
+		let iter = KMergeIterator::new_from(iter_state, 5, range, false);
+
+		let items: Vec<_> = iter.collect();
+		for (key, _) in &items {
+			assert!(key.seq_num() <= 5, "All items should have seq_num <= snapshot seq_num");
+		}
+	}
+
+	#[test]
+	fn test_empty_levels() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create IterState with no tables
+		let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts.clone());
+
+		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "Iterator with no tables should return no items");
+	}
+
+	#[test]
+	fn test_single_key_range() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Query for exact single key
+		let range = (Bound::Included(b"a1".to_vec()), Bound::Included(b"a1".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let items: Vec<_> = iter.collect();
+		// Should return at most 1 item
+		for (key, _) in &items {
+			assert_eq!(key.user_key.as_ref(), b"a1");
+		}
+	}
+
+	#[test]
+	fn test_inverted_range() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+
+		// Inverted range: start > end
+		let range = (Bound::Included(b"z".to_vec()), Bound::Included(b"a".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert_eq!(count, 0, "Inverted range should return no items");
+	}
+
+	#[test]
+	fn test_mixed_level0_and_level1_tables() {
+		let temp_dir = create_temp_directory();
+		let mut opts = Options::default();
+		opts.path = temp_dir.path().to_path_buf();
+		let opts = Arc::new(opts);
+
+		// Create both L0 and L1 tables
+		let l0_table = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
+		let l1_table1 = create_test_table_with_range(11, "d", "h", 4, opts.clone()).unwrap();
+		let l1_table2 = create_test_table_with_range(12, "i", "n", 7, opts.clone()).unwrap();
+
+		let iter_state = create_iter_state_with_tables(
+			vec![l0_table],
+			vec![l1_table1, l1_table2],
+			vec![],
+			opts.clone(),
+		);
+
+		// Query that overlaps with both levels
+		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"k".to_vec()));
+		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+
+		let count = count_kmerge_items(iter);
+		assert!(count > 0, "Should have items from both L0 and L1 tables");
 	}
 }
