@@ -2456,4 +2456,117 @@ mod tests {
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from both L0 and L1 tables");
 	}
+
+	#[test(tokio::test)]
+	async fn test_cache_effectiveness_with_range_query() {
+		let temp_dir = create_temp_directory();
+		let path = temp_dir.path().to_path_buf();
+
+		let tree = TreeBuilder::new()
+			.with_path(path)
+			.with_block_cache_capacity(10 * 1024 * 1024) // 10MB cache
+			.with_max_memtable_size(500) // Small memtable to trigger flushes
+			.build()
+			.unwrap();
+
+		eprintln!("\n=== Inserting 10,000 keys with periodic flushes ===");
+
+		// Insert 10,000 keys, flushing every 1,000 keys
+		for i in 0..10_000 {
+			let key = format!("key_{:08}", i);
+			let value = format!("value_{}", i);
+
+			let mut tx = tree.begin().unwrap();
+			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tx.commit().await.unwrap();
+
+			// Flush every 1,000 keys to create multiple SSTables
+			if (i + 1) % 1_000 == 0 {
+				tree.flush().unwrap();
+				eprintln!("Flushed after {} keys", i + 1);
+			}
+		}
+
+		// Final flush to ensure all data is on disk
+		tree.flush().unwrap();
+		eprintln!("Final flush completed\n");
+
+		// Reset cache statistics before first query
+		tree.core.opts.block_cache.reset_stats();
+
+		eprintln!("=== First range query (populating cache) ===");
+		// First range query - this will populate the cache
+		let tx = tree.begin().unwrap();
+		let first_results: Vec<_> = tx
+			.range(b"key_00000000", b"key_00010000")
+			.unwrap()
+			.collect::<crate::Result<Vec<_>>>()
+			.unwrap();
+
+		let first_stats = tree.core.opts.block_cache.get_stats();
+		eprintln!("First query results: {} items", first_results.len());
+		eprintln!("First query cache stats:");
+		eprintln!(
+			"  Data hits: {}, Data misses: {}",
+			first_stats.data_hits, first_stats.data_misses
+		);
+		eprintln!(
+			"  Index hits: {}, Index misses: {}",
+			first_stats.index_hits, first_stats.index_misses
+		);
+		eprintln!(
+			"  Total hits: {}, Total misses: {}",
+			first_stats.total_hits(),
+			first_stats.total_misses()
+		);
+		eprintln!("  Hit ratio: {:.2}%\n", first_stats.hit_ratio() * 100.0);
+
+		// Reset cache statistics before second query
+		tree.core.opts.block_cache.reset_stats();
+
+		eprintln!("=== Second range query (served from cache) ===");
+		// Second range query - should be served mostly from cache
+		let tx = tree.begin().unwrap();
+		let second_results: Vec<_> = tx
+			.range(b"key_00000000", b"key_00010000")
+			.unwrap()
+			.collect::<crate::Result<Vec<_>>>()
+			.unwrap();
+
+		let second_stats = tree.core.opts.block_cache.get_stats();
+		eprintln!("Second query results: {} items", second_results.len());
+		eprintln!("Second query cache stats:");
+		eprintln!(
+			"  Data hits: {}, Data misses: {}",
+			second_stats.data_hits, second_stats.data_misses
+		);
+		eprintln!(
+			"  Index hits: {}, Index misses: {}",
+			second_stats.index_hits, second_stats.index_misses
+		);
+		eprintln!(
+			"  Total hits: {}, Total misses: {}",
+			second_stats.total_hits(),
+			second_stats.total_misses()
+		);
+		eprintln!("  Hit ratio: {:.2}%\n", second_stats.hit_ratio() * 100.0);
+
+		// Assertions
+		assert_eq!(first_results.len(), 10_000, "First query should return all 10,000 items");
+		assert_eq!(second_results.len(), 10_000, "Second query should return all 10,000 items");
+		assert!(
+			second_stats.total_hits() > first_stats.total_hits() * 2,
+			"Second query should have at least 2x more cache hits. First: {}, Second: {}",
+			first_stats.total_hits(),
+			second_stats.total_hits()
+		);
+
+		assert!(
+			second_stats.hit_ratio() == 1.0,
+			"Second query should have 100% cache hit ratio, got {:.2}%",
+			second_stats.hit_ratio() * 100.0
+		);
+
+		tree.close().await.unwrap();
+	}
 }
