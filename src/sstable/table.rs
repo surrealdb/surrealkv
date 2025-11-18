@@ -789,7 +789,7 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(&self, keys_only: bool) -> TableIterator {
+	pub(crate) fn iter(self: &Arc<Self>, keys_only: bool) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
@@ -810,7 +810,7 @@ impl Table {
 			current_block: None,
 			current_block_off: 0,
 			index_block: index_block_iter,
-			table: Arc::new(self.clone()),
+			table: Arc::clone(self),
 			positioned: false,
 			exhausted: false,
 			current_partition_index: 0,
@@ -1470,7 +1470,7 @@ mod tests {
 		let (src, size) = build_table(build_data());
 		let opts = default_opts();
 
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 		let mut iter = table.iter(false);
 
 		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
@@ -1498,7 +1498,7 @@ mod tests {
 		let (src, size) = build_table(build_data());
 		let opts = default_opts();
 
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 		let mut iter = table.iter(false);
 
 		iter.advance();
@@ -1643,7 +1643,7 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Create a table reader
-		let table = Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify the number of entries matches
 		assert_eq!(
@@ -2199,7 +2199,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let iter = table.iter(false);
 		let mut collected_items = Vec::new();
@@ -2245,7 +2245,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let mut iter = table.iter(false);
 		let mut seen_keys = Vec::new();
@@ -2302,7 +2302,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let mut iter = table.iter(false);
 
@@ -2357,7 +2357,7 @@ mod tests {
 			let single_data = vec![("only_key", "only_value")];
 			let (src, size) = build_table(single_data.clone());
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
@@ -2373,7 +2373,7 @@ mod tests {
 			let two_data = vec![("first", "1st"), ("second", "2nd")];
 			let (src, size) = build_table(two_data.clone());
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
@@ -2395,7 +2395,7 @@ mod tests {
 
 			let (src, size) = build_table(large_data_refs);
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let collected: Vec<_> = table.iter(false).collect();
 			assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
@@ -2428,7 +2428,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
@@ -2495,7 +2495,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test seek to existing key
 		{
@@ -2566,7 +2566,7 @@ mod tests {
 
 		let (src, size) = build_table(large_data_refs);
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		use std::time::Instant;
 
@@ -2603,7 +2603,7 @@ mod tests {
 		let data = vec![("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")];
 		let (src, size) = build_table(data);
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let mut iter = table.iter(false);
 		iter.seek_to_first();
@@ -2637,7 +2637,7 @@ mod tests {
 
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Create multiple iterators and verify they work independently
 		for iteration in 0..3 {
@@ -2676,7 +2676,7 @@ mod tests {
 			let empty_data: Vec<(&str, &str)> = vec![];
 			let (src, size) = build_table(empty_data);
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let mut iter = table.iter(false);
 
@@ -2693,7 +2693,7 @@ mod tests {
 			let single_data = vec![("single", "item")];
 			let (src, size) = build_table(single_data);
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let mut iter = table.iter(false);
 
@@ -2709,7 +2709,7 @@ mod tests {
 			let data = vec![("a", "1"), ("b", "2")];
 			let (src, size) = build_table(data);
 			let opts = default_opts();
-			let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 			let mut iter = table.iter(false);
 
@@ -2733,7 +2733,7 @@ mod tests {
 		let data = vec![("x", "1"), ("y", "2"), ("z", "3")];
 		let (src, size) = build_table(data.clone());
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test with manual advance() loop - need to position first
 		let mut iter1 = table.iter(false);
@@ -2787,7 +2787,7 @@ mod tests {
 
 		let (src, size) = build_table(large_data_refs);
 		let opts = default_opts();
-		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let collected: Vec<_> = table.iter(false).collect();
 
@@ -2833,7 +2833,7 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Now read the table back with partitioned index
-		let table = Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify it's using partitioned index
 		match &table.index_block {

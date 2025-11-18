@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use crate::{
 	cache::Item,
 	error::{Error, Result},
@@ -19,7 +20,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
 	/// User key of last item in block
-	pub user_key: Vec<u8>,
+	pub user_key: Bytes,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -29,7 +30,7 @@ impl BlockHandleWithKey {
 	#[cfg(test)]
 	pub(crate) fn new(user_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
-			user_key,
+			user_key: Bytes::from(user_key),
 			handle,
 		}
 	}
@@ -167,7 +168,7 @@ impl TopLevelIndex {
 			let internal_key = InternalKey::decode(&key);
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
-				user_key: internal_key.user_key.as_ref().to_vec(),
+				user_key: internal_key.user_key,
 				handle,
 			});
 		}
@@ -181,12 +182,12 @@ impl TopLevelIndex {
 
 	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
 		// Find the partition point in the blocks where the key would fit.
-		let index = self.blocks.partition_point(|block| block.user_key.as_slice() < user_key);
+		let index = self.blocks.partition_point(|block| block.user_key.as_ref() < user_key);
 
 		// Attempt to retrieve the block at the found index.
 		let result = self.blocks.get(index).and_then(|block| {
 			// Compare user keys directly
-			if user_key <= block.user_key.as_slice() {
+			if user_key <= block.user_key.as_ref() {
 				Some(block)
 			} else {
 				None
