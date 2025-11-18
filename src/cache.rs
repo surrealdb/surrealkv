@@ -106,6 +106,15 @@ impl VLogCache {
 pub(crate) struct BlockCache {
 	data: QCache<CacheKey, Item, BlockWeighter>,
 	id: AtomicU64,
+	// Cache statistics (only enabled in tests)
+	#[cfg(test)]
+	data_hits: AtomicU64,
+	#[cfg(test)]
+	data_misses: AtomicU64,
+	#[cfg(test)]
+	index_hits: AtomicU64,
+	#[cfg(test)]
+	index_misses: AtomicU64,
 }
 
 impl BlockCache {
@@ -113,6 +122,14 @@ impl BlockCache {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, BlockWeighter),
 			id: AtomicU64::new(0),
+			#[cfg(test)]
+			data_hits: AtomicU64::new(0),
+			#[cfg(test)]
+			data_misses: AtomicU64::new(0),
+			#[cfg(test)]
+			index_hits: AtomicU64::new(0),
+			#[cfg(test)]
+			index_misses: AtomicU64::new(0),
 		}
 	}
 
@@ -122,9 +139,22 @@ impl BlockCache {
 
 	pub(crate) fn get_data_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
-		let item = self.data.get(&key)?;
+		let item = self.data.get(&key);
 
-		match item {
+		#[cfg(test)]
+		{
+			if item.is_some() {
+				self.data_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			} else {
+				self.data_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+
+		if item.is_none() {
+			return None;
+		}
+
+		match item.unwrap() {
 			Item::Data(block) => Some(block.clone()),
 			_ => None,
 		}
@@ -132,9 +162,22 @@ impl BlockCache {
 
 	pub(crate) fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
 		let key = (table_id, &offset);
-		let item = self.data.get(&key)?;
+		let item = self.data.get(&key);
 
-		match item {
+		#[cfg(test)]
+		{
+			if item.is_some() {
+				self.index_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			} else {
+				self.index_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+
+		if item.is_none() {
+			return None;
+		}
+
+		match item.unwrap() {
 			Item::Index(block) => Some(block.clone()),
 			_ => None,
 		}
@@ -143,5 +186,59 @@ impl BlockCache {
 	pub(crate) fn new_cache_id(&self) -> CacheID {
 		let id = self.id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		id + 1
+	}
+
+	#[cfg(test)]
+	/// Get cache statistics
+	pub(crate) fn get_stats(&self) -> CacheStats {
+		CacheStats {
+			data_hits: self.data_hits.load(std::sync::atomic::Ordering::Relaxed),
+			data_misses: self.data_misses.load(std::sync::atomic::Ordering::Relaxed),
+			index_hits: self.index_hits.load(std::sync::atomic::Ordering::Relaxed),
+			index_misses: self.index_misses.load(std::sync::atomic::Ordering::Relaxed),
+		}
+	}
+
+	#[cfg(test)]
+	/// Reset cache statistics
+	pub(crate) fn reset_stats(&self) {
+		self.data_hits.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.data_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.index_hits.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.index_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+	}
+}
+
+/// Cache statistics (only available in tests)
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CacheStats {
+	pub data_hits: u64,
+	pub data_misses: u64,
+	pub index_hits: u64,
+	pub index_misses: u64,
+}
+
+#[cfg(test)]
+impl CacheStats {
+	pub fn total_hits(&self) -> u64 {
+		self.data_hits + self.index_hits
+	}
+
+	pub fn total_misses(&self) -> u64 {
+		self.data_misses + self.index_misses
+	}
+
+	pub fn total_accesses(&self) -> u64 {
+		self.total_hits() + self.total_misses()
+	}
+
+	pub fn hit_ratio(&self) -> f64 {
+		let total = self.total_accesses();
+		if total == 0 {
+			0.0
+		} else {
+			self.total_hits() as f64 / total as f64
+		}
 	}
 }
