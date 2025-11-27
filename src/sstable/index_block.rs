@@ -3,7 +3,6 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use crate::{
 	cache::Item,
 	error::{Error, Result},
@@ -15,6 +14,7 @@ use crate::{
 	vfs::File,
 	CompressionType, Options,
 };
+use bytes::Bytes;
 
 /// Points to a block on file
 #[derive(Clone, Debug)]

@@ -2029,8 +2029,10 @@ mod tests {
 	#[test]
 	fn test_level0_tables_before_range_skipped() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L0 tables with ranges: [a-c], [d-f], [g-i]
@@ -2056,8 +2058,10 @@ mod tests {
 	#[test]
 	fn test_level0_tables_after_range_skipped() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L0 tables with ranges: [m-o], [p-r], [s-u]
@@ -2083,8 +2087,10 @@ mod tests {
 	#[test]
 	fn test_level0_overlapping_tables_included() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L0 tables with overlapping ranges
@@ -2111,8 +2117,10 @@ mod tests {
 	#[test]
 	fn test_level0_mixed_overlap_scenarios() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L0 tables: [a-c], [e-g], [i-k], [d-f], [j-m]
@@ -2141,8 +2149,10 @@ mod tests {
 	#[test]
 	fn test_level1_binary_search_correct_range() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L1 tables with non-overlapping sorted ranges
@@ -2170,8 +2180,10 @@ mod tests {
 	#[test]
 	fn test_level1_query_before_all_tables() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L1 tables: [d-f], [g-i], [j-l]
@@ -2197,8 +2209,10 @@ mod tests {
 	#[test]
 	fn test_level1_query_after_all_tables() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L1 tables: [a-c], [d-f], [g-i]
@@ -2224,8 +2238,10 @@ mod tests {
 	#[test]
 	fn test_level1_query_spans_all_tables() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create L1 tables: [b-d], [e-g], [h-j]
@@ -2251,8 +2267,10 @@ mod tests {
 	#[test]
 	fn test_bound_included_start_and_end() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create table with keys: "d1", "d5", "h"
@@ -2265,14 +2283,16 @@ mod tests {
 		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
 
 		let items: Vec<_> = iter.collect();
-		assert!(items.len() > 0, "Should have items in inclusive range");
+		assert!(!items.is_empty(), "Should have items in inclusive range");
 	}
 
 	#[test]
 	fn test_bound_excluded_start_and_end() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create table with keys: "d1", "d5", "h"
@@ -2294,8 +2314,10 @@ mod tests {
 	#[test]
 	fn test_bound_unbounded_start() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
@@ -2313,8 +2335,10 @@ mod tests {
 	#[test]
 	fn test_bound_unbounded_end() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
@@ -2332,8 +2356,10 @@ mod tests {
 	#[test]
 	fn test_fully_unbounded_range() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
@@ -2353,8 +2379,10 @@ mod tests {
 	#[test]
 	fn test_snapshot_seq_num_filtering() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create table with entries having various seq_nums: 1, 4, 7
@@ -2375,8 +2403,10 @@ mod tests {
 	#[test]
 	fn test_empty_levels() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create IterState with no tables
@@ -2392,8 +2422,10 @@ mod tests {
 	#[test]
 	fn test_single_key_range() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
@@ -2414,8 +2446,10 @@ mod tests {
 	#[test]
 	fn test_inverted_range() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
@@ -2433,8 +2467,10 @@ mod tests {
 	#[test]
 	fn test_mixed_level0_and_level1_tables() {
 		let temp_dir = create_temp_directory();
-		let mut opts = Options::default();
-		opts.path = temp_dir.path().to_path_buf();
+		let opts = Options {
+			path: temp_dir.path().to_path_buf(),
+			..Default::default()
+		};
 		let opts = Arc::new(opts);
 
 		// Create both L0 and L1 tables
