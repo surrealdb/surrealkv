@@ -2904,12 +2904,8 @@ mod tests {
 		// Add only key_bbb to the table
 		let key = b"key_bbb";
 		let value = b"value_bbb";
-		let internal_key = InternalKey::new(
-			Bytes::copy_from_slice(key),
-			1,
-			InternalKeyKind::Set,
-			0,
-		);
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
 		writer.add(Arc::new(internal_key), value).unwrap();
 
 		let size = writer.finish().unwrap();
