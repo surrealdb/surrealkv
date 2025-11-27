@@ -29,7 +29,7 @@ use crate::{
 		self,
 		cleanup::cleanup_old_segments,
 		recovery::{repair_corrupted_wal_segment, replay_wal},
-		writer::Wal,
+		Wal,
 	},
 	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
 	VLogChecksumLevel, Value,

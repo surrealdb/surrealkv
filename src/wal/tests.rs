@@ -4,11 +4,13 @@ use test_log::test;
 use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::cleanup::cleanup_old_segments;
+use crate::wal::manager::Wal;
+use crate::wal::metadata::Options;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::segment::list_segment_ids;
-use crate::wal::segment::{MultiSegmentReader, Options, Segment, SegmentRef};
-use crate::wal::writer::Wal;
+use crate::wal::segment::SegmentRef;
+use std::fs::File;
 use std::sync::Arc;
 
 fn create_temp_directory() -> TempDir {
@@ -144,25 +146,23 @@ fn test_wal_replay_latest_segment_only() {
 fn test_wal_with_zero_padding_eof_handling() {
 	let temp_dir = create_temp_directory();
 
-	// Create a WAL segment with small data that doesn't fill the block
+	// Create a WAL with small data that doesn't fill the block
 	let opts = Options::default();
-	let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+	let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 	// Write a small record that won't fill the entire block
 	let small_data = b"hello";
-	segment.append(small_data).expect("should append data");
+	wal.append(small_data).expect("should append data");
 
-	// Close the segment to ensure it's flushed with zero padding
-	segment.close().expect("should close segment");
+	// Close the WAL to ensure it's flushed with zero padding
+	wal.close().expect("should close WAL");
 
 	// Now try to read from the segment using the Reader
 	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
-	let multi_reader =
-		MultiSegmentReader::new(segments).expect("should create multi segment reader");
-
-	let mut reader = Reader::new(multi_reader);
+	let file = File::open(&segments[0].file_path).expect("should open file");
+	let mut reader = Reader::new(file);
 
 	let result = reader.read();
 	match result {
@@ -204,21 +204,19 @@ fn test_wal_with_zero_padding_eof_handling() {
 fn test_empty_wal_segment() {
 	let temp_dir = create_temp_directory();
 
-	// Create an empty WAL segment
+	// Create an empty WAL
 	let opts = Options::default();
-	let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+	let wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 	// Close immediately without writing anything
-	drop(segment);
+	drop(wal);
 
 	// Try to read from the empty segment
 	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
-	let multi_reader =
-		MultiSegmentReader::new(segments).expect("should create multi segment reader");
-
-	let mut reader = Reader::new(multi_reader);
+	let file = File::open(&segments[0].file_path).expect("should open file");
+	let mut reader = Reader::new(file);
 
 	let result = reader.read();
 	match result {
