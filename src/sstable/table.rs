@@ -1643,7 +1643,8 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Create a table reader
-		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table =
+			Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify the number of entries matches
 		assert_eq!(
@@ -2833,7 +2834,8 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Now read the table back with partitioned index
-		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table =
+			Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify it's using partitioned index
 		match &table.index_block {

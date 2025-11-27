@@ -150,11 +150,7 @@ impl BlockCache {
 			}
 		}
 
-		if item.is_none() {
-			return None;
-		}
-
-		match item.unwrap() {
+		match item.as_ref()? {
 			Item::Data(block) => Some(block.clone()),
 			_ => None,
 		}
@@ -173,11 +169,7 @@ impl BlockCache {
 			}
 		}
 
-		if item.is_none() {
-			return None;
-		}
-
-		match item.unwrap() {
+		match item.as_ref()? {
 			Item::Index(block) => Some(block.clone()),
 			_ => None,
 		}

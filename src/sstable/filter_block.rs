@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use crate::FilterPolicy;
+use bytes::Bytes;
 use integer_encoding::FixedInt;
 
 pub(crate) const FILTER_BASE_LOG2: u32 = 11;
