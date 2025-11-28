@@ -779,7 +779,8 @@ impl Table {
 		if iter.valid() {
 			let k = iter.key();
 			let v = iter.value();
-			if self.internal_cmp.compare(&k.encode(), key_encoded) >= Ordering::Equal {
+			// Compare only user keys - we want exact user key match regardless of seq_num
+			if k.user_key == key.user_key {
 				Ok(Some((k, v)))
 			} else {
 				Ok(None)
@@ -2889,5 +2890,47 @@ mod tests {
 				"Iterator value mismatch at position {i}"
 			);
 		}
+	}
+
+	#[test]
+	fn test_get_nonexistent_key_returns_none() {
+		// Regression test: get() should return None for non-existent keys,
+		// even when a lexicographically greater key exists in the table.
+		// Disable bloom filter so we actually exercise the key comparison logic.
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		// Add only key_bbb to the table
+		let key = b"key_bbb";
+		let value = b"value_bbb";
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(internal_key), value).unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		// Try to get key_aaa which does NOT exist
+		// key_aaa < key_bbb lexicographically
+		let lookup_key = InternalKey::new(
+			Bytes::copy_from_slice(b"key_aaa"),
+			2, // Higher seq number for lookup
+			InternalKeyKind::Set,
+			0,
+		);
+
+		let result = table.get(lookup_key).unwrap();
+
+		// The bug: with >= comparison, this incorrectly returns Some((key_bbb, value_bbb))
+		// The fix: with == comparison, this correctly returns None
+		assert!(
+			result.is_none(),
+			"get() should return None for non-existent key, but got {:?}",
+			result.map(|(k, v)| (
+				String::from_utf8_lossy(&k.user_key).to_string(),
+				String::from_utf8_lossy(&v).to_string()
+			))
+		);
 	}
 }
