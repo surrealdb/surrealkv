@@ -2933,4 +2933,568 @@ mod tests {
 			))
 		);
 	}
+
+	#[test]
+	fn test_get_same_key_different_sequence_numbers() {
+		// Validates fix returns value when user_key matches, even with different seq_nums
+		// Internal ordering: user_key asc, seq_num DESC (reversed: higher seq_nums sort first)
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let user_key = b"my_key";
+
+		let key1 = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key1), b"value_100").unwrap();
+
+		let key2 = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key2), b"value_50").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key_higher =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key_higher).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), user_key);
+		assert_eq!(found_value.as_ref(), b"value_100");
+
+		let lookup_key_between =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 75, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key_between).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), user_key);
+		assert_eq!(found_value.as_ref(), b"value_50");
+
+		let lookup_key_exact =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key_exact).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), user_key);
+		assert_eq!(found_value.as_ref(), b"value_100");
+
+		let different_user_key = b"other_key";
+		let lookup_key_different = InternalKey::new(
+			Bytes::copy_from_slice(different_user_key),
+			200,
+			InternalKeyKind::Set,
+			0,
+		);
+		let result = table.get(lookup_key_different).unwrap();
+		assert!(
+			result.is_none(),
+			"Should return None for different user_key, got: {:?}",
+			result.map(|(k, v)| (
+				String::from_utf8_lossy(&k.user_key).to_string(),
+				String::from_utf8_lossy(&v).to_string()
+			))
+		);
+	}
+
+	#[test]
+	fn test_get_with_lower_sequence_number() {
+		// Snapshot at seq=25 can't see future version at seq=50
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 75, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+
+		let user_key = b"my_key";
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key), b"value_50").unwrap();
+
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		if result.is_some() {
+			let (found_key, found_value) = result.unwrap();
+			panic!(
+				"BUG: Expected None, got key={}, seq_num={}, value={:?}",
+				String::from_utf8_lossy(&found_key.user_key),
+				found_key.seq_num(),
+				String::from_utf8_lossy(&found_value)
+			);
+		}
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_empty_table() {
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"any_key"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_multiple_keys_with_sequence_variations() {
+		// Ensures fix doesn't cause cross-key contamination with different seq_nums
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_a =
+			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_a), b"value_a_100").unwrap();
+
+		let key_b = InternalKey::new(Bytes::copy_from_slice(b"key_b"), 50, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_b), b"value_b_50").unwrap();
+
+		let key_c = InternalKey::new(Bytes::copy_from_slice(b"key_c"), 75, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_c), b"value_c_75").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_b_low =
+			InternalKey::new(Bytes::copy_from_slice(b"key_b"), 25, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_b_low).unwrap();
+		assert!(result.is_none());
+
+		let lookup_a_high =
+			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 150, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_a_high).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), b"key_a");
+		assert_eq!(found_value.as_ref(), b"value_a_100");
+
+		let lookup_c_exact =
+			InternalKey::new(Bytes::copy_from_slice(b"key_c"), 75, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_c_exact).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), b"key_c");
+		assert_eq!(found_value.as_ref(), b"value_c_75");
+
+		let lookup_key_b5 =
+			InternalKey::new(Bytes::copy_from_slice(b"key_b5"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key_b5).unwrap();
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_boundary_conditions() {
+		// Edge cases with sequence number boundaries (seq=0, seq=MAX, seq=1)
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let user_key = b"boundary_key";
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key), b"value_100").unwrap();
+
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_min =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 0, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_min).unwrap();
+		assert!(result.is_none());
+
+		let lookup_max = InternalKey::new(
+			Bytes::copy_from_slice(user_key),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			0,
+		);
+		let result = table.get(lookup_max).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), user_key);
+		assert_eq!(found_value.as_ref(), b"value_100");
+
+		let lookup_one =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 1, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_one).unwrap();
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_lookup_higher_than_stored() {
+		// Snapshot at seq=50 can see older version at seq=25
+		// Internal ordering: user_key asc, seq_num DESC (reversed!)
+		// stored(25).cmp(lookup(50)) = lookup.seq_num().cmp(stored.seq_num()) = 50.cmp(25) = Greater
+		// So stored(25) > lookup(50) in internal ordering (even though 25 < 50 numerically)
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 80, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+
+		let user_key = b"mykey";
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key), b"value_25").unwrap();
+
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), user_key);
+		assert_eq!(found_key.seq_num(), 25);
+		assert_eq!(found_value.as_ref(), b"value_25");
+	}
+
+	#[test]
+	fn test_get_partition_index_sequence_numbers() {
+		// Partition index handles sequence numbers correctly across multiple blocks
+		let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		for i in 0..20 {
+			let key = format!("aaa_key_{:03}", i);
+			let value = format!("value_{}", i);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				1000,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+		}
+
+		let target_key = b"target_key";
+		let key_500 =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 500, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_500), b"value_500").unwrap();
+
+		for i in 0..40 {
+			let key = format!("zzz_key_{:03}", i);
+			let value = format!("value_{}", i);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				1000,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		assert!(table.meta.properties.block_count > 1);
+
+		let lookup_high =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 1000, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_high).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), target_key);
+		assert_eq!(found_key.seq_num(), 500);
+		assert_eq!(found_value.as_ref(), b"value_500");
+
+		let lookup_exact =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 500, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_exact).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), target_key);
+		assert_eq!(found_key.seq_num(), 500);
+		assert_eq!(found_value.as_ref(), b"value_500");
+
+		let lookup_low =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_low).unwrap();
+		assert!(result.is_none());
+
+		let filler_key = b"zzz_key_010";
+		let lookup_filler =
+			InternalKey::new(Bytes::copy_from_slice(filler_key), 1000, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_filler).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), filler_key);
+	}
+
+	#[test]
+	fn test_get_nonexistent_key_greater_than_all() {
+		// Key greater than all stored keys should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+
+		let key_ccc =
+			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_ccc), b"value_ccc").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_nonexistent_key_between_existing() {
+		// Key between existing keys should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let key_ccc =
+			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_ccc), b"value_ccc").unwrap();
+
+		let key_eee =
+			InternalKey::new(Bytes::copy_from_slice(b"key_eee"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_eee), b"value_eee").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_with_tombstone() {
+		// Tombstones should be found and returned
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_other =
+			InternalKey::new(Bytes::copy_from_slice(b"key_other"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_other), b"value_other").unwrap();
+
+		let key_target = InternalKey::new(
+			Bytes::copy_from_slice(b"key_target"),
+			100,
+			InternalKeyKind::Delete,
+			0,
+		);
+		writer.add(Arc::new(key_target), b"").unwrap();
+
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_target"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.user_key.as_ref(), b"key_target");
+		assert!(found_key.is_tombstone());
+	}
+
+	#[test]
+	fn test_get_nonexistent_with_similar_prefix() {
+		// Prefix of existing keys should not match
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key1 =
+			InternalKey::new(Bytes::copy_from_slice(b"user_data"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key1), b"value1").unwrap();
+
+		let key2 =
+			InternalKey::new(Bytes::copy_from_slice(b"user_profile"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key2), b"value2").unwrap();
+
+		let key3 =
+			InternalKey::new(Bytes::copy_from_slice(b"username"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key3), b"value3").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"user"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_nonexistent_empty_key() {
+		// Empty key should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b""), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_nonexistent_with_special_chars() {
+		// Binary keys with special bytes handled correctly
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key1 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x00"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key1), b"value0").unwrap();
+
+		let key2 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x01"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key2), b"value1").unwrap();
+
+		let key3 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\xFF"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key3), b"value_ff").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x02"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_nonexistent_in_large_table() {
+		// Non-existent key in multi-block table should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		for i in 0..100 {
+			if i == 50 {
+				continue;
+			}
+			let key = format!("key_{:03}", i);
+			let value = format!("value_{}", i);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				100,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		assert!(table.meta.properties.block_count > 1);
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_050"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_get_all_keys_same_prefix_different_suffix() {
+		// Keys with same prefix but different suffix don't match
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key_a =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_a"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_a), b"value_a").unwrap();
+
+		let key_b =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_b"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_b), b"value_b").unwrap();
+
+		let key_c =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_c"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key_c), b"value_c").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_d"), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key).unwrap();
+
+		assert!(result.is_none());
+	}
 }
