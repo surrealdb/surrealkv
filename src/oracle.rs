@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,29 +42,42 @@ impl CommitEntry {
 /// The current implementation uses Snapshot Isolation (SI) for conflict detection
 pub(crate) struct Oracle {
 	/// Transaction commit queue
-	pub(crate) transaction_commit_id: AtomicU64,
-	transaction_commit_queue: SkipMap<u64, Arc<CommitEntry>>,
-
-	/// Maximum number of entries to keep in queues
-	max_queue_size: usize,
+	pub(crate) transaction_commit_id: Arc<AtomicU64>,
+	transaction_commit_queue: Arc<SkipMap<u64, Arc<CommitEntry>>>,
 
 	/// Track active transaction start points
-	active_txn_starts: SkipMap<u64, AtomicUsize>,
+	active_txn_starts: Arc<SkipMap<u64, AtomicUsize>>,
 
 	/// Logical clock for time-based operations
 	clock: Arc<dyn LogicalClock>,
+
+	/// Background cleanup thread fields
+	cleanup_enabled: Arc<AtomicBool>,
+	cleanup_handle: Mutex<Option<JoinHandle<()>>>,
+	cleanup_interval: Duration,
+}
+
+impl Drop for Oracle {
+	fn drop(&mut self) {
+		self.shutdown_cleanup();
+	}
 }
 
 impl Oracle {
 	/// Creates a new Oracle with default configuration.
 	pub(crate) fn new(clock: Arc<dyn LogicalClock>) -> Self {
-		Self {
-			transaction_commit_id: AtomicU64::new(0),
-			transaction_commit_queue: SkipMap::new(),
-			max_queue_size: 10000,
-			active_txn_starts: SkipMap::new(),
+		let oracle = Self {
+			transaction_commit_id: Arc::new(AtomicU64::new(0)),
+			transaction_commit_queue: Arc::new(SkipMap::new()),
+			active_txn_starts: Arc::new(SkipMap::new()),
 			clock,
-		}
+			cleanup_enabled: Arc::new(AtomicBool::new(true)),
+			cleanup_handle: Mutex::new(None),
+			cleanup_interval: Duration::from_secs(2),
+		};
+		// Start the background cleanup thread
+		oracle.spawn_cleanup_thread();
+		oracle
 	}
 
 	/// Register a new transaction start
@@ -109,10 +123,8 @@ impl Oracle {
 			return Err(Error::TransactionWriteConflict);
 		}
 
-		// Clean up old entries
-		self.cleanup_queue();
-
 		// No conflicts found, return the tx_id and commit timestamp
+		// Note: cleanup happens periodically in background thread
 		let commit_ts = self.clock.now();
 
 		Ok(commit_ts)
@@ -171,35 +183,48 @@ impl Oracle {
 		Ok(false) // No conflicts
 	}
 
-	/// Clean up the commit queue based on active transactions
-	fn cleanup_queue(&self) {
-		// Only clean up if we have too many entries
-		if self.transaction_commit_queue.len() <= self.max_queue_size {
-			return;
+	/// Shutdown the cleanup thread, waiting for it to exit
+	fn shutdown_cleanup(&self) {
+		// Disable cleanup
+		self.cleanup_enabled.store(false, Ordering::Release);
+
+		// Wait for the cleanup thread to exit
+		if let Some(handle) = self.cleanup_handle.lock().unwrap().take() {
+			handle.thread().unpark();
+			let _ = handle.join();
 		}
+	}
 
-		// Find the oldest active transaction start point
-		let oldest_active = match self.active_txn_starts.iter().next() {
-			Some(entry) => {
-				// There are active transactions - we can safely clean up entries
-				// older than the oldest active transaction's start point
-				*entry.key()
+	/// Spawn the background cleanup thread
+	fn spawn_cleanup_thread(&self) {
+		let commit_queue = Arc::clone(&self.transaction_commit_queue);
+		let active_txn_starts = Arc::clone(&self.active_txn_starts);
+		let transaction_commit_id = Arc::clone(&self.transaction_commit_id);
+		let cleanup_enabled = Arc::clone(&self.cleanup_enabled);
+		let interval = self.cleanup_interval;
+
+		let handle = std::thread::spawn(move || {
+			while cleanup_enabled.load(Ordering::Acquire) {
+				// Wait for the specified interval
+				std::thread::park_timeout(interval);
+
+				// Find the oldest active transaction start point
+				let oldest_active = match active_txn_starts.iter().next() {
+					Some(entry) => *entry.key(),
+					None => transaction_commit_id.load(Ordering::Acquire),
+				};
+
+				// Only remove entries that are not needed for conflict detection
+				let keys_to_remove: Vec<u64> =
+					commit_queue.range(..oldest_active).map(|e| *e.key()).collect();
+
+				for key in keys_to_remove {
+					commit_queue.remove(&key);
+				}
 			}
-			None => {
-				// No active transactions currently.
-				// New transactions will get start_commit_id = current transaction_commit_id
-				// So we can safely clean up entries older than the current commit ID
-				// since no future transaction will have a start_commit_id older than this
-				self.transaction_commit_id.load(Ordering::Acquire)
-			}
-		};
+		});
 
-		// Only remove entries that are not needed for conflict detection
-		let keys_to_remove: Vec<u64> =
-			self.transaction_commit_queue.range(..oldest_active).map(|e| *e.key()).collect();
-
-		for key in keys_to_remove {
-			self.transaction_commit_queue.remove(&key);
-		}
+		// Store the thread handle
+		*self.cleanup_handle.lock().unwrap() = Some(handle);
 	}
 }
