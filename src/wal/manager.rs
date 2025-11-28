@@ -18,11 +18,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::file_writer::BufferedFileWriter;
-use super::format::{CompressionType, BLOCK_SIZE};
-use super::metadata::Options;
-use super::segment::{get_segment_range, segment_name, Error, IOError, Result};
 use super::writer::Writer;
+use super::{
+	get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
+	Result, BLOCK_SIZE,
+};
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
 pub struct Wal {

@@ -26,8 +26,7 @@ use crate::{
 	transaction::{Mode, Transaction},
 	vlog::{VLog, VLogGCManager, ValueLocation},
 	wal::{
-		self,
-		cleanup::cleanup_old_segments,
+		self, cleanup_old_segments,
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		Wal,
 	},

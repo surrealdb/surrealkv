@@ -3,16 +3,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::lsm::fsync_directory;
+use crate::wal::list_segment_ids;
 use crate::wal::reader::Reporter;
-use crate::wal::segment::list_segment_ids;
 use crate::{
 	batch::Batch,
 	error::Result,
 	memtable::MemTable,
-	wal::{
-		reader::Reader,
-		segment::{get_segment_range, Error, SegmentRef},
-	},
+	wal::{get_segment_range, reader::Reader, Error, SegmentRef},
 };
 
 /// Default implementation of the Reporter trait for WAL recovery.
@@ -147,8 +144,8 @@ pub(crate) fn replay_wal(
 
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
 	use crate::wal::manager::Wal;
-	use crate::wal::metadata::Options;
 	use crate::wal::reader::Reader;
+	use crate::wal::Options;
 	use std::fs;
 
 	// Build segment paths
@@ -250,7 +247,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 mod tests {
 	use super::*;
 	use crate::wal::manager::Wal;
-	use crate::wal::metadata::Options;
+	use crate::wal::Options;
 	use std::fs;
 	use std::io::{Seek, Write};
 	use tempfile::TempDir;
@@ -445,7 +442,7 @@ mod tests {
 		let record_type = 3u8;
 		let length = 10u16; // Length of data
 		let data = vec![0xFF; 10]; // Some data
-		let crc = crate::wal::segment::calculate_crc32(&[record_type], &data);
+		let crc = crate::wal::calculate_crc32(&[record_type], &data);
 
 		file.write_all(&[record_type]).unwrap(); // Record type: Middle (WRONG!)
 		file.write_all(&length.to_be_bytes()).unwrap(); // Length
@@ -530,7 +527,7 @@ mod tests {
 		let record_type = 3u8;
 		let length = 10u16;
 		let data = vec![0xFF; 10];
-		let crc = crate::wal::segment::calculate_crc32(&[record_type], &data);
+		let crc = crate::wal::calculate_crc32(&[record_type], &data);
 
 		file.write_all(&[record_type]).unwrap();
 		file.write_all(&length.to_be_bytes()).unwrap(); // Length

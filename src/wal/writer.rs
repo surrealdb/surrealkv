@@ -18,9 +18,10 @@ use std::io;
 
 use crc32fast::Hasher;
 
-use super::file_writer::{BufferedFileWriter, WritableFile};
-use super::format::{CompressionType, RecordType, BLOCK_SIZE, HEADER_SIZE};
-use super::segment::{Error, IOError, Result};
+use super::{
+	BufferedFileWriter, CompressionType, Error, IOError, RecordType, Result, WritableFile,
+	BLOCK_SIZE, HEADER_SIZE,
+};
 
 /// Writer for WAL records.
 pub struct Writer {

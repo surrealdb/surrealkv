@@ -2,11 +2,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::vec::Vec;
 
-use crate::wal::format::{
-	CompressionType, RecordType, BLOCK_SIZE, HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
-};
-use crate::wal::segment::{
-	calculate_crc32, validate_record_type, CorruptionError, Error, IOError, Result,
+use crate::wal::{
+	calculate_crc32, validate_record_type, CompressionType, CorruptionError, Error, IOError,
+	RecordType, Result, BLOCK_SIZE, HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
 };
 
 /// Reporter interface for WAL corruption and errors.
@@ -302,8 +300,7 @@ mod tests {
 	use test_log::test;
 
 	use crate::wal::manager::Wal;
-	use crate::wal::metadata::Options;
-	use crate::wal::segment::SegmentRef;
+	use crate::wal::{Options, SegmentRef};
 	use tempdir::TempDir;
 
 	// BufferReader does not return EOF when the underlying reader returns 0 bytes read.
