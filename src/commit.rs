@@ -13,7 +13,7 @@ use crate::{
 	error::{Error, Result},
 };
 
-const MAX_CONCURRENT_COMMITS: usize = 16;
+const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
@@ -265,16 +265,10 @@ impl CommitPipeline {
 
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Phase 1: Prepare (single producer) - assign sequence number
-		let seq_num = self.prepare(&mut batch, commit_batch.clone())?;
+		// Phase 1: Assign sequence number and write to WAL (serialized)
+		let processed_batch = self.prepare(&mut batch, commit_batch.clone(), sync)?;
 
-		// Phase 2: Write to WAL and process VLog (synchronous)
-		let processed_batch = {
-			let env = self.env.clone();
-			env.write(&batch, seq_num, sync)?
-		};
-
-		// Phase 3: Apply to memtable (can be concurrent)
+		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
 			let env = self.env.clone();
 			env.apply(&processed_batch)
@@ -283,7 +277,7 @@ impl CommitPipeline {
 		match apply_result {
 			Ok(_) => {
 				commit_batch.mark_applied();
-				// Phase 4: Publish (multi-consumer)
+				// Phase 3: Publish (multi-consumer)
 				self.publish();
 			}
 			Err(e) => {
@@ -297,8 +291,13 @@ impl CommitPipeline {
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
-	fn prepare(&self, batch: &mut Batch, commit_batch: Arc<CommitBatch>) -> Result<u64> {
-		// Assign sequence number atomically
+	fn prepare(
+		&self,
+		batch: &mut Batch,
+		commit_batch: Arc<CommitBatch>,
+		sync: bool,
+	) -> Result<Batch> {
+		// Assign sequence number atomically and write to WAL (serialized)
 		let _guard = self.write_mutex.lock();
 
 		let count = batch.count() as u64;
@@ -311,7 +310,10 @@ impl CommitPipeline {
 		// Enqueue operation (single producer)
 		self.pending.enqueue(commit_batch.clone());
 
-		Ok(seq_num)
+		// Write to WAL and process VLog (serialized under lock)
+		let processed_batch = self.env.write(batch, seq_num, sync)?;
+
+		Ok(processed_batch)
 	}
 
 	fn publish(&self) {
