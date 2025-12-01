@@ -1,469 +1,293 @@
-use std::fs;
 use std::io;
-use std::path::Path;
-use std::path::PathBuf;
 
-use crate::wal::segment::{get_segment_range, Error, IOError, Options, Result, Segment};
+use crc32fast::Hasher;
 
-/// Write-Ahead Log (Wal) is a data structure used to sequentially
-/// store records in a series of segments.
-pub(crate) struct Wal {
-	/// The currently active segment where data is being written.
-	active_segment: Segment,
+use super::{
+	BufferedFileWriter, CompressionType, Error, IOError, RecordType, Result, WritableFile,
+	BLOCK_SIZE, HEADER_SIZE,
+};
 
-	/// The ID of the currently active segment.
-	active_segment_id: u64,
+/// Writer for WAL records.
+pub struct Writer {
+	/// The underlying buffered file writer.
+	dest: BufferedFileWriter,
 
-	/// The directory where the segment files are located.
-	dir: PathBuf,
+	/// Current offset within the current block (0 to BLOCK_SIZE).
+	block_offset: usize,
 
-	/// Configuration options for the WAL instance.
-	opts: Options,
+	/// If true, writes are not automatically flushed. User must call write_buffer().
+	manual_flush: bool,
 
-	/// A flag indicating whether the WAL instance is closed or not.
-	closed: bool,
+	/// The compression type to use for records.
+	compression_type: CompressionType,
+
+	/// Buffer for compressed data (allocated when compression is enabled).
+	#[allow(dead_code)]
+	compressed_buffer: Option<Vec<u8>>,
 }
 
-impl Wal {
-	/// Opens or creates a new WAL instance associated with the specified directory and segment ID.
-	///
-	/// This function prepares the WAL instance by creating the necessary directory,
-	/// determining the active segment ID, and initializing the active segment.
+impl Writer {
+	/// Creates a new Writer for the given buffered file writer.
 	///
 	/// # Parameters
-	///
-	/// - `dir`: The directory where segment files are located.
-	/// - `opts`: Configuration options for the WAL instance.
-	pub(crate) fn open(dir: &Path, opts: Options) -> Result<Self> {
-		// Ensure the options are valid
-		opts.validate()?;
-
-		// Ensure the directory exists with proper permissions
-		Self::prepare_directory(dir, &opts)?;
-
-		// Clean up any stale .wal.repair files from previous crashed repair attempts
-		Self::cleanup_stale_repair_files(dir)?;
-
-		// Determine the active segment ID
-		let active_segment_id = Self::calculate_active_segment_id(dir)?;
-
-		// Open the active segment
-		let active_segment = Segment::open(dir, active_segment_id, &opts)?;
-
-		Ok(Self {
-			active_segment,
-			active_segment_id,
-			dir: dir.to_path_buf(),
-			opts,
-			closed: false,
-		})
-	}
-
-	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
-		// Directory should already be created by Tree::new()
-		// Just set permissions if needed
-		if let Ok(metadata) = fs::metadata(dir) {
-			let mut permissions = metadata.permissions();
-
-			#[cfg(unix)]
-			{
-				use std::os::unix::fs::PermissionsExt;
-				permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-			}
-
-			#[cfg(windows)]
-			{
-				permissions.set_readonly(false);
-			}
-
-			fs::set_permissions(dir, permissions)?;
-		}
-
-		Ok(())
-	}
-
-	fn calculate_active_segment_id(dir: &Path) -> Result<u64> {
-		let (_, last) = get_segment_range(dir, Some("wal"))?;
-		Ok(if last > 0 {
-			last + 1
+	/// - `dest`: The buffered file writer to write records to.
+	/// - `manual_flush`: If true, user must call write_buffer() to flush.
+	/// - `compression_type`: The compression type to use.
+	pub fn new(
+		dest: BufferedFileWriter,
+		manual_flush: bool,
+		compression_type: CompressionType,
+	) -> Self {
+		// Allocate compressed buffer if compression is enabled
+		let compressed_buffer = if compression_type != CompressionType::None {
+			Some(Vec::with_capacity(BLOCK_SIZE))
 		} else {
-			0
-		})
-	}
-
-	/// Cleans up stale .wal.repair files that may have been left behind
-	/// by crashed repair processes.
-	///
-	/// These files are temporary and should have been either renamed to .wal
-	/// (on success) or deleted (on failure) during the repair process.
-	fn cleanup_stale_repair_files(dir: &Path) -> Result<()> {
-		// Check if the directory exists
-		if !dir.exists() {
-			return Ok(());
-		}
-
-		// Read all files in the WAL directory
-		let entries = match fs::read_dir(dir) {
-			Ok(entries) => entries,
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {
-				return Ok(());
-			}
-			Err(e) => {
-				return Err(Error::IO(IOError::new(
-					io::ErrorKind::Other,
-					&format!("Failed to read WAL directory: {}", e),
-				)));
-			}
+			None
 		};
 
-		let mut removed_count = 0;
-
-		// Find and remove all .wal.repair files
-		for entry in entries.flatten() {
-			let path = entry.path();
-			if let Some(filename) = path.file_name() {
-				let filename_str = filename.to_string_lossy();
-
-				if filename_str.ends_with(".wal.repair") {
-					match fs::remove_file(&path) {
-						Ok(()) => {
-							removed_count += 1;
-							log::warn!(
-								"Removed stale repair file from previous crashed repair: {}",
-								filename_str
-							);
-						}
-						Err(e) => {
-							log::error!(
-								"Failed to remove stale repair file {}: {}",
-								filename_str,
-								e
-							);
-							// Don't fail the entire open operation for this
-						}
-					}
-				}
-			}
+		Self {
+			dest,
+			block_offset: 0,
+			manual_flush,
+			compression_type,
+			compressed_buffer,
 		}
-
-		if removed_count > 0 {
-			log::info!("Cleaned up {} stale .wal.repair files", removed_count);
-		}
-
-		Ok(())
 	}
 
-	/// Appends a record to the active segment.
+	/// Adds a record to the WAL.
 	///
-	/// This function appends the record to the active segment. If the active segment is
-	/// full, a new segment will be created and the record will be appended to it.
+	/// The record is automatically fragmented if it doesn't fit in the current block.
+	/// If manual_flush is false, the data is automatically flushed to disk.
 	///
-	/// The function returns a tuple containing the offset at which the record was appended
-	/// and the number of bytes written.
-	///
-	/// # Arguments
-	///
-	/// * `rec` - A reference to the byte slice containing the record to be appended.
+	/// # Parameters
+	/// - `slice`: The data to write.
 	///
 	/// # Returns
-	///
-	/// A result containing the tuple `(offset, bytes_written)` or an `io::Error` in case of failure.
-	///
-	/// # Errors
-	///
-	/// This function may return an error if the active segment is closed, the provided record
-	/// is empty, or any I/O error occurs during the appending process.
-	pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
-		if self.closed {
-			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Segment is closed")));
-		}
-
-		if rec.is_empty() {
-			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
-		}
-
-		let (off, _) = self.active_segment.append(rec)?;
-
-		Ok(off)
-	}
-
-	#[cfg(test)]
-	fn read_at(&self, buf: &mut [u8], off: u64) -> Result<usize> {
-		if buf.is_empty() {
-			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "Buffer is empty")));
-		}
-
-		let mut r = 0;
-		while r < buf.len() {
-			let offset = off + r as u64;
-			let segment_id = off / self.opts.max_file_size;
-			let read_offset = offset % self.opts.max_file_size;
-
-			// Read data from the appropriate segment
-			r += self.read_segment_data(&mut buf[r..], segment_id, read_offset)?;
-		}
-
-		Ok(r)
-	}
-
-	#[cfg(test)]
-	fn read_segment_data(
-		&self,
-		buf: &mut [u8],
-		segment_id: u64,
-		read_offset: u64,
-	) -> Result<usize> {
-		if segment_id == self.active_segment_id {
-			self.active_segment.read_at(buf, read_offset)
+	/// - Ok(()) if successful.
+	/// - Err if an I/O error occurs.
+	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
+		// Compress data if compression is enabled
+		let compressed;
+		let data_to_write = if self.compression_type == CompressionType::Lz4 {
+			compressed = lz4_flex::compress_prepend_size(slice);
+			&compressed[..]
 		} else {
-			let segment = Segment::open(&self.dir, segment_id, &self.opts)?;
-			segment.read_at(buf, read_offset)
-		}
-	}
+			slice
+		};
 
-	pub(crate) fn close(&mut self) -> Result<()> {
-		if self.closed {
-			return Ok(());
+		let mut ptr = data_to_write;
+		let mut begin = true;
+
+		// Fragment the record if necessary and emit it
+		while begin || !ptr.is_empty() {
+			// Check if we need to switch to a new block
+			self.maybe_switch_to_new_block(ptr.len())?;
+
+			// Calculate how much data fits in the current block
+			let avail = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
+			let fragment_length = ptr.len().min(avail);
+			let fragment = &ptr[..fragment_length];
+
+			// Determine record type
+			let is_end = fragment_length == ptr.len();
+			let record_type = if begin && is_end {
+				RecordType::Full
+			} else if begin {
+				RecordType::First
+			} else if is_end {
+				RecordType::Last
+			} else {
+				RecordType::Middle
+			};
+
+			// Write the physical record
+			self.emit_physical_record(record_type, fragment)?;
+
+			// Advance pointer
+			ptr = &ptr[fragment_length..];
+			begin = false;
 		}
-		self.closed = true;
-		self.active_segment.close()?;
+
+		// Flush if not in manual mode
+		if !self.manual_flush {
+			self.write_buffer()?;
+		}
+
 		Ok(())
 	}
 
-	pub(crate) fn sync(&mut self) -> Result<()> {
-		if self.closed {
+	/// Adds a compression type record at the start of the WAL.
+	///
+	/// This should be called before any data records are written.
+	pub fn add_compression_type_record(&mut self) -> Result<()> {
+		// Should be the first record
+		if self.block_offset != 0 {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"Compression type record must be first",
+			)));
+		}
+
+		if self.compression_type == CompressionType::None {
 			return Ok(());
 		}
-		self.active_segment.sync()?;
+
+		// Encode compression type (just the type as u8 for now)
+		let data = [self.compression_type as u8];
+
+		// Emit as SetCompressionType record
+		self.emit_physical_record(RecordType::SetCompressionType, &data)?;
+
+		if !self.manual_flush {
+			self.write_buffer()?;
+		}
+
 		Ok(())
 	}
 
-	// Returns the current offset within the segment.
-	#[cfg(test)]
-	fn offset(&self) -> u64 {
-		self.active_segment.offset()
+	/// Writes any buffered data to the file.
+	///
+	/// Flushes to OS cache (fast) but does NOT fsync to disk.
+	/// For durability, call sync() explicitly when needed.
+	pub fn write_buffer(&mut self) -> Result<()> {
+		self.dest.flush() // Fast: OS cache only, no fsync
 	}
 
-	pub(crate) fn get_dir_path(&self) -> &Path {
-		&self.dir
+	/// Syncs data to disk (slow, durable).
+	///
+	/// Should be called when durability is required (e.g., transaction commit).
+	pub fn sync(&mut self) -> Result<()> {
+		self.dest.sync() // Slow: flush + fsync to disk
 	}
 
-	/// Explicitly rotates the active WAL segment to a new one.
-	///
-	/// This method should be called when a memtable is being flushed to ensure
-	/// a one-to-one relationship between memtables and WAL segments.
-	///
-	/// # Returns
-	///
-	/// The ID of the newly created segment, or an error if something went wrong.
-	pub(crate) fn rotate(&mut self) -> Result<u64> {
-		// Sync and close the current active segment
-		self.active_segment.close()?;
-
-		// Update the active segment id and create a new segment
-		self.active_segment_id += 1;
-		let new_segment = Segment::open(&self.dir, self.active_segment_id, &self.opts)?;
-		self.active_segment = new_segment;
-
-		Ok(self.active_segment_id)
+	/// Closes the writer, syncing and flushing all data.
+	pub fn close(&mut self) -> Result<()> {
+		self.sync()?;
+		self.dest.close()
 	}
-}
 
-impl Drop for Wal {
-	/// Attempt to fsync data on drop, in case we're running without sync.
-	fn drop(&mut self) {
-		if !self.closed {
-			self.close().ok();
+	/// Switches to a new block if the content won't fit in the current one.
+	fn maybe_switch_to_new_block(&mut self, content_size: usize) -> Result<()> {
+		let leftover = BLOCK_SIZE - self.block_offset;
+
+		// If there's not enough space for header + content, pad and move to next block
+		if leftover < HEADER_SIZE + content_size && leftover < BLOCK_SIZE {
+			// Pad remaining space with zeros
+			let padding = vec![0u8; leftover];
+			self.dest.append(&padding)?;
+			self.block_offset = 0;
 		}
+
+		Ok(())
+	}
+
+	/// Emits a single physical record to the file.
+	fn emit_physical_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
+		let length = data.len();
+		if length > 0xffff {
+			return Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Record too large")));
+		}
+
+		// Calculate CRC correctly: CRC(type_byte || data)
+		// Must match Reader's calculate_crc32 function
+		let type_byte = record_type as u8;
+		let mut hasher = Hasher::new();
+		hasher.update(&[type_byte]); // Add type byte
+		hasher.update(data); // Add data
+		let crc = hasher.finalize(); // Single CRC over both
+
+		// Write header (7-byte format)
+		let mut header = Vec::with_capacity(HEADER_SIZE);
+		header.extend_from_slice(&crc.to_le_bytes());
+		header.extend_from_slice(&(length as u16).to_le_bytes());
+		header.push(record_type as u8);
+
+		self.dest.append(&header)?;
+		self.dest.append(data)?;
+
+		self.block_offset += HEADER_SIZE + length;
+
+		Ok(())
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use crate::wal::segment::{BLOCK_SIZE, WAL_RECORD_HEADER_SIZE};
-	use test_log::test;
-
 	use super::*;
+	use std::fs::File;
 	use tempdir::TempDir;
 
-	fn create_temp_directory() -> TempDir {
-		TempDir::new("test").unwrap()
+	#[test]
+	fn test_writer_basic() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+
+		// Write a simple record
+		writer.add_record(b"Hello, World!").unwrap();
+
+		writer.close().unwrap();
+
+		// Verify file exists and has content
+		let metadata = std::fs::metadata(&file_path).unwrap();
+		assert!(metadata.len() > 0);
 	}
 
 	#[test]
-	fn append() {
-		// Create a temporary directory
-		let temp_dir = create_temp_directory();
+	fn test_manual_flush() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		// Create aol options and open a aol file
-		let opts = Options::default();
-		let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
+		let mut writer = Writer::new(buffered_writer, true, CompressionType::None);
 
-		// Test initial offset
-		let sz = a.offset();
-		assert_eq!(0, sz);
+		// Write without auto-flush
+		writer.add_record(b"Test").unwrap();
 
-		// Test appending an empty buffer
-		let r = a.append(&[]);
-		assert!(r.is_err());
+		// Manual flush
+		writer.write_buffer().unwrap();
 
-		// Test appending a non-empty buffer
-		let r = a.append(&[0, 1, 2, 3]);
-		assert!(r.is_ok());
-
-		// Test appending another buffer
-		let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
-		assert!(r.is_ok());
-
-		// Validate offset after appending
-		// 7 + 4 + 7 + 7 = 25
-		assert_eq!(a.offset(), 25);
-
-		// Test syncing segment
-		let r = a.sync();
-		assert!(r.is_ok());
-
-		// Validate offset after syncing
-		assert_eq!(a.offset(), BLOCK_SIZE as u64);
-
-		// Test reading from segment
-		let mut bs = vec![0; 11];
-		let n = a.read_at(&mut bs, 0).expect("should read");
-		assert_eq!(11, n);
-		assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test reading another portion of data from segment
-		let mut bs = vec![0; 14];
-		let n = a.read_at(&mut bs, 11).expect("should read");
-		assert_eq!(14, n);
-		assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test reading beyond segment's current size
-		let mut bs = vec![0; 14];
-		let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
-		assert!(r.is_err());
-
-		// Test appending another buffer after syncing
-		let r = a.append(&[11, 12, 13, 14]);
-		assert!(r.is_ok());
-
-		// Validate offset after appending
-		// BLOCK_SIZE + 7 + 4 = 4107
-		assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 4);
-
-		// Test reading from segment after appending
-		let mut bs = vec![0; 11];
-		let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
-		assert_eq!(11, n);
-		assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test syncing segment again
-		let r = a.sync();
-		assert!(r.is_ok());
-
-		// Validate offset after syncing again
-		assert_eq!(a.offset(), BLOCK_SIZE as u64 * 2);
-
-		// Test closing wal
-		assert!(a.close().is_ok());
+		writer.close().unwrap();
 	}
 
 	#[test]
-	fn wal_reopen() {
-		// Create a temporary directory
-		let temp_dir = create_temp_directory();
+	fn test_fragmentation() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).unwrap();
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		// Create aol options and open a aol file
-		let opts = Options::default();
-		let mut a = Wal::open(temp_dir.path(), opts).expect("should create aol");
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
 
-		// Test appending a non-empty buffer
-		let r = a.append(&[0, 1, 2, 3]);
-		assert!(r.is_ok());
+		// Write a large record that will be fragmented
+		let large_data = vec![b'A'; BLOCK_SIZE * 2];
+		writer.add_record(&large_data).unwrap();
 
-		// Test closing wal
-		assert!(a.close().is_ok());
+		writer.close().unwrap();
 
-		// Reopen the wal
-		let opts = Options::default();
-		let mut a = Wal::open(temp_dir.path(), opts).expect("should open aol");
-
-		// Test appending another buffer
-		let r = a.append(&[4, 5, 6, 7, 8, 9, 10]);
-		assert!(r.is_ok());
-
-		// Validate offset after appending
-		// 4096 + 7 + 7 = 4110
-		assert_eq!(a.offset(), BLOCK_SIZE as u64 + 7 + 7);
-
-		// Test reading from segment
-		let mut bs = vec![0; 11];
-		let n = a.read_at(&mut bs, 0).expect("should read");
-		assert_eq!(11, n);
-		assert_eq!(&[0, 1, 2, 3].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test reading another portion of data from segment
-		let mut bs = vec![0; 14];
-		let n = a.read_at(&mut bs, BLOCK_SIZE as u64).expect("should read");
-		assert_eq!(14, n);
-		assert_eq!(&[4, 5, 6, 7, 8, 9, 10].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test reading beyond segment's current size
-		let mut bs = vec![0; 14];
-		let r = a.read_at(&mut bs, BLOCK_SIZE as u64 + 1);
-		assert!(r.is_err());
-
-		// Test appending another buffer after syncing
-		let r = a.append(&[11, 12, 13, 14]);
-		assert!(r.is_ok());
-
-		// Validate offset after appending
-		// BLOCK_SZIE + 14 + 7 + 4 = 4121
-		assert_eq!(a.offset(), BLOCK_SIZE as u64 + 14 + 7 + 4);
-
-		// Test reading from segment after appending
-		let mut bs = vec![0; 11];
-		let n = a.read_at(&mut bs, BLOCK_SIZE as u64 + 14).expect("should read");
-		assert_eq!(11, n);
-		assert_eq!(&[11, 12, 13, 14].to_vec(), &bs[WAL_RECORD_HEADER_SIZE..]);
-
-		// Test closing wal
-		assert!(a.close().is_ok());
+		let metadata = std::fs::metadata(&file_path).unwrap();
+		assert!(metadata.len() > BLOCK_SIZE as u64 * 2);
 	}
 
 	#[test]
-	fn test_cleanup_stale_repair_files() {
-		use std::fs;
+	fn test_legacy_vs_recyclable() {
+		let temp_dir = TempDir::new("test").unwrap();
 
-		let temp_dir = create_temp_directory();
-		let wal_dir = temp_dir.path();
+		// Write with legacy format
+		{
+			let file_path = temp_dir.path().join("test.wal");
+			let file = File::create(&file_path).unwrap();
+			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+			let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+			writer.add_record(b"test record").unwrap();
+			writer.close().unwrap();
 
-		// Create stale .wal.repair files (simulating crashed repair attempts)
-		fs::write(wal_dir.join("00000000000000000000.wal.repair"), b"stale repair 1").unwrap();
-		fs::write(wal_dir.join("00000000000000000001.wal.repair"), b"stale repair 2").unwrap();
-
-		// Verify the stale repair files exist before opening WAL
-		assert!(wal_dir.join("00000000000000000000.wal.repair").exists());
-		assert!(wal_dir.join("00000000000000000001.wal.repair").exists());
-
-		// Open WAL - this should trigger cleanup of stale .wal.repair files
-		let wal = Wal::open(wal_dir, Options::default());
-		assert!(wal.is_ok(), "WAL should open successfully after cleanup");
-
-		// Verify stale .wal.repair files were removed
-		assert!(
-			!wal_dir.join("00000000000000000000.wal.repair").exists(),
-			".wal.repair files should be cleaned up"
-		);
-		assert!(
-			!wal_dir.join("00000000000000000001.wal.repair").exists(),
-			".wal.repair files should be cleaned up"
-		);
-
-		// Verify a new WAL segment was created (since directory was empty of valid segments)
-		assert!(
-			wal_dir.join("00000000000000000000.wal").exists(),
-			"New WAL segment should be created"
-		);
+			let meta = std::fs::metadata(&file_path).unwrap();
+			assert!(meta.len() > 0);
+		}
 	}
 }

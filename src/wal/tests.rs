@@ -3,16 +3,26 @@ use test_log::test;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
-use crate::wal::cleanup::cleanup_old_segments;
+use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
-use crate::wal::segment::list_segment_ids;
-use crate::wal::segment::{MultiSegmentReader, Options, Segment, SegmentRef};
-use crate::wal::writer::Wal;
+use crate::wal::{
+	cleanup_old_segments, get_segment_range, list_segment_ids, parse_segment_name, segment_name,
+	should_include_file, CompressionType, Options, RecordType, SegmentRef,
+};
+use std::fs::File;
+use std::io::Write as IoWrite;
+use std::path::Path;
 use std::sync::Arc;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
+}
+
+fn create_segment_file(dir: &Path, name: &str) {
+	let file_path = dir.join(name);
+	let mut file = File::create(file_path).unwrap();
+	file.write_all(b"dummy content").unwrap();
 }
 
 // Utility function to create a temporary WAL directory
@@ -144,25 +154,23 @@ fn test_wal_replay_latest_segment_only() {
 fn test_wal_with_zero_padding_eof_handling() {
 	let temp_dir = create_temp_directory();
 
-	// Create a WAL segment with small data that doesn't fill the block
+	// Create a WAL with small data that doesn't fill the block
 	let opts = Options::default();
-	let mut segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+	let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 	// Write a small record that won't fill the entire block
 	let small_data = b"hello";
-	segment.append(small_data).expect("should append data");
+	wal.append(small_data).expect("should append data");
 
-	// Close the segment to ensure it's flushed with zero padding
-	segment.close().expect("should close segment");
+	// Close the WAL to ensure it's flushed with zero padding
+	wal.close().expect("should close WAL");
 
 	// Now try to read from the segment using the Reader
 	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
-	let multi_reader =
-		MultiSegmentReader::new(segments).expect("should create multi segment reader");
-
-	let mut reader = Reader::new(multi_reader);
+	let file = File::open(&segments[0].file_path).expect("should open file");
+	let mut reader = Reader::new(file);
 
 	let result = reader.read();
 	match result {
@@ -182,14 +190,14 @@ fn test_wal_with_zero_padding_eof_handling() {
 		}
 		Err(e) => {
 			match e {
-				crate::wal::segment::Error::IO(io_err) => {
+				crate::wal::Error::IO(io_err) => {
 					if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
 						// Expected EOF error
 					} else {
 						panic!("Got unexpected IO error: {io_err}");
 					}
 				}
-				crate::wal::segment::Error::Corruption(_) => {
+				crate::wal::Error::Corruption(_) => {
 					panic!("Got corruption error when expecting EOF: {e}");
 				}
 				_ => {
@@ -204,21 +212,19 @@ fn test_wal_with_zero_padding_eof_handling() {
 fn test_empty_wal_segment() {
 	let temp_dir = create_temp_directory();
 
-	// Create an empty WAL segment
+	// Create an empty WAL
 	let opts = Options::default();
-	let segment = Segment::open(temp_dir.path(), 0, &opts).expect("should create segment");
+	let wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 	// Close immediately without writing anything
-	drop(segment);
+	drop(wal);
 
 	// Try to read from the empty segment
 	let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 		.expect("should read segments");
 
-	let multi_reader =
-		MultiSegmentReader::new(segments).expect("should create multi segment reader");
-
-	let mut reader = Reader::new(multi_reader);
+	let file = File::open(&segments[0].file_path).expect("should open file");
+	let mut reader = Reader::new(file);
 
 	let result = reader.read();
 	match result {
@@ -227,14 +233,14 @@ fn test_empty_wal_segment() {
 		}
 		Err(e) => {
 			match e {
-				crate::wal::segment::Error::IO(io_err) => {
+				crate::wal::Error::IO(io_err) => {
 					if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
 						// Expected EOF error from empty segment
 					} else {
 						panic!("Got unexpected IO error from empty segment: {io_err}");
 					}
 				}
-				crate::wal::segment::Error::Corruption(_) => {
+				crate::wal::Error::Corruption(_) => {
 					panic!("Got corruption error from empty segment when expecting EOF: {e}");
 				}
 				_ => {
@@ -243,4 +249,193 @@ fn test_empty_wal_segment() {
 			}
 		}
 	}
+}
+
+// ===== Format Tests =====
+
+#[test]
+fn test_record_type_from_u8() {
+	assert_eq!(RecordType::from_u8(0).unwrap(), RecordType::Empty);
+	assert_eq!(RecordType::from_u8(1).unwrap(), RecordType::Full);
+	assert_eq!(RecordType::from_u8(9).unwrap(), RecordType::SetCompressionType);
+	assert!(RecordType::from_u8(5).is_err()); // Recyclable types no longer supported
+	assert!(RecordType::from_u8(255).is_err());
+}
+
+#[test]
+fn test_compression_type_from_u8() {
+	assert_eq!(CompressionType::from_u8(0).unwrap(), CompressionType::None);
+	assert!(CompressionType::from_u8(255).is_err());
+}
+
+// ===== Options Tests =====
+
+#[test]
+fn test_options_validation() {
+	let mut opts = Options::default();
+	assert!(opts.validate().is_ok());
+
+	opts.max_file_size = 0;
+	assert!(opts.validate().is_err());
+}
+
+#[test]
+fn test_options_builder() {
+	let opts = Options::default()
+		.with_max_file_size(50 * 1024 * 1024)
+		.with_compression(CompressionType::Lz4)
+		.with_extension("log".to_string());
+
+	assert_eq!(opts.max_file_size, 50 * 1024 * 1024);
+	assert_eq!(opts.compression_type, Some(CompressionType::Lz4));
+	assert_eq!(opts.file_extension, Some("log".to_string()));
+}
+
+// ===== Segment Utility Tests =====
+
+#[test]
+fn segment_name_with_extension() {
+	let index = 100;
+	let ext = "log";
+	let expected = format!("{index:020}.{ext}");
+	assert_eq!(segment_name(index, ext), expected);
+}
+
+#[test]
+fn segment_name_without_extension() {
+	let index = 100;
+	let expected = format!("{index:020}");
+	assert_eq!(segment_name(index, ""), expected);
+}
+
+#[test]
+fn segment_name_with_compound_extension() {
+	let index = 5;
+	let name = segment_name(index, "wal.repair");
+	assert_eq!(name, "00000000000000000005.wal.repair");
+
+	let (parsed_id, parsed_ext) = parse_segment_name(&name).unwrap();
+	assert_eq!(parsed_id, index);
+	assert_eq!(parsed_ext, Some("wal.repair".to_string()));
+}
+
+#[test]
+fn parse_segment_name_with_extension() {
+	let name = "00000000000000000010.log";
+	let result = parse_segment_name(name).unwrap();
+	assert_eq!(result, (10, Some("log".to_string())));
+}
+
+#[test]
+fn parse_segment_name_without_extension() {
+	let name = "00000000000000000010";
+	let result = parse_segment_name(name).unwrap();
+	assert_eq!(result, (10, None));
+}
+
+#[test]
+fn parse_segment_name_with_compound_extension() {
+	let name = "00000000000000000010.wal.repair";
+	let result = parse_segment_name(name).unwrap();
+	assert_eq!(result, (10, Some("wal.repair".to_string())));
+}
+
+#[test]
+fn parse_segment_name_invalid_format() {
+	let name = "invalid_name";
+	let result = parse_segment_name(name);
+	assert!(result.is_err());
+}
+
+#[test]
+fn segments_empty_directory() {
+	let temp_dir = create_temp_directory();
+	let dir = temp_dir.path().to_path_buf();
+
+	let result = get_segment_range(&dir, Some("wal")).unwrap();
+	assert_eq!(result, (0, 0));
+}
+
+#[test]
+fn segments_non_empty_directory() {
+	let temp_dir = create_temp_directory();
+	let dir = temp_dir.path().to_path_buf();
+
+	create_segment_file(&dir, "00000000000000000001.log");
+	create_segment_file(&dir, "00000000000000000003.log");
+	create_segment_file(&dir, "00000000000000000002.log");
+	create_segment_file(&dir, "00000000000000000004.log");
+
+	let result = get_segment_range(&dir, Some("log")).unwrap();
+	assert_eq!(result, (1, 4));
+}
+
+#[test]
+fn test_get_segment_range_with_compound_extension() {
+	let temp_dir = create_temp_directory();
+	let dir = temp_dir.path().to_path_buf();
+
+	create_segment_file(&dir, "00000000000000000001.wal");
+	create_segment_file(&dir, "00000000000000000002.wal");
+	create_segment_file(&dir, "00000000000000000003.wal.repair");
+	create_segment_file(&dir, "00000000000000000004.wal.repair");
+	create_segment_file(&dir, "00000000000000000005.wal.repair");
+	create_segment_file(&dir, "00000000000000000006.wal");
+
+	let result = get_segment_range(&dir, Some("wal")).unwrap();
+	assert_eq!(result, (1, 6));
+
+	let result = get_segment_range(&dir, Some("wal.repair")).unwrap();
+	assert_eq!(result, (3, 5));
+
+	let wal_segments = list_segment_ids(&dir, Some("wal")).unwrap();
+	assert_eq!(wal_segments, vec![1, 2, 6]);
+
+	let repair_segments = list_segment_ids(&dir, Some("wal.repair")).unwrap();
+	assert_eq!(repair_segments, vec![3, 4, 5]);
+}
+
+#[test]
+fn test_list_segment_ids() {
+	let temp_dir = TempDir::new("test").expect("should create temp dir");
+	let dir_path = temp_dir.path();
+
+	create_segment_file(dir_path, &segment_name(1, ""));
+	create_segment_file(dir_path, &segment_name(2, ""));
+	create_segment_file(dir_path, &segment_name(10, ""));
+
+	let segment_ids = list_segment_ids(dir_path, None).unwrap();
+	assert_eq!(segment_ids, vec![1, 2, 10]);
+}
+
+#[test]
+fn test_list_segment_ids_with_extension_filter() {
+	let temp_dir = TempDir::new("test").expect("should create temp dir");
+	let dir_path = temp_dir.path();
+
+	create_segment_file(dir_path, &segment_name(1, ""));
+	create_segment_file(dir_path, &segment_name(2, "repair"));
+	create_segment_file(dir_path, &segment_name(3, "tmp"));
+	create_segment_file(dir_path, &segment_name(4, "repair"));
+
+	let segment_ids_no_ext = list_segment_ids(dir_path, None).unwrap();
+	assert_eq!(segment_ids_no_ext, vec![1]);
+
+	let segment_ids_repair = list_segment_ids(dir_path, Some("repair")).unwrap();
+	assert_eq!(segment_ids_repair, vec![2, 4]);
+
+	let segment_ids_tmp = list_segment_ids(dir_path, Some("tmp")).unwrap();
+	assert_eq!(segment_ids_tmp, vec![3]);
+}
+
+#[test]
+fn test_should_include_file_helper() {
+	assert!(should_include_file(None, None));
+	assert!(!should_include_file(None, Some("repair".to_string())));
+	assert!(!should_include_file(None, Some("tmp".to_string())));
+
+	assert!(!should_include_file(Some("repair"), None));
+	assert!(should_include_file(Some("repair"), Some("repair".to_string())));
+	assert!(!should_include_file(Some("repair"), Some("tmp".to_string())));
+	assert!(!should_include_file(Some("tmp"), Some("repair".to_string())));
 }
