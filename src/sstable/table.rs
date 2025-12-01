@@ -549,6 +549,9 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	metaindexiter.seek(&meta_key);
 
 	if metaindexiter.valid() {
+		let k = metaindexiter.key();
+		// Verify exact match to avoid using wrong entry
+		assert_eq!(k.user_key.as_ref(), b"meta");
 		let val = metaindexiter.value().to_vec();
 		let buf_bytes = Bytes::from(val);
 		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
@@ -673,14 +676,24 @@ impl Table {
 		file: Arc<dyn File>,
 		options: &Options,
 	) -> Result<Option<FilterBlockReader>> {
-		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name())
-			.as_bytes()
-			.to_vec();
+		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
+
+		// Create encoded InternalKey for seeking
+		let filter_key = InternalKey::new(
+			Bytes::copy_from_slice(filter_name.as_bytes()),
+			0,
+			InternalKeyKind::Set,
+			0,
+		);
 
 		let mut metaindexiter = metaix.iter(false);
-		metaindexiter.seek(&filter_name);
+		metaindexiter.seek(&filter_key.encode());
 
 		if metaindexiter.valid() {
+			let k = metaindexiter.key();
+
+			// Verify exact match to avoid using wrong entry
+			assert_eq!(k.user_key.as_ref(), filter_name.as_bytes());
 			let val = metaindexiter.value();
 
 			let fbl = BlockHandle::decode(&val);
@@ -3496,5 +3509,111 @@ mod tests {
 		let result = table.get(lookup_key).unwrap();
 
 		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_table_iterator_seek_nonexistent_key() {
+		// Test that seeking to a non-existent key positions the iterator
+		// at the next greater key (correct iterator semantics)
+		let opts = Arc::new(Options::default());
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		// Add only key_bbb to the table
+		let key = b"key_bbb";
+		let value = b"value_bbb";
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(internal_key), value).unwrap();
+
+		let size = writer.finish().unwrap();
+		let table =
+			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+
+		// Seek to key_aaa which does NOT exist
+		// key_aaa < key_bbb lexicographically
+		let mut iter = table.iter(false);
+		let lookup_key = InternalKey::new(
+			Bytes::copy_from_slice(b"key_aaa"),
+			2, // Higher seq number for lookup
+			InternalKeyKind::Set,
+			0,
+		);
+		iter.seek(&lookup_key.encode());
+
+		// Iterator behavior: seek positions at next >= key
+		assert!(iter.valid(), "Iterator should be valid (positioned at next key)");
+
+		// The iterator is positioned at key_bbb (the next greater key)
+		let current_key = iter.key();
+		assert_eq!(
+			current_key.user_key.as_ref(),
+			b"key_bbb",
+			"Iterator should be positioned at the next greater key"
+		);
+
+		// If caller wants exact match, they must check the key themselves
+		let is_exact_match = current_key.user_key.as_ref() == b"key_aaa";
+		assert!(!is_exact_match, "Caller should check for exact match if needed");
+	}
+
+	#[test]
+	fn test_table_iterator_seek_nonexistent_past_end() {
+		// Test that seeking past all keys makes iterator invalid
+		let opts = Arc::new(Options::default());
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key = b"key_bbb";
+		let value = b"value_bbb";
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(internal_key), value).unwrap();
+
+		let size = writer.finish().unwrap();
+		let table =
+			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+
+		// Seek to key_zzz which is past all keys
+		let mut iter = table.iter(false);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 2, InternalKeyKind::Set, 0);
+		iter.seek(&lookup_key.encode());
+
+		// Iterator should be invalid (no more keys)
+		assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
+	}
+
+	#[test]
+	fn test_table_iterator_seek_exact_match() {
+		// Test that seeking to an existing key positions at that key
+		let opts = Arc::new(Options::default());
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key = b"key_bbb";
+		let value = b"value_bbb";
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(internal_key), value).unwrap();
+
+		let size = writer.finish().unwrap();
+		let table =
+			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+
+		// Seek to key_bbb which exists
+		let mut iter = table.iter(false);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 2, InternalKeyKind::Set, 0);
+		iter.seek(&lookup_key.encode());
+
+		assert!(iter.valid(), "Iterator should be valid");
+
+		let current_key = iter.key();
+		assert_eq!(
+			current_key.user_key.as_ref(),
+			b"key_bbb",
+			"Iterator should be positioned at the exact key"
+		);
 	}
 }
