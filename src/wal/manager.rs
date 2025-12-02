@@ -54,13 +54,17 @@ impl Wal {
 	}
 
 	/// Creates a new Writer for the given log number.
+	/// If the segment file already exists, appends to it instead of overwriting.
 	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<Writer> {
 		let extension = opts.file_extension.as_deref().unwrap_or("wal");
 		let file_name = segment_name(log_number, extension);
 		let file_path = dir.join(&file_name);
 
-		// Open or create the file
+		// Open or create the file (append mode ensures writes go to end)
 		let file = Self::open_wal_file(&file_path, opts)?;
+
+		// Get file size from the opened file handle
+		let existing_size = file.metadata()?.len();
 
 		// Create buffered file writer
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
@@ -68,21 +72,23 @@ impl Wal {
 		// Create Writer (use compression type from options)
 		let compression_type = opts.compression_type.unwrap_or(CompressionType::None);
 
-		let manual_flush = false;
-
-		let mut writer = Writer::new(buffered_writer, manual_flush, compression_type);
-
-		// If compression is enabled, write compression type record first
-		if compression_type != CompressionType::None {
-			writer.add_compression_type_record()?;
+		if existing_size > 0 {
+			// Calculate block_offset from file size
+			let block_offset = (existing_size as usize) % BLOCK_SIZE;
+			Ok(Writer::new(buffered_writer, false, compression_type, block_offset))
+		} else {
+			// New file - start fresh
+			let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
+			if compression_type != CompressionType::None {
+				writer.add_compression_type_record()?;
+			}
+			Ok(writer)
 		}
-
-		Ok(writer)
 	}
 
 	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
 		let mut open_options = OpenOptions::new();
-		open_options.read(true).write(true).create(true);
+		open_options.read(true).write(true).create(true).append(true);
 
 		#[cfg(unix)]
 		{
@@ -120,11 +126,8 @@ impl Wal {
 
 	fn calculate_active_log_number(dir: &Path) -> Result<u64> {
 		let (_, last) = get_segment_range(dir, Some("wal"))?;
-		Ok(if last > 0 {
-			last + 1
-		} else {
-			0
-		})
+		// Return the last segment to append to, or 0 if no segments exist
+		Ok(last)
 	}
 
 	/// Cleans up stale .wal.repair files from crashed repair processes.
@@ -351,6 +354,118 @@ mod tests {
 		assert!(
 			wal_dir.join("00000000000000000000.wal").exists(),
 			"New WAL file should be created"
+		);
+	}
+
+	#[test]
+	fn test_wal_append_to_existing() {
+		let temp_dir = create_temp_directory();
+		let opts = Options::default();
+
+		// First session - write some data
+		{
+			let mut wal = Wal::open(temp_dir.path(), opts.clone()).unwrap();
+			wal.append(&[1, 2, 3, 4]).unwrap();
+			wal.close().unwrap();
+		}
+
+		// Verify only one WAL file exists
+		assert!(temp_dir.path().join("00000000000000000000.wal").exists());
+		let size_after_first =
+			fs::metadata(temp_dir.path().join("00000000000000000000.wal")).unwrap().len();
+
+		// Second session - should append to same file
+		{
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			wal.append(&[5, 6, 7, 8]).unwrap();
+			wal.close().unwrap();
+		}
+
+		// Should still be only one WAL file, but larger
+		let files: Vec<_> = fs::read_dir(temp_dir.path())
+			.unwrap()
+			.filter_map(|e| e.ok())
+			.filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
+			.collect();
+		assert_eq!(files.len(), 1, "Should still have only one WAL file");
+
+		let size_after_second =
+			fs::metadata(temp_dir.path().join("00000000000000000000.wal")).unwrap().len();
+		assert!(size_after_second > size_after_first, "File should be larger after appending");
+	}
+
+	#[test]
+	fn test_wal_block_offset_across_sessions() {
+		use crate::wal::reader::Reader;
+		use std::fs::File;
+
+		let temp_dir = create_temp_directory();
+		let opts = Options::default();
+
+		// Create test data of varying lengths to stress block alignment
+		let test_records: Vec<Vec<u8>> = vec![
+			vec![1; 10],    // Small record
+			vec![2; 100],   // Medium record
+			vec![3; 1000],  // Larger record
+			vec![4; 50],    // Another small one
+			vec![5; 5000],  // Record that might cross block boundary
+			vec![6; 7],     // Tiny record
+			vec![7; 2500],  // Medium-large record
+			vec![8; 33],    // Odd size
+			vec![9; 16000], // Large record (half a block)
+			vec![10; 100],  // Final medium record
+		];
+
+		// Write records across multiple sessions (close and reopen between each)
+		// This tests that block_offset is correctly restored each time
+		for (i, record) in test_records.iter().enumerate() {
+			let mut wal = Wal::open(temp_dir.path(), opts.clone()).unwrap();
+			wal.append(record).unwrap();
+			wal.close().unwrap();
+
+			// Verify file size is growing
+			let size =
+				fs::metadata(temp_dir.path().join("00000000000000000000.wal")).unwrap().len();
+			assert!(size > 0, "File should have content after write {}", i);
+		}
+
+		// Verify only one WAL file exists (all appends went to the same file)
+		let files: Vec<_> = fs::read_dir(temp_dir.path())
+			.unwrap()
+			.filter_map(|e| e.ok())
+			.filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
+			.collect();
+		assert_eq!(files.len(), 1, "Should have only one WAL file after all sessions");
+
+		// Read back all records and verify they match
+		let file =
+			File::open(temp_dir.path().join("00000000000000000000.wal")).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		for (i, expected) in test_records.iter().enumerate() {
+			let result = reader.read();
+			assert!(
+				result.is_ok(),
+				"Should be able to read record {} (block_offset was wrong if this fails)",
+				i
+			);
+			let (data, _) = result.unwrap();
+			assert_eq!(
+				data,
+				expected,
+				"Record {} content should match (got {} bytes, expected {} bytes)",
+				i,
+				data.len(),
+				expected.len()
+			);
+		}
+
+		// Verify no more records
+		let result = reader.read();
+		assert!(
+			result.is_err(),
+			"Should have no more records after reading all {} expected",
+			test_records.len()
 		);
 	}
 }

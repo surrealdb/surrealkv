@@ -37,6 +37,7 @@ impl Writer {
 		dest: BufferedFileWriter,
 		manual_flush: bool,
 		compression_type: CompressionType,
+		block_offset: usize,
 	) -> Self {
 		// Allocate compressed buffer if compression is enabled
 		let compressed_buffer = if compression_type != CompressionType::None {
@@ -47,7 +48,7 @@ impl Writer {
 
 		Self {
 			dest,
-			block_offset: 0,
+			block_offset,
 			manual_flush,
 			compression_type,
 			compressed_buffer,
@@ -224,7 +225,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
 		// Write a simple record
 		writer.add_record(b"Hello, World!").unwrap();
@@ -243,7 +244,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, true, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, true, CompressionType::None, 0);
 
 		// Write without auto-flush
 		writer.add_record(b"Test").unwrap();
@@ -261,7 +262,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
 		// Write a large record that will be fragmented
 		let large_data = vec![b'A'; BLOCK_SIZE * 2];
@@ -271,23 +272,5 @@ mod tests {
 
 		let metadata = std::fs::metadata(&file_path).unwrap();
 		assert!(metadata.len() > BLOCK_SIZE as u64 * 2);
-	}
-
-	#[test]
-	fn test_legacy_vs_recyclable() {
-		let temp_dir = TempDir::new("test").unwrap();
-
-		// Write with legacy format
-		{
-			let file_path = temp_dir.path().join("test.wal");
-			let file = File::create(&file_path).unwrap();
-			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
-			let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
-			writer.add_record(b"test record").unwrap();
-			writer.close().unwrap();
-
-			let meta = std::fs::metadata(&file_path).unwrap();
-			assert!(meta.len() > 0);
-		}
 	}
 }
