@@ -504,4 +504,193 @@ mod tests {
 		let (data, _) = reader.read().expect("should read small record");
 		assert_eq!(data, vec![1, 2, 3, 4]);
 	}
+
+	// ==================== Bug Detection Tests ====================
+
+	/// Test #1: Verify offset is correct from the very first read.
+	/// Checks that end_of_buffer_offset is properly initialized.
+	#[test]
+	fn reader_offset_from_first_read() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let opts = Options::default();
+		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
+
+		// Write a small record (7 byte header + 3 bytes data = 10 bytes)
+		wal.append(b"foo").expect("should append");
+		wal.close().expect("should close");
+
+		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
+			.expect("should read segments");
+
+		let file = File::open(&segments[0].file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let (data, offset) = reader.read().expect("should read");
+		assert_eq!(data, b"foo");
+
+		// Offset should be HEADER_SIZE + data length = 7 + 3 = 10
+		// NOT the end of the block (32768)
+		assert_eq!(
+			offset,
+			(WAL_RECORD_HEADER_SIZE + 3) as u64,
+			"First read offset should be precise"
+		);
+	}
+
+	/// Test #2: Verify offsets are correct and increasing for multiple records.
+	#[test]
+	fn reader_offsets_increasing() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let opts = Options::default();
+		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
+
+		// Write multiple records
+		wal.append(b"aaa").expect("should append"); // 7 + 3 = 10
+		wal.append(b"bbbbb").expect("should append"); // 7 + 5 = 12
+		wal.append(b"c").expect("should append"); // 7 + 1 = 8
+		wal.close().expect("should close");
+
+		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
+			.expect("should read segments");
+
+		let file = File::open(&segments[0].file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let (_, offset1) = reader.read().expect("should read 1");
+		let (_, offset2) = reader.read().expect("should read 2");
+		let (_, offset3) = reader.read().expect("should read 3");
+
+		// Each offset should be after the previous record
+		assert_eq!(offset1, 10, "First record ends at 10");
+		assert_eq!(offset2, 22, "Second record ends at 22");
+		assert_eq!(offset3, 30, "Third record ends at 30");
+
+		// Offsets must be strictly increasing
+		assert!(offset1 < offset2, "Offsets must increase");
+		assert!(offset2 < offset3, "Offsets must increase");
+	}
+
+	/// Test #3: Verify offset is correct for partial final block.
+	#[test]
+	fn reader_offset_partial_block() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let opts = Options::default();
+		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
+
+		// Write records that don't fill a complete block
+		let record_size = 100;
+		for i in 0..5 {
+			let data: Vec<u8> = (0..record_size).map(|j| ((i + j) & 0xFF) as u8).collect();
+			wal.append(&data).expect("should append");
+		}
+		wal.close().expect("should close");
+
+		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
+			.expect("should read segments");
+
+		let file = File::open(&segments[0].file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let mut last_offset = 0u64;
+		let mut count = 0;
+		while let Ok((data, offset)) = reader.read() {
+			assert_eq!(data.len(), record_size);
+			assert!(offset > last_offset, "Offset {} should be > previous {}", offset, last_offset);
+			// Each record is HEADER_SIZE + 100 = 107 bytes
+			let expected = ((count + 1) * (WAL_RECORD_HEADER_SIZE + record_size)) as u64;
+			assert_eq!(offset, expected, "Record {} offset mismatch", count);
+			last_offset = offset;
+			count += 1;
+		}
+		assert_eq!(count, 5);
+	}
+
+	/// Test #4: Verify corrupted compressed data is detected.
+	#[test]
+	fn reader_corrupted_compressed_data() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let file_path = temp_dir.path().join("test.wal");
+
+		// Manually write a corrupted compressed record
+		{
+			let mut file = File::create(&file_path).expect("should create file");
+
+			// First write a SetCompressionType record for LZ4
+			let compression_type = 5u8; // SetCompressionType
+			let compression_data = [1u8]; // LZ4
+			let crc1 = calc_crc(compression_type, &compression_data);
+			write_raw_record(&mut file, crc1, 1, compression_type, &compression_data);
+
+			// Now write a "Full" record with garbage that looks like compressed data
+			let record_type = 1u8; // Full
+			let garbage_compressed = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]; // Invalid LZ4
+			let crc2 = calc_crc(record_type, &garbage_compressed);
+			write_raw_record(
+				&mut file,
+				crc2,
+				garbage_compressed.len() as u16,
+				record_type,
+				&garbage_compressed,
+			);
+		}
+
+		let file = File::open(&file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		// Should fail on decompression
+		let result = reader.read();
+		assert!(result.is_err(), "Should detect corrupted compressed data");
+	}
+
+	/// Test #5: Verify writer handles block boundary correctly for exact fit.
+	#[test]
+	fn writer_block_boundary_exact_fit() {
+		use crate::wal::{BufferedFileWriter, CompressionType};
+
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let file_path = temp_dir.path().join("test.wal");
+		let file = File::create(&file_path).expect("should create file");
+		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+		let mut writer =
+			crate::wal::writer::Writer::new(buffered_writer, false, CompressionType::None, 0);
+
+		// Write a record that fills exactly to block boundary
+		// BLOCK_SIZE - HEADER_SIZE = 32768 - 7 = 32761
+		let exact_fit_size = BLOCK_SIZE - WAL_RECORD_HEADER_SIZE;
+		let data = vec![b'X'; exact_fit_size];
+		writer.add_record(&data).expect("should write exact fit record");
+
+		// Write another small record (should go to next block)
+		writer.add_record(b"next").expect("should write next record");
+
+		writer.close().expect("should close");
+
+		// Read back and verify
+		let file = File::open(&file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let (read_data, offset1) = reader.read().expect("should read first");
+		assert_eq!(read_data.len(), exact_fit_size);
+		assert_eq!(offset1, BLOCK_SIZE as u64, "First record fills entire block");
+
+		let (read_data, offset2) = reader.read().expect("should read second");
+		assert_eq!(read_data, b"next");
+		// Second record starts at BLOCK_SIZE, so ends at BLOCK_SIZE + HEADER_SIZE + 4
+		assert_eq!(offset2, (BLOCK_SIZE + WAL_RECORD_HEADER_SIZE + 4) as u64);
+	}
+
+	/// Helper to write a raw WAL record directly to file.
+	fn write_raw_record(file: &mut File, crc: u32, length: u16, record_type: u8, data: &[u8]) {
+		file.write_all(&crc.to_le_bytes()).unwrap();
+		file.write_all(&length.to_le_bytes()).unwrap();
+		file.write_all(&[record_type]).unwrap();
+		file.write_all(data).unwrap();
+	}
+
+	/// Helper to calculate CRC for a record.
+	fn calc_crc(record_type: u8, data: &[u8]) -> u32 {
+		use crate::wal::calculate_crc32;
+		calculate_crc32(&[record_type], data)
+	}
 }

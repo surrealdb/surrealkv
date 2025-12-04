@@ -1,11 +1,11 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::writer::Writer;
 use super::{
 	get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
-	Result, BLOCK_SIZE,
+	RecordType, Result, BLOCK_SIZE, HEADER_SIZE,
 };
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
@@ -66,24 +66,67 @@ impl Wal {
 		// Get file size from the opened file handle
 		let existing_size = file.metadata()?.len();
 
-		// Create buffered file writer
-		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
-
-		// Create Writer (use compression type from options)
-		let compression_type = opts.compression_type.unwrap_or(CompressionType::None);
-
 		if existing_size > 0 {
+			// Existing file: detect the compression type from the file itself.
+			// This prevents compression mismatch bugs when reopening with different options.
+			let detected_compression = Self::detect_compression_type(&file_path)?;
+
 			// Calculate block_offset from file size
 			let block_offset = (existing_size as usize) % BLOCK_SIZE;
-			Ok(Writer::new(buffered_writer, false, compression_type, block_offset))
+
+			// Create buffered file writer
+			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
+			Ok(Writer::new(buffered_writer, false, detected_compression, block_offset))
 		} else {
-			// New file - start fresh
+			// New file - use compression type from options
+			let compression_type = opts.compression_type.unwrap_or(CompressionType::None);
+
+			// Create buffered file writer
+			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+
 			let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
 			if compression_type != CompressionType::None {
 				writer.add_compression_type_record()?;
 			}
 			Ok(writer)
 		}
+	}
+
+	/// Detects the compression type used in an existing WAL file.
+	///
+	/// Reads the first record's header. If it's a SetCompressionType record,
+	/// parses and returns that compression type. Otherwise returns None (no compression).
+	fn detect_compression_type(file_path: &Path) -> Result<CompressionType> {
+		let mut file = File::open(file_path)?;
+
+		// Read just enough for the header
+		let mut header = [0u8; HEADER_SIZE];
+		match file.read_exact(&mut header) {
+			Ok(_) => {}
+			Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+				// File too short, assume no compression
+				return Ok(CompressionType::None);
+			}
+			Err(e) => return Err(Error::IO(IOError::new(e.kind(), &e.to_string()))),
+		}
+
+		// Parse the record type from header byte 6
+		let record_type_byte = header[6];
+		let record_type = RecordType::from_u8(record_type_byte)?;
+
+		if record_type == RecordType::SetCompressionType {
+			// Read the compression type byte (length is in bytes 4-5)
+			let length = u16::from_le_bytes([header[4], header[5]]);
+			if length >= 1 {
+				let mut compression_byte = [0u8; 1];
+				file.read_exact(&mut compression_byte)?;
+				return CompressionType::from_u8(compression_byte[0]);
+			}
+		}
+
+		// First record is not SetCompressionType, so file has no compression
+		Ok(CompressionType::None)
 	}
 
 	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
@@ -466,6 +509,106 @@ mod tests {
 			result.is_err(),
 			"Should have no more records after reading all {} expected",
 			test_records.len()
+		);
+	}
+
+	/// Test: Verify that reopening a WAL with different compression settings
+	/// correctly uses the file's original compression type (not the new options).
+	///
+	/// This test verifies the fix for a bug where reopening a WAL with different
+	/// compression options would cause data corruption - new records would be
+	/// compressed differently without a SetCompressionType header, causing the
+	/// reader to fail to decompress them correctly.
+	#[test]
+	fn test_wal_compression_type_detected_on_reopen() {
+		use crate::wal::reader::Reader;
+		use std::fs::File;
+
+		let temp_dir = create_temp_directory();
+
+		// First session - write WITHOUT compression
+		{
+			let opts = Options::default(); // No compression
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			wal.append(b"uncompressed_record_1").unwrap();
+			wal.append(b"uncompressed_record_2").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Second session - reopen WITH compression (different from original)
+		// The fix should detect that the file was created without compression
+		// and continue writing without compression
+		{
+			let opts = Options::default().with_compression(CompressionType::Lz4);
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			// This should be written without compression to match the original file
+			wal.append(b"should_also_be_uncompressed").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Read back all records - all should be readable without decompression issues
+		let file =
+			File::open(temp_dir.path().join("00000000000000000000.wal")).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		// First two records should read fine (uncompressed)
+		let (data1, _) = reader.read().expect("should read first record");
+		assert_eq!(data1, b"uncompressed_record_1");
+
+		let (data2, _) = reader.read().expect("should read second record");
+		assert_eq!(data2, b"uncompressed_record_2");
+
+		// Third record - with the fix, this should also be uncompressed and readable
+		let (data3, _) = reader.read().expect("should read third record");
+		assert_eq!(
+			data3, b"should_also_be_uncompressed",
+			"Third record should be correctly read (was written with detected compression type)"
+		);
+	}
+
+	/// Test: Verify that compression is correctly detected and preserved
+	/// when reopening a compressed WAL.
+	#[test]
+	fn test_wal_compressed_file_detected_on_reopen() {
+		use crate::wal::reader::Reader;
+		use std::fs::File;
+
+		let temp_dir = create_temp_directory();
+
+		// First session - write WITH compression
+		{
+			let opts = Options::default().with_compression(CompressionType::Lz4);
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			wal.append(b"compressed_record_1").unwrap();
+			wal.append(b"compressed_record_2").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Second session - reopen WITHOUT compression in options
+		// The fix should detect that the file uses LZ4 and continue with LZ4
+		{
+			let opts = Options::default(); // No compression in options
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			// This should be written with LZ4 compression to match the original file
+			wal.append(b"should_also_be_compressed").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Read back all records - all should be decompressed correctly
+		let file =
+			File::open(temp_dir.path().join("00000000000000000000.wal")).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let (data1, _) = reader.read().expect("should read first record");
+		assert_eq!(data1, b"compressed_record_1");
+
+		let (data2, _) = reader.read().expect("should read second record");
+		assert_eq!(data2, b"compressed_record_2");
+
+		let (data3, _) = reader.read().expect("should read third record");
+		assert_eq!(
+			data3, b"should_also_be_compressed",
+			"Third record should be correctly decompressed"
 		);
 	}
 }
