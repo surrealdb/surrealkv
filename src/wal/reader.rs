@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::vec::Vec;
 
 use crate::wal::{
@@ -27,19 +27,31 @@ pub trait Reporter {
 	fn old_log_record(&mut self, bytes: usize);
 }
 
-// Reader reads records from a single WAL file.
+/// Reader reads records from a single WAL file using block-based buffering.
+///
+/// Reads entire 32KB blocks into a buffer. When fewer than HEADER_SIZE bytes
+/// remain, the remainder is discarded (it's padding) and the next block is read.
 pub(crate) struct Reader {
-	/// The underlying file reader
-	rdr: BufReader<File>,
+	/// The underlying file handle
+	file: File,
+
+	/// Buffer holding the current block's data
+	buffer: Vec<u8>,
+
+	/// Current read position within the buffer
+	buffer_offset: usize,
+
+	/// File offset at the end of the current buffer
+	end_of_buffer_offset: usize,
+
+	/// Whether EOF has been reached
+	eof: bool,
+
+	/// Whether a read error has occurred
+	read_error: bool,
 
 	/// Buffer for accumulating record fragments
 	rec: Vec<u8>,
-
-	/// Buffer for reading blocks
-	buf: [u8; BLOCK_SIZE],
-
-	/// Total bytes read so far
-	total_read: usize,
 
 	/// Current record type being processed
 	cur_rec_type: RecordType,
@@ -67,7 +79,6 @@ impl Reader {
 	}
 
 	/// Creates a new Reader with custom options.
-	///
 	#[allow(dead_code)]
 	pub(crate) fn with_options(
 		file: File,
@@ -75,10 +86,13 @@ impl Reader {
 		log_number: u64,
 	) -> Self {
 		Reader {
-			rdr: BufReader::with_capacity(BLOCK_SIZE, file),
+			file,
+			buffer: Vec::with_capacity(BLOCK_SIZE),
+			buffer_offset: 0,
+			end_of_buffer_offset: 0,
+			eof: false,
+			read_error: false,
 			rec: Vec::new(),
-			buf: [0u8; BLOCK_SIZE],
-			total_read: 0,
 			cur_rec_type: RecordType::Empty,
 			err: None,
 			reporter,
@@ -104,71 +118,58 @@ impl Reader {
 		}
 	}
 
-	/// Reads the full record header: [CRC32: 4 bytes][Length: 2 bytes][Type: 1 byte]
-	fn read_record_header<R: Read>(rdr: &mut R, buf: &mut [u8]) -> Result<(u32, u16, u8)> {
-		match rdr.read_exact(&mut buf[0..WAL_RECORD_HEADER_SIZE]) {
-			Ok(_) => {
-				// Parse header: CRC (4, LE) + Length (2, LE) + Type (1)
-				let crc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-				let length = u16::from_le_bytes([buf[4], buf[5]]);
-				let record_type = buf[6];
+	/// Returns the number of bytes remaining in the current buffer.
+	fn buffer_remaining(&self) -> usize {
+		self.buffer.len().saturating_sub(self.buffer_offset)
+	}
 
-				Ok((crc, length, record_type))
+	/// Reads the next block from the file into the buffer.
+	///
+	/// This discards any remaining bytes in the current buffer (which would be
+	/// padding at the end of a block) and reads a fresh block.
+	///
+	/// Returns true if more data was read, false if EOF or error.
+	fn read_more(&mut self) -> Result<bool> {
+		if self.eof || self.read_error {
+			return Ok(false);
+		}
+
+		// Discard remaining bytes (padding) and read next full block
+		self.buffer.clear();
+		self.buffer.resize(BLOCK_SIZE, 0);
+
+		match self.file.read(&mut self.buffer) {
+			Ok(0) => {
+				self.eof = true;
+				self.buffer.clear();
+				Ok(false)
+			}
+			Ok(n) => {
+				self.buffer.truncate(n);
+				self.buffer_offset = 0;
+				self.end_of_buffer_offset += n;
+				if n < BLOCK_SIZE {
+					self.eof = true;
+				}
+				Ok(true)
 			}
 			Err(e) => {
-				if e.kind() == io::ErrorKind::UnexpectedEof {
-					Err(Error::IO(IOError::new(
-						io::ErrorKind::UnexpectedEof,
-						"reached end of file while reading header",
-					)))
-				} else {
-					Err(Error::IO(IOError::new(
-						io::ErrorKind::Other,
-						"error reading record header",
-					)))
-				}
+				self.read_error = true;
+				self.buffer.clear();
+				Err(Error::IO(IOError::new(e.kind(), &e.to_string())))
 			}
 		}
 	}
 
-	fn read_and_validate_record<R: Read>(
-		rdr: &mut R,
-		buf: &mut [u8],
-		length: u16,
-		crc: u32,
-		rec_type: &RecordType,
-		type_byte: u8,
-		current_index: usize,
-	) -> Result<(usize, usize)> {
-		// Validate the record type.
-		validate_record_type(rec_type, current_index)?;
-
-		let record_start = WAL_RECORD_HEADER_SIZE;
-		let record_end = record_start + length as usize;
-		match rdr.read_exact(&mut buf[record_start..record_end]) {
-			Ok(_) => {
-				// Validate the checksum using the type byte and payload
-				let calculated_crc = calculate_crc32(&[type_byte], &buf[record_start..record_end]);
-
-				if calculated_crc != crc {
-					return Err(Error::IO(IOError::new(
-						io::ErrorKind::Other,
-						"unexpected checksum",
-					)));
-				}
-				Ok((record_start, record_end))
-			}
-			Err(e) => {
-				if e.kind() == io::ErrorKind::UnexpectedEof {
-					Err(Error::IO(IOError::new(
-						io::ErrorKind::UnexpectedEof,
-						"reached end of file while reading record data",
-					)))
-				} else {
-					Err(Error::IO(IOError::new(io::ErrorKind::Other, "error reading record data")))
-				}
-			}
-		}
+	/// Parses the header from the current buffer position.
+	/// Assumes there are at least WAL_RECORD_HEADER_SIZE bytes available.
+	fn parse_header(&mut self) -> (u32, u16, u8) {
+		let header = &self.buffer[self.buffer_offset..self.buffer_offset + WAL_RECORD_HEADER_SIZE];
+		let crc = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+		let length = u16::from_le_bytes([header[4], header[5]]);
+		let record_type = header[6];
+		self.buffer_offset += WAL_RECORD_HEADER_SIZE;
+		(crc, length, record_type)
 	}
 
 	pub(crate) fn read(&mut self) -> Result<(&[u8], u64)> {
@@ -177,7 +178,7 @@ impl Reader {
 		}
 
 		match self.next() {
-			Ok(_) => Ok((&self.rec, self.total_read as u64)),
+			Ok(_) => Ok((&self.rec, self.end_of_buffer_offset as u64)),
 			Err(e) => {
 				// Check if the error is an UnexpectedEof
 				if let Error::IO(io_err) = &e {
@@ -192,7 +193,7 @@ impl Reader {
 					io::ErrorKind::Other,
 					e.to_string().as_str(),
 					self.log_number,
-					self.total_read as u64,
+					self.end_of_buffer_offset as u64,
 				));
 
 				// Report corruption and return error (caller will handle repair)
@@ -205,75 +206,93 @@ impl Reader {
 
 	fn next(&mut self) -> Result<()> {
 		self.rec.clear();
-		let mut i = 0;
+		let mut fragment_index = 0;
 
 		loop {
-			// Read full header: CRC (4) + Length (2) + Type (1)
-			let (crc, length, type_byte) = Self::read_record_header(&mut self.rdr, &mut self.buf)?;
-			self.total_read += WAL_RECORD_HEADER_SIZE;
-			self.cur_rec_type = RecordType::from_u8(type_byte)?;
-
-			// If the type is Empty (0), it's a padded block.
-			// Read the rest of the block of zeros and continue.
-			if self.cur_rec_type == RecordType::Empty {
-				let remaining = BLOCK_SIZE - (self.total_read % BLOCK_SIZE);
-				if remaining == BLOCK_SIZE {
-					continue;
-				}
-
-				let zeros =
-					&mut self.buf[WAL_RECORD_HEADER_SIZE..WAL_RECORD_HEADER_SIZE + remaining];
-				if self.rdr.read_exact(zeros).is_err() {
+			// When < HEADER_SIZE bytes remain, discard them (padding) and read next block
+			if self.buffer_remaining() < WAL_RECORD_HEADER_SIZE {
+				if !self.read_more()? {
 					return Err(Error::IO(IOError::new(
-						io::ErrorKind::Other,
-						"error reading remaining zeros",
-					)));
-				}
-				self.total_read += remaining;
-
-				if !zeros.iter().all(|&c| c == 0) {
-					return Err(Error::IO(IOError::new(
-						io::ErrorKind::Other,
-						"non-zero byte in current block",
+						io::ErrorKind::UnexpectedEof,
+						"reached end of file",
 					)));
 				}
 				continue;
 			}
 
+			// Parse header from buffer
+			let (crc, length, type_byte) = self.parse_header();
+			self.cur_rec_type = RecordType::from_u8(type_byte)?;
+
+			// If the type is Empty (0), it's a padded block.
+			// Discard the rest of the buffer and read next block.
+			if self.cur_rec_type == RecordType::Empty {
+				// Verify remaining bytes are zeros
+				let remaining = self.buffer_remaining();
+				if remaining > 0 {
+					let zeros = &self.buffer[self.buffer_offset..self.buffer_offset + remaining];
+					if !zeros.iter().all(|&c| c == 0) {
+						return Err(Error::IO(IOError::new(
+							io::ErrorKind::Other,
+							"non-zero byte in padding area",
+						)));
+					}
+				}
+				// Discard rest of buffer and continue (read_more will be called next iteration)
+				self.buffer_offset = self.buffer.len();
+				continue;
+			}
+
 			// Handle SetCompressionType metadata record
 			if self.cur_rec_type == RecordType::SetCompressionType {
-				let record_start = WAL_RECORD_HEADER_SIZE;
-				let record_end = record_start + length as usize;
-				self.rdr.read_exact(&mut self.buf[record_start..record_end])?;
+				// Record must fit in current buffer
+				if (length as usize) > self.buffer_remaining() {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"truncated compression type record",
+					)));
+				}
 
 				// Parse and store compression type
-				let compression_byte = self.buf[record_start];
-				self.compression_type = CompressionType::from_u8(compression_byte)?;
-				self.compression_type_record_read = true;
-
+				if length > 0 {
+					let compression_byte = self.buffer[self.buffer_offset];
+					self.buffer_offset += length as usize;
+					self.compression_type = CompressionType::from_u8(compression_byte)?;
+					self.compression_type_record_read = true;
+				}
 				continue; // Don't return this as a data record
 			}
 
-			// Read and validate the record data.
-			let (record_start, record_end) = Self::read_and_validate_record(
-				&mut self.rdr,
-				&mut self.buf,
-				length,
-				crc,
-				&self.cur_rec_type,
-				type_byte,
-				i,
-			)?;
-			self.total_read += length as usize;
+			// Validate the record type for fragment sequencing
+			validate_record_type(&self.cur_rec_type, fragment_index)?;
 
-			// Copy the record data to the output buffer.
-			self.rec.extend_from_slice(&self.buf[record_start..record_end]);
+			// Each physical record (header + data) must fit within a single block
+			if (length as usize) > self.buffer_remaining() {
+				return Err(Error::IO(IOError::new(
+					io::ErrorKind::Other,
+					"bad record length - exceeds block boundary",
+				)));
+			}
+
+			// Read record data from buffer
+			let record_data =
+				&self.buffer[self.buffer_offset..self.buffer_offset + length as usize];
+
+			// Validate the checksum
+			let calculated_crc = calculate_crc32(&[type_byte], record_data);
+			if calculated_crc != crc {
+				return Err(Error::IO(IOError::new(io::ErrorKind::Other, "checksum mismatch")));
+			}
+
+			// Append record data to output buffer and advance position
+			self.rec.extend_from_slice(record_data);
+			self.buffer_offset += length as usize;
 
 			if self.cur_rec_type == RecordType::Last || self.cur_rec_type == RecordType::Full {
 				break;
 			}
 
-			i += 1;
+			fragment_index += 1;
 		}
 
 		// Decompress if compression is enabled
@@ -294,8 +313,7 @@ impl Reader {
 mod tests {
 	use super::*;
 	use std::fs::File;
-	use std::io::BufReader;
-	use std::io::{Read, Write};
+	use std::io::{BufReader, Read, Write};
 	use std::vec::Vec;
 	use test_log::test;
 
@@ -338,12 +356,6 @@ mod tests {
 		assert_eq!(bytes_read, 0); // Only "World!" left to read
 	}
 
-	// Reader tests removed - comprehensive tests exist in manager.rs, writer.rs, and integration tests
-	// The reader functionality is tested through:
-	// - tests.rs integration tests
-	// - recovery.rs recovery tests
-	// - manager.rs end-to-end tests
-
 	#[test]
 	fn reader_basic() {
 		// Create WAL with test data
@@ -373,9 +385,6 @@ mod tests {
 		assert_eq!(data, vec![7, 8, 9]);
 	}
 
-	// Legacy multi-segment Reader tests removed
-	// Comprehensive coverage exists in integration tests (tests.rs, recovery.rs)
-
 	#[test]
 	fn reader_with_large_data() {
 		// Create aol options and open a aol file
@@ -393,7 +402,6 @@ mod tests {
 			let data: Vec<u8> = (0..record_size).map(|i| (i & 0xFF) as u8).collect();
 			let r = a.append(&data);
 			assert!(r.is_ok());
-			// assert_eq!(data.len() + WAL_RECORD_HEADER_SIZE, r.unwrap().1);
 		}
 
 		a.sync().expect("should sync");
@@ -415,5 +423,79 @@ mod tests {
 		}
 
 		assert_eq!(i, num_records);
+	}
+
+	/// Regression test for block boundary padding bug.
+	///
+	/// This test writes records that will leave < 7 bytes (HEADER_SIZE) at
+	/// various block boundaries. The old streaming reader would read across
+	/// the block boundary, mixing padding zeros with the next record's header.
+	/// The block-based reader correctly discards the padding.
+	#[test]
+	fn reader_block_boundary_padding() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let opts = Options::default();
+		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
+
+		// Write many records of size 68 (like the actual bug case)
+		// This size, with 7-byte headers, will eventually leave < 7 bytes at a block boundary
+		// BLOCK_SIZE = 32768, record + header = 75 bytes
+		// 32768 / 75 = 436.9... so after 436 records, we have 32768 - (436 * 75) = 68 bytes left
+		// After one more record (437), we have 68 - 75 = -7, meaning we wrap to next block
+		// The key is that various record counts will leave different remainders
+		let record_size = 68;
+		let records_to_write = 1000; // Enough to cross multiple block boundaries
+
+		for i in 0..records_to_write {
+			let data: Vec<u8> = (0..record_size).map(|j| ((i + j) & 0xFF) as u8).collect();
+			wal.append(&data).expect("should append");
+		}
+		wal.close().expect("should close");
+
+		// Read back all records - this would fail with "Invalid Record Type" before the fix
+		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
+			.expect("should read segments");
+
+		let file = File::open(&segments[0].file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let mut count = 0;
+		while let Ok((data, _)) = reader.read() {
+			assert_eq!(data.len(), record_size, "Record {} has wrong size", count);
+			count += 1;
+		}
+		assert_eq!(count, records_to_write, "Should read all {} records", records_to_write);
+	}
+
+	/// Test that records spanning multiple blocks are handled correctly.
+	#[test]
+	fn reader_record_spanning_blocks() {
+		let temp_dir = TempDir::new("test").expect("should create temp dir");
+		let opts = Options::default();
+		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
+
+		// Write a record larger than BLOCK_SIZE to force fragmentation
+		let large_record_size = BLOCK_SIZE * 2 + 1000;
+		let large_data: Vec<u8> = (0..large_record_size).map(|i| (i & 0xFF) as u8).collect();
+		wal.append(&large_data).expect("should append large record");
+
+		// Write a small record after
+		wal.append(&[1, 2, 3, 4]).expect("should append small record");
+
+		wal.close().expect("should close");
+
+		// Read back
+		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
+			.expect("should read segments");
+
+		let file = File::open(&segments[0].file_path).expect("should open file");
+		let mut reader = Reader::new(file);
+
+		let (data, _) = reader.read().expect("should read large record");
+		assert_eq!(data.len(), large_record_size);
+		assert_eq!(data, large_data);
+
+		let (data, _) = reader.read().expect("should read small record");
+		assert_eq!(data, vec![1, 2, 3, 4]);
 	}
 }

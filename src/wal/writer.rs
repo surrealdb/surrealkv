@@ -81,8 +81,8 @@ impl Writer {
 
 		// Fragment the record if necessary and emit it
 		while begin || !ptr.is_empty() {
-			// Check if we need to switch to a new block
-			self.maybe_switch_to_new_block(ptr.len())?;
+			// Switch to new block if less than HEADER_SIZE bytes remain
+			self.maybe_switch_to_new_block()?;
 
 			// Calculate how much data fits in the current block
 			let avail = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
@@ -167,13 +167,17 @@ impl Writer {
 		self.dest.close()
 	}
 
-	/// Switches to a new block if the content won't fit in the current one.
-	fn maybe_switch_to_new_block(&mut self, content_size: usize) -> Result<()> {
+	/// Switches to a new block if there's not enough space for a header.
+	///
+	/// Only pads when `leftover < HEADER_SIZE` (< 7 bytes remaining).
+	/// Padding is always less than 7 bytes, which the reader discards
+	/// when `buffer_remaining() < HEADER_SIZE`.
+	fn maybe_switch_to_new_block(&mut self) -> Result<()> {
 		let leftover = BLOCK_SIZE - self.block_offset;
 
-		// If there's not enough space for header + content, pad and move to next block
-		if leftover < HEADER_SIZE + content_size && leftover < BLOCK_SIZE {
-			// Pad remaining space with zeros
+		// Pad when there's not enough space for a header
+		if leftover < HEADER_SIZE {
+			// Pad remaining space with zeros (will be 1-6 bytes)
 			let padding = vec![0u8; leftover];
 			self.dest.append(&padding)?;
 			self.block_offset = 0;
@@ -188,6 +192,16 @@ impl Writer {
 		if length > 0xffff {
 			return Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Record too large")));
 		}
+
+		// Physical record must fit entirely in current block
+		debug_assert!(
+			self.block_offset + HEADER_SIZE + length <= BLOCK_SIZE,
+			"Record exceeds block boundary: offset={}, header={}, data={}, block_size={}",
+			self.block_offset,
+			HEADER_SIZE,
+			length,
+			BLOCK_SIZE
+		);
 
 		// Calculate CRC correctly: CRC(type_byte || data)
 		// Must match Reader's calculate_crc32 function
