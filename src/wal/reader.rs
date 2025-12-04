@@ -197,7 +197,7 @@ impl Reader {
 				));
 
 				// Report corruption and return error (caller will handle repair)
-				self.report_corruption(0, &e.to_string());
+				self.report_corruption(self.rec.len(), &e.to_string());
 				self.err = Some(corruption_err.clone());
 				Err(corruption_err)
 			}
