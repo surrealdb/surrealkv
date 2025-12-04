@@ -178,7 +178,12 @@ impl Reader {
 		}
 
 		match self.next() {
-			Ok(_) => Ok((&self.rec, self.end_of_buffer_offset as u64)),
+			Ok(_) => {
+				// Return the file position immediately after this record
+				// (not end of buffer, which would be same for all records in a block)
+				let offset = self.end_of_buffer_offset - self.buffer_remaining();
+				Ok((&self.rec, offset as u64))
+			}
 			Err(e) => {
 				// Check if the error is an UnexpectedEof
 				if let Error::IO(io_err) = &e {
@@ -189,11 +194,12 @@ impl Reader {
 				}
 
 				// Fixed behavior: Tolerate tail corruption, enable repair
+				let offset = self.end_of_buffer_offset - self.buffer_remaining();
 				let corruption_err = Error::Corruption(CorruptionError::new(
 					io::ErrorKind::Other,
 					e.to_string().as_str(),
 					self.log_number,
-					self.end_of_buffer_offset as u64,
+					offset as u64,
 				));
 
 				// Report corruption and return error (caller will handle repair)
