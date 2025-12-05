@@ -44,10 +44,24 @@ impl Level {
 
 	/// Inserts a new table into the level and maintains sorted order
 	/// Tables are sorted by sequence numbers in descending order
+	/// Using for Level 0 where tables can overlap
 	pub(crate) fn insert(&mut self, table: Arc<Table>) {
 		let insert_pos = self
 			.tables
 			.partition_point(|x| x.meta.properties.seqnos.1 > table.meta.properties.seqnos.1);
+		self.tables.insert(insert_pos, table);
+	}
+
+	/// Inserts a new table sorted by smallest key (ascending)
+	/// Tables cannot overlap, enables O(log n) binary search for range queries
+	/// Using for Level 1+ where tables have non-overlapping key ranges
+	pub(crate) fn insert_sorted_by_key(&mut self, table: Arc<Table>) {
+		let insert_pos = self.tables.partition_point(|existing| {
+			match (&existing.meta.properties.key_range, &table.meta.properties.key_range) {
+				(Some(existing_range), Some(new_range)) => existing_range.low < new_range.low,
+				_ => true,
+			}
+		});
 		self.tables.insert(insert_pos, table);
 	}
 

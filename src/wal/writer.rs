@@ -37,6 +37,7 @@ impl Writer {
 		dest: BufferedFileWriter,
 		manual_flush: bool,
 		compression_type: CompressionType,
+		block_offset: usize,
 	) -> Self {
 		// Allocate compressed buffer if compression is enabled
 		let compressed_buffer = if compression_type != CompressionType::None {
@@ -47,7 +48,7 @@ impl Writer {
 
 		Self {
 			dest,
-			block_offset: 0,
+			block_offset,
 			manual_flush,
 			compression_type,
 			compressed_buffer,
@@ -80,8 +81,8 @@ impl Writer {
 
 		// Fragment the record if necessary and emit it
 		while begin || !ptr.is_empty() {
-			// Check if we need to switch to a new block
-			self.maybe_switch_to_new_block(ptr.len())?;
+			// Switch to new block if less than HEADER_SIZE bytes remain
+			self.maybe_switch_to_new_block()?;
 
 			// Calculate how much data fits in the current block
 			let avail = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
@@ -166,13 +167,17 @@ impl Writer {
 		self.dest.close()
 	}
 
-	/// Switches to a new block if the content won't fit in the current one.
-	fn maybe_switch_to_new_block(&mut self, content_size: usize) -> Result<()> {
+	/// Switches to a new block if there's not enough space for a header.
+	///
+	/// Only pads when `leftover < HEADER_SIZE` (< 7 bytes remaining).
+	/// Padding is always less than 7 bytes, which the reader discards
+	/// when `buffer_remaining() < HEADER_SIZE`.
+	fn maybe_switch_to_new_block(&mut self) -> Result<()> {
 		let leftover = BLOCK_SIZE - self.block_offset;
 
-		// If there's not enough space for header + content, pad and move to next block
-		if leftover < HEADER_SIZE + content_size && leftover < BLOCK_SIZE {
-			// Pad remaining space with zeros
+		// Pad when there's not enough space for a header
+		if leftover < HEADER_SIZE {
+			// Pad remaining space with zeros (will be 1-6 bytes)
 			let padding = vec![0u8; leftover];
 			self.dest.append(&padding)?;
 			self.block_offset = 0;
@@ -187,6 +192,16 @@ impl Writer {
 		if length > 0xffff {
 			return Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Record too large")));
 		}
+
+		// Physical record must fit entirely in current block
+		debug_assert!(
+			self.block_offset + HEADER_SIZE + length <= BLOCK_SIZE,
+			"Record exceeds block boundary: offset={}, header={}, data={}, block_size={}",
+			self.block_offset,
+			HEADER_SIZE,
+			length,
+			BLOCK_SIZE
+		);
 
 		// Calculate CRC correctly: CRC(type_byte || data)
 		// Must match Reader's calculate_crc32 function
@@ -224,7 +239,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
 		// Write a simple record
 		writer.add_record(b"Hello, World!").unwrap();
@@ -243,7 +258,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, true, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, true, CompressionType::None, 0);
 
 		// Write without auto-flush
 		writer.add_record(b"Test").unwrap();
@@ -261,7 +276,7 @@ mod tests {
 		let file = File::create(&file_path).unwrap();
 		let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-		let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
+		let mut writer = Writer::new(buffered_writer, false, CompressionType::None, 0);
 
 		// Write a large record that will be fragmented
 		let large_data = vec![b'A'; BLOCK_SIZE * 2];
@@ -271,23 +286,5 @@ mod tests {
 
 		let metadata = std::fs::metadata(&file_path).unwrap();
 		assert!(metadata.len() > BLOCK_SIZE as u64 * 2);
-	}
-
-	#[test]
-	fn test_legacy_vs_recyclable() {
-		let temp_dir = TempDir::new("test").unwrap();
-
-		// Write with legacy format
-		{
-			let file_path = temp_dir.path().join("test.wal");
-			let file = File::create(&file_path).unwrap();
-			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
-			let mut writer = Writer::new(buffered_writer, false, CompressionType::None);
-			writer.add_record(b"test record").unwrap();
-			writer.close().unwrap();
-
-			let meta = std::fs::metadata(&file_path).unwrap();
-			assert!(meta.len() > 0);
-		}
 	}
 }

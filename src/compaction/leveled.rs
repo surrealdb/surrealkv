@@ -2290,4 +2290,91 @@ mod tests {
 			assert!(found_keys.contains(&expected_key), "Missing expected key: {}", expected_key);
 		}
 	}
+
+	#[test(tokio::test)]
+	async fn test_older_soft_delete_marked_stale_during_compaction() {
+		// This test verifies that when a key has multiple versions including older soft deletes,
+		// compaction correctly handles the older soft deletes when marking them as stale.
+		//
+		// Scenario: key "test-key" has 3 versions:
+		//   - SoftDelete (seq 300) - LATEST
+		//   - Set (seq 200)        - older
+		//   - SoftDelete (seq 100) - oldest
+		//
+		// With versioning disabled, the older versions should be marked stale.
+		// The bug was that older soft deletes (which have empty values) would crash
+		// when the code tried to decode them as ValueLocation.
+
+		let env = TestEnv::new_with_levels(2);
+		let mut levels = Levels::new(2, 10);
+
+		let key = b"test-key".to_vec();
+
+		// Create L0 table with latest SoftDelete (seq 300)
+		let l0_entries = vec![(
+			InternalKey::new(Bytes::from(key.clone()), 300, InternalKeyKind::SoftDelete, 0),
+			vec![], // SoftDelete has empty value
+		)];
+		let l0_table = env.create_test_table(100, l0_entries).unwrap();
+		Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(l0_table);
+
+		// Create L1 table with older Set (seq 200) and oldest SoftDelete (seq 100)
+		let raw_value = b"some-value".to_vec();
+		let encoded_value = create_inline_value(&raw_value);
+		let l1_entries = vec![
+			(
+				InternalKey::new(Bytes::from(key.clone()), 200, InternalKeyKind::Set, 0),
+				encoded_value,
+			),
+			(
+				InternalKey::new(Bytes::from(key.clone()), 100, InternalKeyKind::SoftDelete, 0),
+				vec![], // Older SoftDelete also has empty value
+			),
+		];
+		let l1_table = env.create_test_table(200, l1_entries).unwrap();
+		Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(l1_table);
+
+		// Create manifest and run compaction
+		let manifest_path = env.options.path.join("test_manifest_older_soft_delete");
+		let manifest = LevelManifest {
+			path: manifest_path.clone(),
+			levels,
+			hidden_set: HashSet::new(),
+			next_table_id: Arc::new(AtomicU64::new(1000)),
+			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+			snapshots: Vec::new(),
+		};
+		write_manifest_to_disk(&manifest).unwrap();
+		let manifest = Arc::new(RwLock::new(manifest));
+
+		let strategy = Arc::new(Strategy::new(1, 1));
+		// NOTE: Do NOT set vlog = None - we need VLog enabled to trigger the bug
+		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+
+		let compactor = Compactor::new(compaction_options, strategy.clone());
+
+		// This should NOT panic - older soft deletes should be handled correctly
+		compactor.compact().unwrap();
+
+		// Verify the result: only the latest SoftDelete should remain
+		let manifest_guard = manifest.read().unwrap();
+		let levels = manifest_guard.levels.get_levels();
+
+		let mut soft_deletes = 0;
+		let mut sets = 0;
+
+		for table in &levels[1].tables {
+			for (key, _) in table.iter(false) {
+				match key.kind() {
+					InternalKeyKind::SoftDelete => soft_deletes += 1,
+					InternalKeyKind::Set => sets += 1,
+					_ => {}
+				}
+			}
+		}
+
+		// Only the latest SoftDelete (seq 300) should remain
+		assert_eq!(soft_deletes, 1, "Should have exactly 1 soft delete (the latest)");
+		assert_eq!(sets, 0, "Should have no Set entries (superseded by SoftDelete)");
+	}
 }

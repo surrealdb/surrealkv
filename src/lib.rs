@@ -219,7 +219,7 @@ impl Default for Options {
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
 			vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
 			path: PathBuf::from(""),
-			level_count: 1,
+			level_count: 6,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
 			index_partition_size: 16384,           // 16KB
 			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
