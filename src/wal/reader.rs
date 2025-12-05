@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::wal::{
@@ -193,13 +193,50 @@ impl Reader {
 					}
 				}
 
+				// Calculate error offset and gather debugging info
+				let error_offset = self.end_of_buffer_offset - self.buffer_remaining();
+				let file_size = self.file.seek(SeekFrom::End(0)).unwrap_or(0);
+				let block_number = error_offset / BLOCK_SIZE;
+				let offset_within_block = error_offset % BLOCK_SIZE;
+
+				// Detailed error logging for debugging
+				log::error!(
+					"WAL corruption detected: \
+					log_number={}, \
+					error_offset={} (0x{:X}), \
+					file_size={} bytes, \
+					block_number={}, \
+					offset_within_block={}, \
+					buffer_offset={}, \
+					buffer_len={}, \
+					end_of_buffer_offset={}, \
+					eof={}, \
+					compression={:?}, \
+					accumulated_record_len={}, \
+					current_record_type={:?}, \
+					error=\"{}\"",
+					self.log_number,
+					error_offset,
+					error_offset,
+					file_size,
+					block_number,
+					offset_within_block,
+					self.buffer_offset,
+					self.buffer.len(),
+					self.end_of_buffer_offset,
+					self.eof,
+					self.compression_type,
+					self.rec.len(),
+					self.cur_rec_type,
+					e
+				);
+
 				// Fixed behavior: Tolerate tail corruption, enable repair
-				let offset = self.end_of_buffer_offset - self.buffer_remaining();
 				let corruption_err = Error::Corruption(CorruptionError::new(
 					io::ErrorKind::Other,
 					e.to_string().as_str(),
 					self.log_number,
-					offset as u64,
+					error_offset as u64,
 				));
 
 				// Report corruption and return error (caller will handle repair)
@@ -694,10 +731,9 @@ mod tests {
 		calculate_crc32(&[record_type], data)
 	}
 
-	// ==================== RocksDB-style Helper Functions ====================
+	// ==================== Helper Functions ====================
 
 	/// Construct a Vec<u8> of the specified length made out of the supplied partial string.
-	/// (Equivalent to RocksDB's BigString)
 	fn big_string(partial: &str, n: usize) -> Vec<u8> {
 		let mut result = Vec::with_capacity(n);
 		let partial_bytes = partial.as_bytes();
@@ -737,9 +773,9 @@ mod tests {
 		data[header_offset..header_offset + 4].copy_from_slice(&crc.to_le_bytes());
 	}
 
-	// ==================== RocksDB Basic Tests ====================
+	// ==================== Basic Tests ====================
 
-	/// RocksDB: Empty - Read from empty WAL returns EOF
+	/// Empty - Read from empty WAL returns EOF
 	#[test]
 	fn empty() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -756,8 +792,7 @@ mod tests {
 		assert!(result.is_err(), "Empty WAL should return EOF");
 	}
 
-	/// RocksDB: ReadWrite - Write and read multiple records
-	/// Note: Unlike RocksDB, surrealkv doesn't allow empty records
+	/// ReadWrite - Write and read multiple records
 	#[test]
 	fn read_write_multiple_records() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -791,7 +826,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: ManyBlocks - Write/read many records (stress test)
+	/// ManyBlocks - Write/read many records (stress test)
 	#[test]
 	fn many_blocks() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -813,14 +848,14 @@ mod tests {
 
 		for i in 0..num_records {
 			let expected = number_string(i);
-			let (data, _) = reader.read().expect(&format!("should read record {}", i));
+			let (data, _) = reader.read().unwrap_or_else(|_| panic!("should read record {}", i));
 			assert_eq!(data, expected.as_bytes(), "Record {} mismatch", i);
 		}
 
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: Fragmentation - Small, medium, and large records
+	/// Fragmentation - Small, medium, and large records
 	#[test]
 	fn fragmentation() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -853,7 +888,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: RandomRead - 500 random-sized records
+	/// RandomRead - 500 random-sized records
 	#[test]
 	fn random_read() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -879,16 +914,16 @@ mod tests {
 		let mut reader = Reader::new(file);
 
 		for (i, expected) in expected_records.iter().enumerate() {
-			let (data, _) = reader.read().expect(&format!("should read record {}", i));
+			let (data, _) = reader.read().unwrap_or_else(|_| panic!("should read record {}", i));
 			assert_eq!(data, expected, "Record {} mismatch", i);
 		}
 
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	// ==================== RocksDB Block Boundary Tests ====================
+	// ==================== Block Boundary Tests ====================
 
-	/// RocksDB: MarginalTrailer - Record leaves exactly HEADER_SIZE space at block end
+	/// MarginalTrailer - Record leaves exactly HEADER_SIZE space at block end
 	#[test]
 	fn marginal_trailer() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -924,7 +959,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: MarginalTrailer2 - Same but without empty record in between
+	/// MarginalTrailer2 - Same but without empty record in between
 	#[test]
 	fn marginal_trailer2() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -952,7 +987,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: ShortTrailer - Record leaves < HEADER_SIZE space (tests zero padding)
+	/// ShortTrailer - Record leaves < HEADER_SIZE space (tests zero padding)
 	#[test]
 	fn short_trailer() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -985,7 +1020,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: AlignedEof - Record ends exactly at block boundary
+	/// AlignedEof - Record ends exactly at block boundary
 	#[test]
 	fn aligned_eof() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1010,9 +1045,9 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	// ==================== RocksDB Corruption Detection Tests ====================
+	// ==================== Corruption Detection Tests ====================
 
-	/// RocksDB: BadRecordType - Invalid record type byte
+	/// BadRecordType - Invalid record type byte
 	#[test]
 	fn bad_record_type() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1034,7 +1069,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect bad record type");
 	}
 
-	/// RocksDB: TruncatedTrailingRecordIsIgnored - Partial record at EOF
+	/// TruncatedTrailingRecord - Partial record at EOF
 	#[test]
 	fn truncated_trailing_record() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1065,7 +1100,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF on truncated record");
 	}
 
-	/// RocksDB: BadLength - Corrupted length field
+	/// BadLength - Corrupted length field
 	#[test]
 	fn bad_length() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1088,7 +1123,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect bad length");
 	}
 
-	/// RocksDB: ChecksumMismatch - Corrupt CRC
+	/// ChecksumMismatch - Corrupt CRC
 	#[test]
 	fn checksum_mismatch() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1112,7 +1147,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect checksum mismatch");
 	}
 
-	/// RocksDB: ErrorJoinsRecords - Corrupt middle block shouldn't join fragments
+	/// ErrorJoinsRecords - Corrupt middle block shouldn't join fragments
 	///
 	/// This test verifies that when a middle block is corrupted, the reader:
 	/// 1. Does NOT join fragments from different records (first(R1) + last(R2))
@@ -1160,13 +1195,8 @@ mod tests {
 
 		// Collect all records that were successfully read
 		let mut records_read: Vec<Vec<u8>> = Vec::new();
-		loop {
-			match reader.read() {
-				Ok((data, _)) => {
-					records_read.push(data.to_vec());
-				}
-				Err(_) => break,
-			}
+		while let Ok((data, _)) = reader.read() {
+			records_read.push(data.to_vec());
 		}
 
 		// Key assertion: We must NEVER return a record that is a mix of
@@ -1218,9 +1248,9 @@ mod tests {
 		);
 	}
 
-	// ==================== RocksDB Fragment Sequencing Tests ====================
+	// ==================== Fragment Sequencing Tests ====================
 
-	/// RocksDB: UnexpectedMiddleType - Middle type without preceding First
+	/// UnexpectedMiddleType - Middle type without preceding First
 	///
 	/// Tests that a Middle record appearing at the start of a sequence is
 	/// detected as invalid. A Middle must always follow a First or another Middle.
@@ -1262,7 +1292,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect unexpected Middle type");
 	}
 
-	/// RocksDB: UnexpectedLastType - Last type without preceding First
+	/// UnexpectedLastType - Last type without preceding First
 	///
 	/// Tests that a Last record appearing without a preceding First is
 	/// detected as invalid. A Last must always follow a First or Middle.
@@ -1304,7 +1334,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect unexpected Last type");
 	}
 
-	/// RocksDB: UnexpectedFullType - Full type after First (partial record lost)
+	/// UnexpectedFullType - Full type after First (partial record lost)
 	///
 	/// Tests that a Full record appearing when we expect Middle/Last (after First)
 	/// is detected as invalid. This simulates a partial record being lost.
@@ -1341,7 +1371,7 @@ mod tests {
 		assert!(result.is_err(), "Should detect unexpected Full after First");
 	}
 
-	/// RocksDB: MissingLastIsIgnored - Fragmented record without Last fragment
+	/// MissingLast - Fragmented record without Last fragment
 	///
 	/// Tests that when the Last fragment of a multi-block record is missing,
 	/// the record is not returned and earlier complete records are still readable.
@@ -1387,7 +1417,7 @@ mod tests {
 		assert!(result.is_err(), "Should return error for missing Last fragment");
 	}
 
-	/// RocksDB: PartialLastIsIgnored - Truncated Last fragment
+	/// PartialLast - Truncated Last fragment
 	///
 	/// Tests that when the Last fragment is partially written (truncated),
 	/// earlier complete records are still readable.
@@ -1445,9 +1475,9 @@ mod tests {
 		}
 	}
 
-	// ==================== RocksDB Compression Tests ====================
+	// ==================== Compression Tests ====================
 
-	/// RocksDB: CompressionLogTest::Empty - Empty with LZ4
+	/// CompressionEmpty - Empty with LZ4
 	#[test]
 	fn compression_empty() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1465,7 +1495,7 @@ mod tests {
 		assert!(result.is_err(), "Empty compressed WAL should return EOF");
 	}
 
-	/// RocksDB: CompressionLogTest::ReadWrite - Basic with LZ4
+	/// CompressionReadWrite - Basic with LZ4
 	#[test]
 	fn compression_read_write() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1498,7 +1528,7 @@ mod tests {
 		assert!(reader.read().is_err(), "Should return EOF");
 	}
 
-	/// RocksDB: CompressionLogTest::Fragmentation - Large records with LZ4
+	/// CompressionFragmentation - Large records with LZ4
 	#[test]
 	fn compression_fragmentation() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");

@@ -308,7 +308,7 @@ impl<'a> CompactionIterator<'a> {
 
 			// Add to delete list and collect discard stats if needed
 			if should_mark_stale && self.vlog.is_some() {
-				if is_hard_delete {
+				if key.is_tombstone() {
 					// Hard Delete: add key size to delete list
 					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
 				} else {
