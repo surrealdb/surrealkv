@@ -312,7 +312,14 @@ impl LevelManifest {
 		// Add new tables to levels
 		for (level, table) in &changeset.new_tables {
 			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
-				Arc::make_mut(level_ref).insert(table.clone());
+				let level_mut = Arc::make_mut(level_ref);
+				if *level == 0 {
+					// Level 0: sorted by sequence number (tables can overlap)
+					level_mut.insert(table.clone());
+				} else {
+					// Level 1+: sorted by smallest key (tables cannot overlap)
+					level_mut.insert_sorted_by_key(table.clone());
+				}
 			}
 		}
 
@@ -507,7 +514,7 @@ mod tests {
 		// Add table to level 1
 		{
 			let level1 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[1]);
-			level1.insert(table3.clone());
+			level1.insert_sorted_by_key(table3.clone());
 		}
 
 		let expected_next_id = 100;
