@@ -1141,13 +1141,11 @@ mod tests {
 		write_manifest_to_disk(&manifest).expect("Failed to write manifest");
 
 		// Reload and verify
-		let loaded_manifest =
-			LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
+		let loaded_manifest = LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
 
 		// Verify format version is still V1
 		assert_eq!(
-			loaded_manifest.manifest_format_version,
-			MANIFEST_FORMAT_VERSION_V1,
+			loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
 			"Should be V1 format"
 		);
 

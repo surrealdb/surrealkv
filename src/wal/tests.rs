@@ -136,7 +136,8 @@ fn test_wal_replay_latest_segment_only() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Replay WAL - should only replay the latest segment
-	let (sequence_number, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	let (sequence_number_opt, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries in memtable
 	let entry_count = memtable.iter().count();
@@ -480,4 +481,3 @@ fn test_cleanup_respects_min_wal_number() {
 	assert_eq!(remaining_segment_ids[0], 3, "Segment 3 should remain");
 	assert_eq!(remaining_segment_ids[1], 4, "Segment 4 should remain");
 }
-
