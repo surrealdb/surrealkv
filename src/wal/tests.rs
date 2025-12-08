@@ -60,10 +60,12 @@ fn test_cleanup_old_segments() {
 		segment_ids_before.len()
 	);
 
-	// Run cleanup - should remove all except the latest segment
-	let removed_count = cleanup_old_segments(temp_dir.path()).unwrap();
+	// Run cleanup - should remove all segments older than the latest one
+	// Set min_wal_number to the latest segment ID to keep only that segment
+	let latest_segment_id = *segment_ids_before.iter().max().unwrap();
+	let removed_count = cleanup_old_segments(temp_dir.path(), latest_segment_id).unwrap();
 
-	// Verify at least 4 segments were removed (keeping only the latest)
+	// Verify at least 4 segments were removed (keeping only segments >= latest_segment_id)
 	assert!(removed_count >= 4, "Expected at least 4 segments to be removed, got {removed_count}");
 
 	// Verify only the latest segment remains
@@ -78,9 +80,8 @@ fn test_cleanup_old_segments() {
 	);
 
 	// The remaining segment should be the latest one
-	let latest_segment_id = segment_ids_before.iter().max().unwrap();
 	assert_eq!(
-		remaining_segment_ids[0], *latest_segment_id,
+		remaining_segment_ids[0], latest_segment_id,
 		"Expected latest segment {} to remain, but got {}",
 		latest_segment_id, remaining_segment_ids[0]
 	);
@@ -135,7 +136,7 @@ fn test_wal_replay_latest_segment_only() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Replay WAL - should only replay the latest segment
-	let (sequence_number, corruption_info) = replay_wal(temp_dir.path(), &memtable).unwrap();
+	let (sequence_number, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
 
 	// Count actual entries in memtable
 	let entry_count = memtable.iter().count();
@@ -439,3 +440,44 @@ fn test_should_include_file_helper() {
 	assert!(!should_include_file(Some("repair"), Some("tmp".to_string())));
 	assert!(!should_include_file(Some("tmp"), Some("repair".to_string())));
 }
+
+#[test]
+fn test_cleanup_respects_min_wal_number() {
+	let temp_dir = create_test_wal_dir();
+
+	// Create WAL with manual rotation to create 5 segments (0-4)
+	let opts = Options::default();
+	let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+
+	for segment in 0..5 {
+		// Write records to current segment
+		for i in 0..10 {
+			let data = format!("seg{segment}_record_{i:02}").into_bytes();
+			wal.append(&data).unwrap();
+		}
+
+		// Rotate to next segment (except for the last one)
+		if segment < 4 {
+			wal.rotate().unwrap();
+		}
+	}
+
+	wal.close().unwrap();
+
+	// Get segment IDs before cleanup
+	let segment_ids_before = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
+	assert_eq!(segment_ids_before.len(), 5, "Should have 5 segments initially");
+
+	// Run cleanup with min_wal_number = 3
+	// This should delete segments 0, 1, 2 and keep 3, 4
+	let removed_count = cleanup_old_segments(temp_dir.path(), 3).unwrap();
+
+	assert_eq!(removed_count, 3, "Should remove segments 0, 1, 2");
+
+	// Verify remaining segments
+	let remaining_segment_ids = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
+	assert_eq!(remaining_segment_ids.len(), 2, "Should have 2 segments remaining");
+	assert_eq!(remaining_segment_ids[0], 3, "Segment 3 should remain");
+	assert_eq!(remaining_segment_ids[1], 4, "Segment 4 should remain");
+}
+
