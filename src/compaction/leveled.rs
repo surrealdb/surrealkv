@@ -505,9 +505,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 
 		// Write the manifest to disk
 		write_manifest_to_disk(&manifest)?;
@@ -922,9 +924,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1113,9 +1117,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: shared_table_id_counter.clone(),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1448,9 +1454,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1528,9 +1536,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1617,9 +1627,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1713,9 +1725,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1839,9 +1853,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1961,9 +1977,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2195,9 +2213,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2341,9 +2361,11 @@ mod tests {
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
-			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-			snapshots: Vec::new(),
-		};
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
 

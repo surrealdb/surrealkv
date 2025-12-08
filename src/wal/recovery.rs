@@ -54,6 +54,7 @@ impl Reporter for DefaultReporter {
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	memtable: &Arc<MemTable>,
+	min_wal_number: u64,
 ) -> Result<(u64, Option<(usize, usize)>)> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
@@ -78,6 +79,15 @@ pub(crate) fn replay_wal(
 
 	// Only replay the latest segment since we use one segment per memtable
 	let latest_segment_id = last;
+
+	// Skip WAL if it's older than the minimum log number with unflushed data
+	// This implements RocksDB-style recovery where flushed WALs are not replayed
+	if latest_segment_id < min_wal_number {
+		log::info!(
+			"Skipping WAL #{latest_segment_id:020} since it is older than min log to keep #{min_wal_number:020}"
+		);
+		return Ok((0, None));
+	}
 
 	// Define initial sequence number
 	let mut max_seq_num = 0;
@@ -294,7 +304,7 @@ mod tests {
 		wal.close().unwrap();
 
 		// Replay the WAL
-		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Verify the bug is fixed: max_seq_num should be 203 (highest from batch2), not 200 (starting of batch2)
 		assert_eq!(
@@ -313,7 +323,7 @@ mod tests {
 		let wal_dir = temp_dir.path();
 		let memtable = Arc::new(MemTable::new());
 
-		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		assert_eq!(max_seq_num, 0, "Empty WAL directory should return 0");
 		assert!(corruption_info.is_none(), "No corruption should be detected");
@@ -351,7 +361,7 @@ mod tests {
 		wal.append(&batch3.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
-		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+		let (max_seq_num, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// For single-entry batches, starting and highest should be the same
 		// The max should be 700 (from the latest batch)
@@ -392,7 +402,7 @@ mod tests {
 
 		// Create a fresh memtable for the test
 		let memtable = Arc::new(MemTable::new());
-		let (max_seq_num, _) = replay_wal(wal_dir, &memtable).unwrap();
+		let (max_seq_num, _) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// The max should be from the latest segment (301), not the starting sequence number
 		assert_eq!(
@@ -453,7 +463,7 @@ mod tests {
 		// Test using Core::replay_wal_with_repair (the actual production flow)
 		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
 		let max_seq_num =
-			crate::lsm::Core::replay_wal_with_repair(wal_dir, "Test repair", |memtable| {
+			crate::lsm::Core::replay_wal_with_repair(wal_dir, 0, "Test repair", |memtable| {
 				// This closure is called with the recovered memtable
 				*recovered_memtable.write().unwrap() = memtable;
 				Ok(())
@@ -537,7 +547,7 @@ mod tests {
 
 		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
 		let max_seq_num =
-			crate::lsm::Core::replay_wal_with_repair(wal_dir, "Test repair", |memtable| {
+			crate::lsm::Core::replay_wal_with_repair(wal_dir, 0, "Test repair", |memtable| {
 				*recovered_memtable.write().unwrap() = memtable;
 				Ok(())
 			})
@@ -585,7 +595,7 @@ mod tests {
 
 		// Replay with TolerateCorruptedTailRecords (default)
 		let memtable = Arc::new(MemTable::new());
-		let (seq_num, corruption_info) = replay_wal(wal_dir, &memtable).unwrap();
+		let (seq_num, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Should recover valid batches and report corruption
 		assert_eq!(seq_num, 200);
@@ -609,7 +619,7 @@ mod tests {
 		wal.close().unwrap();
 
 		let memtable = Arc::new(MemTable::new());
-		let result = replay_wal(wal_dir, &memtable);
+		let result = replay_wal(wal_dir, &memtable, 0);
 
 		assert!(result.is_ok());
 	}
@@ -633,7 +643,7 @@ mod tests {
 
 		// Replay - DefaultReporter is created internally
 		let memtable = Arc::new(MemTable::new());
-		let (seq_num, _) = replay_wal(wal_dir, &memtable).unwrap();
+		let (seq_num, _) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		assert_eq!(seq_num, 100);
 		// Reporter is used internally for logging
