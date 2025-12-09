@@ -21,6 +21,9 @@ mod vfs;
 mod vlog;
 mod wal;
 
+#[cfg(test)]
+mod test;
+
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
