@@ -65,6 +65,10 @@ pub(crate) struct ManifestChangeSet {
 
 	/// Snapshots to delete (by sequence number)
 	pub deleted_snapshots: HashSet<u64>,
+
+	/// New log_number to set (if Some)
+	/// Indicates that WALs with number < log_number have been flushed
+	pub log_number: Option<u64>,
 }
 
 mod iter;
@@ -119,7 +123,7 @@ impl LevelManifest {
 		// Initialize levels with default values
 		let levels = Self::initialize_levels(opts.level_count);
 
-		// Start with next_table_id = 1 (0 is often reserved)
+		// Start with next_table_id = 1 (0 is reserved)
 		let next_table_id = Arc::new(AtomicU64::new(1));
 
 		let manifest = Self {
@@ -155,21 +159,9 @@ impl LevelManifest {
 		self.log_number
 	}
 
-	/// Sets the minimum WAL number that contains unflushed data
-	pub(crate) fn set_log_number(&mut self, log_number: u64) {
-		self.log_number = log_number;
-	}
-
 	/// Returns the last sequence number persisted in the manifest
 	pub(crate) fn get_last_sequence(&self) -> u64 {
 		self.last_sequence
-	}
-
-	/// Sets the last sequence number if it's higher than current
-	pub(crate) fn set_last_sequence(&mut self, seq: u64) {
-		if seq > self.last_sequence {
-			self.last_sequence = seq;
-		}
 	}
 
 	/// Initializes levels with default values
@@ -367,6 +359,11 @@ impl LevelManifest {
 			self.manifest_format_version = version;
 		}
 
+		// Apply log_number if present
+		if let Some(log_num) = changeset.log_number {
+			self.log_number = log_num;
+		}
+
 		// Add new tables to levels
 		for (level, table) in &changeset.new_tables {
 			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
@@ -380,7 +377,7 @@ impl LevelManifest {
 				}
 			}
 
-			// Update last_sequence if this table has a higher sequence number (RocksDB-style)
+			// Update last_sequence if this table has a higher sequence number
 			if table.meta.largest_seq_num > self.last_sequence {
 				self.last_sequence = table.meta.largest_seq_num;
 			}
@@ -1160,16 +1157,21 @@ mod tests {
 
 		// Create a manifest with log_number and last_sequence set
 		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
-		manifest.set_log_number(42);
-		manifest.set_last_sequence(12345);
 
 		// Add a table to ensure non-trivial state
 		let table = create_test_table_with_seq_nums(1, 100, 200, opts.clone())
 			.expect("Failed to create table");
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table);
-		}
+
+		// Use changeset to atomically set log_number and add table
+		let changeset = ManifestChangeSet {
+			log_number: Some(42),
+			new_tables: vec![(0, table)],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
+
+		// Directly set last_sequence for test (tests have access to private fields)
+		manifest.last_sequence = 12345;
 
 		// Persist to disk
 		write_manifest_to_disk(&manifest).expect("Failed to write manifest");
