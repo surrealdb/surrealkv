@@ -139,24 +139,11 @@ impl CoreInner {
 		let manifest = LevelManifest::new(opts.clone())?;
 		let manifest_log_number = manifest.get_log_number();
 
-		// Initialize WAL
-		// If manifest.log_number > highest_wal_on_disk, we need to ensure WAL starts from log_number
-		// RocksDB Note: log_number indicates "all WALs < log_number are flushed"
-		// So the next active WAL should be >= log_number
+		// Initialize WAL starting from manifest.log_number (RocksDB-style)
+		// This avoids creating intermediate empty WAL files
 		let wal_path = opts.wal_dir();
-		let mut wal_instance = Wal::open(&wal_path, wal::Options::default())?;
-
-		// Advance WAL to at least manifest.log_number (next unflushed WAL)
-		// This handles the case where cleanup deleted old WAL files
-		while wal_instance.get_active_log_number() < manifest_log_number {
-			log::debug!(
-				"Advancing WAL from {} to {} (manifest says WALs < {} are flushed)",
-				wal_instance.get_active_log_number(),
-				wal_instance.get_active_log_number() + 1,
-				manifest_log_number
-			);
-			wal_instance.rotate()?;
-		}
+		let wal_instance =
+			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
 		let wal = Some(wal_instance);
 		let level_manifest = Arc::new(RwLock::new(manifest));
@@ -282,7 +269,7 @@ impl CoreInner {
 	}
 
 	/// Flushes active memtable to SST and updates manifest log_number.
-	/// 
+	///
 	/// This is the core flush logic used by both shutdown and normal memtable rotation.
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL - the caller is responsible
 	/// for WAL rotation if needed.
@@ -293,7 +280,7 @@ impl CoreInner {
 	///   will be set to `flushed_wal_number + 1`. If None, uses current active WAL number.
 	///
 	/// # Returns
-	/// 
+	///
 	/// - `Ok(Some(table))` if flush occurred successfully
 	/// - `Ok(None)` if memtable was empty (nothing to flush)
 	/// - `Err(_)` on failure
@@ -813,8 +800,6 @@ impl Core {
 
 		// Set visible sequence number (in-memory, will be persisted on next flush)
 		commit_pipeline.set_seq_num(max_seq_num);
-
-		log::info!("Sequence number initialized: seq_num={}", max_seq_num);
 
 		let core = Self {
 			inner: inner.clone(),
@@ -4207,18 +4192,52 @@ mod tests {
 		tree.close().await.unwrap();
 	}
 
+	#[test(tokio::test)]
+	async fn test_open_crud_bench_and_commit() {
+		// Use the crud-bench folder from the workspace root
+		let path = PathBuf::from("crud-bench");
 
-    #[test(tokio::test)]
-    async fn test_open_crud_bench_and_commit() {
-        // Use the crud-bench folder from the workspace root
-        let path = PathBuf::from("crud-bench");
-    
-        // Create options matching the existing database configuration (VLog enabled)
-        let opts = create_test_options(path.clone(), |opts| {
-            opts.enable_vlog = false;
-        });
-    
-        // Open the existing database
-        let tree = Tree::new(opts).unwrap();
-    }
+		// Create options matching the existing database configuration (VLog enabled)
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.enable_vlog = false;
+		});
+
+		// Open the existing database
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Verify sequence number consistency
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let manifest_last_seq = manifest.get_last_sequence();
+
+		println!("\n=== Sequence Number Verification ===");
+		println!("Manifest last_sequence: {}", manifest_last_seq);
+
+		// Get all tables from Level 0 and find the highest sequence number
+		let level0 = &manifest.levels.get_levels()[0];
+		let mut highest_sst_seq = 0;
+
+		println!("\nLevel 0 SST files:");
+		for table in &level0.tables {
+			println!(
+				"  Table {}: seq_range=[{}-{}]",
+				table.id, table.meta.smallest_seq_num, table.meta.largest_seq_num
+			);
+			if table.meta.largest_seq_num > highest_sst_seq {
+				highest_sst_seq = table.meta.largest_seq_num;
+			}
+		}
+
+		println!("\nHighest sequence in SST files: {}", highest_sst_seq);
+		println!("Manifest last_sequence:        {}", manifest_last_seq);
+
+		// Verify they match
+		assert_eq!(
+			manifest_last_seq, highest_sst_seq,
+			"Manifest last_sequence should match highest sequence in SST files"
+		);
+
+		println!("✅ Sequence numbers are consistent!");
+
+		tree.close().await.unwrap();
+	}
 }

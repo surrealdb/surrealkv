@@ -53,6 +53,50 @@ impl Wal {
 		})
 	}
 
+	/// Opens or creates a WAL instance starting at a specific log number.
+	///
+	/// This is used when the manifest indicates a specific log_number should be used,
+	/// avoiding the creation of intermediate empty WAL files.
+	///
+	/// # Arguments
+	///
+	/// * `dir` - WAL directory path
+	/// * `starting_log_number` - The log number to start from
+	/// * `opts` - WAL options
+	///
+	/// # RocksDB-Style Behavior
+	///
+	/// Instead of creating intermediate empty files (0, 1, 2, 3, 4), this directly
+	/// creates the WAL at the target number (4), matching RocksDB's approach.
+	pub(crate) fn open_with_log_number(
+		dir: &Path,
+		starting_log_number: u64,
+		opts: Options,
+	) -> Result<Self> {
+		// Ensure the options are valid
+		opts.validate()?;
+
+		// Ensure the directory exists with proper permissions
+		Self::prepare_directory(dir, &opts)?;
+
+		// Clean up any stale .wal.repair files from previous crashed repair attempts
+		Self::cleanup_stale_repair_files(dir)?;
+
+		// Use the provided log number directly (no calculation from disk)
+		let active_log_number = starting_log_number;
+
+		// Create the active Writer at the specified log number
+		let active_writer = Self::create_writer(dir, active_log_number, &opts)?;
+
+		Ok(Self {
+			active_writer,
+			active_log_number,
+			dir: dir.to_path_buf(),
+			opts,
+			closed: false,
+		})
+	}
+
 	/// Creates a new Writer for the given log number.
 	/// If the segment file already exists, appends to it instead of overwriting.
 	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<Writer> {
