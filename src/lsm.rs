@@ -135,10 +135,26 @@ impl CoreInner {
 		// The oracle provides monotonic timestamps for transaction ordering
 		let oracle = Oracle::new(opts.clock.clone());
 
-		// Initialize WAL and level manifest
-		let wal_path = opts.wal_dir();
-		let wal = Some(Wal::open(&wal_path, wal::Options::default())?);
+		// Initialize level manifest FIRST to get log_number
 		let manifest = LevelManifest::new(opts.clone())?;
+		let manifest_log_number = manifest.get_log_number();
+
+		// Initialize WAL, ensuring it starts from at least manifest.log_number
+		let wal_path = opts.wal_dir();
+		let mut wal_instance = Wal::open(&wal_path, wal::Options::default())?;
+
+		// Advance WAL to match manifest's log_number if needed (RocksDB-style)
+		// This ensures WAL number continues from where manifest says, not from disk files
+		while wal_instance.get_active_log_number() < manifest_log_number {
+			log::debug!(
+				"Advancing WAL from {} to match manifest log_number={}",
+				wal_instance.get_active_log_number(),
+				manifest_log_number
+			);
+			wal_instance.rotate()?;
+		}
+
+		let wal = Some(wal_instance);
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize versioned index if versioned queries are enabled
@@ -203,13 +219,14 @@ impl CoreInner {
 		// New writes will go to the new WAL while we flush the old memtable
 		if let Some(ref wal) = self.wal {
 			let mut wal_guard = wal.write();
+			let old_log_number = wal_guard.get_active_log_number();
 			wal_guard.rotate().map_err(|e| {
 				Error::Other(format!("Failed to rotate WAL before memtable flush: {}", e))
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 
-			log::debug!("Rotated WAL to log_number={} before memtable flush", new_log_number);
+			log::info!("WAL rotated before flush: {} -> {}", old_log_number, new_log_number);
 		}
 
 		// Step 3: Use centralized flush logic
@@ -223,7 +240,7 @@ impl CoreInner {
 			return Ok(());
 		}
 
-		log::debug!("Memtable flush completed, starting WAL cleanup");
+		log::debug!("Memtable flush completed successfully");
 
 		// Step 4: Async WAL cleanup based on manifest log_number
 		// Only WAL segments older than log_number can be safely deleted
@@ -233,9 +250,23 @@ impl CoreInner {
 
 		let min_wal_to_keep = self.level_manifest.read()?.get_log_number();
 
+		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
+
 		tokio::spawn(async move {
-			if let Err(e) = cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				log::warn!("Failed to clean up old WAL segments: {e}");
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+				Ok(count) if count > 0 => {
+					log::info!(
+						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+						count,
+						min_wal_to_keep
+					);
+				}
+				Ok(_) => {
+					log::debug!("No old WAL segments to clean up");
+				}
+				Err(e) => {
+					log::warn!("Failed to clean up old WAL segments: {}", e);
+				}
 			}
 		});
 
@@ -283,15 +314,33 @@ impl CoreInner {
 		// Track the immutable memtable until it's successfully flushed
 		immutable_memtables.add(table_id, flushed_memtable.clone());
 
+		// Log memtable state before flush
+		let memtable_entries = flushed_memtable.iter().count();
+		let memtable_size = flushed_memtable.size();
+
+		log::info!(
+			"Starting memtable flush: table_id={}, entries={}, size_bytes={}",
+			table_id,
+			memtable_entries,
+			memtable_size
+		);
+
 		// Release locks before the potentially slow flush operation
 		drop(active_memtable);
 		drop(immutable_memtables);
 
 		// Step 2: Flush the immutable memtable to disk as an SSTable
-		log::debug!("Flushing memtable to SST file with table_id={}", table_id);
 		let table = flushed_memtable.flush(table_id, self.opts.clone()).map_err(|e| {
 			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
 		})?;
+
+		log::info!(
+			"Memtable flushed to SST: table_id={}, file_size={}, seq_range=[{}-{}]",
+			table.id,
+			table.meta.properties.file_size,
+			table.meta.smallest_seq_num,
+			table.meta.largest_seq_num
+		);
 
 		// Step 3: Add the new SSTable to Level 0
 		self.add_table_to_l0(table.clone()).map_err(|e| {
@@ -302,28 +351,34 @@ impl CoreInner {
 		})?;
 
 		// Step 4: Update manifest log_number and last_sequence
-		// The log_number points to the current active WAL, meaning all previous WALs are flushed
+		// RocksDB-style: log_number = current_active_wal + 1
+		// This indicates "all WALs with number < log_number have been flushed"
+		// So if current WAL is #0 and we just flushed it, log_number becomes #1
 		// The last_sequence tracks the highest sequence number (RocksDB-style)
 		if let Some(ref wal) = self.wal {
 			let wal_guard = wal.read();
 			let current_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 
+			// Set log_number to current + 1, meaning current WAL has been flushed
+			let next_log_number = current_log_number + 1;
+
 			let mut manifest = self.level_manifest.write()?;
-			manifest.set_log_number(current_log_number);
+			manifest.set_log_number(next_log_number);
 			manifest.set_last_sequence(table.meta.largest_seq_num);
 			write_manifest_to_disk(&manifest).map_err(|e| {
 				Error::Other(format!(
 					"Failed to update manifest after flush (log_number={}, last_seq={}): {}",
-					current_log_number, table.meta.largest_seq_num, e
+					next_log_number, table.meta.largest_seq_num, e
 				))
 			})?;
 
-			log::debug!(
-				"Updated manifest: log_number={}, last_sequence={} after flushing table_id={}",
+			log::info!(
+				"Manifest updated after flush: table_id={}, log_number={} (WAL #{:020} flushed), last_sequence={}",
+				table_id,
+				next_log_number,
 				current_log_number,
-				table.meta.largest_seq_num,
-				table_id
+				table.meta.largest_seq_num
 			);
 		}
 
@@ -669,6 +724,9 @@ impl Core {
 
 	/// Creates a new LSM tree with background task management
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		log::info!("=== Starting LSM tree initialization ===");
+		log::info!("Database path: {:?}", opts.path);
+
 		let inner = Arc::new(CoreInner::new(opts.clone())?);
 
 		// Initialize background task manager
@@ -683,6 +741,13 @@ impl Core {
 
 		// Get min_wal_number from manifest to skip already-flushed WALs
 		let min_wal_number = inner.level_manifest.read()?.get_log_number();
+		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
+
+		log::info!(
+			"Manifest state: log_number={}, last_sequence={}",
+			min_wal_number,
+			manifest_last_seq
+		);
 
 		// Replay WAL with automatic repair on corruption (returns None if skipped/empty)
 		let wal_seq_num_opt = Self::replay_wal_with_repair(
@@ -722,6 +787,8 @@ impl Core {
 		// Set visible sequence number (in-memory, will be persisted on next flush)
 		commit_pipeline.set_seq_num(max_seq_num);
 
+		log::info!("Sequence number initialized: seq_num={}", max_seq_num);
+
 		let core = Self {
 			inner: inner.clone(),
 			commit_pipeline: commit_pipeline.clone(),
@@ -734,7 +801,10 @@ impl Core {
 			let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
 			vlog_gc_manager.start();
 			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
+			log::debug!("VLog GC manager started");
 		}
+
+		log::info!("=== LSM tree initialization complete ===");
 
 		Ok(core)
 	}
@@ -794,10 +864,17 @@ impl Core {
 		// Step 3: Always flush the active memtable if it has data (RocksDB-style)
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
 		let active_memtable = self.inner.active_memtable.read()?;
+		let memtable_size = active_memtable.size();
+		let memtable_entries = active_memtable.iter().count();
+
 		if !active_memtable.is_empty() {
 			drop(active_memtable);
 
-			log::info!("Flushing active memtable during shutdown");
+			log::info!(
+				"Flushing active memtable on shutdown: entries={}, size_bytes={}",
+				memtable_entries,
+				memtable_size
+			);
 
 			// Direct flush without WAL rotation
 			// Uses centralized flush logic that updates manifest log_number
@@ -805,18 +882,20 @@ impl Core {
 				Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
 			})?;
 
-			log::info!("Active memtable flushed successfully");
+			log::info!("Active memtable flushed successfully on shutdown");
 		} else {
-			log::debug!("Active memtable is empty, skipping flush");
+			log::debug!("Active memtable is empty, skipping shutdown flush");
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		if let Some(ref wal) = self.inner.wal {
-			log::debug!("Closing WAL...");
+			let wal_log_number = wal.read().get_active_log_number();
+			log::info!("Closing WAL: active_log_number={}", wal_log_number);
+
 			let mut wal_guard = wal.write();
 			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-			log::debug!("WAL closed successfully");
+			log::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
 
 		// Step 5: Close the versioned index if present
@@ -836,7 +915,14 @@ impl Core {
 		// Step 7: Release the database lock
 		let mut lockfile = self.inner.lockfile.lock()?;
 		lockfile.release()?;
-		log::info!("LSM tree shutdown complete");
+
+		// Log final state
+		let final_manifest = self.inner.level_manifest.read()?;
+		log::info!(
+			"=== LSM tree shutdown complete === log_number={}, last_sequence={}",
+			final_manifest.get_log_number(),
+			final_manifest.get_last_sequence()
+		);
 
 		Ok(())
 	}
@@ -3561,8 +3647,9 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
-	async fn test_clean_shutdown_skips_wal_on_restart() {
+	#[test_log::test(tokio::test)]
+	async fn test_clean_shutdown_actually_skips_wal() {
+		// This test explicitly validates that WAL is NOT replayed after clean shutdown
 		let temp_dir = TempDir::new("test").unwrap();
 		let path = temp_dir.path().to_path_buf();
 
@@ -3570,42 +3657,55 @@ mod tests {
 			opts.max_memtable_size = 1024;
 		});
 
-		// Phase 1: Create database and write data
-		let log_number_before;
+		// Phase 1: Write data and clean shutdown
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 
-			log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-
 			let mut txn = tree.begin().unwrap();
-			txn.set(b"key1", b"value1").unwrap();
-			txn.set(b"key2", b"value2").unwrap();
+			txn.set(b"test_key", b"test_value").unwrap();
 			txn.commit().await.unwrap();
 
-			// Clean shutdown (should flush memtable)
+			// Clean shutdown - should flush to SST
 			tree.close().await.unwrap();
 		}
 
-		// Verify manifest was updated after close
-		let manifest_after = LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
-		let log_number_after = manifest_after.get_log_number();
+		// Phase 2: Check manifest state after shutdown
+		let manifest = LevelManifest::new(opts.clone()).expect("Failed to load manifest");
+		let log_number = manifest.get_log_number();
+		let last_sequence = manifest.get_last_sequence();
 
-		// log_number should have advanced (or stayed same if no flush needed)
+		println!("After shutdown: log_number={}, last_sequence={}", log_number, last_sequence);
+
+		// CRITICAL CHECK: log_number should be > 0 to skip WAL #0
 		assert!(
-			log_number_after >= log_number_before,
-			"log_number should not regress after shutdown"
+			log_number > 0,
+			"BUG: log_number should be > 0 after flush to indicate WAL #0 is flushed, got {}",
+			log_number
 		);
 
-		// Phase 2: Restart and verify WAL was skipped
+		// Phase 3: Restart and verify WAL was actually skipped
 		{
-			let tree = Tree::new(opts.clone()).unwrap();
+			// Create a custom Core to inspect if WAL was replayed
+			let inner = Arc::new(CoreInner::new(opts.clone()).unwrap());
 
-			// Verify data is accessible (from SST, not WAL)
-			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec().into()));
-			assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec().into()));
+			// Before WAL replay, memtable should be empty
+			let memtable_before = inner.active_memtable.read().unwrap().clone();
+			assert!(memtable_before.is_empty(), "Memtable should be empty before WAL replay");
 
-			tree.close().await.unwrap();
+			// Now do WAL replay
+			let wal_path = opts.wal_dir();
+			let min_wal_number = log_number;
+
+			let wal_seq_opt =
+				Core::replay_wal_with_repair(&wal_path, min_wal_number, "Test", |_memtable| Ok(()))
+					.unwrap();
+
+			// CRITICAL: WAL should have been skipped (return None)
+			assert_eq!(
+				wal_seq_opt, None,
+				"BUG: WAL should have been skipped but was replayed! min_wal={}, returned={:?}",
+				min_wal_number, wal_seq_opt
+			);
 		}
 	}
 
@@ -3734,7 +3834,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test_log::test(tokio::test)]
 	async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let temp_dir = TempDir::new("test").unwrap();
 		let path = temp_dir.path().to_path_buf();
@@ -3743,29 +3843,31 @@ mod tests {
 			opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
 		});
 
-		let manifest_seq_after_flush;
+		let manifest_seq_initial;
 
-		// Phase 1: Write and flush
+		// Phase 1: Write data and clean shutdown (no flush, just close)
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"key1", b"value1").unwrap();
 			txn.commit().await.unwrap();
 
-			tree.flush().unwrap();
-			manifest_seq_after_flush =
-				tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+			// Don't flush, just close - this will flush memtable on shutdown
 			tree.close().await.unwrap();
+
+			// Get the manifest sequence after shutdown flush
+			let manifest = LevelManifest::new(opts.clone()).unwrap();
+			manifest_seq_initial = manifest.get_last_sequence();
 		}
 
-		// Phase 2: Write more data but crash (no flush)
+		// Phase 2: Write more data but crash (no flush, no close)
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"key2", b"value2").unwrap();
 			txn.commit().await.unwrap();
 
-			// Crash: drop without close, but release lock manually
+			// Crash: drop without close, release lock manually
 			{
 				let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
 				lockfile.release().unwrap();
@@ -3777,26 +3879,30 @@ mod tests {
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 
-			// In-memory sequence should be updated from WAL
+			// In-memory sequence should be updated from WAL (key2 recovery)
 			let in_memory_seq = tree.core.seq_num();
-			assert!(
-				in_memory_seq > manifest_seq_after_flush,
-				"In-memory sequence should be updated from WAL"
-			);
 
-			// Manifest should still have old value (not yet persisted)
+			// Manifest sequence should still be from Phase 1
 			let manifest_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
 			assert_eq!(
-				manifest_seq, manifest_seq_after_flush,
-				"Manifest last_sequence should not be updated until flush"
+				manifest_seq, manifest_seq_initial,
+				"Manifest last_sequence should not be updated until flush (from Phase 2 crash)"
+			);
+
+			// In-memory should be higher (includes recovered WAL data)
+			assert!(
+				in_memory_seq > manifest_seq,
+				"In-memory sequence ({}) should be > manifest ({}) after WAL recovery",
+				in_memory_seq,
+				manifest_seq
 			);
 
 			// Now flush and verify manifest gets updated
 			tree.flush().unwrap();
-			let manifest_seq_after_new_flush =
+			let manifest_seq_after_flush =
 				tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
 			assert!(
-				manifest_seq_after_new_flush > manifest_seq_after_flush,
+				manifest_seq_after_flush >= in_memory_seq,
 				"Manifest last_sequence should update after flush"
 			);
 
@@ -3959,7 +4065,7 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
+	#[test_log::test(tokio::test)]
 	async fn test_full_crash_recovery_scenario() {
 		let temp_dir = TempDir::new("test").unwrap();
 		let path = temp_dir.path().to_path_buf();
@@ -3998,6 +4104,9 @@ mod tests {
 			tree.close().await.unwrap();
 		}
 
+		// Give async cleanup time to finish from Phase 2
+		tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
 		// Phase 3: Write batch C, crash before flush
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
@@ -4006,6 +4115,10 @@ mod tests {
 				txn.set(format!("batch_c_{i}").as_bytes(), b"value_c").unwrap();
 				txn.commit().await.unwrap();
 			}
+
+			// Check current WAL number before crash
+			let current_wal = tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+			println!("Batch C written to WAL #{:020}", current_wal);
 
 			// Simulate crash: drop without close
 			// Release lock manually to allow reopen

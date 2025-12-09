@@ -65,38 +65,52 @@ pub(crate) fn replay_wal(
 	memtable: &Arc<MemTable>,
 	min_wal_number: u64,
 ) -> Result<ReplayResult> {
+	log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
+	log::debug!("WAL recovery parameters: min_wal_number={}", min_wal_number);
+
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
+		log::debug!("WAL directory does not exist, skipping recovery");
 		return Ok((None, None));
 	}
 
 	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
+		log::debug!("No WAL segments found, skipping recovery");
 		return Ok((None, None));
 	}
 
 	// Get range of segment IDs (looking for .wal files)
 	let (first, last) = match get_segment_range(wal_dir, Some("wal")) {
 		Ok(range) => range,
-		Err(Error::IO(_)) => return Ok((None, None)),
+		Err(Error::IO(_)) => {
+			log::debug!("Could not get WAL segment range, skipping recovery");
+			return Ok((None, None));
+		}
 		Err(e) => return Err(e.into()),
 	};
 
 	// If no segments, nothing to replay
 	if first > last {
+		log::debug!("No valid WAL segment range, skipping recovery");
 		return Ok((None, None));
 	}
 
 	// Only replay the latest segment since we use one segment per memtable
 	let latest_segment_id = last;
+	log::debug!("WAL segment range: first={}, last={}", first, latest_segment_id);
 
 	// Skip WAL if it's older than the minimum log number with unflushed data
 	// This implements RocksDB-style recovery where flushed WALs are not replayed
 	if latest_segment_id < min_wal_number {
 		log::info!(
-			"Skipping WAL #{latest_segment_id:020} since it is older than min log to keep #{min_wal_number:020}"
+			"Skipping WAL #{:020} (already flushed to SST, min_log_number={:020})",
+			latest_segment_id,
+			min_wal_number
 		);
 		return Ok((None, None));
 	}
+
+	log::info!("Replaying WAL #{:020}", latest_segment_id);
 
 	// Define initial sequence number
 	let mut max_seq_num = 0;
@@ -132,6 +146,9 @@ pub(crate) fn replay_wal(
 	// Create reader with reporter
 	let mut reader = Reader::with_options(file, Some(reporter), latest_segment_id);
 
+	// Track replay statistics
+	let mut batches_replayed = 0;
+
 	// Process each record in the latest segment
 	loop {
 		match reader.read() {
@@ -147,6 +164,16 @@ pub(crate) fn replay_wal(
 				if batch_highest_seq_num > max_seq_num {
 					max_seq_num = batch_highest_seq_num;
 				}
+
+				batches_replayed += 1;
+
+				log::error!(
+					"Replayed batch from WAL #{:020}: max_seq_num={}, entries={}, offset={}",
+					latest_segment_id,
+					batch_highest_seq_num,
+					batch.count(),
+					offset
+				);
 
 				// Apply the batch to the memtable
 				memtable.add(&batch)?;
@@ -175,14 +202,24 @@ pub(crate) fn replay_wal(
 
 	// No corruption found
 	// Return Some(max_seq_num) if we actually replayed data, None if empty
-	Ok((
-		if max_seq_num > 0 {
-			Some(max_seq_num)
-		} else {
-			None
-		},
-		None,
-	))
+	let result = if max_seq_num > 0 {
+		Some(max_seq_num)
+	} else {
+		None
+	};
+
+	match result {
+		Some(seq) => log::info!(
+			"WAL #{:020} recovery complete: batches={}, max_seq_num={}, total_entries={}",
+			latest_segment_id,
+			batches_replayed,
+			seq,
+			memtable.iter().count()
+		),
+		None => log::info!("WAL #{:020} was empty (no batches found)", latest_segment_id),
+	}
+
+	Ok((result, None))
 }
 
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
