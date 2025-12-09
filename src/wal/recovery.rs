@@ -100,7 +100,7 @@ pub(crate) fn replay_wal(
 	log::debug!("WAL segment range: first={}, last={}", first, latest_segment_id);
 
 	// Skip WAL if it's older than the minimum log number with unflushed data
-	// This implements RocksDB-style recovery where flushed WALs are not replayed
+	// Flushed WALs are not replayed
 	if latest_segment_id < min_wal_number {
 		log::info!(
 			"Skipping WAL #{:020} (already flushed to SST, min_log_number={:020})",

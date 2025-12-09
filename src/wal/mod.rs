@@ -552,8 +552,8 @@ impl WritableFile for BufferedFileWriter {
 /// Cleans up old WAL segments based on the minimum log number with unflushed data.
 ///
 /// This function removes all WAL segments with ID < min_wal_number, since they have
-/// been flushed to SSTables and are no longer needed. This implements RocksDB-style
-/// WAL cleanup where the manifest tracks which WALs have been flushed.
+/// been flushed to SSTables and are no longer needed. The manifest tracks which WALs
+/// have been flushed.
 ///
 /// # Arguments
 ///

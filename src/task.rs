@@ -70,10 +70,13 @@ impl TaskManager {
 					}
 
 					running.store(true, Ordering::SeqCst);
+					log::debug!("Memtable flush task starting");
+
 					if let Err(e) = core.compact_memtable() {
 						// TODO: Handle error appropriately
 						log::error!("Memtable compaction task error: {e:?}");
 					} else {
+						log::debug!("Memtable flush task completed successfully");
 						// If memtable compaction succeeded, trigger level compaction
 						level_notify.notify_one();
 					}
@@ -100,11 +103,15 @@ impl TaskManager {
 					}
 
 					running.store(true, Ordering::SeqCst);
+					log::debug!("Level compaction task starting");
+
 					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
 					if let Err(e) = core.compact(strategy) {
 						// TODO: Handle error appropriately
 						log::error!("Level compaction task error: {e:?}");
+					} else {
+						log::debug!("Level compaction completed successfully");
 					}
 					running.store(false, Ordering::SeqCst);
 				}

@@ -64,10 +64,10 @@ impl Wal {
 	/// * `starting_log_number` - The log number to start from
 	/// * `opts` - WAL options
 	///
-	/// # RocksDB-Style Behavior
+	/// # Behavior
 	///
 	/// Instead of creating intermediate empty files (0, 1, 2, 3, 4), this directly
-	/// creates the WAL at the target number (4), matching RocksDB's approach.
+	/// creates the WAL at the target number (4).
 	pub(crate) fn open_with_log_number(
 		dir: &Path,
 		starting_log_number: u64,
