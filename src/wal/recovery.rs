@@ -167,7 +167,7 @@ pub(crate) fn replay_wal(
 
 				batches_replayed += 1;
 
-				log::error!(
+				log::debug!(
 					"Replayed batch from WAL #{:020}: max_seq_num={}, entries={}, offset={}",
 					latest_segment_id,
 					batch_highest_seq_num,
@@ -180,7 +180,7 @@ pub(crate) fn replay_wal(
 			}
 			Err(Error::Corruption(err)) => {
 				// Tolerate tail corruption - return info for automatic repair
-				log::warn!(
+				log::error!(
 					"Corrupted WAL record detected in segment {latest_segment_id:020} at offset {last_valid_offset}: {err}"
 				);
 				return Ok((
