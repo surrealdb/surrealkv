@@ -181,6 +181,8 @@ impl LevelManifest {
 
 	/// Load a manifest from file and return a complete LevelManifest instance
 	fn load_from_file<P: AsRef<Path>>(manifest_path: P, opts: Arc<Options>) -> Result<Self> {
+		log::info!("Loading manifest from {:?}", manifest_path.as_ref());
+
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
 		let mut level_manifest = Cursor::new(data);
@@ -197,6 +199,14 @@ impl LevelManifest {
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
 		let log_number = level_manifest.read_u64::<BigEndian>()?;
 		let last_sequence = level_manifest.read_u64::<BigEndian>()?;
+
+		log::debug!(
+			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
+			version,
+			next_table_id,
+			log_number,
+			last_sequence
+		);
 
 		// Read levels data
 		let level_data = Levels::decode(&mut level_manifest)?;
@@ -244,6 +254,17 @@ impl LevelManifest {
 		}
 
 		// Create and return the complete manifest
+		let total_tables: usize = levels_vec.iter().map(|l| l.tables.len()).sum();
+
+		log::info!(
+			"Manifest loaded successfully: version={}, log_number={}, last_sequence={}, tables={}, levels={}",
+			version,
+			log_number,
+			last_sequence,
+			total_tables,
+			levels_vec.len()
+		);
+
 		Ok(Self {
 			path: manifest_path.as_ref().to_path_buf(),
 			levels: Levels(levels_vec),
@@ -440,11 +461,23 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 
 /// Write the full versioned manifest to disk
 pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
+	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+
+	log::debug!(
+		"Writing manifest: version={}, log_number={}, last_sequence={}, next_table_id={}, total_tables={}",
+		manifest.manifest_format_version,
+		manifest.log_number,
+		manifest.last_sequence,
+		next_table_id,
+		total_tables
+	);
+
 	let mut buf = Vec::new();
 
 	// Write header
 	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
-	buf.write_u64::<BigEndian>(manifest.next_table_id.load(Ordering::SeqCst))?;
+	buf.write_u64::<BigEndian>(next_table_id)?;
 	buf.write_u64::<BigEndian>(manifest.log_number)?;
 	buf.write_u64::<BigEndian>(manifest.last_sequence)?;
 
@@ -460,6 +493,7 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	}
 
 	replace_file_content(&manifest.path, &buf)?;
+	log::debug!("Manifest written successfully to {:?}", manifest.path);
 	Ok(())
 }
 

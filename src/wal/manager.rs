@@ -254,6 +254,8 @@ impl Wal {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
 		}
 
+		log::trace!("WAL append: log_number={}, bytes={}", self.active_log_number, rec.len());
+
 		self.active_writer.add_record(rec)?;
 
 		// Return 0 for now (offset tracking can be added if needed)
@@ -271,6 +273,10 @@ impl Wal {
 		if self.closed {
 			return Ok(());
 		}
+
+		let log_number = self.active_log_number;
+		log::debug!("Closing WAL #{:020}", log_number);
+
 		self.closed = true;
 
 		// Sync and close the active writer (already fsyncs file data)
@@ -279,6 +285,8 @@ impl Wal {
 		// Fsync the directory to persist metadata changes
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+
+		log::debug!("WAL #{:020} closed and synced successfully", log_number);
 
 		Ok(())
 	}
@@ -294,10 +302,14 @@ impl Wal {
 
 	/// Explicitly rotates the active WAL to a new file.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
+		let old_log_number = self.active_log_number;
+
 		self.active_writer.sync()?;
 
 		// Update the log number
 		self.active_log_number += 1;
+
+		log::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
 
 		// Create a new Writer for the new log number
 		let new_writer = Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
@@ -306,6 +318,12 @@ impl Wal {
 		// Fsync the directory to ensure new file is visible after crash
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+
+		log::info!(
+			"WAL rotated and fsynced: {:020} -> {:020}",
+			old_log_number,
+			self.active_log_number
+		);
 
 		Ok(self.active_log_number)
 	}
