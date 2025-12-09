@@ -139,16 +139,20 @@ impl CoreInner {
 		let manifest = LevelManifest::new(opts.clone())?;
 		let manifest_log_number = manifest.get_log_number();
 
-		// Initialize WAL, ensuring it starts from at least manifest.log_number
+		// Initialize WAL
+		// If manifest.log_number > highest_wal_on_disk, we need to ensure WAL starts from log_number
+		// RocksDB Note: log_number indicates "all WALs < log_number are flushed"
+		// So the next active WAL should be >= log_number
 		let wal_path = opts.wal_dir();
 		let mut wal_instance = Wal::open(&wal_path, wal::Options::default())?;
 
-		// Advance WAL to match manifest's log_number if needed (RocksDB-style)
-		// This ensures WAL number continues from where manifest says, not from disk files
+		// Advance WAL to at least manifest.log_number (next unflushed WAL)
+		// This handles the case where cleanup deleted old WAL files
 		while wal_instance.get_active_log_number() < manifest_log_number {
 			log::debug!(
-				"Advancing WAL from {} to match manifest log_number={}",
+				"Advancing WAL from {} to {} (manifest says WALs < {} are flushed)",
 				wal_instance.get_active_log_number(),
+				wal_instance.get_active_log_number() + 1,
 				manifest_log_number
 			);
 			wal_instance.rotate()?;
@@ -217,7 +221,8 @@ impl CoreInner {
 		// Step 2: Rotate WAL BEFORE flush
 		// This creates a new WAL file for subsequent writes
 		// New writes will go to the new WAL while we flush the old memtable
-		if let Some(ref wal) = self.wal {
+		// CRITICAL: Save the old WAL number to correctly mark it as flushed
+		let flushed_wal_number = if let Some(ref wal) = self.wal {
 			let mut wal_guard = wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			wal_guard.rotate().map_err(|e| {
@@ -227,11 +232,14 @@ impl CoreInner {
 			drop(wal_guard);
 
 			log::info!("WAL rotated before flush: {} -> {}", old_log_number, new_log_number);
-		}
+			Some(old_log_number)
+		} else {
+			None
+		};
 
-		// Step 3: Use centralized flush logic
-		// This flushes memtable, adds to L0, and updates manifest log_number
-		let table = self.flush_memtable_and_update_manifest()?;
+		// Step 3: Use centralized flush logic, passing the WAL number we're flushing
+		// This ensures manifest marks the correct WAL as flushed (not the new active one)
+		let table = self.flush_memtable_and_update_manifest(flushed_wal_number)?;
 
 		if table.is_none() {
 			// Memtable was empty after rotation, nothing to flush
@@ -274,13 +282,18 @@ impl CoreInner {
 	}
 
 	/// Flushes active memtable to SST and updates manifest log_number.
-	///
+	/// 
 	/// This is the core flush logic used by both shutdown and normal memtable rotation.
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL - the caller is responsible
 	/// for WAL rotation if needed.
 	///
-	/// # Returns
+	/// # Arguments
 	///
+	/// - `flushed_wal_number`: Optional WAL number that was flushed. If provided, log_number
+	///   will be set to `flushed_wal_number + 1`. If None, uses current active WAL number.
+	///
+	/// # Returns
+	/// 
 	/// - `Ok(Some(table))` if flush occurred successfully
 	/// - `Ok(None)` if memtable was empty (nothing to flush)
 	/// - `Err(_)` on failure
@@ -291,9 +304,12 @@ impl CoreInner {
 	/// 1. Memtable is swapped and marked as immutable
 	/// 2. Immutable memtable is flushed to SST file
 	/// 3. SST is added to Level 0
-	/// 4. Manifest log_number is updated to current active WAL number
+	/// 4. Manifest log_number is updated to mark flushed WALs
 	/// 5. This marks all previous WALs as flushed
-	fn flush_memtable_and_update_manifest(&self) -> Result<Option<Arc<Table>>> {
+	fn flush_memtable_and_update_manifest(
+		&self,
+		flushed_wal_number: Option<u64>,
+	) -> Result<Option<Arc<Table>>> {
 		// Step 1: Atomically swap active memtable with a new empty one
 		let mut active_memtable = self.active_memtable.write()?;
 
@@ -351,17 +367,25 @@ impl CoreInner {
 		})?;
 
 		// Step 4: Update manifest log_number and last_sequence
-		// RocksDB-style: log_number = current_active_wal + 1
+		// RocksDB-style: log_number = flushed_wal + 1
 		// This indicates "all WALs with number < log_number have been flushed"
-		// So if current WAL is #0 and we just flushed it, log_number becomes #1
 		// The last_sequence tracks the highest sequence number (RocksDB-style)
 		if let Some(ref wal) = self.wal {
-			let wal_guard = wal.read();
-			let current_log_number = wal_guard.get_active_log_number();
-			drop(wal_guard);
+			// Determine which WAL was flushed
+			let wal_that_was_flushed = match flushed_wal_number {
+				Some(num) => num,
+				None => {
+					// No explicit WAL provided, use current active - 1
+					// This happens during shutdown when no rotation occurred
+					let wal_guard = wal.read();
+					let current = wal_guard.get_active_log_number();
+					drop(wal_guard);
+					current
+				}
+			};
 
-			// Set log_number to current + 1, meaning current WAL has been flushed
-			let next_log_number = current_log_number + 1;
+			// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
+			let next_log_number = wal_that_was_flushed + 1;
 
 			let mut manifest = self.level_manifest.write()?;
 			manifest.set_log_number(next_log_number);
@@ -377,7 +401,7 @@ impl CoreInner {
 				"Manifest updated after flush: table_id={}, log_number={} (WAL #{:020} flushed), last_sequence={}",
 				table_id,
 				next_log_number,
-				current_log_number,
+				wal_that_was_flushed,
 				table.meta.largest_seq_num
 			);
 		}
@@ -697,7 +721,8 @@ impl Core {
 						if !retry_memtable.is_empty() {
 							set_recovered_memtable(retry_memtable)?;
 						}
-						retry_seq_num
+						// CRITICAL: Return early here to avoid overwriting with original partial data
+						return Ok(retry_seq_num);
 					}
 					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
 						// WAL is still corrupted after repair - this is a serious problem
@@ -715,6 +740,8 @@ impl Core {
 			}
 		};
 
+		// Only set recovered_memtable if we didn't go through repair path
+		// (repair path returns early with retry_memtable already set)
 		if !recovered_memtable.is_empty() {
 			set_recovered_memtable(recovered_memtable)?;
 		}
@@ -878,7 +905,8 @@ impl Core {
 
 			// Direct flush without WAL rotation
 			// Uses centralized flush logic that updates manifest log_number
-			self.inner.flush_memtable_and_update_manifest().map_err(|e| {
+			// Pass None for flushed_wal_number since we didn't rotate
+			self.inner.flush_memtable_and_update_manifest(None).map_err(|e| {
 				Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
 			})?;
 
@@ -4178,4 +4206,19 @@ mod tests {
 
 		tree.close().await.unwrap();
 	}
+
+
+    #[test(tokio::test)]
+    async fn test_open_crud_bench_and_commit() {
+        // Use the crud-bench folder from the workspace root
+        let path = PathBuf::from("crud-bench");
+    
+        // Create options matching the existing database configuration (VLog enabled)
+        let opts = create_test_options(path.clone(), |opts| {
+            opts.enable_vlog = false;
+        });
+    
+        // Open the existing database
+        let tree = Tree::new(opts).unwrap();
+    }
 }
