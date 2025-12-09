@@ -88,42 +88,45 @@ fn test_cleanup_old_segments() {
 }
 
 #[test]
-fn test_wal_replay_latest_segment_only() {
+fn test_wal_replay_all_segments() {
 	let temp_dir = create_test_wal_dir();
 
 	// Create WAL with manual rotation to create multiple segments
 	let opts = Options::default();
 	let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
 
-	// Write 10 records to first segment
-	for i in 0..10 {
-		let data = format!("test_record_{i:02}").into_bytes();
-		wal.append(&data).unwrap();
+	// Write batch to first segment (segment 0)
+	let mut batch1 = Batch::new(100);
+	for i in 0..3 {
+		let key = format!("key_seg0_{i:02}");
+		let value = format!("value_seg0_{i:02}");
+		batch1.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
 	}
+	wal.append(&batch1.encode().unwrap()).unwrap();
 
 	// Manually rotate to create second segment
 	wal.rotate().unwrap();
 
-	// Write 10 records to second segment
-	for i in 10..20 {
-		let data = format!("test_record_{i:02}").into_bytes();
-		wal.append(&data).unwrap();
+	// Write batch to second segment (segment 1)
+	let mut batch2 = Batch::new(200);
+	for i in 0..4 {
+		let key = format!("key_seg1_{i:02}");
+		let value = format!("value_seg1_{i:02}");
+		batch2.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
 	}
+	wal.append(&batch2.encode().unwrap()).unwrap();
 
 	// Manually rotate to create third segment
 	wal.rotate().unwrap();
 
-	// Write batch records to third segment (latest)
-	// Encode the batch with sequence number 100
-	let mut batch = Batch::new(100);
-	for i in 20..25 {
-		let key = format!("key_{i:02}");
-		let value = format!("value_{i:02}");
-		batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+	// Write batch to third segment (segment 2)
+	let mut batch3 = Batch::new(300);
+	for i in 0..5 {
+		let key = format!("key_seg2_{i:02}");
+		let value = format!("value_seg2_{i:02}");
+		batch3.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
 	}
-
-	let encoded_batch = batch.encode().unwrap();
-	wal.append(&encoded_batch).unwrap();
+	wal.append(&batch3.encode().unwrap()).unwrap();
 
 	// Close WAL to ensure everything is flushed
 	drop(wal);
@@ -135,7 +138,7 @@ fn test_wal_replay_latest_segment_only() {
 	// Create a memtable for recovery
 	let memtable = Arc::new(MemTable::default());
 
-	// Replay WAL - should only replay the latest segment
+	// Replay WAL - should replay ALL segments, not just the latest
 	let (sequence_number_opt, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
@@ -145,11 +148,11 @@ fn test_wal_replay_latest_segment_only() {
 	// Verify no corruption was detected
 	assert!(corruption_info.is_none(), "Expected no corruption, but got: {corruption_info:?}");
 
-	// Verify sequence number is from the latest segment (104)
-	assert_eq!(sequence_number, 104);
+	// Verify sequence number is from the latest segment (304 = 300 + 4)
+	assert_eq!(sequence_number, 304, "Expected max sequence number from all segments");
 
-	// Verify the memtable contains only the data from the latest segment
-	assert_eq!(entry_count, 5, "Expected 5 entries from latest segment");
+	// Verify the memtable contains data from ALL segments (3 + 4 + 5 = 12 entries)
+	assert_eq!(entry_count, 12, "Expected 12 entries from all 3 segments combined");
 }
 
 #[test]

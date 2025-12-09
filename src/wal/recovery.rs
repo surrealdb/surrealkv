@@ -95,108 +95,118 @@ pub(crate) fn replay_wal(
 		return Ok((None, None));
 	}
 
-	// Only replay the latest segment since we use one segment per memtable
-	let latest_segment_id = last;
-	log::debug!("WAL segment range: first={}, last={}", first, latest_segment_id);
+	// Determine the range of segments to replay
+	// Skip segments older than min_wal_number (already flushed to SST)
+	let start_segment = std::cmp::max(first, min_wal_number);
 
-	// Skip WAL if it's older than the minimum log number with unflushed data
-	// Flushed WALs are not replayed
-	if latest_segment_id < min_wal_number {
+	if start_segment > last {
 		log::info!(
-			"Skipping WAL #{:020} (already flushed to SST, min_log_number={:020})",
-			latest_segment_id,
+			"All WAL segments already flushed (last={:020}, min_log_number={:020})",
+			last,
 			min_wal_number
 		);
 		return Ok((None, None));
 	}
 
-	log::info!("Replaying WAL #{:020}", latest_segment_id);
+	log::info!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
 
-	// Define initial sequence number
+	// Track statistics across all segments
 	let mut max_seq_num = 0;
+	let mut total_batches_replayed = 0;
+	let mut segments_processed = 0;
 
-	// Track current segment and offset for reporting corruption location
-	let mut last_valid_offset = 0;
-
-	// Get only the latest segment (with .wal extension)
+	// Get all segments in the directory
 	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
-	let latest_segment = all_segments.into_iter().find(|seg| seg.id == latest_segment_id);
 
-	// If no latest segment found, we're done
-	let latest_segment = match latest_segment {
-		Some(seg) => seg,
-		None => {
-			return Ok((
-				if max_seq_num > 0 {
-					Some(max_seq_num)
-				} else {
-					None
-				},
-				None,
-			));
-		}
-	};
+	// Process each segment in order from start_segment to last
+	for segment_id in start_segment..=last {
+		// Find this segment in the list
+		let segment = match all_segments.iter().find(|seg| seg.id == segment_id) {
+			Some(seg) => seg,
+			None => {
+				log::warn!("WAL segment #{:020} not found, skipping", segment_id);
+				continue;
+			}
+		};
 
-	// Open the latest segment file
-	let file = File::open(&latest_segment.file_path)?;
+		log::debug!("Processing WAL segment #{:020}", segment_id);
 
-	// Create reporter for corruption tracking
-	let reporter = Box::new(DefaultReporter::new(latest_segment_id));
+		// Open the segment file
+		let file = File::open(&segment.file_path)?;
 
-	// Create reader with reporter
-	let mut reader = Reader::with_options(file, Some(reporter), latest_segment_id);
+		// Create reporter for corruption tracking
+		let reporter = Box::new(DefaultReporter::new(segment_id));
 
-	// Track replay statistics
-	let mut batches_replayed = 0;
+		// Create reader with reporter
+		let mut reader = Reader::with_options(file, Some(reporter), segment_id);
 
-	// Process each record in the latest segment
-	loop {
-		match reader.read() {
-			Ok((record_data, offset)) => {
-				// Update tracking info
-				last_valid_offset = offset as usize;
+		// Track statistics for this segment
+		let mut batches_in_segment = 0;
+		let mut last_valid_offset = 0;
 
-				// Decode batch and get sequence number
-				let batch = Batch::decode(record_data)?;
-				let batch_highest_seq_num = batch.get_highest_seq_num();
+		// Process each record in this segment
+		loop {
+			match reader.read() {
+				Ok((record_data, offset)) => {
+					// Update tracking info
+					last_valid_offset = offset as usize;
 
-				// Update max sequence number
-				if batch_highest_seq_num > max_seq_num {
-					max_seq_num = batch_highest_seq_num;
+					// Decode batch and get sequence number
+					let batch = Batch::decode(record_data)?;
+					let batch_highest_seq_num = batch.get_highest_seq_num();
+
+					// Update max sequence number across all segments
+					if batch_highest_seq_num > max_seq_num {
+						max_seq_num = batch_highest_seq_num;
+					}
+
+					batches_in_segment += 1;
+
+					log::debug!(
+						"Replayed batch from WAL #{:020}: seq_num={}, entries={}, offset={}",
+						segment_id,
+						batch_highest_seq_num,
+						batch.count(),
+						offset
+					);
+
+					// Apply the batch to the memtable
+					memtable.add(&batch)?;
 				}
-
-				batches_replayed += 1;
-
-				log::error!(
-					"Replayed batch from WAL #{:020}: max_seq_num={}, entries={}, offset={}",
-					latest_segment_id,
-					batch_highest_seq_num,
-					batch.count(),
-					offset
-				);
-
-				// Apply the batch to the memtable
-				memtable.add(&batch)?;
+				Err(Error::Corruption(err)) => {
+					// Corruption detected - stop immediately and don't process further segments
+					// This matches RocksDB behavior: only repair segment N, leave N+1 untouched
+					log::warn!(
+						"Corrupted WAL record detected in segment {:020} at offset {}: {}",
+						segment_id,
+						last_valid_offset,
+						err
+					);
+					return Ok((
+						if max_seq_num > 0 {
+							Some(max_seq_num)
+						} else {
+							None
+						},
+						Some((segment_id as usize, last_valid_offset)),
+					));
+				}
+				Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+					// End of this segment reached, move to next segment
+					break;
+				}
+				Err(err) => return Err(err.into()),
 			}
-			Err(Error::Corruption(err)) => {
-				// Tolerate tail corruption - return info for automatic repair
-				log::warn!(
-					"Corrupted WAL record detected in segment {latest_segment_id:020} at offset {last_valid_offset}: {err}"
-				);
-				return Ok((
-					if max_seq_num > 0 {
-						Some(max_seq_num)
-					} else {
-						None
-					},
-					Some((latest_segment_id as usize, last_valid_offset)),
-				));
-			}
-			Err(Error::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-				// End of WAL reached
-				break;
-			}
-			Err(err) => return Err(err.into()),
+		}
+
+		if batches_in_segment > 0 {
+			log::info!(
+				"Replayed {} batches from WAL segment #{:020}",
+				batches_in_segment,
+				segment_id
+			);
+			total_batches_replayed += batches_in_segment;
+			segments_processed += 1;
 		}
 	}
 
@@ -210,13 +220,13 @@ pub(crate) fn replay_wal(
 
 	match result {
 		Some(seq) => log::info!(
-			"WAL #{:020} recovery complete: batches={}, max_seq_num={}, total_entries={}",
-			latest_segment_id,
-			batches_replayed,
+			"WAL recovery complete: {} batches across {} segments, max_seq_num={}, total_entries={}",
+			total_batches_replayed,
+			segments_processed,
 			seq,
 			memtable.iter().count()
 		),
-		None => log::info!("WAL #{:020} was empty (no batches found)", latest_segment_id),
+		None => log::info!("No data recovered from WAL segments"),
 	}
 
 	Ok((result, None))
@@ -345,8 +355,8 @@ mod tests {
 		// Create a memtable to replay into
 		let memtable = Arc::new(MemTable::new());
 
-		// Test case: Multiple batches, each with multiple entries
-		// This is the critical test case that would have failed with the old bug
+		// Test case: Multiple batches across multiple WAL segments
+		// This verifies that ALL segments are replayed, not just the latest
 
 		// Batch 1: Starting at 100, with 3 entries (100, 101, 102)
 		let mut batch1 = Batch::new(100);
@@ -363,29 +373,33 @@ mod tests {
 		batch2.set(b"key7", b"value7", 0).unwrap(); // seq_num 203
 											  // Highest sequence number should be 203
 
-		// Create WAL and rotate
+		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		wal.append(&batch1.encode().unwrap()).unwrap();
-		wal.rotate().unwrap();
+		wal.rotate().unwrap(); // Rotate to segment 1
 
 		wal.append(&batch2.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
-		// Replay the WAL
+		// Replay the WAL - should replay BOTH segments
 		let (max_seq_num_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
-		// Verify the bug is fixed: max_seq_num should be 203 (highest from batch2), not 200 (starting of batch2)
+		// Verify both segments are replayed: max_seq_num should be 203 (highest from batch2)
 		assert_eq!(
 			max_seq_num_opt,
 			Some(203),
-			"WAL recovery should track highest sequence number (203), not starting sequence number (200)"
+			"WAL recovery should track highest sequence number (203) across all segments"
 		);
 		assert!(corruption_info.is_none(), "No corruption should be detected");
 
-		// Verify the memtable contains the expected entries
-		assert!(!memtable.is_empty(), "Memtable should not be empty after replay");
+		// Verify the memtable contains entries from BOTH segments
+		let entry_count = memtable.iter().count();
+		assert_eq!(
+			entry_count, 7,
+			"Memtable should contain all 7 entries from both WAL segments (6 sets + 1 delete)"
+		);
 	}
 
 	#[test]
@@ -408,8 +422,8 @@ mod tests {
 
 		let memtable = Arc::new(MemTable::new());
 
-		// Test with multiple single-entry batches
-		// This tests the edge case where starting = highest for each batch
+		// Test with multiple single-entry batches across 3 WAL segments
+		// This tests that ALL segments are replayed, not just the latest
 		let mut batch1 = Batch::new(500);
 		batch1.set(b"key1", b"value1", 0).unwrap(); // seq_num 500
 
@@ -419,7 +433,7 @@ mod tests {
 		let mut batch3 = Batch::new(700);
 		batch3.set(b"key3", b"value3", 0).unwrap(); // seq_num 700
 
-		// Create WAL for all batches (use rotation to create three files)
+		// Create WAL for all batches (use rotation to create three segments)
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
@@ -434,14 +448,17 @@ mod tests {
 
 		let (max_seq_num_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
-		// For single-entry batches, starting and highest should be the same
-		// The max should be 700 (from the latest batch)
+		// All three segments should be replayed, max should be 700
 		assert_eq!(
 			max_seq_num_opt,
 			Some(700),
-			"Multiple single-entry batches should return highest sequence number"
+			"Should replay all 3 segments and return highest sequence number (700)"
 		);
 		assert!(corruption_info.is_none(), "No corruption should be detected");
+
+		// Verify all 3 entries are in the memtable (from all 3 segments)
+		let entry_count = memtable.iter().count();
+		assert_eq!(entry_count, 3, "Memtable should contain all 3 entries from all 3 WAL segments");
 	}
 
 	#[test]
@@ -450,8 +467,8 @@ mod tests {
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
-		// Test case: Multiple batches with different starting sequence numbers
-		// This ensures the max tracking works across multiple batches
+		// Test case: Multiple batches across 2 WAL segments
+		// This ensures ALL segments are replayed and max tracking works correctly
 		let mut batch1 = Batch::new(200); // Starting sequence number 200
 		batch1.set(b"key1", b"value1", 0).unwrap(); // seq_num 200
 		batch1.set(b"key2", b"value2", 0).unwrap(); // seq_num 201
@@ -462,12 +479,12 @@ mod tests {
 		batch2.set(b"key4", b"value4", 0).unwrap(); // seq_num 301
 											  // Highest sequence number should be 301
 
-		// Create WAL and rotate
+		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		wal.append(&batch1.encode().unwrap()).unwrap();
-		wal.rotate().unwrap();
+		wal.rotate().unwrap(); // Rotate to segment 1
 
 		wal.append(&batch2.encode().unwrap()).unwrap();
 		wal.close().unwrap();
@@ -476,12 +493,16 @@ mod tests {
 		let memtable = Arc::new(MemTable::new());
 		let (max_seq_num_opt, _) = replay_wal(wal_dir, &memtable, 0).unwrap();
 
-		// The max should be from the latest segment (301), not the starting sequence number
+		// Both segments should be replayed, max should be 301
 		assert_eq!(
 			max_seq_num_opt,
 			Some(301),
-			"WAL recovery should track highest sequence number across all batches"
+			"WAL recovery should track highest sequence number (301) across all segments"
 		);
+
+		// Verify all 4 entries from both segments are in the memtable
+		let entry_count = memtable.iter().count();
+		assert_eq!(entry_count, 4, "Memtable should contain all 4 entries from both WAL segments");
 	}
 
 	#[test]
@@ -718,5 +739,130 @@ mod tests {
 
 		assert_eq!(seq_num_opt, Some(100));
 		// Reporter is used internally for logging
+	}
+
+	#[test]
+	fn test_multi_segment_recovery_after_crash() {
+		use crate::batch::Batch;
+
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Simulate: rotate WAL, crash before flush
+		// This is the critical bug scenario that was causing data loss
+
+		// Create first batch in WAL segment 0
+		let mut batch1 = Batch::new(100);
+		batch1.set(b"key1", b"value1", 0).unwrap();
+		batch1.set(b"key2", b"value2", 0).unwrap();
+
+		let opts = Options::default();
+		let mut wal = Wal::open(wal_dir, opts).unwrap();
+		wal.append(&batch1.encode().unwrap()).unwrap();
+
+		// Rotate to WAL segment 1 (simulating memtable rotation)
+		wal.rotate().unwrap();
+
+		// Create second batch in WAL segment 1
+		let mut batch2 = Batch::new(200);
+		batch2.set(b"key3", b"value3", 0).unwrap();
+		batch2.set(b"key4", b"value4", 0).unwrap();
+
+		wal.append(&batch2.encode().unwrap()).unwrap();
+
+		// Close without flushing memtable (simulating crash)
+		wal.close().unwrap();
+
+		// Now attempt recovery - both WAL segments should be replayed
+		let memtable = Arc::new(MemTable::new());
+		let (max_seq_num_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+
+		// Verify both segments were replayed
+		assert_eq!(
+			max_seq_num_opt,
+			Some(201),
+			"Should replay both WAL segments and return max seq from segment 1"
+		);
+		assert!(corruption_info.is_none(), "No corruption should be detected");
+
+		// Verify all 4 entries from both segments are recovered
+		let entry_count = memtable.iter().count();
+		assert_eq!(
+			entry_count, 4,
+			"Should recover all 4 entries from both WAL segments (2 from each)"
+		);
+	}
+
+	#[test]
+	fn test_corruption_stops_at_segment_n() {
+		use crate::batch::Batch;
+
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		// Create 3 segments with valid data
+		let opts = Options::default();
+		let mut wal = Wal::open(wal_dir, opts).unwrap();
+
+		// Segment 0: valid data
+		let mut batch0 = Batch::new(100);
+		batch0.set(b"key0", b"value0", 0).unwrap();
+		wal.append(&batch0.encode().unwrap()).unwrap();
+		wal.rotate().unwrap();
+
+		// Segment 1: will be corrupted
+		let mut batch1 = Batch::new(200);
+		batch1.set(b"key1", b"value1", 0).unwrap();
+		let encoded1 = batch1.encode().unwrap();
+		wal.append(&encoded1).unwrap();
+		wal.rotate().unwrap();
+
+		// Segment 2: valid data (should NOT be processed due to corruption in segment 1)
+		let mut batch2 = Batch::new(300);
+		batch2.set(b"key2", b"value2", 0).unwrap();
+		wal.append(&batch2.encode().unwrap()).unwrap();
+		wal.close().unwrap();
+
+		// Corrupt segment 1
+		let segment1_path = wal_dir.join("00000000000000000001.wal");
+		let mut file = fs::OpenOptions::new().read(true).write(true).open(&segment1_path).unwrap();
+
+		// Corrupt at the beginning of the segment
+		file.seek(std::io::SeekFrom::Start(0)).unwrap();
+		let record_type = 3u8; // Middle record (invalid at start)
+		let length = 10u16;
+		let data = vec![0xFF; 10];
+		let crc = crate::wal::calculate_crc32(&[record_type], &data);
+
+		file.write_all(&[record_type]).unwrap();
+		file.write_all(&length.to_be_bytes()).unwrap();
+		file.write_all(&crc.to_be_bytes()).unwrap();
+		file.write_all(&data).unwrap();
+		drop(file);
+
+		// Attempt recovery
+		let memtable = Arc::new(MemTable::new());
+		let (max_seq_num_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+
+		// Should have replayed segment 0 successfully
+		assert_eq!(
+			max_seq_num_opt,
+			Some(100),
+			"Should have replayed only segment 0 before hitting corruption in segment 1"
+		);
+
+		// Should report corruption in segment 1
+		assert!(corruption_info.is_some(), "Should detect corruption in segment 1");
+		let (corrupted_segment, _offset) = corruption_info.unwrap();
+		assert_eq!(corrupted_segment, 1, "Corruption should be reported in segment 1");
+
+		// Verify only segment 0's data is in memtable (segment 2 should NOT be processed)
+		let entry_count = memtable.iter().count();
+		assert_eq!(
+			entry_count, 1,
+			"Should have only 1 entry from segment 0 (segment 2 should NOT be processed)"
+		);
 	}
 }
