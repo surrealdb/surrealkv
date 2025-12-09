@@ -900,6 +900,27 @@ impl Core {
 			log::debug!("Active memtable is empty, skipping shutdown flush");
 		}
 
+		// Step 3.5: Clean up obsolete WAL files (RocksDB-style synchronous cleanup)
+		// This happens after flush so manifest.log_number is updated
+		if let Some(ref wal) = self.inner.wal {
+			let wal_dir = wal.read().get_dir_path().to_path_buf();
+			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+
+			log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
+
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+				Ok(count) if count > 0 => {
+					log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+				}
+				Ok(_) => {
+					log::debug!("No obsolete WAL files to clean up");
+				}
+				Err(e) => {
+					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
+				}
+			}
+		}
+
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		if let Some(ref wal) = self.inner.wal {
@@ -4655,6 +4676,101 @@ mod tests {
 			println!("\n✅ All 3 cycles verified: flush, recovery, and WAL behavior correct!");
 
 			tree.close().await.unwrap();
+		}
+	}
+
+	#[test_log::test(tokio::test)]
+	async fn test_wal_files_after_multiple_open_close_cycles() {
+		// Simulates: open -> write 100 entries -> close, repeated multiple times
+		// Investigates why the last WAL file always remains
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+		});
+
+		let wal_dir = opts.wal_dir();
+
+		println!("\n=== Multiple Open-Write-Close Cycles ===\n");
+
+		for cycle in 1..=3 {
+			println!("--- Cycle {} ---", cycle);
+
+			// List WAL files before opening
+			let wals_before_open =
+				crate::wal::list_segment_ids(&wal_dir, Some("wal")).unwrap_or_default();
+			println!("WAL files before open: {:?}", wals_before_open);
+
+			{
+				let tree = Tree::new(opts.clone()).unwrap();
+
+				let manifest = tree.core.inner.level_manifest.read().unwrap();
+				let wal_num = tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+
+				println!("After open:");
+				println!("  Active WAL: {}", wal_num);
+				println!("  Manifest log_number: {}", manifest.get_log_number());
+				drop(manifest);
+
+				// Write 100 entries
+				for i in 0..100 {
+					let mut txn = tree.begin().unwrap();
+					txn.set(format!("cycle{}_key_{}", cycle, i).as_bytes(), b"value").unwrap();
+					txn.commit().await.unwrap();
+				}
+
+				let wals_before_close =
+					crate::wal::list_segment_ids(&wal_dir, Some("wal")).unwrap_or_default();
+				println!("WAL files before close: {:?}", wals_before_close);
+
+				// Check WAL file sizes
+				for wal_id in &wals_before_close {
+					let wal_path = wal_dir.join(format!("{:020}.wal", wal_id));
+					if let Ok(meta) = std::fs::metadata(&wal_path) {
+						println!("  WAL #{}: {} bytes", wal_id, meta.len());
+					}
+				}
+
+				// Close (should flush)
+				tree.close().await.unwrap();
+
+				// Give async cleanup time to run
+				tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+			}
+
+			// List WAL files after close
+			let wals_after_close =
+				crate::wal::list_segment_ids(&wal_dir, Some("wal")).unwrap_or_default();
+			println!("WAL files after close: {:?}", wals_after_close);
+
+			// Check WAL file sizes after close
+			for wal_id in &wals_after_close {
+				let wal_path = wal_dir.join(format!("{:020}.wal", wal_id));
+				if let Ok(meta) = std::fs::metadata(&wal_path) {
+					println!("  WAL #{}: {} bytes", wal_id, meta.len());
+				}
+			}
+
+			// Check manifest state after close
+			let manifest = LevelManifest::new(opts.clone()).unwrap();
+			println!("Manifest after close: log_number={}", manifest.get_log_number());
+
+			println!();
+		}
+
+		println!("=== Analysis ===");
+		let final_wals = crate::wal::list_segment_ids(&wal_dir, Some("wal")).unwrap_or_default();
+		println!("Final WAL files remaining: {:?}", final_wals);
+
+		if !final_wals.is_empty() {
+			println!("\n⚠️  WAL files remain after all cycles");
+			for wal_id in &final_wals {
+				let wal_path = wal_dir.join(format!("{:020}.wal", wal_id));
+				if let Ok(meta) = std::fs::metadata(&wal_path) {
+					println!("  WAL #{}: {} bytes", wal_id, meta.len());
+				}
+			}
 		}
 	}
 }
