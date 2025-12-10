@@ -1,20 +1,26 @@
 // Note: Needs to be tested if a top-level index improves performance as such.
 // TODO: Replace the current non-partitioned index block writer with this
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::{
 	cache::Item,
 	error::{Error, Result},
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockWriter},
-		table::{compress_block, read_table_block, write_block_at_offset},
+		table::{
+			block_size_with_trailer, compress_block, decompress_block, read_table_block, unmask,
+			write_block_at_offset, BLOCK_CKSUM_LEN, BLOCK_COMPRESS_LEN,
+		},
 		InternalKey,
 	},
 	vfs::File,
 	CompressionType, Options,
 };
 use bytes::Bytes;
+use crc32fast::Hasher as Crc32;
+use integer_encoding::FixedInt;
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
@@ -151,6 +157,8 @@ pub(crate) struct TopLevelIndex {
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
 	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
 	file: Arc<dyn File>,
+	// Cache for pinned partition blocks
+	partition_map: Arc<RwLock<HashMap<u64, Arc<Block>>>>,
 }
 
 impl TopLevelIndex {
@@ -172,12 +180,19 @@ impl TopLevelIndex {
 				handle,
 			});
 		}
-		Ok(TopLevelIndex {
+		let index = TopLevelIndex {
 			id,
 			opts: opt.clone(),
 			blocks,
 			file: f.clone(),
-		})
+			partition_map: Arc::new(RwLock::new(HashMap::new())),
+		};
+
+		// Prefetch all partition blocks immediately
+		// This ensures partitions are ALWAYS available without disk I/O
+		index.cache_dependencies()?;
+
+		Ok(index)
 	}
 
 	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
@@ -198,18 +213,21 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
-		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
-			return Ok(block);
-		}
+		let offset = block_handle.offset();
 
-		let block_data =
-			read_table_block(self.opts.clone(), self.file.clone(), &block_handle.handle)?;
-		let block = Arc::new(block_data);
-		self.opts.block_cache.insert(self.id, block_handle.offset(), Item::Index(block.clone()));
-
-		Ok(block)
+		// Check partition_map (all partitions should be pinned after cache_dependencies)
+		let map = self.partition_map.read().unwrap();
+		map.get(&offset).cloned().ok_or_else(|| {
+			Error::CorruptedBlock(format!(
+				"Partition block at offset {} not in partition_map. \
+				This indicates cache_dependencies failed or there's a bug. \
+				Table ID: {}, Total partitions: {}",
+				offset,
+				self.id,
+				self.blocks.len()
+			))
+		})
 	}
-
 	pub(crate) fn get(&self, user_key: &[u8]) -> Result<Arc<Block>> {
 		let Some(block_handle) = self.find_block_handle_by_key(user_key) else {
 			return Err(Error::BlockNotFound);
@@ -225,6 +243,110 @@ impl TopLevelIndex {
 		} else {
 			Err(Error::BlockNotFound)
 		}
+	}
+
+	/// Prefetch all partition blocks in one I/O operation
+	/// Following RocksDB's PartitionIndexReader::CacheDependencies pattern
+	pub(crate) fn cache_dependencies(&self) -> Result<()> {
+		// Early return if partitions already cached
+		{
+			let map = self.partition_map.read().unwrap();
+			if !map.is_empty() {
+				return Ok(());
+			}
+		}
+
+		// Step 1: Find the range of all partition blocks
+		if self.blocks.is_empty() {
+			return Ok(());
+		}
+
+		let first_handle = &self.blocks[0];
+		let last_handle = &self.blocks[self.blocks.len() - 1];
+
+		// Calculate offsets
+		let prefetch_off = first_handle.handle.offset as u64;
+		let last_off =
+			last_handle.handle.offset as u64 + block_size_with_trailer(&last_handle.handle) as u64;
+		let prefetch_len = last_off - prefetch_off;
+
+		// Step 2: Single large read for all partition blocks
+		let mut buffer = vec![0u8; prefetch_len as usize];
+		self.file.read_at(prefetch_off, &mut buffer)?;
+
+		// Step 3: Parse and cache all partitions from buffer
+		let mut map_in_progress = HashMap::new();
+		let partition_count = self.blocks.len();
+
+		for block_handle_with_key in &self.blocks {
+			let block_handle = &block_handle_with_key.handle;
+
+			// Calculate position in prefetch buffer
+			let offset_in_buffer = (block_handle.offset as u64 - prefetch_off) as usize;
+			let block_size = block_handle.size;
+			let total_size = block_size + BLOCK_COMPRESS_LEN + BLOCK_CKSUM_LEN;
+
+			// Extract block data from buffer
+			let block_slice = &buffer[offset_in_buffer..offset_in_buffer + total_size];
+
+			// Decompress and verify checksum
+			let block = self.parse_and_cache_partition(
+				block_slice,
+				block_size,
+				block_handle.offset as u64,
+			)?;
+
+			map_in_progress.insert(block_handle.offset as u64, block);
+		}
+
+		// Step 4: Save to partition_map
+		if map_in_progress.len() == partition_count {
+			let mut map = self.partition_map.write().unwrap();
+			*map = map_in_progress;
+		}
+
+		Ok(())
+	}
+
+	/// Helper to parse partition from prefetch buffer
+	fn parse_and_cache_partition(
+		&self,
+		data: &[u8],
+		block_size: usize,
+		offset: u64,
+	) -> Result<Arc<Block>> {
+		// Check cache first
+		if let Some(block) = self.opts.block_cache.get_index_block(self.id, offset) {
+			return Ok(block);
+		}
+
+		// Parse block data
+		let block_data = &data[0..block_size];
+		let compression_type = data[block_size];
+		let checksum_bytes = &data[block_size + 1..block_size + 5];
+
+		// Verify checksum
+		let expected_checksum = unmask(u32::decode_fixed(checksum_bytes).unwrap());
+		let mut hasher = Crc32::new();
+		hasher.update(block_data);
+		hasher.update(&[compression_type]);
+
+		if hasher.finalize() != expected_checksum {
+			return Err(Error::CorruptedBlock(format!(
+				"Checksum mismatch for partition at offset {}",
+				offset
+			)));
+		}
+
+		// Decompress
+		let decompressed = decompress_block(block_data, CompressionType::from(compression_type))?;
+
+		let block = Arc::new(Block::new(Bytes::from(decompressed), self.opts.clone()));
+
+		// Insert into cache
+		self.opts.block_cache.insert(self.id, offset, Item::Index(block.clone()));
+
+		Ok(block)
 	}
 }
 
@@ -356,6 +478,7 @@ mod tests {
 				BlockHandleWithKey::new(b"j".to_vec(), BlockHandle::new(20, 10)),
 			],
 			file: f.clone(),
+			partition_map: Arc::new(RwLock::new(HashMap::new())),
 		};
 
 		// A list of tuples where the first element is the key to find,
@@ -443,6 +566,57 @@ mod tests {
 				// This is also acceptable for keys completely out of range
 			}
 			Err(e) => panic!("Unexpected error for key after range: {e:?}"),
+		}
+	}
+
+	#[test]
+	fn test_cache_dependencies_prefetch() {
+		let opts = Arc::new(Options::default());
+		let max_block_size = 50; // Small size to force multiple partitions
+		let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+
+		// Add enough entries to create multiple partitions
+		let entries = vec![
+			("key_001", "handle_001"),
+			("key_002", "handle_002"),
+			("key_003", "handle_003"),
+			("key_004", "handle_004"),
+			("key_005", "handle_005"),
+		];
+
+		for (key, handle) in &entries {
+			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
+			writer.add(&internal_key, handle.as_bytes()).unwrap();
+		}
+
+		// Write to buffer
+		let mut buffer = Vec::new();
+		let (top_level_handle, _) = writer.finish(&mut buffer, CompressionType::None, 0).unwrap();
+
+		// Now read it back
+		let file = wrap_buffer(buffer);
+		let index = TopLevelIndex::new(0, opts.clone(), file, &top_level_handle).unwrap();
+
+		// Verify partition_map is now populated
+		{
+			let map = index.partition_map.read().unwrap();
+			assert!(!map.is_empty(), "Partition map should be populated after cache_dependencies");
+			assert_eq!(map.len(), index.blocks.len(), "All partitions should be cached");
+		}
+
+		// Verify we can load blocks from the partition_map
+		for block_handle in &index.blocks {
+			let block = index.load_block(block_handle).unwrap();
+			assert!(block.size() > 0, "Block should not be empty");
+		}
+
+		// Call cache_dependencies again - should return early
+		index.cache_dependencies().unwrap();
+
+		// Verify partition count hasn't changed
+		{
+			let map = index.partition_map.read().unwrap();
+			assert_eq!(map.len(), index.blocks.len(), "Partition count should remain the same");
 		}
 	}
 }

@@ -34,6 +34,13 @@ pub const BLOCK_COMPRESS_LEN: usize = 1;
 
 const MASK_DELTA: u32 = 0xa282_ead8;
 
+/// Calculate total size of block including trailer (compression + checksum)
+/// Matches RocksDB's BlockSizeWithTrailer
+#[inline]
+pub(crate) fn block_size_with_trailer(handle: &BlockHandle) -> usize {
+	handle.size + BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN
+}
+
 pub(crate) fn mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(MASK_DELTA)
 }
@@ -636,6 +643,7 @@ impl Table {
 		// println!("meta ix handle: {:?}", footer.meta_index);
 
 		// Using partitioned index
+		// Note: TopLevelIndex::new() automatically prefetches all partitions
 		let index_block = {
 			let partitioned_index =
 				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
