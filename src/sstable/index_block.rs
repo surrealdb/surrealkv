@@ -88,25 +88,7 @@ impl TopLevelIndexWriter {
 
 	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
 		// LOG: What's being added to index block
-		use crate::sstable::InternalKey;
-		let decoded = InternalKey::decode(key);
 		let will_partition = self.current_block.size_estimate() >= self.max_block_size;
-
-		log::error!(
-			"[INDEX PARTITION] Adding key to index block\n\
-			User key: {:?}\n\
-			Full key: {:?}\n\
-			Seq: {}, Kind: {:?}, Timestamp: {}\n\
-			Current block size: {} bytes\n\
-			Will trigger partition: {}",
-			&decoded.user_key,
-			key,
-			decoded.seq_num(),
-			decoded.kind(),
-			decoded.timestamp,
-			self.current_block.size_estimate(),
-			will_partition
-		);
 
 		if will_partition {
 			log::error!("[INDEX PARTITION] Finishing current index block, starting new partition");

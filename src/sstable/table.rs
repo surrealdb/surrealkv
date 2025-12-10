@@ -292,22 +292,6 @@ impl<W: Write> TableWriter<W> {
 		// TODO: check if this has to be a separator or successor
 		let separator_key = self.internal_cmp.separator(&block.last_key, next_key);
 
-		// LOG: Separator creation for data block
-		log::error!(
-			"[TABLE {}] Creating separator for data block\n\
-		Input last_key: {:?}\n\
-		Input next_key: {:?}\n\
-		Output separator: {:?}\n\
-		Separator shortened: {} (from {} to {} bytes)",
-			self.meta.properties.id,
-			&block.last_key,
-			next_key,
-			&separator_key,
-			separator_key.len() < block.last_key.len(),
-			block.last_key.len(),
-			separator_key.len()
-		);
-
 		self.prev_block_last_key = block.last_key.clone();
 
 		// Finalize the current block and compress it.
@@ -322,19 +306,6 @@ impl<W: Write> TableWriter<W> {
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		);
 		let handle_encoded = handle.encode();
-
-		// LOG: Adding separator to partitioned index
-		log::error!(
-			"[TABLE {}] Adding separator InternalKey to partitioned index\n\
-		Separator user_key: {:?}\n\
-		Full InternalKey: {:?}\n\
-		Seq: {}, Kind: Separator, Timestamp: {}",
-			self.meta.properties.id,
-			&separator_key,
-			&sep_key.encode(),
-			INTERNAL_KEY_SEQ_NUM_MAX,
-			INTERNAL_KEY_TIMESTAMP_MAX
-		);
 
 		self.partitioned_index.add(&sep_key.encode(), &handle_encoded)?;
 
