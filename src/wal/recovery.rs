@@ -189,7 +189,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			}
 			Err(Error::Corruption(err)) => {
 				// Stop at the first corruption
-				log::info!(
+				log::error!(
                     "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
                 );
 				break;
