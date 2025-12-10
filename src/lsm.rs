@@ -250,14 +250,21 @@ impl CoreInner {
 		// This ensures manifest marks the correct WAL as flushed (not the new active one)
 		let table = self.flush_memtable_and_update_manifest(flushed_wal_number)?;
 
+		// Step 3.5: Handle case where memtable was empty (concurrent flush)
+		// CRITICAL: Even if memtable was empty, we MUST update log_number to mark
+		// the rotated WAL as processed, otherwise it won't be cleaned up
 		if table.is_none() {
-			// Memtable was empty after rotation, nothing to flush
-			// This can happen if another thread flushed it concurrently
-			log::debug!("Memtable was empty after WAL rotation, skipping flush");
-			return Ok(());
-		}
+			// Memtable was empty after rotation (concurrent flush by another thread)
+			log::debug!("Memtable was empty after WAL rotation, updating log_number only");
 
-		log::debug!("Memtable flush completed successfully");
+			// Update log_number to mark the rotated WAL as flushed (even though empty)
+			// This is essential for WAL cleanup to work correctly
+			if let Some(wal_num) = flushed_wal_number {
+				self.update_manifest_log_number(wal_num)?;
+			}
+		} else {
+			log::debug!("Memtable flush completed successfully");
+		}
 
 		// Step 4: Async WAL cleanup based on manifest log_number
 		// Only WAL segments older than log_number can be safely deleted
@@ -409,6 +416,43 @@ impl CoreInner {
 		);
 
 		Ok(Some(table))
+	}
+
+	/// Updates the manifest's log_number to mark a WAL as flushed.
+	///
+	/// This is a helper function to avoid code duplication when updating log_number
+	/// without adding new SSTables (e.g., when memtable is empty after concurrent flush).
+	///
+	/// # Arguments
+	///
+	/// * `flushed_wal_number` - The WAL number that was flushed (log_number will be set to this + 1)
+	///
+	/// # Returns
+	///
+	/// Ok(()) if successful, Error otherwise
+	fn update_manifest_log_number(&self, flushed_wal_number: u64) -> Result<()> {
+		let changeset = ManifestChangeSet {
+			log_number: Some(flushed_wal_number + 1),
+			..Default::default()
+		};
+
+		let mut manifest = self.level_manifest.write()?;
+		manifest.apply_changeset(&changeset)?;
+		write_manifest_to_disk(&manifest).map_err(|e| {
+			Error::Other(format!(
+				"Failed to update manifest log_number={}: {}",
+				flushed_wal_number + 1,
+				e
+			))
+		})?;
+
+		log::debug!(
+			"Updated log_number to {} (WAL {:020} marked as flushed)",
+			flushed_wal_number + 1,
+			flushed_wal_number
+		);
+
+		Ok(())
 	}
 
 	/// Cleans up orphaned SST files not referenced in manifest
@@ -4638,9 +4682,7 @@ mod tests {
 			}
 
 			// Count SSTs before close
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			sst_count_before = manifest.iter().count();
-			drop(manifest);
+			sst_count_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 			// Close without flush (flush_on_close=false)
 			tree.close().await.unwrap();
@@ -4649,8 +4691,7 @@ mod tests {
 		// Reopen and verify SST count hasn't changed
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let sst_count_after = manifest.iter().count();
+			let sst_count_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 			assert_eq!(
 				sst_count_after, sst_count_before,
@@ -4681,16 +4722,13 @@ mod tests {
 				txn.set(b"test", b"data").unwrap();
 				txn.commit().await.unwrap();
 
-				let manifest = tree.core.inner.level_manifest.read().unwrap();
-				sst_before = manifest.iter().count();
-				drop(manifest);
+				sst_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 				tree.close().await.unwrap();
 			}
 
 			let tree = Tree::new(opts.clone()).unwrap();
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let sst_after = manifest.iter().count();
+			let sst_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 			assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
 			tree.close().await.unwrap();
@@ -4710,16 +4748,13 @@ mod tests {
 				txn.set(b"test", b"data").unwrap();
 				txn.commit().await.unwrap();
 
-				let manifest = tree.core.inner.level_manifest.read().unwrap();
-				sst_before = manifest.iter().count();
-				drop(manifest);
+				sst_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 				tree.close().await.unwrap();
 			}
 
 			let tree = Tree::new(opts.clone()).unwrap();
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let sst_after = manifest.iter().count();
+			let sst_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 			assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
