@@ -87,7 +87,29 @@ impl TopLevelIndexWriter {
 	}
 
 	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
-		if self.current_block.size_estimate() >= self.max_block_size {
+		// LOG: What's being added to index block
+		use crate::sstable::InternalKey;
+		let decoded = InternalKey::decode(key);
+		let will_partition = self.current_block.size_estimate() >= self.max_block_size;
+
+		log::error!(
+			"[INDEX PARTITION] Adding key to index block\n\
+			User key: {:?}\n\
+			Full key: {:?}\n\
+			Seq: {}, Kind: {:?}, Timestamp: {}\n\
+			Current block size: {} bytes\n\
+			Will trigger partition: {}",
+			&decoded.user_key,
+			key,
+			decoded.seq_num(),
+			decoded.kind(),
+			decoded.timestamp,
+			self.current_block.size_estimate(),
+			will_partition
+		);
+
+		if will_partition {
+			log::error!("[INDEX PARTITION] Finishing current index block, starting new partition");
 			self.finish_current_block();
 		}
 		self.current_block.add(key, handle)
@@ -139,6 +161,14 @@ impl TopLevelIndexWriter {
 			let (block_handle, new_offset) =
 				Self::write_compressed_block(writer, block_data, compression_type, offset)?;
 			offset = new_offset; // Update the offset for the next iteration
+
+			// LOG: Building top-level index
+			log::error!(
+				"[TOP LEVEL INDEX] Adding partition last_key to top-level index\n\
+				Partition last_key: {:?}\n\
+				Note: This is already a separator key from data blocks",
+				&separator_key
+			);
 
 			// Use the last key of each block as the separator key
 			top_level_index.add(&separator_key, &block_handle.encode())?;

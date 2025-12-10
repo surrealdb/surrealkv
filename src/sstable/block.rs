@@ -201,31 +201,40 @@ impl BlockWriter {
 				let current_internal_key = InternalKey::decode(key);
 
 				log::error!(
-					"Block key ordering violation detected!\n\
-				Last Key:\n\
-				  User Key: {:?}\n\
-				  Seq Num: {}\n\
-				  Kind: {:?}\n\
-				  Timestamp: {}\n\
-				  Raw bytes: {:?}\n\
-				Current Key:\n\
-				  User Key: {:?}\n\
-				  Seq Num: {}\n\
-				  Kind: {:?}\n\
-				  Timestamp: {}\n\
-				  Raw bytes: {:?}\n\
-				Comparison result: {:?} (expected: Less)",
+					"[BLOCK] Key ordering violation detected!\n\
+			Last Key:\n\
+			  User Key (UTF-8): {:?}\n\
+			  User Key (bytes): {:?}\n\
+			  Seq Num: {}\n\
+			  Kind: {:?}\n\
+			  Timestamp: {}\n\
+			  Full InternalKey: {:?}\n\
+			Current Key:\n\
+			  User Key (UTF-8): {:?}\n\
+			  User Key (bytes): {:?}\n\
+			  Seq Num: {}\n\
+			  Kind: {:?}\n\
+			  Timestamp: {}\n\
+			  Full InternalKey: {:?}\n\
+			Comparison result: {:?} (expected: Less)\n\
+			Block state:\n\
+			  Entries in block: {}\n\
+			  Buffer size: {} bytes",
 					String::from_utf8_lossy(&last_internal_key.user_key),
+					last_internal_key.user_key.as_ref(),
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
 					last_internal_key.timestamp,
 					self.last_key.as_slice(),
 					String::from_utf8_lossy(&current_internal_key.user_key),
+					current_internal_key.user_key.as_ref(),
 					current_internal_key.seq_num(),
 					current_internal_key.kind(),
 					current_internal_key.timestamp,
 					key,
-					cmp_result
+					cmp_result,
+					self.num_entries,
+					self.buffer.len()
 				);
 			}
 		}

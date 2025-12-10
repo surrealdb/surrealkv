@@ -56,8 +56,23 @@ impl Compactor {
 		let choice = self.strategy.pick_levels(&levels_guard);
 
 		match choice {
-			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
-			CompactionChoice::Skip => Ok(()),
+			CompactionChoice::Merge(input) => {
+				log::error!(
+					"[COMPACTION] Compaction choice: MERGE\n\
+					Source level: {}\n\
+					Target level: {}\n\
+					Tables to merge: {} tables with IDs: {:?}",
+					input.source_level,
+					input.target_level,
+					input.tables_to_merge.len(),
+					input.tables_to_merge
+				);
+				self.merge_tables(levels_guard, &input)
+			}
+			CompactionChoice::Skip => {
+				log::error!("[COMPACTION] Compaction choice: SKIP (no compaction needed)");
+				Ok(())
+			}
 		}
 	}
 
@@ -66,6 +81,15 @@ impl Compactor {
 		mut levels: RwLockWriteGuard<'_, LevelManifest>,
 		input: &CompactionInput,
 	) -> Result<()> {
+		log::error!(
+			"[COMPACTION] Starting merge_tables\n\
+			Merging L{} → L{}\n\
+			Number of tables to merge: {}",
+			input.source_level,
+			input.target_level,
+			input.tables_to_merge.len()
+		);
+
 		let merge_result = {
 			let tables = levels.get_all_tables();
 
@@ -77,6 +101,11 @@ impl Compactor {
 					table_opt.cloned()
 				})
 				.collect();
+
+			log::error!(
+				"[COMPACTION] Found {} tables to merge (filter_map result)",
+				to_merge.len()
+			);
 
 			let iterators: Vec<BoxedIterator<'_>> = to_merge
 				.into_iter()
@@ -91,16 +120,40 @@ impl Compactor {
 			let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
 			let new_table_path = self.get_table_path(new_table_id);
 
+			log::error!(
+				"[COMPACTION] Creating new merged table\n\
+			New table ID: {}\n\
+			Target level: L{}\n\
+			Path: {:?}",
+				new_table_id,
+				input.target_level,
+				new_table_path
+			);
+
 			// Write merged data and collect discard statistics
 			let discard_stats =
 				self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
+
+			log::error!(
+				"[COMPACTION] Finished writing merged table {}, opening for use",
+				new_table_id
+			);
 
 			let new_table = self.open_table(new_table_id, &new_table_path)?;
 			Ok((new_table, new_table_id, discard_stats))
 		};
 
 		match merge_result {
-			Ok((new_table, _, discard_stats)) => {
+			Ok((new_table, new_table_id, discard_stats)) => {
+				log::error!(
+					"[COMPACTION] Merge successful, updating manifest\n\
+				New table ID: {}\n\
+				Removing {} old tables: {:?}",
+					new_table_id,
+					input.tables_to_merge.len(),
+					input.tables_to_merge
+				);
+
 				self.update_manifest(input, new_table)?;
 				self.cleanup_old_tables(input);
 
@@ -111,9 +164,21 @@ impl Compactor {
 					}
 				}
 
+				log::error!(
+					"[COMPACTION] Merge complete for L{} → L{}, table {} created",
+					input.source_level,
+					input.target_level,
+					new_table_id
+				);
+
 				Ok(())
 			}
 			Err(e) => {
+				log::error!(
+					"[COMPACTION] Merge FAILED, restoring original state\n\
+				Error: {:?}",
+					e
+				);
 				// Restore the original state
 				let mut levels = self.options.level_manifest.write()?;
 				levels.unhide_tables(&input.tables_to_merge);
@@ -145,9 +210,34 @@ impl Compactor {
 			self.options.lopts.clock.clone(),
 		);
 
+		let mut key_count = 0u64;
 		for (key, value) in &mut comp_iter {
+			key_count += 1;
+
+			// print the first 10 keys
+			if key_count <= 10 {
+				log::error!(
+					"[COMPACTION TABLE {}] Key #{} from iterator\n\
+				Key: {:?}\n\
+				User Key: {:?}\n\
+				Seq Num: {}\n\
+				",
+					table_id,
+					key_count,
+					&key.encode(),
+					&key.user_key,
+					key.seq_num(),
+				);
+			}
+
 			writer.add(key, &value)?;
 		}
+
+		log::error!(
+			"[COMPACTION TABLE {}] Finished writing {} keys from compaction iterator",
+			table_id,
+			key_count
+		);
 
 		writer.finish()?;
 

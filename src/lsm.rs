@@ -282,7 +282,14 @@ impl CoreInner {
 impl CompactionOperations for CoreInner {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
-		self.make_room_for_write()
+		log::error!("[MEMTABLE COMPACTION] Starting memtable flush to make room for writes");
+		let result = self.make_room_for_write();
+		if result.is_ok() {
+			log::error!("[MEMTABLE COMPACTION] Memtable flush completed successfully");
+		} else {
+			log::error!("[MEMTABLE COMPACTION] Memtable flush failed: {:?}", result);
+		}
+		result
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -292,12 +299,22 @@ impl CompactionOperations for CoreInner {
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		log::error!("[LEVEL COMPACTION] Starting level compaction");
+
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
 		// Execute compaction according to the chosen strategy
 		let compactor = Compactor::new(options, strategy);
-		compactor.compact()?;
+		let result = compactor.compact();
+
+		if result.is_ok() {
+			log::error!("[LEVEL COMPACTION] Level compaction completed successfully");
+		} else {
+			log::error!("[LEVEL COMPACTION] Level compaction failed: {:?}", result);
+		}
+
+		result?;
 
 		// // Clean deleted versions from versioned index after compaction
 		// self.clean_expired_versions()?;
