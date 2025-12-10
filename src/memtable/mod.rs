@@ -85,7 +85,7 @@ impl MemTable {
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.map_size.load(Ordering::Relaxed) as usize
+		self.map_size.load(Ordering::Acquire) as usize
 	}
 
 	/// Adds a batch of operations to the memtable.

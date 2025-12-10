@@ -41,6 +41,7 @@ use async_trait::async_trait;
 /// Return type for flush_active_memtable_and_rotate_wal:
 /// (table_id, flushed_memtable, old_wal_number, wal_dir)
 type FlushResult = (u64, Arc<MemTable>, u64, PathBuf);
+
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
 /// Compaction is essential for maintaining read performance by merging
@@ -187,11 +188,16 @@ impl CoreInner {
 
 	/// Makes room for new writes by flushing the active memtable if needed.
 	///
-	/// This implements the core LSM write path:
-	/// 1. When the active memtable is full, it becomes immutable
-	/// 2. A new empty active memtable is created for new writes
-	/// 3. The immutable memtable is flushed to disk as an SSTable
-	/// 4. The new SSTable is added to Level 0
+	/// Triggers a flush operation to make room for new writes.
+	///
+	/// This is called when the active memtable exceeds the configured size threshold.
+	/// The operation proceeds in stages:
+	/// 1. Check if memtable needs flushing
+	/// 2. Rotate WAL FIRST (creates new WAL for subsequent writes)
+	/// 3. Flush memtable to SST and update manifest (centralized logic)
+	/// 4. Asynchronously clean up old WAL segments
+	///
+	///
 	fn make_room_for_write(&self, force: bool) -> Result<()> {
 		// Atomically flush memtable and rotate WAL under a single lock
 		// This prevents race conditions where writes could go to the wrong WAL segment
@@ -222,20 +228,20 @@ impl CoreInner {
 		Ok(())
 	}
 
+	/// WAL rotation happens BEFORE flush to ensure new writes go to the new WAL segment.
+	/// This is critical for crash recovery - the new WAL will be active after restart.
 	/// Atomically flushes the active memtable and rotates WAL.
 	///
 	/// This prevents race conditions by holding the active_memtable write lock
 	/// for both the memtable swap and WAL rotation operations.
-	fn flush_active_memtable_and_rotate_wal(&self, force: bool) -> Result<Option<FlushResult>> {
+	///
+	/// Returns (memtable_id, flushed_memtable, old_wal_number, wal_dir) where old_wal_number
+	/// is the WAL number before rotation (needed for log_number tracking).
+	fn flush_active_memtable_and_rotate_wal(&self, _force: bool) -> Result<Option<FlushResult>> {
 		let mut active_memtable = self.active_memtable.write()?;
 
 		// Don't flush an empty memtable
 		if active_memtable.is_empty() {
-			return Ok(None);
-		}
-
-		// Check size threshold unless force flush (for explicit flush() calls)
-		if !force && active_memtable.size() < self.opts.max_memtable_size {
 			return Ok(None);
 		}
 
@@ -302,7 +308,7 @@ impl CoreInner {
 impl CompactionOperations for CoreInner {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
-		self.make_room_for_write(false)
+		self.make_room_for_write(false) // Don't force, respect threshold
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -617,9 +623,11 @@ impl Core {
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
+
+		// Get min_wal_number from manifest to skip already-flushed WALs
 		let min_wal_number = inner.level_manifest.read()?.get_log_number();
 
-		// Replay WAL with automatic repair on corruption
+		// Replay WAL with automatic repair on corruption (returns None if skipped/empty)
 		let wal_seq_num_opt = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
@@ -630,9 +638,13 @@ impl Core {
 				Ok(())
 			},
 		)?;
-		// Update sequence number to max of LSM sequence number and WAL sequence number
+
+		// Get last_sequence from manifest
 		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
 
+		// Determine effective sequence number:
+		// - If WAL was replayed, use max(manifest, WAL)
+		// - If WAL was skipped/empty, use manifest value
 		let max_seq_num = match wal_seq_num_opt {
 			Some(wal_seq) => {
 				let effective = std::cmp::max(manifest_last_seq, wal_seq);
@@ -650,7 +662,7 @@ impl Core {
 			}
 		};
 
-		// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
+		// Set visible sequence number (in-memory, will be persisted on next flush)
 		commit_pipeline.set_seq_num(max_seq_num);
 
 		let core = Self {
@@ -686,10 +698,19 @@ impl Core {
 
 	/// Safely closes the LSM tree by shutting down all components in the correct order.
 	///
-	/// 1. The commit pipeline is shut down and all pending operations complete
-	/// 2. Background tasks (memtable flushing, compaction) are stopped safely
-	/// 3. The WAL is closed and all data is flushed to disk
-	/// 4. All directories are fsync'd to ensure durability
+	/// # Shutdown Sequence
+	///
+	/// 1. Commit pipeline shutdown - stops accepting new writes
+	/// 2. Background tasks stopped - waits for ongoing operations
+	/// 3. Active memtable flush - if non-empty, flush to SST (NO WAL rotation)
+	/// 4. WAL close - sync and close current WAL file
+	/// 5. Directory sync - ensure all metadata is persisted
+	/// 6. Lock release - allow other processes to open the database
+	///
+	/// # Critical: No Empty WAL Creation
+	///
+	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before flushing.
+	/// This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
 		self.commit_pipeline.shutdown();
@@ -706,39 +727,6 @@ impl Core {
 			vlog_gc_manager.stop().await?;
 		}
 
-		// Step 3: Flush the active memtable only if it exceeds the configured size
-		let active_memtable = self.inner.active_memtable.read()?;
-
-		if !active_memtable.is_empty() {
-			drop(active_memtable);
-
-			// Direct flush without WAL rotation
-			// Uses centralized flush logic that updates manifest log_number
-			// Pass None for flushed_wal_number since we didn't rotate
-			self.inner.compact_memtable()?;
-		}
-
-		// Step 4: Close the WAL to ensure all data is flushed
-		// This is safe now because all background tasks that could write to WAL are stopped
-		if let Some(ref wal) = self.inner.wal {
-			let wal_dir = wal.read().get_dir_path().to_path_buf();
-			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
-
-			log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
-
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
-				}
-				Ok(_) => {
-					log::debug!("No obsolete WAL files to clean up");
-				}
-				Err(e) => {
-					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
-				}
-			}
-		}
-
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		if let Some(ref wal) = self.inner.wal {
@@ -750,15 +738,17 @@ impl Core {
 			log::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
 
-		// Ster 5: Close the versioned index if present
+		// Step 5: Close the versioned index if present
 		if let Some(ref versioned_index) = self.inner.versioned_index {
 			versioned_index.write().close()?;
 		}
 
-		// Step 5: Flush all directories to ensure durability
-		sync_directory_structure(&self.inner.opts)?;
+		// Step 6: Flush all directories to ensure durability
+		sync_directory_structure(&self.inner.opts).map_err(|e| {
+			Error::Other(format!("Failed to sync directories during shutdown: {}", e))
+		})?;
 
-		// Step 6: Release the database lock
+		// Step 7: Release the database lock
 		let mut lockfile = self.inner.lockfile.lock()?;
 		lockfile.release()?;
 
@@ -959,7 +949,7 @@ impl Tree {
 
 	/// Flushes the active memtable to disk
 	pub fn flush(&self) -> Result<()> {
-		self.core.make_room_for_write(true)
+		self.core.make_room_for_write(true) // Force flush, bypass threshold
 	}
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
