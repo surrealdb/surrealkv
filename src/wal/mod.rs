@@ -549,15 +549,16 @@ impl WritableFile for BufferedFileWriter {
 
 // ===== Cleanup =====
 
-/// Cleans up old WAL segments, keeping only the latest segment.
+/// Cleans up old WAL segments based on the minimum log number with unflushed data.
 ///
-/// This function removes all WAL segments except the latest one, since we use
-/// one segment per memtable and only the latest segment contains unflushed data.
-/// All older segments have been flushed to SSTables and are no longer needed.
+/// This function removes all WAL segments with ID < min_wal_number, since they have
+/// been flushed to SSTables and are no longer needed. The manifest tracks which WALs
+/// have been flushed.
 ///
 /// # Arguments
 ///
 /// * `wal_dir` - The directory containing the WAL segments
+/// * `min_wal_number` - The minimum WAL number that contains unflushed data
 ///
 /// # Returns
 ///

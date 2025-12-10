@@ -60,10 +60,12 @@ fn test_cleanup_old_segments() {
 		segment_ids_before.len()
 	);
 
-	// Run cleanup - should remove all except the latest segment
+	// Run cleanup - should remove all segments older than the latest one
+	// Set min_wal_number to the latest segment ID to keep only that segment
+	let latest_segment_id = *segment_ids_before.iter().max().unwrap();
 	let removed_count = cleanup_old_segments(temp_dir.path()).unwrap();
 
-	// Verify at least 4 segments were removed (keeping only the latest)
+	// Verify at least 4 segments were removed (keeping only segments >= latest_segment_id)
 	assert!(removed_count >= 4, "Expected at least 4 segments to be removed, got {removed_count}");
 
 	// Verify only the latest segment remains
@@ -78,9 +80,8 @@ fn test_cleanup_old_segments() {
 	);
 
 	// The remaining segment should be the latest one
-	let latest_segment_id = segment_ids_before.iter().max().unwrap();
 	assert_eq!(
-		remaining_segment_ids[0], *latest_segment_id,
+		remaining_segment_ids[0], latest_segment_id,
 		"Expected latest segment {} to remain, but got {}",
 		latest_segment_id, remaining_segment_ids[0]
 	);
@@ -135,7 +136,8 @@ fn test_wal_replay_latest_segment_only() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Replay WAL - should only replay the latest segment
-	let (sequence_number, corruption_info) = replay_wal(temp_dir.path(), &memtable).unwrap();
+	let (sequence_number_opt, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries in memtable
 	let entry_count = memtable.iter().count();

@@ -505,12 +505,12 @@ impl std::ops::Deref for Core {
 
 impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
-	///
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
+		min_wal_number: u64,
 		context: &str, // "Database startup" or "Database reload"
 		mut set_recovered_memtable: F,
-	) -> Result<u64>
+	) -> Result<Option<u64>>
 	where
 		F: FnMut(Arc<MemTable>) -> Result<()>,
 	{
@@ -518,10 +518,14 @@ impl Core {
 		let recovered_memtable = Arc::new(MemTable::default());
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num = match replay_wal(wal_path, &recovered_memtable)? {
-			(seq_num, None) => {
-				// No corruption detected, successful replay
-				seq_num
+		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number)? {
+			(Some(seq_num), None) => {
+				// WAL was replayed successfully, no corruption
+				Some(seq_num)
+			}
+			(None, None) => {
+				// WAL was skipped or empty
+				None
 			}
 			(_seq_num, Some((corrupted_segment_id, last_valid_offset))) => {
 				log::warn!(
@@ -542,13 +546,14 @@ impl Core {
 				// After repair, try to replay again to get any additional data
 				// Create a fresh memtable for the retry
 				let retry_memtable = Arc::new(MemTable::default());
-				match replay_wal(wal_path, &retry_memtable) {
+				match replay_wal(wal_path, &retry_memtable, min_wal_number) {
 					Ok((retry_seq_num, None)) => {
 						// Successful replay after repair, use the retry memtable
 						if !retry_memtable.is_empty() {
 							set_recovered_memtable(retry_memtable)?;
 						}
-						retry_seq_num
+						// CRITICAL: Return early here to avoid overwriting with original partial data
+						return Ok(retry_seq_num);
 					}
 					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
 						// WAL is still corrupted after repair - this is a serious problem
@@ -566,11 +571,13 @@ impl Core {
 			}
 		};
 
+		// Only set recovered_memtable if we didn't go through repair path
+		// (repair path returns early with retry_memtable already set)
 		if !recovered_memtable.is_empty() {
 			set_recovered_memtable(recovered_memtable)?;
 		}
 
-		Ok(wal_seq_num)
+		Ok(wal_seq_num_opt)
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -586,18 +593,38 @@ impl Core {
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
+		let min_wal_number = inner.level_manifest.read()?.get_log_number();
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num =
-			Self::replay_wal_with_repair(&wal_path, "Database startup", |memtable| {
+		let wal_seq_num_opt = Self::replay_wal_with_repair(
+			&wal_path,
+			min_wal_number,
+			"Database startup",
+			|memtable| {
 				let mut active_memtable = inner.active_memtable.write()?;
 				*active_memtable = memtable;
 				Ok(())
-			})?;
-
+			},
+		)?;
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = inner.level_manifest.read()?.lsn();
-		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
+		let manifest_last_seq = inner.level_manifest.read()?.lsn();
+
+		let max_seq_num = match wal_seq_num_opt {
+			Some(wal_seq) => {
+				let effective = std::cmp::max(manifest_last_seq, wal_seq);
+				log::debug!(
+					"WAL replayed: manifest_last_seq={}, wal_seq={}, using max={}",
+					manifest_last_seq,
+					wal_seq,
+					effective
+				);
+				effective
+			}
+			None => {
+				log::debug!("WAL skipped or empty, using manifest_last_seq={}", manifest_last_seq);
+				manifest_last_seq
+			}
+		};
 
 		// Set visible sequence number ts to highest of lsn from Wal, or latest table in manifest
 		commit_pipeline.set_seq_num(max_seq_num);
@@ -820,18 +847,28 @@ impl Tree {
 
 		// Replay any WAL entries that were restored
 		let wal_path = self.core.inner.opts.path.join("wal");
-		let wal_seq_num =
-			Core::replay_wal_with_repair(&wal_path, "Database restore", |memtable| {
+		let min_wal_number = self.core.inner.level_manifest.read()?.get_log_number();
+		let wal_seq_num_opt = Core::replay_wal_with_repair(
+			&wal_path,
+			min_wal_number,
+			"Database restore",
+			|memtable| {
 				let mut active_memtable = self.core.inner.active_memtable.write()?;
 				*active_memtable = memtable;
 				Ok(())
-			})?;
+			},
+		)?;
 
-		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let current_seq_num = self.core.inner.level_manifest.read()?.lsn();
-		let max_seq_num = std::cmp::max(current_seq_num, wal_seq_num);
+		// Get last_sequence from manifest
+		let manifest_last_seq = self.core.inner.level_manifest.read()?.get_last_sequence();
 
-		// Set visible sequence number to highest of lsn from WAL or latest table in manifest
+		// Determine effective sequence number (same logic as Core::new)
+		let max_seq_num = match wal_seq_num_opt {
+			Some(wal_seq) => std::cmp::max(manifest_last_seq, wal_seq),
+			None => manifest_last_seq,
+		};
+
+		// Set visible sequence number
 		self.core.commit_pipeline.set_seq_num(max_seq_num);
 
 		Ok(metadata)
