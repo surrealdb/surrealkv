@@ -900,7 +900,7 @@ impl Core {
 	///
 	/// 1. Commit pipeline shutdown - stops accepting new writes
 	/// 2. Background tasks stopped - waits for ongoing operations
-	/// 3. Active memtable flush - if non-empty, flush to SST (NO WAL rotation)
+	/// 3. Active memtable flush - if flush_on_close enabled AND memtable non-empty, flush to SST (NO WAL rotation)
 	/// 4. WAL close - sync and close current WAL file
 	/// 5. Directory sync - ensure all metadata is persisted
 	/// 6. Lock release - allow other processes to open the database
@@ -932,31 +932,35 @@ impl Core {
 			log::debug!("VLog GC manager stopped");
 		}
 
-		// Step 3: Always flush the active memtable if it has data
+		// Step 3: Conditionally flush the active memtable based on flush_on_close option
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
-		let active_memtable = self.inner.active_memtable.read()?;
-		let memtable_size = active_memtable.size();
-		let memtable_entries = active_memtable.iter().count();
+		if self.inner.opts.flush_on_close {
+			let active_memtable = self.inner.active_memtable.read()?;
+			let memtable_size = active_memtable.size();
+			let memtable_entries = active_memtable.iter().count();
 
-		if !active_memtable.is_empty() {
-			drop(active_memtable);
+			if !active_memtable.is_empty() {
+				drop(active_memtable);
 
-			log::info!(
-				"Flushing active memtable on shutdown: entries={}, size_bytes={}",
-				memtable_entries,
-				memtable_size
-			);
+				log::info!(
+					"Flushing active memtable on shutdown (flush_on_close=true): entries={}, size_bytes={}",
+					memtable_entries,
+					memtable_size
+				);
 
-			// Direct flush without WAL rotation
-			// Uses centralized flush logic that updates manifest log_number
-			// Pass None for flushed_wal_number since we didn't rotate
-			self.inner.flush_memtable_and_update_manifest(None).map_err(|e| {
-				Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
-			})?;
+				// Direct flush without WAL rotation
+				// Uses centralized flush logic that updates manifest log_number
+				// Pass None for flushed_wal_number since we didn't rotate
+				self.inner.flush_memtable_and_update_manifest(None).map_err(|e| {
+					Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
+				})?;
 
-			log::info!("Active memtable flushed successfully on shutdown");
+				log::info!("Active memtable flushed successfully on shutdown");
+			} else {
+				log::debug!("Active memtable is empty, skipping shutdown flush");
+			}
 		} else {
-			log::debug!("Active memtable is empty, skipping shutdown flush");
+			log::info!("Skipping memtable flush on shutdown (flush_on_close=false)");
 		}
 
 		// Step 3.5: Clean up obsolete WAL files (synchronous cleanup)
@@ -1357,6 +1361,12 @@ impl TreeBuilder {
 	/// Enables or disables versioned queries with timestamp tracking
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
+		self
+	}
+
+	/// Controls whether to flush the active memtable during database shutdown.
+	pub fn with_flush_on_close(mut self, value: bool) -> Self {
+		self.opts = self.opts.with_flush_on_close(value);
 		self
 	}
 
@@ -3748,6 +3758,7 @@ mod tests {
 
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.max_memtable_size = 1024;
+			opts.flush_on_close = true;
 		});
 
 		// Phase 1: Write data and clean shutdown
@@ -4420,6 +4431,7 @@ mod tests {
 
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+			opts.flush_on_close = true;
 		});
 
 		let sst_dir = opts.sstable_dir();
@@ -4558,7 +4570,12 @@ mod tests {
 
 		// Cycle 3: Reopen, write but DON'T flush, close (tests shutdown flush)
 		{
-			let tree = Tree::new(opts.clone()).unwrap();
+			// Enable flush_on_close to test shutdown flush behavior
+			let opts_with_flush = Arc::new(Options {
+				flush_on_close: true,
+				..(*opts).clone()
+			});
+			let tree = Tree::new(opts_with_flush).unwrap();
 
 			// Verify both previous cycles' data
 			let txn = tree.begin().unwrap();
@@ -4574,7 +4591,7 @@ mod tests {
 
 			let sst_before_close = count_ssts();
 
-			// Close WITHOUT explicit flush (shutdown should flush)
+			// Close WITHOUT explicit flush (shutdown should flush because flush_on_close=true)
 			tree.close().await.unwrap();
 
 			let sst_after_close = count_ssts();
@@ -4582,7 +4599,7 @@ mod tests {
 			assert_eq!(
 				sst_after_close,
 				sst_before_close + 1,
-				"Shutdown should flush and create SST"
+				"Shutdown should flush and create SST when flush_on_close=true"
 			);
 		}
 
@@ -4594,6 +4611,121 @@ mod tests {
 			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec().into()));
 			assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec().into()));
 			assert_eq!(txn.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec().into()));
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn test_close_without_flush() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.flush_on_close = false; // Default behavior
+			opts.max_memtable_size = 1024 * 1024;
+		});
+
+		let sst_count_before;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write some data that won't trigger auto-flush
+			for i in 0..10 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Count SSTs before close
+			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			sst_count_before = manifest.iter().count();
+			drop(manifest);
+
+			// Close without flush (flush_on_close=false)
+			tree.close().await.unwrap();
+		}
+
+		// Reopen and verify SST count hasn't changed
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let sst_count_after = manifest.iter().count();
+
+			assert_eq!(
+				sst_count_after, sst_count_before,
+				"SST count should not increase when flush_on_close=false"
+			);
+
+			// Data should still be accessible via WAL recovery
+			let txn = tree.begin().unwrap();
+			assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec().into()));
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn test_flush_on_close_option_comparison() {
+		// Test with flush_on_close = true
+		{
+			let temp_dir = TempDir::new("test").unwrap();
+			let opts = create_test_options(temp_dir.path().to_path_buf(), |opts| {
+				opts.flush_on_close = true;
+			});
+
+			let sst_before;
+			{
+				let tree = Tree::new(opts.clone()).unwrap();
+				let mut txn = tree.begin().unwrap();
+				txn.set(b"test", b"data").unwrap();
+				txn.commit().await.unwrap();
+
+				let manifest = tree.core.inner.level_manifest.read().unwrap();
+				sst_before = manifest.iter().count();
+				drop(manifest);
+
+				tree.close().await.unwrap();
+			}
+
+			let tree = Tree::new(opts.clone()).unwrap();
+			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let sst_after = manifest.iter().count();
+
+			assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
+			tree.close().await.unwrap();
+		}
+
+		// Test with flush_on_close = false
+		{
+			let temp_dir = TempDir::new("test").unwrap();
+			let opts = create_test_options(temp_dir.path().to_path_buf(), |opts| {
+				opts.flush_on_close = false;
+			});
+
+			let sst_before;
+			{
+				let tree = Tree::new(opts.clone()).unwrap();
+				let mut txn = tree.begin().unwrap();
+				txn.set(b"test", b"data").unwrap();
+				txn.commit().await.unwrap();
+
+				let manifest = tree.core.inner.level_manifest.read().unwrap();
+				sst_before = manifest.iter().count();
+				drop(manifest);
+
+				tree.close().await.unwrap();
+			}
+
+			let tree = Tree::new(opts.clone()).unwrap();
+			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let sst_after = manifest.iter().count();
+
+			assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
+
+			// But data should still be accessible via WAL
+			let txn = tree.begin().unwrap();
+			assert_eq!(txn.get(b"test").unwrap(), Some(b"data".to_vec().into()));
 
 			tree.close().await.unwrap();
 		}

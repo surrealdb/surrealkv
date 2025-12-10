@@ -202,6 +202,13 @@ pub struct Options {
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
 	pub(crate) clock: Arc<dyn LogicalClock>,
+
+	// Shutdown configuration
+	/// If true, flush active memtable to SSTable during shutdown.
+	/// If false, skip flush for faster shutdown (unpersisted data will be lost if WAL disabled).
+	///
+	/// DEFAULT: false
+	pub flush_on_close: bool,
 }
 
 impl Default for Options {
@@ -230,6 +237,7 @@ impl Default for Options {
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
+			flush_on_close: false,
 		}
 	}
 }
@@ -333,6 +341,24 @@ impl Options {
 			// All values should go to VLog for versioned queries
 			self.vlog_value_threshold = 0;
 		}
+		self
+	}
+
+	/// Controls whether to flush the active memtable during database shutdown.
+	///
+	/// When enabled, ensures all in-memory data is persisted to SSTables before closing,
+	/// at the cost of slower shutdown. When disabled, allows faster shutdown but unpersisted
+	/// data in the active memtable will be lost if WAL is not enabled.
+	///
+	/// # Arguments
+	///
+	/// * `value` - If true, flush on close. If false, skip flush.
+	///
+	/// # Default
+	///
+	/// false (skip flush for faster shutdown)
+	pub const fn with_flush_on_close(mut self, value: bool) -> Self {
+		self.flush_on_close = value;
 		self
 	}
 
