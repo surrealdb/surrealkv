@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::{
 	fs::{create_dir_all, File},
-	path::Path,
+	path::{Path, PathBuf},
 	sync::{Arc, Mutex, RwLock},
 };
 
@@ -37,6 +37,10 @@ use bytes::Bytes;
 
 use async_trait::async_trait;
 
+// ===== Type Aliases =====
+/// Return type for flush_active_memtable_and_rotate_wal:
+/// (table_id, flushed_memtable, old_wal_number, wal_dir)
+type FlushResult = (u64, Arc<MemTable>, u64, PathBuf);
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
 /// Compaction is essential for maintaining read performance by merging
@@ -135,10 +139,16 @@ impl CoreInner {
 		// The oracle provides monotonic timestamps for transaction ordering
 		let oracle = Oracle::new(opts.clock.clone());
 
-		// Initialize WAL and level manifest
-		let wal_path = opts.wal_dir();
-		let wal = Some(Wal::open(&wal_path, wal::Options::default())?);
+		// Initialize level manifest FIRST to get log_number
 		let manifest = LevelManifest::new(opts.clone())?;
+		let manifest_log_number = manifest.get_log_number();
+
+		// Initialize WAL starting from manifest.log_number
+		let wal_path = opts.wal_dir();
+		let wal_instance =
+			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+
+		let wal = Some(wal_instance);
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize versioned index if versioned queries are enabled
@@ -182,10 +192,11 @@ impl CoreInner {
 	/// 2. A new empty active memtable is created for new writes
 	/// 3. The immutable memtable is flushed to disk as an SSTable
 	/// 4. The new SSTable is added to Level 0
-	fn make_room_for_write(&self) -> Result<()> {
+	fn make_room_for_write(&self, force: bool) -> Result<()> {
 		// Atomically flush memtable and rotate WAL under a single lock
 		// This prevents race conditions where writes could go to the wrong WAL segment
-		let Some((table_id, flushed_memtable)) = self.flush_active_memtable_and_rotate_wal()?
+		let Some((table_id, flushed_memtable, old_wal_number, wal_dir)) =
+			self.flush_active_memtable_and_rotate_wal(force)?
 		else {
 			return Ok(());
 		};
@@ -196,15 +207,15 @@ impl CoreInner {
 
 		// Add the new SSTable to Level 0
 		// L0 is special: it contains recently flushed SSTables that may have overlapping keys
-		self.add_table_to_l0(table)?;
+		self.add_table_to_l0(table, old_wal_number)?;
 
 		// Clean up old WAL segments since the memtable has been successfully flushed
 		// Done asynchronously to avoid blocking the flush operation
-		let wal_guard = self.wal.as_ref().unwrap().read();
-		let wal_dir = wal_guard.get_dir_path().to_path_buf();
+		// Use the NEW log_number (after flush) for cleanup
+		let new_log_number = old_wal_number + 1;
 		tokio::spawn(async move {
-			if let Err(e) = cleanup_old_segments(&wal_dir) {
-				log::warn!("Failed to clean up old WAL segments: {e}");
+			if let Err(e) = cleanup_old_segments(&wal_dir, new_log_number) {
+				log::warn!("Failed to clean up old WAL segments: {}", e);
 			}
 		});
 
@@ -215,11 +226,16 @@ impl CoreInner {
 	///
 	/// This prevents race conditions by holding the active_memtable write lock
 	/// for both the memtable swap and WAL rotation operations.
-	fn flush_active_memtable_and_rotate_wal(&self) -> Result<Option<(u64, Arc<MemTable>)>> {
+	fn flush_active_memtable_and_rotate_wal(&self, force: bool) -> Result<Option<FlushResult>> {
 		let mut active_memtable = self.active_memtable.write()?;
 
 		// Don't flush an empty memtable
 		if active_memtable.is_empty() {
+			return Ok(None);
+		}
+
+		// Check size threshold unless force flush (for explicit flush() calls)
+		if !force && active_memtable.size() < self.opts.max_memtable_size {
 			return Ok(None);
 		}
 
@@ -239,9 +255,11 @@ impl CoreInner {
 		// - New writes (to the new active memtable) go to a new WAL segment
 		// - No race condition between memtable swap and WAL rotation
 		let mut wal_guard = self.wal.as_ref().unwrap().write();
+		let old_wal_number = wal_guard.get_active_log_number();
+		let wal_dir = wal_guard.get_dir_path().to_path_buf();
 		wal_guard.rotate()?;
 
-		Ok(Some((memtable_id, flushed_memtable)))
+		Ok(Some((memtable_id, flushed_memtable, old_wal_number, wal_dir)))
 	}
 
 	/// Adds a newly flushed SSTable to Level 0.
@@ -251,7 +269,7 @@ impl CoreInner {
 	/// - SSTables may have overlapping key ranges
 	/// - Queries must check all L0 SSTables
 	/// - Too many L0 files triggers compaction to maintain read performance
-	fn add_table_to_l0(&self, table: Arc<Table>) -> Result<()> {
+	fn add_table_to_l0(&self, table: Arc<Table>, old_wal_number: u64) -> Result<()> {
 		let mut original_manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 		let table_id = table.id;
@@ -259,6 +277,8 @@ impl CoreInner {
 		// Create a changeset to add the table
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, table));
+		// Set log_number to indicate the flushed WAL
+		changeset.log_number = Some(old_wal_number + 1);
 
 		// Apply the changeset
 		original_manifest.apply_changeset(&changeset)?;
@@ -282,7 +302,7 @@ impl CoreInner {
 impl CompactionOperations for CoreInner {
 	/// Triggers a memtable flush to create space for new writes
 	fn compact_memtable(&self) -> Result<()> {
-		self.make_room_for_write()
+		self.make_room_for_write(false)
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -505,6 +525,10 @@ impl std::ops::Deref for Core {
 
 impl Core {
 	/// Function to replay WAL with automatic repair on corruption.
+	///
+	/// Returns Option<u64>:
+	/// - Some(seq_num) if WAL was actually replayed
+	/// - None if WAL was skipped (already flushed) or empty
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
@@ -607,7 +631,7 @@ impl Core {
 			},
 		)?;
 		// Update sequence number to max of LSM sequence number and WAL sequence number
-		let manifest_last_seq = inner.level_manifest.read()?.lsn();
+		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
 
 		let max_seq_num = match wal_seq_num_opt {
 			Some(wal_seq) => {
@@ -684,15 +708,46 @@ impl Core {
 
 		// Step 3: Flush the active memtable only if it exceeds the configured size
 		let active_memtable = self.inner.active_memtable.read()?;
-		if active_memtable.size() > self.inner.opts.max_memtable_size {
+
+		if !active_memtable.is_empty() {
+			drop(active_memtable);
+
+			// Direct flush without WAL rotation
+			// Uses centralized flush logic that updates manifest log_number
+			// Pass None for flushed_wal_number since we didn't rotate
 			self.inner.compact_memtable()?;
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		if let Some(ref wal) = self.inner.wal {
+			let wal_dir = wal.read().get_dir_path().to_path_buf();
+			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+
+			log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
+
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+				Ok(count) if count > 0 => {
+					log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+				}
+				Ok(_) => {
+					log::debug!("No obsolete WAL files to clean up");
+				}
+				Err(e) => {
+					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
+				}
+			}
+		}
+
+		// Step 4: Close the WAL to ensure all data is flushed
+		// This is safe now because all background tasks that could write to WAL are stopped
+		if let Some(ref wal) = self.inner.wal {
+			let wal_log_number = wal.read().get_active_log_number();
+			log::info!("Closing WAL: active_log_number={}", wal_log_number);
+
 			let mut wal_guard = wal.write();
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {e}")))?;
+			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
+			log::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
 
 		// Ster 5: Close the versioned index if present
@@ -904,7 +959,7 @@ impl Tree {
 
 	/// Flushes the active memtable to disk
 	pub fn flush(&self) -> Result<()> {
-		self.core.make_room_for_write()
+		self.core.make_room_for_write(true)
 	}
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {

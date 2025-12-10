@@ -53,49 +53,49 @@ impl Wal {
 		})
 	}
 
-	// /// Opens or creates a WAL instance starting at a specific log number.
-	// ///
-	// /// This is used when the manifest indicates a specific log_number should be used,
-	// /// avoiding the creation of intermediate empty WAL files.
-	// ///
-	// /// # Arguments
-	// ///
-	// /// * `dir` - WAL directory path
-	// /// * `starting_log_number` - The log number to start from
-	// /// * `opts` - WAL options
-	// ///
-	// /// # Behavior
-	// ///
-	// /// Instead of creating intermediate empty files (0, 1, 2, 3, 4), this directly
-	// /// creates the WAL at the target number (4).
-	// pub(crate) fn open_with_log_number(
-	// 	dir: &Path,
-	// 	starting_log_number: u64,
-	// 	opts: Options,
-	// ) -> Result<Self> {
-	// 	// Ensure the options are valid
-	// 	opts.validate()?;
+	/// Opens or creates a WAL instance starting at a specific log number.
+	///
+	/// This is used when the manifest indicates a specific log_number should be used,
+	/// avoiding the creation of intermediate empty WAL files.
+	///
+	/// # Arguments
+	///
+	/// * `dir` - WAL directory path
+	/// * `starting_log_number` - The log number to start from
+	/// * `opts` - WAL options
+	///
+	/// # Behavior
+	///
+	/// Instead of creating intermediate empty files (0, 1, 2, 3, 4), this directly
+	/// creates the WAL at the target number (4).
+	pub(crate) fn open_with_log_number(
+		dir: &Path,
+		starting_log_number: u64,
+		opts: Options,
+	) -> Result<Self> {
+		// Ensure the options are valid
+		opts.validate()?;
 
-	// 	// Ensure the directory exists with proper permissions
-	// 	Self::prepare_directory(dir, &opts)?;
+		// Ensure the directory exists with proper permissions
+		Self::prepare_directory(dir, &opts)?;
 
-	// 	// Clean up any stale .wal.repair files from previous crashed repair attempts
-	// 	Self::cleanup_stale_repair_files(dir)?;
+		// Clean up any stale .wal.repair files from previous crashed repair attempts
+		Self::cleanup_stale_repair_files(dir)?;
 
-	// 	// Use the provided log number directly (no calculation from disk)
-	// 	let active_log_number = starting_log_number;
+		// Use the provided log number directly (no calculation from disk)
+		let active_log_number = starting_log_number;
 
-	// 	// Create the active Writer at the specified log number
-	// 	let active_writer = Self::create_writer(dir, active_log_number, &opts)?;
+		// Create the active Writer at the specified log number
+		let active_writer = Self::create_writer(dir, active_log_number, &opts)?;
 
-	// 	Ok(Self {
-	// 		active_writer,
-	// 		active_log_number,
-	// 		dir: dir.to_path_buf(),
-	// 		opts,
-	// 		closed: false,
-	// 	})
-	// }
+		Ok(Self {
+			active_writer,
+			active_log_number,
+			dir: dir.to_path_buf(),
+			opts,
+			closed: false,
+		})
+	}
 
 	/// Creates a new Writer for the given log number.
 	/// If the segment file already exists, appends to it instead of overwriting.
@@ -337,10 +337,10 @@ impl Wal {
 		&self.dir
 	}
 
-	// /// Returns the active log number
-	// pub(crate) fn get_active_log_number(&self) -> u64 {
-	// 	self.active_log_number
-	// }
+	/// Returns the active log number
+	pub(crate) fn get_active_log_number(&self) -> u64 {
+		self.active_log_number
+	}
 
 	/// Explicitly rotates the active WAL to a new file.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
