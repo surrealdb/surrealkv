@@ -16,7 +16,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+		InternalKey, InternalKeyKind,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -289,7 +289,8 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Determine the separator key between the current and next block.
-		// TODO: check if this has to be a separator or successor
+		// The separator function already returns an encoded InternalKey with the
+		// appropriate user key separator and MAX seq_num/timestamp.
 		let separator_key = self.internal_cmp.separator(&block.last_key, next_key);
 
 		self.prev_block_last_key = block.last_key.clone();
@@ -298,16 +299,10 @@ impl<W: Write> TableWriter<W> {
 		let contents = block.finish();
 		let handle = self.write_compressed_block(contents, self.opts.compression)?;
 
-		// Encode the block handle and add it to the index block.
-		let sep_key = InternalKey::new(
-			Bytes::from(separator_key.clone()),
-			INTERNAL_KEY_SEQ_NUM_MAX,
-			InternalKeyKind::Separator,
-			INTERNAL_KEY_TIMESTAMP_MAX,
-		);
+		// Add the separator key and block handle to the index.
+		// Note: separator_key is already an encoded InternalKey from the comparator.
 		let handle_encoded = handle.encode();
-
-		self.partitioned_index.add(&sep_key.encode(), &handle_encoded)?;
+		self.partitioned_index.add(&separator_key, &handle_encoded)?;
 
 		// Prepare for the next data block.
 		self.data_block = Some(BlockWriter::new(self.opts.clone()));
@@ -1339,7 +1334,7 @@ mod tests {
 	use std::vec;
 	use test_log::test;
 
-	use crate::sstable::InternalKey;
+	use crate::sstable::{InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
 
 	use super::*;
 	use rand::rngs::StdRng;
@@ -1410,7 +1405,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(724, actual);
+		assert_eq!(692, actual);
 	}
 
 	#[test]
