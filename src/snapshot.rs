@@ -6,6 +6,7 @@ use std::sync::{atomic::AtomicU32, Arc};
 
 use crate::error::{Error, Result};
 use crate::iter::{BoxedCursor, DoubleEndedStdIterAdapter};
+use crate::levels::level_iterator::LevelIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
@@ -22,14 +23,81 @@ use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 /// Type alias for versioned entries with key, timestamp, and optional value
 use interval_heap::IntervalHeap;
 
+/// Inline buffer size for cached key bytes - covers most real-world keys without heap allocation.
+/// This matches the INLINE_KEY_SIZE used in block.rs for consistency.
+const INLINE_KEY_SIZE: usize = 64;
+
+/// An optimized key buffer that avoids heap allocation for small keys.
+/// Used by CursorIntervalHeapItem to store cached key bytes.
+#[derive(Clone)]
+struct InlineKeyBuffer {
+	inline_buf: [u8; INLINE_KEY_SIZE],
+	heap_buf: Vec<u8>,
+	len: usize,
+	is_inline: bool,
+}
+
+impl InlineKeyBuffer {
+	/// Create a new buffer from key bytes
+	#[inline]
+	fn new(key_bytes: &[u8]) -> Self {
+		let len = key_bytes.len();
+		if len <= INLINE_KEY_SIZE {
+			let mut inline_buf = [0u8; INLINE_KEY_SIZE];
+			inline_buf[..len].copy_from_slice(key_bytes);
+			Self {
+				inline_buf,
+				heap_buf: Vec::new(),
+				len,
+				is_inline: true,
+			}
+		} else {
+			Self {
+				inline_buf: [0u8; INLINE_KEY_SIZE],
+				heap_buf: key_bytes.to_vec(),
+				len,
+				is_inline: false,
+			}
+		}
+	}
+
+	/// Get the key bytes as a slice
+	#[inline]
+	fn as_slice(&self) -> &[u8] {
+		if self.is_inline {
+			&self.inline_buf[..self.len]
+		} else {
+			&self.heap_buf[..self.len]
+		}
+	}
+}
+
 /// Cursor-based heap item for merge iteration.
-/// Stores the decoded key for efficient comparison via direct field access.
-#[derive(Eq)]
+/// Stores cached raw key bytes for zero-allocation comparison.
+#[derive(Clone)]
 pub(crate) struct CursorIntervalHeapItem {
-	/// Decoded key for efficient comparison (direct field access, no byte parsing)
-	key: Arc<InternalKey>,
+	/// Cached raw key bytes from current iterator position.
+	/// Using inline buffer to avoid heap allocation for small keys.
+	cached_key: InlineKeyBuffer,
 	/// Index into the iterators vector
 	iterator_index: usize,
+}
+
+impl CursorIntervalHeapItem {
+	/// Create a new heap item from raw key bytes
+	#[inline]
+	pub(crate) fn new(key_bytes: &[u8], iterator_index: usize) -> Self {
+		Self {
+			cached_key: InlineKeyBuffer::new(key_bytes),
+			iterator_index,
+		}
+	}
+
+	/// Get the cached key bytes
+	#[inline]
+	pub(crate) fn key_bytes(&self) -> &[u8] {
+		self.cached_key.as_slice()
+	}
 }
 
 impl PartialEq for CursorIntervalHeapItem {
@@ -38,19 +106,15 @@ impl PartialEq for CursorIntervalHeapItem {
 	}
 }
 
+impl Eq for CursorIntervalHeapItem {}
+
 impl Ord for CursorIntervalHeapItem {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// First compare by user key (direct field access - no byte parsing!)
-		match self.key.user_key.cmp(&other.key.user_key) {
-			Ordering::Equal => {
-				// Same user key, compare by sequence number in DESCENDING order
-				// (higher sequence number = more recent)
-				match other.key.seq_num().cmp(&self.key.seq_num()) {
-					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
-					ord => ord,
-				}
-			}
-			ord => ord, // Different user keys
+		// Use zero-allocation raw byte comparison
+		match InternalKey::compare_encoded(self.cached_key.as_slice(), other.cached_key.as_slice())
+		{
+			Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
+			ord => ord,
 		}
 	}
 }
@@ -728,9 +792,14 @@ impl<'a> KMergeIterator<'a> {
 
 			// Tables - these implement LSMIterator directly
 			for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
-				// Optimization: Skip tables that are completely outside the query range
+				if level.tables.is_empty() {
+					continue;
+				}
+
 				if level_idx == 0 {
-					// Level 0: Tables can overlap, so we check all but skip those completely outside range
+					// Level 0: Tables can overlap, so we need each table as a separate
+					// iterator in the merge heap to maintain correct ordering.
+					// We still use LevelIterator for each table to benefit from lazy seeking.
 					for table in &level.tables {
 						// Skip tables completely before or after the range
 						if table.is_before_range(&query_range) || table.is_after_range(&query_range)
@@ -775,48 +844,18 @@ impl<'a> KMergeIterator<'a> {
 						iterators.push(Box::new(table_iter));
 					}
 				} else {
-					// Level 1+: Tables have non-overlapping key ranges, use binary search
-					let start_idx = level.find_first_overlapping_table(&query_range);
-					let end_idx = level.find_last_overlapping_table(&query_range);
-
-					for table in &level.tables[start_idx..end_idx] {
-						let mut table_iter = table.iter(keys_only);
-						// Seek to start if unbounded
-						match &range.0 {
-							Bound::Included(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									INTERNAL_KEY_SEQ_NUM_MAX,
-									InternalKeyKind::Max,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-							}
-							Bound::Excluded(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									0,
-									InternalKeyKind::Delete,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-								// If we're at the excluded key, advance once
-								if table_iter.valid() {
-									let current_user_key =
-										InternalKey::extract_user_key(table_iter.key_bytes());
-									if current_user_key == key.as_slice() {
-										table_iter.advance();
-									}
-								}
-							}
-							Bound::Unbounded => {
-								table_iter.seek_to_first();
-							}
-						}
-
-						// Box table iterator directly as BoxedCursor
-						iterators.push(Box::new(table_iter));
-					}
+					// Level 1+: Tables have non-overlapping key ranges.
+					// Use a single LevelIterator per level to reduce heap size from
+					// O(total_tables) to O(num_levels).
+					// LevelIterator lazily opens tables and only keeps one active at a time.
+					let level_iter = LevelIterator::new(
+						level_idx,
+						level.tables.clone(),
+						&query_range,
+						range.0.clone(),
+						keys_only,
+					);
+					iterators.push(Box::new(level_iter));
 				}
 			}
 		}
@@ -851,10 +890,8 @@ impl<'a> KMergeIterator<'a> {
 					iter.advance();
 				}
 				if iter.valid() {
-					self.heap.push(CursorIntervalHeapItem {
-						key: iter.decoded_key(),
-						iterator_index: idx,
-					});
+					self.heap
+						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 			}
 		}
@@ -869,10 +906,8 @@ impl<'a> KMergeIterator<'a> {
 				// Re-position at last entry for backward iteration
 				iter.seek_to_last();
 				if iter.valid() {
-					self.heap.push(CursorIntervalHeapItem {
-						key: iter.decoded_key(),
-						iterator_index: idx,
-					});
+					self.heap
+						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 			}
 		}
@@ -907,8 +942,49 @@ impl Iterator for KMergeIterator<'_> {
 			// Get the smallest item from the heap
 			let heap_item = self.heap.pop_min()?;
 			let idx = heap_item.iterator_index;
+			let cached_key_bytes = heap_item.key_bytes();
 
-			// Get value from the cursor (skip copy if keys_only) and use the key from heap_item
+			// Extract seq_num for visibility check (zero-alloc)
+			let seq_num = InternalKey::extract_seq_num(cached_key_bytes);
+
+			// Check visibility (seq_num <= snapshot_seq_num)
+			if seq_num > self.snapshot_seq_num {
+				// Still need to advance the iterator before skipping
+				unsafe {
+					let iterators = self.iterators.as_mut();
+					let iter = &mut iterators[idx];
+					if iter.advance() && iter.valid() {
+						self.heap
+							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					}
+				}
+				continue;
+			}
+
+			// Extract user_key for range check (zero-alloc)
+			let user_key = InternalKey::extract_user_key(cached_key_bytes);
+
+			// Check if the key exceeds the range end
+			let skip = match &self.range_end {
+				Bound::Included(end) => user_key > end.as_slice(),
+				Bound::Excluded(end) => user_key >= end.as_slice(),
+				Bound::Unbounded => false,
+			};
+
+			if skip {
+				// Still need to advance the iterator before skipping
+				unsafe {
+					let iterators = self.iterators.as_mut();
+					let iter = &mut iterators[idx];
+					if iter.advance() && iter.valid() {
+						self.heap
+							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					}
+				}
+				continue;
+			}
+
+			// Get value from the cursor and advance
 			let value = unsafe {
 				let iterators = self.iterators.as_mut();
 				let iter = &mut iterators[idx];
@@ -921,39 +997,15 @@ impl Iterator for KMergeIterator<'_> {
 
 				// Advance the cursor and re-insert if valid
 				if iter.advance() && iter.valid() {
-					self.heap.push(CursorIntervalHeapItem {
-						key: iter.decoded_key(),
-						iterator_index: idx,
-					});
+					self.heap
+						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 
 				value
 			};
-			// Use the key from heap_item directly - no need to decode again!
-			let key = heap_item.key;
 
-			// Check visibility (seq_num <= snapshot_seq_num)
-			if key.seq_num() > self.snapshot_seq_num {
-				continue;
-			}
-
-			// Check if the key exceeds the range end
-			let user_key = key.user_key.as_ref();
-			match &self.range_end {
-				Bound::Included(end) => {
-					if user_key > end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Excluded(end) => {
-					if user_key >= end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Unbounded => {
-					// No end bound to check
-				}
-			}
+			// Decode the key only when returning (this is the only allocation per returned item)
+			let key = Arc::new(InternalKey::decode(cached_key_bytes));
 
 			// Return the key-value pair
 			return Some((key, value));
@@ -975,8 +1027,49 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 			// Get the largest item from the heap
 			let heap_item = self.heap.pop_max()?;
 			let idx = heap_item.iterator_index;
+			let cached_key_bytes = heap_item.key_bytes();
 
-			// Get value from the cursor (skip copy if keys_only) and use the key from heap_item
+			// Extract seq_num for visibility check (zero-alloc)
+			let seq_num = InternalKey::extract_seq_num(cached_key_bytes);
+
+			// Check visibility (seq_num <= snapshot_seq_num)
+			if seq_num > self.snapshot_seq_num {
+				// Still need to move iterator backwards before skipping
+				unsafe {
+					let iterators = self.iterators.as_mut();
+					let iter = &mut iterators[idx];
+					if iter.prev() && iter.valid() {
+						self.heap
+							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					}
+				}
+				continue;
+			}
+
+			// Extract user_key for range check (zero-alloc)
+			let user_key = InternalKey::extract_user_key(cached_key_bytes);
+
+			// Check if the key exceeds the range end
+			let skip = match &self.range_end {
+				Bound::Included(end) => user_key > end.as_slice(),
+				Bound::Excluded(end) => user_key >= end.as_slice(),
+				Bound::Unbounded => false,
+			};
+
+			if skip {
+				// Still need to move iterator backwards before skipping
+				unsafe {
+					let iterators = self.iterators.as_mut();
+					let iter = &mut iterators[idx];
+					if iter.prev() && iter.valid() {
+						self.heap
+							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					}
+				}
+				continue;
+			}
+
+			// Get value from the cursor and move backwards
 			let value = unsafe {
 				let iterators = self.iterators.as_mut();
 				let iter = &mut iterators[idx];
@@ -989,39 +1082,15 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 
 				// Move cursor backwards and re-insert if valid
 				if iter.prev() && iter.valid() {
-					self.heap.push(CursorIntervalHeapItem {
-						key: iter.decoded_key(),
-						iterator_index: idx,
-					});
+					self.heap
+						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 
 				value
 			};
-			// Use the key from heap_item directly - no need to decode again!
-			let key = heap_item.key;
 
-			// Check visibility (seq_num <= snapshot_seq_num)
-			if key.seq_num() > self.snapshot_seq_num {
-				continue;
-			}
-
-			// Check if the key exceeds the range end
-			let user_key = key.user_key.as_ref();
-			match &self.range_end {
-				Bound::Included(end) => {
-					if user_key > end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Excluded(end) => {
-					if user_key >= end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Unbounded => {
-					// No end bound to check
-				}
-			}
+			// Decode the key only when returning (this is the only allocation per returned item)
+			let key = Arc::new(InternalKey::decode(cached_key_bytes));
 
 			// Return the key-value pair
 			return Some((key, value));

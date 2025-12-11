@@ -138,6 +138,36 @@ impl InternalKey {
 		&encoded_key[..encoded_key.len().saturating_sub(16)]
 	}
 
+	/// Extract sequence number from encoded internal key bytes without allocation.
+	/// The trailer is at bytes [len-16..len-8] and contains (seq_num << 8) | kind.
+	#[inline]
+	pub(crate) fn extract_seq_num(encoded_key: &[u8]) -> u64 {
+		if encoded_key.len() < 16 {
+			return 0;
+		}
+		let n = encoded_key.len() - 16;
+		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
+		trailer >> 8
+	}
+
+	/// Compare two encoded internal keys without allocation.
+	/// Comparison order: user_key ascending, then seq_num descending.
+	/// This is the same ordering as InternalKey::cmp but operates on raw bytes.
+	#[inline]
+	pub(crate) fn compare_encoded(a: &[u8], b: &[u8]) -> Ordering {
+		let a_user = Self::extract_user_key(a);
+		let b_user = Self::extract_user_key(b);
+		match a_user.cmp(b_user) {
+			Ordering::Equal => {
+				// Extract seq_num and compare in descending order
+				let a_seq = Self::extract_seq_num(a);
+				let b_seq = Self::extract_seq_num(b);
+				b_seq.cmp(&a_seq) // Descending order
+			}
+			ord => ord,
+		}
+	}
+
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.as_ref().to_vec();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
@@ -203,5 +233,110 @@ impl Default for InternalKey {
 			timestamp: 0,
 			trailer: 0,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_compare_encoded_same_user_key_different_seq_num() {
+		// Keys with same user_key should be ordered by seq_num in descending order
+		let key1 = InternalKey::new(Bytes::from("key1"), 100, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::from("key1"), 50, InternalKeyKind::Set, 0);
+
+		let encoded1 = key1.encode();
+		let encoded2 = key2.encode();
+
+		// key1 (seq=100) should come before key2 (seq=50) due to descending seq order
+		assert_eq!(InternalKey::compare_encoded(&encoded1, &encoded2), Ordering::Less);
+		assert_eq!(InternalKey::compare_encoded(&encoded2, &encoded1), Ordering::Greater);
+
+		// Same key should be equal
+		assert_eq!(InternalKey::compare_encoded(&encoded1, &encoded1), Ordering::Equal);
+	}
+
+	#[test]
+	fn test_compare_encoded_different_user_key() {
+		// Different user keys should be ordered lexicographically
+		let key1 = InternalKey::new(Bytes::from("aaa"), 100, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::from("bbb"), 100, InternalKeyKind::Set, 0);
+
+		let encoded1 = key1.encode();
+		let encoded2 = key2.encode();
+
+		// "aaa" < "bbb" lexicographically
+		assert_eq!(InternalKey::compare_encoded(&encoded1, &encoded2), Ordering::Less);
+		assert_eq!(InternalKey::compare_encoded(&encoded2, &encoded1), Ordering::Greater);
+	}
+
+	#[test]
+	fn test_compare_encoded_matches_internal_key_ord() {
+		// Verify that compare_encoded produces the same ordering as InternalKey::cmp
+		let test_cases = vec![
+			// (user_key1, seq1, user_key2, seq2)
+			("key", 100, "key", 50),
+			("key", 50, "key", 100),
+			("aaa", 100, "bbb", 100),
+			("bbb", 100, "aaa", 100),
+			("key", 1, "key", 1000),
+			("", 100, "", 50),
+			("a", 1, "b", 1),
+		];
+
+		for (uk1, seq1, uk2, seq2) in test_cases {
+			let key1 = InternalKey::new(Bytes::from(uk1), seq1, InternalKeyKind::Set, 0);
+			let key2 = InternalKey::new(Bytes::from(uk2), seq2, InternalKeyKind::Set, 0);
+
+			let expected = key1.cmp(&key2);
+			let actual = InternalKey::compare_encoded(&key1.encode(), &key2.encode());
+
+			assert_eq!(
+				actual, expected,
+				"Mismatch for ({}, seq={}) vs ({}, seq={}): expected {:?}, got {:?}",
+				uk1, seq1, uk2, seq2, expected, actual
+			);
+		}
+	}
+
+	#[test]
+	fn test_extract_seq_num() {
+		let key = InternalKey::new(Bytes::from("test_key"), 12345, InternalKeyKind::Set, 0);
+		let encoded = key.encode();
+
+		assert_eq!(InternalKey::extract_seq_num(&encoded), 12345);
+	}
+
+	#[test]
+	fn test_extract_user_key() {
+		let key = InternalKey::new(Bytes::from("test_key"), 100, InternalKeyKind::Set, 0);
+		let encoded = key.encode();
+
+		assert_eq!(InternalKey::extract_user_key(&encoded), b"test_key");
+	}
+
+	#[test]
+	fn test_compare_encoded_empty_user_key() {
+		let key1 = InternalKey::new(Bytes::from(""), 100, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::from(""), 50, InternalKeyKind::Set, 0);
+
+		let encoded1 = key1.encode();
+		let encoded2 = key2.encode();
+
+		// Empty user keys with different seq nums
+		assert_eq!(InternalKey::compare_encoded(&encoded1, &encoded2), Ordering::Less);
+	}
+
+	#[test]
+	fn test_compare_encoded_large_seq_nums() {
+		let key1 = InternalKey::new(Bytes::from("key"), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::from("key"), 1, InternalKeyKind::Set, 0);
+
+		let encoded1 = key1.encode();
+		let encoded2 = key2.encode();
+
+		// MAX seq should come before 1 (descending order)
+		assert_eq!(InternalKey::compare_encoded(&encoded1, &encoded2), Ordering::Less);
 	}
 }

@@ -69,6 +69,7 @@ pub(crate) struct ManifestChangeSet {
 
 mod iter;
 mod level;
+pub(crate) mod level_iterator;
 
 pub type HiddenSet = HashSet<u64>;
 
