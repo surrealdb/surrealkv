@@ -161,8 +161,12 @@ impl LevelIterator {
 					iter.seek(&ikey.encode());
 				}
 				Bound::Excluded(key) => {
-					let ikey =
-						InternalKey::new(Bytes::copy_from_slice(key), 0, InternalKeyKind::Delete, 0);
+					let ikey = InternalKey::new(
+						Bytes::copy_from_slice(key),
+						0,
+						InternalKeyKind::Delete,
+						0,
+					);
 					iter.seek(&ikey.encode());
 					// If we're at the excluded key, advance once
 					if iter.valid() {
@@ -448,4 +452,3 @@ mod tests {
 		assert!(!iter.valid());
 	}
 }
-

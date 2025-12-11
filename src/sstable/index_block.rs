@@ -285,16 +285,14 @@ impl TopLevelIndex {
 		let index = self.blocks.partition_point(|block| block.user_key.as_ref() < user_key);
 
 		// Attempt to retrieve the block at the found index.
-		let result = self.blocks.get(index).and_then(|block| {
+		self.blocks.get(index).and_then(|block| {
 			// Compare user keys directly
 			if user_key <= block.user_key.as_ref() {
 				Some(block)
 			} else {
 				None
 			}
-		});
-
-		result
+		})
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {

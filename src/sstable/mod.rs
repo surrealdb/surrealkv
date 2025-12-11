@@ -330,7 +330,8 @@ mod tests {
 
 	#[test]
 	fn test_compare_encoded_large_seq_nums() {
-		let key1 = InternalKey::new(Bytes::from("key"), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set, 0);
+		let key1 =
+			InternalKey::new(Bytes::from("key"), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set, 0);
 		let key2 = InternalKey::new(Bytes::from("key"), 1, InternalKeyKind::Set, 0);
 
 		let encoded1 = key1.encode();

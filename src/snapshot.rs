@@ -806,6 +806,7 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
+
 						let mut table_iter = table.iter(keys_only);
 						// Seek to start if unbounded
 						match &range.0 {
@@ -890,8 +891,7 @@ impl<'a> KMergeIterator<'a> {
 					iter.advance();
 				}
 				if iter.valid() {
-					self.heap
-						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 			}
 		}
@@ -906,8 +906,7 @@ impl<'a> KMergeIterator<'a> {
 				// Re-position at last entry for backward iteration
 				iter.seek_to_last();
 				if iter.valid() {
-					self.heap
-						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 			}
 		}
@@ -954,8 +953,7 @@ impl Iterator for KMergeIterator<'_> {
 					let iterators = self.iterators.as_mut();
 					let iter = &mut iterators[idx];
 					if iter.advance() && iter.valid() {
-						self.heap
-							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+						self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 					}
 				}
 				continue;
@@ -972,15 +970,11 @@ impl Iterator for KMergeIterator<'_> {
 			};
 
 			if skip {
-				// Still need to advance the iterator before skipping
-				unsafe {
-					let iterators = self.iterators.as_mut();
-					let iter = &mut iterators[idx];
-					if iter.advance() && iter.valid() {
-						self.heap
-							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
-					}
-				}
+				// When a key exceeds range_end, DON'T add the iterator back to the heap!
+				// Since keys are sorted within each iterator, if current key > range_end,
+				// all subsequent keys will also be > range_end.
+				// We simply drop this iterator from the merge by not re-adding it to the heap.
+				// This prevents scanning through millions of out-of-range items.
 				continue;
 			}
 
@@ -997,8 +991,7 @@ impl Iterator for KMergeIterator<'_> {
 
 				// Advance the cursor and re-insert if valid
 				if iter.advance() && iter.valid() {
-					self.heap
-						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 
 				value
@@ -1039,8 +1032,7 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 					let iterators = self.iterators.as_mut();
 					let iter = &mut iterators[idx];
 					if iter.prev() && iter.valid() {
-						self.heap
-							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+						self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 					}
 				}
 				continue;
@@ -1062,8 +1054,7 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 					let iterators = self.iterators.as_mut();
 					let iter = &mut iterators[idx];
 					if iter.prev() && iter.valid() {
-						self.heap
-							.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+						self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 					}
 				}
 				continue;
@@ -1082,8 +1073,7 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 
 				// Move cursor backwards and re-insert if valid
 				if iter.prev() && iter.valid() {
-					self.heap
-						.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
+					self.heap.push(CursorIntervalHeapItem::new(iter.key_bytes(), idx));
 				}
 
 				value
