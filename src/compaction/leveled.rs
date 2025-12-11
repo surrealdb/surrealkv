@@ -38,7 +38,7 @@ impl Default for Strategy {
 	fn default() -> Self {
 		Self {
 			base_level_size: 4,
-			size_multiplier: 10,
+			size_multiplier: 2,
 			last_compacted_level: AtomicUsize::new(0),
 			compaction_priority: CompactionPriority::default(),
 		}
