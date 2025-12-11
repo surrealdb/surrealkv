@@ -154,7 +154,7 @@ pub(crate) struct TopLevelIndex {
 	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
 	file: Arc<dyn File>,
 	/// Pinned partitions - when set, these partitions are kept in memory
-	/// and bypass the LRU cache for faster access (modeled after RocksDB's partition_map_)
+	/// and bypass the LRU cache for faster access
 	pinned_partitions: Option<HashMap<u64, Arc<Block>>>,
 }
 
@@ -188,7 +188,6 @@ impl TopLevelIndex {
 
 	/// Prefetch and optionally pin all partitions.
 	///
-	/// This is modeled after RocksDB's `PartitionIndexReader::CacheDependencies()`.
 	/// It reads all partitions in a single bulk I/O operation and optionally
 	/// pins them in memory to avoid LRU eviction.
 	///

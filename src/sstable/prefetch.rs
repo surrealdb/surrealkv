@@ -64,7 +64,6 @@ impl PrefetchBuffer {
 
 /// Tracks sequential access and manages adaptive readahead.
 ///
-/// This is modeled after RocksDB's `BlockPrefetcher` in `block_prefetcher.cc`.
 /// It detects sequential read patterns and automatically prefetches
 /// additional data when sequential access is detected.
 pub(crate) struct BlockPrefetcher {

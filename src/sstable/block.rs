@@ -12,11 +12,9 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 pub(crate) type BlockData = Bytes;
 
 // Inline buffer size for keys - covers most real-world keys without heap allocation
-// RocksDB uses 39 bytes; we use 64 for better alignment and slightly larger keys
 const INLINE_KEY_SIZE: usize = 64;
 
 /// An optimized key buffer that avoids heap allocation for small keys.
-/// Similar to RocksDB's IterKey class.
 #[derive(Clone)]
 pub(crate) struct IterKeyBuffer {
 	inline_buf: [u8; INLINE_KEY_SIZE],
@@ -42,7 +40,7 @@ impl IterKeyBuffer {
 		}
 	}
 
-	/// Truncate to shared_len bytes and append data (like RocksDB's TrimAppend)
+	/// Truncate to shared_len bytes and append data
 	#[inline]
 	pub(crate) fn trim_append(&mut self, shared_len: usize, data: &[u8]) {
 		let total = shared_len + data.len();
@@ -671,7 +669,12 @@ impl LSMIterator for BlockIterator {
 	// Get the raw value bytes - zero copy
 	#[inline]
 	fn value_bytes(&self) -> &[u8] {
-		&self.block[self.current_value_offset_start..self.current_value_offset_end]
+		// Respect keys_only mode - return empty slice to avoid unnecessary work
+		if self.keys_only {
+			&[]
+		} else {
+			&self.block[self.current_value_offset_start..self.current_value_offset_end]
+		}
 	}
 }
 

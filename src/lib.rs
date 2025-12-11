@@ -605,4 +605,12 @@ pub(crate) trait Iterator {
 	fn decode_key(&self) -> InternalKey {
 		InternalKey::decode(self.key_bytes())
 	}
+
+	/// Return cached decoded key if available, avoiding re-decode.
+	/// Default implementation decodes from key_bytes().
+	/// Override this for iterators that already have decoded keys (e.g., memtable adapters).
+	/// REQUIRES: `valid()`
+	fn decoded_key(&self) -> Arc<InternalKey> {
+		Arc::new(InternalKey::decode(self.key_bytes()))
+	}
 }

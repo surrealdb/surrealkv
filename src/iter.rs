@@ -17,22 +17,58 @@ pub type BoxedCursor<'a> = Box<dyn LSMIterator + 'a>;
 
 /// Adapter to wrap a DoubleEndedIterator as an LSMIterator (cursor).
 /// Supports both forward and backward iteration.
+/// Stores the decoded key directly to avoid encode/decode round-trips.
 pub(crate) struct DoubleEndedStdIterAdapter<I> {
 	iter: I,
-	current_key: Option<Vec<u8>>,   // Encoded key bytes
-	current_value: Option<Vec<u8>>, // Value bytes
+	current_key: Option<Arc<InternalKey>>, // Store decoded key directly
+	current_value: Option<Value>,          // Store value directly
+	cached_key_bytes: std::cell::UnsafeCell<Option<Vec<u8>>>, // Lazy encode for key_bytes()
+	/// When true, skip storing values (for count queries)
+	keys_only: bool,
 }
+
+// Safety: The UnsafeCell is only accessed through &self in key_bytes() which
+// does interior mutation to cache the encoded key. This is safe because:
+// 1. The cache is invalidated on every mutation (advance, prev, seek, etc.)
+// 2. key_bytes() only reads current_key (immutable) and writes to cache
+// 3. No concurrent access - iterators are not Sync
+unsafe impl<I: Send> Send for DoubleEndedStdIterAdapter<I> {}
 
 impl<I> DoubleEndedStdIterAdapter<I>
 where
 	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
 {
-	pub(crate) fn new(iter: I) -> Self {
+	pub(crate) fn new(iter: I, keys_only: bool) -> Self {
 		Self {
 			iter,
 			current_key: None,
 			current_value: None,
+			cached_key_bytes: std::cell::UnsafeCell::new(None),
+			keys_only,
 		}
+	}
+
+	/// Set the current key/value and invalidate the cached key bytes
+	#[inline]
+	fn set_current(&mut self, key: Arc<InternalKey>, value: Value) {
+		self.current_key = Some(key);
+		// Skip storing value when keys_only mode is enabled
+		self.current_value = if self.keys_only {
+			None
+		} else {
+			Some(value)
+		};
+		// Safety: we have &mut self
+		unsafe { *self.cached_key_bytes.get() = None };
+	}
+
+	/// Clear the current key/value
+	#[inline]
+	fn clear_current(&mut self) {
+		self.current_key = None;
+		self.current_value = None;
+		// Safety: we have &mut self
+		unsafe { *self.cached_key_bytes.get() = None };
 	}
 }
 
@@ -51,11 +87,9 @@ where
 	fn seek_to_last(&mut self) {
 		// Use next_back to get the last item
 		if let Some((key, value)) = self.iter.next_back() {
-			self.current_key = Some(key.encode());
-			self.current_value = Some(value.to_vec());
+			self.set_current(key, value);
 		} else {
-			self.current_key = None;
-			self.current_value = None;
+			self.clear_current();
 		}
 	}
 
@@ -64,76 +98,76 @@ where
 		for (key, value) in self.iter.by_ref() {
 			let encoded = key.encode();
 			if encoded.as_slice() >= target {
-				self.current_key = Some(encoded);
-				self.current_value = Some(value.to_vec());
+				// Cache the encoded bytes since we already computed them
+				// Safety: we have &mut self
+				unsafe { *self.cached_key_bytes.get() = Some(encoded) };
+				self.current_key = Some(key);
+				// Skip storing value when keys_only mode is enabled
+				self.current_value = if self.keys_only {
+					None
+				} else {
+					Some(value)
+				};
 				return Some(());
 			}
 		}
-		self.current_key = None;
-		self.current_value = None;
+		self.clear_current();
 		None
 	}
 
 	fn advance(&mut self) -> bool {
 		if let Some((key, value)) = self.iter.next() {
-			self.current_key = Some(key.encode());
-			self.current_value = Some(value.to_vec());
+			self.set_current(key, value);
 			true
 		} else {
-			self.current_key = None;
-			self.current_value = None;
+			self.clear_current();
 			false
 		}
 	}
 
 	fn prev(&mut self) -> bool {
 		if let Some((key, value)) = self.iter.next_back() {
-			self.current_key = Some(key.encode());
-			self.current_value = Some(value.to_vec());
+			self.set_current(key, value);
 			true
 		} else {
-			self.current_key = None;
-			self.current_value = None;
+			self.clear_current();
 			false
 		}
 	}
 
 	fn key_bytes(&self) -> &[u8] {
-		self.current_key.as_deref().unwrap_or(&[])
+		// Safety: Interior mutation to cache the encoded key.
+		// This is safe because we only read current_key and write to cache.
+		// The cache is invalidated on any mutation to current_key.
+		unsafe {
+			let cache = &mut *self.cached_key_bytes.get();
+			if cache.is_none() {
+				if let Some(ref key) = self.current_key {
+					*cache = Some(key.encode());
+				}
+			}
+			cache.as_ref().map(|v| v.as_slice()).unwrap_or(&[])
+		}
 	}
 
 	fn value_bytes(&self) -> &[u8] {
-		self.current_value.as_deref().unwrap_or(&[])
+		self.current_value.as_ref().map(|v| v.as_ref()).unwrap_or(&[])
+	}
+
+	fn decoded_key(&self) -> Arc<InternalKey> {
+		// Return the already-decoded key - no extra allocation!
+		self.current_key.clone().unwrap()
 	}
 }
 
 /// Heap item for cursor-based merge iteration.
-/// Stores key bytes for comparison but delegates value access to the iterator.
+/// Stores the decoded key for efficient comparison via direct field access.
 #[derive(Eq)]
 pub(crate) struct CursorHeapItem {
-	/// Raw key bytes for comparison (copied from iterator)
-	pub(crate) key_bytes: Bytes,
+	/// Decoded key for efficient comparison (direct field access, no byte parsing)
+	pub(crate) key: Arc<InternalKey>,
 	/// Index into the iterators vector
 	pub(crate) iterator_index: usize,
-}
-
-impl CursorHeapItem {
-	/// Extract user key from the stored key bytes (zero-copy slice)
-	#[inline]
-	fn user_key(&self) -> &[u8] {
-		InternalKey::extract_user_key(&self.key_bytes)
-	}
-
-	/// Extract sequence number from the stored key bytes
-	#[inline]
-	fn seq_num(&self) -> u64 {
-		if self.key_bytes.len() < 16 {
-			return 0;
-		}
-		let n = self.key_bytes.len() - 16;
-		let trailer = u64::from_be_bytes(self.key_bytes[n..n + 8].try_into().unwrap());
-		trailer >> 8
-	}
 }
 
 impl PartialEq for CursorHeapItem {
@@ -151,12 +185,12 @@ impl Ord for CursorHeapItem {
 
 impl CursorHeapItem {
 	fn cmp_internal(&self, other: &Self) -> Ordering {
-		// First compare by user key
-		match self.user_key().cmp(other.user_key()) {
+		// First compare by user key (direct field access - no byte parsing!)
+		match self.key.user_key.cmp(&other.key.user_key) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
-				match other.seq_num().cmp(&self.seq_num()) {
+				match other.key.seq_num().cmp(&self.key.seq_num()) {
 					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
 					ord => ord,
 				}
@@ -261,7 +295,7 @@ impl<'a> CompactionIterator<'a> {
 			iter.seek_to_first();
 			if iter.valid() {
 				self.heap.push(CursorHeapItem {
-					key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+					key: iter.decoded_key(),
 					iterator_index: idx,
 				});
 			}
@@ -269,25 +303,25 @@ impl<'a> CompactionIterator<'a> {
 		self.initialized = true;
 	}
 
-	/// Pop the next item from heap, copy key/value, advance the iterator
+	/// Pop the next item from heap, get value, advance the iterator
 	fn pop_and_advance(&mut self) -> Option<(Arc<InternalKey>, Value)> {
 		let heap_item = self.heap.pop()?;
 		let idx = heap_item.iterator_index;
 
-		// Get key/value from the iterator (it's still positioned on current entry)
+		// Get value from the iterator (it's still positioned on current entry)
+		// Use the key from heap_item directly - no need to decode again!
 		let iter = &mut self.iterators[idx];
-		let key = Arc::new(iter.decode_key());
 		let value = Bytes::copy_from_slice(iter.value_bytes());
 
 		// Advance the iterator and re-insert if valid
 		if iter.advance() && iter.valid() {
 			self.heap.push(CursorHeapItem {
-				key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+				key: iter.decoded_key(),
 				iterator_index: idx,
 			});
 		}
 
-		Some((key, value))
+		Some((heap_item.key, value))
 	}
 
 	/// Flushes the batched delete-list entries to the VLog

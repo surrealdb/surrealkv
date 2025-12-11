@@ -22,33 +22,14 @@ use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 /// Type alias for versioned entries with key, timestamp, and optional value
 use interval_heap::IntervalHeap;
 
-/// Cursor-based heap item for zero-allocation merge iteration.
-/// Stores key bytes for comparison but delegates value access to the iterator.
+/// Cursor-based heap item for merge iteration.
+/// Stores the decoded key for efficient comparison via direct field access.
 #[derive(Eq)]
 pub(crate) struct CursorIntervalHeapItem {
-	/// Raw key bytes for comparison (copied from iterator)
-	key_bytes: Bytes,
+	/// Decoded key for efficient comparison (direct field access, no byte parsing)
+	key: Arc<InternalKey>,
 	/// Index into the iterators vector
 	iterator_index: usize,
-}
-
-impl CursorIntervalHeapItem {
-	/// Extract user key from the stored key bytes (zero-copy slice)
-	#[inline]
-	fn user_key(&self) -> &[u8] {
-		InternalKey::extract_user_key(&self.key_bytes)
-	}
-
-	/// Extract sequence number from the stored key bytes
-	#[inline]
-	fn seq_num(&self) -> u64 {
-		if self.key_bytes.len() < 16 {
-			return 0;
-		}
-		let n = self.key_bytes.len() - 16;
-		let trailer = u64::from_be_bytes(self.key_bytes[n..n + 8].try_into().unwrap());
-		trailer >> 8
-	}
 }
 
 impl PartialEq for CursorIntervalHeapItem {
@@ -59,12 +40,12 @@ impl PartialEq for CursorIntervalHeapItem {
 
 impl Ord for CursorIntervalHeapItem {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// First compare by user key
-		match self.user_key().cmp(other.user_key()) {
+		// First compare by user key (direct field access - no byte parsing!)
+		match self.key.user_key.cmp(&other.key.user_key) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
-				match other.seq_num().cmp(&self.seq_num()) {
+				match other.key.seq_num().cmp(&self.key.seq_num()) {
 					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
 					ord => ord,
 				}
@@ -704,6 +685,9 @@ pub(crate) struct KMergeIterator<'a> {
 
 	/// Whether the iterator has been initialized for backward iteration
 	initialized_hi: bool,
+
+	/// When true, skip value copying (for count queries)
+	keys_only: bool,
 }
 
 impl<'a> KMergeIterator<'a> {
@@ -734,12 +718,12 @@ impl<'a> KMergeIterator<'a> {
 			// Active memtable with range - wrap with DoubleEndedStdIterAdapter
 			// Don't position yet - initialize_lo/hi will do that
 			let active_iter = state_ref.active.range(range.clone());
-			iterators.push(Box::new(DoubleEndedStdIterAdapter::new(active_iter)));
+			iterators.push(Box::new(DoubleEndedStdIterAdapter::new(active_iter, keys_only)));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
 				let iter = memtable.range(range.clone());
-				iterators.push(Box::new(DoubleEndedStdIterAdapter::new(iter)));
+				iterators.push(Box::new(DoubleEndedStdIterAdapter::new(iter, keys_only)));
 			}
 
 			// Tables - these implement LSMIterator directly
@@ -852,6 +836,7 @@ impl<'a> KMergeIterator<'a> {
 			range_end: range.1,
 			initialized_lo: false,
 			initialized_hi: false,
+			keys_only,
 		}
 	}
 
@@ -867,7 +852,7 @@ impl<'a> KMergeIterator<'a> {
 				}
 				if iter.valid() {
 					self.heap.push(CursorIntervalHeapItem {
-						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						key: iter.decoded_key(),
 						iterator_index: idx,
 					});
 				}
@@ -885,7 +870,7 @@ impl<'a> KMergeIterator<'a> {
 				iter.seek_to_last();
 				if iter.valid() {
 					self.heap.push(CursorIntervalHeapItem {
-						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						key: iter.decoded_key(),
 						iterator_index: idx,
 					});
 				}
@@ -923,23 +908,29 @@ impl Iterator for KMergeIterator<'_> {
 			let heap_item = self.heap.pop_min()?;
 			let idx = heap_item.iterator_index;
 
-			// Get key and value from the cursor (it's still positioned on current entry)
-			let (key, value) = unsafe {
+			// Get value from the cursor (skip copy if keys_only) and use the key from heap_item
+			let value = unsafe {
 				let iterators = self.iterators.as_mut();
 				let iter = &mut iterators[idx];
-				let key = Arc::new(iter.decode_key());
-				let value = Bytes::copy_from_slice(iter.value_bytes());
+				// Skip value copying for keys_only mode (e.g., count queries)
+				let value = if self.keys_only {
+					Bytes::new()
+				} else {
+					Bytes::copy_from_slice(iter.value_bytes())
+				};
 
 				// Advance the cursor and re-insert if valid
 				if iter.advance() && iter.valid() {
 					self.heap.push(CursorIntervalHeapItem {
-						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						key: iter.decoded_key(),
 						iterator_index: idx,
 					});
 				}
 
-				(key, value)
+				value
 			};
+			// Use the key from heap_item directly - no need to decode again!
+			let key = heap_item.key;
 
 			// Check visibility (seq_num <= snapshot_seq_num)
 			if key.seq_num() > self.snapshot_seq_num {
@@ -985,23 +976,29 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 			let heap_item = self.heap.pop_max()?;
 			let idx = heap_item.iterator_index;
 
-			// Get key and value from the cursor (it's still positioned on current entry)
-			let (key, value) = unsafe {
+			// Get value from the cursor (skip copy if keys_only) and use the key from heap_item
+			let value = unsafe {
 				let iterators = self.iterators.as_mut();
 				let iter = &mut iterators[idx];
-				let key = Arc::new(iter.decode_key());
-				let value = Bytes::copy_from_slice(iter.value_bytes());
+				// Skip value copying for keys_only mode (e.g., count queries)
+				let value = if self.keys_only {
+					Bytes::new()
+				} else {
+					Bytes::copy_from_slice(iter.value_bytes())
+				};
 
 				// Move cursor backwards and re-insert if valid
 				if iter.prev() && iter.valid() {
 					self.heap.push(CursorIntervalHeapItem {
-						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						key: iter.decoded_key(),
 						iterator_index: idx,
 					});
 				}
 
-				(key, value)
+				value
 			};
+			// Use the key from heap_item directly - no need to decode again!
+			let key = heap_item.key;
 
 			// Check visibility (seq_num <= snapshot_seq_num)
 			if key.seq_num() > self.snapshot_seq_num {

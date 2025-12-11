@@ -914,9 +914,9 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
-	/// Adaptive readahead for sequential scans (modeled after RocksDB's BlockPrefetcher)
+	/// Adaptive readahead for sequential scans
 	block_prefetcher: BlockPrefetcher,
-	/// Previous partition offset for reseek optimization (modeled after RocksDB's prev_block_offset_)
+	/// Previous partition offset for reseek optimization
 	/// When a seek lands in the same partition, we can reuse the partition iterator
 	prev_partition_offset: u64,
 }
@@ -980,7 +980,7 @@ impl TableIterator {
 	}
 
 	/// Save the current partition offset before seek operations.
-	/// This enables the reseek optimization (modeled after RocksDB's SavePrevIndexValue).
+	/// This enables the reseek optimization.
 	fn save_prev_partition_offset(&mut self) {
 		if self.current_partition_iter.is_some() {
 			let IndexType::Partitioned(ref idx) = self.table.index_block;
@@ -1185,7 +1185,12 @@ impl Iterator for TableIterator {
 		// Get the current item before advancing
 		let block = self.current_block.as_ref().unwrap();
 		let key = Arc::new(InternalKey::decode(block.key_bytes()));
-		let value = Bytes::copy_from_slice(block.value_bytes());
+		// Skip value allocation for keys_only mode
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
+			Bytes::copy_from_slice(block.value_bytes())
+		};
 
 		// Advance for the next call to next()
 		self.advance();
@@ -1200,10 +1205,13 @@ impl DoubleEndedIterator for TableIterator {
 			return None;
 		}
 		let block = self.current_block.as_ref().unwrap();
-		Some((
-			Arc::new(InternalKey::decode(block.key_bytes())),
-			Bytes::copy_from_slice(block.value_bytes()),
-		))
+		// Skip value allocation for keys_only mode
+		let value = if self.keys_only {
+			Bytes::new()
+		} else {
+			Bytes::copy_from_slice(block.value_bytes())
+		};
+		Some((Arc::new(InternalKey::decode(block.key_bytes())), value))
 	}
 }
 
@@ -1297,7 +1305,7 @@ impl LSMIterator for TableIterator {
 	fn seek(&mut self, target: &[u8]) -> Option<()> {
 		// RESEEK OPTIMIZATION: Check if we can seek within the current block
 		// This avoids re-reading the block from cache/disk if we're seeking forward
-		// within the same block (like RocksDB's BlockBasedTableIterator)
+		// within the same block
 		if let Some(ref mut block) = self.current_block {
 			if block.valid() {
 				let current_key = block.key_bytes();
@@ -1471,7 +1479,12 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn value_bytes(&self) -> &[u8] {
-		self.current_block.as_ref().unwrap().value_bytes()
+		// Respect keys_only mode - return empty slice to avoid unnecessary work
+		if self.keys_only {
+			&[]
+		} else {
+			self.current_block.as_ref().unwrap().value_bytes()
+		}
 	}
 }
 
