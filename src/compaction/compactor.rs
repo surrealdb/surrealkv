@@ -194,6 +194,9 @@ impl Compactor {
 		merge_iter: Vec<BoxedIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<HashMap<u32, i64>> {
+		use crate::sstable::InternalKey;
+		use std::sync::Arc;
+
 		let file = SysFile::create(path)?;
 		let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
 
@@ -210,27 +213,41 @@ impl Compactor {
 			self.options.lopts.clock.clone(),
 		);
 
+		// Buffer to capture all key-value pairs for debugging on error
+		let mut kv_buffer: Vec<(Arc<InternalKey>, Vec<u8>)> = Vec::new();
+
 		let mut key_count = 0u64;
 		for (key, value) in &mut comp_iter {
 			key_count += 1;
 
-			// print the first 10 keys
-			if key_count <= 10 {
-				log::error!(
-					"[COMPACTION TABLE {}] Key #{} from iterator\n\
-				Key: {:?}\n\
-				User Key: {:?}\n\
-				Seq Num: {}\n\
-				",
-					table_id,
-					key_count,
-					&key.encode(),
-					&key.user_key,
-					key.seq_num(),
-				);
-			}
+			// Store the key-value pair in buffer before adding
+			kv_buffer.push((key.clone(), value.to_vec()));
 
-			writer.add(key, &value)?;
+			if let Err(e) = writer.add(key, &value) {
+				// Log all key-value pairs from the buffer to help debug
+				log::error!(
+					"[COMPACTION TABLE {}] ERROR during writer.add: {:?}\n\
+					Dumping all {} key-value pairs from buffer:",
+					table_id,
+					e,
+					kv_buffer.len()
+				);
+
+				for (idx, (k, v)) in kv_buffer.iter().enumerate() {
+					log::error!(
+						"[COMPACTION TABLE {} DUMP] Entry #{}: user_key={:?} seq={} kind={:?} ts={} value_len={}",
+						table_id,
+						idx + 1,
+						String::from_utf8_lossy(&k.user_key),
+						k.seq_num(),
+						k.kind(),
+						k.timestamp,
+						v.len()
+					);
+				}
+
+				return Err(e);
+			}
 		}
 
 		log::error!(

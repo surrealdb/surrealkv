@@ -239,7 +239,37 @@ impl<W: Write> TableWriter<W> {
 		// Ensure the key is in ascending order.
 		if !self.prev_block_last_key.is_empty() {
 			let order = self.internal_cmp.compare(&self.prev_block_last_key, &enc_key);
-			assert_eq!(order, Ordering::Less, "Keys must be in ascending order");
+			if order != Ordering::Less {
+				let prev_internal_key = InternalKey::decode(&self.prev_block_last_key);
+				log::error!(
+					"[TABLE] Key ordering violation across blocks!\n\
+					Previous block last key:\n\
+					  User Key (UTF-8): {:?}\n\
+					  User Key (bytes): {:?}\n\
+					  Seq Num: {}\n\
+					  Kind: {:?}\n\
+					  Timestamp: {}\n\
+					Current Key:\n\
+					  User Key (UTF-8): {:?}\n\
+					  User Key (bytes): {:?}\n\
+					  Seq Num: {}\n\
+					  Kind: {:?}\n\
+					  Timestamp: {}\n\
+					Comparison result: {:?} (expected: Less)",
+					String::from_utf8_lossy(&prev_internal_key.user_key),
+					prev_internal_key.user_key.as_ref(),
+					prev_internal_key.seq_num(),
+					prev_internal_key.kind(),
+					prev_internal_key.timestamp,
+					String::from_utf8_lossy(&key.user_key),
+					key.user_key.as_ref(),
+					key.seq_num(),
+					key.kind(),
+					key.timestamp,
+					order
+				);
+				return Err(Error::KeyNotInOrder);
+			}
 		}
 
 		// Initialize filter block on first key

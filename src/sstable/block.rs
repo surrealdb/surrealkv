@@ -200,7 +200,7 @@ impl BlockWriter {
 				let last_internal_key = InternalKey::decode(self.last_key.as_slice());
 				let current_internal_key = InternalKey::decode(key);
 
-				log::error!(
+				let error_msg = format!(
 					"[BLOCK] Key ordering violation detected!\n\
 			Last Key:\n\
 			  User Key (UTF-8): {:?}\n\
@@ -236,13 +236,11 @@ impl BlockWriter {
 					self.num_entries,
 					self.buffer.len()
 				);
+
+				log::error!("{}", error_msg);
+				return Err(Error::KeyNotInOrder);
 			}
 		}
-
-		assert!(
-			self.buffer.is_empty()
-				|| self.internal_cmp.compare(self.last_key.as_slice(), key) == Ordering::Less
-		);
 
 		let mut shared_prefix_length = 0;
 		if self.restart_counter < self.restart_interval {
