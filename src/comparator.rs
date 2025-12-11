@@ -205,7 +205,7 @@ impl Comparator for InternalKeyComparator {
 			let result = InternalKey::new(
 				Bytes::from(user_key_succ),
 				INTERNAL_KEY_SEQ_NUM_MAX,
-				internal_key.kind(),
+				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
 			);
 			return result.encode();
@@ -296,7 +296,7 @@ impl Comparator for TimestampComparator {
 			let result = InternalKey::new(
 				Bytes::from(user_key_succ),
 				INTERNAL_KEY_SEQ_NUM_MAX,
-				internal_key.kind(),
+				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
 			);
 			return result.encode();

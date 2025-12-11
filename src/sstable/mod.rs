@@ -27,8 +27,8 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 		3 => InternalKeyKind::Merge,
 		4 => InternalKeyKind::LogData,
 		5 => InternalKeyKind::RangeDelete,
-		6 => InternalKeyKind::Separator,
-		7 => InternalKeyKind::Replace,
+		6 => InternalKeyKind::Replace,
+		7 => InternalKeyKind::Separator,
 		24 => InternalKeyKind::Max,
 		_ => InternalKeyKind::Invalid,
 	}
@@ -78,9 +78,9 @@ pub enum InternalKeyKind {
 	Merge = 3,
 	LogData = 4,
 	RangeDelete = 5,
-	Separator = 6,
-	Replace = 7, // Replaces previous key when versioning is enabled
-	Max = 24,    // Leaving space for other kinds
+	Replace = 6, // Replaces previous key when versioning is enabled
+	Separator = 7,
+	Max = 24, // Leaving space for other kinds
 	Invalid = 191,
 }
 
