@@ -4,11 +4,7 @@
 //! 1. `PrefetchBuffer` - An in-memory buffer for bulk prefetched data
 //! 2. `BlockPrefetcher` - Tracks sequential access and manages adaptive readahead
 
-use crate::{
-	error::Result,
-	sstable::block::BlockHandle,
-	vfs::File,
-};
+use crate::{error::Result, sstable::block::BlockHandle, vfs::File};
 
 use super::table::{BLOCK_CKSUM_LEN, BLOCK_COMPRESS_LEN};
 
@@ -38,7 +34,10 @@ impl PrefetchBuffer {
 	pub fn prefetch(file: &dyn File, offset: u64, len: usize) -> Result<Self> {
 		let mut data = vec![0u8; len];
 		file.read_at(offset, &mut data)?;
-		Ok(Self { data, offset })
+		Ok(Self {
+			data,
+			offset,
+		})
 	}
 
 	/// Check if the given block handle is fully contained within this buffer.
@@ -343,4 +342,3 @@ mod tests {
 		assert!(prefetcher.readahead_size <= 16000);
 	}
 }
-

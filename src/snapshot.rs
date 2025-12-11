@@ -755,8 +755,9 @@ impl<'a> KMergeIterator<'a> {
 								table_iter.seek(&ikey.encode());
 								// If we're at the excluded key, advance once
 								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
+									let current_user_key =
+										InternalKey::extract_user_key(table_iter.key_bytes());
+									if current_user_key == key.as_slice() {
 										table_iter.advance();
 									}
 								}
@@ -801,8 +802,9 @@ impl<'a> KMergeIterator<'a> {
 								table_iter.seek(&ikey.encode());
 								// If we're at the excluded key, advance once
 								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
+									let current_user_key =
+										InternalKey::extract_user_key(table_iter.key_bytes());
+									if current_user_key == key.as_slice() {
 										table_iter.advance();
 									}
 								}

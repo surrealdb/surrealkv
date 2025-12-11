@@ -544,12 +544,11 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	metaindexiter.seek(&meta_key);
 
 	if metaindexiter.valid() {
-		let k = metaindexiter.key();
+		let k = metaindexiter.decode_key();
 		// Verify exact match to avoid using wrong entry
 		assert_eq!(k.user_key.as_ref(), b"meta");
-		let val = metaindexiter.value().to_vec();
-		let buf_bytes = Bytes::from(val);
-		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
+		let val = Bytes::copy_from_slice(metaindexiter.value_bytes());
+		return Ok(Some(TableMetadata::decode(&val)?));
 	}
 	Ok(None)
 }
@@ -699,18 +698,18 @@ impl Table {
 		metaindexiter.seek(&filter_key.encode());
 
 		if metaindexiter.valid() {
-			let k = metaindexiter.key();
+			let k = metaindexiter.decode_key();
 
 			// Verify exact match to avoid using wrong entry
 			assert_eq!(k.user_key.as_ref(), filter_name.as_bytes());
-			let val = metaindexiter.value();
+			let val = metaindexiter.value_bytes();
 
-			let fbl = BlockHandle::decode(&val);
+			let fbl = BlockHandle::decode(val);
 			let filter_block_location = match fbl {
 				Err(_e) => {
 					return Err(Error::CorruptedBlock(format!(
 						"Couldn't decode corrupt blockhandle {:?}",
-						&val
+						val
 					)));
 				}
 				Ok(res) => res.0,
@@ -772,12 +771,12 @@ impl Table {
 				partition_iter.seek(key_encoded);
 
 				if partition_iter.valid() {
-					let last_key_in_block = partition_iter.key();
-					let val = partition_iter.value();
+					let last_key_in_block = partition_iter.decode_key();
+					let val = partition_iter.value_bytes();
 					if Ordering::Less
 						== self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
 					{
-						Some(BlockHandle::decode(&val).unwrap().0)
+						Some(BlockHandle::decode(val).unwrap().0)
 					} else {
 						return Ok(None);
 					}
@@ -799,11 +798,14 @@ impl Table {
 		// Go to entry and check if it's the wanted entry.
 		iter.seek(key_encoded);
 		if iter.valid() {
-			let k = iter.key();
-			let v = iter.value();
-			// Compare only user keys - we want exact user key match regardless of seq_num
-			if k.user_key == key.user_key {
-				Ok(Some((k, v)))
+			// Zero-copy user key comparison - only decode if we have a match
+			let k_bytes = iter.key_bytes();
+			let k_user_key = InternalKey::extract_user_key(k_bytes);
+			if k_user_key == key.user_key.as_ref() {
+				// Only decode when we have a match (allocate only on success)
+				let k = InternalKey::decode(k_bytes);
+				let v = Bytes::copy_from_slice(iter.value_bytes());
+				Ok(Some((Arc::new(k), v)))
 			} else {
 				Ok(None)
 			}
@@ -926,8 +928,8 @@ impl TableIterator {
 		// First try to advance within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
 			if partition_iter.advance() {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						return Err(Error::CorruptedBlock(format!(
 							"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
@@ -954,8 +956,8 @@ impl TableIterator {
 		partition_iter.seek_to_first();
 
 		if partition_iter.valid() {
-			let val = partition_iter.value();
-			let (handle, _) = match BlockHandle::decode(&val) {
+			let val = partition_iter.value_bytes();
+			let (handle, _) = match BlockHandle::decode(val) {
 				Err(e) => {
 					return Err(Error::CorruptedBlock(format!(
 						"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
@@ -990,34 +992,37 @@ impl TableIterator {
 
 	/// Check if the given partition handle matches the previously saved partition.
 	/// If so, we can reuse the existing partition iterator.
-	fn is_same_partition(&self, partition_handle: &crate::sstable::index_block::BlockHandleWithKey) -> bool {
-		self.current_partition_iter.is_some() && partition_handle.offset() == self.prev_partition_offset
+	fn is_same_partition(
+		&self,
+		partition_handle: &crate::sstable::index_block::BlockHandleWithKey,
+	) -> bool {
+		self.current_partition_iter.is_some()
+			&& partition_handle.offset() == self.prev_partition_offset
 	}
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
 		// Try adaptive readahead prefetch first
-		let block = if let Ok(true) =
-			self.block_prefetcher.prefetch_if_needed(&*self.table.file, handle)
-		{
-			// Prefetch was triggered, try to read from buffer
-			if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
-				// Decompress and create block from prefetch buffer
-				self.decompress_prefetched_block(&data)?
+		let block =
+			if let Ok(true) = self.block_prefetcher.prefetch_if_needed(&*self.table.file, handle) {
+				// Prefetch was triggered, try to read from buffer
+				if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
+					// Decompress and create block from prefetch buffer
+					self.decompress_prefetched_block(&data)?
+				} else {
+					// Fallback to normal read
+					self.table.read_block(handle)?
+				}
+			} else if self.block_prefetcher.is_in_buffer(handle) {
+				// Already in buffer from previous prefetch
+				if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
+					self.decompress_prefetched_block(&data)?
+				} else {
+					self.table.read_block(handle)?
+				}
 			} else {
-				// Fallback to normal read
+				// Normal read (no prefetch or not in buffer)
 				self.table.read_block(handle)?
-			}
-		} else if self.block_prefetcher.is_in_buffer(handle) {
-			// Already in buffer from previous prefetch
-			if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
-				self.decompress_prefetched_block(&data)?
-			} else {
-				self.table.read_block(handle)?
-			}
-		} else {
-			// Normal read (no prefetch or not in buffer)
-			self.table.read_block(handle)?
-		};
+			};
 
 		let mut block_iter = block.iter(self.keys_only);
 
@@ -1056,17 +1061,10 @@ impl TableIterator {
 		let block_data = &raw_data[..n];
 
 		// Decompress based on compression type
-		let decompressed = decompress_block(block_data, CompressionType::from(compression_type_byte))?;
+		let decompressed =
+			decompress_block(block_data, CompressionType::from(compression_type_byte))?;
 
 		Ok(Arc::new(Block::new(Bytes::from(decompressed), self.table.opts.clone())))
-	}
-
-	fn key(&self) -> Arc<InternalKey> {
-		self.current_block.as_ref().unwrap().key()
-	}
-
-	fn value(&self) -> Value {
-		self.current_block.as_ref().unwrap().value()
 	}
 
 	fn reset(&mut self) {
@@ -1081,6 +1079,34 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
+	/// Slow path for advance - handles block transitions and initial positioning
+	#[cold]
+	fn advance_slow(&mut self) -> bool {
+		// If not positioned, position at first entry
+		if !self.positioned {
+			self.seek_to_first();
+			return self.valid();
+		}
+
+		// Current block is exhausted, try to move to next block
+		match self.skip_to_next_entry() {
+			Ok(true) => {
+				// Successfully loaded next block and positioned at first entry
+				true
+			}
+			Ok(false) => {
+				// No more blocks available - mark as exhausted
+				self.mark_exhausted();
+				false
+			}
+			Err(_) => {
+				// Error loading next block - mark as exhausted
+				self.mark_exhausted();
+				false
+			}
+		}
+	}
+
 	fn prev(&mut self) -> bool {
 		if let Some(ref mut block) = self.current_block {
 			if block.prev() {
@@ -1093,8 +1119,8 @@ impl TableIterator {
 		// Try to move to previous block within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
 			if partition_iter.prev() {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(_) => return false,
 					Ok(res) => res,
 				};
@@ -1121,8 +1147,8 @@ impl TableIterator {
 				partition_iter.seek_to_last();
 
 				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
+					let val = partition_iter.value_bytes();
+					let (handle, _) = match BlockHandle::decode(val) {
 						Err(_) => return false,
 						Ok(res) => res,
 					};
@@ -1157,15 +1183,14 @@ impl Iterator for TableIterator {
 		}
 
 		// Get the current item before advancing
-		let current_item = Some((
-			self.current_block.as_ref().unwrap().key(),
-			self.current_block.as_ref().unwrap().value(),
-		));
+		let block = self.current_block.as_ref().unwrap();
+		let key = Arc::new(InternalKey::decode(block.key_bytes()));
+		let value = Bytes::copy_from_slice(block.value_bytes());
 
 		// Advance for the next call to next()
 		self.advance();
 
-		current_item
+		Some((key, value))
 	}
 }
 
@@ -1174,9 +1199,10 @@ impl DoubleEndedIterator for TableIterator {
 		if !self.prev() {
 			return None;
 		}
+		let block = self.current_block.as_ref().unwrap();
 		Some((
-			self.current_block.as_ref().unwrap().key(),
-			self.current_block.as_ref().unwrap().value(),
+			Arc::new(InternalKey::decode(block.key_bytes())),
+			Bytes::copy_from_slice(block.value_bytes()),
 		))
 	}
 }
@@ -1202,8 +1228,8 @@ impl LSMIterator for TableIterator {
 				partition_iter.seek_to_first();
 
 				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
+					let val = partition_iter.value_bytes();
+					let (handle, _) = match BlockHandle::decode(val) {
 						Err(_) => {
 							self.reset();
 							return;
@@ -1238,8 +1264,8 @@ impl LSMIterator for TableIterator {
 				partition_iter.seek_to_last();
 
 				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
+					let val = partition_iter.value_bytes();
+					let (handle, _) = match BlockHandle::decode(val) {
 						Err(_) => {
 							self.reset();
 							return;
@@ -1269,17 +1295,44 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn seek(&mut self, target: &[u8]) -> Option<()> {
+		// RESEEK OPTIMIZATION: Check if we can seek within the current block
+		// This avoids re-reading the block from cache/disk if we're seeking forward
+		// within the same block (like RocksDB's BlockBasedTableIterator)
+		if let Some(ref mut block) = self.current_block {
+			if block.valid() {
+				let current_key = block.key_bytes();
+				// Only try within-block seek if target > current key (seeking forward)
+				if self.table.internal_cmp.compare(target, current_key) == Ordering::Greater {
+					// Check if target is still within this block's range using partition iter
+					if let Some(ref partition_iter) = self.current_partition_iter {
+						if partition_iter.valid() {
+							let block_upper = partition_iter.key_bytes();
+							if self.table.internal_cmp.compare(target, block_upper)
+								!= Ordering::Greater
+							{
+								// Target is within current block's range - seek within block only
+								block.seek(target);
+								if block.valid() {
+									return Some(());
+								}
+								// If not valid after seek, fall through to full seek
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Save previous partition offset for reseek optimization
 		self.save_prev_partition_offset();
 
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
-		// Extract user key from target for partition lookup (optimization)
-		let target_key = InternalKey::decode(target);
+		// Extract user key from target for partition lookup (zero-copy optimization)
+		let user_key = InternalKey::extract_user_key(target);
 
 		// For partitioned index, first find the correct partition
-		if let Some(block_handle) =
-			partitioned_index.find_block_handle_by_key(target_key.user_key.as_ref())
+		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(user_key)
 		{
 			// Find the partition index
 			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
@@ -1317,8 +1370,8 @@ impl LSMIterator for TableIterator {
 			if partition_iter_result.is_ok() {
 				if let Some(ref partition_iter) = self.current_partition_iter {
 					if partition_iter.valid() {
-						let v = partition_iter.value();
-						let (handle, _) = match BlockHandle::decode(&v) {
+						let v = partition_iter.value_bytes();
+						let (handle, _) = match BlockHandle::decode(v) {
 							Err(_) => {
 								self.positioned = true;
 								self.current_block = None;
@@ -1369,43 +1422,24 @@ impl LSMIterator for TableIterator {
 		Some(())
 	}
 
+	#[inline(always)]
 	fn advance(&mut self) -> bool {
-		// If exhausted, stay exhausted
+		// Fast path: already exhausted
 		if self.exhausted {
 			return false;
 		}
 
-		// If not positioned, position at first entry
-		if !self.positioned {
-			self.seek_to_first();
-			return self.valid();
-		}
-
-		// Try to advance within the current block first
-		if let Some(ref mut block) = self.current_block {
-			if block.advance() {
-				// Successfully advanced within current block
-				return true;
+		// Fast path: advance within current block (most common case)
+		if self.positioned {
+			if let Some(ref mut block) = self.current_block {
+				if block.advance() {
+					return true;
+				}
 			}
 		}
 
-		// Current block is exhausted, try to move to next block
-		match self.skip_to_next_entry() {
-			Ok(true) => {
-				// Successfully loaded next block and positioned at first entry
-				true
-			}
-			Ok(false) => {
-				// No more blocks available - mark as exhausted
-				self.mark_exhausted();
-				false
-			}
-			Err(_) => {
-				// Error loading next block - mark as exhausted
-				self.mark_exhausted();
-				false
-			}
-		}
+		// Slow path: block transition or initial positioning
+		self.advance_slow()
 	}
 
 	fn prev(&mut self) -> bool {
@@ -1416,8 +1450,8 @@ impl LSMIterator for TableIterator {
 		}
 
 		if self.index_block.prev() && self.index_block.valid() {
-			let val = self.index_block.value();
-			let (handle, _) = match BlockHandle::decode(&val) {
+			let val = self.index_block.value_bytes();
+			let (handle, _) = match BlockHandle::decode(val) {
 				Err(_) => return false,
 				Ok(res) => res,
 			};
@@ -1433,12 +1467,12 @@ impl LSMIterator for TableIterator {
 		false
 	}
 
-	fn key(&self) -> Arc<InternalKey> {
-		self.key()
+	fn key_bytes(&self) -> &[u8] {
+		self.current_block.as_ref().unwrap().key_bytes()
 	}
 
-	fn value(&self) -> Value {
-		self.value()
+	fn value_bytes(&self) -> &[u8] {
+		self.current_block.as_ref().unwrap().value_bytes()
 	}
 }
 
@@ -1607,12 +1641,18 @@ mod tests {
 		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"bcd"[..], &b"asa"[..])
+		);
 
 		let key = InternalKey::new(Bytes::from_static(b"abc"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"abc"[..], &b"def"[..])
+		);
 
 		// Seek-past-last invalidates.
 		let key = InternalKey::new(Bytes::from_static(b"{{{"), 2, InternalKeyKind::Set, 0);
@@ -1634,31 +1674,52 @@ mod tests {
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"abc"[..], &b"def"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abd"[..], &b"dee"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"abd"[..], &b"dee"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"bcd"[..], &b"asa"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bsr"[..], &b"a00"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"bsr"[..], &b"a00"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"xyz"[..], &b"xxx"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"xyz"[..], &b"xxx"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"xzz"[..], &b"yyy"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"xzz"[..], &b"yyy"[..])
+		);
 
 		iter.advance();
 		assert!(iter.valid());
-		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"zzz"[..], &b"111"[..]));
+		assert_eq!(
+			(&iter.decode_key().user_key[..], iter.value_bytes()),
+			(&b"zzz"[..], &b"111"[..])
+		);
 	}
 
 	#[test]
@@ -2452,7 +2513,7 @@ mod tests {
 				"Iterator should be valid after advancing to item {expected_index}"
 			);
 
-			let current_key = iter.key();
+			let current_key = iter.decode_key();
 			let key_str = std::str::from_utf8(&current_key.user_key).unwrap();
 			let expected_key = data[expected_index].0;
 			assert_eq!(
@@ -2579,10 +2640,10 @@ mod tests {
 
 			let mut remaining_items = Vec::new();
 			while iter.valid() {
-				let current_key = iter.key();
-				let current_value = iter.value();
+				let current_key = iter.decode_key();
+				let current_value = iter.value_bytes();
 				let key_str = std::str::from_utf8(&current_key.user_key).unwrap();
-				let value_str = std::str::from_utf8(current_value.as_ref()).unwrap();
+				let value_str = std::str::from_utf8(current_value).unwrap();
 				remaining_items.push((key_str.to_string(), value_str.to_string()));
 
 				if !iter.advance() {
@@ -2637,7 +2698,7 @@ mod tests {
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
-			let current_key = iter.key();
+			let current_key = iter.decode_key();
 			let found_key = std::str::from_utf8(&current_key.user_key).unwrap();
 			assert_eq!(found_key, "key_005", "Should find the exact key we sought");
 
@@ -2670,7 +2731,7 @@ mod tests {
 			iter.seek(&seek_key.encode());
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
-			let current_key = iter.key();
+			let current_key = iter.decode_key();
 			let found_key = std::str::from_utf8(&current_key.user_key).unwrap();
 			assert_eq!(found_key, "key_005", "Should find next key when seeking non-existing");
 		}
@@ -2741,8 +2802,8 @@ mod tests {
 		iter.seek_to_first();
 
 		while iter.valid() {
-			let _key = iter.key();
-			let _value = iter.value();
+			let _key = iter.decode_key();
+			let _value = iter.value_bytes();
 
 			if !iter.advance() {
 				break;
@@ -2872,7 +2933,8 @@ mod tests {
 		iter1.seek_to_first();
 		let mut collected_via_advance = Vec::new();
 		while iter1.valid() {
-			collected_via_advance.push((iter1.key(), iter1.value()));
+			collected_via_advance
+				.push((Arc::new(iter1.decode_key()), Bytes::copy_from_slice(iter1.value_bytes())));
 			if !iter1.advance() {
 				break;
 			}
@@ -3662,7 +3724,7 @@ mod tests {
 		assert!(iter.valid(), "Iterator should be valid (positioned at next key)");
 
 		// The iterator is positioned at key_bbb (the next greater key)
-		let current_key = iter.key();
+		let current_key = iter.decode_key();
 		assert_eq!(
 			current_key.user_key.as_ref(),
 			b"key_bbb",
@@ -3726,7 +3788,7 @@ mod tests {
 
 		assert!(iter.valid(), "Iterator should be valid");
 
-		let current_key = iter.key();
+		let current_key = iter.decode_key();
 		assert_eq!(
 			current_key.user_key.as_ref(),
 			b"key_bbb",
@@ -3759,12 +3821,8 @@ mod tests {
 		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
 
 		// Table should be created successfully
-		let lookup_key = InternalKey::new(
-			Bytes::copy_from_slice(b"test_key"),
-			100,
-			InternalKeyKind::Set,
-			0,
-		);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"test_key"), 100, InternalKeyKind::Set, 0);
 		assert!(table.get(lookup_key).unwrap().is_some());
 
 		// Test with All pinning
@@ -3783,12 +3841,8 @@ mod tests {
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(
-			Bytes::copy_from_slice(b"test_key2"),
-			101,
-			InternalKeyKind::Set,
-			0,
-		);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"test_key2"), 101, InternalKeyKind::Set, 0);
 		assert!(table.get(lookup_key).unwrap().is_some());
 	}
 
@@ -3824,39 +3878,27 @@ mod tests {
 		let mut iter = table.iter(false);
 
 		// Seek to first key
-		let lookup1 = InternalKey::new(
-			Bytes::copy_from_slice(b"key_010"),
-			200,
-			InternalKeyKind::Set,
-			0,
-		);
+		let lookup1 =
+			InternalKey::new(Bytes::copy_from_slice(b"key_010"), 200, InternalKeyKind::Set, 0);
 		iter.seek(&lookup1.encode());
 		assert!(iter.valid());
-		let first_key = iter.key();
+		let first_key = iter.decode_key();
 		assert_eq!(first_key.user_key.as_ref(), b"key_010");
 
 		// Seek to nearby key in same partition - should reuse partition
-		let lookup2 = InternalKey::new(
-			Bytes::copy_from_slice(b"key_015"),
-			200,
-			InternalKeyKind::Set,
-			0,
-		);
+		let lookup2 =
+			InternalKey::new(Bytes::copy_from_slice(b"key_015"), 200, InternalKeyKind::Set, 0);
 		iter.seek(&lookup2.encode());
 		assert!(iter.valid());
-		let second_key = iter.key();
+		let second_key = iter.decode_key();
 		assert_eq!(second_key.user_key.as_ref(), b"key_015");
 
 		// Seek backwards in same partition
-		let lookup3 = InternalKey::new(
-			Bytes::copy_from_slice(b"key_005"),
-			200,
-			InternalKeyKind::Set,
-			0,
-		);
+		let lookup3 =
+			InternalKey::new(Bytes::copy_from_slice(b"key_005"), 200, InternalKeyKind::Set, 0);
 		iter.seek(&lookup3.encode());
 		assert!(iter.valid());
-		let third_key = iter.key();
+		let third_key = iter.decode_key();
 		assert_eq!(third_key.user_key.as_ref(), b"key_005");
 	}
 

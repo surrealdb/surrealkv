@@ -11,6 +11,108 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 pub(crate) type BlockData = Bytes;
 
+// Inline buffer size for keys - covers most real-world keys without heap allocation
+// RocksDB uses 39 bytes; we use 64 for better alignment and slightly larger keys
+const INLINE_KEY_SIZE: usize = 64;
+
+/// An optimized key buffer that avoids heap allocation for small keys.
+/// Similar to RocksDB's IterKey class.
+#[derive(Clone)]
+pub(crate) struct IterKeyBuffer {
+	inline_buf: [u8; INLINE_KEY_SIZE],
+	heap_buf: Vec<u8>,
+	len: usize,
+	is_inline: bool,
+}
+
+impl Default for IterKeyBuffer {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl IterKeyBuffer {
+	#[inline]
+	pub(crate) fn new() -> Self {
+		IterKeyBuffer {
+			inline_buf: [0u8; INLINE_KEY_SIZE],
+			heap_buf: Vec::new(),
+			len: 0,
+			is_inline: true,
+		}
+	}
+
+	/// Truncate to shared_len bytes and append data (like RocksDB's TrimAppend)
+	#[inline]
+	pub(crate) fn trim_append(&mut self, shared_len: usize, data: &[u8]) {
+		let total = shared_len + data.len();
+
+		if total <= INLINE_KEY_SIZE {
+			// Fast path: fits in inline buffer
+			if !self.is_inline && shared_len > 0 {
+				// Copy shared prefix from heap to inline
+				self.inline_buf[..shared_len].copy_from_slice(&self.heap_buf[..shared_len]);
+			}
+			self.inline_buf[shared_len..total].copy_from_slice(data);
+			self.len = total;
+			self.is_inline = true;
+		} else {
+			// Slow path: need heap buffer
+			if self.is_inline {
+				// Move shared prefix from inline to heap
+				self.heap_buf.clear();
+				if shared_len > 0 {
+					self.heap_buf.extend_from_slice(&self.inline_buf[..shared_len]);
+				}
+			} else {
+				self.heap_buf.truncate(shared_len);
+			}
+			self.heap_buf.extend_from_slice(data);
+			self.len = total;
+			self.is_inline = false;
+		}
+	}
+
+	/// Clear the buffer
+	#[inline]
+	pub(crate) fn clear(&mut self) {
+		self.len = 0;
+		self.is_inline = true;
+	}
+
+	/// Truncate to the given length
+	#[inline]
+	pub(crate) fn truncate(&mut self, len: usize) {
+		if len < self.len {
+			self.len = len;
+			// If we're using heap and new length fits inline, we could switch
+			// but it's not worth the copy - just keep using heap
+		}
+	}
+
+	/// Get the key as a slice
+	#[inline]
+	pub(crate) fn as_slice(&self) -> &[u8] {
+		if self.is_inline {
+			&self.inline_buf[..self.len]
+		} else {
+			&self.heap_buf[..self.len]
+		}
+	}
+
+	/// Get the length of the key
+	#[inline]
+	pub(crate) fn len(&self) -> usize {
+		self.len
+	}
+
+	/// Check if the buffer is empty
+	#[inline]
+	pub(crate) fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+}
+
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
 pub(crate) struct BlockHandle {
 	pub(crate) offset: usize,
@@ -317,7 +419,7 @@ pub(crate) struct BlockIterator {
 	block: BlockData,
 	restart_points: Vec<u32>,
 	offset: usize,
-	current_key: Vec<u8>,
+	current_key: IterKeyBuffer,
 	/// offset of the current entry used for prev iteration
 	current_entry_offset: usize,
 	current_restart_index: usize,
@@ -349,7 +451,7 @@ impl BlockIterator {
 		BlockIterator {
 			block,
 			restart_points,
-			current_key: Vec::new(),
+			current_key: IterKeyBuffer::new(),
 			offset: 0,
 			current_entry_offset: 0,
 			current_restart_index: 0,
@@ -373,7 +475,30 @@ impl BlockIterator {
 	}
 
 	// Decodes the shared prefix length, non-shared key length, and value size from the block
+	// Uses a fast path when all three values are < 128 (single byte each)
+	#[inline(always)]
 	fn decode_entry_lengths(&self, offset: usize) -> Option<(usize, usize, usize, usize)> {
+		let data = self.block.get(offset..)?;
+		if data.len() < 3 {
+			return None;
+		}
+
+		let shared = data[0] as usize;
+		let non_shared = data[1] as usize;
+		let value_len = data[2] as usize;
+
+		// Fast path: all values < 128 (single byte each)
+		if (shared | non_shared | value_len) < 128 {
+			return Some((shared, non_shared, value_len, 3));
+		}
+
+		// Slow path fallback for larger varints
+		self.decode_entry_lengths_slow(offset)
+	}
+
+	// Slow path for varint decoding when values >= 128
+	#[cold]
+	fn decode_entry_lengths_slow(&self, offset: usize) -> Option<(usize, usize, usize, usize)> {
 		let mut i = 0;
 		let (shared_prefix_length, shared_prefix_length_size) =
 			usize::decode_var(&self.block[offset..])?;
@@ -398,9 +523,11 @@ impl BlockIterator {
 		let (shared_prefix, non_shared_key, value_size, i) =
 			self.decode_entry_lengths(self.offset)?;
 
-		self.current_key.truncate(shared_prefix);
-		self.current_key
-			.extend_from_slice(&self.block[self.offset + i..self.offset + i + non_shared_key]);
+		// Use trim_append for efficient key buffer reuse
+		self.current_key.trim_append(
+			shared_prefix,
+			&self.block[self.offset + i..self.offset + i + non_shared_key],
+		);
 
 		self.offset += i + non_shared_key;
 
@@ -431,7 +558,7 @@ impl Iterator for BlockIterator {
 		} else {
 			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
+		Some((Bytes::copy_from_slice(self.current_key.as_slice()), value))
 	}
 }
 
@@ -446,7 +573,7 @@ impl DoubleEndedIterator for BlockIterator {
 		} else {
 			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
+		Some((Bytes::copy_from_slice(self.current_key.as_slice()), value))
 	}
 }
 
@@ -504,7 +631,7 @@ impl LSMIterator for BlockIterator {
 		self.seek_to_restart_point(left);
 
 		while self.advance() {
-			if self.internal_cmp.compare(&self.current_key, target) != Ordering::Less {
+			if self.internal_cmp.compare(self.current_key.as_slice(), target) != Ordering::Less {
 				break;
 			}
 		}
@@ -551,14 +678,16 @@ impl LSMIterator for BlockIterator {
 		true
 	}
 
-	// Get the current key
-	fn key(&self) -> Arc<InternalKey> {
-		Arc::new(InternalKey::decode(&self.current_key))
+	// Get the raw key bytes - zero copy
+	#[inline]
+	fn key_bytes(&self) -> &[u8] {
+		self.current_key.as_slice()
 	}
 
-	// Get the current value
-	fn value(&self) -> Value {
-		self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+	// Get the raw value bytes - zero copy
+	#[inline]
+	fn value_bytes(&self) -> &[u8] {
+		&self.block[self.current_value_offset_start..self.current_value_offset_end]
 	}
 }
 
@@ -627,8 +756,8 @@ mod tests {
 
 		let mut i = 0;
 		while block_iter.advance() {
-			assert_eq!(block_iter.key().user_key.as_ref(), data[i].0);
-			assert_eq!(block_iter.value(), Bytes::copy_from_slice(data[i].1));
+			assert_eq!(block_iter.decode_key().user_key.as_ref(), data[i].0);
+			assert_eq!(block_iter.value_bytes(), data[i].1);
 			i += 1;
 		}
 
@@ -649,24 +778,24 @@ mod tests {
 		let mut iter = Block::new(block_contents, o.clone()).iter(false);
 
 		iter.next();
-		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
+		assert_eq!(iter.decode_key().user_key.as_ref(), "key1".as_bytes());
+		assert_eq!(iter.value_bytes(), b"value1");
 
 		iter.next();
 		assert!(iter.valid());
 
 		iter.prev();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
+		assert_eq!(iter.decode_key().user_key.as_ref(), "key1".as_bytes());
+		assert_eq!(iter.value_bytes(), b"value1");
 
 		// Go to the last entry
 		while iter.advance() {}
 
 		iter.prev();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_ref(), "pkey2".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value"));
+		assert_eq!(iter.decode_key().user_key.as_ref(), "pkey2".as_bytes());
+		assert_eq!(iter.value_bytes(), b"value");
 	}
 
 	#[test]
@@ -687,7 +816,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.decode_key().user_key.to_vec(), block_iter.value_bytes().to_vec(),)),
 			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -695,7 +824,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.decode_key().user_key.to_vec(), block_iter.value_bytes().to_vec(),)),
 			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -703,7 +832,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.decode_key().user_key.to_vec(), block_iter.value_bytes().to_vec(),)),
 			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
 		);
 
@@ -711,7 +840,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.decode_key().user_key.to_vec(), block_iter.value_bytes().to_vec(),)),
 			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -738,13 +867,13 @@ mod tests {
 
 			block_iter.seek_to_last();
 			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_ref(), "pkey3".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
+			assert_eq!(block_iter.decode_key().user_key.as_ref(), "pkey3".as_bytes());
+			assert_eq!(block_iter.value_bytes(), b"value");
 
 			block_iter.seek_to_first();
 			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value1"));
+			assert_eq!(block_iter.decode_key().user_key.as_ref(), "key1".as_bytes());
+			assert_eq!(block_iter.value_bytes(), b"value1");
 
 			block_iter.next();
 			assert!(block_iter.valid());
@@ -753,8 +882,8 @@ mod tests {
 			block_iter.next();
 			assert!(block_iter.valid());
 
-			assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
+			assert_eq!(block_iter.decode_key().user_key.as_ref(), "pkey1".as_bytes());
+			assert_eq!(block_iter.value_bytes(), b"value");
 		}
 	}
 }

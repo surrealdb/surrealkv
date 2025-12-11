@@ -131,6 +131,13 @@ impl InternalKey {
 		}
 	}
 
+	/// Extract user key slice from encoded internal key bytes without allocation.
+	/// The encoded format is: [user_key][trailer:8][timestamp:8]
+	#[inline]
+	pub(crate) fn extract_user_key(encoded_key: &[u8]) -> &[u8] {
+		&encoded_key[..encoded_key.len().saturating_sub(16)]
+	}
+
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.as_ref().to_vec();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());

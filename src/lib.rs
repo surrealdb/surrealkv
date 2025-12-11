@@ -587,15 +587,22 @@ pub(crate) trait Iterator {
 	/// REQUIRES: `valid()`
 	fn prev(&mut self) -> bool;
 
-	/// Return the key for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
+	/// Return the raw key bytes for the current entry. Zero-copy slice
+	/// pointing directly into the underlying data.
+	/// The returned slice is valid only until the next modification of the iterator.
 	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<InternalKey>;
+	fn key_bytes(&self) -> &[u8];
 
-	/// Return the value for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
+	/// Return the raw value bytes for the current entry. Zero-copy slice
+	/// pointing directly into the underlying data.
+	/// The returned slice is valid only until the next modification of the iterator.
 	/// REQUIRES: `valid()`
-	fn value(&self) -> Value;
+	fn value_bytes(&self) -> &[u8];
+
+	/// Decode and return the key as an InternalKey.
+	/// This allocates - prefer key_bytes() for hot paths.
+	/// REQUIRES: `valid()`
+	fn decode_key(&self) -> InternalKey {
+		InternalKey::decode(self.key_bytes())
+	}
 }

@@ -222,7 +222,8 @@ impl TopLevelIndex {
 				Arc::new(block)
 			} else {
 				// Fallback to reading from file (shouldn't happen if prefetch worked)
-				let block_data = read_table_block(self.opts.clone(), self.file.clone(), &bh.handle)?;
+				let block_data =
+					read_table_block(self.opts.clone(), self.file.clone(), &bh.handle)?;
 				Arc::new(block_data)
 			};
 
