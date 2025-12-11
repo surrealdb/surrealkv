@@ -3,6 +3,7 @@ pub(crate) mod bloom;
 pub(crate) mod filter_block;
 pub(crate) mod index_block;
 pub(crate) mod meta;
+pub(crate) mod prefetch;
 pub(crate) mod table;
 
 use bytes::Bytes;

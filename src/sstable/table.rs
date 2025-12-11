@@ -16,11 +16,12 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
+		prefetch::BlockPrefetcher,
 		InternalKey, InternalKeyKind,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
-	Options, Value,
+	Options, PartitionPinningTier, Value,
 };
 
 use super::meta::KeyRange;
@@ -629,10 +630,24 @@ impl Table {
 		let footer = read_footer(file.clone(), file_size as usize)?;
 		// println!("meta ix handle: {:?}", footer.meta_index);
 
-		// Using partitioned index
+		// Using partitioned index with tiered prefetching
 		let index_block = {
-			let partitioned_index =
+			let mut partitioned_index =
 				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
+
+			// Determine if partitions should be pinned based on tier configuration
+			let should_pin = match opts.partition_pinning_tier {
+				PartitionPinningTier::None => false,
+				PartitionPinningTier::All => true,
+				PartitionPinningTier::FlushedAndSmall => {
+					// Pin if file is small (typically L0 flushes and small tables)
+					file_size < opts.partition_pinning_size_threshold
+				}
+			};
+
+			// Prefetch and optionally pin partitions
+			partitioned_index.prefetch_partitions(should_pin)?;
+
 			IndexType::Partitioned(partitioned_index)
 		};
 
@@ -814,6 +829,13 @@ impl Table {
 			}
 		};
 
+		// Create adaptive readahead prefetcher with options from table configuration
+		let block_prefetcher = BlockPrefetcher::with_auto_readahead_threshold(
+			self.opts.initial_auto_readahead_size,
+			self.opts.max_auto_readahead_size,
+			self.opts.num_file_reads_for_auto_readahead,
+		);
+
 		TableIterator {
 			current_block: None,
 			current_block_off: 0,
@@ -824,6 +846,8 @@ impl Table {
 			current_partition_index: 0,
 			current_partition_iter: None,
 			keys_only,
+			block_prefetcher,
+			prev_partition_offset: 0,
 		}
 	}
 
@@ -888,6 +912,11 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
+	/// Adaptive readahead for sequential scans (modeled after RocksDB's BlockPrefetcher)
+	block_prefetcher: BlockPrefetcher,
+	/// Previous partition offset for reseek optimization (modeled after RocksDB's prev_block_offset_)
+	/// When a seek lands in the same partition, we can reuse the partition iterator
+	prev_partition_offset: u64,
 }
 
 impl TableIterator {
@@ -945,10 +974,51 @@ impl TableIterator {
 	fn reset_partitioned_state(&mut self) {
 		self.current_partition_index = 0;
 		self.current_partition_iter = None;
+		self.prev_partition_offset = 0;
+	}
+
+	/// Save the current partition offset before seek operations.
+	/// This enables the reseek optimization (modeled after RocksDB's SavePrevIndexValue).
+	fn save_prev_partition_offset(&mut self) {
+		if self.current_partition_iter.is_some() {
+			let IndexType::Partitioned(ref idx) = self.table.index_block;
+			if self.current_partition_index < idx.blocks.len() {
+				self.prev_partition_offset = idx.blocks[self.current_partition_index].offset();
+			}
+		}
+	}
+
+	/// Check if the given partition handle matches the previously saved partition.
+	/// If so, we can reuse the existing partition iterator.
+	fn is_same_partition(&self, partition_handle: &crate::sstable::index_block::BlockHandleWithKey) -> bool {
+		self.current_partition_iter.is_some() && partition_handle.offset() == self.prev_partition_offset
 	}
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
-		let block = self.table.read_block(handle)?;
+		// Try adaptive readahead prefetch first
+		let block = if let Ok(true) =
+			self.block_prefetcher.prefetch_if_needed(&*self.table.file, handle)
+		{
+			// Prefetch was triggered, try to read from buffer
+			if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
+				// Decompress and create block from prefetch buffer
+				self.decompress_prefetched_block(&data)?
+			} else {
+				// Fallback to normal read
+				self.table.read_block(handle)?
+			}
+		} else if self.block_prefetcher.is_in_buffer(handle) {
+			// Already in buffer from previous prefetch
+			if let Some(data) = self.block_prefetcher.read_from_buffer(handle) {
+				self.decompress_prefetched_block(&data)?
+			} else {
+				self.table.read_block(handle)?
+			}
+		} else {
+			// Normal read (no prefetch or not in buffer)
+			self.table.read_block(handle)?
+		};
+
 		let mut block_iter = block.iter(self.keys_only);
 
 		// Position at first entry in the new block
@@ -961,6 +1031,34 @@ impl TableIterator {
 		}
 
 		Err(Error::CorruptedBlock("Empty block".to_string()))
+	}
+
+	/// Decompress a block from the prefetch buffer.
+	fn decompress_prefetched_block(&self, raw_data: &[u8]) -> Result<Arc<Block>> {
+		if raw_data.len() < BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN {
+			return Err(Error::CorruptedBlock("prefetched block too small".to_owned()));
+		}
+
+		let n = raw_data.len() - BLOCK_CKSUM_LEN - BLOCK_COMPRESS_LEN;
+		let compression_type_byte = raw_data[n];
+		let checksum_bytes = &raw_data[n + 1..n + 1 + BLOCK_CKSUM_LEN];
+		let expected_checksum = u32::from_le_bytes(
+			checksum_bytes
+				.try_into()
+				.map_err(|_| Error::CorruptedBlock("invalid checksum bytes".to_owned()))?,
+		);
+
+		// Verify checksum
+		if !verify_table_block(&raw_data[..n], compression_type_byte, unmask(expected_checksum)) {
+			return Err(Error::CorruptedBlock("checksum mismatch in prefetched block".to_owned()));
+		}
+
+		let block_data = &raw_data[..n];
+
+		// Decompress based on compression type
+		let decompressed = decompress_block(block_data, CompressionType::from(compression_type_byte))?;
+
+		Ok(Arc::new(Block::new(Bytes::from(decompressed), self.table.opts.clone())))
 	}
 
 	fn key(&self) -> Arc<InternalKey> {
@@ -1171,6 +1269,9 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn seek(&mut self, target: &[u8]) -> Option<()> {
+		// Save previous partition offset for reseek optimization
+		self.save_prev_partition_offset();
+
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// Extract user key from target for partition lookup (optimization)
@@ -1188,52 +1289,74 @@ impl LSMIterator for TableIterator {
 				}
 			}
 
-			if let Ok(partition_block) = partitioned_index.load_block(block_handle) {
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek(target);
+			// RESEEK OPTIMIZATION: Check if we're seeking within the same partition
+			// If so, reuse the existing partition iterator instead of reloading
+			let partition_iter_result = if self.is_same_partition(block_handle) {
+				// Reuse existing partition iterator - just seek within it
+				if let Some(ref mut existing_iter) = self.current_partition_iter {
+					existing_iter.seek(target);
+					Ok(())
+				} else {
+					Err(Error::BlockNotFound)
+				}
+			} else {
+				// Different partition - need to load it
+				match partitioned_index.load_block(block_handle) {
+					Ok(partition_block) => {
+						let mut partition_iter = partition_block.iter(false);
+						partition_iter.seek(target);
+						self.current_partition_iter = Some(partition_iter);
+						// Update prev_partition_offset for future seeks
+						self.prev_partition_offset = block_handle.offset();
+						Ok(())
+					}
+					Err(e) => Err(e),
+				}
+			};
 
-				if partition_iter.valid() {
-					let v = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&v) {
-						Err(_) => {
-							self.positioned = true;
-							self.current_block = None;
-							return Some(());
-						}
-						Ok(res) => res,
-					};
-					self.current_partition_iter = Some(partition_iter);
-					if let Ok(()) = self.load_block(&handle) {
-						if let Some(ref mut block_iter) = self.current_block {
-							block_iter.seek(target);
-							self.positioned = true;
-							self.exhausted = false;
+			if partition_iter_result.is_ok() {
+				if let Some(ref partition_iter) = self.current_partition_iter {
+					if partition_iter.valid() {
+						let v = partition_iter.value();
+						let (handle, _) = match BlockHandle::decode(&v) {
+							Err(_) => {
+								self.positioned = true;
+								self.current_block = None;
+								return Some(());
+							}
+							Ok(res) => res,
+						};
+						if let Ok(()) = self.load_block(&handle) {
+							if let Some(ref mut block_iter) = self.current_block {
+								block_iter.seek(target);
+								self.positioned = true;
+								self.exhausted = false;
 
-							// If not valid in current block, the key might be in next block
-							if !block_iter.valid() {
-								// Try to advance to next block
-								match self.skip_to_next_entry() {
-									Ok(true) => {
-										// Successfully loaded next block and positioned at first entry
-										return Some(());
-									}
-									Ok(false) => {
-										// No more blocks - mark as positioned but invalid
-										self.positioned = true;
-										self.current_block = None;
-										return Some(());
-									}
-									Err(_) => {
-										// Error - mark as positioned but invalid
-										self.positioned = true;
-										self.current_block = None;
-										return Some(());
+								// If not valid in current block, the key might be in next block
+								if !block_iter.valid() {
+									// Try to advance to next block
+									match self.skip_to_next_entry() {
+										Ok(true) => {
+											// Successfully loaded next block and positioned at first entry
+											return Some(());
+										}
+										Ok(false) => {
+											// No more blocks - mark as positioned but invalid
+											self.positioned = true;
+											self.current_block = None;
+											return Some(());
+										}
+										Err(_) => {
+											// Error - mark as positioned but invalid
+											self.positioned = true;
+											self.current_block = None;
+											return Some(());
+										}
 									}
 								}
-							}
 
-							return Some(());
+								return Some(());
+							}
 						}
 					}
 				}
@@ -3609,5 +3732,234 @@ mod tests {
 			b"key_bbb",
 			"Iterator should be positioned at the exact key"
 		);
+	}
+
+	// ============================================================
+	// Tests for new partitioned index features
+	// ============================================================
+
+	#[test]
+	fn test_partition_pinning_tiers() {
+		use crate::PartitionPinningTier;
+
+		// Test with None pinning (small file)
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_partition_pinning_tier(PartitionPinningTier::None),
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key =
+			InternalKey::new(Bytes::copy_from_slice(b"test_key"), 100, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key), b"test_value").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		// Table should be created successfully
+		let lookup_key = InternalKey::new(
+			Bytes::copy_from_slice(b"test_key"),
+			100,
+			InternalKeyKind::Set,
+			0,
+		);
+		assert!(table.get(lookup_key).unwrap().is_some());
+
+		// Test with All pinning
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_partition_pinning_tier(PartitionPinningTier::All),
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		let key =
+			InternalKey::new(Bytes::copy_from_slice(b"test_key2"), 101, InternalKeyKind::Set, 0);
+		writer.add(Arc::new(key), b"test_value2").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+		let lookup_key = InternalKey::new(
+			Bytes::copy_from_slice(b"test_key2"),
+			101,
+			InternalKeyKind::Set,
+			0,
+		);
+		assert!(table.get(lookup_key).unwrap().is_some());
+	}
+
+	#[test]
+	fn test_iterator_reseek_optimization() {
+		// Test that seeking within the same partition doesn't reload it
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(256)
+				.with_index_partition_size(2048), // Large partition to keep multiple blocks in one partition
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		// Add many entries to create multiple blocks within a partition
+		for i in 0..100 {
+			let key = format!("key_{:03}", i);
+			let value = format!("value_{}", i);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				100 + i,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table =
+			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+
+		let mut iter = table.iter(false);
+
+		// Seek to first key
+		let lookup1 = InternalKey::new(
+			Bytes::copy_from_slice(b"key_010"),
+			200,
+			InternalKeyKind::Set,
+			0,
+		);
+		iter.seek(&lookup1.encode());
+		assert!(iter.valid());
+		let first_key = iter.key();
+		assert_eq!(first_key.user_key.as_ref(), b"key_010");
+
+		// Seek to nearby key in same partition - should reuse partition
+		let lookup2 = InternalKey::new(
+			Bytes::copy_from_slice(b"key_015"),
+			200,
+			InternalKeyKind::Set,
+			0,
+		);
+		iter.seek(&lookup2.encode());
+		assert!(iter.valid());
+		let second_key = iter.key();
+		assert_eq!(second_key.user_key.as_ref(), b"key_015");
+
+		// Seek backwards in same partition
+		let lookup3 = InternalKey::new(
+			Bytes::copy_from_slice(b"key_005"),
+			200,
+			InternalKeyKind::Set,
+			0,
+		);
+		iter.seek(&lookup3.encode());
+		assert!(iter.valid());
+		let third_key = iter.key();
+		assert_eq!(third_key.user_key.as_ref(), b"key_005");
+	}
+
+	#[test]
+	fn test_adaptive_readahead_config() {
+		// Test that adaptive readahead configuration is respected
+		let opts = Options::new()
+			.with_initial_auto_readahead_size(16 * 1024)
+			.with_max_auto_readahead_size(128 * 1024)
+			.with_num_file_reads_for_auto_readahead(3);
+
+		assert_eq!(opts.initial_auto_readahead_size, 16 * 1024);
+		assert_eq!(opts.max_auto_readahead_size, 128 * 1024);
+		assert_eq!(opts.num_file_reads_for_auto_readahead, 3);
+	}
+
+	#[test]
+	fn test_sequential_scan_with_prefetcher() {
+		// Test that sequential scans work correctly with the prefetcher
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(256)
+				.with_initial_auto_readahead_size(1024)
+				.with_max_auto_readahead_size(4096)
+				.with_num_file_reads_for_auto_readahead(2),
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+
+		// Add many entries to trigger multiple block reads
+		for i in 0..200 {
+			let key = format!("key_{:05}", i);
+			let value = format!("value_{:05}", i);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table =
+			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+
+		// Sequential scan should work correctly
+		let mut count = 0;
+		for (key, _value) in table.iter(false) {
+			let expected_key = format!("key_{:05}", count);
+			assert_eq!(
+				key.user_key.as_ref(),
+				expected_key.as_bytes(),
+				"Mismatch at position {}",
+				count
+			);
+			count += 1;
+		}
+		assert_eq!(count, 200, "Should have iterated all 200 entries");
+	}
+
+	#[test]
+	fn test_prefetch_buffer_basic() {
+		use crate::sstable::prefetch::PrefetchBuffer;
+
+		// Create a test file buffer
+		let data: Vec<u8> = (0..1000usize).map(|i| (i % 256) as u8).collect();
+
+		// Prefetch a portion
+		let buffer = PrefetchBuffer::prefetch(&data, 100, 500).unwrap();
+
+		// Check contains
+		let handle = BlockHandle::new(150, 50);
+		assert!(buffer.contains(&handle));
+
+		// Check read_block
+		let block_data = buffer.read_block(&handle).unwrap();
+		assert!(!block_data.is_empty());
+	}
+
+	#[test]
+	fn test_block_prefetcher_sequential_pattern() {
+		use crate::sstable::prefetch::{BlockPrefetcher, BLOCK_TRAILER_SIZE};
+
+		// Create test data
+		let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
+
+		let mut prefetcher = BlockPrefetcher::with_auto_readahead_threshold(1000, 8000, 2);
+
+		// First read - no prefetch
+		let handle1 = BlockHandle::new(0, 100);
+		let result1 = prefetcher.prefetch_if_needed(&data, &handle1).unwrap();
+		assert!(!result1, "Should not prefetch on first read");
+
+		// Second sequential read - still no prefetch (need 2 reads first)
+		let handle2 = BlockHandle::new(100 + BLOCK_TRAILER_SIZE, 100);
+		let result2 = prefetcher.prefetch_if_needed(&data, &handle2).unwrap();
+		assert!(!result2, "Should not prefetch on second read");
+
+		// Third sequential read - triggers prefetch
+		let handle3 = BlockHandle::new(200 + 2 * BLOCK_TRAILER_SIZE, 100);
+		let result3 = prefetcher.prefetch_if_needed(&data, &handle3).unwrap();
+		assert!(result3, "Should prefetch on third sequential read");
 	}
 }

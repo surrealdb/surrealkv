@@ -171,6 +171,21 @@ pub enum VLogChecksumLevel {
 	Full = 1,
 }
 
+/// Controls which tables have their index partitions pinned in memory.
+///
+/// This is modeled after RocksDB's `MetadataCacheOptions::partition_pinning`.
+/// Pinning partitions avoids cache lookups and potential eviction for hot tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PartitionPinningTier {
+	/// No pinning - all partitions use the block cache with LRU eviction
+	None,
+	/// Pin L0 tables and tables smaller than `partition_pinning_size_threshold`
+	#[default]
+	FlushedAndSmall,
+	/// Pin all partition blocks in all tables
+	All,
+}
+
 #[derive(Clone)]
 pub struct Options {
 	pub block_size: usize,
@@ -204,6 +219,23 @@ pub struct Options {
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
 	pub(crate) clock: Arc<dyn LogicalClock>,
+
+	// Partition prefetching and adaptive readahead configuration
+	/// Controls which tables have their index partitions pinned in memory
+	/// Default: FlushedAndSmall (pin L0 + small tables)
+	pub partition_pinning_tier: PartitionPinningTier,
+	/// Size threshold for "small" tables that get partitions pinned
+	/// Default: 2x max_memtable_size
+	pub partition_pinning_size_threshold: u64,
+	/// Initial readahead size for sequential scans in bytes
+	/// Default: 8KB
+	pub initial_auto_readahead_size: usize,
+	/// Maximum readahead size in bytes (readahead grows exponentially up to this)
+	/// Default: 256KB
+	pub max_auto_readahead_size: usize,
+	/// Number of sequential reads before enabling auto readahead
+	/// Default: 2
+	pub num_file_reads_for_auto_readahead: u64,
 }
 
 impl Default for Options {
@@ -232,6 +264,12 @@ impl Default for Options {
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
+			// Partition prefetching defaults
+			partition_pinning_tier: PartitionPinningTier::FlushedAndSmall,
+			partition_pinning_size_threshold: 200 * 1024 * 1024, // 2x max_memtable_size default
+			initial_auto_readahead_size: 8 * 1024,               // 8KB
+			max_auto_readahead_size: 256 * 1024,                 // 256KB
+			num_file_reads_for_auto_readahead: 2,
 		}
 	}
 }
@@ -295,6 +333,36 @@ impl Options {
 	// Partitioned index configuration
 	pub const fn with_index_partition_size(mut self, size: usize) -> Self {
 		self.index_partition_size = size;
+		self
+	}
+
+	/// Sets the partition pinning tier for index partitions
+	pub const fn with_partition_pinning_tier(mut self, tier: PartitionPinningTier) -> Self {
+		self.partition_pinning_tier = tier;
+		self
+	}
+
+	/// Sets the size threshold for "small" tables that get partitions pinned
+	pub const fn with_partition_pinning_size_threshold(mut self, threshold: u64) -> Self {
+		self.partition_pinning_size_threshold = threshold;
+		self
+	}
+
+	/// Sets the initial readahead size for sequential scans
+	pub const fn with_initial_auto_readahead_size(mut self, size: usize) -> Self {
+		self.initial_auto_readahead_size = size;
+		self
+	}
+
+	/// Sets the maximum readahead size (readahead grows exponentially up to this)
+	pub const fn with_max_auto_readahead_size(mut self, size: usize) -> Self {
+		self.max_auto_readahead_size = size;
+		self
+	}
+
+	/// Sets the number of sequential reads before enabling auto readahead
+	pub const fn with_num_file_reads_for_auto_readahead(mut self, count: u64) -> Self {
+		self.num_file_reads_for_auto_readahead = count;
 		self
 	}
 

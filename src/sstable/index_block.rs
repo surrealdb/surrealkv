@@ -1,5 +1,6 @@
 // Note: Needs to be tested if a top-level index improves performance as such.
 // TODO: Replace the current non-partitioned index block writer with this
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use crate::{
 	error::{Error, Result},
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockWriter},
+		prefetch::{PrefetchBuffer, BLOCK_TRAILER_SIZE},
 		table::{compress_block, read_table_block, write_block_at_offset},
 		InternalKey,
 	},
@@ -151,6 +153,9 @@ pub(crate) struct TopLevelIndex {
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
 	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
 	file: Arc<dyn File>,
+	/// Pinned partitions - when set, these partitions are kept in memory
+	/// and bypass the LRU cache for faster access (modeled after RocksDB's partition_map_)
+	pinned_partitions: Option<HashMap<u64, Arc<Block>>>,
 }
 
 impl TopLevelIndex {
@@ -177,7 +182,107 @@ impl TopLevelIndex {
 			opts: opt.clone(),
 			blocks,
 			file: f.clone(),
+			pinned_partitions: None,
 		})
+	}
+
+	/// Prefetch and optionally pin all partitions.
+	///
+	/// This is modeled after RocksDB's `PartitionIndexReader::CacheDependencies()`.
+	/// It reads all partitions in a single bulk I/O operation and optionally
+	/// pins them in memory to avoid LRU eviction.
+	///
+	/// # Arguments
+	/// * `pin` - If true, partitions are pinned in memory (bypass cache eviction)
+	pub(crate) fn prefetch_partitions(&mut self, pin: bool) -> Result<()> {
+		if self.blocks.is_empty() {
+			return Ok(());
+		}
+
+		// Find first and last partition offsets
+		let first_off = self.blocks.first().map(|b| b.handle.offset).unwrap_or(0);
+		let last = self.blocks.last().ok_or(Error::BlockNotFound)?;
+		let last_off = last.handle.offset + last.handle.size + BLOCK_TRAILER_SIZE;
+
+		// Bulk prefetch entire range
+		let prefetch_len = last_off.saturating_sub(first_off);
+		if prefetch_len == 0 {
+			return Ok(());
+		}
+
+		let prefetch_buf = PrefetchBuffer::prefetch(&*self.file, first_off as u64, prefetch_len)?;
+
+		// Read each partition from buffer
+		let mut map = HashMap::new();
+		for bh in &self.blocks {
+			// Try to read from prefetch buffer first
+			let block = if let Some(data) = prefetch_buf.read_block(&bh.handle) {
+				// Decompress if needed and create block
+				let block = self.decompress_block_data(&data)?;
+				Arc::new(block)
+			} else {
+				// Fallback to reading from file (shouldn't happen if prefetch worked)
+				let block_data = read_table_block(self.opts.clone(), self.file.clone(), &bh.handle)?;
+				Arc::new(block_data)
+			};
+
+			if pin {
+				map.insert(bh.handle.offset as u64, block.clone());
+			}
+
+			// Also insert into cache
+			self.opts.block_cache.insert(self.id, bh.offset(), Item::Index(block));
+		}
+
+		if pin {
+			self.pinned_partitions = Some(map);
+		}
+
+		Ok(())
+	}
+
+	/// Decompress raw block data from the prefetch buffer.
+	fn decompress_block_data(&self, raw_data: &[u8]) -> Result<Block> {
+		use crate::sstable::table::{unmask, BLOCK_CKSUM_LEN, BLOCK_COMPRESS_LEN};
+		use crc32fast::Hasher as Crc32;
+
+		if raw_data.len() < BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN {
+			return Err(Error::CorruptedBlock("block too small".to_owned()));
+		}
+
+		let n = raw_data.len() - BLOCK_CKSUM_LEN - BLOCK_COMPRESS_LEN;
+		let compression_type_byte = raw_data[n];
+		let checksum_bytes = &raw_data[n + 1..n + 1 + BLOCK_CKSUM_LEN];
+		let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().unwrap());
+
+		// Verify checksum
+		let mut hasher = Crc32::new();
+		hasher.update(&raw_data[..n + 1]); // data + compression byte
+		let actual_checksum = unmask(expected_checksum);
+		if hasher.finalize() != actual_checksum {
+			return Err(Error::CorruptedBlock("checksum mismatch".to_owned()));
+		}
+
+		let block_data = &raw_data[..n];
+
+		// Decompress based on compression type
+		let decompressed = match compression_type_byte.into() {
+			CompressionType::None => Bytes::copy_from_slice(block_data),
+			CompressionType::SnappyCompression => {
+				let mut decoder = snap::raw::Decoder::new();
+				let decompressed = decoder
+					.decompress_vec(block_data)
+					.map_err(|e| Error::CorruptedBlock(format!("snappy decompress failed: {e}")))?;
+				Bytes::from(decompressed)
+			}
+		};
+
+		Ok(Block::new(decompressed, self.opts.clone()))
+	}
+
+	/// Check if partitions are pinned in memory.
+	pub(crate) fn has_pinned_partitions(&self) -> bool {
+		self.pinned_partitions.is_some()
 	}
 
 	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
@@ -198,10 +303,19 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
+		// Check pinned partitions first (fastest path)
+		if let Some(ref pinned) = self.pinned_partitions {
+			if let Some(block) = pinned.get(&(block_handle.handle.offset as u64)) {
+				return Ok(block.clone());
+			}
+		}
+
+		// Check block cache
 		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
 			return Ok(block);
 		}
 
+		// Read from file
 		let block_data =
 			read_table_block(self.opts.clone(), self.file.clone(), &block_handle.handle)?;
 		let block = Arc::new(block_data);
@@ -356,6 +470,7 @@ mod tests {
 				BlockHandleWithKey::new(b"j".to_vec(), BlockHandle::new(20, 10)),
 			],
 			file: f.clone(),
+			pinned_partitions: None,
 		};
 
 		// A list of tuples where the first element is the key to find,
