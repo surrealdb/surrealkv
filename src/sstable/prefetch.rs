@@ -60,11 +60,6 @@ impl PrefetchBuffer {
 		let end = start + handle.size + BLOCK_TRAILER_SIZE;
 		Some(self.data[start..end].to_vec())
 	}
-
-	/// Get the ending offset of this buffer (exclusive).
-	pub fn end_offset(&self) -> u64 {
-		self.offset + self.data.len() as u64
-	}
 }
 
 /// Tracks sequential access and manages adaptive readahead.
@@ -96,25 +91,6 @@ pub(crate) struct BlockPrefetcher {
 }
 
 impl BlockPrefetcher {
-	/// Create a new BlockPrefetcher with the given configuration.
-	///
-	/// # Arguments
-	/// * `initial_size` - Initial readahead size in bytes
-	/// * `max_size` - Maximum readahead size in bytes
-	pub fn new(initial_size: usize, max_size: usize) -> Self {
-		Self {
-			num_file_reads: 0,
-			prev_offset: 0,
-			prev_len: 0,
-			readahead_size: initial_size,
-			readahead_limit: 0,
-			buffer: None,
-			initial_readahead_size: initial_size,
-			max_readahead_size: max_size,
-			num_reads_for_auto_readahead: 2,
-		}
-	}
-
 	/// Create a new BlockPrefetcher with custom auto-readahead threshold.
 	pub fn with_auto_readahead_threshold(
 		initial_size: usize,
@@ -160,11 +136,6 @@ impl BlockPrefetcher {
 		} else {
 			false
 		}
-	}
-
-	/// Get a reference to the current prefetch buffer.
-	pub fn buffer(&self) -> Option<&PrefetchBuffer> {
-		self.buffer.as_ref()
 	}
 
 	/// Prefetch if needed, based on access pattern.
@@ -240,7 +211,6 @@ mod tests {
 
 		assert_eq!(buf.offset, 100);
 		assert_eq!(buf.data.len(), 500);
-		assert_eq!(buf.end_offset(), 600);
 	}
 
 	#[test]
@@ -282,7 +252,7 @@ mod tests {
 	#[test]
 	fn test_block_prefetcher_sequential_detection() {
 		let data = make_test_file(10000);
-		let mut prefetcher = BlockPrefetcher::new(1000, 8000);
+		let mut prefetcher = BlockPrefetcher::with_auto_readahead_threshold(1000, 8000, 2);
 
 		// First read - no prefetch yet
 		let handle1 = BlockHandle::new(0, 100);
@@ -306,7 +276,7 @@ mod tests {
 	#[test]
 	fn test_block_prefetcher_non_sequential_reset() {
 		let data = make_test_file(10000);
-		let mut prefetcher = BlockPrefetcher::new(1000, 8000);
+		let mut prefetcher = BlockPrefetcher::with_auto_readahead_threshold(1000, 8000, 2);
 
 		// Sequential reads
 		let handle1 = BlockHandle::new(0, 100);
@@ -327,7 +297,7 @@ mod tests {
 	#[test]
 	fn test_block_prefetcher_exponential_growth() {
 		let data = make_test_file(100000);
-		let mut prefetcher = BlockPrefetcher::new(1000, 16000);
+		let mut prefetcher = BlockPrefetcher::with_auto_readahead_threshold(1000, 16000, 2);
 
 		// Trigger prefetch with sequential reads
 		let mut offset = 0;

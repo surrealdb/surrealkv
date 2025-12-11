@@ -2,43 +2,161 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::{cmp::Ordering, sync::Arc};
 
+use bytes::Bytes;
+
 use crate::clock::LogicalClock;
 use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
+use crate::Iterator as LSMIterator;
 
 use crate::{sstable::InternalKey, Key, Value};
 
-pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
+/// Boxed cursor for zero-allocation iteration using the LSMIterator (cursor) pattern.
+/// Consumers use advance() + key_bytes() + value_bytes() instead of next().
+pub type BoxedCursor<'a> = Box<dyn LSMIterator + 'a>;
 
-// Holds a key-value pair and the iterator index
+/// Adapter to wrap a DoubleEndedIterator as an LSMIterator (cursor).
+/// Supports both forward and backward iteration.
+pub(crate) struct DoubleEndedStdIterAdapter<I> {
+	iter: I,
+	current_key: Option<Vec<u8>>,   // Encoded key bytes
+	current_value: Option<Vec<u8>>, // Value bytes
+}
+
+impl<I> DoubleEndedStdIterAdapter<I>
+where
+	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
+{
+	pub(crate) fn new(iter: I) -> Self {
+		Self {
+			iter,
+			current_key: None,
+			current_value: None,
+		}
+	}
+}
+
+impl<I> LSMIterator for DoubleEndedStdIterAdapter<I>
+where
+	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
+{
+	fn valid(&self) -> bool {
+		self.current_key.is_some()
+	}
+
+	fn seek_to_first(&mut self) {
+		self.advance();
+	}
+
+	fn seek_to_last(&mut self) {
+		// Use next_back to get the last item
+		if let Some((key, value)) = self.iter.next_back() {
+			self.current_key = Some(key.encode());
+			self.current_value = Some(value.to_vec());
+		} else {
+			self.current_key = None;
+			self.current_value = None;
+		}
+	}
+
+	fn seek(&mut self, target: &[u8]) -> Option<()> {
+		// Scan forward until we find >= target
+		for (key, value) in self.iter.by_ref() {
+			let encoded = key.encode();
+			if encoded.as_slice() >= target {
+				self.current_key = Some(encoded);
+				self.current_value = Some(value.to_vec());
+				return Some(());
+			}
+		}
+		self.current_key = None;
+		self.current_value = None;
+		None
+	}
+
+	fn advance(&mut self) -> bool {
+		if let Some((key, value)) = self.iter.next() {
+			self.current_key = Some(key.encode());
+			self.current_value = Some(value.to_vec());
+			true
+		} else {
+			self.current_key = None;
+			self.current_value = None;
+			false
+		}
+	}
+
+	fn prev(&mut self) -> bool {
+		if let Some((key, value)) = self.iter.next_back() {
+			self.current_key = Some(key.encode());
+			self.current_value = Some(value.to_vec());
+			true
+		} else {
+			self.current_key = None;
+			self.current_value = None;
+			false
+		}
+	}
+
+	fn key_bytes(&self) -> &[u8] {
+		self.current_key.as_deref().unwrap_or(&[])
+	}
+
+	fn value_bytes(&self) -> &[u8] {
+		self.current_value.as_deref().unwrap_or(&[])
+	}
+}
+
+/// Heap item for cursor-based merge iteration.
+/// Stores key bytes for comparison but delegates value access to the iterator.
 #[derive(Eq)]
-pub(crate) struct HeapItem {
-	pub(crate) key: Arc<InternalKey>,
-	pub(crate) value: Value,
+pub(crate) struct CursorHeapItem {
+	/// Raw key bytes for comparison (copied from iterator)
+	pub(crate) key_bytes: Bytes,
+	/// Index into the iterators vector
 	pub(crate) iterator_index: usize,
 }
 
-impl PartialEq for HeapItem {
+impl CursorHeapItem {
+	/// Extract user key from the stored key bytes (zero-copy slice)
+	#[inline]
+	fn user_key(&self) -> &[u8] {
+		InternalKey::extract_user_key(&self.key_bytes)
+	}
+
+	/// Extract sequence number from the stored key bytes
+	#[inline]
+	fn seq_num(&self) -> u64 {
+		if self.key_bytes.len() < 16 {
+			return 0;
+		}
+		let n = self.key_bytes.len() - 16;
+		let trailer = u64::from_be_bytes(self.key_bytes[n..n + 8].try_into().unwrap());
+		trailer >> 8
+	}
+}
+
+impl PartialEq for CursorHeapItem {
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
 }
 
-impl Ord for HeapItem {
+impl Ord for CursorHeapItem {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Invert for min-heap behavior
 		other.cmp_internal(self)
 	}
 }
 
-impl HeapItem {
+impl CursorHeapItem {
 	fn cmp_internal(&self, other: &Self) -> Ordering {
 		// First compare by user key
-		match self.key.user_key.cmp(&other.key.user_key) {
+		match self.user_key().cmp(other.user_key()) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
-				match other.key.seq_num().cmp(&self.key.seq_num()) {
+				match other.seq_num().cmp(&self.seq_num()) {
 					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
 					ord => ord,
 				}
@@ -48,96 +166,9 @@ impl HeapItem {
 	}
 }
 
-impl PartialOrd for HeapItem {
+impl PartialOrd for CursorHeapItem {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
-	}
-}
-
-pub(crate) struct MergeIterator<'a> {
-	iterators: Vec<BoxedIterator<'a>>,
-	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem>,
-	// Current key we're processing, to skip duplicate versions
-	current_user_key: Option<Key>,
-	initialized: bool,
-	// If true, skip hard delete entries at the bottom level
-	is_bottom_level: bool,
-}
-
-impl<'a> MergeIterator<'a> {
-	pub(crate) fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
-		let heap = BinaryHeap::with_capacity(iterators.len());
-
-		Self {
-			iterators,
-			heap,
-			current_user_key: None,
-			initialized: false,
-			is_bottom_level,
-		}
-	}
-
-	fn initialize(&mut self) {
-		// Pull the first item from each iterator and add to heap
-		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: idx,
-				});
-			}
-		}
-		self.initialized = true;
-	}
-}
-
-impl Iterator for MergeIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if !self.initialized {
-			self.initialize();
-		}
-
-		loop {
-			// Get the smallest item from the heap
-			let heap_item = self.heap.pop()?;
-
-			// Pull the next item from the same iterator and add back to heap
-			if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: heap_item.iterator_index,
-				});
-			}
-
-			let user_key = heap_item.key.user_key.clone();
-			let is_hard_delete = heap_item.key.is_hard_delete_marker();
-
-			// Check if this is a new user key
-			let is_new_key = match &self.current_user_key {
-				None => true,
-				Some(current) => user_key != current,
-			};
-
-			if is_new_key {
-				// New user key - update tracking
-				self.current_user_key = Some(user_key);
-
-				// At the bottom level, skip hard delete entries since there are no older entries below
-				if is_hard_delete && self.is_bottom_level {
-					continue;
-				}
-
-				// Return this item (most recent version of this user key)
-				return Some((heap_item.key, heap_item.value));
-			}
-			// Same user key - this is an older version, skip it
-			continue;
-		}
 	}
 }
 
@@ -157,20 +188,23 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Val
 	Ok(())
 }
 
+/// Compaction iterator using cursor pattern for input iterators.
+/// Uses BoxedCursor for efficient input but still buffers versions for retention logic.
 pub(crate) struct CompactionIterator<'a> {
-	iterators: Vec<BoxedIterator<'a>>,
-	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem>,
+	iterators: Vec<BoxedCursor<'a>>,
+	// Heap of iterator indices, ordered by their current key
+	heap: BinaryHeap<CursorHeapItem>,
 	is_bottom_level: bool,
 
 	// Track the current key being processed
 	current_user_key: Option<Key>,
 
-	// Buffer for accumulating all versions of the current key
+	// Buffer for accumulating all versions of the current key (still need to copy for retention logic)
 	accumulated_versions: Vec<(Arc<InternalKey>, Value)>,
 
 	// Buffer for outputting the versions of the current key
 	output_versions: Vec<(Arc<InternalKey>, Value)>,
+	output_index: usize,
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
@@ -194,7 +228,7 @@ pub(crate) struct CompactionIterator<'a> {
 
 impl<'a> CompactionIterator<'a> {
 	pub(crate) fn new(
-		iterators: Vec<BoxedIterator<'a>>,
+		iterators: Vec<BoxedCursor<'a>>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,
@@ -210,6 +244,7 @@ impl<'a> CompactionIterator<'a> {
 			current_user_key: None,
 			accumulated_versions: Vec::new(),
 			output_versions: Vec::new(),
+			output_index: 0,
 			discard_stats: HashMap::new(),
 			vlog,
 			delete_list_batch: Vec::new(),
@@ -221,17 +256,38 @@ impl<'a> CompactionIterator<'a> {
 	}
 
 	fn initialize(&mut self) {
-		// Pull the first item from each iterator and add to heap
+		// Position each iterator at its first entry and add to heap
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
+			iter.seek_to_first();
+			if iter.valid() {
+				self.heap.push(CursorHeapItem {
+					key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
 					iterator_index: idx,
 				});
 			}
 		}
 		self.initialized = true;
+	}
+
+	/// Pop the next item from heap, copy key/value, advance the iterator
+	fn pop_and_advance(&mut self) -> Option<(Arc<InternalKey>, Value)> {
+		let heap_item = self.heap.pop()?;
+		let idx = heap_item.iterator_index;
+
+		// Get key/value from the iterator (it's still positioned on current entry)
+		let iter = &mut self.iterators[idx];
+		let key = Arc::new(iter.decode_key());
+		let value = Bytes::copy_from_slice(iter.value_bytes());
+
+		// Advance the iterator and re-insert if valid
+		if iter.advance() && iter.valid() {
+			self.heap.push(CursorHeapItem {
+				key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+				iterator_index: idx,
+			});
+		}
+
+		Some((key, value))
 	}
 
 	/// Flushes the batched delete-list entries to the VLog
@@ -361,13 +417,19 @@ impl Iterator for CompactionIterator<'_> {
 
 		loop {
 			// First, return any pending output versions
-			if !self.output_versions.is_empty() {
-				// Remove from front to maintain sequence number order (already sorted descending)
-				return Some(self.output_versions.remove(0));
+			if self.output_index < self.output_versions.len() {
+				let item = self.output_versions[self.output_index].clone();
+				self.output_index += 1;
+				// Clear when all consumed
+				if self.output_index >= self.output_versions.len() {
+					self.output_versions.clear();
+					self.output_index = 0;
+				}
+				return Some(item);
 			}
 
 			// Get the next item from the heap
-			let heap_item = match self.heap.pop() {
+			let (key, value) = match self.pop_and_advance() {
 				Some(item) => item,
 				None => {
 					// No more items in heap, process any remaining accumulated versions
@@ -375,28 +437,25 @@ impl Iterator for CompactionIterator<'_> {
 						self.process_accumulated_versions();
 						// Return first output version if any
 						if !self.output_versions.is_empty() {
-							return Some(self.output_versions.remove(0));
+							let item = self.output_versions[0].clone();
+							self.output_index = 1;
+							if self.output_index >= self.output_versions.len() {
+								self.output_versions.clear();
+								self.output_index = 0;
+							}
+							return Some(item);
 						}
 					}
 					return None;
 				}
 			};
 
-			// Pull the next item from the same iterator and add back to heap
-			if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: heap_item.iterator_index,
-				});
-			}
-
-			let user_key = heap_item.key.user_key.clone();
+			let user_key = key.user_key.clone();
 
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
 				None => true,
-				Some(current) => user_key != current,
+				Some(current) => user_key != *current,
 			};
 
 			if is_new_key {
@@ -406,20 +465,26 @@ impl Iterator for CompactionIterator<'_> {
 
 					// Start accumulating the new key
 					self.current_user_key = Some(user_key);
-					self.accumulated_versions.push((heap_item.key, heap_item.value));
+					self.accumulated_versions.push((key, value));
 
 					// Return first output version from processed key if any
 					if !self.output_versions.is_empty() {
-						return Some(self.output_versions.remove(0));
+						let item = self.output_versions[0].clone();
+						self.output_index = 1;
+						if self.output_index >= self.output_versions.len() {
+							self.output_versions.clear();
+							self.output_index = 0;
+						}
+						return Some(item);
 					}
 				} else {
 					// First key - start accumulating
 					self.current_user_key = Some(user_key);
-					self.accumulated_versions.push((heap_item.key, heap_item.value));
+					self.accumulated_versions.push((key, value));
 				}
 			} else {
 				// Same user key - add to accumulated versions
-				self.accumulated_versions.push((heap_item.key, heap_item.value));
+				self.accumulated_versions.push((key, value));
 			}
 		}
 	}
@@ -476,114 +541,83 @@ mod tests {
 	}
 
 	// Creates a mock iterator with predefined entries
+	// Now implements LSMIterator for use with cursor-based iterators
 	struct MockIterator {
-		items: Vec<(Arc<InternalKey>, Value)>,
-		index: usize,
+		items: Vec<(Vec<u8>, Vec<u8>)>, // (encoded_key, value)
+		index: isize,                   // -1 = before first, 0..n = valid positions
 	}
 
 	impl MockIterator {
 		fn new(items: Vec<(Arc<InternalKey>, Value)>) -> Self {
+			let encoded_items: Vec<_> =
+				items.into_iter().map(|(k, v)| (k.encode(), v.to_vec())).collect();
 			Self {
-				items,
-				index: 0,
+				items: encoded_items,
+				index: -1, // Not positioned initially
 			}
 		}
 	}
 
-	impl Iterator for MockIterator {
-		type Item = (Arc<InternalKey>, Value);
+	impl LSMIterator for MockIterator {
+		fn valid(&self) -> bool {
+			self.index >= 0 && (self.index as usize) < self.items.len()
+		}
 
-		fn next(&mut self) -> Option<Self::Item> {
-			if self.index < self.items.len() {
-				let item = self.items[self.index].clone();
+		fn seek_to_first(&mut self) {
+			self.index = if self.items.is_empty() {
+				-1
+			} else {
+				0
+			};
+		}
+
+		fn seek_to_last(&mut self) {
+			self.index = if self.items.is_empty() {
+				-1
+			} else {
+				(self.items.len() - 1) as isize
+			};
+		}
+
+		fn seek(&mut self, target: &[u8]) -> Option<()> {
+			// Binary search for the target
+			for (i, (key, _)) in self.items.iter().enumerate() {
+				if key.as_slice() >= target {
+					self.index = i as isize;
+					return Some(());
+				}
+			}
+			self.index = -1;
+			None
+		}
+
+		fn advance(&mut self) -> bool {
+			if self.index < 0 {
+				// First call - position at first item
+				self.index = 0;
+			} else {
 				self.index += 1;
-				Some(item)
+			}
+			self.valid()
+		}
+
+		fn prev(&mut self) -> bool {
+			if self.index > 0 {
+				self.index -= 1;
+				true
 			} else {
-				None
-			}
-		}
-	}
-
-	impl DoubleEndedIterator for MockIterator {
-		fn next_back(&mut self) -> Option<Self::Item> {
-			if self.index < self.items.len() {
-				let item = self.items.pop()?;
-				Some(item)
-			} else {
-				None
-			}
-		}
-	}
-
-	#[test]
-	fn test_merge_iterator_sequence_ordering() {
-		// First iterator (L0) with hard delete entries for even keys
-		let mut items1 = Vec::new();
-		for i in 0..10 {
-			if i % 2 == 0 {
-				// hard_delete for even keys
-				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
-				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				self.index = -1;
+				false
 			}
 		}
 
-		// Second iterator (L1) with values for all keys
-		let mut items2 = Vec::new();
-		for i in 0..20 {
-			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
-			let value_str = format!("value-{i}");
-			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+		fn key_bytes(&self) -> &[u8] {
+			&self.items[self.index as usize].0
 		}
 
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
-
-		// Create the merge iterator
-		let merge_iter = MergeIterator::new(vec![iter1, iter2], false);
-
-		// Collect all items
-		let mut result = Vec::new();
-		for (key, _) in merge_iter {
-			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
-			let seq = key.seq_num();
-			let kind = key.kind();
-			result.push((key_str, seq, kind));
+		fn value_bytes(&self) -> &[u8] {
+			&self.items[self.index as usize].1
 		}
-
-		// Now verify the output
-
-		// 1. First, check that all keys are in ascending order by user key
-		for i in 1..result.len() {
-			assert!(
-				result[i - 1].0 <= result[i].0,
-				"Keys not in ascending order: {} vs {}",
-				result[i - 1].0,
-				result[i].0
-			);
-		}
-
-		// 2. Check that for keys with hard delete entries, the hard_delete comes first
-		for i in 0..10 {
-			if i % 2 == 0 {
-				// Find this key in the result
-				let key = format!("key-{i:03}");
-				let entries: Vec<_> = result.iter().filter(|(k, _, _)| k == &key).collect();
-
-				// Should only have one entry per key due to deduplication
-				assert_eq!(entries.len(), 1, "Key {key} has multiple entries");
-
-				// And it should be the hard_delete (seq=200, kind=Delete)
-				let (_, seq, kind) = entries[0];
-				assert_eq!(*seq, 200, "Key {key} has wrong sequence");
-				assert_eq!(*kind, InternalKeyKind::Delete, "Key {key} has wrong kind");
-			}
-		}
-
-		// 3. Check that we have the correct total number of entries
-		// All keys (20) because we get 5 keys with hard delete entries from items1 and 15 other keys from items2
-		assert_eq!(result.len(), 20, "Wrong number of entries");
 	}
 
 	#[test]
@@ -610,7 +644,14 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Test non-bottom level (should keep hard delete entries)
-		let comp_iter = MergeIterator::new(vec![iter1, iter2], false);
+		let comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false, // not bottom level
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::default()),
+		);
 
 		// Collect all items
 		let mut result = Vec::new();
@@ -675,7 +716,14 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Use bottom level
-		let comp_iter = MergeIterator::new(vec![iter1, iter2], true);
+		let comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			true, // bottom level
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::default()),
+		);
 
 		// Collect all items
 		let mut bottom_result = Vec::new();

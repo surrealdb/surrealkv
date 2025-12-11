@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
 
 use crate::error::{Error, Result};
-use crate::iter::BoxedIterator;
+use crate::iter::{BoxedCursor, DoubleEndedStdIterAdapter};
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
@@ -22,27 +22,49 @@ use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 /// Type alias for versioned entries with key, timestamp, and optional value
 use interval_heap::IntervalHeap;
 
+/// Cursor-based heap item for zero-allocation merge iteration.
+/// Stores key bytes for comparison but delegates value access to the iterator.
 #[derive(Eq)]
-struct HeapItem {
-	key: Arc<InternalKey>,
-	value: Value,
+pub(crate) struct CursorIntervalHeapItem {
+	/// Raw key bytes for comparison (copied from iterator)
+	key_bytes: Bytes,
+	/// Index into the iterators vector
 	iterator_index: usize,
 }
 
-impl PartialEq for HeapItem {
+impl CursorIntervalHeapItem {
+	/// Extract user key from the stored key bytes (zero-copy slice)
+	#[inline]
+	fn user_key(&self) -> &[u8] {
+		InternalKey::extract_user_key(&self.key_bytes)
+	}
+
+	/// Extract sequence number from the stored key bytes
+	#[inline]
+	fn seq_num(&self) -> u64 {
+		if self.key_bytes.len() < 16 {
+			return 0;
+		}
+		let n = self.key_bytes.len() - 16;
+		let trailer = u64::from_be_bytes(self.key_bytes[n..n + 8].try_into().unwrap());
+		trailer >> 8
+	}
+}
+
+impl PartialEq for CursorIntervalHeapItem {
 	fn eq(&self, other: &Self) -> bool {
 		self.cmp(other) == Ordering::Equal
 	}
 }
 
-impl Ord for HeapItem {
+impl Ord for CursorIntervalHeapItem {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// First compare by user key
-		match self.key.user_key.cmp(&other.key.user_key) {
+		match self.user_key().cmp(other.user_key()) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
-				match other.key.seq_num().cmp(&self.key.seq_num()) {
+				match other.seq_num().cmp(&self.seq_num()) {
 					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
 					ord => ord,
 				}
@@ -52,7 +74,7 @@ impl Ord for HeapItem {
 	}
 }
 
-impl PartialOrd for HeapItem {
+impl PartialOrd for CursorIntervalHeapItem {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
@@ -660,16 +682,19 @@ impl Drop for Snapshot {
 	}
 }
 
-/// A merge iterator that sorts by key+seqno.
+/// A merge iterator that sorts by key+seqno using the cursor pattern.
 pub(crate) struct KMergeIterator<'a> {
 	// Owned state
 	_iter_state: Box<IterState>,
 
-	/// Array of iterators to merge over
-	iterators: NonNull<Vec<BoxedIterator<'a>>>,
+	/// Array of cursors to merge over
+	iterators: NonNull<Vec<BoxedCursor<'a>>>,
 
 	/// Interval heap of items ordered by their current key
-	heap: IntervalHeap<HeapItem>,
+	heap: IntervalHeap<CursorIntervalHeapItem>,
+
+	/// Snapshot sequence number for visibility filtering
+	snapshot_seq_num: u64,
 
 	/// Range bounds for filtering
 	range_end: Bound<Vec<u8>>,
@@ -689,7 +714,7 @@ impl<'a> KMergeIterator<'a> {
 		keys_only: bool,
 	) -> Self {
 		let boxed_state = Box::new(iter_state);
-		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
+		let mut iterators: Vec<BoxedCursor<'a>> = Vec::new();
 
 		unsafe {
 			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
@@ -706,23 +731,18 @@ impl<'a> KMergeIterator<'a> {
 				KeyRange::new((Bytes::from(low), Bytes::from(high)))
 			};
 
-			// Active memtable with range
-			let active_iter = state_ref.active.range(range.clone()).filter(move |item| {
-				// Filter out items that are not visible in this snapshot
-				item.0.seq_num() <= snapshot_seq_num
-			});
-			iterators.push(Box::new(active_iter));
+			// Active memtable with range - wrap with DoubleEndedStdIterAdapter
+			// Don't position yet - initialize_lo/hi will do that
+			let active_iter = state_ref.active.range(range.clone());
+			iterators.push(Box::new(DoubleEndedStdIterAdapter::new(active_iter)));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
-				let iter = memtable.range(range.clone()).filter(move |item| {
-					// Filter out items that are not visible in this snapshot
-					item.0.seq_num() <= snapshot_seq_num
-				});
-				iterators.push(Box::new(iter));
+				let iter = memtable.range(range.clone());
+				iterators.push(Box::new(DoubleEndedStdIterAdapter::new(iter)));
 			}
 
-			// Tables - these have native seek support
+			// Tables - these implement LSMIterator directly
 			for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
 				// Optimization: Skip tables that are completely outside the query range
 				if level_idx == 0 {
@@ -767,12 +787,8 @@ impl<'a> KMergeIterator<'a> {
 							}
 						}
 
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						// Box table iterator directly as BoxedCursor
+						iterators.push(Box::new(table_iter));
 					}
 				} else {
 					// Level 1+: Tables have non-overlapping key ranges, use binary search
@@ -814,12 +830,8 @@ impl<'a> KMergeIterator<'a> {
 							}
 						}
 
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						// Box table iterator directly as BoxedCursor
+						iterators.push(Box::new(table_iter));
 					}
 				}
 			}
@@ -836,6 +848,7 @@ impl<'a> KMergeIterator<'a> {
 			_iter_state: boxed_state,
 			iterators: iterators_ptr,
 			heap,
+			snapshot_seq_num,
 			range_end: range.1,
 			initialized_lo: false,
 			initialized_hi: false,
@@ -843,14 +856,18 @@ impl<'a> KMergeIterator<'a> {
 	}
 
 	fn initialize_lo(&mut self) {
-		// Pull the first item from each iterator and add to heap
+		// Position all cursors for forward iteration and add valid ones to heap
 		unsafe {
 			let iterators = self.iterators.as_mut();
 			for (idx, iter) in iterators.iter_mut().enumerate() {
-				if let Some((key, value)) = iter.next() {
-					self.heap.push(HeapItem {
-						key,
-						value,
+				// If not already positioned, call advance() to position
+				// (memtable iterators need this; table iterators are already positioned)
+				if !iter.valid() {
+					iter.advance();
+				}
+				if iter.valid() {
+					self.heap.push(CursorIntervalHeapItem {
+						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
 						iterator_index: idx,
 					});
 				}
@@ -860,14 +877,15 @@ impl<'a> KMergeIterator<'a> {
 	}
 
 	fn initialize_hi(&mut self) {
-		// Pull the last item from each iterator and add to heap
+		// For backward iteration, position each cursor at last entry
 		unsafe {
 			let iterators = self.iterators.as_mut();
 			for (idx, iter) in iterators.iter_mut().enumerate() {
-				if let Some((key, value)) = iter.next_back() {
-					self.heap.push(HeapItem {
-						key,
-						value,
+				// Re-position at last entry for backward iteration
+				iter.seek_to_last();
+				if iter.valid() {
+					self.heap.push(CursorIntervalHeapItem {
+						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
 						iterator_index: idx,
 					});
 				}
@@ -903,21 +921,33 @@ impl Iterator for KMergeIterator<'_> {
 
 			// Get the smallest item from the heap
 			let heap_item = self.heap.pop_min()?;
+			let idx = heap_item.iterator_index;
 
-			// Pull the next item from the same iterator and add back to heap if valid
-			unsafe {
+			// Get key and value from the cursor (it's still positioned on current entry)
+			let (key, value) = unsafe {
 				let iterators = self.iterators.as_mut();
-				if let Some((key, value)) = iterators[heap_item.iterator_index].next() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: heap_item.iterator_index,
+				let iter = &mut iterators[idx];
+				let key = Arc::new(iter.decode_key());
+				let value = Bytes::copy_from_slice(iter.value_bytes());
+
+				// Advance the cursor and re-insert if valid
+				if iter.advance() && iter.valid() {
+					self.heap.push(CursorIntervalHeapItem {
+						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						iterator_index: idx,
 					});
 				}
+
+				(key, value)
+			};
+
+			// Check visibility (seq_num <= snapshot_seq_num)
+			if key.seq_num() > self.snapshot_seq_num {
+				continue;
 			}
 
 			// Check if the key exceeds the range end
-			let user_key = heap_item.key.user_key.as_ref();
+			let user_key = key.user_key.as_ref();
 			match &self.range_end {
 				Bound::Included(end) => {
 					if user_key > end.as_slice() {
@@ -935,7 +965,7 @@ impl Iterator for KMergeIterator<'_> {
 			}
 
 			// Return the key-value pair
-			return Some((heap_item.key, heap_item.value));
+			return Some((key, value));
 		}
 	}
 }
@@ -953,21 +983,33 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 
 			// Get the largest item from the heap
 			let heap_item = self.heap.pop_max()?;
+			let idx = heap_item.iterator_index;
 
-			// Pull the previous item from the same iterator and add back to heap if valid
-			unsafe {
+			// Get key and value from the cursor (it's still positioned on current entry)
+			let (key, value) = unsafe {
 				let iterators = self.iterators.as_mut();
-				if let Some((key, value)) = iterators[heap_item.iterator_index].next_back() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: heap_item.iterator_index,
+				let iter = &mut iterators[idx];
+				let key = Arc::new(iter.decode_key());
+				let value = Bytes::copy_from_slice(iter.value_bytes());
+
+				// Move cursor backwards and re-insert if valid
+				if iter.prev() && iter.valid() {
+					self.heap.push(CursorIntervalHeapItem {
+						key_bytes: Bytes::copy_from_slice(iter.key_bytes()),
+						iterator_index: idx,
 					});
 				}
+
+				(key, value)
+			};
+
+			// Check visibility (seq_num <= snapshot_seq_num)
+			if key.seq_num() > self.snapshot_seq_num {
+				continue;
 			}
 
 			// Check if the key exceeds the range end
-			let user_key = heap_item.key.user_key.as_ref();
+			let user_key = key.user_key.as_ref();
 			match &self.range_end {
 				Bound::Included(end) => {
 					if user_key > end.as_slice() {
@@ -985,7 +1027,7 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 			}
 
 			// Return the key-value pair
-			return Some((heap_item.key, heap_item.value));
+			return Some((key, value));
 		}
 	}
 }

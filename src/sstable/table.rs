@@ -1332,8 +1332,7 @@ impl LSMIterator for TableIterator {
 		let user_key = InternalKey::extract_user_key(target);
 
 		// For partitioned index, first find the correct partition
-		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(user_key)
-		{
+		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(user_key) {
 			// Find the partition index
 			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
 				if std::ptr::eq(handle, block_handle) {

@@ -1,7 +1,7 @@
 use crate::{
 	compaction::{CompactionChoice, CompactionInput, CompactionStrategy},
 	error::Result,
-	iter::{BoxedIterator, CompactionIterator},
+	iter::{BoxedCursor, CompactionIterator},
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	lsm::CoreInner,
 	memtable::ImmutableMemtables,
@@ -78,9 +78,9 @@ impl Compactor {
 				})
 				.collect();
 
-			let iterators: Vec<BoxedIterator<'_>> = to_merge
+			let iterators: Vec<BoxedCursor<'_>> = to_merge
 				.into_iter()
-				.map(|table| Box::new(table.iter(false)) as BoxedIterator<'_>)
+				.map(|table| Box::new(table.iter(false)) as BoxedCursor<'_>)
 				.collect();
 
 			// Hide tables that are being merged
@@ -126,7 +126,7 @@ impl Compactor {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedIterator<'_>>,
+		merge_iter: Vec<BoxedCursor<'_>>,
 		input: &CompactionInput,
 	) -> Result<HashMap<u32, i64>> {
 		let file = SysFile::create(path)?;

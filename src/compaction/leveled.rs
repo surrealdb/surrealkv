@@ -336,13 +336,14 @@ mod tests {
 	use tempfile::TempDir;
 
 	use crate::{
+		clock::MockLogicalClock,
 		compaction::{
 			compactor::{CompactionOptions, Compactor},
 			leveled::Strategy,
 			CompactionChoice, CompactionStrategy,
 		},
 		error::Result,
-		iter::MergeIterator,
+		iter::{BoxedCursor, CompactionIterator},
 		levels::{write_manifest_to_disk, Level, LevelManifest, Levels},
 		memtable::ImmutableMemtables,
 		sstable::{
@@ -2019,11 +2020,16 @@ mod tests {
 		let value_table = env.create_test_table(101, value_entries).unwrap();
 
 		// Test non-bottom level compaction
-		let iterators: Vec<_> = vec![
-			Box::new(tombstone_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
-			Box::new(value_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
-		];
-		let comp_iter_non_bottom = MergeIterator::new(iterators, false);
+		let iterators: Vec<BoxedCursor<'_>> =
+			vec![Box::new(tombstone_table.iter(false)), Box::new(value_table.iter(false))];
+		let comp_iter_non_bottom = CompactionIterator::new(
+			iterators,
+			false, // not bottom level
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::default()),
+		);
 		let non_bottom_result: Vec<_> = comp_iter_non_bottom.collect();
 
 		// Non-bottom level should preserve tombstone
@@ -2037,11 +2043,16 @@ mod tests {
 		assert_eq!(key.seq_num(), 100, "Should be the newer tombstone");
 
 		// Test bottom level compaction
-		let iterators: Vec<_> = vec![
-			Box::new(tombstone_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
-			Box::new(value_table.iter(false)) as Box<dyn DoubleEndedIterator<Item = _>>,
-		];
-		let comp_iter_bottom = MergeIterator::new(iterators, true);
+		let iterators: Vec<BoxedCursor<'_>> =
+			vec![Box::new(tombstone_table.iter(false)), Box::new(value_table.iter(false))];
+		let comp_iter_bottom = CompactionIterator::new(
+			iterators,
+			true, // bottom level
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::default()),
+		);
 		let bottom_result: Vec<_> = comp_iter_bottom.collect();
 
 		// Bottom level should filter out tombstones

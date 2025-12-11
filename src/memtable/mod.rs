@@ -12,7 +12,6 @@ use std::{
 use crate::{
 	batch::Batch,
 	error::Result,
-	iter::MergeIterator,
 	sstable::{
 		table::{Table, TableWriter},
 		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
@@ -172,10 +171,8 @@ impl MemTable {
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone());
 
-			let iter = self.iter();
-			let iter = Box::new(iter);
-			let merge_iter = MergeIterator::new(vec![iter], false);
-			for (key, encoded_val) in merge_iter {
+			// Iterate directly over memtable - no need for MergeIterator with single source
+			for (key, encoded_val) in self.iter() {
 				// The memtable already contains the correct ValueLocation encoding
 				// (either inline or with VLog pointer), so we can use it directly
 				table_writer.add(key, &encoded_val)?;

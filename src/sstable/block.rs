@@ -80,16 +80,6 @@ impl IterKeyBuffer {
 		self.is_inline = true;
 	}
 
-	/// Truncate to the given length
-	#[inline]
-	pub(crate) fn truncate(&mut self, len: usize) {
-		if len < self.len {
-			self.len = len;
-			// If we're using heap and new length fits inline, we could switch
-			// but it's not worth the copy - just keep using heap
-		}
-	}
-
 	/// Get the key as a slice
 	#[inline]
 	pub(crate) fn as_slice(&self) -> &[u8] {
@@ -98,12 +88,6 @@ impl IterKeyBuffer {
 		} else {
 			&self.heap_buf[..self.len]
 		}
-	}
-
-	/// Get the length of the key
-	#[inline]
-	pub(crate) fn len(&self) -> usize {
-		self.len
 	}
 
 	/// Check if the buffer is empty

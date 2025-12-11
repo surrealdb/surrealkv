@@ -281,11 +281,6 @@ impl TopLevelIndex {
 		Ok(Block::new(decompressed, self.opts.clone()))
 	}
 
-	/// Check if partitions are pinned in memory.
-	pub(crate) fn has_pinned_partitions(&self) -> bool {
-		self.pinned_partitions.is_some()
-	}
-
 	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
 		// Find the partition point in the blocks where the key would fit.
 		let index = self.blocks.partition_point(|block| block.user_key.as_ref() < user_key);
