@@ -902,7 +902,24 @@ impl Iterator for KMergeIterator<'_> {
 			// Get the smallest item from the heap
 			let heap_item = self.heap.pop_min()?;
 
-			// Pull the next item from the same iterator and add back to heap if valid
+			// Check if the key exceeds the range end BEFORE advancing the iterator.
+			// Since keys are sorted, if current key > range_end,
+			// all subsequent keys from this iterator will also be > range_end.
+			// So we drop this iterator from the merge (don't re-add to heap).
+			let user_key = heap_item.key.user_key.as_ref();
+			let exceeds_range = match &self.range_end {
+				Bound::Included(end) => user_key > end.as_slice(),
+				Bound::Excluded(end) => user_key >= end.as_slice(),
+				Bound::Unbounded => false,
+			};
+
+			if exceeds_range {
+				// DON'T re-add this iterator to the heap - all its remaining keys are out of range
+				continue;
+			}
+
+			// Only advance and re-add to heap if the current key is in range.
+			// This ensures we don't waste time processing out-of-range keys.
 			unsafe {
 				let iterators = self.iterators.as_mut();
 				if let Some((key, value)) = iterators[heap_item.iterator_index].next() {
@@ -911,24 +928,6 @@ impl Iterator for KMergeIterator<'_> {
 						value,
 						iterator_index: heap_item.iterator_index,
 					});
-				}
-			}
-
-			// Check if the key exceeds the range end
-			let user_key = heap_item.key.user_key.as_ref();
-			match &self.range_end {
-				Bound::Included(end) => {
-					if user_key > end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Excluded(end) => {
-					if user_key >= end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Unbounded => {
-					// No end bound to check
 				}
 			}
 
