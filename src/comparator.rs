@@ -126,7 +126,7 @@ impl Comparator for BytewiseComparator {
 				return result;
 			}
 		}
-		// All bytes are 0xFF - leave unchanged (like RocksDB)
+		// All bytes are 0xFF - leave unchanged
 		result
 	}
 }
@@ -156,6 +156,12 @@ impl Comparator for InternalKeyComparator {
 		key_a.cmp(&key_b)
 	}
 
+	/// Generates a separator key between two internal keys.
+	///
+	/// This function matches RocksDB's FindShortestInternalKeySeparator exactly:
+	/// 1. Extract user keys and compute a separator
+	/// 2. If separator is same length or shorter AND logically larger, use max seq_num
+	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
 			return a.to_vec();
@@ -172,8 +178,9 @@ impl Comparator for InternalKeyComparator {
 			let sep =
 				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
 
-			// Use MAX_SEQUENCE_NUMBER when separator is shorter than original
-			if sep.len() < key_a.user_key.len()
+			// Use MAX_SEQUENCE_NUMBER when separator is same length or shorter AND logically larger
+			// (matches RocksDB's <= check)
+			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
@@ -184,29 +191,35 @@ impl Comparator for InternalKeyComparator {
 				);
 				return result.encode();
 			}
-
-			// Otherwise use original sequence number
-			let result =
-				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
-			return result.encode();
 		}
 
-		// User keys are the same, just return a
+		// Fallback: Return original key unchanged
 		a.to_vec()
 	}
 
+	/// Generates a successor key for an internal key.
+	///
+	/// This function matches RocksDB's FindShortInternalKeySuccessor exactly.
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
 		let internal_key = InternalKey::decode(key);
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
 
-		// Create a new internal key with the successor user key and original sequence/kind
-		let result = InternalKey::new(
-			Bytes::from(user_key_succ),
-			internal_key.seq_num(),
-			internal_key.kind(),
-			internal_key.timestamp,
-		);
-		result.encode()
+		// If successor is same length or shorter AND logically larger, use max seq_num
+		if user_key_succ.len() <= internal_key.user_key.len()
+			&& self.user_comparator.compare(internal_key.user_key.as_ref(), &user_key_succ)
+				== Ordering::Less
+		{
+			let result = InternalKey::new(
+				Bytes::from(user_key_succ),
+				INTERNAL_KEY_SEQ_NUM_MAX,
+				internal_key.kind(),
+				INTERNAL_KEY_TIMESTAMP_MAX,
+			);
+			return result.encode();
+		}
+
+		// Fallback: Return original key unchanged
+		key.to_vec()
 	}
 }
 
@@ -238,6 +251,12 @@ impl Comparator for TimestampComparator {
 		key_a.cmp_by_timestamp(&key_b)
 	}
 
+	/// Generates a separator key between two internal keys.
+	///
+	/// This function matches RocksDB's FindShortestInternalKeySeparator exactly:
+	/// 1. Extract user keys and compute a separator
+	/// 2. If separator is same length or shorter AND logically larger, use max seq_num/timestamp
+	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
 			return a.to_vec();
@@ -254,8 +273,9 @@ impl Comparator for TimestampComparator {
 			let sep =
 				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
 
-			// Use MAX_TIMESTAMP when separator is shorter than original
-			if sep.len() < key_a.user_key.len()
+			// Use MAX_TIMESTAMP when separator is same length or shorter AND logically larger
+			// (matches RocksDB's <= check)
+			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
@@ -266,29 +286,35 @@ impl Comparator for TimestampComparator {
 				);
 				return result.encode();
 			}
-
-			// Otherwise use original timestamp
-			let result =
-				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
-			return result.encode();
 		}
 
-		// Can't create a meaningful separator, return a
+		// Fallback: Return original key unchanged
 		a.to_vec()
 	}
 
+	/// Generates a successor key for an internal key.
+	///
+	/// This function matches RocksDB's FindShortInternalKeySuccessor exactly.
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
 		let internal_key = InternalKey::decode(key);
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
 
-		// Create a new internal key with the successor user key and original timestamp/kind
-		let result = InternalKey::new(
-			Bytes::from(user_key_succ),
-			internal_key.seq_num(),
-			internal_key.kind(),
-			internal_key.timestamp,
-		);
-		result.encode()
+		// If successor is same length or shorter AND logically larger, use max seq_num/timestamp
+		if user_key_succ.len() <= internal_key.user_key.len()
+			&& self.user_comparator.compare(internal_key.user_key.as_ref(), &user_key_succ)
+				== Ordering::Less
+		{
+			let result = InternalKey::new(
+				Bytes::from(user_key_succ),
+				INTERNAL_KEY_SEQ_NUM_MAX,
+				internal_key.kind(),
+				INTERNAL_KEY_TIMESTAMP_MAX,
+			);
+			return result.encode();
+		}
+
+		// Fallback: Return original key unchanged
+		key.to_vec()
 	}
 }
 
@@ -298,7 +324,7 @@ mod tests {
 	use rand::{Rng, SeedableRng};
 
 	// ============================================================================
-	// Basic Separator Tests (ported from RocksDB comparator_db_test.cc)
+	// Basic Separator Tests
 	// ============================================================================
 
 	#[test]
@@ -406,7 +432,7 @@ mod tests {
 	}
 
 	// ============================================================================
-	// Basic Successor Tests (ported from RocksDB comparator_db_test.cc)
+	// Basic Successor Tests
 	// ============================================================================
 
 	#[test]
@@ -422,7 +448,7 @@ mod tests {
 	fn test_successor_all_0xff() {
 		let cmp = BytewiseComparator::default();
 
-		// All 0xFF - leave unchanged (like RocksDB)
+		// All 0xFF - leave unchanged
 		let key = vec![0xff, 0xff, 0xff];
 		let succ = cmp.successor(&key);
 		assert_eq!(succ, key);
@@ -458,7 +484,7 @@ mod tests {
 	}
 
 	// ============================================================================
-	// Randomized Fuzz Test (ported from RocksDB SeparatorSuccessorRandomizeTest)
+	// Randomized Fuzz Test
 	// ============================================================================
 
 	#[test]
@@ -478,7 +504,7 @@ mod tests {
 			let size2 = if rng.random_bool(0.5) {
 				rng.random_range(0..16)
 			} else {
-				let diff = rng.random_range(0..5) as i32 - 2;
+				let diff = rng.random_range(0..5) - 2;
 				let tmp = size1 as i32 + diff;
 				tmp.max(0) as usize
 			};
@@ -505,7 +531,7 @@ mod tests {
 					} else if rng.random_ratio(1, 4) {
 						break;
 					} else {
-						let diff = rng.random_range(0..5) as i32 - 2;
+						let diff = rng.random_range(0..5) - 2;
 						let s1_char = s1[pos] as i32;
 						let s2_char = (s1_char + diff).clamp(0, 255) as u8;
 						s2[pos] = s2_char;
@@ -607,5 +633,184 @@ mod tests {
 	fn test_comparator_name() {
 		let cmp = BytewiseComparator::default();
 		assert_eq!(cmp.name(), "leveldb.BytewiseComparator");
+	}
+
+	// ============================================================================
+	// InternalKeyComparator Tests (ported from RocksDB dbformat_test.cc)
+	// ============================================================================
+
+	use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
+
+	/// Helper to create an encoded internal key for testing
+	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
+		InternalKey::new(Bytes::from(user_key.to_vec()), seq, kind, 0).encode()
+	}
+
+	/// Helper to create an encoded internal key with max seq num (for expected results)
+	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
+		// In RocksDB, kValueTypeForSeek is used for shortened keys
+		// In SurrealKV, we use the original kind from the start key
+		InternalKey::new(
+			Bytes::from(user_key.to_vec()),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode()
+	}
+
+	#[test]
+	fn test_internal_key_short_separator_same_user_key() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// When user keys are same, separator should return unchanged
+		// (regardless of sequence numbers)
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"foo", 99, InternalKeyKind::Set)
+			)
+		);
+
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"foo", 101, InternalKeyKind::Set)
+			)
+		);
+
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"foo", 100, InternalKeyKind::Set)
+			)
+		);
+
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"foo", 100, InternalKeyKind::Delete)
+			)
+		);
+	}
+
+	#[test]
+	fn test_internal_key_short_separator_misordered() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// When user keys are misordered (start > limit), return unchanged
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"bar", 99, InternalKeyKind::Set)
+			)
+		);
+	}
+
+	#[test]
+	fn test_internal_key_short_separator_different_user_keys() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// When user keys are different and correctly ordered, should shorten with max seq
+		// "foo" vs "hello" -> "g" with max seq
+		let result = cmp.separator(
+			&ikey(b"foo", 100, InternalKeyKind::Set),
+			&ikey(b"hello", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"g"));
+
+		// "ABC1AAAAA" vs "ABC2ABB" -> "ABC2" with max seq
+		let result = cmp.separator(
+			&ikey(b"ABC1AAAAA", 100, InternalKeyKind::Set),
+			&ikey(b"ABC2ABB", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"ABC2"));
+
+		// "AAA1AAA" vs "AAA2AA" -> "AAA2" with max seq
+		let result = cmp.separator(
+			&ikey(b"AAA1AAA", 100, InternalKeyKind::Set),
+			&ikey(b"AAA2AA", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"AAA2"));
+
+		// "AAA1AAA" vs "AAA4" -> "AAA2" with max seq
+		let result = cmp.separator(
+			&ikey(b"AAA1AAA", 100, InternalKeyKind::Set),
+			&ikey(b"AAA4", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"AAA2"));
+
+		// "AAA1AAA" vs "AAA2" -> "AAA1B" with max seq (scan forward case)
+		let result = cmp.separator(
+			&ikey(b"AAA1AAA", 100, InternalKeyKind::Set),
+			&ikey(b"AAA2", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"AAA1B"));
+
+		// "AAA1AAA" vs "AAA2A" -> "AAA2" with max seq
+		let result = cmp.separator(
+			&ikey(b"AAA1AAA", 100, InternalKeyKind::Set),
+			&ikey(b"AAA2A", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"AAA2"));
+	}
+
+	#[test]
+	fn test_internal_key_short_separator_adjacent() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// "AAA1" vs "AAA2" - adjacent, can't shorten further, return unchanged
+		let result = cmp.separator(
+			&ikey(b"AAA1", 100, InternalKeyKind::Set),
+			&ikey(b"AAA2", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey(b"AAA1", 100, InternalKeyKind::Set));
+	}
+
+	#[test]
+	fn test_internal_key_short_separator_prefix_cases() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// When start user key is prefix of limit user key, return unchanged
+		assert_eq!(
+			ikey(b"foo", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foo", 100, InternalKeyKind::Set),
+				&ikey(b"foobar", 200, InternalKeyKind::Set)
+			)
+		);
+
+		// When limit user key is prefix of start user key, return unchanged
+		assert_eq!(
+			ikey(b"foobar", 100, InternalKeyKind::Set),
+			cmp.separator(
+				&ikey(b"foobar", 100, InternalKeyKind::Set),
+				&ikey(b"foo", 200, InternalKeyKind::Set)
+			)
+		);
+	}
+
+	#[test]
+	fn test_internal_key_shortest_successor() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// Normal case: "foo" becomes "g" with max seq num
+		let result = cmp.successor(&ikey(b"foo", 100, InternalKeyKind::Set));
+		assert_eq!(result, ikey_max_seq(b"g"));
+	}
+
+	#[test]
+	fn test_internal_key_shortest_successor_all_0xff() {
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// All 0xFF case: returns unchanged
+		let input = ikey(&[0xff, 0xff], 100, InternalKeyKind::Set);
+		let result = cmp.successor(&input);
+		assert_eq!(result, input);
 	}
 }
