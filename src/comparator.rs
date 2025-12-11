@@ -635,12 +635,12 @@ mod tests {
 		InternalKey::new(Bytes::from(user_key.to_vec()), seq, kind, 0).encode()
 	}
 
-	/// Helper to create an encoded internal key with max seq num (for expected results)
+	/// Helper to create an encoded internal key with max seq num (for expected separator results)
 	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
 		InternalKey::new(
 			Bytes::from(user_key.to_vec()),
 			INTERNAL_KEY_SEQ_NUM_MAX,
-			InternalKeyKind::Set,
+			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode()
