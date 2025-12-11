@@ -31,7 +31,7 @@ use crate::{
 		Wal,
 	},
 	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
-	VLogChecksumLevel, Value,
+	TimestampComparator, VLogChecksumLevel, Value,
 };
 use bytes::Bytes;
 
@@ -146,9 +146,8 @@ impl CoreInner {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator = Arc::new(crate::TimestampComparator {
-				user_comparator: Arc::new(BytewiseComparator {}),
-			});
+			let comparator =
+				Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(parking_lot::RwLock::new(tree)))
 		} else {

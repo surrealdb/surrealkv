@@ -1,0 +1,611 @@
+//! Comparator implementations for key ordering.
+//!
+//! This module provides the `Comparator` trait and `BytewiseComparator` implementation,
+//! matching the behavior of RocksDB's comparator interface.
+
+use std::{cmp::Ordering, sync::Arc};
+
+use bytes::Bytes;
+
+use crate::sstable::{InternalKey, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX};
+
+/// A trait for comparing keys in a key-value store.
+///
+/// This trait defines methods for comparing keys, generating separator keys, generating successor keys,
+/// and retrieving the name of the comparator.
+pub trait Comparator: Send + Sync {
+	/// Compares two keys `a` and `b`.
+	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
+
+	/// Generates a separator key between two keys `from` and `to`.
+	///
+	/// This method should return a key that is greater than or equal to `from` and less than `to`.
+	/// It is used to optimize the storage layout by finding a midpoint key.
+	fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8>;
+
+	/// Generates the successor key of a given key.
+	///
+	/// This method should return a key that is lexicographically greater than the given key.
+	/// It is used to find the next key in the key space.
+	fn successor(&self, key: &[u8]) -> Vec<u8>;
+
+	/// Retrieves the name of the comparator.
+	fn name(&self) -> &str;
+}
+
+/// A bytewise comparator that compares keys lexicographically.
+///
+/// This implementation matches RocksDB's `BytewiseComparator` exactly.
+#[derive(Default, Clone, Copy)]
+pub struct BytewiseComparator {}
+
+impl BytewiseComparator {}
+
+impl Comparator for BytewiseComparator {
+	#[inline]
+	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+		a.cmp(b)
+	}
+
+	#[inline]
+	fn name(&self) -> &'static str {
+		"leveldb.BytewiseComparator"
+	}
+
+	#[inline]
+	/// Generates a separator key between two byte slices `a` (start) and `b` (limit).
+	///
+	/// This function matches RocksDB's FindShortestSeparator exactly:
+	/// 1. Find the common prefix
+	/// 2. If one string is a prefix of the other, return unchanged
+	/// 3. At first differing byte, try to increment and truncate
+	/// 4. If that would exceed limit, scan forward for a non-0xFF byte to increment
+	/// 5. If no shortening possible, return unchanged
+	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
+		let min_length = std::cmp::min(a.len(), b.len());
+		let mut diff_index = 0;
+
+		// Find length of common prefix
+		while diff_index < min_length && a[diff_index] == b[diff_index] {
+			diff_index += 1;
+		}
+
+		if diff_index >= min_length {
+			// Do not shorten if one string is a prefix of the other
+			return a.to_vec();
+		}
+
+		let start_byte = a[diff_index];
+		let limit_byte = b[diff_index];
+
+		if start_byte >= limit_byte {
+			// Cannot shorten since limit is smaller than start or start is
+			// already the shortest possible.
+			return a.to_vec();
+		}
+
+		// start_byte < limit_byte
+		if diff_index < b.len() - 1 || start_byte + 1 < limit_byte {
+			// Safe to increment and truncate
+			let mut result = Vec::from(&a[..=diff_index]);
+			result[diff_index] += 1;
+			debug_assert!(self.compare(&result, b) == Ordering::Less);
+			return result;
+		}
+
+		// Incrementing the current byte would make start >= limit.
+		// Skip this byte and find the first non-0xFF byte in start to increment.
+		diff_index += 1;
+
+		while diff_index < a.len() {
+			if a[diff_index] < 0xff {
+				let mut result = Vec::from(&a[..=diff_index]);
+				result[diff_index] += 1;
+				debug_assert!(self.compare(&result, b) == Ordering::Less);
+				return result;
+			}
+			diff_index += 1;
+		}
+
+		// Could not shorten, return original
+		a.to_vec()
+	}
+
+	#[inline]
+	/// Generates the successor key of a given byte slice `key`.
+	///
+	/// This function matches RocksDB's FindShortSuccessor exactly:
+	/// Find the first non-0xFF byte, increment it, and truncate.
+	/// If all bytes are 0xFF, leave it unchanged.
+	fn successor(&self, key: &[u8]) -> Vec<u8> {
+		let mut result = key.to_vec();
+		for i in 0..key.len() {
+			if key[i] != 0xff {
+				result[i] += 1;
+				result.resize(i + 1, 0);
+				return result;
+			}
+		}
+		// All bytes are 0xFF - leave unchanged (like RocksDB)
+		result
+	}
+}
+
+#[derive(Clone)]
+pub struct InternalKeyComparator {
+	user_comparator: Arc<dyn Comparator>,
+}
+
+impl InternalKeyComparator {
+	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
+		Self {
+			user_comparator,
+		}
+	}
+}
+
+impl Comparator for InternalKeyComparator {
+	fn name(&self) -> &'static str {
+		"surrealkv.InternalKeyComparator"
+	}
+
+	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+		// Decode internal keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+		key_a.cmp(&key_b)
+	}
+
+	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
+		if a == b {
+			return a.to_vec();
+		}
+
+		// Decode keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+
+		// If user keys are different, compute a separator for user keys
+		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
+			!= Ordering::Equal
+		{
+			let sep =
+				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
+
+			// Use MAX_SEQUENCE_NUMBER when separator is shorter than original
+			if sep.len() < key_a.user_key.len()
+				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
+			{
+				let result = InternalKey::new(
+					Bytes::from(sep),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					key_a.kind(),
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				);
+				return result.encode();
+			}
+
+			// Otherwise use original sequence number
+			let result =
+				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
+			return result.encode();
+		}
+
+		// User keys are the same, just return a
+		a.to_vec()
+	}
+
+	fn successor(&self, key: &[u8]) -> Vec<u8> {
+		let internal_key = InternalKey::decode(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
+
+		// Create a new internal key with the successor user key and original sequence/kind
+		let result = InternalKey::new(
+			Bytes::from(user_key_succ),
+			internal_key.seq_num(),
+			internal_key.kind(),
+			internal_key.timestamp,
+		);
+		result.encode()
+	}
+}
+
+/// A comparator that compares internal keys first by user key, then by timestamp
+/// This is used for versioned queries where we want to order by user key and timestamp
+#[derive(Clone)]
+pub struct TimestampComparator {
+	user_comparator: Arc<dyn Comparator>,
+}
+
+impl TimestampComparator {
+	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
+		Self {
+			user_comparator,
+		}
+	}
+}
+
+impl Comparator for TimestampComparator {
+	fn name(&self) -> &'static str {
+		"surrealkv.TimestampComparator"
+	}
+
+	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+		// Decode internal keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+		// Use the timestamp-based comparison method
+		key_a.cmp_by_timestamp(&key_b)
+	}
+
+	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
+		if a == b {
+			return a.to_vec();
+		}
+
+		// Decode keys using InternalKey
+		let key_a = InternalKey::decode(a);
+		let key_b = InternalKey::decode(b);
+
+		// If user keys are different, compute a separator for user keys
+		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
+			!= Ordering::Equal
+		{
+			let sep =
+				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
+
+			// Use MAX_TIMESTAMP when separator is shorter than original
+			if sep.len() < key_a.user_key.len()
+				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
+			{
+				let result = InternalKey::new(
+					Bytes::from(sep),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					key_a.kind(),
+					INTERNAL_KEY_TIMESTAMP_MAX,
+				);
+				return result.encode();
+			}
+
+			// Otherwise use original timestamp
+			let result =
+				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
+			return result.encode();
+		}
+
+		// Can't create a meaningful separator, return a
+		a.to_vec()
+	}
+
+	fn successor(&self, key: &[u8]) -> Vec<u8> {
+		let internal_key = InternalKey::decode(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
+
+		// Create a new internal key with the successor user key and original timestamp/kind
+		let result = InternalKey::new(
+			Bytes::from(user_key_succ),
+			internal_key.seq_num(),
+			internal_key.kind(),
+			internal_key.timestamp,
+		);
+		result.encode()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use rand::{Rng, SeedableRng};
+
+	// ============================================================================
+	// Basic Separator Tests (ported from RocksDB comparator_db_test.cc)
+	// ============================================================================
+
+	#[test]
+	fn test_find_shortest_separator_basic() {
+		let cmp = BytewiseComparator::default();
+
+		// Test case from RocksDB: "abc1xyz" vs "abc3xy" should produce "abc2"
+		let s1 = b"abc1xyz";
+		let s2 = b"abc3xy";
+		let sep = cmp.separator(s1, s2);
+		assert_eq!(sep, b"abc2");
+
+		// Another basic test
+		let sep = cmp.separator(b"abcd", b"abcf");
+		assert_eq!(sep, b"abce");
+	}
+
+	#[test]
+	fn test_separator_equal_strings() {
+		let cmp = BytewiseComparator::default();
+
+		// Equal strings should return unchanged
+		let s = b"abcdef";
+		let sep = cmp.separator(s, s);
+		assert_eq!(sep, s.to_vec());
+	}
+
+	#[test]
+	fn test_separator_prefix_cases() {
+		let cmp = BytewiseComparator::default();
+
+		// One string is prefix of another - should return unchanged
+		let sep = cmp.separator(b"abc", b"abcdef");
+		assert_eq!(sep, b"abc".to_vec());
+
+		let sep = cmp.separator(b"abcdef", b"abc");
+		assert_eq!(sep, b"abcdef".to_vec());
+	}
+
+	#[test]
+	fn test_separator_start_greater_than_limit() {
+		let cmp = BytewiseComparator::default();
+
+		// When start >= limit at diff position, return unchanged
+		let sep = cmp.separator(b"abd", b"abc");
+		assert_eq!(sep, b"abd".to_vec());
+	}
+
+	#[test]
+	fn test_separator_adjacent_bytes() {
+		let cmp = BytewiseComparator::default();
+
+		// "abc" vs "abd" - can't increment 'c' to 'd' because that equals limit
+		// Should scan forward (but no more bytes), so return original
+		let sep = cmp.separator(b"abc", b"abd");
+		assert_eq!(sep, b"abc".to_vec());
+
+		// "abc" vs "abe" - can increment 'c' to 'd'
+		let sep = cmp.separator(b"abc", b"abe");
+		assert_eq!(sep, b"abd");
+	}
+
+	#[test]
+	fn test_separator_scan_forward() {
+		let cmp = BytewiseComparator::default();
+
+		// "AA1AAA" vs "AA2" - at diff position, incrementing would exceed
+		// Scan forward to find non-0xFF byte
+		let sep = cmp.separator(b"AA1AAA", b"AA2");
+		assert_eq!(sep, b"AA1B");
+	}
+
+	#[test]
+	fn test_separator_all_0xff_suffix() {
+		let cmp = BytewiseComparator::default();
+
+		// Start has all 0xFF after diff position - can't shorten
+		let start = &[b'A', b'A', 0x01, 0xff, 0xff, 0xff];
+		let limit = &[b'A', b'A', 0x02];
+		let sep = cmp.separator(start, limit);
+		// Should return original since all bytes after diff are 0xFF
+		assert_eq!(sep, start.to_vec());
+	}
+
+	#[test]
+	fn test_separator_empty_strings() {
+		let cmp = BytewiseComparator::default();
+
+		// Empty strings
+		let sep = cmp.separator(b"", b"");
+		assert_eq!(sep, b"".to_vec());
+
+		// Empty start with non-empty limit
+		let sep = cmp.separator(b"", b"abc");
+		assert_eq!(sep, b"".to_vec());
+	}
+
+	#[test]
+	fn test_separator_wide_gap() {
+		let cmp = BytewiseComparator::default();
+
+		// Wide gap allows truncation
+		let sep = cmp.separator(b"abc", b"zzz");
+		assert_eq!(sep, b"b");
+	}
+
+	// ============================================================================
+	// Basic Successor Tests (ported from RocksDB comparator_db_test.cc)
+	// ============================================================================
+
+	#[test]
+	fn test_find_short_successor_basic() {
+		let cmp = BytewiseComparator::default();
+
+		// Basic successor tests
+		assert_eq!(cmp.successor(b"abcd"), b"b");
+		assert_eq!(cmp.successor(b"zzzz"), b"{"); // 'z' + 1 = '{'
+	}
+
+	#[test]
+	fn test_successor_all_0xff() {
+		let cmp = BytewiseComparator::default();
+
+		// All 0xFF - leave unchanged (like RocksDB)
+		let key = vec![0xff, 0xff, 0xff];
+		let succ = cmp.successor(&key);
+		assert_eq!(succ, key);
+	}
+
+	#[test]
+	fn test_successor_empty() {
+		let cmp = BytewiseComparator::default();
+
+		// Empty key - leave unchanged
+		let succ = cmp.successor(b"");
+		assert_eq!(succ, b"".to_vec());
+	}
+
+	#[test]
+	fn test_successor_with_0xff_prefix() {
+		let cmp = BytewiseComparator::default();
+
+		// 0xFF prefix followed by incrementable byte
+		let key = vec![0xff, 0xff, b'a'];
+		let succ = cmp.successor(&key);
+		assert_eq!(succ, vec![0xff, 0xff, b'b']);
+	}
+
+	#[test]
+	fn test_successor_single_byte() {
+		let cmp = BytewiseComparator::default();
+
+		assert_eq!(cmp.successor(b"a"), b"b");
+		assert_eq!(cmp.successor(&[0x00]), vec![0x01]);
+		assert_eq!(cmp.successor(&[0xfe]), vec![0xff]);
+		assert_eq!(cmp.successor(&[0xff]), vec![0xff]); // unchanged
+	}
+
+	// ============================================================================
+	// Randomized Fuzz Test (ported from RocksDB SeparatorSuccessorRandomizeTest)
+	// ============================================================================
+
+	#[test]
+	fn test_separator_successor_randomized() {
+		let cmp = BytewiseComparator::default();
+
+		// Boundary characters for edge case testing
+		let char_list: [u8; 6] = [0, 1, 2, 253, 254, 255];
+
+		let mut rng = rand::rngs::StdRng::seed_from_u64(301);
+
+		for _ in 0..1000 {
+			// Generate random size for s1 (skewed toward smaller sizes)
+			let size1 = rng.random_range(0..16);
+
+			// size2 is either random or within [-2, +2] of size1
+			let size2 = if rng.random_bool(0.5) {
+				rng.random_range(0..16)
+			} else {
+				let diff = rng.random_range(0..5) as i32 - 2;
+				let tmp = size1 as i32 + diff;
+				tmp.max(0) as usize
+			};
+
+			// Generate s1
+			let mut s1 = Vec::with_capacity(size1);
+			for _ in 0..size1 {
+				if rng.random_bool(0.5) {
+					s1.push(rng.random::<u8>());
+				} else {
+					s1.push(char_list[rng.random_range(0..char_list.len())]);
+				}
+			}
+
+			// Generate s2 based on s1, then modify
+			let mut s2 = s1.clone();
+			s2.resize(size2, 0);
+
+			if !s2.is_empty() {
+				let mut pos = s2.len() - 1;
+				loop {
+					if pos >= s1.len() || rng.random_ratio(1, 4) {
+						s2[pos] = rng.random::<u8>();
+					} else if rng.random_ratio(1, 4) {
+						break;
+					} else {
+						let diff = rng.random_range(0..5) as i32 - 2;
+						let s1_char = s1[pos] as i32;
+						let s2_char = (s1_char + diff).clamp(0, 255) as u8;
+						s2[pos] = s2_char;
+					}
+					if pos == 0 {
+						break;
+					}
+					pos -= 1;
+				}
+			}
+
+			// Test separators in both directions
+			for rev in 0..2 {
+				if rev == 1 {
+					std::mem::swap(&mut s1, &mut s2);
+				}
+
+				let separator = cmp.separator(&s1, &s2);
+
+				if s1 == s2 {
+					// Equal strings should return unchanged
+					assert_eq!(s1, separator, "Equal strings should return unchanged");
+				} else if s1 < s2 {
+					// Valid separator invariants
+					assert!(
+						s1 <= separator,
+						"Separator must be >= start. s1={:?}, sep={:?}",
+						s1,
+						separator
+					);
+					assert!(
+						separator < s2,
+						"Separator must be < limit. sep={:?}, s2={:?}",
+						separator,
+						s2
+					);
+					assert!(
+						separator.len() <= s1.len().max(s2.len()),
+						"Separator should not be longer than max(s1, s2)"
+					);
+				} else {
+					// s1 > s2: separator should equal s1 (can't shorten)
+					assert_eq!(s1, separator, "When s1 > s2, separator should equal s1");
+				}
+			}
+
+			// Test successor
+			let succ = cmp.successor(&s1);
+			assert!(succ >= s1, "Successor must be >= original. s1={:?}, succ={:?}", s1, succ);
+		}
+	}
+
+	// ============================================================================
+	// Additional Edge Cases
+	// ============================================================================
+
+	#[test]
+	fn test_separator_binary_data() {
+		let cmp = BytewiseComparator::default();
+
+		// Binary data with null bytes
+		let s1 = &[0x00, 0x01, 0x02];
+		let s2 = &[0x00, 0x01, 0x05];
+		let sep = cmp.separator(s1, s2);
+		assert_eq!(sep, vec![0x00, 0x01, 0x03]);
+
+		// Binary data at boundaries
+		let s1 = &[0x00, 0x00, 0x00];
+		let s2 = &[0x00, 0x00, 0x10];
+		let sep = cmp.separator(s1, s2);
+		assert_eq!(sep, vec![0x00, 0x00, 0x01]);
+	}
+
+	#[test]
+	fn test_separator_long_common_prefix() {
+		let cmp = BytewiseComparator::default();
+
+		// Long common prefix
+		let s1 = b"aaaaaaaaaaaaaaaaaaaab";
+		let s2 = b"aaaaaaaaaaaaaaaaaaaad";
+		let sep = cmp.separator(s1, s2);
+		assert_eq!(sep, b"aaaaaaaaaaaaaaaaaaaac");
+	}
+
+	#[test]
+	fn test_compare_basic() {
+		let cmp = BytewiseComparator::default();
+
+		assert_eq!(cmp.compare(b"abc", b"abc"), Ordering::Equal);
+		assert_eq!(cmp.compare(b"abc", b"abd"), Ordering::Less);
+		assert_eq!(cmp.compare(b"abd", b"abc"), Ordering::Greater);
+		assert_eq!(cmp.compare(b"abc", b"abcd"), Ordering::Less);
+		assert_eq!(cmp.compare(b"abcd", b"abc"), Ordering::Greater);
+		assert_eq!(cmp.compare(b"", b""), Ordering::Equal);
+		assert_eq!(cmp.compare(b"", b"a"), Ordering::Less);
+	}
+
+	#[test]
+	fn test_comparator_name() {
+		let cmp = BytewiseComparator::default();
+		assert_eq!(cmp.name(), "leveldb.BytewiseComparator");
+	}
+}

@@ -1435,7 +1435,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(692, actual);
+		assert_eq!(690, actual);
 	}
 
 	#[test]
