@@ -91,7 +91,6 @@ impl TopLevelIndexWriter {
 		let will_partition = self.current_block.size_estimate() >= self.max_block_size;
 
 		if will_partition {
-			log::error!("[INDEX PARTITION] Finishing current index block, starting new partition");
 			self.finish_current_block();
 		}
 		self.current_block.add(key, handle)
@@ -143,14 +142,6 @@ impl TopLevelIndexWriter {
 			let (block_handle, new_offset) =
 				Self::write_compressed_block(writer, block_data, compression_type, offset)?;
 			offset = new_offset; // Update the offset for the next iteration
-
-			// LOG: Building top-level index
-			log::error!(
-				"[TOP LEVEL INDEX] Adding partition last_key to top-level index\n\
-				Partition last_key: {:?}\n\
-				Note: This is already a separator key from data blocks",
-				&separator_key
-			);
 
 			// Use the last key of each block as the separator key
 			top_level_index.add(&separator_key, &block_handle.encode())?;
