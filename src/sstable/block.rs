@@ -193,10 +193,52 @@ impl BlockWriter {
 		assert!(self.restart_counter <= self.restart_interval);
 
 		// Ensure keys are added in sorted order
-		assert!(
-			self.buffer.is_empty()
-				|| self.internal_cmp.compare(self.last_key.as_slice(), key) == Ordering::Less
-		);
+		if !self.buffer.is_empty() {
+			let cmp_result = self.internal_cmp.compare(self.last_key.as_slice(), key);
+			if cmp_result != Ordering::Less {
+				// Decode both keys for detailed logging
+				let last_internal_key = InternalKey::decode(self.last_key.as_slice());
+				let current_internal_key = InternalKey::decode(key);
+
+				log::error!(
+					"[BLOCK] Key ordering violation detected!\n\
+					Last Key:\n\
+					  User Key (UTF-8): {:?}\n\
+					  User Key (bytes): {:?}\n\
+					  Seq Num: {}\n\
+					  Kind: {:?}\n\
+					  Timestamp: {}\n\
+					  Full InternalKey: {:?}\n\
+					Current Key:\n\
+					  User Key (UTF-8): {:?}\n\
+					  User Key (bytes): {:?}\n\
+					  Seq Num: {}\n\
+					  Kind: {:?}\n\
+					  Timestamp: {}\n\
+					  Full InternalKey: {:?}\n\
+					Comparison result: {:?} (expected: Less)\n\
+					Block state:\n\
+					  Entries in block: {}\n\
+					  Buffer size: {} bytes",
+					String::from_utf8_lossy(&last_internal_key.user_key),
+					last_internal_key.user_key.as_ref(),
+					last_internal_key.seq_num(),
+					last_internal_key.kind(),
+					last_internal_key.timestamp,
+					self.last_key.as_slice(),
+					String::from_utf8_lossy(&current_internal_key.user_key),
+					current_internal_key.user_key.as_ref(),
+					current_internal_key.seq_num(),
+					current_internal_key.kind(),
+					current_internal_key.timestamp,
+					key,
+					cmp_result,
+					self.num_entries,
+					self.buffer.len()
+				);
+			}
+			assert!(cmp_result == Ordering::Less);
+		}
 
 		let mut shared_prefix_length = 0;
 		if self.restart_counter < self.restart_interval {
