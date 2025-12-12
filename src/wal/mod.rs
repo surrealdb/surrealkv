@@ -13,6 +13,9 @@ pub mod writer;
 
 pub use manager::Wal;
 
+#[cfg(test)]
+mod tests;
+
 // ===== Format Constants and Types =====
 
 /// The size of a single block in bytes (32KB).

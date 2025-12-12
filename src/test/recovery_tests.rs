@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::batch::Batch;
+use crate::error::Error;
 use crate::memtable::MemTable;
 use crate::test::recovery_test_helpers::{CorruptionType, WalTestHelper};
 use crate::wal::manager::Wal;
@@ -32,11 +33,10 @@ fn test_sequential_5_segments_recovery() {
 
 	// Replay WAL
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Verify all 500 entries recovered
 	assert_eq!(max_seq_opt, Some(1499), "Max sequence should be 1499");
-	assert!(corruption_info.is_none(), "No corruption expected");
 	WalTestHelper::verify_entry_count(&memtable, 500);
 
 	// Verify max_seq_num is from last segment
@@ -56,11 +56,10 @@ fn test_empty_segments_between_data() {
 
 	// Replay WAL
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Verify 150 entries recovered (only non-empty segments)
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	assert!(corruption_info.is_none(), "No corruption expected");
 	WalTestHelper::verify_entry_count(&memtable, 150);
 
 	// Verify keys from segments 0, 2, 4
@@ -80,11 +79,10 @@ fn test_large_batches_multiple_segments() {
 
 	// Replay WAL
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Verify all 5000 entries recovered
 	assert_eq!(max_seq_opt, Some(14999), "Max sequence should be 14999");
-	assert!(corruption_info.is_none(), "No corruption expected");
 	WalTestHelper::verify_entry_count(&memtable, 5000);
 }
 
@@ -101,11 +99,10 @@ fn test_variable_sized_segments() {
 
 	// Replay WAL
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Verify all entries recovered
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	assert!(corruption_info.is_none(), "No corruption expected");
 	WalTestHelper::verify_entry_count(&memtable, total_entries);
 
 	// Verify all keys present
@@ -135,12 +132,11 @@ fn test_100_segments_recovery() {
 	// Replay WAL
 	let memtable = Arc::new(MemTable::new());
 	let start = std::time::Instant::now();
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 	let replay_duration = start.elapsed();
 
 	// Verify all entries recovered
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	assert!(corruption_info.is_none(), "No corruption expected");
 	WalTestHelper::verify_entry_count(&memtable, total_entries);
 
 	// Log performance metrics
@@ -168,7 +164,7 @@ fn test_single_large_vs_multiple_small_segments() {
 
 	let memtable1 = Arc::new(MemTable::new());
 	let start = std::time::Instant::now();
-	let (max_seq1, _) = replay_wal(temp_dir1.path(), &memtable1, 0).unwrap();
+	let max_seq1 = replay_wal(temp_dir1.path(), &memtable1, 0).unwrap();
 	let single_replay = start.elapsed();
 
 	// Scenario B: 10 segments with 1000 entries each
@@ -179,7 +175,7 @@ fn test_single_large_vs_multiple_small_segments() {
 
 	let memtable2 = Arc::new(MemTable::new());
 	let start = std::time::Instant::now();
-	let (max_seq2, _) = replay_wal(temp_dir2.path(), &memtable2, 0).unwrap();
+	let max_seq2 = replay_wal(temp_dir2.path(), &memtable2, 0).unwrap();
 	let multi_replay = start.elapsed();
 
 	// Verify both recovered same data
@@ -219,10 +215,9 @@ fn test_crash_immediately_after_rotation() {
 
 	// Recovery should replay segment 0 fully, ignore empty segment 1
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert_eq!(max_seq_opt, Some(149), "Should recover all 50 entries from segment 0");
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 50);
 }
 
@@ -250,10 +245,9 @@ fn test_crash_after_multiple_rapid_rotations() {
 
 	// Recovery should replay all 5 segments
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 5);
 }
 
@@ -288,14 +282,34 @@ fn test_crash_during_wal_write_mid_batch() {
 	let file = fs::OpenOptions::new().write(true).open(&segment_path).unwrap();
 	file.set_len(truncate_point).unwrap();
 
-	// Recovery should get batch1 fully, partial/corrupted batch2 stopped
+	// Recovery should get batch1 fully, then detect corruption in batch2
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should recover at least batch1
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(entry_count >= 10, "Should recover at least batch1 (10 entries), got {}", entry_count);
+	// Should detect corruption or recover with partial data
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected corruption detected
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 10,
+				"Should recover at least batch1 (10 entries), got {}",
+				entry_count
+			);
+		}
+		Ok(_) => {
+			// Also acceptable if corruption happens at boundary
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 10,
+				"Should recover at least batch1 (10 entries), got {}",
+				entry_count
+			);
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -315,10 +329,9 @@ fn test_crash_with_unflushed_memtable() {
 
 	// Recovery should get all segments
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 90);
 }
 
@@ -345,12 +358,22 @@ fn test_partial_batch_at_segment_end() {
 	let current_size = file.metadata().unwrap().len();
 	file.set_len(current_size - 10).unwrap(); // Remove last 10 bytes
 
-	// Recovery should handle EOF gracefully
+	// Recovery may detect corruption or handle EOF
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, _) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should recover some entries (partial batch before truncation)
-	assert!(max_seq_opt.is_some() || memtable.is_empty());
+	// Should either recover data or detect corruption
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected - truncation looks like corruption
+		}
+		Ok(_) => {
+			// Also acceptable for clean truncation at record boundary
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -364,10 +387,9 @@ fn test_empty_segment_at_end() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 1000);
 
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 100);
 }
 
@@ -382,11 +404,10 @@ fn test_all_empty_segments() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 1000);
 
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Should return None for empty recovery
 	assert_eq!(max_seq_opt, None);
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 0);
 }
 
@@ -401,10 +422,9 @@ fn test_rapid_rotation_with_minimal_data() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 2000);
 
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert_eq!(max_seq_opt, Some(2009));
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 10);
 }
 
@@ -427,15 +447,18 @@ fn test_corruption_first_record_segment_0() {
 
 	// Recovery should detect corruption, not process any segments
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should detect corruption immediately
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 0);
-
-	// No data should be recovered (corruption at start)
-	assert_eq!(max_seq_opt, None);
+	// Should detect corruption immediately in segment 0
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 0);
+		}
+		_ => panic!("Expected WalCorruption error in segment 0"),
+	}
 }
 
 #[test]
@@ -453,21 +476,24 @@ fn test_corruption_middle_segment_0() {
 
 	// Recovery should get partial data from segment 0, stop there
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 0
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 0);
-
-	// Should have some entries from before corruption point
-	if let Some(_seq) = max_seq_opt {
-		let entry_count = memtable.iter().count();
-		assert!(
-			entry_count > 0 && entry_count < 100,
-			"Should have partial recovery from segment 0, got {}",
-			entry_count
-		);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 0);
+			// Should have some entries from before corruption point
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count < 100,
+				"Should have partial recovery from segment 0, got {}",
+				entry_count
+			);
+		}
+		_ => panic!("Expected WalCorruption error in segment 0"),
 	}
 }
 
@@ -486,17 +512,20 @@ fn test_corruption_end_segment_0() {
 
 	// Recovery should get most of segment 0
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 0);
-
-	// Should have most entries from segment 0
-	if let Some(_seq) = max_seq_opt {
-		let entry_count = memtable.iter().count();
-		assert!(entry_count > 0, "Should have recovered entries before corruption");
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 0);
+			// Note: Random byte corruption can hit CRC which invalidates entire record.
+			// So we may have fewer entries than expected or even none.
+			// The key assertion is that corruption is detected in segment 0.
+		}
+		_ => panic!("Expected WalCorruption error in segment 0"),
 	}
 }
 
@@ -515,16 +544,20 @@ fn test_corruption_beginning_middle_segment() {
 
 	// Recovery should get segments 0-1, stop at segment 2
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 2
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 2);
-
-	// Should have recovered segments 0-1 (80 entries)
-	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_entry_count(&memtable, 80);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 2);
+			// Should have recovered segments 0-1 (80 entries)
+			WalTestHelper::verify_entry_count(&memtable, 80);
+		}
+		_ => panic!("Expected WalCorruption error in segment 2"),
+	}
 }
 
 #[test]
@@ -542,21 +575,25 @@ fn test_corruption_middle_of_middle_segment() {
 
 	// Recovery should get 0-1 full, 2 partial
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 2
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 2);
-
-	// Should have segments 0-1 (100) + partial segment 2
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(
-		entry_count >= 100,
-		"Should have at least 100 entries from segments 0-1, got {}",
-		entry_count
-	);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 2);
+			// Should have segments 0-1 (100) + partial segment 2
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 100,
+				"Should have at least 100 entries from segments 0-1, got {}",
+				entry_count
+			);
+		}
+		_ => panic!("Expected WalCorruption error in segment 2"),
+	}
 }
 
 #[test]
@@ -574,21 +611,25 @@ fn test_corruption_last_segment() {
 
 	// Recovery should get 0-3 fully, partial 4
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 4
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 4);
-
-	// Should have segments 0-3 (100 entries) at minimum
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(
-		entry_count >= 100,
-		"Should have at least segments 0-3 (100 entries), got {}",
-		entry_count
-	);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 4);
+			// Should have segments 0-3 (100 entries) at minimum
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 100,
+				"Should have at least segments 0-3 (100 entries), got {}",
+				entry_count
+			);
+		}
+		_ => panic!("Expected WalCorruption error in segment 4"),
+	}
 }
 
 #[test]
@@ -604,14 +645,28 @@ fn test_truncated_wal_file() {
 	// Truncate segment 1 at 60%
 	WalTestHelper::corrupt_segment(wal_dir, 1, 0.6, CorruptionType::Truncate);
 
-	// Recovery should handle truncation as EOF
+	// Recovery may detect truncation as corruption
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should have segment 0 + partial segment 1
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
+	// Should have segment 0 + possibly partial segment 1
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			// Truncation detected as corruption in segment 1
+			assert!(segment_id >= 1, "Corruption should be in segment 1 or later");
+			let entry_count = memtable.iter().count();
+			assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
+		}
+		Ok(_) => {
+			// Also acceptable for clean truncation at record boundary
+			let entry_count = memtable.iter().count();
+			assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -629,10 +684,20 @@ fn test_random_byte_corruption() {
 
 	// Should detect corruption via CRC or invalid data
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Corruption should be detected
-	assert!(corruption_info.is_some() || max_seq_opt.is_some());
+	// Corruption should be detected (or partial recovery happened before corruption)
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected corruption detected
+		}
+		Ok(_) => {
+			// Partial recovery is also acceptable
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -652,17 +717,25 @@ fn test_multiple_corruptions_stop_at_first() {
 
 	// Should stop at segment 1 corruption
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	if let Some((corrupted_seg, _)) = corruption_info {
-		// Should stop at segment 1, never reach segment 3
-		assert_eq!(corrupted_seg, 1, "Should stop at first corruption (segment 1)");
+	// Should stop at segment 1, never reach segment 3
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 1, "Should stop at first corruption (segment 1)");
+			// Should have segment 0 + partial segment 1
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 40,
+				"Should have at least segment 0 (40 entries), got {}",
+				entry_count
+			);
+		}
+		_ => panic!("Expected WalCorruption error in segment 1"),
 	}
-
-	// Should have segment 0 + partial segment 1
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(entry_count >= 40, "Should have at least segment 0 (40 entries), got {}", entry_count);
 }
 
 #[test]
@@ -680,11 +753,21 @@ fn test_crc_mismatch() {
 
 	// Should detect CRC mismatch
 	let memtable = Arc::new(MemTable::new());
-	let (_max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// CRC check should catch corruption
-	// Either corrupted or partial recovery
-	assert!(corruption_info.is_some() || memtable.iter().count() < 40);
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected corruption detected
+		}
+		Ok(_) => {
+			// Partial recovery with less than full entries
+			assert!(memtable.iter().count() < 40, "Should have partial recovery");
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -702,16 +785,20 @@ fn test_corruption_in_wal_header() {
 
 	// Should detect header corruption immediately in segment 1
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
-
-	// Should have segment 0 fully
-	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_entry_count(&memtable, 35);
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 1
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 1);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 1);
+			// Should have segment 0 fully
+			WalTestHelper::verify_entry_count(&memtable, 35);
+		}
+		_ => panic!("Expected WalCorruption error in segment 1"),
+	}
 }
 
 #[test]
@@ -729,10 +816,21 @@ fn test_corruption_in_batch_data() {
 
 	// Should detect when trying to decode batch
 	let memtable = Arc::new(MemTable::new());
-	let (_max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Either corruption detected or partial recovery
 	// (depends on where exactly corruption hits)
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected corruption detected
+		}
+		Ok(_) => {
+			// Partial recovery is acceptable
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 #[test]
@@ -752,16 +850,20 @@ fn test_completely_corrupted_file() {
 
 	// Should get segment 0, fail on segment 1
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
-
-	// Should have segment 0
-	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_entry_count(&memtable, 25);
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption in segment 1
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 1);
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 1);
+			// Should have segment 0
+			WalTestHelper::verify_entry_count(&memtable, 25);
+		}
+		_ => panic!("Expected WalCorruption error in segment 1"),
+	}
 }
 
 #[test]
@@ -779,18 +881,34 @@ fn test_tail_corruption_recovery() {
 	let mut file = fs::OpenOptions::new().append(true).open(&segment_path).unwrap();
 	file.write_all(b"CORRUPTED_TAIL_DATA_HERE").unwrap();
 
-	// Should tolerate tail corruption, recover valid data
+	// Should detect tail corruption or recover valid data
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should recover most/all of the valid data
-	assert!(max_seq_opt.is_some());
-	let entry_count = memtable.iter().count();
-	assert!(
-		entry_count >= 30,
-		"Should recover most data despite tail corruption, got {}",
-		entry_count
-	);
+	// Should either detect corruption or recover all valid data
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected - tail corruption detected
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 30,
+				"Should recover most data despite tail corruption, got {}",
+				entry_count
+			);
+		}
+		Ok(_) => {
+			// Also acceptable if corruption was at a clean boundary
+			let entry_count = memtable.iter().count();
+			assert!(
+				entry_count >= 30,
+				"Should recover most data despite tail corruption, got {}",
+				entry_count
+			);
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 // ============================================================================
@@ -814,10 +932,9 @@ fn test_contiguous_sequence_numbers() {
 
 	// Replay and verify
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert_eq!(max_seq_opt, Some(399), "Max sequence should be 399");
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 300);
 }
 
@@ -835,10 +952,9 @@ fn test_sequence_tracking_10_segments() {
 
 	// Replay and verify
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1999), "Max sequence should be 1999");
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 1000);
 }
 
@@ -857,15 +973,21 @@ fn test_sequence_after_corruption() {
 
 	// Replay
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should have segment 0 fully recovered
-	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_some());
-
-	// Should have at least segment 0 (101 entries)
-	let entry_count = memtable.iter().count();
-	assert!(entry_count >= 101, "Should have at least segment 0");
+	// Should detect corruption in segment 1
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 1);
+			// Should have at least segment 0 (101 entries)
+			let entry_count = memtable.iter().count();
+			assert!(entry_count >= 101, "Should have at least segment 0");
+		}
+		_ => panic!("Expected WalCorruption error in segment 1"),
+	}
 }
 
 #[test]
@@ -882,10 +1004,9 @@ fn test_large_sequence_numbers() {
 
 	// Replay
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1_000_149));
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 150);
 }
 
@@ -901,10 +1022,9 @@ fn test_sequence_gaps_detection() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 5000);
 
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 90);
 }
 
@@ -924,11 +1044,10 @@ fn test_skip_flushed_segments() {
 
 	// Replay with min_wal_number=3 (segments 0-2 already flushed)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 3).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 3).unwrap();
 
 	// Should only replay segments 3-4 (40 entries)
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 40);
 }
 
@@ -944,11 +1063,10 @@ fn test_all_segments_already_flushed() {
 
 	// Replay with min_wal_number=3 (all segments already flushed)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 3).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 3).unwrap();
 
 	// Should return None (nothing to replay)
 	assert_eq!(max_seq_opt, None);
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 0);
 }
 
@@ -971,11 +1089,10 @@ fn test_min_wal_equals_first_segment() {
 
 	// Replay with min_wal_number=5
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 5).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 5).unwrap();
 
 	// Should replay all three segments (5, 6, 7)
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 75);
 }
 
@@ -992,11 +1109,10 @@ fn test_mixed_flushed_unflushed() {
 	// Simulate: segments 0-2 flushed (min_wal_number=3)
 	// Segments 3-5 unflushed
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 3).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 3).unwrap();
 
 	// Should replay segments 3-5 (54 entries)
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 54);
 }
 
@@ -1012,11 +1128,10 @@ fn test_recovery_min_wal_zero() {
 
 	// Replay with min_wal_number=0 (all segments)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Should replay all 6 segments
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 132);
 }
 
@@ -1035,17 +1150,20 @@ fn test_corruption_at_min_wal_boundary() {
 
 	// Replay with min_wal_number=3
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 3).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 3);
 
 	// Should detect corruption in segment 3, not process 4-5
-	assert!(corruption_info.is_some());
-	let (corrupted_seg, _) = corruption_info.unwrap();
-	assert_eq!(corrupted_seg, 3);
-
-	// May have partial data from segment 3 before corruption
-	if max_seq_opt.is_some() {
-		let entry_count = memtable.iter().count();
-		assert!(entry_count < 24 * 3, "Should have less than all unflushed segments");
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			assert_eq!(segment_id, 3);
+			// May have partial data from segment 3 before corruption
+			let entry_count = memtable.iter().count();
+			assert!(entry_count < 24 * 3, "Should have less than all unflushed segments");
+		}
+		_ => panic!("Expected WalCorruption error in segment 3"),
 	}
 }
 
@@ -1061,11 +1179,10 @@ fn test_boundary_with_empty_segments() {
 
 	// Replay with min_wal_number=2 (skip 0, 1)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 2).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 2).unwrap();
 
 	// Should replay segments 2(empty), 3, 4 = 40 entries
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 40);
 }
 
@@ -1101,11 +1218,10 @@ fn test_very_large_values_across_segments() {
 
 	// Replay
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Verify all large values recovered
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 25);
 }
 
@@ -1138,11 +1254,10 @@ fn test_many_small_batches() {
 	// Replay
 	let start = std::time::Instant::now();
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 1000);
 
 	log::info!("1000 small batches replay time: {:?}", duration);
@@ -1175,11 +1290,10 @@ fn test_few_large_batches() {
 	// Replay
 	let start = std::time::Instant::now();
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 1000);
 
 	log::info!("5 large batches replay time: {:?}", duration);
@@ -1201,7 +1315,7 @@ fn test_recovery_performance_scaling() {
 
 		let start = std::time::Instant::now();
 		let memtable = Arc::new(MemTable::new());
-		let (_max_seq, _corruption) = replay_wal(wal_dir, &memtable, 0).unwrap();
+		let _max_seq = replay_wal(wal_dir, &memtable, 0).unwrap();
 		let duration = start.elapsed();
 
 		let total_entries = seg_count * entries_per_segment;
@@ -1231,11 +1345,10 @@ fn test_wal_segments_with_gaps() {
 
 	// Replay - should warn but process available segments
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Should process 0, 1, then skip 2 (missing), then 3, 4
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 
 	// Should have 4 segments worth of data (0, 1, 3, 4)
 	WalTestHelper::verify_entry_count(&memtable, 112);
@@ -1261,11 +1374,10 @@ fn test_non_sequential_segment_ids_with_min_wal() {
 
 	// Replay with min_wal_number=5
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 5).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 5).unwrap();
 
 	// Should process 5, 10, 15 (3 segments = 78 entries)
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 78);
 }
 
@@ -1285,11 +1397,10 @@ fn test_zero_length_segment_file() {
 
 	// Replay
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	// Should get segment 0, skip empty segment 1, get segment 2
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 64);
 }
 
@@ -1305,10 +1416,9 @@ fn test_segment_larger_than_expected() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 20000);
 
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 5000);
 }
 
@@ -1334,10 +1444,9 @@ fn test_recovery_with_readonly_segment() {
 
 	// Replay should work (only reading, not writing)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 70);
 }
 
@@ -1354,10 +1463,9 @@ fn test_only_wal_extension_processed() {
 
 	// Replay should only process .wal files (segments 0 and 1)
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 76);
 }
 
@@ -1381,7 +1489,7 @@ fn test_symlink_to_wal_segment() {
 
 		// Replay should handle symlink
 		let memtable = Arc::new(MemTable::new());
-		let (_max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+		let _result = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Should process files (might process symlink as separate segment or skip it)
 		let entry_count = memtable.iter().count();
@@ -1401,15 +1509,30 @@ fn test_concurrent_wal_directory_modifications() {
 	let entries_per_segment = vec![45, 45];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 24000);
 
-	// Modify directory during "recovery" (add extra file)
+	// Modify directory during "recovery" (add extra file with garbage content)
 	fs::write(wal_dir.join("00000000000000000002.wal"), b"new_file").unwrap();
 
-	// Replay
+	// Replay - the new file with invalid content will cause corruption
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, _corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Should handle gracefully
-	assert!(max_seq_opt.is_some());
+	// Should either detect corruption in the garbage file or recover segments 0-1
+	match result {
+		Err(Error::WalCorruption {
+			segment_id,
+			..
+		}) => {
+			// Expected - garbage file detected as corruption
+			assert_eq!(segment_id, 2, "Corruption should be in segment 2");
+			// Should have recovered segments 0-1
+			let entry_count = memtable.iter().count();
+			assert!(entry_count >= 90, "Should have recovered segments 0-1, got {}", entry_count);
+		}
+		Ok(_) => {
+			// Also acceptable if somehow handled gracefully
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }
 
 // ============================================================================
@@ -1449,10 +1572,9 @@ fn test_compressed_wal_segments() {
 
 	// Replay - should decompress automatically
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 150);
 }
 
@@ -1501,10 +1623,9 @@ fn test_mixed_compression_segments() {
 
 	// Replay - should handle both compressed and uncompressed segments
 	let memtable = Arc::new(MemTable::new());
-	let (max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let max_seq_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	assert!(corruption_info.is_none());
 	WalTestHelper::verify_entry_count(&memtable, 160);
 }
 
@@ -1537,13 +1658,20 @@ fn test_compressed_data_corruption() {
 
 	// Replay - should detect corruption (decompression failure or CRC mismatch)
 	let memtable = Arc::new(MemTable::new());
-	let (_max_seq_opt, corruption_info) = replay_wal(wal_dir, &memtable, 0).unwrap();
+	let result = replay_wal(wal_dir, &memtable, 0);
 
 	// Should detect corruption or have partial recovery
 	// (exact behavior depends on where corruption hits in compressed stream)
-	let entry_count = memtable.iter().count();
-	assert!(
-		corruption_info.is_some() || entry_count < 60,
-		"Should detect corruption in compressed data"
-	);
+	match result {
+		Err(Error::WalCorruption {
+			..
+		}) => {
+			// Expected corruption detected
+		}
+		Ok(_) => {
+			let entry_count = memtable.iter().count();
+			assert!(entry_count < 60, "Should detect corruption in compressed data");
+		}
+		Err(e) => panic!("Unexpected error: {}", e),
+	}
 }

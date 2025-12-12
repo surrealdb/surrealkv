@@ -138,15 +138,12 @@ fn test_wal_replay_all_segments() {
 	// Create a memtable for recovery
 	let memtable = Arc::new(MemTable::default());
 
-	// Replay WAL - should only replay the latest segment
-	let (sequence_number_opt, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	// Replay WAL - should replay all segments
+	let sequence_number_opt = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries in memtable
 	let entry_count = memtable.iter().count();
-
-	// Verify no corruption was detected
-	assert!(corruption_info.is_none(), "Expected no corruption, but got: {corruption_info:?}");
 
 	// Verify sequence number is from the latest segment (304 = 300 + 4)
 	assert_eq!(sequence_number, 304, "Expected max sequence number from all segments");

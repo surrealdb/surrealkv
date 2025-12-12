@@ -781,35 +781,36 @@ impl Core {
 		let recovered_memtable = Arc::new(MemTable::default());
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number)? {
-			(Some(seq_num), None) => {
-				// WAL was replayed successfully, no corruption
-				Some(seq_num)
+		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
+			Ok(seq_num_opt) => {
+				// WAL was replayed successfully (or was empty/skipped)
+				seq_num_opt
 			}
-			(None, None) => {
-				// WAL was skipped or empty
-				None
-			}
-			(_seq_num, Some((corrupted_segment_id, last_valid_offset))) => {
+			Err(Error::WalCorruption {
+				segment_id,
+				offset,
+				message,
+			}) => {
 				log::warn!(
-                    "Detected WAL corruption in segment {corrupted_segment_id} at offset {last_valid_offset}. Attempting repair..."
-                );
+					"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
+					segment_id,
+					offset,
+					message
+				);
 
 				// Attempt to repair the corrupted segment
-				if let Err(repair_err) =
-					repair_corrupted_wal_segment(wal_path, corrupted_segment_id)
-				{
+				if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id) {
 					log::error!("Failed to repair WAL segment: {repair_err}");
 					return Err(Error::Other(format!(
-                        "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
-                    )));
+						"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
+					)));
 				}
 
 				// After repair, replay again to recover data from ALL segments.
 				// The initial replay stopped at the corruption point and didn't process subsequent segments.
 				let retry_memtable = Arc::new(MemTable::default());
 				match replay_wal(wal_path, &retry_memtable, min_wal_number) {
-					Ok((retry_seq_num, None)) => {
+					Ok(retry_seq_num) => {
 						// Successful replay after repair
 						log::info!(
 							"WAL replay after repair succeeded: {} entries recovered",
@@ -820,11 +821,15 @@ impl Core {
 						}
 						return Ok(retry_seq_num);
 					}
-					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
+					Err(Error::WalCorruption {
+						segment_id: seg_id,
+						offset: off,
+						message,
+					}) => {
 						// WAL still corrupted after repair - fail
 						return Err(Error::Other(format!(
-                            "{context} failed: WAL segment {seg_id} still corrupted at offset {offset} after repair"
-                        )));
+							"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
+						)));
 					}
 					Err(retry_err) => {
 						// Replay failed after repair - fail
@@ -833,6 +838,10 @@ impl Core {
 						)));
 					}
 				}
+			}
+			Err(e) => {
+				// Other errors (IO, etc.) - propagate
+				return Err(e);
 			}
 		};
 
