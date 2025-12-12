@@ -175,7 +175,7 @@ pub(crate) fn replay_wal(
 				}
 				Err(Error::Corruption(err)) => {
 					// Corruption detected - stop immediately and don't process further segments
-					// This matches RocksDB behavior: only repair segment N, leave N+1 untouched
+					// Only repair segment N, leave N+1 untouched
 					log::warn!(
 						"Corrupted WAL record detected in segment {:020} at offset {}: {}",
 						segment_id,

@@ -1,7 +1,4 @@
 //! LSM Recovery Integration Tests
-//!
-//! Integration tests for WAL recovery, memtable flush, SST interaction, and manifest
-//! coordination. Based on RocksDB's recovery test suite.
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,11 +19,10 @@ where
 }
 
 // ============================================================================
-// Core Recovery Tests (Based on RocksDB)
+// Core Recovery Tests
 // ============================================================================
 
 /// Test 1: Basic Recovery
-/// RocksDB: TEST_F(DBWALTest, Recover)
 #[test(tokio::test)]
 async fn test_basic_recovery() {
 	let temp_dir = TempDir::new().unwrap();
@@ -79,7 +75,6 @@ async fn test_basic_recovery() {
 }
 
 /// Test 2: Recovery With Existing SST Files
-/// RocksDB: TEST_F(DBWALTest, RecoverWithTableHandle)
 #[test(tokio::test)]
 async fn test_recover_with_existing_ssts() {
 	let temp_dir = TempDir::new().unwrap();
@@ -141,8 +136,7 @@ async fn test_recover_with_existing_ssts() {
 	}
 }
 
-/// Test 3: Recovery Without Flush (Multiple WALs) - MOST CRITICAL
-/// RocksDB: TEST_F(DBWALTest, RecoverWithoutFlush)
+/// Test 3: Recovery Without Flush (Multiple WALs)
 #[test(tokio::test)]
 async fn test_recover_multiple_wals_without_flush() {
 	let temp_dir = TempDir::new().unwrap();
@@ -221,7 +215,6 @@ async fn test_recover_multiple_wals_without_flush() {
 }
 
 /// Test 4: Recovery With Large WAL
-/// RocksDB: TEST_F(DBWALTest, RecoverWithLargeLog)
 #[test(tokio::test)]
 async fn test_recover_with_large_wal() {
 	let temp_dir = TempDir::new().unwrap();
@@ -263,7 +256,6 @@ async fn test_recover_with_large_wal() {
 }
 
 /// Test 5: Recovery With Empty WAL
-/// RocksDB: TEST_F(DBWALTest, RecoveryWithEmptyLog)
 #[test(tokio::test)]
 async fn test_recovery_with_empty_wal() {
 	let temp_dir = TempDir::new().unwrap();
@@ -294,7 +286,6 @@ async fn test_recovery_with_empty_wal() {
 }
 
 /// Test 6: Verify File Count After Recovery
-/// RocksDB: TEST_F(DBWALTest, RecoverCheckFileAmount)
 #[test(tokio::test)]
 async fn test_file_count_after_recovery() {
 	let temp_dir = TempDir::new().unwrap();
@@ -349,7 +340,6 @@ async fn test_file_count_after_recovery() {
 }
 
 /// Test 7: WAL Cleanup After Recovery Without Flush
-/// RocksDB: TEST_F(DBWALTest, WalCleanupAfterAvoidFlushDuringRecovery)
 #[test(tokio::test)]
 async fn test_wal_cleanup_after_recovery_without_flush() {
 	let temp_dir = TempDir::new().unwrap();
@@ -399,7 +389,6 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 }
 
 /// Test 8: Mixed Flushed and Unflushed WALs
-/// Pattern from RocksDB recovery flow
 #[test(tokio::test)]
 async fn test_mixed_flushed_and_unflushed_wals() {
 	let temp_dir = TempDir::new().unwrap();
@@ -467,7 +456,6 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 }
 
 /// Test 9: Orphaned SST Cleanup
-/// Pattern from RocksDB orphan file handling
 /// Note: This test verifies that orphaned SSTs don't break recovery
 #[test(tokio::test)]
 async fn test_orphaned_sst_doesnt_break_recovery() {
@@ -504,7 +492,6 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 }
 
 /// Test 10: Manifest Log Number Progression
-/// Critical for multi-WAL recovery
 #[test(tokio::test)]
 async fn test_manifest_log_number_progression() {
 	let temp_dir = TempDir::new().unwrap();

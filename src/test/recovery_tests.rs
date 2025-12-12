@@ -1,8 +1,4 @@
-//! Comprehensive WAL Recovery Tests
-//!
-//! This module contains extensive tests for WAL recovery based on RocksDB's test coverage.
-//! Tests are organized into categories covering all recovery scenarios, corruption handling,
-//! crash scenarios, and edge cases.
+//! WAL Recovery Tests
 
 use std::fs;
 use std::io::Write;

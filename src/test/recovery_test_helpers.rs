@@ -1,7 +1,4 @@
 //! Test helper utilities for LSM recovery integration tests
-//!
-//! These helpers simplify common patterns in recovery testing, similar to
-//! RocksDB's RecoveryTestHelper.
 
 use std::fs::{self, OpenOptions};
 use std::path::Path;
