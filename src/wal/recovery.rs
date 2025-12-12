@@ -69,9 +69,7 @@ impl Reporter for DefaultReporter {
 /// # Partial State on Corruption
 ///
 /// When corruption is detected, the memtable will contain all successfully replayed data
-/// up to the corruption point. The caller can use this partial recovery to:
-/// 1. Attempt repair using `repair_corrupted_wal_segment`
-/// 2. Retry replay with the repaired segment
+/// up to the corruption point.
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	memtable: &Arc<MemTable>,
@@ -172,23 +170,8 @@ pub(crate) fn replay_wal(
 					// Update tracking info
 					last_valid_offset = offset as usize;
 
-					// Decode batch - treat decode errors as corruption
-					let batch = match Batch::decode(record_data) {
-						Ok(b) => b,
-						Err(e) => {
-							log::error!(
-								"Failed to decode batch in segment {:020} at offset {}: {}",
-								segment_id,
-								last_valid_offset,
-								e
-							);
-							return Err(Error::wal_corruption(
-								segment_id as usize,
-								last_valid_offset,
-								format!("Failed to decode batch: {}", e),
-							));
-						}
-					};
+					// Decode batch
+					let batch = Batch::decode(record_data)?;
 
 					let batch_highest_seq_num = batch.get_highest_seq_num();
 
@@ -207,20 +190,8 @@ pub(crate) fn replay_wal(
 						offset
 					);
 
-					// Apply the batch to the memtable - treat failures as corruption
-					if let Err(e) = memtable.add(&batch) {
-						log::error!(
-							"Failed to apply batch to memtable in segment {:020} at offset {}: {}",
-							segment_id,
-							last_valid_offset,
-							e
-						);
-						return Err(Error::wal_corruption(
-							segment_id as usize,
-							last_valid_offset,
-							format!("Failed to apply batch to memtable: {}", e),
-						));
-					}
+					// Apply the batch to the memtable
+					memtable.add(&batch)?;
 				}
 				Err(WalError::Corruption(err)) => {
 					// Corruption detected - stop immediately and don't process further segments

@@ -359,7 +359,7 @@ impl LevelManifest {
 			self.manifest_format_version = version;
 		}
 
-		// Apply log_number if present, but only if it's higher (monotonic invariant)
+		// Apply log_number if present, but only if it's higher
 		// This prevents race conditions where concurrent flushes could move log_number backward
 		if let Some(log_num) = changeset.log_number {
 			if log_num > self.log_number {

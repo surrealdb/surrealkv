@@ -192,15 +192,6 @@ impl CoreInner {
 	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
 	/// 4. Release locks, then flush memtable to SST and update manifest
 	/// 5. Asynchronously clean up old WAL segments
-	///
-	/// CRITICAL: We must hold the memtable write lock through WAL rotation and swap.
-	/// This prevents a race condition where:
-	/// - Thread A reads memtable (above threshold), releases read lock
-	/// - Thread A rotates WAL, captures flushed_wal_number
-	/// - Thread B swaps memtable before Thread A acquires write lock
-	/// - Thread A sees empty memtable, calls update_manifest_log_number()
-	/// - Thread A marks WAL as flushed, but Thread B's flush is still in progress
-	/// - CRASH: WAL is marked flushed but data was never written to SST → DATA LOSS
 	fn make_room_for_write(&self, force: bool) -> Result<()> {
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
 		// We need the write lock before checking/rotating/swapping to ensure atomicity
