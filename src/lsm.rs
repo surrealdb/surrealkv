@@ -188,17 +188,24 @@ impl CoreInner {
 	///
 	/// This is called when the active memtable exceeds the configured size threshold.
 	/// The operation proceeds in stages:
-	/// 1. Check if memtable needs flushing
-	/// 2. Rotate WAL FIRST (creates new WAL for subsequent writes)
-	/// 3. Flush memtable to SST and update manifest (centralized logic)
-	/// 4. Asynchronously clean up old WAL segments
+	/// 1. Acquire memtable write lock and check if flushing is needed
+	/// 2. If flushing, rotate WAL while STILL holding memtable lock
+	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
+	/// 4. Release locks, then flush memtable to SST and update manifest
+	/// 5. Asynchronously clean up old WAL segments
 	///
-	///
-	/// WAL rotation happens BEFORE flush to ensure new writes go to the new WAL segment.
-	/// This is critical for crash recovery - the new WAL will be active after restart.
+	/// CRITICAL: We must hold the memtable write lock through WAL rotation and swap.
+	/// This prevents a race condition where:
+	/// - Thread A reads memtable (above threshold), releases read lock
+	/// - Thread A rotates WAL, captures flushed_wal_number
+	/// - Thread B swaps memtable before Thread A acquires write lock
+	/// - Thread A sees empty memtable, calls update_manifest_log_number()
+	/// - Thread A marks WAL as flushed, but Thread B's flush is still in progress
+	/// - CRASH: WAL is marked flushed but data was never written to SST → DATA LOSS
 	fn make_room_for_write(&self, force: bool) -> Result<()> {
-		// Step 1: Check if active memtable needs flushing
-		let active_memtable = self.active_memtable.read()?;
+		// Step 1: Acquire WRITE lock upfront to prevent race conditions
+		// We need the write lock before checking/rotating/swapping to ensure atomicity
+		let mut active_memtable = self.active_memtable.write()?;
 		let size = active_memtable.size();
 
 		if active_memtable.is_empty() {
@@ -220,15 +227,14 @@ impl CoreInner {
 		}
 
 		log::debug!("make_room_for_write: flushing memtable size={}", size);
-		drop(active_memtable);
 
-		// Step 2: Rotate WAL BEFORE flush
-		// This creates a new WAL file for subsequent writes
-		// New writes will go to the new WAL while we flush the old memtable
-		// CRITICAL: Save the old WAL number to correctly mark it as flushed
-		let flushed_wal_number = if let Some(ref wal) = self.wal {
+		// Step 2: Rotate WAL while STILL holding memtable write lock
+		// We must rotate WAL and swap memtable atomically
+		// to prevent the race condition described above
+		let (flushed_wal_number, wal_dir) = if let Some(ref wal) = self.wal {
 			let mut wal_guard = wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
+			let dir = wal_guard.get_dir_path().to_path_buf();
 			wal_guard.rotate().map_err(|e| {
 				Error::Other(format!("Failed to rotate WAL before memtable flush: {}", e))
 			})?;
@@ -240,58 +246,99 @@ impl CoreInner {
 				old_log_number,
 				new_log_number
 			);
-			Some(old_log_number)
+			(Some(old_log_number), Some(dir))
 		} else {
-			None
+			(None, None)
 		};
 
-		// Step 3: Use centralized flush logic, passing the WAL number we're flushing
-		// This ensures manifest marks the correct WAL as flushed (not the new active one)
-		let table = self.flush_memtable_and_update_manifest(flushed_wal_number)?;
+		// Step 3: Swap memtable while STILL holding write lock
+		// Take the memtable data that we will flush
+		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
-		// Step 3.5: Handle case where memtable was empty (concurrent flush)
-		// CRITICAL: Even if memtable was empty, we MUST update log_number to mark
-		// the rotated WAL as processed, otherwise it won't be cleaned up
-		if table.is_none() {
-			// Memtable was empty after rotation (concurrent flush by another thread)
-			log::debug!("Memtable was empty after WAL rotation, updating log_number only");
+		// Get table ID and track immutable memtable
+		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let table_id = self.level_manifest.read()?.next_table_id();
+		immutable_memtables.add(table_id, flushed_memtable.clone());
 
-			// Update log_number to mark the rotated WAL as flushed (even though empty)
-			// This is essential for WAL cleanup to work correctly
-			if let Some(wal_num) = flushed_wal_number {
-				self.update_manifest_log_number(wal_num)?;
-			}
-		} else {
-			log::debug!("Memtable flush completed successfully");
+		// Now we can release locks - the memtable is safely in immutable_memtables
+		// and no other thread can race us on this specific data
+		drop(active_memtable);
+		drop(immutable_memtables);
+
+		// Step 4: Flush the memtable to SST (slow I/O operation, no locks held)
+		let table = flushed_memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
+		})?;
+
+		log::debug!(
+			"Created SST table_id={}, file_size={}",
+			table.id,
+			table.meta.properties.file_size
+		);
+
+		// Step 5: Prepare atomic changeset with both SST and log_number
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, table.clone()));
+
+		// Set log_number if we rotated a WAL
+		if let Some(wal_num) = flushed_wal_number {
+			changeset.log_number = Some(wal_num + 1);
+
+			log::debug!(
+				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+				table_id,
+				wal_num + 1,
+				wal_num
+			);
 		}
 
-		// Step 4: Async WAL cleanup based on manifest log_number
-		// Only WAL segments older than log_number can be safely deleted
-		let wal_guard = self.wal.as_ref().unwrap().read();
-		let wal_dir = wal_guard.get_dir_path().to_path_buf();
-		drop(wal_guard);
+		// Step 6: Apply changeset atomically
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
 
-		let min_wal_to_keep = self.level_manifest.read()?.get_log_number();
+		manifest.apply_changeset(&changeset)?;
+		write_manifest_to_disk(&manifest).map_err(|e| {
+			Error::Other(format!(
+				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
+				table_id, changeset.log_number, e
+			))
+		})?;
 
-		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
+		memtable_lock.remove(table_id);
+		drop(manifest);
+		drop(memtable_lock);
 
-		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!(
-						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-						count,
-						min_wal_to_keep
-					);
+		log::info!(
+			"Memtable flush completed: table_id={}, log_number={:?}",
+			table_id,
+			changeset.log_number
+		);
+
+		// Step 7: Async WAL cleanup using values we already have
+		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number earlier
+		if let (Some(dir), Some(wal_num)) = (wal_dir, flushed_wal_number) {
+			let min_wal_to_keep = wal_num + 1; // Same as changeset.log_number
+
+			log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
+
+			tokio::spawn(async move {
+				match cleanup_old_segments(&dir, min_wal_to_keep) {
+					Ok(count) if count > 0 => {
+						log::info!(
+							"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+							count,
+							min_wal_to_keep
+						);
+					}
+					Ok(_) => {
+						log::debug!("No old WAL segments to clean up");
+					}
+					Err(e) => {
+						log::warn!("Failed to clean up old WAL segments: {}", e);
+					}
 				}
-				Ok(_) => {
-					log::debug!("No old WAL segments to clean up");
-				}
-				Err(e) => {
-					log::warn!("Failed to clean up old WAL segments: {}", e);
-				}
-			}
-		});
+			});
+		}
 
 		Ok(())
 	}
@@ -415,43 +462,6 @@ impl CoreInner {
 		);
 
 		Ok(Some(table))
-	}
-
-	/// Updates the manifest's log_number to mark a WAL as flushed.
-	///
-	/// This is a helper function to avoid code duplication when updating log_number
-	/// without adding new SSTables (e.g., when memtable is empty after concurrent flush).
-	///
-	/// # Arguments
-	///
-	/// * `flushed_wal_number` - The WAL number that was flushed (log_number will be set to this + 1)
-	///
-	/// # Returns
-	///
-	/// Ok(()) if successful, Error otherwise
-	fn update_manifest_log_number(&self, flushed_wal_number: u64) -> Result<()> {
-		let changeset = ManifestChangeSet {
-			log_number: Some(flushed_wal_number + 1),
-			..Default::default()
-		};
-
-		let mut manifest = self.level_manifest.write()?;
-		manifest.apply_changeset(&changeset)?;
-		write_manifest_to_disk(&manifest).map_err(|e| {
-			Error::Other(format!(
-				"Failed to update manifest log_number={}: {}",
-				flushed_wal_number + 1,
-				e
-			))
-		})?;
-
-		log::debug!(
-			"Updated log_number to {} (WAL {:020} marked as flushed)",
-			flushed_wal_number + 1,
-			flushed_wal_number
-		);
-
-		Ok(())
 	}
 
 	/// Cleans up orphaned SST files not referenced in manifest
