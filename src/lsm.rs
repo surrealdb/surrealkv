@@ -32,7 +32,7 @@ use crate::{
 		Wal,
 	},
 	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
-	VLogChecksumLevel, Value,
+	TimestampComparator, VLogChecksumLevel, Value,
 };
 use bytes::Bytes;
 
@@ -154,9 +154,8 @@ impl CoreInner {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator = Arc::new(crate::TimestampComparator {
-				user_comparator: Arc::new(BytewiseComparator {}),
-			});
+			let comparator =
+				Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
 			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
 			Some(Arc::new(parking_lot::RwLock::new(tree)))
 		} else {
@@ -4722,13 +4721,13 @@ mod tests {
 				txn.set(b"test", b"data").unwrap();
 				txn.commit().await.unwrap();
 
-				sst_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
+				sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 				tree.close().await.unwrap();
 			}
 
 			let tree = Tree::new(opts.clone()).unwrap();
-			let sst_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
+			let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 			assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
 			tree.close().await.unwrap();
@@ -4748,13 +4747,13 @@ mod tests {
 				txn.set(b"test", b"data").unwrap();
 				txn.commit().await.unwrap();
 
-				sst_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
+				sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 				tree.close().await.unwrap();
 			}
 
 			let tree = Tree::new(opts.clone()).unwrap();
-			let sst_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
+			let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 			assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
