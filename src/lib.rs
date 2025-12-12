@@ -239,7 +239,7 @@ impl Default for Options {
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
-			flush_on_close: false,
+			flush_on_close: true,
 		}
 	}
 }
