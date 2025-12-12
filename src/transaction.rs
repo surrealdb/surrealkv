@@ -58,8 +58,8 @@ pub enum Durability {
 }
 
 /// Options for write operations in transactions.
-/// Similar to RocksDB's WriteOptions, this struct allows configuring
-/// various parameters for write operations like set() and delete().
+/// This struct allows configuring various parameters for write operations
+/// like set() and delete().
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteOptions {
 	/// Durability level for the write operation
@@ -97,8 +97,8 @@ impl WriteOptions {
 }
 
 /// Options for read operations in transactions.
-/// Similar to RocksDB's ReadOptions, this struct allows configuring
-/// various parameters for read operations like get(), range(), and keys().
+/// This struct allows configuring various parameters for read operations
+/// like get(), range(), and keys().
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadOptions {
 	/// Whether to return only keys without values (for range operations)

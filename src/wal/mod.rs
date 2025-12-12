@@ -549,48 +549,50 @@ impl WritableFile for BufferedFileWriter {
 
 // ===== Cleanup =====
 
-/// Cleans up old WAL segments, keeping only the latest segment.
+/// Cleans up old WAL segments based on the minimum log number with unflushed data.
 ///
-/// This function removes all WAL segments except the latest one, since we use
-/// one segment per memtable and only the latest segment contains unflushed data.
-/// All older segments have been flushed to SSTables and are no longer needed.
+/// This function removes all WAL segments with ID < min_wal_number, since they have
+/// been flushed to SSTables and are no longer needed. The manifest tracks which WALs
+/// have been flushed.
 ///
 /// # Arguments
 ///
 /// * `wal_dir` - The directory containing the WAL segments
+/// * `min_wal_number` - The minimum WAL number that contains unflushed data
 ///
 /// # Returns
 ///
 /// A result with the count of removed segments or an error
-pub(crate) fn cleanup_old_segments(wal_dir: &Path) -> Result<usize> {
+pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Result<usize> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		return Ok(0);
 	}
 
-	// Get range of segment IDs (looking for .wal files)
-	let (first, last) = match get_segment_range(wal_dir, Some("wal")) {
-		Ok(range) => range,
+	// List all segment IDs with .wal extension
+	let segment_ids = match list_segment_ids(wal_dir, Some("wal")) {
+		Ok(ids) => ids,
 		Err(_) => return Ok(0), // No segments to clean
 	};
 
-	// If no segments or only one segment, nothing to clean
-	if first >= last {
+	// If no segments, nothing to clean
+	if segment_ids.is_empty() {
 		return Ok(0);
 	}
 
-	// List all segment IDs with .wal extension
-	let segment_ids = list_segment_ids(wal_dir, Some("wal"))?;
 	let mut removed_count = 0;
 
-	// Remove all segments except the latest one
+	// Remove all segments older than min_wal_number (already flushed to SST)
 	for segment_id in segment_ids {
-		if segment_id < last {
+		if segment_id < min_wal_number {
 			let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
 
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {
 					removed_count += 1;
+					log::debug!(
+						"Removed flushed WAL segment {segment_id:020} (older than min {min_wal_number:020})"
+					);
 				}
 				Err(e) => {
 					// Log error but continue trying to remove other segments

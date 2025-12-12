@@ -65,6 +65,10 @@ pub(crate) struct ManifestChangeSet {
 
 	/// Snapshots to delete (by sequence number)
 	pub deleted_snapshots: HashSet<u64>,
+
+	/// New log_number to set (if Some)
+	/// Indicates that WALs with number < log_number have been flushed
+	pub log_number: Option<u64>,
 }
 
 mod iter;
@@ -91,6 +95,15 @@ pub(crate) struct LevelManifest {
 
 	/// A list of read snapshots that are currently open
 	pub snapshots: Vec<SnapshotInfo>,
+
+	/// Minimum WAL number that contains unflushed data.
+	/// All WAL files with number < log_number have been flushed to SST and can be safely deleted.
+	pub(crate) log_number: u64,
+
+	/// Last sequence number persisted in the manifest.
+	/// Tracks the highest sequence number across all SSTables.
+	/// Updated when new tables are added during flush operations.
+	pub(crate) last_sequence: u64,
 }
 
 impl LevelManifest {
@@ -110,7 +123,7 @@ impl LevelManifest {
 		// Initialize levels with default values
 		let levels = Self::initialize_levels(opts.level_count);
 
-		// Start with next_table_id = 1 (0 is often reserved)
+		// Start with next_table_id = 1 (0 is reserved)
 		let next_table_id = Arc::new(AtomicU64::new(1));
 
 		let manifest = Self {
@@ -120,6 +133,8 @@ impl LevelManifest {
 			next_table_id,
 			manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		// Write levels to disk with the counter
@@ -139,6 +154,16 @@ impl LevelManifest {
 		0
 	}
 
+	/// Returns the minimum WAL number that contains unflushed data
+	pub(crate) fn get_log_number(&self) -> u64 {
+		self.log_number
+	}
+
+	/// Returns the last sequence number persisted in the manifest
+	pub(crate) fn get_last_sequence(&self) -> u64 {
+		self.last_sequence
+	}
+
 	/// Initializes levels with default values
 	fn initialize_levels(level_count: u8) -> Levels {
 		let levels = (0..level_count).map(|_| Arc::new(Level::default())).collect::<Vec<_>>();
@@ -148,6 +173,8 @@ impl LevelManifest {
 
 	/// Load a manifest from file and return a complete LevelManifest instance
 	fn load_from_file<P: AsRef<Path>>(manifest_path: P, opts: Arc<Options>) -> Result<Self> {
+		log::info!("Loading manifest from {:?}", manifest_path.as_ref());
+
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
 		let mut level_manifest = Cursor::new(data);
@@ -162,6 +189,16 @@ impl LevelManifest {
 		}
 
 		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
+		let log_number = level_manifest.read_u64::<BigEndian>()?;
+		let last_sequence = level_manifest.read_u64::<BigEndian>()?;
+
+		log::debug!(
+			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
+			version,
+			next_table_id,
+			log_number,
+			last_sequence
+		);
 
 		// Read levels data
 		let level_data = Levels::decode(&mut level_manifest)?;
@@ -209,6 +246,17 @@ impl LevelManifest {
 		}
 
 		// Create and return the complete manifest
+		let total_tables: usize = levels_vec.iter().map(|l| l.tables.len()).sum();
+
+		log::info!(
+			"Manifest loaded successfully: version={}, log_number={}, last_sequence={}, tables={}, levels={}",
+			version,
+			log_number,
+			last_sequence,
+			total_tables,
+			levels_vec.len()
+		);
+
 		Ok(Self {
 			path: manifest_path.as_ref().to_path_buf(),
 			levels: Levels(levels_vec),
@@ -216,6 +264,8 @@ impl LevelManifest {
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: version,
 			snapshots,
+			log_number,
+			last_sequence,
 		})
 	}
 
@@ -309,6 +359,11 @@ impl LevelManifest {
 			self.manifest_format_version = version;
 		}
 
+		// Apply log_number if present
+		if let Some(log_num) = changeset.log_number {
+			self.log_number = log_num;
+		}
+
 		// Add new tables to levels
 		for (level, table) in &changeset.new_tables {
 			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
@@ -320,6 +375,11 @@ impl LevelManifest {
 					// Level 1+: sorted by smallest key (tables cannot overlap)
 					level_mut.insert_sorted_by_key(table.clone());
 				}
+			}
+
+			// Update last_sequence if this table has a higher sequence number
+			if table.meta.largest_seq_num > self.last_sequence {
+				self.last_sequence = table.meta.largest_seq_num;
 			}
 		}
 
@@ -398,11 +458,25 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 
 /// Write the full versioned manifest to disk
 pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
+	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
+	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+
+	log::debug!(
+		"Writing manifest: version={}, log_number={}, last_sequence={}, next_table_id={}, total_tables={}",
+		manifest.manifest_format_version,
+		manifest.log_number,
+		manifest.last_sequence,
+		next_table_id,
+		total_tables
+	);
+
 	let mut buf = Vec::new();
 
 	// Write header
 	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
-	buf.write_u64::<BigEndian>(manifest.next_table_id.load(Ordering::SeqCst))?;
+	buf.write_u64::<BigEndian>(next_table_id)?;
+	buf.write_u64::<BigEndian>(manifest.log_number)?;
+	buf.write_u64::<BigEndian>(manifest.last_sequence)?;
 
 	// Write levels data
 	manifest.levels.encode(&mut buf)?;
@@ -416,6 +490,7 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	}
 
 	replace_file_content(&manifest.path, &buf)?;
+	log::debug!("Manifest written successfully to {:?}", manifest.path);
 	Ok(())
 }
 
@@ -1065,5 +1140,56 @@ mod tests {
 				"Third table should have lowest seq num"
 			);
 		}
+	}
+
+	#[test]
+	fn test_manifest_v1_with_log_number_and_last_sequence() {
+		let mut opts = Options::default();
+		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+		let repo_path = temp_dir.path().to_path_buf();
+		opts.path = repo_path.clone();
+		opts.level_count = 3;
+		let opts = Arc::new(opts);
+
+		// Create required directories
+		fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
+		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
+
+		// Create a manifest with log_number and last_sequence set
+		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
+
+		// Add a table to ensure non-trivial state
+		let table = create_test_table_with_seq_nums(1, 100, 200, opts.clone())
+			.expect("Failed to create table");
+
+		// Use changeset to atomically set log_number and add table
+		let changeset = ManifestChangeSet {
+			log_number: Some(42),
+			new_tables: vec![(0, table)],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
+
+		// Directly set last_sequence for test (tests have access to private fields)
+		manifest.last_sequence = 12345;
+
+		// Persist to disk
+		write_manifest_to_disk(&manifest).expect("Failed to write manifest");
+
+		// Reload and verify
+		let loaded_manifest = LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
+
+		// Verify format version is still V1
+		assert_eq!(
+			loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+			"Should be V1 format"
+		);
+
+		// Verify new fields persisted correctly
+		assert_eq!(loaded_manifest.get_log_number(), 42, "log_number should persist");
+		assert_eq!(loaded_manifest.get_last_sequence(), 12345, "last_sequence should persist");
+
+		// Verify table loaded correctly
+		assert_eq!(loaded_manifest.levels.get_levels()[0].tables.len(), 1);
 	}
 }

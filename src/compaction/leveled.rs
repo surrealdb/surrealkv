@@ -7,18 +7,18 @@ use crate::levels::{Level, LevelManifest};
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 
-/// Compaction priority strategy similar to RocksDB's compaction_priority options
+/// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactionPriority {
 	#[allow(unused)]
-	/// Files whose range hasn't been compacted for the longest (RocksDB's kOldestSmallestSeqFirst)
+	/// Files whose range hasn't been compacted for the longest
 	OldestSmallestSeqFirst,
 
-	/// Files whose latest update is oldest (RocksDB's kOldestLargestSeqFirst)
+	/// Files whose latest update is oldest
 	#[allow(unused)]
 	OldestLargestSeqFirst,
 
-	/// Larger files compensated by deletes (RocksDB's kByCompensatedSize - default)
+	/// Larger files compensated by deletes (default)
 	#[default]
 	ByCompensatedSize,
 }
@@ -135,7 +135,7 @@ impl Strategy {
 		}
 	}
 
-	/// RocksDB's kOldestSmallestSeqFirst: ranges that haven't been compacted for longest
+	/// Selects ranges that haven't been compacted for longest
 	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
@@ -170,7 +170,7 @@ impl Strategy {
 		choices.first().map(|choice| choice.table_id)
 	}
 
-	/// RocksDB's kOldestLargestSeqFirst: files whose latest update is oldest (cold data)
+	/// Selects files whose latest update is oldest (cold data)
 	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
@@ -205,7 +205,7 @@ impl Strategy {
 		choices.first().map(|choice| choice.table_id)
 	}
 
-	/// Selects files based on compensated size (RocksDB's kByCompensatedSize)
+	/// Selects files based on compensated size
 	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<u64> {
 		if source_level.tables.is_empty() {
 			return None;
@@ -224,7 +224,7 @@ impl Strategy {
 			let num_entries = source_table.meta.properties.num_entries;
 			let num_deletions = source_table.meta.properties.num_deletions;
 
-			// Calculate compensated size as RocksDB does:
+			// Calculate compensated size:
 			// Base file size, adjusted upward by delete ratio
 			let compensated_size = if num_entries > 0 && num_deletions > 0 {
 				let delete_ratio = num_deletions as f64 / num_entries as f64;
@@ -507,6 +507,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		// Write the manifest to disk
@@ -924,6 +926,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1115,6 +1119,8 @@ mod tests {
 			next_table_id: shared_table_id_counter.clone(),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1450,6 +1456,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1530,6 +1538,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 
 		write_manifest_to_disk(&manifest).unwrap();
@@ -1619,6 +1629,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1715,6 +1727,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1841,6 +1855,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -1963,6 +1979,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -2197,6 +2215,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
@@ -2343,6 +2363,8 @@ mod tests {
 			next_table_id: Arc::new(AtomicU64::new(1000)),
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
+			log_number: 0,
+			last_sequence: 0,
 		};
 		write_manifest_to_disk(&manifest).unwrap();
 		let manifest = Arc::new(RwLock::new(manifest));
