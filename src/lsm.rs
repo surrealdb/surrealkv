@@ -1006,8 +1006,22 @@ impl Core {
 			log::info!("Skipping memtable flush on shutdown (flush_on_close=false)");
 		}
 
-		// Step 3.5: Clean up obsolete WAL files (synchronous cleanup)
-		// This happens after flush so manifest.log_number is updated
+		// Step 4: Close the WAL to ensure all data is flushed
+		// This is safe now because all background tasks that could write to WAL are stopped
+		// NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may delete the active WAL file
+		if let Some(ref wal) = self.inner.wal {
+			let wal_log_number = wal.read().get_active_log_number();
+			log::info!("Closing WAL: active_log_number={}", wal_log_number);
+
+			let mut wal_guard = wal.write();
+			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
+			log::debug!("WAL #{:020} closed and synced", wal_log_number);
+		}
+
+		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
+		// This happens AFTER closing the WAL to prevent deleting the active WAL file.
+		// When memtable flush sets log_number = current_wal + 1, cleanup would delete the
+		// active WAL if done before closing it.
 		if let Some(ref wal) = self.inner.wal {
 			let wal_dir = wal.read().get_dir_path().to_path_buf();
 			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
@@ -1025,17 +1039,6 @@ impl Core {
 					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
 				}
 			}
-		}
-
-		// Step 4: Close the WAL to ensure all data is flushed
-		// This is safe now because all background tasks that could write to WAL are stopped
-		if let Some(ref wal) = self.inner.wal {
-			let wal_log_number = wal.read().get_active_log_number();
-			log::info!("Closing WAL: active_log_number={}", wal_log_number);
-
-			let mut wal_guard = wal.write();
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-			log::debug!("WAL #{:020} closed and synced", wal_log_number);
 		}
 
 		// Step 5: Close the versioned index if present
