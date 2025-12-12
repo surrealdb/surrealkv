@@ -110,7 +110,7 @@ pub(crate) struct CoreInner {
 	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
-	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
+	pub(crate) wal: parking_lot::RwLock<Wal>,
 
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
@@ -146,7 +146,6 @@ impl CoreInner {
 		let wal_instance =
 			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
-		let wal = Some(wal_instance);
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize versioned index if versioned queries are enabled
@@ -176,7 +175,7 @@ impl CoreInner {
 			snapshot_counter: SnapshotCounter::default(),
 			oracle: Arc::new(oracle),
 			vlog,
-			wal: wal.map(parking_lot::RwLock::new),
+			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 		})
@@ -231,8 +230,8 @@ impl CoreInner {
 		// Step 2: Rotate WAL while STILL holding memtable write lock
 		// We must rotate WAL and swap memtable atomically
 		// to prevent the race condition described above
-		let (flushed_wal_number, wal_dir) = if let Some(ref wal) = self.wal {
-			let mut wal_guard = wal.write();
+		let (flushed_wal_number, wal_dir) = {
+			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			let dir = wal_guard.get_dir_path().to_path_buf();
 			wal_guard.rotate().map_err(|e| {
@@ -246,9 +245,7 @@ impl CoreInner {
 				old_log_number,
 				new_log_number
 			);
-			(Some(old_log_number), Some(dir))
-		} else {
-			(None, None)
+			(old_log_number, dir)
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
@@ -280,17 +277,15 @@ impl CoreInner {
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, table.clone()));
 
-		// Set log_number if we rotated a WAL
-		if let Some(wal_num) = flushed_wal_number {
-			changeset.log_number = Some(wal_num + 1);
+		// Set log_number after WAL rotation
+		changeset.log_number = Some(flushed_wal_number + 1);
 
-			log::debug!(
-				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-				table_id,
-				wal_num + 1,
-				wal_num
-			);
-		}
+		log::debug!(
+			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			table_id,
+			flushed_wal_number + 1,
+			flushed_wal_number
+		);
 
 		// Step 6: Apply changeset atomically
 		let mut manifest = self.level_manifest.write()?;
@@ -316,29 +311,27 @@ impl CoreInner {
 
 		// Step 7: Async WAL cleanup using values we already have
 		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number earlier
-		if let (Some(dir), Some(wal_num)) = (wal_dir, flushed_wal_number) {
-			let min_wal_to_keep = wal_num + 1; // Same as changeset.log_number
+		let min_wal_to_keep = flushed_wal_number + 1; // Same as changeset.log_number
 
-			log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
+		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
 
-			tokio::spawn(async move {
-				match cleanup_old_segments(&dir, min_wal_to_keep) {
-					Ok(count) if count > 0 => {
-						log::info!(
-							"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-							count,
-							min_wal_to_keep
-						);
-					}
-					Ok(_) => {
-						log::debug!("No old WAL segments to clean up");
-					}
-					Err(e) => {
-						log::warn!("Failed to clean up old WAL segments: {}", e);
-					}
+		tokio::spawn(async move {
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+				Ok(count) if count > 0 => {
+					log::info!(
+						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+						count,
+						min_wal_to_keep
+					);
 				}
-			});
-		}
+				Ok(_) => {
+					log::debug!("No old WAL segments to clean up");
+				}
+				Err(e) => {
+					log::warn!("Failed to clean up old WAL segments: {}", e);
+				}
+			}
+		});
 
 		Ok(())
 	}
@@ -413,30 +406,25 @@ impl CoreInner {
 		changeset.new_tables.push((0, table.clone()));
 
 		// Determine which WAL was flushed and set log_number atomically
-		if let Some(ref wal) = self.wal {
-			let wal_that_was_flushed = match flushed_wal_number {
-				Some(num) => num,
-				None => {
-					// No explicit WAL provided, use current active WAL
-					// This happens during shutdown when no rotation occurred
-					let wal_guard = wal.read();
-					let current = wal_guard.get_active_log_number();
-					drop(wal_guard);
-					current
-				}
-			};
+		let wal_that_was_flushed = match flushed_wal_number {
+			Some(num) => num,
+			None => {
+				// No explicit WAL provided, use current active WAL
+				// This happens during shutdown when no rotation occurred
+				self.wal.read().get_active_log_number()
+			}
+		};
 
-			// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
-			// log_number indicates "all WALs with number < log_number have been flushed"
-			changeset.log_number = Some(wal_that_was_flushed + 1);
+		// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
+		// log_number indicates "all WALs with number < log_number have been flushed"
+		changeset.log_number = Some(wal_that_was_flushed + 1);
 
-			log::debug!(
-				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-				table_id,
-				wal_that_was_flushed + 1,
-				wal_that_was_flushed
-			);
-		}
+		log::debug!(
+			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			table_id,
+			wal_that_was_flushed + 1,
+			wal_that_was_flushed
+		);
 
 		// Step 4: Apply changeset and write to disk ATOMICALLY
 		// This is the critical section - both SST addition and log_number update happen together
@@ -689,14 +677,12 @@ impl CommitEnv for LsmCommitEnv {
 			}
 		}
 
-		// Write to WAL if present
-		if let Some(ref wal) = self.core.wal {
-			let enc_bytes = processed_batch.encode()?;
-			let mut wal_guard = wal.write();
-			wal_guard.append(&enc_bytes)?;
-			if sync {
-				wal_guard.sync()?;
-			}
+		// Write to WAL for durability
+		let enc_bytes = processed_batch.encode()?;
+		let mut wal_guard = self.core.wal.write();
+		wal_guard.append(&enc_bytes)?;
+		if sync {
+			wal_guard.sync()?;
 		}
 
 		Ok(processed_batch)
@@ -1030,35 +1016,32 @@ impl Core {
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		// NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may delete the active WAL file
-		if let Some(ref wal) = self.inner.wal {
-			let wal_log_number = wal.read().get_active_log_number();
-			log::info!("Closing WAL: active_log_number={}", wal_log_number);
+		let wal_log_number = self.inner.wal.read().get_active_log_number();
+		log::info!("Closing WAL: active_log_number={}", wal_log_number);
 
-			let mut wal_guard = wal.write();
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-			log::debug!("WAL #{:020} closed and synced", wal_log_number);
-		}
+		let mut wal_guard = self.inner.wal.write();
+		wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
+		log::debug!("WAL #{:020} closed and synced", wal_log_number);
+		drop(wal_guard);
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
 		// This happens AFTER closing the WAL to prevent deleting the active WAL file.
 		// When memtable flush sets log_number = current_wal + 1, cleanup would delete the
 		// active WAL if done before closing it.
-		if let Some(ref wal) = self.inner.wal {
-			let wal_dir = wal.read().get_dir_path().to_path_buf();
-			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
+		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
 
-			log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
+		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
-				}
-				Ok(_) => {
-					log::debug!("No obsolete WAL files to clean up");
-				}
-				Err(e) => {
-					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
-				}
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			Ok(count) if count > 0 => {
+				log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+			}
+			Ok(_) => {
+				log::debug!("No obsolete WAL files to clean up");
+			}
+			Err(e) => {
+				log::warn!("Failed to clean up WAL files during shutdown: {}", e);
 			}
 		}
 
@@ -1220,7 +1203,7 @@ impl Tree {
 
 		// Reopen the WAL from the restored directory
 		{
-			let mut wal_guard = self.core.inner.wal.as_ref().unwrap().write();
+			let mut wal_guard = self.core.inner.wal.write();
 			let wal_path = self.core.inner.opts.path.join("wal");
 			let new_wal = Wal::open(&wal_path, wal::Options::default())?;
 			*wal_guard = new_wal;
@@ -4463,8 +4446,7 @@ mod tests {
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 
-			let wal_num_after_reopen =
-				tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+			let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
 
 			// CRITICAL: WAL number should be SAME as before (appending to existing)
 			assert_eq!(
@@ -4477,8 +4459,7 @@ mod tests {
 			txn.set(b"key2", b"value2").unwrap();
 			txn.commit().await.unwrap();
 
-			let wal_num_after_write =
-				tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+			let wal_num_after_write = tree.core.inner.wal.read().get_active_log_number();
 
 			// Should still be same WAL
 			assert_eq!(
