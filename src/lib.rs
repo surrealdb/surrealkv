@@ -5,6 +5,7 @@ mod checkpoint;
 mod clock;
 mod commit;
 mod compaction;
+mod comparator;
 mod discard;
 mod error;
 mod iter;
@@ -27,12 +28,13 @@ mod test;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::{InternalKey, INTERNAL_KEY_TIMESTAMP_MAX};
+use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 
 use bytes::Bytes;
 use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
-use std::{borrow::Cow, cmp::Ordering, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -205,6 +207,13 @@ pub struct Options {
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
 	pub(crate) clock: Arc<dyn LogicalClock>,
+
+	// Shutdown configuration
+	/// If true, flush active memtable to SSTable during shutdown.
+	/// If false, skip flush for faster shutdown (unpersisted data will be lost if WAL disabled).
+	///
+	/// DEFAULT: false
+	pub flush_on_close: bool,
 }
 
 impl Default for Options {
@@ -233,6 +242,7 @@ impl Default for Options {
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
+			flush_on_close: true,
 		}
 	}
 }
@@ -336,6 +346,24 @@ impl Options {
 			// All values should go to VLog for versioned queries
 			self.vlog_value_threshold = 0;
 		}
+		self
+	}
+
+	/// Controls whether to flush the active memtable during database shutdown.
+	///
+	/// When enabled, ensures all in-memory data is persisted to SSTables before closing,
+	/// at the cost of slower shutdown. When disabled, allows faster shutdown but unpersisted
+	/// data in the active memtable will be lost if WAL is not enabled.
+	///
+	/// # Arguments
+	///
+	/// * `value` - If true, flush on close. If false, skip flush.
+	///
+	/// # Default
+	///
+	/// false (skip flush for faster shutdown)
+	pub const fn with_flush_on_close(mut self, value: bool) -> Self {
+		self.flush_on_close = value;
 		self
 	}
 
@@ -476,30 +504,6 @@ impl From<u8> for CompressionType {
 	}
 }
 
-/// A trait for comparing keys in a key-value store.
-///
-/// This trait defines methods for comparing keys, generating separator keys, generating successor keys,
-/// and retrieving the name of the comparator.
-pub trait Comparator: Send + Sync {
-	/// Compares two keys `a` and `b`.
-	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
-
-	/// Generates a separator key between two keys `from` and `to`.
-	///
-	/// This method should return a key that is greater than or equal to `from` and less than `to`.
-	/// It is used to optimize the storage layout by finding a midpoint key.
-	fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8>;
-
-	/// Generates the successor key of a given key.
-	///
-	/// This method should return a key that is lexicographically greater than the given key.
-	/// It is used to find the next key in the key space.
-	fn successor(&self, key: &[u8]) -> Vec<u8>;
-
-	/// Retrieves the name of the comparator.
-	fn name(&self) -> &str;
-}
-
 pub trait FilterPolicy: Send + Sync {
 	/// Return the name of this policy.  Note that if the filter encoding
 	/// changes in an incompatible way, the name returned by this method
@@ -555,248 +559,4 @@ pub(crate) trait Iterator {
 	/// the iterator.
 	/// REQUIRES: `valid()`
 	fn value(&self) -> Value;
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct BytewiseComparator {}
-
-impl BytewiseComparator {}
-
-impl Comparator for BytewiseComparator {
-	#[inline]
-	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		a.cmp(b)
-	}
-
-	#[inline]
-	fn name(&self) -> &'static str {
-		"leveldb.BytewiseComparator"
-	}
-
-	#[inline]
-	/// Generates a separator key between two byte slices `a` and `b`.
-	///
-	/// This function uses a three-tier approach like `LevelDB`:
-	/// 1. Find first differing byte and try to increment
-	/// 2. If that fails, work backwards from end of `a` trying to increment non-0xff bytes
-	/// 3. Final fallback: append a 0 byte to make it longer than `a`
-	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
-		if a == b {
-			return a.to_vec();
-		}
-
-		let min_size = std::cmp::min(a.len(), b.len());
-		let mut diff_index = 0;
-
-		// Find first differing position
-		while diff_index < min_size && a[diff_index] == b[diff_index] {
-			diff_index += 1;
-		}
-
-		// Primary: Try to find a short separator at first difference
-		while diff_index < min_size {
-			let diff = a[diff_index];
-			if diff < 0xff && diff + 1 < b[diff_index] {
-				let mut sep = Vec::from(&a[0..=diff_index]);
-				sep[diff_index] += 1;
-				debug_assert!(self.compare(&sep, b) == Ordering::Less);
-				return sep;
-			}
-			diff_index += 1;
-		}
-
-		// Secondary: Work backwards from end of `a`, try incrementing non-0xff bytes
-		let mut sep = Vec::with_capacity(a.len() + 1);
-		sep.extend_from_slice(a);
-
-		if !a.is_empty() {
-			let mut i = a.len() - 1;
-			while i > 0 && sep[i] == 0xff {
-				i -= 1;
-			}
-			if sep[i] < 0xff {
-				sep[i] += 1;
-				if self.compare(&sep, b) == Ordering::Less {
-					return sep;
-				}
-				sep[i] -= 1; // revert the change
-			}
-		}
-
-		// Final backup: Append a 0 byte to make it longer than `a`
-		sep.extend_from_slice(&[0]);
-		sep
-	}
-
-	#[inline]
-	/// Generates the successor key of a given byte slice `key`.
-	///
-	/// This function finds the first non-0xff byte, increments it, and truncates the result.
-	/// If all bytes are 0xff, it appends a 0xff byte.
-	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let mut result = key.to_vec();
-		for i in 0..key.len() {
-			if key[i] != 0xff {
-				result[i] += 1;
-				result.resize(i + 1, 0); // truncate and zero-fill
-				return result;
-			}
-		}
-		// Rare path: all bytes are 0xff
-		result.push(0xff);
-		result
-	}
-}
-
-#[derive(Clone)]
-pub(crate) struct InternalKeyComparator {
-	user_comparator: Arc<dyn Comparator>,
-}
-
-impl InternalKeyComparator {
-	pub fn new(user_comparator: Arc<dyn Comparator>) -> Self {
-		Self {
-			user_comparator,
-		}
-	}
-}
-
-impl Comparator for InternalKeyComparator {
-	fn name(&self) -> &'static str {
-		"surrealkv.InternalKeyComparator"
-	}
-
-	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-		key_a.cmp(&key_b)
-	}
-
-	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
-		if a == b {
-			return a.to_vec();
-		}
-
-		// Decode keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-
-		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
-			!= Ordering::Equal
-		{
-			let sep =
-				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
-
-			// Use MAX_SEQUENCE_NUMBER when separator is shorter than original
-			if sep.len() < key_a.user_key.len()
-				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
-			{
-				let result = InternalKey::new(
-					Bytes::from(sep),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					key_a.kind(),
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				);
-				return result.encode();
-			}
-
-			// Otherwise use original sequence number
-			let result =
-				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
-			return result.encode();
-		}
-
-		// User keys are the same, just return a
-		a.to_vec()
-	}
-
-	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = InternalKey::decode(key);
-		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
-
-		// Create a new internal key with the successor user key and original sequence/kind
-		let result = InternalKey::new(
-			Bytes::from(user_key_succ),
-			internal_key.seq_num(),
-			internal_key.kind(),
-			internal_key.timestamp,
-		);
-		result.encode()
-	}
-}
-
-/// A comparator that compares internal keys first by user key, then by timestamp
-/// This is used for versioned queries where we want to order by user key and timestamp
-#[derive(Clone)]
-pub(crate) struct TimestampComparator {
-	user_comparator: Arc<dyn Comparator>,
-}
-
-impl Comparator for TimestampComparator {
-	fn name(&self) -> &'static str {
-		"surrealkv.TimestampComparator"
-	}
-
-	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-		// Use the timestamp-based comparison method
-		key_a.cmp_by_timestamp(&key_b)
-	}
-
-	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
-		if a == b {
-			return a.to_vec();
-		}
-
-		// Decode keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-
-		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
-			!= Ordering::Equal
-		{
-			let sep =
-				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
-
-			// Use MAX_TIMESTAMP when separator is shorter than original
-			if sep.len() < key_a.user_key.len()
-				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
-			{
-				let result = InternalKey::new(
-					Bytes::from(sep),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					key_a.kind(),
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				);
-				return result.encode();
-			}
-
-			// Otherwise use original timestamp
-			let result =
-				InternalKey::new(Bytes::from(sep), key_a.seq_num(), key_a.kind(), key_a.timestamp);
-			return result.encode();
-		}
-
-		// Can't create a meaningful separator, return a
-		a.to_vec()
-	}
-
-	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = InternalKey::decode(key);
-		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
-
-		// Create a new internal key with the successor user key and original timestamp/kind
-		let result = InternalKey::new(
-			Bytes::from(user_key_succ),
-			internal_key.seq_num(),
-			internal_key.kind(),
-			internal_key.timestamp,
-		);
-		result.encode()
-	}
 }

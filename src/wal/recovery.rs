@@ -240,7 +240,6 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
-	let _repair_path = wal_dir.join(format!("{segment_id:020}.wal.repair"));
 
 	// Verify the corrupted segment exists
 	if !segment_path.exists() {
@@ -279,7 +278,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			}
 			Err(Error::Corruption(err)) => {
 				// Stop at the first corruption
-				log::info!(
+				log::error!(
                     "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
                 );
 				break;

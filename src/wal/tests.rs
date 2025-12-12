@@ -138,7 +138,7 @@ fn test_wal_replay_all_segments() {
 	// Create a memtable for recovery
 	let memtable = Arc::new(MemTable::default());
 
-	// Replay WAL - should replay ALL segments, not just the latest
+	// Replay WAL - should only replay the latest segment
 	let (sequence_number_opt, corruption_info) = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
