@@ -790,35 +790,37 @@ impl Core {
 					repair_corrupted_wal_segment(wal_path, corrupted_segment_id)
 				{
 					log::error!("Failed to repair WAL segment: {repair_err}");
-					// Fail fast - cannot continue with corrupted WAL
 					return Err(Error::Other(format!(
                         "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
                     )));
 				}
 
-				// After repair, try to replay again to get any additional data
-				// Create a fresh memtable for the retry
+				// After repair, replay again to recover data from ALL segments.
+				// The initial replay stopped at the corruption point and didn't process subsequent segments.
 				let retry_memtable = Arc::new(MemTable::default());
 				match replay_wal(wal_path, &retry_memtable, min_wal_number) {
 					Ok((retry_seq_num, None)) => {
-						// Successful replay after repair, use the retry memtable
+						// Successful replay after repair
+						log::info!(
+							"WAL replay after repair succeeded: {} entries recovered",
+							retry_memtable.iter().count()
+						);
 						if !retry_memtable.is_empty() {
 							set_recovered_memtable(retry_memtable)?;
 						}
-						// CRITICAL: Return early here to avoid overwriting with original partial data
 						return Ok(retry_seq_num);
 					}
 					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
-						// WAL is still corrupted after repair - this is a serious problem
+						// WAL still corrupted after repair - fail
 						return Err(Error::Other(format!(
-                            "{context} failed: WAL segment {seg_id} still corrupted after repair at offset {offset}. Repair was incomplete."
+                            "{context} failed: WAL segment {seg_id} still corrupted at offset {offset} after repair"
                         )));
 					}
 					Err(retry_err) => {
-						// Replay failed after successful repair - also a serious problem
+						// Replay failed after repair - fail
 						return Err(Error::Other(format!(
-                            "{context} failed: WAL replay failed after successful repair. {retry_err}"
-                        )));
+							"{context} failed: WAL replay failed after repair. {retry_err}"
+						)));
 					}
 				}
 			}
