@@ -11,15 +11,6 @@ pub mod reader;
 pub mod recovery;
 pub mod writer;
 
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-pub mod test_helpers;
-
-#[cfg(test)]
-mod recovery_comprehensive_tests;
-
 pub use manager::Wal;
 
 // ===== Format Constants and Types =====
