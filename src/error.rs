@@ -44,6 +44,12 @@ pub enum Error {
 	InvalidArgument(String),
 	InvalidTag(String),
 	BPlusTree(String), // B+ tree specific errors
+	/// WAL corruption detected during recovery, includes location for repair
+	WalCorruption {
+		segment_id: usize,
+		offset: usize,
+		message: String,
+	},
 }
 
 // Implementation of Display trait for Error
@@ -87,13 +93,28 @@ impl fmt::Display for Error {
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
-
+            Self::WalCorruption { segment_id, offset, message } => write!(
+                f,
+                "WAL corruption in segment {} at offset {}: {}",
+                segment_id, offset, message
+            ),
         }
 	}
 }
 
 // Implementation of Error trait for Error
 impl std::error::Error for Error {}
+
+impl Error {
+	/// Creates a WalCorruption error with the given segment ID, offset, and message
+	pub fn wal_corruption(segment_id: usize, offset: usize, message: impl Into<String>) -> Self {
+		Self::WalCorruption {
+			segment_id,
+			offset,
+			message: message.into(),
+		}
+	}
+}
 
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {

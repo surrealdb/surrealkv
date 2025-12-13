@@ -110,7 +110,7 @@ pub(crate) struct CoreInner {
 	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
-	pub(crate) wal: Option<parking_lot::RwLock<Wal>>,
+	pub(crate) wal: parking_lot::RwLock<Wal>,
 
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
@@ -146,7 +146,6 @@ impl CoreInner {
 		let wal_instance =
 			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
-		let wal = Some(wal_instance);
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		// Initialize versioned index if versioned queries are enabled
@@ -176,7 +175,7 @@ impl CoreInner {
 			snapshot_counter: SnapshotCounter::default(),
 			oracle: Arc::new(oracle),
 			vlog,
-			wal: wal.map(parking_lot::RwLock::new),
+			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 		})
@@ -188,17 +187,15 @@ impl CoreInner {
 	///
 	/// This is called when the active memtable exceeds the configured size threshold.
 	/// The operation proceeds in stages:
-	/// 1. Check if memtable needs flushing
-	/// 2. Rotate WAL FIRST (creates new WAL for subsequent writes)
-	/// 3. Flush memtable to SST and update manifest (centralized logic)
-	/// 4. Asynchronously clean up old WAL segments
-	///
-	///
-	/// WAL rotation happens BEFORE flush to ensure new writes go to the new WAL segment.
-	/// This is critical for crash recovery - the new WAL will be active after restart.
+	/// 1. Acquire memtable write lock and check if flushing is needed
+	/// 2. If flushing, rotate WAL while STILL holding memtable lock
+	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
+	/// 4. Release locks, then flush memtable to SST and update manifest
+	/// 5. Asynchronously clean up old WAL segments
 	fn make_room_for_write(&self, force: bool) -> Result<()> {
-		// Step 1: Check if active memtable needs flushing
-		let active_memtable = self.active_memtable.read()?;
+		// Step 1: Acquire WRITE lock upfront to prevent race conditions
+		// We need the write lock before checking/rotating/swapping to ensure atomicity
+		let mut active_memtable = self.active_memtable.write()?;
 		let size = active_memtable.size();
 
 		if active_memtable.is_empty() {
@@ -220,15 +217,14 @@ impl CoreInner {
 		}
 
 		log::debug!("make_room_for_write: flushing memtable size={}", size);
-		drop(active_memtable);
 
-		// Step 2: Rotate WAL BEFORE flush
-		// This creates a new WAL file for subsequent writes
-		// New writes will go to the new WAL while we flush the old memtable
-		// CRITICAL: Save the old WAL number to correctly mark it as flushed
-		let flushed_wal_number = if let Some(ref wal) = self.wal {
-			let mut wal_guard = wal.write();
+		// Step 2: Rotate WAL while STILL holding memtable write lock
+		// We must rotate WAL and swap memtable atomically
+		// to prevent the race condition described above
+		let (flushed_wal_number, wal_dir) = {
+			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
+			let dir = wal_guard.get_dir_path().to_path_buf();
 			wal_guard.rotate().map_err(|e| {
 				Error::Other(format!("Failed to rotate WAL before memtable flush: {}", e))
 			})?;
@@ -240,38 +236,73 @@ impl CoreInner {
 				old_log_number,
 				new_log_number
 			);
-			Some(old_log_number)
-		} else {
-			None
+			(old_log_number, dir)
 		};
 
-		// Step 3: Use centralized flush logic, passing the WAL number we're flushing
-		// This ensures manifest marks the correct WAL as flushed (not the new active one)
-		let table = self.flush_memtable_and_update_manifest(flushed_wal_number)?;
+		// Step 3: Swap memtable while STILL holding write lock
+		// Take the memtable data that we will flush
+		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
-		// Step 3.5: Handle case where memtable was empty (concurrent flush)
-		// CRITICAL: Even if memtable was empty, we MUST update log_number to mark
-		// the rotated WAL as processed, otherwise it won't be cleaned up
-		if table.is_none() {
-			// Memtable was empty after rotation (concurrent flush by another thread)
-			log::debug!("Memtable was empty after WAL rotation, updating log_number only");
+		// Get table ID and track immutable memtable
+		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let table_id = self.level_manifest.read()?.next_table_id();
+		immutable_memtables.add(table_id, flushed_memtable.clone());
 
-			// Update log_number to mark the rotated WAL as flushed (even though empty)
-			// This is essential for WAL cleanup to work correctly
-			if let Some(wal_num) = flushed_wal_number {
-				self.update_manifest_log_number(wal_num)?;
-			}
-		} else {
-			log::debug!("Memtable flush completed successfully");
-		}
+		// Now we can release locks - the memtable is safely in immutable_memtables
+		// and no other thread can race us on this specific data
+		drop(active_memtable);
+		drop(immutable_memtables);
 
-		// Step 4: Async WAL cleanup based on manifest log_number
-		// Only WAL segments older than log_number can be safely deleted
-		let wal_guard = self.wal.as_ref().unwrap().read();
-		let wal_dir = wal_guard.get_dir_path().to_path_buf();
-		drop(wal_guard);
+		// Step 4: Flush the memtable to SST (slow I/O operation, no locks held)
+		let table = flushed_memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
+		})?;
 
-		let min_wal_to_keep = self.level_manifest.read()?.get_log_number();
+		log::debug!(
+			"Created SST table_id={}, file_size={}",
+			table.id,
+			table.meta.properties.file_size
+		);
+
+		// Step 5: Prepare atomic changeset with both SST and log_number
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, table.clone()));
+
+		// Set log_number after WAL rotation
+		changeset.log_number = Some(flushed_wal_number + 1);
+
+		log::debug!(
+			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			table_id,
+			flushed_wal_number + 1,
+			flushed_wal_number
+		);
+
+		// Step 6: Apply changeset atomically
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+
+		manifest.apply_changeset(&changeset)?;
+		write_manifest_to_disk(&manifest).map_err(|e| {
+			Error::Other(format!(
+				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
+				table_id, changeset.log_number, e
+			))
+		})?;
+
+		memtable_lock.remove(table_id);
+		drop(manifest);
+		drop(memtable_lock);
+
+		log::info!(
+			"Memtable flush completed: table_id={}, log_number={:?}",
+			table_id,
+			changeset.log_number
+		);
+
+		// Step 7: Async WAL cleanup using values we already have
+		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number earlier
+		let min_wal_to_keep = flushed_wal_number + 1; // Same as changeset.log_number
 
 		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
 
@@ -366,30 +397,25 @@ impl CoreInner {
 		changeset.new_tables.push((0, table.clone()));
 
 		// Determine which WAL was flushed and set log_number atomically
-		if let Some(ref wal) = self.wal {
-			let wal_that_was_flushed = match flushed_wal_number {
-				Some(num) => num,
-				None => {
-					// No explicit WAL provided, use current active WAL
-					// This happens during shutdown when no rotation occurred
-					let wal_guard = wal.read();
-					let current = wal_guard.get_active_log_number();
-					drop(wal_guard);
-					current
-				}
-			};
+		let wal_that_was_flushed = match flushed_wal_number {
+			Some(num) => num,
+			None => {
+				// No explicit WAL provided, use current active WAL
+				// This happens during shutdown when no rotation occurred
+				self.wal.read().get_active_log_number()
+			}
+		};
 
-			// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
-			// log_number indicates "all WALs with number < log_number have been flushed"
-			changeset.log_number = Some(wal_that_was_flushed + 1);
+		// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
+		// log_number indicates "all WALs with number < log_number have been flushed"
+		changeset.log_number = Some(wal_that_was_flushed + 1);
 
-			log::debug!(
-				"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-				table_id,
-				wal_that_was_flushed + 1,
-				wal_that_was_flushed
-			);
-		}
+		log::debug!(
+			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			table_id,
+			wal_that_was_flushed + 1,
+			wal_that_was_flushed
+		);
 
 		// Step 4: Apply changeset and write to disk ATOMICALLY
 		// This is the critical section - both SST addition and log_number update happen together
@@ -415,43 +441,6 @@ impl CoreInner {
 		);
 
 		Ok(Some(table))
-	}
-
-	/// Updates the manifest's log_number to mark a WAL as flushed.
-	///
-	/// This is a helper function to avoid code duplication when updating log_number
-	/// without adding new SSTables (e.g., when memtable is empty after concurrent flush).
-	///
-	/// # Arguments
-	///
-	/// * `flushed_wal_number` - The WAL number that was flushed (log_number will be set to this + 1)
-	///
-	/// # Returns
-	///
-	/// Ok(()) if successful, Error otherwise
-	fn update_manifest_log_number(&self, flushed_wal_number: u64) -> Result<()> {
-		let changeset = ManifestChangeSet {
-			log_number: Some(flushed_wal_number + 1),
-			..Default::default()
-		};
-
-		let mut manifest = self.level_manifest.write()?;
-		manifest.apply_changeset(&changeset)?;
-		write_manifest_to_disk(&manifest).map_err(|e| {
-			Error::Other(format!(
-				"Failed to update manifest log_number={}: {}",
-				flushed_wal_number + 1,
-				e
-			))
-		})?;
-
-		log::debug!(
-			"Updated log_number to {} (WAL {:020} marked as flushed)",
-			flushed_wal_number + 1,
-			flushed_wal_number
-		);
-
-		Ok(())
 	}
 
 	/// Cleans up orphaned SST files not referenced in manifest
@@ -679,14 +668,12 @@ impl CommitEnv for LsmCommitEnv {
 			}
 		}
 
-		// Write to WAL if present
-		if let Some(ref wal) = self.core.wal {
-			let enc_bytes = processed_batch.encode()?;
-			let mut wal_guard = wal.write();
-			wal_guard.append(&enc_bytes)?;
-			if sync {
-				wal_guard.sync()?;
-			}
+		// Write to WAL for durability
+		let enc_bytes = processed_batch.encode()?;
+		let mut wal_guard = self.core.wal.write();
+		wal_guard.append(&enc_bytes)?;
+		if sync {
+			wal_guard.sync()?;
 		}
 
 		Ok(processed_batch)
@@ -771,56 +758,67 @@ impl Core {
 		let recovered_memtable = Arc::new(MemTable::default());
 
 		// Replay WAL with automatic repair on corruption
-		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number)? {
-			(Some(seq_num), None) => {
-				// WAL was replayed successfully, no corruption
-				Some(seq_num)
+		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
+			Ok(seq_num_opt) => {
+				// WAL was replayed successfully (or was empty/skipped)
+				seq_num_opt
 			}
-			(None, None) => {
-				// WAL was skipped or empty
-				None
-			}
-			(_seq_num, Some((corrupted_segment_id, last_valid_offset))) => {
+			Err(Error::WalCorruption {
+				segment_id,
+				offset,
+				message,
+			}) => {
 				log::warn!(
-                    "Detected WAL corruption in segment {corrupted_segment_id} at offset {last_valid_offset}. Attempting repair..."
-                );
+					"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
+					segment_id,
+					offset,
+					message
+				);
 
 				// Attempt to repair the corrupted segment
-				if let Err(repair_err) =
-					repair_corrupted_wal_segment(wal_path, corrupted_segment_id)
-				{
+				if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id) {
 					log::error!("Failed to repair WAL segment: {repair_err}");
-					// Fail fast - cannot continue with corrupted WAL
 					return Err(Error::Other(format!(
-                        "{context} failed: WAL segment {corrupted_segment_id} is corrupted and could not be repaired. {repair_err}"
-                    )));
+						"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
+					)));
 				}
 
-				// After repair, try to replay again to get any additional data
-				// Create a fresh memtable for the retry
+				// After repair, replay again to recover data from ALL segments.
+				// The initial replay stopped at the corruption point and didn't process subsequent segments.
 				let retry_memtable = Arc::new(MemTable::default());
 				match replay_wal(wal_path, &retry_memtable, min_wal_number) {
-					Ok((retry_seq_num, None)) => {
-						// Successful replay after repair, use the retry memtable
+					Ok(retry_seq_num) => {
+						// Successful replay after repair
+						log::info!(
+							"WAL replay after repair succeeded: {} entries recovered",
+							retry_memtable.iter().count()
+						);
 						if !retry_memtable.is_empty() {
 							set_recovered_memtable(retry_memtable)?;
 						}
-						// CRITICAL: Return early here to avoid overwriting with original partial data
 						return Ok(retry_seq_num);
 					}
-					Ok((_retry_seq_num, Some((seg_id, offset)))) => {
-						// WAL is still corrupted after repair - this is a serious problem
+					Err(Error::WalCorruption {
+						segment_id: seg_id,
+						offset: off,
+						message,
+					}) => {
+						// WAL still corrupted after repair - fail
 						return Err(Error::Other(format!(
-                            "{context} failed: WAL segment {seg_id} still corrupted after repair at offset {offset}. Repair was incomplete."
-                        )));
+							"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
+						)));
 					}
 					Err(retry_err) => {
-						// Replay failed after successful repair - also a serious problem
+						// Replay failed after repair - fail
 						return Err(Error::Other(format!(
-                            "{context} failed: WAL replay failed after successful repair. {retry_err}"
-                        )));
+							"{context} failed: WAL replay failed after repair. {retry_err}"
+						)));
 					}
 				}
+			}
+			Err(e) => {
+				// Other errors (IO, etc.) - propagate
+				return Err(e);
 			}
 		};
 
@@ -1009,35 +1007,32 @@ impl Core {
 		// Step 4: Close the WAL to ensure all data is flushed
 		// This is safe now because all background tasks that could write to WAL are stopped
 		// NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may delete the active WAL file
-		if let Some(ref wal) = self.inner.wal {
-			let wal_log_number = wal.read().get_active_log_number();
-			log::info!("Closing WAL: active_log_number={}", wal_log_number);
+		let wal_log_number = self.inner.wal.read().get_active_log_number();
+		log::info!("Closing WAL: active_log_number={}", wal_log_number);
 
-			let mut wal_guard = wal.write();
-			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-			log::debug!("WAL #{:020} closed and synced", wal_log_number);
-		}
+		let mut wal_guard = self.inner.wal.write();
+		wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
+		log::debug!("WAL #{:020} closed and synced", wal_log_number);
+		drop(wal_guard);
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
 		// This happens AFTER closing the WAL to prevent deleting the active WAL file.
 		// When memtable flush sets log_number = current_wal + 1, cleanup would delete the
 		// active WAL if done before closing it.
-		if let Some(ref wal) = self.inner.wal {
-			let wal_dir = wal.read().get_dir_path().to_path_buf();
-			let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
+		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
 
-			log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
+		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
-				}
-				Ok(_) => {
-					log::debug!("No obsolete WAL files to clean up");
-				}
-				Err(e) => {
-					log::warn!("Failed to clean up WAL files during shutdown: {}", e);
-				}
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			Ok(count) if count > 0 => {
+				log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+			}
+			Ok(_) => {
+				log::debug!("No obsolete WAL files to clean up");
+			}
+			Err(e) => {
+				log::warn!("Failed to clean up WAL files during shutdown: {}", e);
 			}
 		}
 
@@ -1199,7 +1194,7 @@ impl Tree {
 
 		// Reopen the WAL from the restored directory
 		{
-			let mut wal_guard = self.core.inner.wal.as_ref().unwrap().write();
+			let mut wal_guard = self.core.inner.wal.write();
 			let wal_path = self.core.inner.opts.path.join("wal");
 			let new_wal = Wal::open(&wal_path, wal::Options::default())?;
 			*wal_guard = new_wal;
@@ -4442,8 +4437,7 @@ mod tests {
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 
-			let wal_num_after_reopen =
-				tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+			let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
 
 			// CRITICAL: WAL number should be SAME as before (appending to existing)
 			assert_eq!(
@@ -4456,8 +4450,7 @@ mod tests {
 			txn.set(b"key2", b"value2").unwrap();
 			txn.commit().await.unwrap();
 
-			let wal_num_after_write =
-				tree.core.inner.wal.as_ref().unwrap().read().get_active_log_number();
+			let wal_num_after_write = tree.core.inner.wal.read().get_active_log_number();
 
 			// Should still be same WAL
 			assert_eq!(

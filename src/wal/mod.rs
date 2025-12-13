@@ -11,10 +11,10 @@ pub mod reader;
 pub mod recovery;
 pub mod writer;
 
+pub use manager::Wal;
+
 #[cfg(test)]
 mod tests;
-
-pub use manager::Wal;
 
 // ===== Format Constants and Types =====
 

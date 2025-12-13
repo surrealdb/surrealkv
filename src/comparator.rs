@@ -33,8 +33,6 @@ pub trait Comparator: Send + Sync {
 }
 
 /// A bytewise comparator that compares keys lexicographically.
-///
-/// This implementation matches RocksDB's `BytewiseComparator` exactly.
 #[derive(Default, Clone, Copy)]
 pub struct BytewiseComparator {}
 
