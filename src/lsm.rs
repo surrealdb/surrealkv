@@ -1357,15 +1357,9 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the block cache capacity.
+	/// Sets the unified block cache capacity (includes data blocks, index blocks, and VLog values).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.opts = self.opts.with_block_cache_capacity(capacity_bytes);
-		self
-	}
-
-	/// Sets the VLog cache capacity.
-	pub fn with_vlog_cache_capacity(mut self, capacity_bytes: u64) -> Self {
-		self.opts = self.opts.with_vlog_cache_capacity(capacity_bytes);
 		self
 	}
 

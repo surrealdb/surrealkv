@@ -9,7 +9,7 @@ use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
 use crate::{
-	cache::{self, Item},
+	cache,
 	error::{Error, Result},
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter},
@@ -721,11 +721,7 @@ impl Table {
 		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;
 		let b = Arc::new(b);
 
-		self.opts.block_cache.insert(
-			self.cache_id,
-			location.offset() as u64,
-			Item::Data(b.clone()),
-		);
+		self.opts.block_cache.insert_data_block(self.cache_id, location.offset() as u64, b.clone());
 
 		Ok(b)
 	}

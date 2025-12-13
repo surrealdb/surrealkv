@@ -9,7 +9,6 @@ use std::{
 	},
 };
 
-use crate::cache::VLogCache;
 use crate::{batch::Batch, discard::DiscardStats, Value};
 use crate::{bplustree::tree::DiskBPlusTree, Tree, TreeBuilder};
 use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
@@ -540,9 +539,6 @@ pub(crate) struct VLog {
 	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
 	pub(crate) delete_list: Arc<DeleteList>,
 
-	/// Dedicated cache for VLog values to avoid repeated disk reads
-	cache: Arc<VLogCache>,
-
 	/// Options for VLog configuration
 	opts: Arc<Options>,
 
@@ -579,7 +575,6 @@ impl VLog {
 			gc_in_progress: AtomicBool::new(false),
 			discard_stats: Mutex::new(DiscardStats::new(opts.discard_stats_dir())?),
 			delete_list,
-			cache: opts.vlog_cache.clone(),
 			opts,
 			versioned_index,
 		};
@@ -755,8 +750,9 @@ impl VLog {
 
 	/// Retrieves a value using a ValuePointer
 	pub(crate) fn get(&self, pointer: &ValuePointer) -> Result<Value> {
-		// Check cache first
-		if let Some(cached_value) = self.cache.get(pointer.file_id, pointer.offset) {
+		// Check unified block cache first
+		if let Some(cached_value) = self.opts.block_cache.get_vlog(pointer.file_id, pointer.offset)
+		{
 			return Ok(cached_value);
 		}
 
@@ -829,8 +825,8 @@ impl VLog {
 		let entry_data = Bytes::from(entry_data_vec);
 		let value_bytes = entry_data.slice(value_start..crc_start);
 
-		// Cache the value for future reads
-		self.cache.insert(pointer.file_id, pointer.offset, value_bytes.clone());
+		// Cache the value in unified block cache for future reads
+		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)
 	}
@@ -1524,7 +1520,6 @@ mod tests {
 
 		let mut opts = opts.unwrap_or(Options {
 			vlog_checksum_verification: VLogChecksumLevel::Full,
-			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		});
 
@@ -1664,7 +1659,7 @@ mod tests {
 		assert_eq!(retrieved1, retrieved2);
 
 		// Verify that the cache contains the value
-		let cached_value = vlog.cache.get(pointer.file_id, pointer.offset);
+		let cached_value = vlog.opts.block_cache.get_vlog(pointer.file_id, pointer.offset);
 		assert!(cached_value.is_some());
 		assert_eq!(cached_value.unwrap(), Bytes::from(value));
 	}
@@ -1674,7 +1669,6 @@ mod tests {
 		let opts = Options {
 			vlog_max_file_size: 1024, // Small file size to force multiple files
 			vlog_checksum_verification: VLogChecksumLevel::Full,
-			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
 		// Create initial VLog and add data to create multiple files
@@ -2026,7 +2020,6 @@ mod tests {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
-			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
 
@@ -2169,7 +2162,6 @@ mod tests {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 800,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
-			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		};
 
@@ -2319,7 +2311,6 @@ mod tests {
 			path: temp_dir.path().to_path_buf(),
 			vlog_max_file_size: 2048,
 			vlog_checksum_verification: VLogChecksumLevel::Full,
-			vlog_cache: Arc::new(VLogCache::with_capacity_bytes(1024 * 1024)),
 			..Default::default()
 		});
 		std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();

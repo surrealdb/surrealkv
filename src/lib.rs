@@ -181,8 +181,7 @@ pub struct Options {
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
 	pub compression: CompressionType,
-	block_cache: Arc<cache::BlockCache>,
-	vlog_cache: Arc<cache::VLogCache>,
+	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
 	pub max_memtable_size: usize,
@@ -228,8 +227,7 @@ impl Default for Options {
 			comparator: Arc::new(crate::BytewiseComparator {}),
 			compression: CompressionType::None,
 			filter_policy: Some(Arc::new(bf)),
-			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)),
-			vlog_cache: Arc::new(cache::VLogCache::with_capacity_bytes(1 << 20)),
+			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
 			path: PathBuf::from(""),
 			level_count: 6,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
@@ -292,14 +290,9 @@ impl Options {
 		self
 	}
 
-	// Method to set block_cache capacity
+	/// Sets the unified block cache capacity (includes data blocks, index blocks, and VLog values)
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
-		self
-	}
-
-	pub fn with_vlog_cache_capacity(mut self, capacity_bytes: u64) -> Self {
-		self.vlog_cache = Arc::new(cache::VLogCache::with_capacity_bytes(capacity_bytes));
 		self
 	}
 
