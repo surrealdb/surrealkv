@@ -151,7 +151,7 @@ impl Snapshot {
 
 		Ok(IterState {
 			active: active.clone(),
-			immutable: immutable.iter().map(|(_, mt)| mt.clone()).collect(),
+			immutable: immutable.iter().map(|entry| entry.memtable.clone()).collect(),
 			levels: manifest.levels.clone(),
 		})
 	}
@@ -222,7 +222,8 @@ impl Snapshot {
 		let memtable_lock = self.core.immutable_memtables.read()?;
 
 		// Check the immutable memtables for the key
-		for (_, memtable) in memtable_lock.iter().rev() {
+		for entry in memtable_lock.iter().rev() {
+			let memtable = &entry.memtable;
 			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None); // Key is a tombstone, return None
