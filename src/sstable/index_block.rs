@@ -4,7 +4,6 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::{
-	cache::Item,
 	error::{Error, Result},
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockWriter},
@@ -205,7 +204,7 @@ impl TopLevelIndex {
 		let block_data =
 			read_table_block(self.opts.clone(), self.file.clone(), &block_handle.handle)?;
 		let block = Arc::new(block_data);
-		self.opts.block_cache.insert(self.id, block_handle.offset(), Item::Index(block.clone()));
+		self.opts.block_cache.insert_index_block(self.id, block_handle.offset(), block.clone());
 
 		Ok(block)
 	}
