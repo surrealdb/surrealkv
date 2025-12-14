@@ -1194,9 +1194,11 @@ impl Tree {
 
 		// Reopen the WAL from the restored directory
 		{
+			let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
 			let mut wal_guard = self.core.inner.wal.write();
 			let wal_path = self.core.inner.opts.path.join("wal");
-			let new_wal = Wal::open(&wal_path, wal::Options::default())?;
+			let new_wal =
+				Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 			*wal_guard = new_wal;
 		}
 

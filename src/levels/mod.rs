@@ -143,17 +143,6 @@ impl LevelManifest {
 		Ok(manifest)
 	}
 
-	pub(crate) fn lsn(&self) -> u64 {
-		let level0 = self.levels.get_levels().first();
-		if let Some(level) = level0 {
-			if !level.tables.is_empty() {
-				let first_table = level.tables.first().unwrap();
-				return first_table.meta.largest_seq_num;
-			}
-		}
-		0
-	}
-
 	/// Returns the minimum WAL number that contains unflushed data
 	pub(crate) fn get_log_number(&self) -> u64 {
 		self.log_number
@@ -256,6 +245,21 @@ impl LevelManifest {
 			total_tables,
 			levels_vec.len()
 		);
+
+		// Validate last_sequence matches the maximum sequence number across all tables
+		let computed_max_seq = levels_vec
+			.iter()
+			.flat_map(|level| level.tables.iter())
+			.map(|table| table.meta.largest_seq_num)
+			.max()
+			.unwrap_or(0);
+
+		if computed_max_seq != last_sequence {
+			return Err(Error::LoadManifestFail(format!(
+				"Manifest last_sequence mismatch: stored={}, computed from tables={}",
+				last_sequence, computed_max_seq
+			)));
+		}
 
 		Ok(Self {
 			path: manifest_path.as_ref().to_path_buf(),
@@ -577,29 +581,20 @@ mod tests {
 		let table2 =
 			create_test_table(table_id2, 200, opts.clone()).expect("Failed to create table 2");
 
-		// Add tables to level 0
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table1.clone());
-			level0.insert(table2.clone());
-		}
-
 		// Create a table for level 1
 		let table_id3 = 3;
 		let table3 =
 			create_test_table(table_id3, 300, opts.clone()).expect("Failed to create table 3");
 
-		// Add table to level 1
-		{
-			let level1 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[1]);
-			level1.insert_sorted_by_key(table3.clone());
-		}
-
 		let expected_next_id = 100;
 		manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
 
-		// Create changeset for manifest field updates
 		let changeset = ManifestChangeSet {
+			new_tables: vec![
+				(0, table1.clone()), // Level 0
+				(0, table2.clone()), // Level 0
+				(1, table3.clone()), // Level 1
+			],
 			new_snapshots: vec![
 				SnapshotInfo {
 					seq_num: 10,
@@ -621,6 +616,9 @@ mod tests {
 
 		// Apply changeset to manifest
 		manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
+
+		// Verify last_sequence was updated correctly (table3 has largest_seq_num = 300)
+		assert_eq!(manifest.get_last_sequence(), 300, "last_sequence should be 300");
 
 		// Persist the manifest with our custom next_table_id
 		write_manifest_to_disk(&manifest).expect("Failed to write to disk");
@@ -937,44 +935,59 @@ mod tests {
 		// Create a new manifest
 		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
-		// Test 1: Empty L0 should return LSN of 0
-		assert_eq!(manifest.lsn(), 0, "Empty L0 should return LSN of 0");
+		// Test 1: Empty manifest should have last_sequence of 0
+		assert_eq!(
+			manifest.get_last_sequence(),
+			0,
+			"Empty manifest should return last_sequence of 0"
+		);
 
-		// Test 2: Single table in L0
+		// Test 2: Add single table via changeset
 		// Create table with sequence numbers 1-10 (largest_seq_num = 10)
 		let table1 = create_test_table_with_seq_nums(1, 1, 10, opts.clone())
 			.expect("Failed to create table 1");
 
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table1.clone());
-		}
+		let changeset1 = ManifestChangeSet {
+			new_tables: vec![(0, table1.clone())],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset1).expect("Failed to apply changeset");
 
-		assert_eq!(manifest.lsn(), 10, "Single table should return its largest_seq_num");
+		assert_eq!(manifest.get_last_sequence(), 10, "Single table should update last_sequence");
 
-		// Test 3: Multiple tables in L0 - add tables in ascending sequence order
+		// Test 3: Add table with higher sequence numbers
 		// Create table with sequence numbers 11-20 (largest_seq_num = 20)
 		let table2 = create_test_table_with_seq_nums(2, 11, 20, opts.clone())
 			.expect("Failed to create table 2");
 
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table2.clone());
-		}
+		let changeset2 = ManifestChangeSet {
+			new_tables: vec![(0, table2.clone())],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset2).expect("Failed to apply changeset");
 
-		assert_eq!(manifest.lsn(), 20, "Should return highest LSN from multiple tables");
+		assert_eq!(
+			manifest.get_last_sequence(),
+			20,
+			"Should update to highest sequence from new table"
+		);
 
-		// Test 4: Add another table with higher sequence numbers
+		// Test 4: Add table with even higher sequence numbers
 		// Create table with sequence numbers 21-30 (largest_seq_num = 30)
 		let table3 = create_test_table_with_seq_nums(3, 21, 30, opts.clone())
 			.expect("Failed to create table 3");
 
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table3.clone());
-		}
+		let changeset3 = ManifestChangeSet {
+			new_tables: vec![(0, table3.clone())],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset3).expect("Failed to apply changeset");
 
-		assert_eq!(manifest.lsn(), 30, "Should return highest LSN after adding new table");
+		assert_eq!(
+			manifest.get_last_sequence(),
+			30,
+			"Should update to highest sequence after adding new table"
+		);
 
 		// Test 5: Verify table ordering - tables should be sorted by largest_seq_num descending
 		{
@@ -1001,16 +1014,17 @@ mod tests {
 		let table4 = create_test_table_with_seq_nums(4, 5, 8, opts.clone())
 			.expect("Failed to create table 4");
 
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table4.clone());
-		}
+		let changeset4 = ManifestChangeSet {
+			new_tables: vec![(0, table4.clone())],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset4).expect("Failed to apply changeset");
 
-		// LSN should still be 30 (highest among all tables)
+		// last_sequence should still be 30 (highest among all tables)
 		assert_eq!(
-			manifest.lsn(),
+			manifest.get_last_sequence(),
 			30,
-			"LSN should remain highest even after adding table with lower seq nums"
+			"last_sequence should remain highest even after adding table with lower seq nums"
 		);
 
 		// Verify correct ordering after out-of-order insertion
@@ -1042,12 +1056,17 @@ mod tests {
 		let table5 = create_test_table_with_seq_nums(5, 25, 35, opts.clone())
 			.expect("Failed to create table 5");
 
-		{
-			let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-			level0.insert(table5.clone());
-		}
+		let changeset5 = ManifestChangeSet {
+			new_tables: vec![(0, table5.clone())],
+			..Default::default()
+		};
+		manifest.apply_changeset(&changeset5).expect("Failed to apply changeset");
 
-		assert_eq!(manifest.lsn(), 35, "Should return new highest LSN from overlapping ranges");
+		assert_eq!(
+			manifest.get_last_sequence(),
+			35,
+			"Should return new highest last_sequence from overlapping ranges"
+		);
 
 		// Verify final ordering
 		{
@@ -1063,7 +1082,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_lsn_persistence_across_manifest_reload() {
+	fn test_last_sequence_persistence_across_manifest_reload() {
 		let mut opts = Options::default();
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -1079,50 +1098,51 @@ mod tests {
 		// Create manifest directory
 		fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
-		let expected_lsn = 50;
+		let expected_last_sequence = 50;
 
-		// Create manifest with tables and verify LSN
+		// Create manifest with tables via changeset and verify last_sequence
 		{
 			let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
 			// Create tables with different sequence ranges
 			let table1 = create_test_table_with_seq_nums(1, 1, 20, opts.clone())
 				.expect("Failed to create table 1");
-			let table2 = create_test_table_with_seq_nums(2, 21, expected_lsn, opts.clone())
-				.expect("Failed to create table 2");
+			let table2 =
+				create_test_table_with_seq_nums(2, 21, expected_last_sequence, opts.clone())
+					.expect("Failed to create table 2");
 			let table3 = create_test_table_with_seq_nums(3, 10, 30, opts.clone())
 				.expect("Failed to create table 3");
 
-			{
-				let level0 = Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]);
-				level0.insert(table1);
-				level0.insert(table2);
-				level0.insert(table3);
-			}
+			// Add all tables via a single changeset
+			let changeset = ManifestChangeSet {
+				new_tables: vec![(0, table1), (0, table2), (0, table3)],
+				..Default::default()
+			};
+			manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
 
-			// Verify LSN before persistence
+			// Verify last_sequence before persistence
 			assert_eq!(
-				manifest.lsn(),
-				expected_lsn,
-				"LSN should be {} before persistence",
-				expected_lsn
+				manifest.get_last_sequence(),
+				expected_last_sequence,
+				"last_sequence should be {} before persistence",
+				expected_last_sequence
 			);
 
 			// Persist the manifest
 			write_manifest_to_disk(&manifest).expect("Failed to write manifest to disk");
 		}
 
-		// Reload manifest and verify LSN is preserved
+		// Reload manifest and verify last_sequence is preserved
 		{
 			let reloaded_manifest =
 				LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
 
-			// Verify LSN after reload
+			// Verify last_sequence after reload
 			assert_eq!(
-				reloaded_manifest.lsn(),
-				expected_lsn,
-				"LSN should be {} after reload",
-				expected_lsn
+				reloaded_manifest.get_last_sequence(),
+				expected_last_sequence,
+				"last_sequence should be {} after reload",
+				expected_last_sequence
 			);
 
 			// Verify table count and ordering
@@ -1162,10 +1182,12 @@ mod tests {
 		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
 
 		// Add a table to ensure non-trivial state
+		// Table with sequence numbers 100-200, so last_sequence should be 200
 		let table = create_test_table_with_seq_nums(1, 100, 200, opts.clone())
 			.expect("Failed to create table");
 
 		// Use changeset to atomically set log_number and add table
+		// The changeset will automatically update last_sequence from the table's largest_seq_num
 		let changeset = ManifestChangeSet {
 			log_number: Some(42),
 			new_tables: vec![(0, table)],
@@ -1173,8 +1195,12 @@ mod tests {
 		};
 		manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
 
-		// Directly set last_sequence for test (tests have access to private fields)
-		manifest.last_sequence = 12345;
+		// Verify last_sequence was updated by the changeset
+		assert_eq!(
+			manifest.get_last_sequence(),
+			200,
+			"last_sequence should be updated by changeset"
+		);
 
 		// Persist to disk
 		write_manifest_to_disk(&manifest).expect("Failed to write manifest");
@@ -1190,7 +1216,7 @@ mod tests {
 
 		// Verify new fields persisted correctly
 		assert_eq!(loaded_manifest.get_log_number(), 42, "log_number should persist");
-		assert_eq!(loaded_manifest.get_last_sequence(), 12345, "last_sequence should persist");
+		assert_eq!(loaded_manifest.get_last_sequence(), 200, "last_sequence should persist");
 
 		// Verify table loaded correctly
 		assert_eq!(loaded_manifest.levels.get_levels()[0].tables.len(), 1);

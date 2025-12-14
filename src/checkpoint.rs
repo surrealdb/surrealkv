@@ -179,10 +179,10 @@ impl DatabaseCheckpoint {
 		// Step 1: Flush all memtables to ensure consistency
 		self.flush_all_memtables()?;
 
-		// Step 2: Get current sequence number from the levels
+		// Step 2: Get current sequence number from the manifest
 		let sequence_number = {
 			let levels_guard = self.core.level_manifest.read()?;
-			levels_guard.lsn()
+			levels_guard.get_last_sequence()
 		};
 
 		// Step 3: Create checkpoint subdirectories
