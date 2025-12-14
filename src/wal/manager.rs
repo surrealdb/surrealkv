@@ -688,4 +688,82 @@ mod tests {
 			"Third record should be correctly decompressed"
 		);
 	}
+
+	/// Test: Verify that when a WAL is opened with compression enabled,
+	/// the SetCompressionType record is written and can be read back by the Reader.
+	///
+	/// This test opens a WAL with compression, writes data, then verifies
+	/// that the Reader correctly detects the compression type from the file.
+	#[test]
+	fn test_wal_compression_type_readable_by_reader() {
+		use crate::wal::reader::Reader;
+		use std::fs::File;
+
+		let temp_dir = create_temp_directory();
+
+		// Open WAL with LZ4 compression and write some data
+		{
+			let opts = Options::default().with_compression(CompressionType::Lz4);
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			wal.append(b"test_data").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Open the WAL file with Reader and verify compression type is detected
+		let wal_path = temp_dir.path().join("00000000000000000000.wal");
+		let file = File::open(&wal_path).expect("should open WAL file");
+		let mut reader = Reader::new(file);
+
+		// Before reading any records, compression type should be None
+		assert_eq!(
+			reader.get_compression_type(),
+			CompressionType::None,
+			"Compression type should be None before reading any records"
+		);
+
+		// Read the first data record - this should trigger reading the SetCompressionType record first
+		let (data, _) = reader.read().expect("should read first record");
+		assert_eq!(data, b"test_data", "Data should match what was written");
+
+		// After reading, the Reader should have detected the compression type
+		assert_eq!(
+			reader.get_compression_type(),
+			CompressionType::Lz4,
+			"Reader should detect LZ4 compression type from SetCompressionType record"
+		);
+	}
+
+	/// Test: Verify that when a WAL is opened WITHOUT compression,
+	/// the Reader correctly reports no compression type.
+	#[test]
+	fn test_wal_no_compression_type_when_disabled() {
+		use crate::wal::reader::Reader;
+		use std::fs::File;
+
+		let temp_dir = create_temp_directory();
+
+		// Open WAL without compression and write some data
+		{
+			let opts = Options::default(); // No compression
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+			wal.append(b"test_data").unwrap();
+			wal.close().unwrap();
+		}
+
+		// Open the WAL file with Reader
+		let wal_path = temp_dir.path().join("00000000000000000000.wal");
+		let file = File::open(&wal_path).expect("should open WAL file");
+		let mut reader = Reader::new(file);
+
+		// Read the first data record
+		let (data, _) = reader.read().expect("should read first record");
+		assert_eq!(data, b"test_data", "Data should match what was written");
+
+		// After reading, the Reader should still report no compression
+		assert_eq!(
+			reader.get_compression_type(),
+			CompressionType::None,
+			"Reader should report no compression when WAL was created without compression"
+		);
+	}
 }
