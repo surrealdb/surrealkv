@@ -102,6 +102,15 @@ impl Reader {
 		}
 	}
 
+	/// Returns the compression type detected from the WAL file.
+	///
+	/// This is set when a SetCompressionType record is read from the file.
+	/// Returns `CompressionType::None` if no compression record was found.
+	#[cfg(test)]
+	pub(crate) fn get_compression_type(&self) -> CompressionType {
+		self.compression_type
+	}
+
 	/// Reports corruption to the reporter if present.
 	#[allow(dead_code)]
 	fn report_corruption(&mut self, bytes: usize, reason: &str) {
