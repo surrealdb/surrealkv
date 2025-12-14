@@ -353,6 +353,7 @@ mod tests {
 	use super::*;
 	use crate::wal::manager::Wal;
 	use crate::wal::Options;
+	use crate::WalRecoveryMode;
 	use std::fs;
 	use std::io::{Seek, Write};
 	use tempfile::TempDir;
@@ -568,13 +569,18 @@ mod tests {
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
 		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
-		let max_seq_num =
-			crate::lsm::Core::replay_wal_with_repair(wal_dir, 0, "Test repair", |memtable| {
+		let max_seq_num = crate::lsm::Core::replay_wal_with_repair(
+			wal_dir,
+			0,
+			"Test repair",
+			WalRecoveryMode::TolerateCorruptedWithRepair,
+			|memtable| {
 				// This closure is called with the recovered memtable
 				*recovered_memtable.write().unwrap() = memtable;
 				Ok(())
-			})
-			.unwrap();
+			},
+		)
+		.unwrap();
 
 		// Verify the repair worked correctly
 		// Since the first record is corrupted, we should recover None (no valid data)
@@ -649,12 +655,17 @@ mod tests {
 		drop(file);
 
 		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
-		let max_seq_num =
-			crate::lsm::Core::replay_wal_with_repair(wal_dir, 0, "Test repair", |memtable| {
+		let max_seq_num = crate::lsm::Core::replay_wal_with_repair(
+			wal_dir,
+			0,
+			"Test repair",
+			WalRecoveryMode::TolerateCorruptedWithRepair,
+			|memtable| {
 				*recovered_memtable.write().unwrap() = memtable;
 				Ok(())
-			})
-			.unwrap();
+			},
+		)
+		.unwrap();
 
 		// Verify the repair worked correctly
 		// Since the third batch is corrupted, we should recover data from the first two batches

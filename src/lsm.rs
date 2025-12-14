@@ -32,7 +32,7 @@ use crate::{
 		Wal,
 	},
 	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
-	TimestampComparator, VLogChecksumLevel, Value,
+	TimestampComparator, VLogChecksumLevel, Value, WalRecoveryMode,
 };
 use bytes::Bytes;
 
@@ -740,15 +740,28 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
-	/// Function to replay WAL with automatic repair on corruption.
+	/// Function to replay WAL with configurable recovery behavior on corruption.
 	///
-	/// Returns Option<u64>:
-	/// - Some(seq_num) if WAL was actually replayed
-	/// - None if WAL was skipped (already flushed) or empty
+	/// # Arguments
+	///
+	/// * `wal_path` - Path to the WAL directory
+	/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped)
+	/// * `context` - Context string for error messages (e.g., "Database startup")
+	/// * `recovery_mode` - Controls behavior on corruption:
+	///   - `AbsoluteConsistency`: Fail immediately on any corruption
+	///   - `TolerateCorruptedWithRepair`: Attempt repair and continue (default)
+	/// * `set_recovered_memtable` - Callback to set the recovered memtable
+	///
+	/// # Returns
+	///
+	/// * `Ok(Some(seq_num))` - WAL was replayed successfully
+	/// * `Ok(None)` - WAL was skipped (already flushed) or empty
+	/// * `Err(...)` - Error during replay (corruption in AbsoluteConsistency mode, or unrecoverable error)
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
-		context: &str, // "Database startup" or "Database reload"
+		context: &str,
+		recovery_mode: WalRecoveryMode,
 		mut set_recovered_memtable: F,
 	) -> Result<Option<u64>>
 	where
@@ -757,7 +770,7 @@ impl Core {
 		// Create a new empty memtable to recover WAL entries
 		let recovered_memtable = Arc::new(MemTable::default());
 
-		// Replay WAL with automatic repair on corruption
+		// Replay WAL
 		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
 			Ok(seq_num_opt) => {
 				// WAL was replayed successfully (or was empty/skipped)
@@ -768,51 +781,73 @@ impl Core {
 				offset,
 				message,
 			}) => {
-				log::warn!(
-					"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
-					segment_id,
-					offset,
-					message
-				);
-
-				// Attempt to repair the corrupted segment
-				if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id) {
-					log::error!("Failed to repair WAL segment: {repair_err}");
-					return Err(Error::Other(format!(
-						"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
-					)));
-				}
-
-				// After repair, replay again to recover data from ALL segments.
-				// The initial replay stopped at the corruption point and didn't process subsequent segments.
-				let retry_memtable = Arc::new(MemTable::default());
-				match replay_wal(wal_path, &retry_memtable, min_wal_number) {
-					Ok(retry_seq_num) => {
-						// Successful replay after repair
-						log::info!(
-							"WAL replay after repair succeeded: {} entries recovered",
-							retry_memtable.iter().count()
+				// Handle corruption based on recovery mode
+				match recovery_mode {
+					WalRecoveryMode::AbsoluteConsistency => {
+						// Fail immediately on any corruption - no repair attempted
+						log::error!(
+							"WAL corruption detected in segment {} at offset {}: {}. \
+							AbsoluteConsistency mode: failing immediately without repair.",
+							segment_id,
+							offset,
+							message
 						);
-						if !retry_memtable.is_empty() {
-							set_recovered_memtable(retry_memtable)?;
+						return Err(Error::WalCorruption {
+							segment_id,
+							offset,
+							message,
+						});
+					}
+					WalRecoveryMode::TolerateCorruptedWithRepair => {
+						// Current behavior: attempt repair and retry
+						log::warn!(
+							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
+							segment_id,
+							offset,
+							message
+						);
+
+						// Attempt to repair the corrupted segment
+						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
+						{
+							log::error!("Failed to repair WAL segment: {repair_err}");
+							return Err(Error::Other(format!(
+								"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
+							)));
 						}
-						return Ok(retry_seq_num);
-					}
-					Err(Error::WalCorruption {
-						segment_id: seg_id,
-						offset: off,
-						message,
-					}) => {
-						// WAL still corrupted after repair - fail
-						return Err(Error::Other(format!(
-							"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
-						)));
-					}
-					Err(retry_err) => {
-						// Replay failed after repair - fail
-						return Err(Error::Other(format!(
-							"{context} failed: WAL replay failed after repair. {retry_err}"
-						)));
+
+						// After repair, replay again to recover data from ALL segments.
+						// The initial replay stopped at the corruption point and didn't process subsequent segments.
+						let retry_memtable = Arc::new(MemTable::default());
+						match replay_wal(wal_path, &retry_memtable, min_wal_number) {
+							Ok(retry_seq_num) => {
+								// Successful replay after repair
+								log::info!(
+									"WAL replay after repair succeeded: {} entries recovered",
+									retry_memtable.iter().count()
+								);
+								if !retry_memtable.is_empty() {
+									set_recovered_memtable(retry_memtable)?;
+								}
+								return Ok(retry_seq_num);
+							}
+							Err(Error::WalCorruption {
+								segment_id: seg_id,
+								offset: off,
+								message,
+							}) => {
+								// WAL still corrupted after repair - fail
+								return Err(Error::Other(format!(
+									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
+								)));
+							}
+							Err(retry_err) => {
+								// Replay failed after repair - fail
+								return Err(Error::Other(format!(
+									"{context} failed: WAL replay failed after repair. {retry_err}"
+								)));
+							}
+						}
 					}
 				}
 			}
@@ -858,11 +893,12 @@ impl Core {
 			manifest_last_seq
 		);
 
-		// Replay WAL with automatic repair on corruption (returns None if skipped/empty)
+		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
 		let wal_seq_num_opt = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
+			opts.wal_recovery_mode,
 			|memtable| {
 				let mut active_memtable = inner.active_memtable.write()?;
 				*active_memtable = memtable;
@@ -1209,6 +1245,7 @@ impl Tree {
 			&wal_path,
 			min_wal_number,
 			"Database restore",
+			self.core.inner.opts.wal_recovery_mode,
 			|memtable| {
 				let mut active_memtable = self.core.inner.active_memtable.write()?;
 				*active_memtable = memtable;
@@ -3834,9 +3871,14 @@ mod tests {
 			let wal_path = opts.wal_dir();
 			let min_wal_number = log_number;
 
-			let wal_seq_opt =
-				Core::replay_wal_with_repair(&wal_path, min_wal_number, "Test", |_memtable| Ok(()))
-					.unwrap();
+			let wal_seq_opt = Core::replay_wal_with_repair(
+				&wal_path,
+				min_wal_number,
+				"Test",
+				WalRecoveryMode::default(),
+				|_memtable| Ok(()),
+			)
+			.unwrap();
 
 			// CRITICAL: WAL should have been skipped (return None)
 			assert_eq!(
@@ -5228,6 +5270,170 @@ mod tests {
 
 			let result = txn.get(b"batch4_key49").unwrap().unwrap();
 			assert_eq!(result, Bytes::copy_from_slice(b"batch4_value49"));
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	#[test_log::test(tokio::test)]
+	async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
+		use std::io::Write;
+
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		// Phase 1: Create a valid WAL with some data
+		{
+			let opts = create_test_options(path.clone(), |opts| {
+				opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+				opts.flush_on_close = false; // Don't flush on close - keep data in WAL
+			});
+
+			let tree = Tree::new(opts.clone()).unwrap();
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key1", b"value1").unwrap();
+			txn.set(b"key2", b"value2").unwrap();
+			txn.commit().await.unwrap();
+
+			// Close without flush - data only in WAL
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Corrupt the WAL file
+		let wal_dir = path.join("wal");
+		let segment_path = wal_dir.join("00000000000000000000.wal");
+		{
+			let mut file = std::fs::OpenOptions::new().append(true).open(&segment_path).unwrap();
+			file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
+		}
+
+		// Phase 3: Try to open with AbsoluteConsistency mode - should FAIL
+		{
+			let opts = create_test_options(path.clone(), |opts| {
+				opts.wal_recovery_mode = WalRecoveryMode::AbsoluteConsistency;
+			});
+
+			let result = Tree::new(opts);
+
+			// Should fail due to corruption
+			match result {
+				Err(Error::WalCorruption {
+					..
+				}) => {
+					// Expected - AbsoluteConsistency correctly fails on corruption
+				}
+				Err(e) => panic!("Expected WalCorruption error, got: {}", e),
+				Ok(_) => {
+					panic!("AbsoluteConsistency should fail on WAL corruption, but it succeeded")
+				}
+			}
+		}
+	}
+
+	#[test_log::test(tokio::test)]
+	async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
+		use std::io::Write;
+
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		// Phase 1: Create a valid WAL with some data
+		{
+			let opts = create_test_options(path.clone(), |opts| {
+				opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+				opts.flush_on_close = false; // Don't flush on close - keep data in WAL
+			});
+
+			let tree = Tree::new(opts.clone()).unwrap();
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key1", b"value1").unwrap();
+			txn.set(b"key2", b"value2").unwrap();
+			txn.commit().await.unwrap();
+
+			// Close without flush - data only in WAL
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Corrupt the WAL file at the end
+		let wal_dir = path.join("wal");
+		let segment_path = wal_dir.join("00000000000000000000.wal");
+		{
+			let mut file = std::fs::OpenOptions::new().append(true).open(&segment_path).unwrap();
+			file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
+		}
+
+		// Phase 3: Open with default TolerateCorruptedWithRepair mode - should SUCCEED
+		{
+			let opts = create_test_options(path.clone(), |opts| {
+				opts.wal_recovery_mode = WalRecoveryMode::TolerateCorruptedWithRepair;
+			});
+
+			let result = Tree::new(opts);
+
+			// Should succeed (repair the WAL and recover data)
+			let tree = match result {
+				Ok(t) => t,
+				Err(e) => {
+					panic!("TolerateCorruptedWithRepair should succeed after repairing WAL: {}", e)
+				}
+			};
+
+			// Verify data was recovered
+			let txn = tree.begin().unwrap();
+			assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec().into()));
+			assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec().into()));
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	#[test]
+	fn test_wal_recovery_mode_default_is_tolerate_with_repair() {
+		// Verify that the default recovery mode is TolerateCorruptedWithRepair
+		let opts = Options::default();
+		assert_eq!(
+			opts.wal_recovery_mode,
+			WalRecoveryMode::TolerateCorruptedWithRepair,
+			"Default recovery mode should be TolerateCorruptedWithRepair"
+		);
+	}
+
+	#[test_log::test(tokio::test)]
+	async fn test_wal_incremental_number_after_flush_and_reopen() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 1024;
+			opts.flush_on_close = true;
+		});
+
+		// Phase 1: Write data and clean shutdown (triggers flush)
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let wal_num_before = tree.core.inner.wal.read().get_active_log_number();
+			assert_eq!(wal_num_before, 0, "Fresh database should start at WAL #0");
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"test_key", b"test_value").unwrap();
+			txn.commit().await.unwrap();
+
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Reopen and verify WAL has incremental number
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
+
+			// CRITICAL: WAL number should be > 0 since WAL #0 was flushed
+			assert!(
+				wal_num_after_reopen > 0,
+				"BUG: After flush and reopen, WAL should start at incremental number, not 0. Got {}",
+				wal_num_after_reopen
+			);
 
 			tree.close().await.unwrap();
 		}
