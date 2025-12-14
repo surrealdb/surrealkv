@@ -174,6 +174,17 @@ pub enum VLogChecksumLevel {
 	Full = 1,
 }
 
+/// WAL recovery mode to control consistency guarantees during crash recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalRecoveryMode {
+	/// Attempt automatic repair of corrupted WAL segments and retry replay.
+	#[default]
+	TolerateCorruptedWithRepair,
+
+	/// Fail immediately on any WAL corruption (no repair attempted).
+	AbsoluteConsistency,
+}
+
 #[derive(Clone)]
 pub struct Options {
 	pub block_size: usize,
@@ -213,6 +224,11 @@ pub struct Options {
 	///
 	/// DEFAULT: false
 	pub flush_on_close: bool,
+
+	// WAL recovery configuration
+	/// Controls behavior when WAL corruption is detected during recovery.
+	/// Default: TolerateCorruptedWithRepair (attempt repair and continue)
+	pub wal_recovery_mode: WalRecoveryMode,
 }
 
 impl Default for Options {
@@ -241,6 +257,7 @@ impl Default for Options {
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
+			wal_recovery_mode: WalRecoveryMode::default(),
 		}
 	}
 }
@@ -357,6 +374,22 @@ impl Options {
 	/// false (skip flush for faster shutdown)
 	pub const fn with_flush_on_close(mut self, value: bool) -> Self {
 		self.flush_on_close = value;
+		self
+	}
+
+	/// Sets the WAL recovery mode to control behavior when corruption is detected.
+	///
+	/// # Arguments
+	///
+	/// * `mode` - The recovery mode to use:
+	///   - `TolerateCorruptedWithRepair`: Attempt repair and continue (default)
+	///   - `AbsoluteConsistency`: Fail immediately on any corruption
+	///
+	/// # Default
+	///
+	/// `TolerateCorruptedWithRepair`
+	pub const fn with_wal_recovery_mode(mut self, mode: WalRecoveryMode) -> Self {
+		self.wal_recovery_mode = mode;
 		self
 	}
 
