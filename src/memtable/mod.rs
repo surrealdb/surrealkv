@@ -21,22 +21,40 @@ use crate::{
 	Options, Value,
 };
 
+/// Entry in the immutable memtables list, tracking both the table ID
+/// and the WAL number that contains this memtable's data.
+#[derive(Clone)]
+pub(crate) struct ImmutableEntry {
+	/// The table ID that will be used for the SST file
+	pub table_id: u64,
+	/// The WAL number that was current when this memtable was active.
+	/// Used to determine which WALs can be safely deleted after flush.
+	pub wal_number: u64,
+	/// The memtable data
+	pub memtable: Arc<MemTable>,
+}
+
 #[derive(Default)]
-pub(crate) struct ImmutableMemtables(Vec<(u64, Arc<MemTable>)>);
+pub(crate) struct ImmutableMemtables(Vec<ImmutableEntry>);
 
 impl ImmutableMemtables {
-	pub(crate) fn add(&mut self, id: u64, memtable: Arc<MemTable>) {
-		self.0.push((id, memtable));
-		self.0.sort_by_key(|(id, _)| *id); // Maintain sorted order by ID
+	/// Adds an immutable memtable entry with its associated table ID and WAL number.
+	pub(crate) fn add(&mut self, table_id: u64, wal_number: u64, memtable: Arc<MemTable>) {
+		self.0.push(ImmutableEntry {
+			table_id,
+			wal_number,
+			memtable,
+		});
+		self.0.sort_by_key(|entry| entry.table_id); // Maintain sorted order by ID
 	}
 
 	pub(crate) fn remove(&mut self, id_to_remove: u64) {
-		if let Ok(index) = self.0.binary_search_by_key(&id_to_remove, |(id, _)| *id) {
+		if let Ok(index) = self.0.binary_search_by_key(&id_to_remove, |entry| entry.table_id) {
 			self.0.remove(index);
 		}
 	}
 
-	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &(u64, Arc<MemTable>)> {
+	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &ImmutableEntry> {
 		self.0.iter()
 	}
 
@@ -49,6 +67,9 @@ pub(crate) struct MemTable {
 	map: SkipMap<InternalKey, Value>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
+	/// WAL number that was current when this memtable started receiving writes.
+	/// Used to determine which WALs can be safely deleted after flush.
+	wal_number: AtomicU64,
 }
 
 impl Default for MemTable {
@@ -64,7 +85,21 @@ impl MemTable {
 			map: SkipMap::new(),
 			latest_seq_num: AtomicU64::new(0),
 			map_size: AtomicU32::new(0),
+			wal_number: AtomicU64::new(0),
 		}
+	}
+
+	/// Sets the WAL number associated with this memtable.
+	/// This should be called when the memtable starts receiving writes
+	/// to track which WAL contains its data.
+	pub(crate) fn set_wal_number(&self, wal_number: u64) {
+		self.wal_number.store(wal_number, Ordering::Release);
+	}
+
+	/// Gets the WAL number associated with this memtable.
+	/// Returns 0 if the WAL number has not been set.
+	pub(crate) fn get_wal_number(&self) -> u64 {
+		self.wal_number.load(Ordering::Acquire)
 	}
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {

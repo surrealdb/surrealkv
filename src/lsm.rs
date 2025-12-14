@@ -19,7 +19,7 @@ use crate::{
 	error::Result,
 	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
 	lockfile::LockFile,
-	memtable::{ImmutableMemtables, MemTable},
+	memtable::{ImmutableEntry, ImmutableMemtables, MemTable},
 	oracle::Oracle,
 	snapshot::Counter as SnapshotCounter,
 	sstable::{table::Table, InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX},
@@ -127,8 +127,7 @@ impl CoreInner {
 		let mut lockfile = LockFile::new(&opts.path);
 		lockfile.acquire()?;
 
-		// Initialize active and immutable memtables
-		let active_memtable = Arc::new(RwLock::new(Arc::new(MemTable::new())));
+		// Initialize immutable memtables
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
 		// TODO: Add a way to recover from the WAL or level manifest
@@ -144,7 +143,13 @@ impl CoreInner {
 		// This avoids creating intermediate empty WAL files
 		let wal_path = opts.wal_dir();
 		let wal_instance =
-			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+
+		// Initialize active memtable with its WAL number set to the initial WAL
+		// This tracks which WAL the memtable's data belongs to for later flush
+		let initial_memtable = Arc::new(MemTable::new());
+		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
+		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
@@ -221,7 +226,7 @@ impl CoreInner {
 		// Step 2: Rotate WAL while STILL holding memtable write lock
 		// We must rotate WAL and swap memtable atomically
 		// to prevent the race condition described above
-		let (flushed_wal_number, wal_dir) = {
+		let (flushed_wal_number, new_wal_number, wal_dir) = {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			let dir = wal_guard.get_dir_path().to_path_buf();
@@ -236,17 +241,23 @@ impl CoreInner {
 				old_log_number,
 				new_log_number
 			);
-			(old_log_number, dir)
+			(old_log_number, new_log_number, dir)
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
 		// Take the memtable data that we will flush
 		let flushed_memtable = std::mem::take(&mut *active_memtable);
 
-		// Get table ID and track immutable memtable
+		// Set the WAL number on the new (empty) active memtable
+		// This tracks which WAL the new memtable's data will belong to
+		active_memtable.set_wal_number(new_wal_number);
+
+		// Get table ID and track immutable memtable with its WAL number
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 		let table_id = self.level_manifest.read()?.next_table_id();
-		immutable_memtables.add(table_id, flushed_memtable.clone());
+		// Track the WAL number that contains this memtable's data
+		// (the old WAL before rotation)
+		immutable_memtables.add(table_id, flushed_wal_number, flushed_memtable.clone());
 
 		// Now we can release locks - the memtable is safely in immutable_memtables
 		// and no other thread can race us on this specific data
@@ -373,8 +384,12 @@ impl CoreInner {
 		// Get table ID for the SST file
 		let table_id = self.level_manifest.read()?.next_table_id();
 
+		// Get the WAL number from the memtable (set when it started receiving writes)
+		// or use the current WAL if not set
+		let memtable_wal_number = flushed_memtable.get_wal_number();
+
 		// Track the immutable memtable until it's successfully flushed
-		immutable_memtables.add(table_id, flushed_memtable.clone());
+		immutable_memtables.add(table_id, memtable_wal_number, flushed_memtable.clone());
 
 		// Release locks before the potentially slow flush operation
 		drop(active_memtable);
@@ -400,9 +415,9 @@ impl CoreInner {
 		let wal_that_was_flushed = match flushed_wal_number {
 			Some(num) => num,
 			None => {
-				// No explicit WAL provided, use current active WAL
-				// This happens during shutdown when no rotation occurred
-				self.wal.read().get_active_log_number()
+				// No explicit WAL provided, use the memtable's stored WAL number
+				// This is the WAL that was active when the memtable started receiving writes
+				memtable_wal_number
 			}
 		};
 
@@ -441,6 +456,218 @@ impl CoreInner {
 		);
 
 		Ok(Some(table))
+	}
+
+	/// Flushes a single immutable memtable using its pre-assigned table_id.
+	///
+	/// This is used during shutdown to flush immutable memtables that already have
+	/// their table_ids assigned (from when they were moved from active to immutable).
+	///
+	/// # Arguments
+	///
+	/// * `table_id` - The pre-assigned table ID for this memtable
+	/// * `wal_number` - The WAL number that contains this memtable's data
+	/// * `memtable` - The immutable memtable to flush
+	///
+	/// # Returns
+	///
+	/// * `Ok(table)` - The flushed SSTable
+	/// * `Err(_)` - If flush or manifest update fails
+	///
+	/// # Important
+	///
+	/// Unlike `flush_memtable_and_update_manifest`, this method:
+	/// - Does NOT call `next_table_id()` - uses the pre-assigned ID
+	/// - Does NOT swap the active memtable
+	/// - Removes the memtable from immutable_memtables tracking after success
+	/// - Updates log_number to mark the associated WAL as flushed
+	fn flush_single_immutable_memtable(
+		&self,
+		table_id: u64,
+		wal_number: u64,
+		memtable: Arc<MemTable>,
+	) -> Result<Arc<Table>> {
+		log::debug!(
+			"Flushing immutable memtable: table_id={}, wal_number={}, size={}",
+			table_id,
+			wal_number,
+			memtable.size()
+		);
+
+		// Flush the memtable to SST using the pre-assigned table_id
+		let table = memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to flush immutable memtable to SST table_id={}: {}",
+				table_id, e
+			))
+		})?;
+
+		log::debug!(
+			"Created SST from immutable memtable: table_id={}, file_size={}",
+			table.id,
+			table.meta.properties.file_size
+		);
+
+		// Prepare changeset - add SST to level 0 and update log_number
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, table.clone()));
+
+		// Update log_number to mark this WAL as flushed
+		// log_number indicates "all WALs with number < log_number have been flushed"
+		changeset.log_number = Some(wal_number + 1);
+
+		// Apply changeset atomically
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+
+		manifest.apply_changeset(&changeset)?;
+		write_manifest_to_disk(&manifest).map_err(|e| {
+			Error::Other(format!(
+				"Failed to update manifest for immutable memtable: table_id={}: {}",
+				table_id, e
+			))
+		})?;
+
+		// Remove successfully flushed memtable from tracking
+		memtable_lock.remove(table_id);
+
+		log::info!(
+			"Immutable memtable flushed: table_id={}, wal_number={}, log_number={}",
+			table_id,
+			wal_number,
+			wal_number + 1
+		);
+
+		Ok(table)
+	}
+
+	/// Flushes all memtables (immutable and active) during shutdown.
+	///
+	/// # Critical: Flush Ordering
+	///
+	/// Immutable memtables MUST be flushed BEFORE the active memtable to preserve
+	/// SSTable ordering:
+	/// - Immutable memtables contain OLDER data (were swapped out earlier)
+	/// - Active memtable contains NEWEST data (currently receiving writes)
+	/// - Table IDs must reflect temporal order (newer data = higher table_id)
+	///
+	/// # Flush Sequence
+	///
+	/// 1. Flush ALL immutable memtables FIRST using their pre-assigned table_ids
+	/// 2. Flush active memtable LAST (gets new highest table_id)
+	/// 3. Update manifest log_number to mark all WALs as flushed
+	///
+	/// # WAL Handling
+	///
+	/// This method does NOT rotate the WAL. The final log_number in manifest
+	/// is set to current_wal + 1, indicating all data up to current WAL is persisted.
+	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
+		log::info!("Flushing all memtables for shutdown...");
+
+		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
+		// We need to collect them first to avoid holding the lock during I/O
+		let immutables_to_flush: Vec<ImmutableEntry> = {
+			let immutable_guard = self.immutable_memtables.read()?;
+			immutable_guard.iter().cloned().collect()
+		};
+
+		let immutable_count = immutables_to_flush.len();
+		if immutable_count > 0 {
+			log::info!("Flushing {} immutable memtable(s) first (older data)", immutable_count);
+		}
+
+		// Flush each immutable memtable using its pre-assigned table_id and WAL number
+		// These were assigned when the memtable was moved from active to immutable
+		//
+		// We use fail-fast because:
+		// 1. Successfully flushed memtables already updated log_number (their WALs can be deleted)
+		// 2. Failed memtable's WAL is preserved (its wal_number >= current log_number)
+		// 3. On restart, WAL replay recovers all unflushed data
+		let mut flushed_count = 0;
+
+		for entry in immutables_to_flush {
+			if entry.memtable.is_empty() {
+				// Skip empty memtables - just remove from tracking
+				let mut immutable_guard = self.immutable_memtables.write()?;
+				immutable_guard.remove(entry.table_id);
+				log::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
+				continue;
+			}
+
+			// Fail-fast: return immediately on error
+			// WAL replay will recover this and subsequent memtables on restart
+			self.flush_single_immutable_memtable(entry.table_id, entry.wal_number, entry.memtable)?;
+
+			flushed_count += 1;
+			log::debug!(
+				"Flushed immutable memtable {}/{}: table_id={}, wal_number={}",
+				flushed_count,
+				immutable_count,
+				entry.table_id,
+				entry.wal_number
+			);
+		}
+
+		if flushed_count > 0 {
+			log::info!("Flushed {} immutable memtable(s) successfully", flushed_count);
+		}
+
+		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
+		let active_memtable = self.active_memtable.read()?;
+		let active_size = active_memtable.size();
+		let active_is_empty = active_memtable.is_empty();
+		drop(active_memtable);
+
+		if !active_is_empty {
+			log::info!("Flushing active memtable last (newest data): size={}", active_size);
+
+			// Use flush_memtable_and_update_manifest which:
+			// - Gets a new (highest) table_id
+			// - Updates log_number to mark WAL as flushed
+			// - Does NOT rotate WAL (we pass None)
+			// Fail-fast: return immediately on error
+			match self.flush_memtable_and_update_manifest(None)? {
+				Some(table) => {
+					log::info!(
+						"Active memtable flushed: table_id={}, file_size={}",
+						table.id,
+						table.meta.properties.file_size
+					);
+				}
+				None => {
+					log::debug!("Active memtable was empty, skipped flush");
+				}
+			}
+		} else {
+			log::debug!("Active memtable is empty, skipping flush");
+
+			// Even if active is empty, we should update log_number if we flushed immutables
+			// This marks the WAL as safe to delete
+			if flushed_count > 0 {
+				let current_wal = self.wal.read().get_active_log_number();
+				let changeset = ManifestChangeSet {
+					log_number: Some(current_wal + 1),
+					..Default::default()
+				};
+
+				let mut manifest = self.level_manifest.write()?;
+				manifest.apply_changeset(&changeset)?;
+				write_manifest_to_disk(&manifest).map_err(|e| {
+					Error::Other(format!(
+						"Failed to update manifest log_number after immutable flush: {}",
+						e
+					))
+				})?;
+
+				log::debug!(
+					"Updated manifest log_number to {} after immutable flushes",
+					current_wal + 1
+				);
+			}
+		}
+
+		log::info!("All memtables flushed successfully for shutdown");
+		Ok(())
 	}
 
 	/// Cleans up orphaned SST files not referenced in manifest
@@ -906,6 +1133,14 @@ impl Core {
 			},
 		)?;
 
+		// After WAL replay, ensure the active memtable has the correct WAL number set
+		// This is needed because the recovered memtable replaces the initial one
+		{
+			let active_memtable = inner.active_memtable.read()?;
+			let current_wal_number = inner.wal.read().get_active_log_number();
+			active_memtable.set_wal_number(current_wal_number);
+		}
+
 		// Get last_sequence from manifest
 		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
 
@@ -1009,35 +1244,19 @@ impl Core {
 			log::debug!("VLog GC manager stopped");
 		}
 
-		// Step 3: Conditionally flush the active memtable based on flush_on_close option
+		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
+		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable
+		// to preserve SSTable ordering (older data = lower table_ids)
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
 		if self.inner.opts.flush_on_close {
-			let active_memtable = self.inner.active_memtable.read()?;
-			let memtable_size = active_memtable.size();
-			let memtable_entries = active_memtable.iter().count();
+			log::info!("Flushing all memtables on shutdown (flush_on_close=true)");
 
-			if !active_memtable.is_empty() {
-				drop(active_memtable);
+			// Flush ALL memtables: immutables first (older data), then active (newest data)
+			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
+				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
+			})?;
 
-				log::info!(
-					"Flushing active memtable on shutdown (flush_on_close=true): entries={}, size_bytes={}",
-					memtable_entries,
-					memtable_size
-				);
-
-				// Direct flush without WAL rotation
-				// Uses centralized flush logic that updates manifest log_number
-				// Pass None for flushed_wal_number since we didn't rotate
-				self.inner.flush_memtable_and_update_manifest(None).map_err(|e| {
-					Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
-				})?;
-
-				log::info!("Active memtable flushed successfully on shutdown");
-			} else {
-				log::debug!("Active memtable is empty, skipping shutdown flush");
-			}
-		} else {
-			log::info!("Skipping memtable flush on shutdown (flush_on_close=false)");
+			log::info!("All memtables flushed successfully on shutdown");
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
@@ -1233,8 +1452,11 @@ impl Tree {
 			let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
 			let mut wal_guard = self.core.inner.wal.write();
 			let wal_path = self.core.inner.opts.path.join("wal");
-			let new_wal =
-				Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+			let new_wal = Wal::open_with_min_log_number(
+				&wal_path,
+				manifest_log_number,
+				wal::Options::default(),
+			)?;
 			*wal_guard = new_wal;
 		}
 
@@ -1252,6 +1474,13 @@ impl Tree {
 				Ok(())
 			},
 		)?;
+
+		// After WAL replay, ensure the active memtable has the correct WAL number set
+		{
+			let active_memtable = self.core.inner.active_memtable.read()?;
+			let current_wal_number = self.core.inner.wal.read().get_active_log_number();
+			active_memtable.set_wal_number(current_wal_number);
+		}
 
 		// Get last_sequence from manifest
 		let manifest_last_seq = self.core.inner.level_manifest.read()?.get_last_sequence();
@@ -4799,6 +5028,447 @@ mod tests {
 		}
 	}
 
+	/// Tests that flush_all_memtables_for_shutdown flushes both immutable and active memtables
+	/// in the correct order (immutables first, then active) to preserve SSTable ordering.
+	#[test_log::test(tokio::test)]
+	async fn test_flush_all_memtables_on_close_ordering() {
+		// This test verifies that close() flushes ALL memtables (immutable + active)
+		// and that SSTable table_ids are in correct temporal order
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Small to trigger flushes
+			opts.flush_on_close = true;
+		});
+
+		let sst_dir = opts.sstable_dir();
+
+		// Helper to count SST files
+		let count_ssts = || -> usize {
+			std::fs::read_dir(&sst_dir)
+				.ok()
+				.map(|entries| {
+					entries
+						.filter_map(|e| e.ok())
+						.filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+						.count()
+				})
+				.unwrap_or(0)
+		};
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write enough data to trigger multiple memtable flushes
+			// This creates immutable memtables in the background
+			for i in 0..50 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{:04}", i).as_bytes(), b"value_data_here").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Wait a bit for background flushes to start
+			tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+			let sst_count_before_close = count_ssts();
+			log::info!("SST count before close: {}", sst_count_before_close);
+
+			// Write one more entry to ensure active memtable has data
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"final_key", b"final_value").unwrap();
+			txn.commit().await.unwrap();
+
+			// Close - should flush all remaining memtables
+			tree.close().await.unwrap();
+
+			let sst_count_after_close = count_ssts();
+			log::info!("SST count after close: {}", sst_count_after_close);
+
+			// Should have at least one more SST from the close flush
+			assert!(
+				sst_count_after_close >= sst_count_before_close,
+				"SST count should not decrease after close"
+			);
+		}
+
+		// Reopen and verify all data is accessible
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Verify data from all writes
+			for i in 0..50 {
+				let txn = tree.begin().unwrap();
+				let key = format!("key_{:04}", i);
+				let value = txn.get(key.as_bytes()).unwrap();
+				assert!(value.is_some(), "Key {} should exist after close/reopen", key);
+			}
+
+			// Verify final key
+			let txn = tree.begin().unwrap();
+			assert_eq!(
+				txn.get(b"final_key").unwrap(),
+				Some(b"final_value".to_vec().into()),
+				"Final key should exist after close/reopen"
+			);
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that pending immutable memtables are flushed during close even when
+	/// the active memtable is empty.
+	#[test_log::test(tokio::test)]
+	async fn test_flush_immutable_memtables_with_empty_active() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Small to trigger flush
+			opts.flush_on_close = true;
+		});
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data to trigger a memtable flush (creates immutable memtable)
+			for i in 0..20 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{}", i).as_bytes(), b"value_data").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Wait for background flush to complete
+			tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+			// After flush, active memtable should be empty
+			// Close should handle this correctly
+			tree.close().await.unwrap();
+		}
+
+		// Reopen and verify data
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			for i in 0..20 {
+				let txn = tree.begin().unwrap();
+				let key = format!("key_{}", i);
+				assert!(txn.get(key.as_bytes()).unwrap().is_some(), "Key {} should exist", key);
+			}
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that SSTable table_ids are in correct ascending order after flushing
+	/// immutable memtables followed by active memtable.
+	#[test_log::test(tokio::test)]
+	async fn test_sst_table_ids_ordered_correctly_on_close() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+			opts.flush_on_close = true;
+		});
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data - will be flushed on close
+			for i in 0..5 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Get initial table count
+			let initial_count = tree.core.inner.level_manifest.read().unwrap().iter().count();
+
+			// Close triggers flush
+			tree.close().await.unwrap();
+
+			// Reopen and verify table count increased
+			let tree2 = Tree::new(opts.clone()).unwrap();
+			let after_count = tree2.core.inner.level_manifest.read().unwrap().iter().count();
+
+			assert_eq!(
+				after_count,
+				initial_count + 1,
+				"Should have one more SST after close flush"
+			);
+
+			// Verify table_ids are in ascending order
+			{
+				let manifest = tree2.core.inner.level_manifest.read().unwrap();
+				let mut prev_id = 0u64;
+				for table in manifest.iter() {
+					assert!(
+						table.id > prev_id || prev_id == 0,
+						"Table IDs should be in ascending order: prev={}, current={}",
+						prev_id,
+						table.id
+					);
+					prev_id = table.id;
+				}
+			} // Drop manifest before await
+
+			tree2.close().await.unwrap();
+		}
+	}
+
+	/// Tests that WAL numbers are correctly tracked with memtables and that
+	/// log_number is updated incrementally as each memtable is flushed.
+	#[test_log::test(tokio::test)]
+	async fn test_wal_number_tracking_on_flush() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
+			opts.flush_on_close = true;
+		});
+
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Get initial state
+		let initial_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let initial_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		log::info!(
+			"Initial state: log_number={}, wal_number={}",
+			initial_log_number,
+			initial_wal_number
+		);
+
+		// Write some data
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key1", b"value1").unwrap();
+		txn.commit().await.unwrap();
+
+		// Explicitly flush
+		tree.flush().unwrap();
+
+		// Verify log_number increased to wal_number + 1
+		let after_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		assert_eq!(
+			after_flush_log,
+			initial_wal_number + 1,
+			"log_number should be initial_wal + 1 after flush"
+		);
+
+		// Verify new memtable has new WAL number
+		let new_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		assert!(
+			new_wal_number > initial_wal_number,
+			"New memtable should have higher WAL number: {} > {}",
+			new_wal_number,
+			initial_wal_number
+		);
+		log::info!(
+			"After first flush: log_number={}, new_wal_number={}",
+			after_flush_log,
+			new_wal_number
+		);
+
+		// Second write + flush cycle
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key2", b"value2").unwrap();
+		txn.commit().await.unwrap();
+
+		tree.flush().unwrap();
+
+		let after_second_flush_log =
+			tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		assert_eq!(
+			after_second_flush_log,
+			new_wal_number + 1,
+			"log_number should be new_wal + 1 after second flush"
+		);
+		log::info!("After second flush: log_number={}", after_second_flush_log);
+
+		// Verify data survives close/reopen
+		tree.close().await.unwrap();
+
+		let tree2 = Tree::new(opts.clone()).unwrap();
+
+		let txn = tree2.begin().unwrap();
+		assert_eq!(
+			txn.get(b"key1").unwrap(),
+			Some(b"value1".to_vec().into()),
+			"key1 should exist after reopen"
+		);
+		assert_eq!(
+			txn.get(b"key2").unwrap(),
+			Some(b"value2".to_vec().into()),
+			"key2 should exist after reopen"
+		);
+
+		tree2.close().await.unwrap();
+	}
+
+	/// Tests that the active memtable's WAL number is correctly updated after
+	/// each memtable swap during flush.
+	#[test_log::test(tokio::test)]
+	async fn test_memtable_wal_number_after_swap() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
+		});
+
+		let tree = Tree::new(opts.clone()).unwrap();
+
+		// Track WAL numbers through explicit flush cycles
+		let wal_1 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		log::info!("Initial WAL number: {}", wal_1);
+
+		// Write data and flush
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key1", b"value1").unwrap();
+		txn.commit().await.unwrap();
+
+		tree.flush().unwrap();
+
+		let wal_2 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		log::info!("WAL number after first flush: {}", wal_2);
+		assert!(wal_2 > wal_1, "WAL number should increase after flush: {} > {}", wal_2, wal_1);
+
+		// Write more and flush again
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key2", b"value2").unwrap();
+		txn.commit().await.unwrap();
+
+		tree.flush().unwrap();
+
+		let wal_3 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		log::info!("WAL number after second flush: {}", wal_3);
+		assert!(
+			wal_3 > wal_2,
+			"WAL number should increase after second flush: {} > {}",
+			wal_3,
+			wal_2
+		);
+
+		// Verify data survives close/reopen
+		tree.close().await.unwrap();
+
+		let tree2 = Tree::new(opts.clone()).unwrap();
+
+		let txn = tree2.begin().unwrap();
+		assert_eq!(
+			txn.get(b"key1").unwrap(),
+			Some(b"value1".to_vec().into()),
+			"key1 should exist after reopen"
+		);
+		assert_eq!(
+			txn.get(b"key2").unwrap(),
+			Some(b"value2".to_vec().into()),
+			"key2 should exist after reopen"
+		);
+
+		tree2.close().await.unwrap();
+	}
+
+	/// Tests that after multiple flushes and reopen, the new active memtable
+	/// has the correct WAL number assigned.
+	#[test_log::test(tokio::test)]
+	async fn test_wal_number_correct_after_reopen() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
+			opts.flush_on_close = true;
+		});
+
+		// Phase 1: Multiple flushes, track WAL numbers
+		let final_log_number;
+		let last_flushed_wal;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Do 3 write+flush cycles, tracking the last WAL that gets flushed
+			let mut current_wal;
+			for i in 0..3 {
+				// Get the WAL number before flush - this WAL will be flushed
+				current_wal = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+				txn.commit().await.unwrap();
+				tree.flush().unwrap();
+
+				log::info!(
+					"After flush {}: flushed WAL {}, new log_number={}",
+					i,
+					current_wal,
+					tree.core.inner.level_manifest.read().unwrap().get_log_number()
+				);
+			}
+
+			// The last WAL that was flushed is the one before the final flush
+			last_flushed_wal = tree.core.inner.level_manifest.read().unwrap().get_log_number() - 1;
+			final_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+
+			log::info!(
+				"Before close: last_flushed_wal={}, final_log_number={}",
+				last_flushed_wal,
+				final_log_number
+			);
+
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Reopen and verify active memtable's WAL number
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let reopened_log_number =
+				tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			let active_wal_number =
+				tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+
+			log::info!(
+				"After reopen: log_number={}, active_wal_number={}, last_flushed_wal={}",
+				reopened_log_number,
+				active_wal_number,
+				last_flushed_wal
+			);
+
+			// log_number should be preserved from before close
+			assert_eq!(
+				reopened_log_number, final_log_number,
+				"log_number should be preserved after reopen"
+			);
+
+			// Active memtable's WAL number should be exactly log_number
+			// because WAL opens starting from log_number
+			assert_eq!(
+				active_wal_number, reopened_log_number,
+				"Active memtable WAL number should equal log_number on fresh open"
+			);
+
+			// Active WAL number should be greater than the last flushed WAL
+			// (log_number = last_flushed_wal + 1)
+			assert!(
+				active_wal_number > last_flushed_wal,
+				"Active WAL number should be > last flushed WAL: {} > {}",
+				active_wal_number,
+				last_flushed_wal
+			);
+
+			// More specifically, it should be exactly last_flushed_wal + 1
+			assert_eq!(
+				active_wal_number,
+				last_flushed_wal + 1,
+				"Active WAL number should be last_flushed_wal + 1"
+			);
+
+			tree.close().await.unwrap();
+		}
+	}
+
 	#[test_log::test(tokio::test)]
 	async fn test_wal_files_after_multiple_open_close_cycles() {
 		// Simulates: open -> write 100 entries -> close, repeated multiple times
@@ -5434,6 +6104,216 @@ mod tests {
 				"BUG: After flush and reopen, WAL should start at incremental number, not 0. Got {}",
 				wal_num_after_reopen
 			);
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that new writes after crash recovery are not lost.
+	///
+	/// BUG SCENARIO (without fix):
+	/// 1. Crash with segments 1, 2, 3 on disk, manifest log_number=1
+	/// 2. Recovery: replays all segments, WAL opens at segment 1 for new writes
+	/// 3. Write key4 → goes to segment 1
+	/// 4. Flush → log_number becomes 2
+	/// 5. Second crash and recovery
+	/// 6. WAL recovery skips segments < 2 (skips segment 1!)
+	/// 7. key4 is LOST
+	///
+	/// FIX: WAL opens at max(log_number, highest_segment_on_disk)
+	/// - With fix: WAL opens at segment 3, key4 goes to segment 3
+	/// - After flush log_number=4, nothing is skipped, no data loss
+	#[test_log::test(tokio::test)]
+	async fn test_recovery_with_manually_created_wal_segments() {
+		use crate::batch::Batch;
+		use crate::sstable::InternalKeyKind;
+		use crate::vlog::ValueLocation;
+		use crate::wal::Wal;
+
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
+			opts.flush_on_close = false; // Don't auto-flush on close
+		});
+
+		let wal_path = opts.path.join("wal");
+
+		// Phase 1: Establish baseline - write key1, flush, close
+		// This creates: SST with key1, manifest log_number = 1
+		let log_number_after_phase1;
+		let last_seq_after_phase1;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key1", b"value1_from_sst").unwrap();
+			txn.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			log_number_after_phase1 =
+				tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			last_seq_after_phase1 =
+				tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+			log::info!(
+				"Phase 1: After flush, log_number={}, last_seq={}",
+				log_number_after_phase1,
+				last_seq_after_phase1
+			);
+
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Manually create WAL segments 2 and 3 with key2 and key3
+		// This simulates a crash where WAL rotations happened but manifest wasn't updated
+		let highest_segment_created;
+		{
+			log::info!("Phase 2: Creating additional WAL segments");
+
+			// Find the highest existing segment on disk
+			let highest_existing: u64 = std::fs::read_dir(&wal_path)
+				.unwrap()
+				.filter_map(|e| e.ok())
+				.filter_map(|e| {
+					e.path()
+						.file_name()
+						.and_then(|n| n.to_str())
+						.and_then(|n| n.strip_suffix(".wal"))
+						.and_then(|n| n.parse::<u64>().ok())
+				})
+				.max()
+				.unwrap_or(0);
+
+			// Create segment for key2
+			let segment_for_key2 = highest_existing + 1;
+			let next_seq = last_seq_after_phase1 + 1;
+			{
+				let mut batch = Batch::new(next_seq);
+				let encoded_value =
+					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value2_from_wal"))
+						.encode();
+				batch.add_record(InternalKeyKind::Set, b"key2", Some(&encoded_value), 0).unwrap();
+
+				let mut wal = Wal::open_with_min_log_number(
+					&wal_path,
+					segment_for_key2,
+					wal::Options::default(),
+				)
+				.unwrap();
+				wal.append(&batch.encode().unwrap()).unwrap();
+				wal.sync().unwrap();
+				wal.close().unwrap();
+				log::info!("Phase 2: Created segment {} with key2", segment_for_key2);
+			}
+
+			// Create segment for key3
+			let segment_for_key3 = segment_for_key2 + 1;
+			{
+				let mut batch = Batch::new(next_seq + 1);
+				let encoded_value =
+					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value3_from_wal"))
+						.encode();
+				batch.add_record(InternalKeyKind::Set, b"key3", Some(&encoded_value), 0).unwrap();
+
+				let mut wal = Wal::open_with_min_log_number(
+					&wal_path,
+					segment_for_key3,
+					wal::Options::default(),
+				)
+				.unwrap();
+				wal.append(&batch.encode().unwrap()).unwrap();
+				wal.sync().unwrap();
+				wal.close().unwrap();
+				log::info!("Phase 2: Created segment {} with key3", segment_for_key3);
+			}
+
+			highest_segment_created = segment_for_key3;
+		}
+
+		// Phase 3: First recovery - open Tree, verify key2/key3 recovered, then write NEW data
+		// This is where the bug manifests:
+		// - WITHOUT FIX: WAL opens at log_number (1), new writes go to segment 1
+		// - WITH FIX: WAL opens at highest (3), new writes go to segment 3
+		let active_wal_after_recovery;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
+			let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			log::info!(
+				"Phase 3: active_wal={}, log_number={}, highest_created={}",
+				active_wal_after_recovery,
+				log_number,
+				highest_segment_created
+			);
+
+			// KEY ASSERTION: WAL should open at highest segment, not log_number
+			assert_eq!(
+				active_wal_after_recovery, highest_segment_created,
+				"BUG: WAL opened at {} but should open at highest segment {} to prevent data loss",
+				active_wal_after_recovery, highest_segment_created
+			);
+
+			// Verify initial recovery worked
+			let txn = tree.begin().unwrap();
+			assert!(txn.get(b"key1").unwrap().is_some(), "key1 should exist");
+			assert!(txn.get(b"key2").unwrap().is_some(), "key2 should exist");
+			assert!(txn.get(b"key3").unwrap().is_some(), "key3 should exist");
+			drop(txn);
+
+			// Write NEW data after recovery - this is the data that could be lost
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key4_new_after_recovery", b"value4").unwrap();
+			txn.commit().await.unwrap();
+			log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
+
+			// Flush - this updates log_number
+			tree.flush().unwrap();
+			let log_number_after_flush =
+				tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
+
+			// Write more data that stays in WAL (not flushed)
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key5_unflushed", b"value5").unwrap();
+			txn.commit().await.unwrap();
+			log::info!("Phase 3: Wrote key5 (unflushed)");
+
+			// Close without flush (simulating crash)
+			tree.close().await.unwrap();
+		}
+
+		// Phase 4: Second recovery - verify NO data loss
+		// Without the fix, key4 and key5 would be lost because they were written
+		// to segment 1 (if WAL opened there), and segment 1 is now skipped
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let txn = tree.begin().unwrap();
+
+			// Original data should still exist
+			assert!(txn.get(b"key1").unwrap().is_some(), "key1 should persist");
+			assert!(txn.get(b"key2").unwrap().is_some(), "key2 should persist");
+			assert!(txn.get(b"key3").unwrap().is_some(), "key3 should persist");
+
+			// CRITICAL: New data written after recovery should NOT be lost
+			let key4 = txn.get(b"key4_new_after_recovery").unwrap();
+			assert_eq!(
+				key4,
+				Some(b"value4".to_vec().into()),
+				"DATA LOSS BUG: key4 written after recovery was lost! \
+				 This happens when WAL opens at log_number instead of highest segment."
+			);
+
+			let key5 = txn.get(b"key5_unflushed").unwrap();
+			assert_eq!(
+				key5,
+				Some(b"value5".to_vec().into()),
+				"DATA LOSS BUG: key5 (unflushed) was lost!"
+			);
+
+			log::info!("Phase 4: All data verified - no data loss!");
 
 			tree.close().await.unwrap();
 		}
