@@ -415,9 +415,9 @@ impl CoreInner {
 		let wal_that_was_flushed = match flushed_wal_number {
 			Some(num) => num,
 			None => {
-				// No explicit WAL provided, use current active WAL
-				// This happens during shutdown when no rotation occurred
-				self.wal.read().get_active_log_number()
+				// No explicit WAL provided, use the memtable's stored WAL number
+				// This is the WAL that was active when the memtable started receiving writes
+				memtable_wal_number
 			}
 		};
 
@@ -578,7 +578,11 @@ impl CoreInner {
 
 		// Flush each immutable memtable using its pre-assigned table_id and WAL number
 		// These were assigned when the memtable was moved from active to immutable
-		let mut first_error: Option<Error> = None;
+		//
+		// We use fail-fast because:
+		// 1. Successfully flushed memtables already updated log_number (their WALs can be deleted)
+		// 2. Failed memtable's WAL is preserved (its wal_number >= current log_number)
+		// 3. On restart, WAL replay recovers all unflushed data
 		let mut flushed_count = 0;
 
 		for entry in immutables_to_flush {
@@ -590,33 +594,18 @@ impl CoreInner {
 				continue;
 			}
 
-			match self.flush_single_immutable_memtable(
+			// Fail-fast: return immediately on error
+			// WAL replay will recover this and subsequent memtables on restart
+			self.flush_single_immutable_memtable(entry.table_id, entry.wal_number, entry.memtable)?;
+
+			flushed_count += 1;
+			log::debug!(
+				"Flushed immutable memtable {}/{}: table_id={}, wal_number={}",
+				flushed_count,
+				immutable_count,
 				entry.table_id,
-				entry.wal_number,
-				entry.memtable,
-			) {
-				Ok(_) => {
-					flushed_count += 1;
-					log::debug!(
-						"Flushed immutable memtable {}/{}: table_id={}, wal_number={}",
-						flushed_count,
-						immutable_count,
-						entry.table_id,
-						entry.wal_number
-					);
-				}
-				Err(e) => {
-					log::error!(
-						"Failed to flush immutable memtable table_id={}: {}",
-						entry.table_id,
-						e
-					);
-					// Continue flushing other memtables, but remember the error
-					if first_error.is_none() {
-						first_error = Some(e);
-					}
-				}
-			}
+				entry.wal_number
+			);
 		}
 
 		if flushed_count > 0 {
@@ -636,22 +625,17 @@ impl CoreInner {
 			// - Gets a new (highest) table_id
 			// - Updates log_number to mark WAL as flushed
 			// - Does NOT rotate WAL (we pass None)
-			match self.flush_memtable_and_update_manifest(None) {
-				Ok(Some(table)) => {
+			// Fail-fast: return immediately on error
+			match self.flush_memtable_and_update_manifest(None)? {
+				Some(table) => {
 					log::info!(
 						"Active memtable flushed: table_id={}, file_size={}",
 						table.id,
 						table.meta.properties.file_size
 					);
 				}
-				Ok(None) => {
+				None => {
 					log::debug!("Active memtable was empty, skipped flush");
-				}
-				Err(e) => {
-					log::error!("Failed to flush active memtable: {}", e);
-					if first_error.is_none() {
-						first_error = Some(e);
-					}
 				}
 			}
 		} else {
@@ -678,11 +662,6 @@ impl CoreInner {
 					current_wal + 1
 				);
 			}
-		}
-
-		// Return first error if any occurred
-		if let Some(e) = first_error {
-			return Err(e);
 		}
 
 		log::info!("All memtables flushed successfully for shutdown");
