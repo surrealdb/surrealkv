@@ -645,8 +645,10 @@ impl CoreInner {
 			// This marks the WAL as safe to delete
 			if flushed_count > 0 {
 				let current_wal = self.wal.read().get_active_log_number();
-				let mut changeset = ManifestChangeSet::default();
-				changeset.log_number = Some(current_wal + 1);
+				let changeset = ManifestChangeSet {
+					log_number: Some(current_wal + 1),
+					..Default::default()
+				};
 
 				let mut manifest = self.level_manifest.write()?;
 				manifest.apply_changeset(&changeset)?;
@@ -5196,17 +5198,19 @@ mod tests {
 			);
 
 			// Verify table_ids are in ascending order
-			let manifest = tree2.core.inner.level_manifest.read().unwrap();
-			let mut prev_id = 0u64;
-			for table in manifest.iter() {
-				assert!(
-					table.id > prev_id || prev_id == 0,
-					"Table IDs should be in ascending order: prev={}, current={}",
-					prev_id,
-					table.id
-				);
-				prev_id = table.id;
-			}
+			{
+				let manifest = tree2.core.inner.level_manifest.read().unwrap();
+				let mut prev_id = 0u64;
+				for table in manifest.iter() {
+					assert!(
+						table.id > prev_id || prev_id == 0,
+						"Table IDs should be in ascending order: prev={}, current={}",
+						prev_id,
+						table.id
+					);
+					prev_id = table.id;
+				}
+			} // Drop manifest before await
 
 			tree2.close().await.unwrap();
 		}
@@ -6099,6 +6103,210 @@ mod tests {
 				"BUG: After flush and reopen, WAL should start at incremental number, not 0. Got {}",
 				wal_num_after_reopen
 			);
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that new writes after crash recovery are not lost.
+	///
+	/// BUG SCENARIO (without fix):
+	/// 1. Crash with segments 1, 2, 3 on disk, manifest log_number=1
+	/// 2. Recovery: replays all segments, WAL opens at segment 1 for new writes
+	/// 3. Write key4 → goes to segment 1
+	/// 4. Flush → log_number becomes 2
+	/// 5. Second crash and recovery
+	/// 6. WAL recovery skips segments < 2 (skips segment 1!)
+	/// 7. key4 is LOST
+	///
+	/// FIX: WAL opens at max(log_number, highest_segment_on_disk)
+	/// - With fix: WAL opens at segment 3, key4 goes to segment 3
+	/// - After flush log_number=4, nothing is skipped, no data loss
+	#[test_log::test(tokio::test)]
+	async fn test_recovery_with_manually_created_wal_segments() {
+		use crate::batch::Batch;
+		use crate::sstable::InternalKeyKind;
+		use crate::vlog::ValueLocation;
+		use crate::wal::Wal;
+
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
+			opts.flush_on_close = false; // Don't auto-flush on close
+		});
+
+		let wal_path = opts.path.join("wal");
+
+		// Phase 1: Establish baseline - write key1, flush, close
+		// This creates: SST with key1, manifest log_number = 1
+		let log_number_after_phase1;
+		let last_seq_after_phase1;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key1", b"value1_from_sst").unwrap();
+			txn.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			log_number_after_phase1 =
+				tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			last_seq_after_phase1 =
+				tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+			log::info!(
+				"Phase 1: After flush, log_number={}, last_seq={}",
+				log_number_after_phase1,
+				last_seq_after_phase1
+			);
+
+			tree.close().await.unwrap();
+		}
+
+		// Phase 2: Manually create WAL segments 2 and 3 with key2 and key3
+		// This simulates a crash where WAL rotations happened but manifest wasn't updated
+		let highest_segment_created;
+		{
+			log::info!("Phase 2: Creating additional WAL segments");
+
+			// Find the highest existing segment on disk
+			let highest_existing: u64 = std::fs::read_dir(&wal_path)
+				.unwrap()
+				.filter_map(|e| e.ok())
+				.filter_map(|e| {
+					e.path()
+						.file_name()
+						.and_then(|n| n.to_str())
+						.and_then(|n| n.strip_suffix(".wal"))
+						.and_then(|n| n.parse::<u64>().ok())
+				})
+				.max()
+				.unwrap_or(0);
+
+			// Create segment for key2
+			let segment_for_key2 = highest_existing + 1;
+			let next_seq = last_seq_after_phase1 + 1;
+			{
+				let mut batch = Batch::new(next_seq);
+				let encoded_value =
+					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value2_from_wal"))
+						.encode();
+				batch.add_record(InternalKeyKind::Set, b"key2", Some(&encoded_value), 0).unwrap();
+
+				let mut wal =
+					Wal::open_with_log_number(&wal_path, segment_for_key2, wal::Options::default())
+						.unwrap();
+				wal.append(&batch.encode().unwrap()).unwrap();
+				wal.sync().unwrap();
+				wal.close().unwrap();
+				log::info!("Phase 2: Created segment {} with key2", segment_for_key2);
+			}
+
+			// Create segment for key3
+			let segment_for_key3 = segment_for_key2 + 1;
+			{
+				let mut batch = Batch::new(next_seq + 1);
+				let encoded_value =
+					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value3_from_wal"))
+						.encode();
+				batch.add_record(InternalKeyKind::Set, b"key3", Some(&encoded_value), 0).unwrap();
+
+				let mut wal =
+					Wal::open_with_log_number(&wal_path, segment_for_key3, wal::Options::default())
+						.unwrap();
+				wal.append(&batch.encode().unwrap()).unwrap();
+				wal.sync().unwrap();
+				wal.close().unwrap();
+				log::info!("Phase 2: Created segment {} with key3", segment_for_key3);
+			}
+
+			highest_segment_created = segment_for_key3;
+		}
+
+		// Phase 3: First recovery - open Tree, verify key2/key3 recovered, then write NEW data
+		// This is where the bug manifests:
+		// - WITHOUT FIX: WAL opens at log_number (1), new writes go to segment 1
+		// - WITH FIX: WAL opens at highest (3), new writes go to segment 3
+		let active_wal_after_recovery;
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
+			let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			log::info!(
+				"Phase 3: active_wal={}, log_number={}, highest_created={}",
+				active_wal_after_recovery,
+				log_number,
+				highest_segment_created
+			);
+
+			// KEY ASSERTION: WAL should open at highest segment, not log_number
+			assert_eq!(
+				active_wal_after_recovery, highest_segment_created,
+				"BUG: WAL opened at {} but should open at highest segment {} to prevent data loss",
+				active_wal_after_recovery, highest_segment_created
+			);
+
+			// Verify initial recovery worked
+			let txn = tree.begin().unwrap();
+			assert!(txn.get(b"key1").unwrap().is_some(), "key1 should exist");
+			assert!(txn.get(b"key2").unwrap().is_some(), "key2 should exist");
+			assert!(txn.get(b"key3").unwrap().is_some(), "key3 should exist");
+			drop(txn);
+
+			// Write NEW data after recovery - this is the data that could be lost
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key4_new_after_recovery", b"value4").unwrap();
+			txn.commit().await.unwrap();
+			log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
+
+			// Flush - this updates log_number
+			tree.flush().unwrap();
+			let log_number_after_flush =
+				tree.core.inner.level_manifest.read().unwrap().get_log_number();
+			log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
+
+			// Write more data that stays in WAL (not flushed)
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"key5_unflushed", b"value5").unwrap();
+			txn.commit().await.unwrap();
+			log::info!("Phase 3: Wrote key5 (unflushed)");
+
+			// Close without flush (simulating crash)
+			tree.close().await.unwrap();
+		}
+
+		// Phase 4: Second recovery - verify NO data loss
+		// Without the fix, key4 and key5 would be lost because they were written
+		// to segment 1 (if WAL opened there), and segment 1 is now skipped
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			let txn = tree.begin().unwrap();
+
+			// Original data should still exist
+			assert!(txn.get(b"key1").unwrap().is_some(), "key1 should persist");
+			assert!(txn.get(b"key2").unwrap().is_some(), "key2 should persist");
+			assert!(txn.get(b"key3").unwrap().is_some(), "key3 should persist");
+
+			// CRITICAL: New data written after recovery should NOT be lost
+			let key4 = txn.get(b"key4_new_after_recovery").unwrap();
+			assert_eq!(
+				key4,
+				Some(b"value4".to_vec().into()),
+				"DATA LOSS BUG: key4 written after recovery was lost! \
+				 This happens when WAL opens at log_number instead of highest segment."
+			);
+
+			let key5 = txn.get(b"key5_unflushed").unwrap();
+			assert_eq!(
+				key5,
+				Some(b"value5".to_vec().into()),
+				"DATA LOSS BUG: key5 (unflushed) was lost!"
+			);
+
+			log::info!("Phase 4: All data verified - no data loss!");
 
 			tree.close().await.unwrap();
 		}
