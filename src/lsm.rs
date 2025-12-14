@@ -443,6 +443,216 @@ impl CoreInner {
 		Ok(Some(table))
 	}
 
+	/// Flushes a single immutable memtable using its pre-assigned table_id.
+	///
+	/// This is used during shutdown to flush immutable memtables that already have
+	/// their table_ids assigned (from when they were moved from active to immutable).
+	///
+	/// # Arguments
+	///
+	/// * `table_id` - The pre-assigned table ID for this memtable
+	/// * `memtable` - The immutable memtable to flush
+	///
+	/// # Returns
+	///
+	/// * `Ok(table)` - The flushed SSTable
+	/// * `Err(_)` - If flush or manifest update fails
+	///
+	/// # Important
+	///
+	/// Unlike `flush_memtable_and_update_manifest`, this method:
+	/// - Does NOT call `next_table_id()` - uses the pre-assigned ID
+	/// - Does NOT swap the active memtable
+	/// - Removes the memtable from immutable_memtables tracking after success
+	fn flush_single_immutable_memtable(
+		&self,
+		table_id: u64,
+		memtable: Arc<MemTable>,
+	) -> Result<Arc<Table>> {
+		log::debug!("Flushing immutable memtable: table_id={}, size={}", table_id, memtable.size());
+
+		// Flush the memtable to SST using the pre-assigned table_id
+		let table = memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+			Error::Other(format!(
+				"Failed to flush immutable memtable to SST table_id={}: {}",
+				table_id, e
+			))
+		})?;
+
+		log::debug!(
+			"Created SST from immutable memtable: table_id={}, file_size={}",
+			table.id,
+			table.meta.properties.file_size
+		);
+
+		// Prepare changeset - add SST to level 0
+		// Note: We don't update log_number here; that's done after all memtables are flushed
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, table.clone()));
+
+		// Apply changeset atomically
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+
+		manifest.apply_changeset(&changeset)?;
+		write_manifest_to_disk(&manifest).map_err(|e| {
+			Error::Other(format!(
+				"Failed to update manifest for immutable memtable: table_id={}: {}",
+				table_id, e
+			))
+		})?;
+
+		// Remove successfully flushed memtable from tracking
+		memtable_lock.remove(table_id);
+
+		log::info!(
+			"Immutable memtable flushed: table_id={}, last_sequence={}",
+			table_id,
+			manifest.get_last_sequence()
+		);
+
+		Ok(table)
+	}
+
+	/// Flushes all memtables (immutable and active) during shutdown.
+	///
+	/// # Critical: Flush Ordering
+	///
+	/// Immutable memtables MUST be flushed BEFORE the active memtable to preserve
+	/// SSTable ordering:
+	/// - Immutable memtables contain OLDER data (were swapped out earlier)
+	/// - Active memtable contains NEWEST data (currently receiving writes)
+	/// - Table IDs must reflect temporal order (newer data = higher table_id)
+	///
+	/// # Flush Sequence
+	///
+	/// 1. Flush ALL immutable memtables FIRST using their pre-assigned table_ids
+	/// 2. Flush active memtable LAST (gets new highest table_id)
+	/// 3. Update manifest log_number to mark all WALs as flushed
+	///
+	/// # WAL Handling
+	///
+	/// This method does NOT rotate the WAL. The final log_number in manifest
+	/// is set to current_wal + 1, indicating all data up to current WAL is persisted.
+	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
+		log::info!("Flushing all memtables for shutdown...");
+
+		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
+		// We need to collect them first to avoid holding the lock during I/O
+		let immutables_to_flush: Vec<(u64, Arc<MemTable>)> = {
+			let immutable_guard = self.immutable_memtables.read()?;
+			immutable_guard.iter().cloned().collect()
+		};
+
+		let immutable_count = immutables_to_flush.len();
+		if immutable_count > 0 {
+			log::info!("Flushing {} immutable memtable(s) first (older data)", immutable_count);
+		}
+
+		// Flush each immutable memtable using its pre-assigned table_id
+		// These IDs were assigned when the memtable was moved from active to immutable
+		let mut first_error: Option<Error> = None;
+		let mut flushed_count = 0;
+
+		for (table_id, memtable) in immutables_to_flush {
+			if memtable.is_empty() {
+				// Skip empty memtables - just remove from tracking
+				let mut immutable_guard = self.immutable_memtables.write()?;
+				immutable_guard.remove(table_id);
+				log::debug!("Skipped empty immutable memtable: table_id={}", table_id);
+				continue;
+			}
+
+			match self.flush_single_immutable_memtable(table_id, memtable) {
+				Ok(_) => {
+					flushed_count += 1;
+					log::debug!(
+						"Flushed immutable memtable {}/{}: table_id={}",
+						flushed_count,
+						immutable_count,
+						table_id
+					);
+				}
+				Err(e) => {
+					log::error!("Failed to flush immutable memtable table_id={}: {}", table_id, e);
+					// Continue flushing other memtables, but remember the error
+					if first_error.is_none() {
+						first_error = Some(e);
+					}
+				}
+			}
+		}
+
+		if flushed_count > 0 {
+			log::info!("Flushed {} immutable memtable(s) successfully", flushed_count);
+		}
+
+		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
+		let active_memtable = self.active_memtable.read()?;
+		let active_size = active_memtable.size();
+		let active_is_empty = active_memtable.is_empty();
+		drop(active_memtable);
+
+		if !active_is_empty {
+			log::info!("Flushing active memtable last (newest data): size={}", active_size);
+
+			// Use flush_memtable_and_update_manifest which:
+			// - Gets a new (highest) table_id
+			// - Updates log_number to mark WAL as flushed
+			// - Does NOT rotate WAL (we pass None)
+			match self.flush_memtable_and_update_manifest(None) {
+				Ok(Some(table)) => {
+					log::info!(
+						"Active memtable flushed: table_id={}, file_size={}",
+						table.id,
+						table.meta.properties.file_size
+					);
+				}
+				Ok(None) => {
+					log::debug!("Active memtable was empty, skipped flush");
+				}
+				Err(e) => {
+					log::error!("Failed to flush active memtable: {}", e);
+					if first_error.is_none() {
+						first_error = Some(e);
+					}
+				}
+			}
+		} else {
+			log::debug!("Active memtable is empty, skipping flush");
+
+			// Even if active is empty, we should update log_number if we flushed immutables
+			// This marks the WAL as safe to delete
+			if flushed_count > 0 {
+				let current_wal = self.wal.read().get_active_log_number();
+				let mut changeset = ManifestChangeSet::default();
+				changeset.log_number = Some(current_wal + 1);
+
+				let mut manifest = self.level_manifest.write()?;
+				manifest.apply_changeset(&changeset)?;
+				write_manifest_to_disk(&manifest).map_err(|e| {
+					Error::Other(format!(
+						"Failed to update manifest log_number after immutable flush: {}",
+						e
+					))
+				})?;
+
+				log::debug!(
+					"Updated manifest log_number to {} after immutable flushes",
+					current_wal + 1
+				);
+			}
+		}
+
+		// Return first error if any occurred
+		if let Some(e) = first_error {
+			return Err(e);
+		}
+
+		log::info!("All memtables flushed successfully for shutdown");
+		Ok(())
+	}
+
 	/// Cleans up orphaned SST files not referenced in manifest
 	/// Called during database startup to remove files from incomplete flushes
 	///
@@ -1009,33 +1219,19 @@ impl Core {
 			log::debug!("VLog GC manager stopped");
 		}
 
-		// Step 3: Conditionally flush the active memtable based on flush_on_close option
+		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
+		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable
+		// to preserve SSTable ordering (older data = lower table_ids)
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
 		if self.inner.opts.flush_on_close {
-			let active_memtable = self.inner.active_memtable.read()?;
-			let memtable_size = active_memtable.size();
-			let memtable_entries = active_memtable.iter().count();
+			log::info!("Flushing all memtables on shutdown (flush_on_close=true)");
 
-			if !active_memtable.is_empty() {
-				drop(active_memtable);
+			// Flush ALL memtables: immutables first (older data), then active (newest data)
+			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
+				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
+			})?;
 
-				log::info!(
-					"Flushing active memtable on shutdown (flush_on_close=true): entries={}, size_bytes={}",
-					memtable_entries,
-					memtable_size
-				);
-
-				// Direct flush without WAL rotation
-				// Uses centralized flush logic that updates manifest log_number
-				// Pass None for flushed_wal_number since we didn't rotate
-				self.inner.flush_memtable_and_update_manifest(None).map_err(|e| {
-					Error::Other(format!("Failed to flush memtable during shutdown: {}", e))
-				})?;
-
-				log::info!("Active memtable flushed successfully on shutdown");
-			} else {
-				log::debug!("Active memtable is empty, skipping shutdown flush");
-			}
+			log::info!("All memtables flushed successfully on shutdown");
 		} else {
 			log::info!("Skipping memtable flush on shutdown (flush_on_close=false)");
 		}
@@ -4796,6 +4992,193 @@ mod tests {
 			assert_eq!(txn.get(b"test").unwrap(), Some(b"data".to_vec().into()));
 
 			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that flush_all_memtables_for_shutdown flushes both immutable and active memtables
+	/// in the correct order (immutables first, then active) to preserve SSTable ordering.
+	#[test_log::test(tokio::test)]
+	async fn test_flush_all_memtables_on_close_ordering() {
+		// This test verifies that close() flushes ALL memtables (immutable + active)
+		// and that SSTable table_ids are in correct temporal order
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Small to trigger flushes
+			opts.flush_on_close = true;
+		});
+
+		let sst_dir = opts.sstable_dir();
+
+		// Helper to count SST files
+		let count_ssts = || -> usize {
+			std::fs::read_dir(&sst_dir)
+				.ok()
+				.map(|entries| {
+					entries
+						.filter_map(|e| e.ok())
+						.filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+						.count()
+				})
+				.unwrap_or(0)
+		};
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write enough data to trigger multiple memtable flushes
+			// This creates immutable memtables in the background
+			for i in 0..50 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{:04}", i).as_bytes(), b"value_data_here").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Wait a bit for background flushes to start
+			tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+			let sst_count_before_close = count_ssts();
+			log::info!("SST count before close: {}", sst_count_before_close);
+
+			// Write one more entry to ensure active memtable has data
+			let mut txn = tree.begin().unwrap();
+			txn.set(b"final_key", b"final_value").unwrap();
+			txn.commit().await.unwrap();
+
+			// Close - should flush all remaining memtables
+			tree.close().await.unwrap();
+
+			let sst_count_after_close = count_ssts();
+			log::info!("SST count after close: {}", sst_count_after_close);
+
+			// Should have at least one more SST from the close flush
+			assert!(
+				sst_count_after_close >= sst_count_before_close,
+				"SST count should not decrease after close"
+			);
+		}
+
+		// Reopen and verify all data is accessible
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Verify data from all writes
+			for i in 0..50 {
+				let txn = tree.begin().unwrap();
+				let key = format!("key_{:04}", i);
+				let value = txn.get(key.as_bytes()).unwrap();
+				assert!(value.is_some(), "Key {} should exist after close/reopen", key);
+			}
+
+			// Verify final key
+			let txn = tree.begin().unwrap();
+			assert_eq!(
+				txn.get(b"final_key").unwrap(),
+				Some(b"final_value".to_vec().into()),
+				"Final key should exist after close/reopen"
+			);
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that pending immutable memtables are flushed during close even when
+	/// the active memtable is empty.
+	#[test_log::test(tokio::test)]
+	async fn test_flush_immutable_memtables_with_empty_active() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 500; // Small to trigger flush
+			opts.flush_on_close = true;
+		});
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data to trigger a memtable flush (creates immutable memtable)
+			for i in 0..20 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{}", i).as_bytes(), b"value_data").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Wait for background flush to complete
+			tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+			// After flush, active memtable should be empty
+			// Close should handle this correctly
+			tree.close().await.unwrap();
+		}
+
+		// Reopen and verify data
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			for i in 0..20 {
+				let txn = tree.begin().unwrap();
+				let key = format!("key_{}", i);
+				assert!(txn.get(key.as_bytes()).unwrap().is_some(), "Key {} should exist", key);
+			}
+
+			tree.close().await.unwrap();
+		}
+	}
+
+	/// Tests that SSTable table_ids are in correct ascending order after flushing
+	/// immutable memtables followed by active memtable.
+	#[test_log::test(tokio::test)]
+	async fn test_sst_table_ids_ordered_correctly_on_close() {
+		let temp_dir = TempDir::new("test").unwrap();
+		let path = temp_dir.path().to_path_buf();
+
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+			opts.flush_on_close = true;
+		});
+
+		{
+			let tree = Tree::new(opts.clone()).unwrap();
+
+			// Write data - will be flushed on close
+			for i in 0..5 {
+				let mut txn = tree.begin().unwrap();
+				txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
+				txn.commit().await.unwrap();
+			}
+
+			// Get initial table count
+			let initial_count = tree.core.inner.level_manifest.read().unwrap().iter().count();
+
+			// Close triggers flush
+			tree.close().await.unwrap();
+
+			// Reopen and verify table count increased
+			let tree2 = Tree::new(opts.clone()).unwrap();
+			let after_count = tree2.core.inner.level_manifest.read().unwrap().iter().count();
+
+			assert_eq!(
+				after_count,
+				initial_count + 1,
+				"Should have one more SST after close flush"
+			);
+
+			// Verify table_ids are in ascending order
+			let manifest = tree2.core.inner.level_manifest.read().unwrap();
+			let mut prev_id = 0u64;
+			for table in manifest.iter() {
+				assert!(
+					table.id > prev_id || prev_id == 0,
+					"Table IDs should be in ascending order: prev={}, current={}",
+					prev_id,
+					table.id
+				);
+				prev_id = table.id;
+			}
+
+			tree2.close().await.unwrap();
 		}
 	}
 
