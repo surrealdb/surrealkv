@@ -558,7 +558,11 @@ impl LSMIterator for BlockIterator {
 
 	// Get the current value
 	fn value(&self) -> Value {
-		self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+		if self.keys_only {
+			Bytes::new()
+		} else {
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+		}
 	}
 }
 

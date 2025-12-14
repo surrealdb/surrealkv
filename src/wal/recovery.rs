@@ -238,10 +238,10 @@ pub(crate) fn replay_wal(
 		Some(seq) => log::info!(
 			"WAL recovery complete: {} batches across {} segments, max_seq_num={}, total_entries={}",
 			total_batches_replayed,
-			segments_processed,
-			seq,
-			memtable.iter().count()
-		),
+		segments_processed,
+		seq,
+		memtable.iter(false).count()
+	),
 		None => log::info!("No data recovered from WAL segments"),
 	}
 
@@ -410,7 +410,7 @@ mod tests {
 		);
 
 		// Verify the memtable contains entries from BOTH segments
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert_eq!(
 			entry_count, 7,
 			"Memtable should contain all 7 entries from both WAL segments (6 sets + 1 delete)"
@@ -470,7 +470,7 @@ mod tests {
 		);
 
 		// Verify all 3 entries are in the memtable (from all 3 segments)
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert_eq!(entry_count, 3, "Memtable should contain all 3 entries from all 3 WAL segments");
 	}
 
@@ -514,7 +514,7 @@ mod tests {
 		);
 
 		// Verify all 4 entries from both segments are in the memtable
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert_eq!(entry_count, 4, "Memtable should contain all 4 entries from both WAL segments");
 	}
 
@@ -587,7 +587,7 @@ mod tests {
 		assert_eq!(max_seq_num, None, "Should have recovered None when first record is corrupted");
 
 		// Verify that the memtable contains no entries (since first record was corrupted)
-		let entry_count = recovered_memtable.read().unwrap().iter().count();
+		let entry_count = recovered_memtable.read().unwrap().iter(false).count();
 		assert_eq!(
 			entry_count, 0,
 			"Should have recovered 0 entries when first record is corrupted"
@@ -677,7 +677,7 @@ mod tests {
 		);
 
 		// Verify that the memtable contains entries from the first two batches
-		let entry_count = recovered_memtable.read().unwrap().iter().count();
+		let entry_count = recovered_memtable.read().unwrap().iter(false).count();
 		assert_eq!(entry_count, 4, "Should have recovered 4 entries from first two batches");
 	}
 
@@ -816,7 +816,7 @@ mod tests {
 		);
 
 		// Verify all 4 entries from both segments are recovered
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert_eq!(
 			entry_count, 4,
 			"Should recover all 4 entries from both WAL segments (2 from each)"
@@ -887,7 +887,7 @@ mod tests {
 		}
 
 		// Verify only segment 0's data is in memtable (segment 2 should NOT be processed)
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert_eq!(
 			entry_count, 1,
 			"Should have only 1 entry from segment 0 (segment 2 should NOT be processed)"

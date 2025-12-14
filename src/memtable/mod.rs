@@ -207,7 +207,7 @@ impl MemTable {
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone());
 
-			let iter = self.iter();
+			let iter = self.iter(false);
 			let iter = Box::new(iter);
 			let merge_iter = MergeIterator::new(vec![iter], false);
 			for (key, encoded_val) in merge_iter {
@@ -228,10 +228,17 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
-		self.map.iter().map(|entry| {
+	pub(crate) fn iter(
+		&self,
+		keys_only: bool,
+	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
-			let value = entry.value().clone();
+			let value = if keys_only {
+				Bytes::new()
+			} else {
+				entry.value().clone()
+			};
 			(Arc::new(key), value)
 		})
 	}
@@ -239,6 +246,7 @@ impl MemTable {
 	pub(crate) fn range<R>(
 		&self,
 		range: R,
+		keys_only: bool,
 	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_
 	where
 		R: RangeBounds<Vec<u8>>,
@@ -292,9 +300,13 @@ impl MemTable {
 			Bound::Unbounded => Bound::Unbounded,
 		};
 
-		self.map.range((start_bound, end_bound)).map(|entry| {
+		self.map.range((start_bound, end_bound)).map(move |entry| {
 			let key = entry.key().clone();
-			let value = entry.value().clone();
+			let value = if keys_only {
+				Bytes::new()
+			} else {
+				entry.value().clone()
+			};
 			(Arc::new(key), value)
 		})
 	}
@@ -480,7 +492,7 @@ mod tests {
 		let memtable = Arc::new(MemTable::new());
 
 		// Test that iterator is empty
-		let entries: Vec<_> = memtable.iter().collect();
+		let entries: Vec<_> = memtable.iter(false).collect();
 		assert!(entries.is_empty());
 
 		// Test that is_empty returns true
@@ -496,7 +508,7 @@ mod tests {
 			create_test_memtable(vec![(s2b("key1"), s2b("value1"), InternalKeyKind::Set, None)]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(entries.len(), 1);
 
 		let (key, encoded_value) = &entries[0];
@@ -523,7 +535,7 @@ mod tests {
 		]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(entries.len(), 3);
 
 		// Extract user keys for comparison
@@ -552,7 +564,7 @@ mod tests {
 		]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(entries.len(), 3);
 
 		// Extract sequence numbers and values
@@ -614,7 +626,7 @@ mod tests {
 		]);
 
 		// Iterator should see all entries including tombstones
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 
 		// Count entries for each key
 		let mut key_counts = HashMap::new();
@@ -639,7 +651,7 @@ mod tests {
 		]);
 
 		// All key types should be visible in the iterator
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(entries.len(), 4);
 
 		// Extract and verify key information
@@ -693,7 +705,7 @@ mod tests {
 		]);
 
 		// Test inclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..=s2b("k")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("c")..=s2b("k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -705,7 +717,7 @@ mod tests {
 		assert_eq!(user_keys[4].as_ref(), b"k");
 
 		// Test exclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..s2b("k")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("c")..s2b("k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -728,7 +740,7 @@ mod tests {
 		]);
 
 		// Perform a range query from "a" to "f"
-		let range_entries: Vec<_> = memtable.range(s2b("a")..s2b("f")).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable.range(s2b("a")..s2b("f"), false).collect::<Vec<_>>();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();
@@ -774,7 +786,7 @@ mod tests {
 			(vec![0xFF, 0xFE, 0xFD], s2b("value4"), InternalKeyKind::Set, None),
 		]);
 
-		let entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(entries.len(), 4);
 
 		// Extract and verify user keys are in correct order
@@ -799,7 +811,7 @@ mod tests {
 		let (memtable, _) = create_test_memtable(entries);
 
 		// Test that all entries exist
-		let all_entries: Vec<_> = memtable.iter().collect::<Vec<_>>();
+		let all_entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
 		assert_eq!(all_entries.len(), 1000);
 
 		// Test specific gets

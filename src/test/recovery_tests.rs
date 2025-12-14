@@ -292,7 +292,7 @@ fn test_crash_during_wal_write_mid_batch() {
 			..
 		}) => {
 			// Expected corruption detected
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 10,
 				"Should recover at least batch1 (10 entries), got {}",
@@ -301,7 +301,7 @@ fn test_crash_during_wal_write_mid_batch() {
 		}
 		Ok(_) => {
 			// Also acceptable if corruption happens at boundary
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 10,
 				"Should recover at least batch1 (10 entries), got {}",
@@ -486,7 +486,7 @@ fn test_corruption_middle_segment_0() {
 		}) => {
 			assert_eq!(segment_id, 0);
 			// Should have some entries from before corruption point
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count < 100,
 				"Should have partial recovery from segment 0, got {}",
@@ -585,7 +585,7 @@ fn test_corruption_middle_of_middle_segment() {
 		}) => {
 			assert_eq!(segment_id, 2);
 			// Should have segments 0-1 (100) + partial segment 2
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 100,
 				"Should have at least 100 entries from segments 0-1, got {}",
@@ -621,7 +621,7 @@ fn test_corruption_last_segment() {
 		}) => {
 			assert_eq!(segment_id, 4);
 			// Should have segments 0-3 (100 entries) at minimum
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 100,
 				"Should have at least segments 0-3 (100 entries), got {}",
@@ -657,12 +657,12 @@ fn test_truncated_wal_file() {
 		}) => {
 			// Truncation detected as corruption in segment 1
 			assert!(segment_id >= 1, "Corruption should be in segment 1 or later");
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
 		}
 		Ok(_) => {
 			// Also acceptable for clean truncation at record boundary
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
@@ -727,7 +727,7 @@ fn test_multiple_corruptions_stop_at_first() {
 		}) => {
 			assert_eq!(segment_id, 1, "Should stop at first corruption (segment 1)");
 			// Should have segment 0 + partial segment 1
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 40,
 				"Should have at least segment 0 (40 entries), got {}",
@@ -764,7 +764,7 @@ fn test_crc_mismatch() {
 		}
 		Ok(_) => {
 			// Partial recovery with less than full entries
-			assert!(memtable.iter().count() < 40, "Should have partial recovery");
+			assert!(memtable.iter(false).count() < 40, "Should have partial recovery");
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
 	}
@@ -891,7 +891,7 @@ fn test_tail_corruption_recovery() {
 			..
 		}) => {
 			// Expected - tail corruption detected
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 30,
 				"Should recover most data despite tail corruption, got {}",
@@ -900,7 +900,7 @@ fn test_tail_corruption_recovery() {
 		}
 		Ok(_) => {
 			// Also acceptable if corruption was at a clean boundary
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(
 				entry_count >= 30,
 				"Should recover most data despite tail corruption, got {}",
@@ -983,7 +983,7 @@ fn test_sequence_after_corruption() {
 		}) => {
 			assert_eq!(segment_id, 1);
 			// Should have at least segment 0 (101 entries)
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count >= 101, "Should have at least segment 0");
 		}
 		_ => panic!("Expected WalCorruption error in segment 1"),
@@ -1160,7 +1160,7 @@ fn test_corruption_at_min_wal_boundary() {
 		}) => {
 			assert_eq!(segment_id, 3);
 			// May have partial data from segment 3 before corruption
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count < 24 * 3, "Should have less than all unflushed segments");
 		}
 		_ => panic!("Expected WalCorruption error in segment 3"),
@@ -1492,7 +1492,7 @@ fn test_symlink_to_wal_segment() {
 		let _result = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Should process files (might process symlink as separate segment or skip it)
-		let entry_count = memtable.iter().count();
+		let entry_count = memtable.iter(false).count();
 		assert!(entry_count >= 42, "Should process at least original segment");
 	}
 }
@@ -1525,7 +1525,7 @@ fn test_concurrent_wal_directory_modifications() {
 			// Expected - garbage file detected as corruption
 			assert_eq!(segment_id, 2, "Corruption should be in segment 2");
 			// Should have recovered segments 0-1
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count >= 90, "Should have recovered segments 0-1, got {}", entry_count);
 		}
 		Ok(_) => {
@@ -1669,7 +1669,7 @@ fn test_compressed_data_corruption() {
 			// Expected corruption detected
 		}
 		Ok(_) => {
-			let entry_count = memtable.iter().count();
+			let entry_count = memtable.iter(false).count();
 			assert!(entry_count < 60, "Should detect corruption in compressed data");
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
