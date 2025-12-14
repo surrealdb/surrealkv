@@ -143,7 +143,7 @@ impl CoreInner {
 		// This avoids creating intermediate empty WAL files
 		let wal_path = opts.wal_dir();
 		let wal_instance =
-			Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
@@ -1257,8 +1257,6 @@ impl Core {
 			})?;
 
 			log::info!("All memtables flushed successfully on shutdown");
-		} else {
-			log::info!("Skipping memtable flush on shutdown (flush_on_close=false)");
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
@@ -1454,8 +1452,11 @@ impl Tree {
 			let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
 			let mut wal_guard = self.core.inner.wal.write();
 			let wal_path = self.core.inner.opts.path.join("wal");
-			let new_wal =
-				Wal::open_with_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+			let new_wal = Wal::open_with_min_log_number(
+				&wal_path,
+				manifest_log_number,
+				wal::Options::default(),
+			)?;
 			*wal_guard = new_wal;
 		}
 
@@ -6194,9 +6195,12 @@ mod tests {
 						.encode();
 				batch.add_record(InternalKeyKind::Set, b"key2", Some(&encoded_value), 0).unwrap();
 
-				let mut wal =
-					Wal::open_with_log_number(&wal_path, segment_for_key2, wal::Options::default())
-						.unwrap();
+				let mut wal = Wal::open_with_min_log_number(
+					&wal_path,
+					segment_for_key2,
+					wal::Options::default(),
+				)
+				.unwrap();
 				wal.append(&batch.encode().unwrap()).unwrap();
 				wal.sync().unwrap();
 				wal.close().unwrap();
@@ -6212,9 +6216,12 @@ mod tests {
 						.encode();
 				batch.add_record(InternalKeyKind::Set, b"key3", Some(&encoded_value), 0).unwrap();
 
-				let mut wal =
-					Wal::open_with_log_number(&wal_path, segment_for_key3, wal::Options::default())
-						.unwrap();
+				let mut wal = Wal::open_with_min_log_number(
+					&wal_path,
+					segment_for_key3,
+					wal::Options::default(),
+				)
+				.unwrap();
 				wal.append(&batch.encode().unwrap()).unwrap();
 				wal.sync().unwrap();
 				wal.close().unwrap();

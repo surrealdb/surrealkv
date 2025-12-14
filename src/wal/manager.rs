@@ -61,16 +61,16 @@ impl Wal {
 	/// # Arguments
 	///
 	/// * `dir` - WAL directory path
-	/// * `starting_log_number` - The log number to start from
+	/// * `min_log_number` - Minimum log number (actual may be higher if existing segments exist)
 	/// * `opts` - WAL options
 	///
 	/// # Behavior
 	///
-	/// Instead of creating intermediate empty files (0, 1, 2, 3, 4), this directly
-	/// creates the WAL at the target number (4).
-	pub(crate) fn open_with_log_number(
+	/// Uses `max(min_log_number, highest_on_disk)` as the actual starting log number.
+	/// This ensures we never write to a log number lower than existing segments on disk.
+	pub(crate) fn open_with_min_log_number(
 		dir: &Path,
-		starting_log_number: u64,
+		min_log_number: u64,
 		opts: Options,
 	) -> Result<Self> {
 		// Ensure the options are valid
@@ -82,7 +82,7 @@ impl Wal {
 		// Clean up any stale .wal.repair files from previous crashed repair attempts
 		Self::cleanup_stale_repair_files(dir)?;
 
-		// Use max of starting_log_number and highest existing segment on disk.
+		// Use max of min_log_number and highest existing segment on disk.
 		// This prevents writing to an old segment that could be skipped on recovery.
 		//
 		// Example scenario this fixes:
@@ -92,12 +92,12 @@ impl Wal {
 		// 4. If memtable flushes (log_number = 6), then crash again
 		// 5. Segment #5 would be skipped, losing the new writes
 		let highest_on_disk = Self::calculate_active_log_number(dir).unwrap_or(0);
-		let active_log_number = std::cmp::max(starting_log_number, highest_on_disk);
+		let active_log_number = std::cmp::max(min_log_number, highest_on_disk);
 
-		if active_log_number > starting_log_number {
+		if active_log_number > min_log_number {
 			log::info!(
-				"WAL: advancing from log_number {} to {} (highest existing segment)",
-				starting_log_number,
+				"WAL: advancing from min_log_number {} to {} (highest existing segment)",
+				min_log_number,
 				active_log_number
 			);
 		}
@@ -784,7 +784,7 @@ mod tests {
 		);
 	}
 
-	/// Tests that `open_with_log_number` uses `max(starting_log_number, highest_on_disk)`.
+	/// Tests that `open_with_min_log_number` uses `max(min_log_number, highest_on_disk)`.
 	///
 	/// This verifies the fix for a data loss bug:
 	/// - Scenario: Crash with segments #1, #2, #3 on disk, manifest log_number=1
@@ -792,7 +792,7 @@ mod tests {
 	/// - If flush updates log_number to 2, then crash → segment 1 skipped → DATA LOSS
 	/// - With fix: WAL opens at segment 3 (highest), new writes safe
 	#[test]
-	fn test_open_with_log_number_uses_highest_segment() {
+	fn test_open_with_min_log_number_uses_highest_segment() {
 		let temp_dir = create_temp_directory();
 		let wal_path = temp_dir.path();
 		let opts = Options::default();
@@ -800,7 +800,7 @@ mod tests {
 		// Step 1: Create WAL segments 1, 2, 3 using the WAL API
 		// Create segment 1 (00000000000000000001.wal)
 		{
-			let mut wal = Wal::open_with_log_number(wal_path, 1, opts.clone()).unwrap();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts.clone()).unwrap();
 			assert_eq!(wal.get_active_log_number(), 1);
 			wal.append(b"data_in_segment_1").unwrap();
 			wal.close().unwrap();
@@ -808,8 +808,8 @@ mod tests {
 
 		// Create segment 2
 		{
-			let mut wal = Wal::open_with_log_number(wal_path, 2, opts.clone()).unwrap();
-			// At this point, highest on disk is 1, starting is 2, so max(2, 1) = 2
+			let mut wal = Wal::open_with_min_log_number(wal_path, 2, opts.clone()).unwrap();
+			// At this point, highest on disk is 1, min is 2, so max(2, 1) = 2
 			assert_eq!(wal.get_active_log_number(), 2);
 			wal.append(b"data_in_segment_2").unwrap();
 			wal.close().unwrap();
@@ -817,7 +817,7 @@ mod tests {
 
 		// Create segment 3
 		{
-			let mut wal = Wal::open_with_log_number(wal_path, 3, opts.clone()).unwrap();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 3, opts.clone()).unwrap();
 			assert_eq!(wal.get_active_log_number(), 3);
 			wal.append(b"data_in_segment_3").unwrap();
 			wal.close().unwrap();
@@ -840,32 +840,32 @@ mod tests {
 		assert!(segments.contains(&2), "Segment 2 should exist");
 		assert!(segments.contains(&3), "Segment 3 should exist");
 
-		// Step 2: Test the fix - open with log_number=1 (as manifest would say after crash)
+		// Step 2: Test the fix - open with min_log_number=1 (as manifest would say after crash)
 		// The fix should cause WAL to open at segment 3 (highest on disk), not 1
 		{
-			let mut wal = Wal::open_with_log_number(wal_path, 1, opts.clone()).unwrap();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts.clone()).unwrap();
 
 			let active = wal.get_active_log_number();
-			log::info!("After open_with_log_number(1): active_log_number = {}", active);
+			log::info!("After open_with_min_log_number(1): active_log_number = {}", active);
 
-			// KEY ASSERTION: WAL should open at highest segment, not log_number
+			// KEY ASSERTION: WAL should open at highest segment, not min_log_number
 			assert_eq!(
 				active, 3,
-				"WAL should open at highest existing segment (3), not at log_number (1)"
+				"WAL should open at highest existing segment (3), not at min_log_number (1)"
 			);
 
 			wal.close().unwrap();
 		}
 
-		// Step 3: Edge case - open with log_number higher than any segment on disk
+		// Step 3: Edge case - open with min_log_number higher than any segment on disk
 		// max(5, 3) = 5, so should open at 5
 		{
-			let mut wal = Wal::open_with_log_number(wal_path, 5, opts.clone()).unwrap();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 5, opts.clone()).unwrap();
 
 			assert_eq!(
 				wal.get_active_log_number(),
 				5,
-				"WAL should open at log_number (5) when it's higher than any segment on disk (3)"
+				"WAL should open at min_log_number (5) when it's higher than any segment on disk (3)"
 			);
 
 			wal.close().unwrap();
