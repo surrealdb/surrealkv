@@ -267,7 +267,7 @@ impl WalTestHelper {
 	/// Verify that memtable contains expected keys
 	pub fn verify_entries(memtable: &Arc<MemTable>, expected_keys: &[String]) {
 		let mut found_keys = Vec::new();
-		for entry in memtable.iter() {
+		for entry in memtable.iter(false) {
 			// entry is (Arc<InternalKey>, Bytes)
 			let key = String::from_utf8(entry.0.user_key.to_vec()).unwrap();
 			found_keys.push(key);
@@ -292,7 +292,7 @@ impl WalTestHelper {
 
 	/// Verify entry count in memtable
 	pub fn verify_entry_count(memtable: &Arc<MemTable>, expected_count: usize) {
-		let actual_count = memtable.iter().count();
+		let actual_count = memtable.iter(false).count();
 		assert_eq!(
 			actual_count, expected_count,
 			"Entry count mismatch. Found: {}, Expected: {}",

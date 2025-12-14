@@ -708,15 +708,16 @@ impl<'a> KMergeIterator<'a> {
 			};
 
 			// Active memtable with range
-			let active_iter = state_ref.active.range(range.clone()).filter(move |item| {
-				// Filter out items that are not visible in this snapshot
-				item.0.seq_num() <= snapshot_seq_num
-			});
+			let active_iter =
+				state_ref.active.range(range.clone(), keys_only).filter(move |item| {
+					// Filter out items that are not visible in this snapshot
+					item.0.seq_num() <= snapshot_seq_num
+				});
 			iterators.push(Box::new(active_iter));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
-				let iter = memtable.range(range.clone()).filter(move |item| {
+				let iter = memtable.range(range.clone(), keys_only).filter(move |item| {
 					// Filter out items that are not visible in this snapshot
 					item.0.seq_num() <= snapshot_seq_num
 				});

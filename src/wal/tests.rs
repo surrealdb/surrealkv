@@ -143,7 +143,7 @@ fn test_wal_replay_all_segments() {
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries in memtable
-	let entry_count = memtable.iter().count();
+	let entry_count = memtable.iter(false).count();
 
 	// Verify sequence number is from the latest segment (304 = 300 + 4)
 	assert_eq!(sequence_number, 304, "Expected max sequence number from all segments");

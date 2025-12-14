@@ -1051,7 +1051,7 @@ impl Core {
 								// Successful replay after repair
 								log::info!(
 									"WAL replay after repair succeeded: {} entries recovered",
-									retry_memtable.iter().count()
+									retry_memtable.iter(true).count()
 								);
 								if !retry_memtable.is_empty() {
 									set_recovered_memtable(retry_memtable)?;
