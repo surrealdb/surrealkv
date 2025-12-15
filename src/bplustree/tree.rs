@@ -2,13 +2,17 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use quick_cache::{sync::Cache, Weighter};
 
 use crate::vfs::File as VfsFile;
 use crate::{Comparator, Key, Value};
+
+// Cache for local limits (constant for a given PAGE_SIZE)
+static LEAF_LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
+static INTERNAL_LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<File>;
@@ -912,8 +916,9 @@ impl LeafNode {
 	}
 
 	/// Find optimal split point that ensures both resulting leaves fit in a page.
-	/// Uses iterative packing algorithm similar to SQLite's balance_nonroot.
+	/// Uses hybrid approach: simple split for common cases, iterative algorithm when needed.
 	/// Takes the new entry (key, value) and its insert position into account.
+	/// Based on SQLite's balance() optimization (btree.c:9128).
 	fn find_split_point_for_insert(
 		&self,
 		new_key: &[u8],
@@ -922,6 +927,50 @@ impl LeafNode {
 	) -> usize {
 		debug_assert!(self.keys.len() >= 1, "Cannot split empty leaf");
 
+		let (_min_local, max_local) = calculate_local_limits(true);
+		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let new_payload = new_key.len() + new_value.len();
+
+		// Check if new entry needs overflow
+		let new_needs_overflow = new_payload > max_local;
+
+		// Check if any existing entry needs overflow
+		let has_overflow = self.keys.iter().zip(&self.values).any(|(k, v)| {
+			let payload = k.len() + v.len();
+			payload > max_local
+		});
+
+		// Calculate current free space (SQLite's check: nFree*3 <= usableSize*2)
+		let current_size = self.current_size();
+		let free_space = PAGE_SIZE - current_size;
+
+		// SQLite's optimization: Only use expensive algorithm if:
+		// 1. There IS overflow, OR
+		// 2. Free space > 2/3 of usable size (page is very full)
+		let needs_complex_split =
+			new_needs_overflow || has_overflow || (free_space * 3 > usable_size * 2);
+
+		if !needs_complex_split {
+			// Fast path: Simple split (like old algorithm)
+			let total = self.keys.len() + 1;
+			if insert_idx < total / 2 {
+				total / 2 - 1
+			} else {
+				total / 2
+			}
+		} else {
+			// Slow path: Complex iterative algorithm only when necessary
+			self.find_split_point_for_insert_complex(new_key, new_value, insert_idx)
+		}
+	}
+
+	/// Complex iterative split algorithm (used when overflow or size uncertainty exists)
+	fn find_split_point_for_insert_complex(
+		&self,
+		new_key: &[u8],
+		new_value: &[u8],
+		insert_idx: usize,
+	) -> usize {
 		let (min_local, max_local) = calculate_local_limits(true);
 		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
 		let max_page_size = PAGE_SIZE;
@@ -1014,32 +1063,36 @@ impl LeafNode {
 
 		// Phase 3: Rebalancing from right to left to avoid empty pages
 		// Similar to SQLite's rebalancing (lines 8600-8631)
+		// Only rebalance if there's significant imbalance (>25% difference)
 		if split_idx > 0 && split_idx < total_cells {
-			let mut optimized_split = split_idx;
-			let mut optimized_left = left_size;
-			let mut optimized_right = right_size;
+			let imbalance_threshold = left_size / 4;
+			if right_size < imbalance_threshold {
+				let mut optimized_split = split_idx;
+				let mut optimized_left = left_size;
+				let mut optimized_right = right_size;
 
-			// Try moving cells from right to left if it improves balance
-			for i in (0..split_idx).rev() {
-				let cell_size = cell_sizes[i];
-				let new_left = optimized_left - cell_size;
-				let new_right = optimized_right + cell_size;
+				// Try moving cells from right to left if it improves balance
+				for i in (0..split_idx).rev() {
+					let cell_size = cell_sizes[i];
+					let new_left = optimized_left - cell_size;
+					let new_right = optimized_right + cell_size;
 
-				// Only move if both still fit and it improves balance
-				if new_left <= max_page_size
-					&& new_right <= max_page_size
-					&& new_right > 0
-					&& (optimized_right == 0 || new_right + cell_size > optimized_left - cell_size)
-				{
-					optimized_left = new_left;
-					optimized_right = new_right;
-					optimized_split = i;
-				} else {
-					break;
+					// Only move if both still fit and it improves balance
+					if new_left <= max_page_size
+						&& new_right <= max_page_size
+						&& new_right > 0 && (optimized_right == 0
+						|| new_right + cell_size > optimized_left - cell_size)
+					{
+						optimized_left = new_left;
+						optimized_right = new_right;
+						optimized_split = i;
+					} else {
+						break;
+					}
 				}
-			}
 
-			split_idx = optimized_split;
+				split_idx = optimized_split;
+			}
 		}
 
 		// Convert back to original key index (account for inserted entry)
@@ -1432,7 +1485,7 @@ pub enum Durability {
 /// - minLocal = (usableSize - 12) * 32 / 255 - 23
 /// - maxLeaf = usableSize - 35
 /// - minLeaf = (usableSize - 12) * 32 / 255 - 23
-fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
+fn calculate_local_limits_internal(is_leaf: bool) -> (usize, usize) {
 	let header_size = if is_leaf {
 		LEAF_HEADER_SIZE
 	} else {
@@ -1448,6 +1501,17 @@ fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
 		let max_local = ((usable_size.saturating_sub(12)) * 64 / 255).saturating_sub(23);
 		let min_local = ((usable_size.saturating_sub(12)) * 32 / 255).saturating_sub(23);
 		(min_local, max_local)
+	}
+}
+
+/// Get cached local limits (cached version of calculate_local_limits_internal)
+/// This is much faster since the limits are constant for a given PAGE_SIZE
+#[inline]
+fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
+	if is_leaf {
+		*LEAF_LIMITS.get_or_init(|| calculate_local_limits_internal(true))
+	} else {
+		*INTERNAL_LIMITS.get_or_init(|| calculate_local_limits_internal(false))
 	}
 }
 
