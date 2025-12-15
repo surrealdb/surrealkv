@@ -912,6 +912,80 @@ impl LeafNode {
 		self.next_leaf = right.next_leaf;
 	}
 
+	/// Find optimal split point that ensures both resulting leaves fit in a page.
+	/// Takes the new entry (key, value) and its insert position into account.
+	fn find_split_point_for_insert(
+		&self,
+		new_key: &[u8],
+		new_value: &[u8],
+		insert_idx: usize,
+	) -> usize {
+		debug_assert!(self.keys.len() >= 1, "Cannot split empty leaf");
+
+		let max_per_entry = get_max_leaf_entry_bytes();
+
+		// Calculate the entry sizes including the new entry
+		let mut entry_sizes: Vec<usize> = Vec::with_capacity(self.keys.len() + 1);
+
+		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
+			if i == insert_idx {
+				// Insert new entry size at this position
+				let new_payload = new_key.len() + new_value.len();
+				let (new_on_page, new_needs_overflow) =
+					calculate_overflow(new_payload, max_per_entry);
+				entry_sizes.push(
+					KEY_SIZE_PREFIX
+						+ VALUE_SIZE_PREFIX
+						+ new_on_page + overflow_ptr_size(new_needs_overflow),
+				);
+			}
+
+			let payload_len = key.len() + value.len();
+			let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, max_per_entry);
+			entry_sizes.push(
+				KEY_SIZE_PREFIX
+					+ VALUE_SIZE_PREFIX
+					+ bytes_on_page + overflow_ptr_size(needs_overflow),
+			);
+		}
+
+		// Handle case where insert_idx is at the end
+		if insert_idx >= self.keys.len() {
+			let new_payload = new_key.len() + new_value.len();
+			let (new_on_page, new_needs_overflow) = calculate_overflow(new_payload, max_per_entry);
+			entry_sizes.push(
+				KEY_SIZE_PREFIX
+					+ VALUE_SIZE_PREFIX
+					+ new_on_page + overflow_ptr_size(new_needs_overflow),
+			);
+		}
+
+		let total_entries = entry_sizes.len();
+
+		// Try each possible split point and find one where both sides fit
+		for split_idx in 1..total_entries {
+			let left_size: usize =
+				LEAF_HEADER_SIZE + entry_sizes[..split_idx].iter().sum::<usize>();
+			let right_size: usize =
+				LEAF_HEADER_SIZE + entry_sizes[split_idx..].iter().sum::<usize>();
+
+			if left_size <= PAGE_SIZE && right_size <= PAGE_SIZE {
+				// Convert back to original key index (account for inserted entry)
+				if insert_idx < split_idx {
+					// New entry is on left side, so split_idx in expanded array
+					// corresponds to (split_idx - 1) in original array
+					return split_idx - 1;
+				} else {
+					return split_idx;
+				}
+			}
+		}
+
+		// Fallback: split in the middle by count (shouldn't happen with proper overflow)
+		self.keys.len().div_ceil(2)
+	}
+
+	/// Simple split point for cases where we don't have the new entry info
 	fn find_split_point(&self) -> usize {
 		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
 		self.keys.len().div_ceil(2)
@@ -1569,16 +1643,22 @@ impl<F: VfsFile> BPlusTree<F> {
 		key: &[u8],
 		value: &[u8],
 	) -> Result<(Bytes, u64, u64)> {
-		let split_idx = leaf.find_split_point();
-
-		let new_leaf_offset = self.allocate_page()?;
-		let mut new_leaf = LeafNode::new(new_leaf_offset);
-
 		let idx =
 			leaf.keys.binary_search_by(|k| self.compare.compare(k, key)).unwrap_or_else(|idx| idx);
 
 		let is_duplicate =
 			idx < leaf.keys.len() && self.compare.compare(key, &leaf.keys[idx]) == Ordering::Equal;
+
+		// Use size-aware split point that accounts for the new entry
+		let split_idx = if is_duplicate {
+			// For duplicates, we're just updating a value, use simple split
+			leaf.find_split_point()
+		} else {
+			leaf.find_split_point_for_insert(key, value, idx)
+		};
+
+		let new_leaf_offset = self.allocate_page()?;
+		let mut new_leaf = LeafNode::new(new_leaf_offset);
 
 		if idx < split_idx {
 			new_leaf.keys = leaf.keys.split_off(split_idx);

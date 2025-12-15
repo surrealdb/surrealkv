@@ -1034,7 +1034,7 @@ where
 		let head = self.inner.next()?;
 
 		// Keep only latest version of the key
-		let _ = self.skip_to_latest(&head.0.user_key);
+		self.skip_to_latest(&head.0.user_key).ok()?;
 
 		Some(head)
 	}
