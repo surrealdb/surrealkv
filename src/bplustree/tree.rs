@@ -923,16 +923,19 @@ impl LeafNode {
 	/// Find optimal split point that ensures both resulting leaves fit in a page.
 	/// Uses hybrid approach: simple split for common cases, iterative algorithm when needed.
 	/// Takes the new entry (key, value) and its insert position into account.
+	///
+	/// - `is_update`: If true, we're updating an existing entry (replacing, not adding).
+	///   The total entry count remains the same. If false, we're inserting a new entry.
 	fn find_split_point_for_insert(
 		&self,
 		new_key: &[u8],
 		new_value: &[u8],
 		insert_idx: usize,
+		is_update: bool,
 	) -> usize {
 		debug_assert!(!self.keys.is_empty(), "Cannot split empty leaf");
 
 		let (_min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 		let new_payload = new_key.len() + new_value.len();
 
 		// Check if new entry needs overflow
@@ -944,19 +947,17 @@ impl LeafNode {
 			payload > max_local
 		});
 
-		// Calculate current free space
-		let current_size = self.current_size();
-		let free_space = PAGE_SIZE - current_size;
-
-		// Only use expensive algorithm if:
-		// 1. There IS overflow, OR
-		// 2. Free space > 2/3 of usable size (page is very full)
-		let needs_complex_split =
-			new_needs_overflow || has_overflow || (free_space * 3 > usable_size * 2);
+		// Only use expensive algorithm if there IS overflow
+		// When overflow exists, we need precise size calculations to ensure both sides fit
+		let needs_complex_split = new_needs_overflow || has_overflow;
 
 		if !needs_complex_split {
 			// Fast path: Simple split (like old algorithm)
-			let total = self.keys.len() + 1;
+			let total = if is_update {
+				self.keys.len() // For updates, total stays the same
+			} else {
+				self.keys.len() + 1 // For inserts, we add one entry
+			};
 			if insert_idx < total / 2 {
 				total / 2 - 1
 			} else {
@@ -964,7 +965,7 @@ impl LeafNode {
 			}
 		} else {
 			// Slow path: Complex iterative algorithm only when necessary
-			self.find_split_point_for_insert_complex(new_key, new_value, insert_idx)
+			self.find_split_point_for_insert_complex(new_key, new_value, insert_idx, is_update)
 		}
 	}
 
@@ -974,26 +975,38 @@ impl LeafNode {
 		new_key: &[u8],
 		new_value: &[u8],
 		insert_idx: usize,
+		is_update: bool,
 	) -> usize {
 		let max_page_size = PAGE_SIZE;
 
 		// Phase 1: Calculate actual cell sizes for all entries including the new one
-		let mut cell_sizes = Vec::with_capacity(self.keys.len() + 1);
+		let capacity = if is_update {
+			self.keys.len() // For updates, total stays the same
+		} else {
+			self.keys.len() + 1 // For inserts, we add one entry
+		};
+		let mut cell_sizes = Vec::with_capacity(capacity);
 
-		// Build cell sizes array with new entry inserted at correct position
+		// Build cell sizes array with new entry inserted/replaced at correct position
 		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
 			if i == insert_idx {
-				// Insert new entry size at this position
+				// Add new entry size at this position
 				let size = leaf_entry_size(new_key, new_value);
 				cell_sizes.push(size);
+
+				// For updates, skip the old entry (we're replacing it, not adding)
+				// For inserts, continue to add the old entry after the new one
+				if is_update {
+					continue; // Skip adding the old entry
+				}
 			}
 
 			let size = leaf_entry_size(key, value);
 			cell_sizes.push(size);
 		}
 
-		// Handle case where insert_idx is at the end
-		if insert_idx >= self.keys.len() {
+		// Handle case where insert_idx is at the end (only for inserts, not updates)
+		if !is_update && insert_idx >= self.keys.len() {
 			let size = leaf_entry_size(new_key, new_value);
 			cell_sizes.push(size);
 		}
@@ -1064,17 +1077,15 @@ impl LeafNode {
 			// Move cells from left to right
 			// Iterate from split_idx down to 1, moving cells to improve balance
 			for i in (1..=split_idx).rev() {
-				let r = i - 1; // Right-most cell in left sibling
-				let d = i; // First cell to the left of right sibling
+				let r = i - 1; // Right-most cell in left sibling (being moved)
 
 				let sz_r = cell_sizes[r]; // Size of cell being moved from left
-				let sz_d = cell_sizes[d]; // Size of cell that would be at boundary
 
 				// Only move if it improves balance
-				// Condition: szRight+szD > szLeft-szR
+				// Condition: szRight+szR > szLeft-szR (moving cell r from left to right)
 				// This ensures moving the cell improves the balance between siblings
-				let new_right = sz_right_opt + sz_d;
-				let new_left = sz_left_opt - sz_r;
+				let new_right = sz_right_opt + sz_r; // Add the cell being moved
+				let new_left = sz_left_opt - sz_r; // Remove the cell being moved
 
 				// Check if moving improves balance
 				// Only move if right is not empty and the move improves balance
@@ -1096,11 +1107,14 @@ impl LeafNode {
 			split_idx = optimized_split;
 		}
 
-		// Convert back to original key index (account for inserted entry)
-		// The split_idx is in the expanded array (with new entry included)
-		// We need to convert it to the original array index
+		// Convert back to original key index
+		// For updates: split_idx directly maps to original array (same size)
+		// For inserts: split_idx is in expanded array (with new entry), needs conversion
 
-		if insert_idx < split_idx {
+		if is_update {
+			// For updates, split_idx directly maps to original array index
+			split_idx
+		} else if insert_idx < split_idx {
 			// New entry is on left side of split
 			// In expanded array: [entry0, ..., NEW_ENTRY, entry(insert_idx), ...]
 			// If split_idx=1: left=[NEW_ENTRY], right=[entry0, entry1, ...]
@@ -1131,13 +1145,6 @@ impl LeafNode {
 			// split_idx in expanded array directly maps to original array
 			split_idx
 		}
-	}
-
-	/// Simple split point for duplicate updates (no new entry being added).
-	/// Since we're just updating an existing value, we don't need to account for new entry size.
-	fn find_split_point_for_update(&self) -> usize {
-		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
-		self.keys.len().div_ceil(2)
 	}
 
 	// Check if this leaf can fit another key-value pair
@@ -1837,12 +1844,8 @@ impl<F: VfsFile> BPlusTree<F> {
 			idx < leaf.keys.len() && self.compare.compare(key, &leaf.keys[idx]) == Ordering::Equal;
 
 		// Use size-aware split point that accounts for the new entry
-		let split_idx = if is_duplicate {
-			// For duplicates, we're just updating a value, use simple split
-			leaf.find_split_point_for_update()
-		} else {
-			leaf.find_split_point_for_insert(key, value, idx)
-		};
+		// Unified function handles both inserts and updates
+		let split_idx = leaf.find_split_point_for_insert(key, value, idx, is_duplicate);
 
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
