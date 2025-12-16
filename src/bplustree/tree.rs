@@ -903,7 +903,10 @@ impl LeafNode {
 			right.keys[0].clone()
 		} else {
 			// Right is now empty, use the current last key
-			self.keys.last().unwrap().clone()
+			// This shouldn't happen - right should not become completely empty during rebalancing
+			self.keys.last().expect(
+				"take_from_right: left node should have at least one key after taking from right"
+			).clone()
 		}
 	}
 
@@ -1043,10 +1046,12 @@ impl LeafNode {
 				break;
 			}
 
-			// If we've exhausted all possibilities, fall back to middle split
+			// If we've exhausted all possibilities, this shouldn't happen
 			if split_idx == 0 || split_idx >= total_cells {
-				split_idx = total_cells / 2;
-				break;
+				panic!(
+				"find_split_point_for_insert_complex: exhausted all split possibilities (split_idx={}, total_cells={}, left_size={}, right_size={}, max_page_size={})",
+				split_idx, total_cells, left_size, right_size, max_page_size
+			);
 			}
 
 			// Safety check to prevent infinite loop
@@ -1055,9 +1060,11 @@ impl LeafNode {
 				&& split_idx >= total_cells - 1
 			{
 				// Right side still too large but can't move more - this shouldn't happen
-				// with proper overflow handling, but use fallback
-				split_idx = total_cells / 2;
-				break;
+				// with proper overflow handling
+				panic!(
+				"find_split_point_for_insert_complex: right side too large but cannot move more cells (split_idx={}, total_cells={}, left_size={}, right_size={}, max_page_size={})",
+				split_idx, total_cells, left_size, right_size, max_page_size
+			);
 			}
 		}
 
@@ -1825,7 +1832,10 @@ impl<F: VfsFile> BPlusTree<F> {
 								new_node_offset,
 							)?;
 
-						let (_, next_parent) = path.pop().unwrap_or_default();
+						// Path should contain the grandparent when splitting an internal node with a parent
+						let (_, next_parent) = path.pop().expect(
+							"handle_splits: path should contain grandparent when splitting internal node with parent"
+						);
 
 						promoted_key = next_promoted_key;
 						promoted_overflow = next_promoted_overflow;
