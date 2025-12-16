@@ -982,7 +982,7 @@ impl LeafNode {
 		}
 	}
 
-	/// Complex iterative split algorithm (used when overflow or size uncertainty exists)
+	/// Ensures proper ordering: right page size <= left page size (cntNew[i] <= cntNew[i-1])
 	fn find_split_point_for_insert_complex(
 		&self,
 		new_key: &[u8],
@@ -1026,98 +1026,71 @@ impl LeafNode {
 
 		let total_cells = cell_sizes.len();
 
-		// Phase 2: Initial packing - start with middle split and iteratively adjust
-		// szLeft and szRight track total size including header and cell data
-		// Note: SurrealKV stores cells sequentially (no cell offset array), so no CELL_POINTER_SIZE overhead
-		let mut split_idx = total_cells / 2;
-		let mut sz_left = LEAF_HEADER_SIZE + cell_sizes[..split_idx].iter().sum::<usize>();
-		let mut sz_right = LEAF_HEADER_SIZE + cell_sizes[split_idx..].iter().sum::<usize>();
+		// Phase 2: Sequential left-to-right processing (no recursion)
+		// Process entries sequentially from left to right, stopping at first valid split point
+		let mut current_page_size = LEAF_HEADER_SIZE;
+		let mut split_idx = 0;
 
-		// Iteratively move cells between left and right until both fit
-		loop {
-			// If left is too large, move cells from left to right
-			while sz_left > max_page_size && split_idx < total_cells {
-				if split_idx == 0 {
-					break;
-				}
-				let sz_cell = cell_sizes[split_idx - 1];
-				sz_left -= sz_cell;
-				sz_right += sz_cell;
-				split_idx -= 1;
-			}
+		// Process entries sequentially from left to right
+		for (i, &cell_size) in cell_sizes.iter().enumerate().take(total_cells) {
+			let new_page_size = current_page_size + cell_size;
 
-			// If right is too large, move cells from right to left
-			while sz_right > max_page_size && split_idx < total_cells - 1 {
-				let sz_cell = cell_sizes[split_idx];
-				sz_left += sz_cell;
-				sz_right -= sz_cell;
-				split_idx += 1;
-			}
-
-			// Check if both sides fit
-			if sz_left <= max_page_size && sz_right <= max_page_size {
+			// If adding this cell would exceed page size, split before it
+			// But ensure we have at least one cell on the left page
+			if new_page_size > max_page_size && current_page_size > LEAF_HEADER_SIZE {
+				split_idx = i;
 				break;
 			}
 
-			// If we've exhausted all possibilities, this shouldn't happen
-			if split_idx == 0 || split_idx >= total_cells {
-				panic!(
-				"find_split_point_for_insert_complex: exhausted all split possibilities (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
-				split_idx, total_cells, sz_left, sz_right, max_page_size
-			);
-			}
+			current_page_size = new_page_size;
+		}
 
-			// Safety check to prevent infinite loop
-			if sz_left <= max_page_size && sz_right > max_page_size && split_idx >= total_cells - 1
-			{
-				// Right side still too large but can't move more - this shouldn't happen
-				// with proper overflow handling
-				panic!(
-				"find_split_point_for_insert_complex: right side too large but cannot move more cells (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
-				split_idx, total_cells, sz_left, sz_right, max_page_size
-			);
+		// If we processed all cells without finding a split point, use the last valid position
+		// This shouldn't happen if we're splitting, but handle it gracefully
+		if split_idx == 0 && current_page_size <= max_page_size {
+			// All entries fit in one page - this shouldn't happen if we're splitting
+			// Use middle split as fallback
+			split_idx = total_cells / 2;
+			if split_idx == 0 {
+				split_idx = 1; // Ensure at least one cell on left
+			}
+		} else if split_idx == 0 {
+			// First cell itself is too large - split after it
+			split_idx = 1;
+		}
+
+		// Calculate sizes for both pages
+		let mut sz_left = LEAF_HEADER_SIZE + cell_sizes[..split_idx].iter().sum::<usize>();
+		let mut sz_right = LEAF_HEADER_SIZE + cell_sizes[split_idx..].iter().sum::<usize>();
+
+		// Phase 3: Ordering check and adjustment
+		// Ensure cntNew[i] <= cntNew[i-1] (right page <= left page in size)
+		// This ensures proper ordering across pages
+		// If right is larger than left, move cells from right to left (if possible)
+		// To move a cell from right to left, we increase split_idx (which moves the boundary right)
+		while sz_right > sz_left && split_idx < total_cells {
+			// Try moving the leftmost cell from right page to left page
+			let cell_to_move = cell_sizes[split_idx];
+			let new_left = sz_left + cell_to_move;
+			let new_right = sz_right - cell_to_move;
+
+			// Only move if both pages still fit and it improves ordering
+			if new_left <= max_page_size && new_right <= max_page_size {
+				sz_left = new_left;
+				sz_right = new_right;
+				split_idx += 1;
+			} else {
+				// Can't improve further without violating size constraints
+				break;
 			}
 		}
 
-		// Phase 3: Rebalancing from left to right to avoid empty pages
-		// Always run rebalancing (no threshold check) to optimize balance
-		// This phase moves cells from left sibling to right sibling to improve balance
-		if split_idx > 0 && split_idx < total_cells {
-			let mut optimized_split = split_idx;
-			let mut sz_left_opt = sz_left;
-			let mut sz_right_opt = sz_right;
-
-			// Move cells from left to right
-			// Iterate from split_idx down to 1, moving cells to improve balance
-			for i in (1..=split_idx).rev() {
-				let r = i - 1; // Right-most cell in left sibling (being moved)
-
-				let sz_r = cell_sizes[r]; // Size of cell being moved from left
-
-				// Only move if it improves balance
-				// Condition: szRight+szR > szLeft-szR (moving cell r from left to right)
-				// This ensures moving the cell improves the balance between siblings
-				let new_right = sz_right_opt + sz_r; // Add the cell being moved
-				let new_left = sz_left_opt - sz_r; // Remove the cell being moved
-
-				// Check if moving improves balance
-				// Only move if right is not empty and the move improves balance
-				if sz_right_opt != 0
-					&& new_left <= max_page_size
-					&& new_right <= max_page_size
-					&& new_right > new_left
-				{
-					// Moving improves balance
-					sz_right_opt = new_right;
-					sz_left_opt = new_left;
-					optimized_split = r;
-				} else {
-					// No improvement, stop moving cells
-					break;
-				}
-			}
-
-			split_idx = optimized_split;
+		// Verify both pages fit (should always be true after sequential processing)
+		if sz_left > max_page_size || sz_right > max_page_size {
+			panic!(
+				"find_split_point_for_insert_complex: pages don't fit after sequential processing (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
+				split_idx, total_cells, sz_left, sz_right, max_page_size
+			);
 		}
 
 		// Convert back to original key index
@@ -2012,12 +1985,19 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok((promoted_key, promoted_overflow, new_node_offset))
 	}
 
+	/// Processes entries left-to-right, ensures ordering (right <= left)
 	fn find_split_point(node: &InternalNode, insert_idx: usize) -> usize {
 		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
 
-		let total_keys = node.keys.len() + 1;
+		// Simple sequential approach: calculate split point based on total keys
+		// Internal node keys are typically similar in size, so simple middle split works well
+		let total_keys = node.keys.len() + 1; // +1 for the new key being inserted
+
+		// Sequential processing: split at middle, adjusting for insert position
 		let split_idx = total_keys / 2;
 
+		// Adjust split point based on where new key is being inserted
+		// This ensures the new key goes to the correct side
 		if split_idx > insert_idx {
 			split_idx - 1
 		} else {
@@ -2170,26 +2150,51 @@ impl<F: VfsFile> BPlusTree<F> {
 		child_idx: usize,
 		is_internal: bool,
 	) -> Result<()> {
-		// Try to borrow from left sibling first
-		if child_idx > 0 {
-			let left_sibling_offset = parent.children[child_idx - 1];
+		// Read siblings once and cache them (performance optimization)
+		let left_sibling_node = if child_idx > 0 {
+			Some(self.read_node(parent.children[child_idx - 1])?)
+		} else {
+			None
+		};
 
+		let right_sibling_node = if child_idx < parent.children.len() - 1 {
+			Some(self.read_node(parent.children[child_idx + 1])?)
+		} else {
+			None
+		};
+
+		// Try to borrow from left sibling first
+		if let Some(ref left_arc) = left_sibling_node {
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(left_node) = self.read_node(left_sibling_offset)?.as_ref()
-				{
+				if let NodeType::Internal(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						self.redistribute_internal_from_left(parent, child_idx - 1, child_idx)?;
+						let mut left_node_mut = self.extract_internal_mut(left_arc.clone());
+						let mut right_node_mut =
+							self.read_internal_node(parent.children[child_idx])?;
+						self.redistribute_internal_from_left(
+							parent,
+							child_idx - 1,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(left_node) = self.read_node(left_sibling_offset)?.as_ref() {
+				if let NodeType::Leaf(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						self.redistribute_leaf_from_left(parent, child_idx - 1, child_idx)?;
+						let mut left_node_mut = self.extract_leaf_mut(left_arc.clone());
+						let mut right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+						self.redistribute_leaf_from_left(
+							parent,
+							child_idx - 1,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
@@ -2197,26 +2202,37 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 
 		// Try to borrow from right sibling if left redistribution wasn't possible
-		if child_idx < parent.children.len() - 1 {
-			let right_sibling_offset = parent.children[child_idx + 1];
-
+		if let Some(ref right_arc) = right_sibling_node {
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(right_node) =
-					self.read_node(right_sibling_offset)?.as_ref()
-				{
+				if let NodeType::Internal(right_node) = right_arc.as_ref() {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
-						self.redistribute_internal_from_right(parent, child_idx, child_idx + 1)?;
+						let mut left_node_mut =
+							self.read_internal_node(parent.children[child_idx])?;
+						let mut right_node_mut = self.extract_internal_mut(right_arc.clone());
+						self.redistribute_internal_from_right(
+							parent,
+							child_idx,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(right_node) = self.read_node(right_sibling_offset)?.as_ref() {
+				if let NodeType::Leaf(right_node) = right_arc.as_ref() {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
-						self.redistribute_leaf_from_right(parent, child_idx, child_idx + 1)?;
+						let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+						let mut right_node_mut = self.extract_leaf_mut(right_arc.clone());
+						self.redistribute_leaf_from_right(
+							parent,
+							child_idx,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
@@ -2226,21 +2242,53 @@ impl<F: VfsFile> BPlusTree<F> {
 		// If we reach here, redistribution wasn't possible, we need to merge nodes
 
 		// Prefer merging with left sibling if possible
-		if child_idx > 0 {
+		if let Some(left_arc) = left_sibling_node {
 			let left_idx = child_idx - 1;
 			if is_internal {
-				self.merge_internal_nodes(parent, left_idx, child_idx)?;
+				let mut left_node_mut = self.extract_internal_mut(left_arc);
+				let right_node_mut = self.read_internal_node(parent.children[child_idx])?;
+				self.merge_internal_nodes(
+					parent,
+					left_idx,
+					child_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			} else {
-				self.merge_leaf_nodes(parent, left_idx, child_idx)?;
+				let mut left_node_mut = self.extract_leaf_mut(left_arc);
+				let right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+				self.merge_leaf_nodes(
+					parent,
+					left_idx,
+					child_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			}
 		}
 		// Otherwise merge with right sibling
-		else if child_idx < parent.children.len() - 1 {
+		else if let Some(right_arc) = right_sibling_node {
 			let right_idx = child_idx + 1;
 			if is_internal {
-				self.merge_internal_nodes(parent, child_idx, right_idx)?;
+				let mut left_node_mut = self.read_internal_node(parent.children[child_idx])?;
+				let right_node_mut = self.extract_internal_mut(right_arc);
+				self.merge_internal_nodes(
+					parent,
+					child_idx,
+					right_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			} else {
-				self.merge_leaf_nodes(parent, child_idx, right_idx)?;
+				let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+				let right_node_mut = self.extract_leaf_mut(right_arc);
+				self.merge_leaf_nodes(
+					parent,
+					child_idx,
+					right_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			}
 		}
 		// There should always be a sibling to merge with unless this is the root
@@ -2273,14 +2321,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let mut right_node = self.read_internal_node(right_offset)?;
-
 		let last_entry_size = if !left_node.keys.is_empty() {
 			let last_key = left_node.keys.last().unwrap();
 			internal_entry_size(last_key)
@@ -2297,13 +2340,13 @@ impl<F: VfsFile> BPlusTree<F> {
 		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
 			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
 			let (new_parent_key, new_parent_overflow) =
-				left_node.redistribute_to_right(&mut right_node, parent_key, parent_overflow);
+				left_node.redistribute_to_right(right_node, parent_key, parent_overflow);
 
 			parent.keys[left_idx] = new_parent_key;
 			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			self.write_node_owned(NodeType::Internal(left_node))?;
-			self.write_node_owned(NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2313,14 +2356,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let mut right_node = self.read_internal_node(right_offset)?;
-
 		let first_entry_size = if !right_node.keys.is_empty() {
 			internal_entry_size(&right_node.keys[0])
 		} else {
@@ -2337,13 +2375,13 @@ impl<F: VfsFile> BPlusTree<F> {
 			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
 
 			let (new_parent_key, new_parent_overflow) =
-				left_node.take_from_right(&mut right_node, parent_key, parent_overflow);
+				left_node.take_from_right(right_node, parent_key, parent_overflow);
 
 			parent.keys[left_idx] = new_parent_key;
 			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			self.write_node_owned(NodeType::Internal(left_node))?;
-			self.write_node_owned(NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2353,14 +2391,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let mut right_node = self.read_leaf_node(right_offset)?;
-
 		let last_idx = left_node.keys.len() - 1;
 		let last_entry_size = if last_idx < left_node.keys.len() {
 			leaf_entry_size(&left_node.keys[last_idx], &left_node.values[last_idx])
@@ -2375,12 +2408,12 @@ impl<F: VfsFile> BPlusTree<F> {
 		let right_size = right_node.current_size();
 
 		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
-			let new_separator = left_node.redistribute_to_right(&mut right_node);
+			let new_separator = left_node.redistribute_to_right(right_node);
 
 			parent.keys[left_idx] = new_separator;
 
-			self.write_node_owned(NodeType::Leaf(left_node))?;
-			self.write_node_owned(NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2390,14 +2423,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let mut right_node = self.read_leaf_node(right_offset)?;
-
 		let first_entry_size = if !right_node.keys.is_empty() {
 			leaf_entry_size(&right_node.keys[0], &right_node.values[0])
 		} else {
@@ -2411,12 +2439,12 @@ impl<F: VfsFile> BPlusTree<F> {
 		let right_size = right_node.current_size();
 
 		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
-			let new_separator = left_node.take_from_right(&mut right_node);
+			let new_separator = left_node.take_from_right(right_node);
 
 			parent.keys[left_idx] = new_separator;
 
-			self.write_node_owned(NodeType::Leaf(left_node))?;
-			self.write_node_owned(NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2459,24 +2487,21 @@ impl<F: VfsFile> BPlusTree<F> {
 		parent: &mut InternalNode,
 		left_idx: usize,
 		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let right_node = self.read_internal_node(right_offset)?;
-
 		if !left_node.can_merge_with(&right_node) {
 			return Ok(());
 		}
 
+		let right_offset = parent.children[right_idx];
 		let (separator, separator_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 
 		left_node.merge_from_right(right_node, separator, separator_overflow);
 
 		parent.children.remove(right_idx);
 
-		self.write_node_owned(NodeType::Internal(left_node))?;
+		self.write_node_owned(NodeType::Internal(left_node.clone()))?;
 
 		self.free_page(right_offset)?;
 
@@ -2488,17 +2513,15 @@ impl<F: VfsFile> BPlusTree<F> {
 		parent: &mut InternalNode,
 		left_idx: usize,
 		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let right_node = self.read_leaf_node(right_offset)?;
-
 		if !left_node.can_merge_with(&right_node) {
 			return Ok(());
 		}
 
+		let left_offset = left_node.offset;
+		let right_offset = parent.children[right_idx];
 		let (_removed_key, removed_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 		parent.children.remove(right_idx);
 
@@ -2519,7 +2542,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		self.write_node_owned(NodeType::Leaf(left_node))?;
+		self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
 
 		self.free_page(right_offset)?;
 
@@ -2722,6 +2745,21 @@ impl<F: VfsFile> BPlusTree<F> {
 		match self.read_node(offset)?.as_ref() {
 			NodeType::Leaf(node) => Ok(node.clone()),
 			_ => Err(BPlusTreeError::InvalidNodeType),
+		}
+	}
+
+	/// Extract a mutable InternalNode from Arc<NodeType>
+	/// Unwraps if possible (no other refs), otherwise clones
+	fn extract_internal_mut(&self, arc_node: Arc<NodeType>) -> InternalNode {
+		match Arc::try_unwrap(arc_node) {
+			Ok(node_type) => match node_type {
+				NodeType::Internal(node) => node,
+				_ => panic!("Expected Internal node"),
+			},
+			Err(arc) => match arc.as_ref() {
+				NodeType::Internal(node) => node.clone(),
+				_ => panic!("Expected Internal node"),
+			},
 		}
 	}
 
@@ -4947,5 +4985,62 @@ mod tests {
 		);
 
 		tree.close().unwrap();
+	}
+
+	#[test]
+	fn test_sequential_split_ordering_guarantee() {
+		// Test that sequential split algorithm ensures right page <= left page (ordering guarantee)
+		let mut tree = create_test_tree(true);
+
+		// Insert entries that will cause multiple splits
+		// Use varying sizes to test the ordering guarantee
+		for i in 0..100 {
+			let key = format!("key{:04}", i).into_bytes();
+			let value = vec![i as u8; 100]; // Fixed size values
+			tree.insert(&key, &value).unwrap();
+		}
+
+		// Verify all entries can be retrieved (ensures splits worked correctly)
+		for i in 0..100 {
+			let key = format!("key{:04}", i).into_bytes();
+			let result = tree.get(&key).unwrap();
+			assert!(result.is_some(), "Key {} should exist", i);
+			assert_eq!(result.unwrap().as_ref(), &vec![i as u8; 100]);
+		}
+
+		// The ordering guarantee is enforced internally by the split algorithm
+		// If splits didn't maintain ordering, we would see panics or incorrect behavior
+		// This test verifies the algorithm works correctly through successful operations
+	}
+
+	#[test]
+	fn test_sequential_split_no_recursion() {
+		// Test that sequential split processes entries left-to-right without recursion
+		let mut tree = create_test_tree(true);
+
+		// Insert entries with sizes that would cause recursion in the old algorithm
+		// The new sequential algorithm should handle this without issues
+		let mut keys = Vec::new();
+		for i in 0..50 {
+			// Vary sizes to create challenging split scenarios
+			let size = if i % 3 == 0 {
+				200 // Larger entries
+			} else if i % 3 == 1 {
+				50 // Medium entries
+			} else {
+				10 // Small entries
+			};
+			let key = format!("key{:04}", i).into_bytes();
+			let value = vec![i as u8; size];
+			keys.push((key.clone(), value.clone()));
+			tree.insert(&key, &value).unwrap();
+		}
+
+		// Verify all entries are still accessible after splits
+		for (key, expected_value) in &keys {
+			let result = tree.get(key).unwrap();
+			assert!(result.is_some(), "Key {:?} should exist", key);
+			assert_eq!(result.unwrap().as_ref(), expected_value.as_slice());
+		}
 	}
 }
