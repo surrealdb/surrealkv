@@ -1032,8 +1032,7 @@ impl LeafNode {
 		let mut split_idx = 0;
 
 		// Process entries sequentially from left to right
-		for i in 0..total_cells {
-			let cell_size = cell_sizes[i];
+		for (i, &cell_size) in cell_sizes.iter().enumerate().take(total_cells) {
 			let new_page_size = current_page_size + cell_size;
 
 			// If adding this cell would exceed page size, split before it
@@ -2151,26 +2150,51 @@ impl<F: VfsFile> BPlusTree<F> {
 		child_idx: usize,
 		is_internal: bool,
 	) -> Result<()> {
-		// Try to borrow from left sibling first
-		if child_idx > 0 {
-			let left_sibling_offset = parent.children[child_idx - 1];
+		// Read siblings once and cache them (performance optimization)
+		let left_sibling_node = if child_idx > 0 {
+			Some(self.read_node(parent.children[child_idx - 1])?)
+		} else {
+			None
+		};
 
+		let right_sibling_node = if child_idx < parent.children.len() - 1 {
+			Some(self.read_node(parent.children[child_idx + 1])?)
+		} else {
+			None
+		};
+
+		// Try to borrow from left sibling first
+		if let Some(ref left_arc) = left_sibling_node {
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(left_node) = self.read_node(left_sibling_offset)?.as_ref()
-				{
+				if let NodeType::Internal(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						self.redistribute_internal_from_left(parent, child_idx - 1, child_idx)?;
+						let mut left_node_mut = self.extract_internal_mut(left_arc.clone());
+						let mut right_node_mut =
+							self.read_internal_node(parent.children[child_idx])?;
+						self.redistribute_internal_from_left(
+							parent,
+							child_idx - 1,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(left_node) = self.read_node(left_sibling_offset)?.as_ref() {
+				if let NodeType::Leaf(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						self.redistribute_leaf_from_left(parent, child_idx - 1, child_idx)?;
+						let mut left_node_mut = self.extract_leaf_mut(left_arc.clone());
+						let mut right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+						self.redistribute_leaf_from_left(
+							parent,
+							child_idx - 1,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
@@ -2178,26 +2202,37 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 
 		// Try to borrow from right sibling if left redistribution wasn't possible
-		if child_idx < parent.children.len() - 1 {
-			let right_sibling_offset = parent.children[child_idx + 1];
-
+		if let Some(ref right_arc) = right_sibling_node {
 			if is_internal {
 				// For internal nodes
-				if let NodeType::Internal(right_node) =
-					self.read_node(right_sibling_offset)?.as_ref()
-				{
+				if let NodeType::Internal(right_node) = right_arc.as_ref() {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
-						self.redistribute_internal_from_right(parent, child_idx, child_idx + 1)?;
+						let mut left_node_mut =
+							self.read_internal_node(parent.children[child_idx])?;
+						let mut right_node_mut = self.extract_internal_mut(right_arc.clone());
+						self.redistribute_internal_from_right(
+							parent,
+							child_idx,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
 			} else {
 				// For leaf nodes
-				if let NodeType::Leaf(right_node) = self.read_node(right_sibling_offset)?.as_ref() {
+				if let NodeType::Leaf(right_node) = right_arc.as_ref() {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
-						self.redistribute_leaf_from_right(parent, child_idx, child_idx + 1)?;
+						let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+						let mut right_node_mut = self.extract_leaf_mut(right_arc.clone());
+						self.redistribute_leaf_from_right(
+							parent,
+							child_idx,
+							&mut left_node_mut,
+							&mut right_node_mut,
+						)?;
 						return Ok(());
 					}
 				}
@@ -2207,21 +2242,53 @@ impl<F: VfsFile> BPlusTree<F> {
 		// If we reach here, redistribution wasn't possible, we need to merge nodes
 
 		// Prefer merging with left sibling if possible
-		if child_idx > 0 {
+		if let Some(left_arc) = left_sibling_node {
 			let left_idx = child_idx - 1;
 			if is_internal {
-				self.merge_internal_nodes(parent, left_idx, child_idx)?;
+				let mut left_node_mut = self.extract_internal_mut(left_arc);
+				let right_node_mut = self.read_internal_node(parent.children[child_idx])?;
+				self.merge_internal_nodes(
+					parent,
+					left_idx,
+					child_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			} else {
-				self.merge_leaf_nodes(parent, left_idx, child_idx)?;
+				let mut left_node_mut = self.extract_leaf_mut(left_arc);
+				let right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+				self.merge_leaf_nodes(
+					parent,
+					left_idx,
+					child_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			}
 		}
 		// Otherwise merge with right sibling
-		else if child_idx < parent.children.len() - 1 {
+		else if let Some(right_arc) = right_sibling_node {
 			let right_idx = child_idx + 1;
 			if is_internal {
-				self.merge_internal_nodes(parent, child_idx, right_idx)?;
+				let mut left_node_mut = self.read_internal_node(parent.children[child_idx])?;
+				let right_node_mut = self.extract_internal_mut(right_arc);
+				self.merge_internal_nodes(
+					parent,
+					child_idx,
+					right_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			} else {
-				self.merge_leaf_nodes(parent, child_idx, right_idx)?;
+				let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+				let right_node_mut = self.extract_leaf_mut(right_arc);
+				self.merge_leaf_nodes(
+					parent,
+					child_idx,
+					right_idx,
+					&mut left_node_mut,
+					right_node_mut,
+				)?;
 			}
 		}
 		// There should always be a sibling to merge with unless this is the root
@@ -2254,14 +2321,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let mut right_node = self.read_internal_node(right_offset)?;
-
 		let last_entry_size = if !left_node.keys.is_empty() {
 			let last_key = left_node.keys.last().unwrap();
 			internal_entry_size(last_key)
@@ -2278,13 +2340,13 @@ impl<F: VfsFile> BPlusTree<F> {
 		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
 			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
 			let (new_parent_key, new_parent_overflow) =
-				left_node.redistribute_to_right(&mut right_node, parent_key, parent_overflow);
+				left_node.redistribute_to_right(right_node, parent_key, parent_overflow);
 
 			parent.keys[left_idx] = new_parent_key;
 			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			self.write_node_owned(NodeType::Internal(left_node))?;
-			self.write_node_owned(NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2294,14 +2356,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let mut right_node = self.read_internal_node(right_offset)?;
-
 		let first_entry_size = if !right_node.keys.is_empty() {
 			internal_entry_size(&right_node.keys[0])
 		} else {
@@ -2318,13 +2375,13 @@ impl<F: VfsFile> BPlusTree<F> {
 			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
 
 			let (new_parent_key, new_parent_overflow) =
-				left_node.take_from_right(&mut right_node, parent_key, parent_overflow);
+				left_node.take_from_right(right_node, parent_key, parent_overflow);
 
 			parent.keys[left_idx] = new_parent_key;
 			parent.set_overflow_at(left_idx, new_parent_overflow);
 
-			self.write_node_owned(NodeType::Internal(left_node))?;
-			self.write_node_owned(NodeType::Internal(right_node))?;
+			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2334,14 +2391,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let mut right_node = self.read_leaf_node(right_offset)?;
-
 		let last_idx = left_node.keys.len() - 1;
 		let last_entry_size = if last_idx < left_node.keys.len() {
 			leaf_entry_size(&left_node.keys[last_idx], &left_node.values[last_idx])
@@ -2356,12 +2408,12 @@ impl<F: VfsFile> BPlusTree<F> {
 		let right_size = right_node.current_size();
 
 		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
-			let new_separator = left_node.redistribute_to_right(&mut right_node);
+			let new_separator = left_node.redistribute_to_right(right_node);
 
 			parent.keys[left_idx] = new_separator;
 
-			self.write_node_owned(NodeType::Leaf(left_node))?;
-			self.write_node_owned(NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2371,14 +2423,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		&mut self,
 		parent: &mut InternalNode,
 		left_idx: usize,
-		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let mut right_node = self.read_leaf_node(right_offset)?;
-
 		let first_entry_size = if !right_node.keys.is_empty() {
 			leaf_entry_size(&right_node.keys[0], &right_node.values[0])
 		} else {
@@ -2392,12 +2439,12 @@ impl<F: VfsFile> BPlusTree<F> {
 		let right_size = right_node.current_size();
 
 		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
-			let new_separator = left_node.take_from_right(&mut right_node);
+			let new_separator = left_node.take_from_right(right_node);
 
 			parent.keys[left_idx] = new_separator;
 
-			self.write_node_owned(NodeType::Leaf(left_node))?;
-			self.write_node_owned(NodeType::Leaf(right_node))?;
+			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
 		}
 
 		Ok(())
@@ -2440,24 +2487,21 @@ impl<F: VfsFile> BPlusTree<F> {
 		parent: &mut InternalNode,
 		left_idx: usize,
 		right_idx: usize,
+		left_node: &mut InternalNode,
+		right_node: InternalNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_internal_node(left_offset)?;
-		let right_node = self.read_internal_node(right_offset)?;
-
 		if !left_node.can_merge_with(&right_node) {
 			return Ok(());
 		}
 
+		let right_offset = parent.children[right_idx];
 		let (separator, separator_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 
 		left_node.merge_from_right(right_node, separator, separator_overflow);
 
 		parent.children.remove(right_idx);
 
-		self.write_node_owned(NodeType::Internal(left_node))?;
+		self.write_node_owned(NodeType::Internal(left_node.clone()))?;
 
 		self.free_page(right_offset)?;
 
@@ -2469,17 +2513,15 @@ impl<F: VfsFile> BPlusTree<F> {
 		parent: &mut InternalNode,
 		left_idx: usize,
 		right_idx: usize,
+		left_node: &mut LeafNode,
+		right_node: LeafNode,
 	) -> Result<()> {
-		let left_offset = parent.children[left_idx];
-		let right_offset = parent.children[right_idx];
-
-		let mut left_node = self.read_leaf_node(left_offset)?;
-		let right_node = self.read_leaf_node(right_offset)?;
-
 		if !left_node.can_merge_with(&right_node) {
 			return Ok(());
 		}
 
+		let left_offset = left_node.offset;
+		let right_offset = parent.children[right_idx];
 		let (_removed_key, removed_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 		parent.children.remove(right_idx);
 
@@ -2500,7 +2542,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		self.write_node_owned(NodeType::Leaf(left_node))?;
+		self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
 
 		self.free_page(right_offset)?;
 
@@ -2703,6 +2745,21 @@ impl<F: VfsFile> BPlusTree<F> {
 		match self.read_node(offset)?.as_ref() {
 			NodeType::Leaf(node) => Ok(node.clone()),
 			_ => Err(BPlusTreeError::InvalidNodeType),
+		}
+	}
+
+	/// Extract a mutable InternalNode from Arc<NodeType>
+	/// Unwraps if possible (no other refs), otherwise clones
+	fn extract_internal_mut(&self, arc_node: Arc<NodeType>) -> InternalNode {
+		match Arc::try_unwrap(arc_node) {
+			Ok(node_type) => match node_type {
+				NodeType::Internal(node) => node,
+				_ => panic!("Expected Internal node"),
+			},
+			Err(arc) => match arc.as_ref() {
+				NodeType::Internal(node) => node.clone(),
+				_ => panic!("Expected Internal node"),
+			},
 		}
 	}
 
