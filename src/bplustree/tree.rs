@@ -133,6 +133,7 @@ const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
 const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
+const CELL_POINTER_SIZE: usize = 2; // 2 bytes for cell pointer overhead
 
 #[derive(Debug)]
 struct Header {
@@ -261,7 +262,7 @@ impl InternalNode {
 			let key_len_total = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
-			// Calculate bytes on page using SQLite overflow algorithm
+			// Calculate bytes on page
 			let (bytes_on_page, needs_overflow) =
 				calculate_overflow(key_len_total, min_local, max_local, usable_size);
 
@@ -921,14 +922,13 @@ impl LeafNode {
 	/// Find optimal split point that ensures both resulting leaves fit in a page.
 	/// Uses hybrid approach: simple split for common cases, iterative algorithm when needed.
 	/// Takes the new entry (key, value) and its insert position into account.
-	/// Based on SQLite's balance() optimization (btree.c:9128).
 	fn find_split_point_for_insert(
 		&self,
 		new_key: &[u8],
 		new_value: &[u8],
 		insert_idx: usize,
 	) -> usize {
-		debug_assert!(self.keys.len() >= 1, "Cannot split empty leaf");
+		debug_assert!(!self.keys.is_empty(), "Cannot split empty leaf");
 
 		let (_min_local, max_local) = calculate_local_limits(true);
 		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
@@ -943,11 +943,11 @@ impl LeafNode {
 			payload > max_local
 		});
 
-		// Calculate current free space (SQLite's check: nFree*3 <= usableSize*2)
+		// Calculate current free space
 		let current_size = self.current_size();
 		let free_space = PAGE_SIZE - current_size;
 
-		// SQLite's optimization: Only use expensive algorithm if:
+		// Only use expensive algorithm if:
 		// 1. There IS overflow, OR
 		// 2. Free space > 2/3 of usable size (page is very full)
 		let needs_complex_split =
@@ -1016,96 +1016,110 @@ impl LeafNode {
 		let total_cells = cell_sizes.len();
 
 		// Phase 2: Initial packing - start with middle split and iteratively adjust
+		// Account for cell pointer overhead (2 bytes per cell)
+		// szLeft and szRight track total size including header, cell data, and cell pointers
 		let mut split_idx = total_cells / 2;
-		let mut left_size = LEAF_HEADER_SIZE + cell_sizes[..split_idx].iter().sum::<usize>();
-		let mut right_size = LEAF_HEADER_SIZE + cell_sizes[split_idx..].iter().sum::<usize>();
+		let mut sz_left = LEAF_HEADER_SIZE
+			+ cell_sizes[..split_idx].iter().sum::<usize>()
+			+ split_idx * CELL_POINTER_SIZE;
+		let mut sz_right = LEAF_HEADER_SIZE
+			+ cell_sizes[split_idx..].iter().sum::<usize>()
+			+ (total_cells - split_idx) * CELL_POINTER_SIZE;
 
 		// Iteratively move cells between left and right until both fit
 		loop {
 			// If left is too large, move cells from left to right
-			while left_size > max_page_size && split_idx < total_cells {
+			while sz_left > max_page_size && split_idx < total_cells {
 				if split_idx == 0 {
 					break;
 				}
-				let cell_size = cell_sizes[split_idx - 1];
-				left_size -= cell_size;
-				right_size += cell_size;
+				let sz_cell = cell_sizes[split_idx - 1];
+				sz_left -= sz_cell + CELL_POINTER_SIZE;
+				sz_right += sz_cell + CELL_POINTER_SIZE;
 				split_idx -= 1;
 			}
 
 			// If right is too large, move cells from right to left
-			while right_size > max_page_size && split_idx < total_cells - 1 {
-				let cell_size = cell_sizes[split_idx];
-				left_size += cell_size;
-				right_size -= cell_size;
+			while sz_right > max_page_size && split_idx < total_cells - 1 {
+				let sz_cell = cell_sizes[split_idx];
+				sz_left += sz_cell + CELL_POINTER_SIZE;
+				sz_right -= sz_cell + CELL_POINTER_SIZE;
 				split_idx += 1;
 			}
 
 			// Check if both sides fit
-			if left_size <= max_page_size && right_size <= max_page_size {
+			if sz_left <= max_page_size && sz_right <= max_page_size {
 				break;
 			}
 
 			// If we've exhausted all possibilities, this shouldn't happen
 			if split_idx == 0 || split_idx >= total_cells {
 				panic!(
-				"find_split_point_for_insert_complex: exhausted all split possibilities (split_idx={}, total_cells={}, left_size={}, right_size={}, max_page_size={})",
-				split_idx, total_cells, left_size, right_size, max_page_size
+				"find_split_point_for_insert_complex: exhausted all split possibilities (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
+				split_idx, total_cells, sz_left, sz_right, max_page_size
 			);
 			}
 
 			// Safety check to prevent infinite loop
-			if left_size <= max_page_size
-				&& right_size > max_page_size
-				&& split_idx >= total_cells - 1
+			if sz_left <= max_page_size && sz_right > max_page_size && split_idx >= total_cells - 1
 			{
 				// Right side still too large but can't move more - this shouldn't happen
 				// with proper overflow handling
 				panic!(
-				"find_split_point_for_insert_complex: right side too large but cannot move more cells (split_idx={}, total_cells={}, left_size={}, right_size={}, max_page_size={})",
-				split_idx, total_cells, left_size, right_size, max_page_size
+				"find_split_point_for_insert_complex: right side too large but cannot move more cells (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
+				split_idx, total_cells, sz_left, sz_right, max_page_size
 			);
 			}
 		}
 
-		// Phase 3: Rebalancing from right to left to avoid empty pages
-		// Similar to SQLite's rebalancing (lines 8600-8631)
-		// Only rebalance if there's significant imbalance (>25% difference)
+		// Phase 3: Rebalancing from left to right to avoid empty pages
+		// Always run rebalancing (no threshold check) to optimize balance
+		// This phase moves cells from left sibling to right sibling to improve balance
 		if split_idx > 0 && split_idx < total_cells {
-			let imbalance_threshold = left_size / 4;
-			if right_size < imbalance_threshold {
-				let mut optimized_split = split_idx;
-				let mut optimized_left = left_size;
-				let mut optimized_right = right_size;
+			let mut optimized_split = split_idx;
+			let mut sz_left_opt = sz_left;
+			let mut sz_right_opt = sz_right;
 
-				// Try moving cells from right to left if it improves balance
-				for i in (0..split_idx).rev() {
-					let cell_size = cell_sizes[i];
-					let new_left = optimized_left - cell_size;
-					let new_right = optimized_right + cell_size;
+			// Move cells from left to right
+			// Iterate from split_idx down to 1, moving cells to improve balance
+			for i in (1..=split_idx).rev() {
+				let r = i - 1; // Right-most cell in left sibling
+				let d = i; // First cell to the left of right sibling
 
-					// Only move if both still fit and it improves balance
-					if new_left <= max_page_size
-						&& new_right <= max_page_size
-						&& new_right > 0 && (optimized_right == 0
-						|| new_right + cell_size > optimized_left - cell_size)
-					{
-						optimized_left = new_left;
-						optimized_right = new_right;
-						optimized_split = i;
-					} else {
-						break;
-					}
+				let sz_r = cell_sizes[r]; // Size of cell being moved from left
+				let sz_d = cell_sizes[d]; // Size of cell that would be at boundary
+
+				// Only move if it improves balance
+				// Condition: szRight+szD+2 > szLeft-(szR+2)
+				// This ensures moving the cell improves the balance between siblings
+				let new_right = sz_right_opt + sz_d + CELL_POINTER_SIZE;
+				let new_left = sz_left_opt - sz_r - CELL_POINTER_SIZE;
+
+				// Check if moving improves balance
+				// Only move if right is not empty and the move improves balance
+				if sz_right_opt != 0
+					&& new_left <= max_page_size
+					&& new_right <= max_page_size
+					&& new_right + CELL_POINTER_SIZE > new_left
+				{
+					// Moving improves balance
+					sz_right_opt = new_right;
+					sz_left_opt = new_left;
+					optimized_split = r;
+				} else {
+					// No improvement, stop moving cells
+					break;
 				}
-
-				split_idx = optimized_split;
 			}
+
+			split_idx = optimized_split;
 		}
 
 		// Convert back to original key index (account for inserted entry)
 		// The split_idx is in the expanded array (with new entry included)
 		// We need to convert it to the original array index
-		let final_split_idx = if insert_idx < split_idx {
+
+		if insert_idx < split_idx {
 			// New entry is on left side of split
 			// In expanded array: [new_entry, entry0, entry1, ...]
 			// If split_idx=1: left=[new_entry], right=[entry0, entry1, ...]
@@ -1128,9 +1142,7 @@ impl LeafNode {
 			// New entry is on right side or at split point
 			// split_idx in expanded array directly maps to original array
 			split_idx
-		};
-
-		final_split_idx
+		}
 	}
 
 	/// Simple split point for cases where we don't have the new entry info
@@ -1484,10 +1496,6 @@ pub enum Durability {
 	Manual,
 }
 
-/// Calculate SQLite-style local payload limits based on page size
-/// Returns (min_local, max_local)
-///
-/// SQLite formulas (from btree.c:3437-3440):
 /// - maxLocal = (usableSize - 12) * 64 / 255 - 23
 /// - minLocal = (usableSize - 12) * 32 / 255 - 23
 /// - maxLeaf = usableSize - 35
@@ -1522,11 +1530,8 @@ fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
 	}
 }
 
-/// Calculate how much of payload to store on page using SQLite's algorithm
+/// Calculate how much of payload to store on page
 /// Returns (bytes_on_page, needs_overflow)
-///
-/// SQLite formula: surplus = minLocal + (nPayload - minLocal) % (usableSize - 4)
-/// nLocal = (surplus <= maxLocal) ? surplus : minLocal
 ///
 /// This minimizes unused space on overflow pages by aligning with overflow page boundaries
 fn calculate_overflow(
@@ -1538,7 +1543,7 @@ fn calculate_overflow(
 	if payload_size <= max_local {
 		(payload_size, false)
 	} else {
-		// SQLite's overflow calculation: minimize unused space on overflow pages
+		// Minimize unused space on overflow pages
 		// Overflow page size is usable_size - 4 (4 bytes for next page pointer)
 		let overflow_page_size = usable_size.saturating_sub(4);
 		let surplus = min_local + (payload_size.saturating_sub(min_local)) % overflow_page_size;
@@ -1565,7 +1570,6 @@ const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 }
 
 /// Cache for cell sizes during split calculations
-/// Similar to SQLite's CellArray.szCell for avoiding redundant calculations
 struct CellSizeCache {
 	sizes: Vec<usize>,
 }
