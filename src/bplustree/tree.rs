@@ -130,6 +130,8 @@ const TRUNK_PAGE_MAX_ENTRIES: usize = (PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRU
 // Constants for size calculation
 const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
 const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child_count(4) = 9 bytes
+const LEAF_USABLE_SIZE: usize = PAGE_SIZE - LEAF_HEADER_SIZE;
+const INTERNAL_USABLE_SIZE: usize = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
 const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
@@ -251,7 +253,7 @@ impl InternalNode {
 		buffer_slice = &buffer_slice[4..];
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 
 		let mut keys = Vec::with_capacity(num_keys);
 		let mut key_overflows = Vec::with_capacity(num_keys);
@@ -496,7 +498,7 @@ impl InternalNode {
 
 	fn calculate_size_and_max_key(&self) -> (usize, usize) {
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 		let mut size = INTERNAL_HEADER_SIZE + self.children.len() * CHILD_PTR_SIZE;
 		let mut max_key_len = 0;
 
@@ -524,7 +526,7 @@ impl Node for InternalNode {
 		buffer.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// 3. Serialize keys with overflow support
 		for (i, key) in self.keys.iter().enumerate() {
@@ -576,7 +578,7 @@ impl Node for InternalNode {
 		let mut size = INTERNAL_HEADER_SIZE;
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// Size for all keys accounting for overflow
 		for key in &self.keys {
@@ -601,7 +603,7 @@ impl Node for InternalNode {
 		let max_key_size = self_max_key.max(other_max_key);
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 		let (separator_on_page, separator_overflow) =
 			calculate_overflow(max_key_size, min_local, max_local, usable_size);
 		let separator_size =
@@ -668,7 +670,7 @@ impl LeafNode {
 		pos += 8;
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 
 		let mut keys = Vec::with_capacity(num_keys);
 		let mut values = Vec::with_capacity(num_keys);
@@ -930,7 +932,7 @@ impl LeafNode {
 		debug_assert!(!self.keys.is_empty(), "Cannot split empty leaf");
 
 		let (_min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 		let new_payload = new_key.len() + new_value.len();
 
 		// Check if new entry needs overflow
@@ -1131,8 +1133,9 @@ impl LeafNode {
 		}
 	}
 
-	/// Simple split point for cases where we don't have the new entry info
-	fn find_split_point(&self) -> usize {
+	/// Simple split point for duplicate updates (no new entry being added).
+	/// Since we're just updating an existing value, we don't need to account for new entry size.
+	fn find_split_point_for_update(&self) -> usize {
 		debug_assert!(self.keys.len() >= 2, "Cannot split leaf with < 2 entries");
 		self.keys.len().div_ceil(2)
 	}
@@ -1140,7 +1143,7 @@ impl LeafNode {
 	// Check if this leaf can fit another key-value pair
 	fn can_fit_entry(&self, key: &[u8], value: &[u8]) -> bool {
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 		let payload_len = key.len() + value.len();
 		let (bytes_on_page, needs_overflow) =
 			calculate_overflow(payload_len, min_local, max_local, usable_size);
@@ -1174,7 +1177,7 @@ impl Node for LeafNode {
 		buffer.extend_from_slice(&self.prev_leaf.to_le_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 
 		// 5. Serialize cells (key+value pairs) with overflow support
 		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
@@ -1226,7 +1229,7 @@ impl Node for LeafNode {
 		let mut size = LEAF_HEADER_SIZE;
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 
 		// Size for all cells accounting for overflow
 		for (key, value) in self.keys.iter().zip(&self.values) {
@@ -1487,12 +1490,11 @@ pub enum Durability {
 /// - maxLeaf = usableSize - 35
 /// - minLeaf = (usableSize - 12) * 32 / 255 - 23
 fn calculate_local_limits_internal(is_leaf: bool) -> (usize, usize) {
-	let header_size = if is_leaf {
-		LEAF_HEADER_SIZE
+	let usable_size = if is_leaf {
+		LEAF_USABLE_SIZE
 	} else {
-		INTERNAL_HEADER_SIZE
+		INTERNAL_USABLE_SIZE
 	};
-	let usable_size = PAGE_SIZE - header_size;
 
 	if is_leaf {
 		let max_leaf = usable_size.saturating_sub(35);
@@ -1559,9 +1561,8 @@ const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 #[inline]
 fn internal_entry_size(key: &[u8]) -> usize {
 	let (min_local, max_local) = calculate_local_limits(false);
-	let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 	let (key_on_page, needs_overflow) =
-		calculate_overflow(key.len(), min_local, max_local, usable_size);
+		calculate_overflow(key.len(), min_local, max_local, INTERNAL_USABLE_SIZE);
 	KEY_SIZE_PREFIX + key_on_page + CHILD_PTR_SIZE + overflow_ptr_size(needs_overflow)
 }
 
@@ -1569,10 +1570,9 @@ fn internal_entry_size(key: &[u8]) -> usize {
 #[inline]
 fn leaf_entry_size(key: &[u8], value: &[u8]) -> usize {
 	let (min_local, max_local) = calculate_local_limits(true);
-	let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
 	let payload_len = key.len() + value.len();
 	let (bytes_on_page, needs_overflow) =
-		calculate_overflow(payload_len, min_local, max_local, usable_size);
+		calculate_overflow(payload_len, min_local, max_local, LEAF_USABLE_SIZE);
 	KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow)
 }
 
@@ -1768,9 +1768,12 @@ impl<F: VfsFile> BPlusTree<F> {
 					let mut parent = self.read_internal_node(offset)?;
 
 					let (min_local, max_local) = calculate_local_limits(false);
-					let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
-					let (key_on_page, key_overflow) =
-						calculate_overflow(promoted_key.len(), min_local, max_local, usable_size);
+					let (key_on_page, key_overflow) = calculate_overflow(
+						promoted_key.len(),
+						min_local,
+						max_local,
+						INTERNAL_USABLE_SIZE,
+					);
 					let entry_size = KEY_SIZE_PREFIX
 						+ key_on_page + CHILD_PTR_SIZE
 						+ overflow_ptr_size(key_overflow);
@@ -1836,7 +1839,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		// Use size-aware split point that accounts for the new entry
 		let split_idx = if is_duplicate {
 			// For duplicates, we're just updating a value, use simple split
-			leaf.find_split_point()
+			leaf.find_split_point_for_update()
 		} else {
 			leaf.find_split_point_for_insert(key, value, idx)
 		};
@@ -2739,7 +2742,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	/// Prepare internal node for writing by creating overflow pages for large keys
 	fn prepare_internal_node_overflow(&mut self, node: &mut InternalNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// Ensure key_overflows vec is properly sized
 		while node.key_overflows.len() < node.keys.len() {
@@ -2777,7 +2780,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	/// Prepare leaf node for writing by creating overflow pages for large cells (key+value)
 	fn prepare_leaf_node_overflow(&mut self, node: &mut LeafNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
+		let usable_size = LEAF_USABLE_SIZE;
 
 		// Ensure overflow vec is properly sized
 		while node.cell_overflows.len() < node.keys.len() {
