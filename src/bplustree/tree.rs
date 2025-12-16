@@ -133,7 +133,6 @@ const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
 const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
-const CELL_POINTER_SIZE: usize = 2; // 2 bytes for cell pointer overhead
 
 #[derive(Debug)]
 struct Header {
@@ -974,57 +973,37 @@ impl LeafNode {
 		new_value: &[u8],
 		insert_idx: usize,
 	) -> usize {
-		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = PAGE_SIZE - LEAF_HEADER_SIZE;
 		let max_page_size = PAGE_SIZE;
 
 		// Phase 1: Calculate actual cell sizes for all entries including the new one
 		let mut cell_sizes = Vec::with_capacity(self.keys.len() + 1);
-		let mut cell_cache = CellSizeCache::new();
-
-		// Helper to compute cell size
-		let compute_cell_size = |payload_len: usize| -> usize {
-			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(payload_len, min_local, max_local, usable_size);
-			KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow)
-		};
 
 		// Build cell sizes array with new entry inserted at correct position
 		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
 			if i == insert_idx {
 				// Insert new entry size at this position
-				let new_payload = new_key.len() + new_value.len();
-				let size =
-					cell_cache.get_or_compute(cell_sizes.len(), || compute_cell_size(new_payload));
+				let size = leaf_entry_size(new_key, new_value);
 				cell_sizes.push(size);
 			}
 
-			let payload_len = key.len() + value.len();
-			let size =
-				cell_cache.get_or_compute(cell_sizes.len(), || compute_cell_size(payload_len));
+			let size = leaf_entry_size(key, value);
 			cell_sizes.push(size);
 		}
 
 		// Handle case where insert_idx is at the end
 		if insert_idx >= self.keys.len() {
-			let new_payload = new_key.len() + new_value.len();
-			let size =
-				cell_cache.get_or_compute(cell_sizes.len(), || compute_cell_size(new_payload));
+			let size = leaf_entry_size(new_key, new_value);
 			cell_sizes.push(size);
 		}
 
 		let total_cells = cell_sizes.len();
 
 		// Phase 2: Initial packing - start with middle split and iteratively adjust
-		// Account for cell pointer overhead (2 bytes per cell)
-		// szLeft and szRight track total size including header, cell data, and cell pointers
+		// szLeft and szRight track total size including header and cell data
+		// Note: SurrealKV stores cells sequentially (no cell offset array), so no CELL_POINTER_SIZE overhead
 		let mut split_idx = total_cells / 2;
-		let mut sz_left = LEAF_HEADER_SIZE
-			+ cell_sizes[..split_idx].iter().sum::<usize>()
-			+ split_idx * CELL_POINTER_SIZE;
-		let mut sz_right = LEAF_HEADER_SIZE
-			+ cell_sizes[split_idx..].iter().sum::<usize>()
-			+ (total_cells - split_idx) * CELL_POINTER_SIZE;
+		let mut sz_left = LEAF_HEADER_SIZE + cell_sizes[..split_idx].iter().sum::<usize>();
+		let mut sz_right = LEAF_HEADER_SIZE + cell_sizes[split_idx..].iter().sum::<usize>();
 
 		// Iteratively move cells between left and right until both fit
 		loop {
@@ -1034,16 +1013,16 @@ impl LeafNode {
 					break;
 				}
 				let sz_cell = cell_sizes[split_idx - 1];
-				sz_left -= sz_cell + CELL_POINTER_SIZE;
-				sz_right += sz_cell + CELL_POINTER_SIZE;
+				sz_left -= sz_cell;
+				sz_right += sz_cell;
 				split_idx -= 1;
 			}
 
 			// If right is too large, move cells from right to left
 			while sz_right > max_page_size && split_idx < total_cells - 1 {
 				let sz_cell = cell_sizes[split_idx];
-				sz_left += sz_cell + CELL_POINTER_SIZE;
-				sz_right -= sz_cell + CELL_POINTER_SIZE;
+				sz_left += sz_cell;
+				sz_right -= sz_cell;
 				split_idx += 1;
 			}
 
@@ -1090,17 +1069,17 @@ impl LeafNode {
 				let sz_d = cell_sizes[d]; // Size of cell that would be at boundary
 
 				// Only move if it improves balance
-				// Condition: szRight+szD+2 > szLeft-(szR+2)
+				// Condition: szRight+szD > szLeft-szR
 				// This ensures moving the cell improves the balance between siblings
-				let new_right = sz_right_opt + sz_d + CELL_POINTER_SIZE;
-				let new_left = sz_left_opt - sz_r - CELL_POINTER_SIZE;
+				let new_right = sz_right_opt + sz_d;
+				let new_left = sz_left_opt - sz_r;
 
 				// Check if moving improves balance
 				// Only move if right is not empty and the move improves balance
 				if sz_right_opt != 0
 					&& new_left <= max_page_size
 					&& new_right <= max_page_size
-					&& new_right + CELL_POINTER_SIZE > new_left
+					&& new_right > new_left
 				{
 					// Moving improves balance
 					sz_right_opt = new_right;
@@ -1121,8 +1100,8 @@ impl LeafNode {
 
 		if insert_idx < split_idx {
 			// New entry is on left side of split
-			// In expanded array: [new_entry, entry0, entry1, ...]
-			// If split_idx=1: left=[new_entry], right=[entry0, entry1, ...]
+			// In expanded array: [entry0, ..., NEW_ENTRY, entry(insert_idx), ...]
+			// If split_idx=1: left=[NEW_ENTRY], right=[entry0, entry1, ...]
 			// In original array, this means split at index 0 (before entry0)
 			// But we can't use 0 because split_off(0) would put everything on right!
 			// Instead, we need to ensure at least the new entry goes left.
@@ -1132,10 +1111,17 @@ impl LeafNode {
 				// Special case: new entry alone on left, all original entries on right
 				// Return 0, but the caller must insert new entry into left before splitting
 				0
+			} else if split_idx == insert_idx + 1 {
+				// Edge case: split_idx(expanded) == insert_idx + 1
+				// In expanded: left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
+				// NEW_ENTRY is at position insert_idx in expanded array, which is < split_idx
+				// In original: we want left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
+				// Return insert_idx + 1 so that idx < split_idx is true in split_leaf
+				insert_idx + 1
 			} else {
-				// split_idx > 1: some original entries also go left
-				// split_idx=2 means: left=[new_entry, entry0], right=[entry1, ...]
-				// In original array, this is split_idx=1 (before entry1)
+				// split_idx > insert_idx + 1: some original entries also go left
+				// split_idx=3, insert_idx=1 means: left=[entry0, NEW_ENTRY, entry1], right=[entry2, ...]
+				// In original array, this is split_idx=2 (before entry2)
 				split_idx - 1
 			}
 		} else {
@@ -1566,32 +1552,6 @@ const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 		OVERFLOW_PTR_SIZE
 	} else {
 		0
-	}
-}
-
-/// Cache for cell sizes during split calculations
-struct CellSizeCache {
-	sizes: Vec<usize>,
-}
-
-impl CellSizeCache {
-	fn new() -> Self {
-		CellSizeCache {
-			sizes: Vec::new(),
-		}
-	}
-
-	fn get_or_compute<F>(&mut self, idx: usize, compute: F) -> usize
-	where
-		F: FnOnce() -> usize,
-	{
-		while self.sizes.len() <= idx {
-			self.sizes.push(0);
-		}
-		if self.sizes[idx] == 0 {
-			self.sizes[idx] = compute();
-		}
-		self.sizes[idx]
 	}
 }
 
