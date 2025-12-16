@@ -941,15 +941,10 @@ impl LeafNode {
 		// Check if new entry needs overflow
 		let new_needs_overflow = new_payload > max_local;
 
-		// Check if any existing entry needs overflow
-		let has_overflow = self.keys.iter().zip(&self.values).any(|(k, v)| {
-			let payload = k.len() + v.len();
-			payload > max_local
-		});
-
-		// Only use expensive algorithm if there IS overflow
-		// When overflow exists, we need precise size calculations to ensure both sides fit
-		let needs_complex_split = new_needs_overflow || has_overflow;
+		// Only use expensive algorithm if NEW entry needs overflow
+		// For existing overflow entries, the fast path is usually sufficient
+		// This avoids O(n) iteration through all entries on every split
+		let needs_complex_split = new_needs_overflow;
 
 		if !needs_complex_split {
 			// Fast path: Simple split (like old algorithm)
@@ -958,10 +953,28 @@ impl LeafNode {
 			} else {
 				self.keys.len() + 1 // For inserts, we add one entry
 			};
-			if insert_idx < total / 2 {
+			let split_idx_expanded = if insert_idx < total / 2 {
 				total / 2 - 1
 			} else {
 				total / 2
+			};
+
+			// Convert from expanded array index to original array index (for inserts only)
+			// Simple rule: if NEW is before split point, subtract 1; otherwise use as-is
+			if is_update {
+				// For updates, split_idx directly maps to original array index
+				split_idx_expanded
+			} else {
+				// For inserts: convert expanded index to original index
+				// If NEW is before split point, split_idx_expanded counts NEW, so subtract 1
+				// If NEW is at or after split point, split_idx_expanded doesn't count NEW yet
+				let split_idx = if insert_idx < split_idx_expanded {
+					split_idx_expanded - 1
+				} else {
+					split_idx_expanded
+				};
+				// Clamp to valid range [0, keys.len()]
+				split_idx.min(self.keys.len())
 			}
 		} else {
 			// Slow path: Complex iterative algorithm only when necessary
@@ -1130,10 +1143,10 @@ impl LeafNode {
 			} else if split_idx == insert_idx + 1 {
 				// Edge case: split_idx(expanded) == insert_idx + 1
 				// In expanded: left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
-				// NEW_ENTRY is at position insert_idx in expanded array, which is < split_idx
-				// In original: we want left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
-				// Return insert_idx + 1 so that idx < split_idx is true in split_leaf
-				insert_idx + 1
+				// Algorithm calculated sz_left for left=[..., NEW_ENTRY] (excluding entry(insert_idx))
+				// To preserve size invariants, we must return insert_idx (not insert_idx + 1)
+				// This ensures left gets [..., NEW_ENTRY] without entry(insert_idx)
+				insert_idx
 			} else {
 				// split_idx > insert_idx + 1: some original entries also go left
 				// split_idx=3, insert_idx=1 means: left=[entry0, NEW_ENTRY, entry1], right=[entry2, ...]
