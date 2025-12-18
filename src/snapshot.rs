@@ -11,7 +11,7 @@ use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
 use crate::{IntoBytes, Key, Value};
-use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::{IterResult, Iterator as LSMIterator, ReadOptions, INTERNAL_KEY_SEQ_NUM_MAX};
 use bytes::Bytes;
 
 /// Type alias for version scan results
@@ -735,7 +735,10 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						let mut table_iter = table.iter(keys_only);
+						let mut table_iter = table.iter(ReadOptions {
+							keys_only,
+							..Default::default()
+						});
 						// Seek to start if unbounded
 						match &range.0 {
 							Bound::Included(key) => {
@@ -781,7 +784,10 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						let mut table_iter = table.iter(keys_only);
+						let mut table_iter = table.iter(ReadOptions {
+							keys_only,
+							..Default::default()
+						});
 						// Seek to start if unbounded
 						match &range.0 {
 							Bound::Included(key) => {

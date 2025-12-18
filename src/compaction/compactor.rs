@@ -8,7 +8,7 @@ use crate::{
 	sstable::table::{Table, TableWriter},
 	vfs::File,
 	vlog::VLog,
-	Options as LSMOptions,
+	Options as LSMOptions, ReadOptions,
 };
 
 use std::{
@@ -80,7 +80,12 @@ impl Compactor {
 
 			let iterators: Vec<BoxedIterator<'_>> = to_merge
 				.into_iter()
-				.map(|table| Box::new(table.iter(false)) as BoxedIterator<'_>)
+				.map(|table| {
+					Box::new(table.iter(ReadOptions {
+						keys_only: false,
+						..Default::default()
+					})) as BoxedIterator<'_>
+				})
 				.collect();
 
 			// Hide tables that are being merged

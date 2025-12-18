@@ -797,7 +797,7 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(self: &Arc<Self>, keys_only: bool) -> TableIterator {
+	pub(crate) fn iter(self: &Arc<Self>, read_options: crate::ReadOptions) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
@@ -823,11 +823,12 @@ impl Table {
 			exhausted: false,
 			current_partition_index: 0,
 			current_partition_iter: None,
-			keys_only,
+			keys_only: read_options.keys_only,
+			read_options,
 			block_prefetcher: BlockPrefetcher::new(
-				0,                                 // compaction_readahead_size - set to 0 for now
-				self.opts.block_size * 2,          // initial_auto_readahead_size - 2x block size
-				self.opts.max_auto_readahead_size, // max_auto_readahead_size
+				0,                                     // compaction_readahead_size - set to 0 for now
+				self.opts.initial_auto_readahead_size, // initial_auto_readahead_size - 8KB default
+				self.opts.max_auto_readahead_size,     // max_auto_readahead_size - 256KB default
 			),
 		}
 	}
@@ -893,6 +894,8 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
+	/// Read options for this iterator
+	read_options: crate::ReadOptions,
 	// Block prefetcher for readahead during iteration
 	block_prefetcher: crate::sstable::index_block::BlockPrefetcher,
 }
@@ -927,26 +930,6 @@ impl TableIterator {
 
 		let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 
-		// Use block prefetcher for readahead
-		let is_for_compaction = false; // TODO: pass actual compaction flag
-		let readahead_size = 0; // TODO: add readahead_size to Options
-		let should_prefetch = self.block_prefetcher.prefetch_if_needed(
-			&partition_handle.handle,
-			readahead_size,
-			is_for_compaction,
-			false, // no_sequential_checking
-			self.table.file.as_ref(),
-		);
-
-		// TODO: Implement actual prefetching logic here when VFS supports it
-		if should_prefetch {
-			// Update readahead limit following RocksDB's pattern
-			let readahead_limit = partition_handle.handle.offset() as u64
-				+ partition_handle.handle.size() as u64
-				+ self.block_prefetcher.get_curr_readahead_size() as u64;
-			self.block_prefetcher.set_readahead_limit(readahead_limit);
-		}
-
 		let partition_block = partitioned_index.load_block(partition_handle)?;
 		// Note: Index blocks always need full key-value pairs to decode block handles
 		let mut partition_iter = partition_block.iter(false);
@@ -976,6 +959,18 @@ impl TableIterator {
 	}
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
+		// Use BlockPrefetcher for data block prefetching with sequential detection
+		let is_for_compaction = false; // Not compaction for now
+		let readahead_size = self.read_options.readahead_size;
+
+		let should_prefetch = self.block_prefetcher.prefetch_if_needed(
+			handle,
+			readahead_size,
+			is_for_compaction,
+			false, // no_sequential_checking
+			self.table.file.as_ref(),
+		);
+
 		let block = self.table.read_block(handle)?;
 		let mut block_iter = block.iter(self.keys_only);
 
@@ -985,6 +980,15 @@ impl TableIterator {
 		if block_iter.valid() {
 			self.current_block = Some(block_iter);
 			self.current_block_off = handle.offset();
+
+			// Update BlockPrefetcher state for sequential detection
+			if should_prefetch {
+				let readahead_limit = handle.offset() as u64
+					+ handle.size() as u64
+					+ self.block_prefetcher.get_curr_readahead_size() as u64;
+				self.block_prefetcher.set_readahead_limit(readahead_limit);
+			}
+
 			return Ok(());
 		}
 
@@ -1353,6 +1357,7 @@ mod tests {
 	use test_log::test;
 
 	use crate::sstable::{InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
+	use crate::transaction::ReadOptions;
 
 	use super::*;
 	use rand::rngs::StdRng;
@@ -1507,7 +1512,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 
 		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
@@ -1535,7 +1540,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 
 		iter.advance();
 		assert!(iter.valid());
@@ -1688,7 +1693,7 @@ mod tests {
 			"Table should contain num_items entries"
 		);
 
-		let iter = table.iter(false);
+		let iter = table.iter(ReadOptions::default());
 		for (item, (key, value)) in iter.enumerate() {
 			let expected_key = format!("key_{item:05}");
 			let expected_value = format!("value_{item:05}");
@@ -2238,7 +2243,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let iter = table.iter(false);
+		let iter = table.iter(ReadOptions::default());
 		let mut collected_items = Vec::new();
 
 		for (key, value) in iter {
@@ -2284,7 +2289,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 		let mut seen_keys = Vec::new();
 		let mut iteration_count = 0;
 
@@ -2341,7 +2346,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 
 		for expected_index in 0..data.len() {
 			let advance_result = iter.advance();
@@ -2396,7 +2401,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(ReadOptions::default()).collect();
 			assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
 			let key_str = std::str::from_utf8(&collected[0].0.user_key).unwrap();
@@ -2412,7 +2417,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(ReadOptions::default()).collect();
 			assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
 			let keys: Vec<String> = collected
@@ -2434,7 +2439,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(ReadOptions::default()).collect();
 			assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
 			let mut seen_keys = std::collections::HashSet::new();
@@ -2470,7 +2475,7 @@ mod tests {
 		let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
 		for (seek_key, expected_start_index) in test_cases {
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 
 			let internal_key = InternalKey::new(
 				Bytes::copy_from_slice(seek_key.as_bytes()),
@@ -2536,7 +2541,7 @@ mod tests {
 
 		// Test seek to existing key
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_005"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2569,7 +2574,7 @@ mod tests {
 
 		// Test seek to non-existing key (should find next key)
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_003"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2582,7 +2587,7 @@ mod tests {
 
 		// Test seek past end
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_999"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2608,7 +2613,7 @@ mod tests {
 		use std::time::Instant;
 
 		let start = Instant::now();
-		let count = table.iter(false).count();
+		let count = table.iter(ReadOptions::default()).count();
 		let duration = start.elapsed();
 
 		assert_eq!(count, 1000, "Should iterate through all 1000 items");
@@ -2617,7 +2622,7 @@ mod tests {
 
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 			let seek_key = InternalKey::new(
 				Bytes::from(format!("key_{i:06}").into_bytes()),
 				1,
@@ -2642,7 +2647,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 		iter.seek_to_first();
 
 		while iter.valid() {
@@ -2678,7 +2683,7 @@ mod tests {
 
 		// Create multiple iterators and verify they work independently
 		for iteration in 0..3 {
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(ReadOptions::default()).collect();
 
 			assert_eq!(
 				collected.len(),
@@ -2715,7 +2720,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 
 			let result = iter.advance();
 			assert!(!result, "advance() on empty table should return false");
@@ -2732,7 +2737,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 
 			assert!(iter.advance(), "First advance should succeed on single-item table");
 			assert!(iter.valid(), "Iterator should be valid after first advance");
@@ -2748,7 +2753,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(ReadOptions::default());
 
 			// Exhaust the iterator
 			while iter.advance() {
@@ -2773,7 +2778,7 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test with manual advance() loop - need to position first
-		let mut iter1 = table.iter(false);
+		let mut iter1 = table.iter(ReadOptions::default());
 		iter1.seek_to_first();
 		let mut collected_via_advance = Vec::new();
 		while iter1.valid() {
@@ -2784,7 +2789,7 @@ mod tests {
 		}
 
 		// Test with standard iterator interface
-		let iter2 = table.iter(false);
+		let iter2 = table.iter(ReadOptions::default());
 		let mut collected_via_next = Vec::new();
 		for (key, value) in iter2 {
 			collected_via_next.push((key, value));
@@ -2826,7 +2831,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let collected: Vec<_> = table.iter(false).collect();
+		let collected: Vec<_> = table.iter(ReadOptions::default()).collect();
 
 		assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
 
@@ -2905,7 +2910,7 @@ mod tests {
 		}
 
 		// Test full iteration
-		let iter = table.iter(false);
+		let iter = table.iter(ReadOptions::default());
 		let collected: Vec<_> = iter.collect();
 		assert_eq!(collected.len(), 100, "Should iterate through all entries");
 
@@ -3554,7 +3559,7 @@ mod tests {
 
 		// Seek to key_aaa which does NOT exist
 		// key_aaa < key_bbb lexicographically
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 		let lookup_key = InternalKey::new(
 			Bytes::copy_from_slice(b"key_aaa"),
 			2, // Higher seq number for lookup
@@ -3597,7 +3602,7 @@ mod tests {
 			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_zzz which is past all keys
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode());
@@ -3624,7 +3629,7 @@ mod tests {
 			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_bbb which exists
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(ReadOptions::default());
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode());

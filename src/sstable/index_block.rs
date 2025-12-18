@@ -16,7 +16,6 @@ use crate::{
 };
 use bytes::Bytes;
 
-/// FilePrefetchBuffer implementation based on RocksDB's design.
 /// Manages prefetching of file data for efficient sequential access.
 pub(crate) struct FilePrefetchBuffer {
 	buffer: Vec<u8>,
@@ -35,7 +34,6 @@ impl FilePrefetchBuffer {
 		}
 	}
 
-	/// Prefetch implementation following RocksDB's FilePrefetchBuffer::Prefetch
 	pub(crate) fn prefetch(
 		&mut self,
 		file: &dyn crate::vfs::File,
@@ -68,7 +66,6 @@ impl FilePrefetchBuffer {
 	}
 }
 
-/// BlockPrefetcher implementation following RocksDB's design.
 /// Handles readahead for sequential block access patterns.
 pub(crate) struct BlockPrefetcher {
 	// Readahead size used in compaction
@@ -94,7 +91,6 @@ impl BlockPrefetcher {
 		initial_auto_readahead_size: usize,
 		max_auto_readahead_size: usize,
 	) -> Self {
-		// Sanitize initial_auto_readahead_size following RocksDB logic
 		let sanitized_initial = if initial_auto_readahead_size > max_auto_readahead_size {
 			max_auto_readahead_size
 		} else {
@@ -113,18 +109,17 @@ impl BlockPrefetcher {
 		}
 	}
 
-	/// Update read pattern for sequential detection (following RocksDB's UpdateReadPattern)
+	/// Update read pattern for sequential detection
 	pub(crate) fn update_read_pattern(&mut self, offset: u64, len: usize) {
 		self.prev_offset = offset;
 		self.prev_len = len;
 	}
 
-	/// Check if block access is sequential (following RocksDB's IsBlockSequential)
+	/// Check if block access is sequential
 	pub(crate) fn is_block_sequential(&self, offset: u64) -> bool {
 		self.prev_len == 0 || (self.prev_offset + self.prev_len as u64 == offset)
 	}
 
-	/// Reset values following RocksDB's ResetValues
 	pub(crate) fn reset_values(&mut self, initial_auto_readahead_size: usize) {
 		self.num_file_reads = 1;
 		// Sanitize the initial size against max_auto_readahead_size
@@ -134,7 +129,6 @@ impl BlockPrefetcher {
 		self.readahead_limit = 0;
 	}
 
-	/// PrefetchIfNeeded implementation following RocksDB's logic
 	pub(crate) fn prefetch_if_needed(
 		&mut self,
 		handle: &BlockHandle,
@@ -154,8 +148,7 @@ impl BlockPrefetcher {
 					let prefetch_result =
 						file.prefetch(offset, len as usize + self.compaction_readahead_size);
 					if prefetch_result.is_ok() {
-						self.readahead_limit =
-							offset + len as u64 + self.compaction_readahead_size as u64;
+						self.readahead_limit = offset + len + self.compaction_readahead_size as u64;
 						return false; // Prefetch succeeded, no need for buffer-based prefetch
 					}
 				}
@@ -191,7 +184,8 @@ impl BlockPrefetcher {
 		self.update_read_pattern(offset, len as usize);
 
 		// Auto readahead logic - try FS prefetch first
-		if self.initial_auto_readahead_size == 0 {
+		// Disable prefetching if either initial or max readahead size is 0
+		if self.initial_auto_readahead_size == 0 || self.max_auto_readahead_size == 0 {
 			return false;
 		}
 
@@ -201,12 +195,11 @@ impl BlockPrefetcher {
 			return false;
 		}
 
-		// Try FS-level prefetch for auto readahead (following RocksDB's logic)
+		// Try FS-level prefetch for auto readahead
 		if file.supports_prefetch() {
 			let prefetch_result = file.prefetch(offset, len as usize + self.readahead_size);
 			if prefetch_result.is_ok() {
 				self.readahead_limit = offset + len + self.readahead_size as u64;
-				// Grow readahead size exponentially like RocksDB
 				self.grow_readahead_size();
 				return false; // FS prefetch succeeded
 			}
@@ -216,7 +209,6 @@ impl BlockPrefetcher {
 		true
 	}
 
-	/// Grow readahead size exponentially following RocksDB's logic
 	pub(crate) fn grow_readahead_size(&mut self) {
 		if self.readahead_size < self.max_auto_readahead_size {
 			self.readahead_size = (self.readahead_size * 2).min(self.max_auto_readahead_size);
@@ -453,7 +445,6 @@ impl TopLevelIndex {
 	}
 
 	/// Cache dependencies by prefetching all partition blocks.
-	/// This mimics RocksDB's CacheDependencies method exactly.
 	pub(crate) fn cache_dependencies(&mut self, pin: bool) -> Result<()> {
 		if !self.partition_map.is_empty() {
 			// The dependencies are already cached since partition_map is filled in
@@ -483,7 +474,6 @@ impl TopLevelIndex {
 		let mut map_in_progress = HashMap::new();
 
 		// After prefetch, read the partitions one by one
-		// In RocksDB, this calls MaybeReadBlockAndLoadToCache for each partition
 		for partition in &self.blocks {
 			let block = self.load_block(partition)?;
 			if pin {
@@ -687,7 +677,7 @@ mod tests {
 		index.cache_dependencies(true).unwrap();
 
 		// Verify partitions are cached
-		assert!(index.partition_map.len() > 0);
+		assert!(!index.partition_map.is_empty());
 		assert_eq!(index.partition_map.len(), index.blocks.len());
 
 		// Test loading from cache

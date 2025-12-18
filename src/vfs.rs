@@ -6,6 +6,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use fs2::FileExt as LockFileExt;
 
 use std::fs::File as SysFile;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 pub trait File: Send + Sync {
 	#[allow(unused)]
@@ -248,9 +250,13 @@ impl File for SysFile {
 		{
 			true
 		}
-		false
+		#[cfg(not(target_os = "linux"))]
+		{
+			false
+		}
 	}
 
+	#[allow(unused_variables)]
 	fn prefetch(&self, offset: u64, length: usize) -> Result<()> {
 		// Basic implementation using OS-level prefetch hints
 		// On Linux, we could use posix_fadvise with POSIX_FADV_WILLNEED
@@ -274,6 +280,9 @@ impl File for SysFile {
 				Ok(())
 			}
 		}
-		Ok(())
+		#[cfg(not(target_os = "linux"))]
+		{
+			Ok(())
+		}
 	}
 }
