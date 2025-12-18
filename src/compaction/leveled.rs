@@ -392,7 +392,7 @@ mod tests {
 			let file = File::create(&table_path)?;
 
 			// Create a TableWriter
-			let mut writer = TableWriter::new(file, id, self.options.clone());
+			let mut writer = TableWriter::new(file, id, self.options.clone(), 0); // Test table, use L0
 
 			// Add entries to the table
 			for (key, value) in entries {

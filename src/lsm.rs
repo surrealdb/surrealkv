@@ -31,8 +31,8 @@ use crate::{
 		recovery::{repair_corrupted_wal_segment, replay_wal},
 		Wal,
 	},
-	BytewiseComparator, Comparator, CompressionType, Error, FilterPolicy, Options,
-	TimestampComparator, VLogChecksumLevel, Value, WalRecoveryMode,
+	BytewiseComparator, Comparator, Error, FilterPolicy, Options, TimestampComparator,
+	VLogChecksumLevel, Value, WalRecoveryMode,
 };
 use bytes::Bytes;
 
@@ -1604,50 +1604,6 @@ impl TreeBuilder {
 	/// Sets the comparator.
 	pub fn with_comparator(mut self, comparator: Arc<dyn Comparator>) -> Self {
 		self.opts = self.opts.with_comparator(comparator);
-		self
-	}
-
-	/// Sets the compression type for data blocks in SSTables.
-	///
-	/// # Arguments
-	///
-	/// * `compression` - The compression algorithm to use
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::{TreeBuilder, CompressionType};
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_compression(CompressionType::SnappyCompression)
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub fn with_compression(mut self, compression: CompressionType) -> Self {
-		self.opts = self.opts.with_compression(compression);
-		self
-	}
-
-	/// Enables Snappy compression for data blocks in SSTables.
-	///
-	/// This is a convenience method for enabling Snappy compression,
-	/// which provides fast compression/decompression with excellent
-	/// compression ratios for typical data patterns.
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::TreeBuilder;
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_snappy_compression()
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub fn with_snappy_compression(mut self) -> Self {
-		self.opts = self.opts.with_snappy_compression();
 		self
 	}
 

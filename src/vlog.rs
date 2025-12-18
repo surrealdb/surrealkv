@@ -11,7 +11,7 @@ use std::{
 
 use crate::{batch::Batch, discard::DiscardStats, Value};
 use crate::{bplustree::tree::DiskBPlusTree, Tree, TreeBuilder};
-use crate::{sstable::InternalKey, vfs, Options, VLogChecksumLevel};
+use crate::{sstable::InternalKey, vfs, CompressionType, Options, VLogChecksumLevel};
 use bytes::Bytes;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -602,7 +602,7 @@ impl VLog {
 					&file_path,
 					file_id,
 					self.opts.vlog_max_file_size,
-					self.opts.compression as u8,
+					CompressionType::None as u8,
 				)?;
 
 				// Register the new file for GC safety
@@ -693,7 +693,7 @@ impl VLog {
 				&max_file_path.unwrap(),
 				highest_file_id,
 				self.opts.vlog_max_file_size,
-				self.opts.compression as u8,
+				CompressionType::None as u8,
 			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
 			*self.writer.write() = Some(writer);
@@ -1953,7 +1953,7 @@ mod tests {
 	#[test]
 	fn test_vlog_file_header_encoding() {
 		let opts = Options::default();
-		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
+		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, CompressionType::None as u8);
 		let encoded = header.encode();
 		let decoded = VLogFileHeader::decode(&encoded).unwrap();
 
@@ -1970,7 +1970,8 @@ mod tests {
 	#[test]
 	fn test_vlog_file_header_invalid_magic() {
 		let opts = Options::default();
-		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
+		let mut header =
+			VLogFileHeader::new(123, opts.vlog_max_file_size, CompressionType::None as u8);
 		header.magic = 0x12345678; // Invalid magic
 		let encoded = header.encode();
 
@@ -1980,7 +1981,7 @@ mod tests {
 	#[test]
 	fn test_vlog_file_header_invalid_size() {
 		let opts = Options::default();
-		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
+		let header = VLogFileHeader::new(123, opts.vlog_max_file_size, CompressionType::None as u8);
 		let mut encoded = header.encode().to_vec();
 		encoded.pop(); // Remove one byte to make it invalid size
 
@@ -1990,7 +1991,8 @@ mod tests {
 	#[test]
 	fn test_vlog_file_header_version_compatibility() {
 		let opts = Options::default();
-		let mut header = VLogFileHeader::new(123, opts.vlog_max_file_size, opts.compression as u8);
+		let mut header =
+			VLogFileHeader::new(123, opts.vlog_max_file_size, CompressionType::None as u8);
 		header.version = VLOG_FORMAT_VERSION;
 		assert!(header.is_compatible());
 
@@ -2329,7 +2331,7 @@ mod tests {
 				&test_file_path,
 				file_id,
 				opts.vlog_max_file_size,
-				opts.compression as u8,
+				CompressionType::None as u8,
 			)
 			.unwrap();
 
@@ -2375,7 +2377,7 @@ mod tests {
 				&test_file_path,
 				file_id,
 				opts.vlog_max_file_size,
-				opts.compression as u8,
+				CompressionType::None as u8,
 			)
 			.unwrap();
 
@@ -2466,7 +2468,7 @@ mod tests {
 				&test_file_path,
 				file_id,
 				opts.vlog_max_file_size,
-				opts.compression as u8,
+				CompressionType::None as u8,
 			)
 			.unwrap();
 			let current_file_size = std::fs::metadata(&test_file_path).unwrap().len();

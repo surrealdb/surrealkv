@@ -520,7 +520,7 @@ mod tests {
 		let mut file = SysFile::create(&table_file_path)?;
 
 		// Create TableWriter that writes directly to the file
-		let mut writer = TableWriter::new(&mut file, table_id, opts.clone());
+		let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
 
 		// Generate and add items
 		for i in 0..num_items {
@@ -884,7 +884,7 @@ mod tests {
 		let mut file = SysFile::create(&table_file_path)?;
 
 		// Create TableWriter that writes directly to the file
-		let mut writer = TableWriter::new(&mut file, table_id, opts.clone());
+		let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
 
 		// Generate and add items with specific sequence numbers
 		for seq_num in seq_start..=seq_end {

@@ -6,6 +6,7 @@ mod clock;
 mod commit;
 mod compaction;
 mod comparator;
+mod compression;
 mod discard;
 mod error;
 mod iter;
@@ -191,7 +192,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
-	pub compression: CompressionType,
+	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
@@ -241,7 +242,7 @@ impl Default for Options {
 			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
 			comparator: Arc::new(crate::BytewiseComparator {}),
-			compression: CompressionType::None,
+			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
 			path: PathBuf::from(""),
@@ -287,36 +288,10 @@ impl Options {
 		self
 	}
 
-	pub const fn with_compression(mut self, value: CompressionType) -> Self {
-		self.compression = value;
-		self
-	}
-
-	/// Enables Snappy compression for data blocks in SSTables.
-	///
-	/// This is a convenience method equivalent to
-	/// `with_compression(CompressionType::SnappyCompression)`.
-	/// Snappy provides fast compression/decompression with reasonable
-	/// compression ratios (~90%+ for highly compressible data).
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::Options;
-	///
-	/// let opts = Options::new().with_snappy_compression();
-	/// ```
-	pub const fn with_snappy_compression(mut self) -> Self {
-		self.compression = CompressionType::SnappyCompression;
-		self
-	}
-
 	/// Disables compression for data blocks in SSTables.
 	///
-	/// This is a convenience method equivalent to
-	/// `with_compression(CompressionType::None)`.
-	/// Use this when compression overhead is not desired or when
-	/// data is already compressed.
+	/// This clears the compression_per_level vector, causing all levels
+	/// to default to CompressionType::None.
 	///
 	/// # Example
 	///
@@ -325,8 +300,44 @@ impl Options {
 	///
 	/// let opts = Options::new().without_compression();
 	/// ```
-	pub const fn without_compression(mut self) -> Self {
-		self.compression = CompressionType::None;
+	pub fn without_compression(mut self) -> Self {
+		self.compression_per_level = Vec::new();
+		self
+	}
+
+	/// Sets compression per level. Vector index corresponds to level number.
+	/// If vector is shorter than level count, last compression type is used for higher levels.
+	/// If vector is empty, global compression setting is used.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::{Options, CompressionType};
+	///
+	/// let opts = Options::new()
+	///     .with_compression_per_level(vec![
+	///         CompressionType::None,        // L0: no compression
+	///         CompressionType::SnappyCompression, // L1+: Snappy compression
+	///     ]);
+	/// ```
+	pub fn with_compression_per_level(mut self, levels: Vec<CompressionType>) -> Self {
+		self.compression_per_level = levels;
+		self
+	}
+
+	/// Convenience method: no compression on L0, Snappy compression on other levels.
+	/// Equivalent to `with_compression_per_level(vec![CompressionType::None, CompressionType::SnappyCompression])`.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::Options;
+	///
+	/// let opts = Options::new().with_l0_no_compression();
+	/// ```
+	pub fn with_l0_no_compression(mut self) -> Self {
+		self.compression_per_level =
+			vec![CompressionType::None, CompressionType::SnappyCompression];
 		self
 	}
 
