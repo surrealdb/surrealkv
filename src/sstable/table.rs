@@ -14,7 +14,7 @@ use crate::{
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter},
 		filter_block::{FilterBlockReader, FilterBlockWriter},
-		index_block::{TopLevelIndex, TopLevelIndexWriter},
+		index_block::{BlockPrefetcher, TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
 		InternalKey, InternalKeyKind,
 	},
@@ -635,8 +635,13 @@ impl Table {
 
 		// Using partitioned index
 		let index_block = {
-			let partitioned_index =
+			let mut partitioned_index =
 				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
+
+			// Call cache_dependencies to prefetch partition blocks during table opening
+			// This matches RocksDB's behavior of prefetching partitions when the table is loaded
+			partitioned_index.cache_dependencies(false)?; // pin=false for now
+
 			IndexType::Partitioned(partitioned_index)
 		};
 
@@ -820,6 +825,10 @@ impl Table {
 			current_partition_index: 0,
 			current_partition_iter: None,
 			keys_only,
+			block_prefetcher: BlockPrefetcher::new(
+				0, // compaction_readahead_size - set to 0 for now
+				self.opts.block_size * 2, // initial_auto_readahead_size - 2x block size
+			),
 		}
 	}
 
@@ -884,6 +893,8 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
+	// Block prefetcher for readahead during iteration
+	block_prefetcher: crate::sstable::index_block::BlockPrefetcher,
 }
 
 impl TableIterator {
@@ -915,6 +926,26 @@ impl TableIterator {
 		}
 
 		let partition_handle = &partitioned_index.blocks[self.current_partition_index];
+
+		// Use block prefetcher for readahead
+		let is_for_compaction = false; // TODO: pass actual compaction flag
+		let readahead_size = 0; // TODO: add readahead_size to Options
+		let should_prefetch = self.block_prefetcher.prefetch_if_needed(
+			&partition_handle.handle,
+			readahead_size,
+			is_for_compaction,
+			false, // no_sequential_checking
+		);
+
+		// TODO: Implement actual prefetching logic here when VFS supports it
+		if should_prefetch {
+			// Update readahead limit following RocksDB's pattern
+			let readahead_limit = partition_handle.handle.offset() as u64 +
+				partition_handle.handle.size() as u64 +
+				self.block_prefetcher.get_curr_readahead_size() as u64;
+			self.block_prefetcher.set_readahead_limit(readahead_limit);
+		}
+
 		let partition_block = partitioned_index.load_block(partition_handle)?;
 		// Note: Index blocks always need full key-value pairs to decode block handles
 		let mut partition_iter = partition_block.iter(false);
@@ -2894,6 +2925,7 @@ mod tests {
 			);
 		}
 	}
+
 
 	#[test]
 	fn test_get_nonexistent_key_returns_none() {
