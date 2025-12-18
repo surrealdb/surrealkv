@@ -292,6 +292,44 @@ impl Options {
 		self
 	}
 
+	/// Enables Snappy compression for data blocks in SSTables.
+	///
+	/// This is a convenience method equivalent to
+	/// `with_compression(CompressionType::SnappyCompression)`.
+	/// Snappy provides fast compression/decompression with reasonable
+	/// compression ratios (~90%+ for highly compressible data).
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::Options;
+	///
+	/// let opts = Options::new().with_snappy_compression();
+	/// ```
+	pub const fn with_snappy_compression(mut self) -> Self {
+		self.compression = CompressionType::SnappyCompression;
+		self
+	}
+
+	/// Disables compression for data blocks in SSTables.
+	///
+	/// This is a convenience method equivalent to
+	/// `with_compression(CompressionType::None)`.
+	/// Use this when compression overhead is not desired or when
+	/// data is already compressed.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::Options;
+	///
+	/// let opts = Options::new().without_compression();
+	/// ```
+	pub const fn without_compression(mut self) -> Self {
+		self.compression = CompressionType::None;
+		self
+	}
+
 	pub fn with_path(mut self, value: PathBuf) -> Self {
 		self.path = value;
 		self

@@ -4,6 +4,8 @@
 //! WAL recovery, memtable flush, SST interaction, and manifest coordination.
 
 #[cfg(test)]
+pub mod compression_tests;
+#[cfg(test)]
 pub mod recovery_integration_tests;
 #[cfg(test)]
 pub mod recovery_test_helpers;

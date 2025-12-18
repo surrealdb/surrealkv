@@ -1607,9 +1607,68 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the compression type.
+	/// Sets the compression type for data blocks in SSTables.
+	///
+	/// # Arguments
+	///
+	/// * `compression` - The compression algorithm to use
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::{TreeBuilder, CompressionType};
+	///
+	/// let tree = TreeBuilder::new()
+	///     .with_path("./data".into())
+	///     .with_compression(CompressionType::SnappyCompression)
+	///     .build()
+	///     .unwrap();
+	/// ```
 	pub fn with_compression(mut self, compression: CompressionType) -> Self {
 		self.opts = self.opts.with_compression(compression);
+		self
+	}
+
+	/// Enables Snappy compression for data blocks in SSTables.
+	///
+	/// This is a convenience method for enabling Snappy compression,
+	/// which provides fast compression/decompression with excellent
+	/// compression ratios for typical data patterns.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::TreeBuilder;
+	///
+	/// let tree = TreeBuilder::new()
+	///     .with_path("./data".into())
+	///     .with_snappy_compression()
+	///     .build()
+	///     .unwrap();
+	/// ```
+	pub fn with_snappy_compression(mut self) -> Self {
+		self.opts = self.opts.with_snappy_compression();
+		self
+	}
+
+	/// Disables compression for data blocks in SSTables.
+	///
+	/// Use this when compression overhead is not desired or when
+	/// data is already compressed at the application level.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::TreeBuilder;
+	///
+	/// let tree = TreeBuilder::new()
+	///     .with_path("./data".into())
+	///     .without_compression()
+	///     .build()
+	///     .unwrap();
+	/// ```
+	pub fn without_compression(mut self) -> Self {
+		self.opts = self.opts.without_compression();
 		self
 	}
 
