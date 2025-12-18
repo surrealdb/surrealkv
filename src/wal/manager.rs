@@ -141,7 +141,7 @@ impl Wal {
 			Ok(Writer::new(buffered_writer, false, detected_compression, block_offset))
 		} else {
 			// New file - use compression type from options
-			let compression_type = opts.compression_type.unwrap_or(CompressionType::None);
+			let compression_type = opts.compression_type;
 
 			// Create buffered file writer
 			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);

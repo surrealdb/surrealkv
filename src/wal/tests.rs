@@ -289,7 +289,7 @@ fn test_options_builder() {
 		.with_extension("log".to_string());
 
 	assert_eq!(opts.max_file_size, 50 * 1024 * 1024);
-	assert_eq!(opts.compression_type, Some(CompressionType::Lz4));
+	assert_eq!(opts.compression_type, CompressionType::Lz4);
 	assert_eq!(opts.file_extension, Some("log".to_string()));
 }
 

@@ -154,7 +154,7 @@ pub struct Options {
 	pub(crate) file_mode: Option<u32>,
 
 	/// The compression type to apply to the segment's data.
-	pub(crate) compression_type: Option<CompressionType>,
+	pub(crate) compression_type: CompressionType,
 
 	/// The extension to use for the segment file.
 	pub(crate) file_extension: Option<String>,
@@ -168,7 +168,7 @@ impl Default for Options {
 		Options {
 			dir_mode: Some(0o750),
 			file_mode: Some(DEFAULT_FILE_MODE),
-			compression_type: Some(CompressionType::None),
+			compression_type: CompressionType::None,
 			file_extension: Some("wal".to_string()),
 			max_file_size: DEFAULT_FILE_SIZE,
 		}
@@ -198,7 +198,7 @@ impl Options {
 	/// Sets the compression type.
 	#[allow(unused)]
 	pub(crate) fn with_compression(mut self, compression_type: CompressionType) -> Self {
-		self.compression_type = Some(compression_type);
+		self.compression_type = compression_type;
 		self
 	}
 

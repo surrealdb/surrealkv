@@ -1549,7 +1549,7 @@ fn test_compressed_wal_segments() {
 
 	// Create WAL with LZ4 compression
 	let opts = Options {
-		compression_type: Some(CompressionType::Lz4),
+		compression_type: CompressionType::Lz4,
 		..Default::default()
 	};
 
@@ -1603,7 +1603,7 @@ fn test_mixed_compression_segments() {
 
 	// Create next 2 segments with LZ4 compression
 	let opts = Options {
-		compression_type: Some(CompressionType::Lz4),
+		compression_type: CompressionType::Lz4,
 		..Default::default()
 	};
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
@@ -1639,7 +1639,7 @@ fn test_compressed_data_corruption() {
 
 	// Create compressed WAL
 	let opts = Options {
-		compression_type: Some(CompressionType::Lz4),
+		compression_type: CompressionType::Lz4,
 		..Default::default()
 	};
 
