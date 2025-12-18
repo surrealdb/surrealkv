@@ -118,6 +118,16 @@ pub(crate) struct CoreInner {
 
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
+
+	/// Write controller for managing write stalls
+	pub(crate) write_controller: Arc<crate::write_controller::WriteController>,
+
+	/// Current write stall guard (if any) - released when stall clears
+	pub(crate) write_stall_guard:
+		Arc<parking_lot::Mutex<Option<crate::write_controller::WriteStallGuard>>>,
+
+	/// Shutdown flag to break write stall blocking loops
+	shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CoreInner {
@@ -172,6 +182,12 @@ impl CoreInner {
 			None
 		};
 
+		// Initialize write controller
+		let write_controller = Arc::new(crate::write_controller::WriteController::new(
+			opts.delayed_write_rate,
+			opts.delayed_write_rate,
+		));
+
 		Ok(Self {
 			opts,
 			active_memtable,
@@ -183,7 +199,50 @@ impl CoreInner {
 			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
+			write_controller,
+			write_stall_guard: Arc::new(parking_lot::Mutex::new(None)),
+			shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		})
+	}
+
+	/// Preprocess write: check stall conditions and apply backpressure
+	pub(crate) async fn preprocess_write(&self, num_bytes: usize, no_slowdown: bool) -> Result<()> {
+		use std::time::Duration;
+
+		// Check if stopped
+		if self.write_controller.is_stopped() {
+			if no_slowdown {
+				return Err(Error::WriteStall(
+					"Write stopped due to compaction backpressure".into(),
+				));
+			}
+
+			// Block until compaction catches up
+			while self.write_controller.is_stopped() {
+				tokio::time::sleep(Duration::from_millis(100)).await;
+
+				// Check for shutdown
+				if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+					return Err(Error::Other("Database is shutting down".into()));
+				}
+			}
+		}
+
+		// Check if needs delay
+		if self.write_controller.needs_delay() {
+			if no_slowdown {
+				return Err(Error::WriteStall(
+					"Write delayed due to compaction backpressure".into(),
+				));
+			}
+
+			let delay_micros = self.write_controller.calculate_delay(num_bytes as u64);
+			if delay_micros > 0 {
+				tokio::time::sleep(Duration::from_micros(delay_micros)).await;
+			}
+		}
+
+		Ok(())
 	}
 
 	/// Makes room for new writes by flushing the active memtable if needed.
@@ -310,6 +369,24 @@ impl CoreInner {
 			table_id,
 			changeset.log_number
 		);
+
+		// Recalculate write stall conditions after flush
+		let num_immutable = self.immutable_memtables.read().unwrap().len();
+		let manifest = self.level_manifest.read().unwrap();
+		let num_l0_files = manifest.levels.get_levels()[0].tables.len();
+		drop(manifest);
+
+		let mut guard_holder = self.write_stall_guard.lock();
+		crate::write_controller::recalculate_write_stall_conditions(
+			num_immutable,
+			num_l0_files,
+			self.opts.max_write_buffer_number,
+			self.opts.level0_slowdown_writes_trigger,
+			self.opts.level0_stop_writes_trigger,
+			&self.write_controller,
+			&mut guard_holder,
+		);
+		drop(guard_holder);
 
 		// Step 7: Async WAL cleanup using values we already have
 		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number earlier
@@ -1223,6 +1300,9 @@ impl Core {
 	/// This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
 		log::info!("Shutting down LSM tree...");
+
+		// Set shutdown flag to unblock any write stalls
+		self.inner.shutting_down.store(true, std::sync::atomic::Ordering::Release);
 
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
 		self.commit_pipeline.shutdown();

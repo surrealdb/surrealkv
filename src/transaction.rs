@@ -66,6 +66,10 @@ pub struct WriteOptions {
 	pub durability: Durability,
 	/// Optional timestamp for the write operation. If None, uses the current timestamp.
 	pub timestamp: Option<u64>,
+	/// If true, return error instead of blocking when write stall occurs.
+	/// Allows applications to handle backpressure themselves.
+	/// Default: false
+	pub no_slowdown: bool,
 }
 
 impl Default for WriteOptions {
@@ -73,6 +77,7 @@ impl Default for WriteOptions {
 		Self {
 			durability: Durability::Eventual,
 			timestamp: None,
+			no_slowdown: false,
 		}
 	}
 }
@@ -864,6 +869,23 @@ impl Transaction {
 			self.closed = true;
 			return Ok(());
 		}
+
+		// Estimate write size for stall controller
+		// Each entry is approximately key_size + value_size + overhead
+		let estimated_write_size: usize = self
+			.write_set
+			.values()
+			.flatten()
+			.map(|entry| {
+				let key_size = entry.key.len();
+				let value_size = entry.value.as_ref().map(|v| v.len()).unwrap_or(0);
+				key_size + value_size + 32 // Add some overhead for metadata
+			})
+			.sum();
+
+		// Preprocess: check stall conditions and apply backpressure
+		// Always wait for stall to clear in commit (no_slowdown=false)
+		self.core.preprocess_write(estimated_write_size, false).await?;
 
 		// Prepare for commit - uses the new Oracle method
 		let _ = self.core.oracle.prepare_commit(self)?;

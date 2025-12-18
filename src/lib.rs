@@ -21,6 +21,7 @@ mod transaction;
 mod vfs;
 mod vlog;
 mod wal;
+mod write_controller;
 
 #[cfg(test)]
 mod test;
@@ -229,6 +230,23 @@ pub struct Options {
 	/// Controls behavior when WAL corruption is detected during recovery.
 	/// Default: TolerateCorruptedWithRepair (attempt repair and continue)
 	pub wal_recovery_mode: WalRecoveryMode,
+
+	// Write stall configuration
+	/// Maximum number of immutable memtables before stopping writes
+	/// Default: 2
+	pub max_write_buffer_number: usize,
+
+	/// L0 file count that triggers write slowdown
+	/// Default: 8
+	pub level0_slowdown_writes_trigger: usize,
+
+	/// L0 file count that stops writes completely
+	/// Default: 12
+	pub level0_stop_writes_trigger: usize,
+
+	/// Initial delayed write rate in bytes/sec
+	/// Default: 32MB/s
+	pub delayed_write_rate: u64,
 }
 
 impl Default for Options {
@@ -258,6 +276,10 @@ impl Default for Options {
 			clock,
 			flush_on_close: true,
 			wal_recovery_mode: WalRecoveryMode::default(),
+			max_write_buffer_number: 2,
+			level0_slowdown_writes_trigger: 8,
+			level0_stop_writes_trigger: 12,
+			delayed_write_rate: 32 * 1024 * 1024, // 32MB/s
 		}
 	}
 }

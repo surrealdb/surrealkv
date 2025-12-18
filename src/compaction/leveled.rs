@@ -528,11 +528,18 @@ mod tests {
 
 		let vlog = Arc::new(crate::vlog::VLog::new(opts.clone(), None).unwrap());
 
+		let write_controller = Arc::new(crate::write_controller::WriteController::new(
+			opts.delayed_write_rate,
+			opts.delayed_write_rate,
+		));
+
 		CompactionOptions {
 			lopts: opts,
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
+			write_controller,
+			write_stall_guard: Arc::new(parking_lot::Mutex::new(None)),
 		}
 	}
 

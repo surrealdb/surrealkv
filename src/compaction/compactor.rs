@@ -24,6 +24,9 @@ pub(crate) struct CompactionOptions {
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
+	pub(crate) write_controller: Arc<crate::write_controller::WriteController>,
+	pub(crate) write_stall_guard:
+		Arc<parking_lot::Mutex<Option<crate::write_controller::WriteStallGuard>>>,
 }
 
 impl CompactionOptions {
@@ -33,6 +36,8 @@ impl CompactionOptions {
 			level_manifest: tree.level_manifest.clone(),
 			immutable_memtables: tree.immutable_memtables.clone(),
 			vlog: tree.vlog.clone(),
+			write_controller: tree.write_controller.clone(),
+			write_stall_guard: tree.write_stall_guard.clone(),
 		}
 	}
 }
@@ -110,6 +115,24 @@ impl Compactor {
 						vlog.update_discard_stats(&discard_stats);
 					}
 				}
+
+				// Recalculate write stall conditions after compaction
+				let num_immutable = self.options.immutable_memtables.read().unwrap().len();
+				let manifest = self.options.level_manifest.read().unwrap();
+				let num_l0_files = manifest.levels.get_levels()[0].tables.len();
+				drop(manifest);
+
+				let mut guard_holder = self.options.write_stall_guard.lock();
+				crate::write_controller::recalculate_write_stall_conditions(
+					num_immutable,
+					num_l0_files,
+					self.options.lopts.max_write_buffer_number,
+					self.options.lopts.level0_slowdown_writes_trigger,
+					self.options.lopts.level0_stop_writes_trigger,
+					&self.options.write_controller,
+					&mut guard_holder,
+				);
+				drop(guard_holder);
 
 				Ok(())
 			}
