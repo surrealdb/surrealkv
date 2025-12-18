@@ -198,6 +198,7 @@ pub struct Options {
 	pub level_count: u8,
 	pub max_memtable_size: usize,
 	pub index_partition_size: usize,
+	pub max_auto_readahead_size: usize,
 
 	// VLog configuration
 	pub vlog_max_file_size: u64,
@@ -249,6 +250,7 @@ impl Default for Options {
 			level_count: 6,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
 			index_partition_size: 16384,           // 16KB
+			max_auto_readahead_size: 256 * 1024,   // 256KB (same as RocksDB)
 			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
@@ -365,6 +367,11 @@ impl Options {
 	// Partitioned index configuration
 	pub const fn with_index_partition_size(mut self, size: usize) -> Self {
 		self.index_partition_size = size;
+		self
+	}
+
+	pub const fn with_max_auto_readahead_size(mut self, size: usize) -> Self {
+		self.max_auto_readahead_size = size;
 		self
 	}
 

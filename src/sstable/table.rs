@@ -639,8 +639,7 @@ impl Table {
 				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
 
 			// Call cache_dependencies to prefetch partition blocks during table opening
-			// This matches RocksDB's behavior of prefetching partitions when the table is loaded
-			partitioned_index.cache_dependencies(false)?; // pin=false for now
+			partitioned_index.cache_dependencies(true)?;
 
 			IndexType::Partitioned(partitioned_index)
 		};
@@ -826,8 +825,9 @@ impl Table {
 			current_partition_iter: None,
 			keys_only,
 			block_prefetcher: BlockPrefetcher::new(
-				0, // compaction_readahead_size - set to 0 for now
-				self.opts.block_size * 2, // initial_auto_readahead_size - 2x block size
+				0,                                 // compaction_readahead_size - set to 0 for now
+				self.opts.block_size * 2,          // initial_auto_readahead_size - 2x block size
+				self.opts.max_auto_readahead_size, // max_auto_readahead_size
 			),
 		}
 	}
@@ -935,14 +935,15 @@ impl TableIterator {
 			readahead_size,
 			is_for_compaction,
 			false, // no_sequential_checking
+			self.table.file.as_ref(),
 		);
 
 		// TODO: Implement actual prefetching logic here when VFS supports it
 		if should_prefetch {
 			// Update readahead limit following RocksDB's pattern
-			let readahead_limit = partition_handle.handle.offset() as u64 +
-				partition_handle.handle.size() as u64 +
-				self.block_prefetcher.get_curr_readahead_size() as u64;
+			let readahead_limit = partition_handle.handle.offset() as u64
+				+ partition_handle.handle.size() as u64
+				+ self.block_prefetcher.get_curr_readahead_size() as u64;
 			self.block_prefetcher.set_readahead_limit(readahead_limit);
 		}
 
@@ -2925,7 +2926,6 @@ mod tests {
 			);
 		}
 	}
-
 
 	#[test]
 	fn test_get_nonexistent_key_returns_none() {

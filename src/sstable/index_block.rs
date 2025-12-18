@@ -35,24 +35,22 @@ impl FilePrefetchBuffer {
 		}
 	}
 
-	pub(crate) fn new_disabled() -> Self {
-		Self {
-			buffer: Vec::new(),
-			offset: 0,
-			size: 0,
-			enable: false,
-		}
-	}
-
 	/// Prefetch implementation following RocksDB's FilePrefetchBuffer::Prefetch
-	pub(crate) fn prefetch(&mut self, file: &dyn crate::vfs::File, offset: u64, n: usize) -> Result<()> {
+	pub(crate) fn prefetch(
+		&mut self,
+		file: &dyn crate::vfs::File,
+		offset: u64,
+		n: usize,
+	) -> Result<()> {
 		if !self.enable || n == 0 {
 			return Ok(());
 		}
 
 		// Check if we already have the requested data
-		if self.size > 0 && offset >= self.offset &&
-		   offset + n as u64 <= self.offset + self.size as u64 {
+		if self.size > 0
+			&& offset >= self.offset
+			&& offset + n as u64 <= self.offset + self.size as u64
+		{
 			return Ok(());
 		}
 
@@ -68,34 +66,6 @@ impl FilePrefetchBuffer {
 
 		Ok(())
 	}
-
-	/// TryReadFromCache implementation following RocksDB's logic
-	pub(crate) fn try_read_from_cache(&self, offset: u64, n: usize, result: &mut [u8]) -> bool {
-		if !self.enable || self.size == 0 {
-			return false;
-		}
-
-		// Check if requested data is in buffer
-		if offset >= self.offset && offset + n as u64 <= self.offset + self.size as u64 {
-			let buffer_start = (offset - self.offset) as usize;
-			result.copy_from_slice(&self.buffer[buffer_start..buffer_start + n]);
-			true
-		} else {
-			false
-		}
-	}
-
-	pub(crate) fn enabled(&self) -> bool {
-		self.enable
-	}
-
-	pub(crate) fn get_prefetch_offset(&self) -> u64 {
-		self.offset
-	}
-
-	pub(crate) fn current_size(&self) -> usize {
-		self.size
-	}
 }
 
 /// BlockPrefetcher implementation following RocksDB's design.
@@ -109,6 +79,8 @@ pub(crate) struct BlockPrefetcher {
 	readahead_limit: u64,
 	// Initial auto readahead size for internal prefetch buffer
 	initial_auto_readahead_size: usize,
+	// Maximum auto readahead size to cap exponential growth
+	max_auto_readahead_size: usize,
 	// Number of file reads for auto readahead
 	num_file_reads: usize,
 	// Previous access pattern for sequential detection
@@ -117,12 +89,24 @@ pub(crate) struct BlockPrefetcher {
 }
 
 impl BlockPrefetcher {
-	pub(crate) fn new(compaction_readahead_size: usize, initial_auto_readahead_size: usize) -> Self {
+	pub(crate) fn new(
+		compaction_readahead_size: usize,
+		initial_auto_readahead_size: usize,
+		max_auto_readahead_size: usize,
+	) -> Self {
+		// Sanitize initial_auto_readahead_size following RocksDB logic
+		let sanitized_initial = if initial_auto_readahead_size > max_auto_readahead_size {
+			max_auto_readahead_size
+		} else {
+			initial_auto_readahead_size
+		};
+
 		Self {
 			compaction_readahead_size,
-			readahead_size: initial_auto_readahead_size,
+			readahead_size: sanitized_initial,
 			readahead_limit: 0,
-			initial_auto_readahead_size,
+			initial_auto_readahead_size: sanitized_initial,
+			max_auto_readahead_size,
 			num_file_reads: 0,
 			prev_offset: 0,
 			prev_len: 0,
@@ -143,8 +127,10 @@ impl BlockPrefetcher {
 	/// Reset values following RocksDB's ResetValues
 	pub(crate) fn reset_values(&mut self, initial_auto_readahead_size: usize) {
 		self.num_file_reads = 1;
-		self.initial_auto_readahead_size = initial_auto_readahead_size;
-		self.readahead_size = initial_auto_readahead_size;
+		// Sanitize the initial size against max_auto_readahead_size
+		let sanitized_initial = initial_auto_readahead_size.min(self.max_auto_readahead_size);
+		self.initial_auto_readahead_size = sanitized_initial;
+		self.readahead_size = sanitized_initial;
 		self.readahead_limit = 0;
 	}
 
@@ -155,6 +141,7 @@ impl BlockPrefetcher {
 		readahead_size: usize,
 		is_for_compaction: bool,
 		no_sequential_checking: bool,
+		file: &dyn crate::vfs::File,
 	) -> bool {
 		let len = handle.size() as u64;
 		let offset = handle.offset() as u64;
@@ -162,8 +149,17 @@ impl BlockPrefetcher {
 		// For compaction with direct I/O support check
 		if is_for_compaction {
 			if self.compaction_readahead_size > 0 {
-				// TODO: Add FS prefetch support check
-				// For now, assume we need to prefetch
+				// Try FS-level prefetch first
+				if file.supports_prefetch() {
+					let prefetch_result =
+						file.prefetch(offset, len as usize + self.compaction_readahead_size);
+					if prefetch_result.is_ok() {
+						self.readahead_limit =
+							offset + len as u64 + self.compaction_readahead_size as u64;
+						return false; // Prefetch succeeded, no need for buffer-based prefetch
+					}
+				}
+				// Fall back to buffer-based prefetch
 				return true;
 			}
 			return false;
@@ -194,18 +190,37 @@ impl BlockPrefetcher {
 
 		self.update_read_pattern(offset, len as usize);
 
-		// Auto readahead logic
+		// Auto readahead logic - try FS prefetch first
 		if self.initial_auto_readahead_size == 0 {
 			return false;
 		}
 
 		self.num_file_reads += 1;
-		if self.num_file_reads <= 2 {  // Default num_file_reads_for_auto_readahead
+		if self.num_file_reads <= 2 {
+			// Default num_file_reads_for_auto_readahead
 			return false;
 		}
 
-		// Start prefetching
+		// Try FS-level prefetch for auto readahead (following RocksDB's logic)
+		if file.supports_prefetch() {
+			let prefetch_result = file.prefetch(offset, len as usize + self.readahead_size);
+			if prefetch_result.is_ok() {
+				self.readahead_limit = offset + len + self.readahead_size as u64;
+				// Grow readahead size exponentially like RocksDB
+				self.grow_readahead_size();
+				return false; // FS prefetch succeeded
+			}
+		}
+
+		// Fall back to buffer-based prefetch
 		true
+	}
+
+	/// Grow readahead size exponentially following RocksDB's logic
+	pub(crate) fn grow_readahead_size(&mut self) {
+		if self.readahead_size < self.max_auto_readahead_size {
+			self.readahead_size = (self.readahead_size * 2).min(self.max_auto_readahead_size);
+		}
 	}
 
 	pub(crate) fn get_curr_readahead_size(&self) -> usize {
@@ -484,11 +499,6 @@ impl TopLevelIndex {
 		Ok(())
 	}
 
-	/// Check if partitions are pinned/cached
-	pub(crate) fn has_cached_partitions(&self) -> bool {
-		!self.partition_map.is_empty()
-	}
-
 	/// Get a cached partition block
 	pub(crate) fn get_cached_partition(&self, offset: u64) -> Option<&Arc<Block>> {
 		self.partition_map.get(&offset)
@@ -677,7 +687,7 @@ mod tests {
 		index.cache_dependencies(true).unwrap();
 
 		// Verify partitions are cached
-		assert!(index.has_cached_partitions());
+		assert!(index.partition_map.len() > 0);
 		assert_eq!(index.partition_map.len(), index.blocks.len());
 
 		// Test loading from cache
@@ -689,36 +699,56 @@ mod tests {
 
 	#[test]
 	fn test_block_prefetcher() {
-		let mut prefetcher = BlockPrefetcher::new(1024, 512); // compaction, initial readahead
+		let mut prefetcher = BlockPrefetcher::new(1024, 512, 256 * 1024); // compaction, initial readahead, max readahead
 
 		let handle = BlockHandle::new(0, 100);
 
 		// Test explicit readahead
-		let should_prefetch = prefetcher.prefetch_if_needed(&handle, 256, false, false);
+		let test_file = wrap_buffer(vec![]);
+		let should_prefetch =
+			prefetcher.prefetch_if_needed(&handle, 256, false, false, test_file.as_ref());
 		assert!(should_prefetch);
 
 		// Test compaction readahead
-		let mut compaction_prefetcher = BlockPrefetcher::new(1024, 512);
-		let should_prefetch = compaction_prefetcher.prefetch_if_needed(&handle, 0, true, false);
+		let mut compaction_prefetcher = BlockPrefetcher::new(1024, 512, 256 * 1024);
+		let should_prefetch =
+			compaction_prefetcher.prefetch_if_needed(&handle, 0, true, false, test_file.as_ref());
 		assert!(should_prefetch);
 
 		// Test sequential access pattern
-		let mut seq_prefetcher = BlockPrefetcher::new(0, 512);
+		let mut seq_prefetcher = BlockPrefetcher::new(0, 512, 256 * 1024);
 		let handle1 = BlockHandle::new(0, 100);
 		let handle2 = BlockHandle::new(100, 100); // Sequential to handle1
 
 		// First access
-		let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle1, 0, false, false);
+		let should_prefetch =
+			seq_prefetcher.prefetch_if_needed(&handle1, 0, false, false, test_file.as_ref());
 		assert!(!should_prefetch);
 
 		// Second sequential access (still no prefetch)
-		let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle2, 0, false, false);
+		let should_prefetch =
+			seq_prefetcher.prefetch_if_needed(&handle2, 0, false, false, test_file.as_ref());
 		assert!(!should_prefetch);
 
 		// Third sequential access (should trigger prefetch)
 		let handle3 = BlockHandle::new(200, 100);
-		let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle3, 0, false, false);
+		let should_prefetch =
+			seq_prefetcher.prefetch_if_needed(&handle3, 0, false, false, test_file.as_ref());
 		assert!(should_prefetch);
+
+		// Test exponential growth capping
+		let mut capped_prefetcher = BlockPrefetcher::new(0, 8 * 1024, 32 * 1024); // 8KB initial, 32KB max
+		assert_eq!(capped_prefetcher.get_curr_readahead_size(), 8 * 1024);
+
+		// Grow multiple times to test capping
+		capped_prefetcher.grow_readahead_size(); // Should become 16KB
+		assert_eq!(capped_prefetcher.get_curr_readahead_size(), 16 * 1024);
+
+		capped_prefetcher.grow_readahead_size(); // Should become 32KB
+		assert_eq!(capped_prefetcher.get_curr_readahead_size(), 32 * 1024);
+
+		capped_prefetcher.grow_readahead_size(); // Should stay at 32KB (capped)
+		assert_eq!(capped_prefetcher.get_curr_readahead_size(), 32 * 1024);
 	}
 
 	#[test]
@@ -730,24 +760,9 @@ mod tests {
 
 		// Test prefetch
 		prefetch_buffer.prefetch(&*file, 7, 5).unwrap(); // "World"
-		assert!(prefetch_buffer.enabled());
-		assert_eq!(prefetch_buffer.get_prefetch_offset(), 7);
-		assert_eq!(prefetch_buffer.current_size(), 5);
-
-		// Test reading from cache
-		let mut buf = [0u8; 5];
-		let success = prefetch_buffer.try_read_from_cache(7, 5, &mut buf);
-		assert!(success);
-		assert_eq!(&buf, b"World");
-
-		// Test reading outside cached range
-		let mut buf2 = [0u8; 5];
-		let success2 = prefetch_buffer.try_read_from_cache(0, 5, &mut buf2);
-		assert!(!success2); // Should fail as it's outside the prefetched range
-
-		// Test disabled buffer
-		let disabled_buffer = FilePrefetchBuffer::new_disabled();
-		assert!(!disabled_buffer.enabled());
+		assert!(prefetch_buffer.enable);
+		assert_eq!(prefetch_buffer.offset, 7);
+		assert_eq!(prefetch_buffer.size, 5);
 	}
 
 	#[test]
