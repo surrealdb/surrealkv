@@ -25,7 +25,7 @@ fn create_temp_directory() -> TempDir {
 fn create_compression_test_options(path: PathBuf) -> Options {
 	Options {
 		path,
-		compression: CompressionType::SnappyCompression,
+		compression_per_level: vec![CompressionType::SnappyCompression], // L0: Snappy
 		max_memtable_size: 64 * 1024,
 		..Default::default()
 	}
@@ -79,12 +79,12 @@ fn build_table_with_compression(
 ) -> (Vec<u8>, usize) {
 	let mut d = Vec::new();
 	let mut opts = default_opts_mut();
-	opts.compression = compression;
+	opts.compression_per_level = vec![compression];
 	opts.block_size = 64 * 1024;
 	let opt = Arc::new(opts);
 
 	{
-		let mut builder = TableWriter::new(&mut d, 0, opt);
+		let mut builder = TableWriter::new(&mut d, 0, opt, 0);
 		for (k, v) in data.iter() {
 			builder
 				.add(
@@ -120,7 +120,7 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	let opts = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		Arc::new(opts)
 	};
 
@@ -188,12 +188,12 @@ fn test_compression_size_reduction() {
 
 	let opts_uncompressed = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::None;
+		opts.compression_per_level = vec![CompressionType::None];
 		Arc::new(opts)
 	};
 	let opts_compressed = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		Arc::new(opts)
 	};
 
@@ -265,7 +265,7 @@ fn test_compression_mixed_patterns() {
 
 	let opts = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		Arc::new(opts)
 	};
 
@@ -301,7 +301,7 @@ fn test_compression_iterator_operations() {
 
 	let opts = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		Arc::new(opts)
 	};
 
@@ -401,7 +401,7 @@ fn test_compression_large_values() {
 
 	let opts = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		opts.block_size = 64 * 1024;
 		Arc::new(opts)
 	};
@@ -452,7 +452,7 @@ fn test_compression_checksum_verification() {
 
 	let opts = {
 		let mut opts = default_opts_mut();
-		opts.compression = CompressionType::SnappyCompression;
+		opts.compression_per_level = vec![CompressionType::SnappyCompression];
 		Arc::new(opts)
 	};
 
@@ -743,14 +743,14 @@ async fn test_lsm_compression_disk_size_comparison() {
 
 	let opts_compressed = Options {
 		path: path_compressed.clone(),
-		compression: CompressionType::SnappyCompression,
+		compression_per_level: vec![CompressionType::SnappyCompression],
 		max_memtable_size: 1024 * 1024, // 1MB - defer flush until explicit call
 		..Default::default()
 	};
 
 	let opts_uncompressed = Options {
 		path: path_uncompressed.clone(),
-		compression: CompressionType::None,
+		compression_per_level: vec![CompressionType::None],
 		max_memtable_size: 1024 * 1024,
 		..Default::default()
 	};
@@ -863,4 +863,176 @@ fn calculate_directory_size(dir: &PathBuf) -> u64 {
 		}
 	}
 	total_size
+}
+
+// ========== Compression Per Level Tests ==========
+
+#[test]
+fn test_compression_per_level_options() {
+	// Test default options (empty vector)
+	let opts = Options::new();
+	assert!(opts.compression_per_level.is_empty());
+
+	// Test setting compression per level
+	let opts = Options::new().with_compression_per_level(vec![
+		CompressionType::None,              // L0
+		CompressionType::SnappyCompression, // L1
+		CompressionType::SnappyCompression, // L2+
+	]);
+
+	assert_eq!(opts.compression_per_level.len(), 3);
+	assert_eq!(opts.compression_per_level[0], CompressionType::None);
+	assert_eq!(opts.compression_per_level[1], CompressionType::SnappyCompression);
+	assert_eq!(opts.compression_per_level[2], CompressionType::SnappyCompression);
+
+	// Test convenience method for L0 no compression
+	let opts = Options::new().with_l0_no_compression();
+
+	assert_eq!(opts.compression_per_level.len(), 2);
+	assert_eq!(opts.compression_per_level[0], CompressionType::None);
+	assert_eq!(opts.compression_per_level[1], CompressionType::SnappyCompression);
+}
+
+#[test]
+fn test_compression_selector_per_level() {
+	let selector = crate::compression::CompressionSelector::new(vec![
+		CompressionType::None,              // L0
+		CompressionType::SnappyCompression, // L1
+		CompressionType::SnappyCompression, // L2
+	]);
+
+	assert_eq!(selector.select_compression(0), CompressionType::None);
+	assert_eq!(selector.select_compression(1), CompressionType::SnappyCompression);
+	assert_eq!(selector.select_compression(2), CompressionType::SnappyCompression);
+	// Higher levels use last configured compression
+	assert_eq!(selector.select_compression(3), CompressionType::SnappyCompression);
+	assert_eq!(selector.select_compression(10), CompressionType::SnappyCompression);
+}
+
+#[test]
+fn test_table_writer_with_level_compression() {
+	let mut buffer = Vec::new();
+
+	// Test with L0 no compression
+	let mut opts = default_opts_mut();
+	opts.compression_per_level = vec![CompressionType::SnappyCompression];
+	opts.compression_per_level = vec![CompressionType::None, CompressionType::SnappyCompression];
+	let opts = Arc::new(opts);
+
+	{
+		let mut writer = TableWriter::new(&mut buffer, 1, opts.clone(), 0); // L0
+		let data =
+			vec![(b"key1".to_vec(), b"value1".to_vec()), (b"key2".to_vec(), b"value2".to_vec())];
+
+		for (key, value) in data {
+			let ikey = InternalKey::new(Bytes::copy_from_slice(&key), 1, InternalKeyKind::Set, 0);
+			writer.add(ikey.into(), &value).unwrap();
+		}
+		writer.finish().unwrap();
+	}
+
+	let buffer_len = buffer.len() as u64;
+	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), buffer_len).unwrap());
+
+	// Verify the table was created successfully
+	let mut iter = table.iter(false);
+	iter.seek_to_first();
+	assert!(iter.valid());
+	assert_eq!(iter.key().user_key.as_ref(), b"key1");
+	assert_eq!(iter.value().as_ref(), b"value1");
+}
+
+#[test(tokio::test)]
+async fn test_compression_per_level_sstable_creation() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let mut opts = Options::new();
+	opts.path = path.clone();
+	opts.compression_per_level = vec![CompressionType::SnappyCompression];
+	// L0: no compression, L1+: Snappy compression
+	opts.compression_per_level = vec![CompressionType::None, CompressionType::SnappyCompression];
+
+	let tree = crate::TreeBuilder::with_options(opts).build().unwrap();
+
+	// Insert data that will fill memtable and create L0 SSTable
+	let mut keys = Vec::new();
+	for i in 0..1000 {
+		let key = format!("key_{:04}", i).into_bytes();
+		let value = generate_compressible_value(1000, b'A'); // Highly compressible
+		keys.push(key.clone());
+
+		let mut txn = tree.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Force flush to create L0 SSTable
+	tree.flush().unwrap();
+
+	// Verify data can be read back
+	for key in &keys {
+		let txn = tree.begin().unwrap();
+		let result = txn.get(key).unwrap();
+		assert!(result.is_some(), "Key {:?} should exist", String::from_utf8_lossy(key));
+		let value = result.unwrap();
+		assert_eq!(value.len(), 1000);
+	}
+
+	tree.close().await.unwrap();
+}
+
+#[test]
+fn test_empty_compression_per_level_defaults_to_none() {
+	// Test that empty compression_per_level vector defaults to None compression
+	let opts = Options::new();
+	// compression_per_level is empty by default
+
+	let selector = crate::compression::CompressionSelector::new(opts.compression_per_level);
+
+	// Should default to None compression for all levels when per_level is empty
+	assert_eq!(selector.select_compression(0), CompressionType::None);
+	assert_eq!(selector.select_compression(1), CompressionType::None);
+	assert_eq!(selector.select_compression(5), CompressionType::None);
+}
+
+#[test(tokio::test)]
+async fn test_compression_per_level_with_different_levels() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let mut opts = Options::new();
+	opts.path = path.clone();
+	opts.compression_per_level = vec![CompressionType::SnappyCompression];
+	opts.level_count = 4; // L0, L1, L2, L3
+	opts.max_memtable_size = 1024 * 1024; // Force frequent flushes
+									   // L0: no compression, L1: no compression, L2+: Snappy
+	opts.compression_per_level =
+		vec![CompressionType::None, CompressionType::None, CompressionType::SnappyCompression];
+
+	let tree = crate::TreeBuilder::with_options(opts).build().unwrap();
+
+	// Insert enough data to potentially create multiple levels
+	let mut keys = Vec::new();
+	for i in 0..5000 {
+		let key = format!("test_key_{:04}", i).into_bytes();
+		let value = generate_compressible_value(500, b'X');
+		keys.push(key.clone());
+
+		let mut txn = tree.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Force flush and compaction
+	tree.flush().unwrap();
+
+	// The test mainly verifies that the system doesn't crash with per-level compression
+	// In a real LSM tree, we'd need to trigger compaction to higher levels to fully test
+
+	let txn = tree.begin().unwrap();
+	let result = txn.get(&keys[0]).unwrap();
+	assert!(result.is_some(), "Should be able to read data after flush");
+
+	tree.close().await.unwrap();
 }

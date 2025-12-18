@@ -10,6 +10,7 @@ use snap::raw::max_compress_len;
 
 use crate::{
 	cache,
+	compression::CompressionSelector,
 	error::{Error, Result},
 	sstable::{
 		block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter},
@@ -162,8 +163,10 @@ impl Footer {
 
 // Defines a writer for constructing and writing table structures to a storage medium.
 pub(crate) struct TableWriter<W: Write> {
-	writer: W,          // Underlying writer to write data to.
-	opts: Arc<Options>, // Shared table options.
+	writer: W,                                 // Underlying writer to write data to.
+	opts: Arc<Options>,                        // Shared table options.
+	compression_selector: CompressionSelector, // Level-aware compression selector.
+	target_level: u8,                          // Target level this SSTable will be written to.
 
 	meta: TableMetadata, // Metadata properties of the table.
 
@@ -179,8 +182,8 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
-	// Constructs a new TableWriter with the provided writer and options.
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>) -> Self {
+	// Constructs a new TableWriter with level-specific compression.
+	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(policy.clone());
@@ -191,12 +194,16 @@ impl<W: Write> TableWriter<W> {
 			}
 		};
 
+		let compression_selector = CompressionSelector::new(opts.compression_per_level.clone());
+
 		let mut meta = TableMetadata::new();
 		meta.properties.id = id;
 
 		TableWriter {
 			writer,
 			opts: opts.clone(),
+			compression_selector,
+			target_level,
 			offset: 0,
 			meta,
 			prev_block_last_key: Vec::new(),
@@ -289,7 +296,8 @@ impl<W: Write> TableWriter<W> {
 
 		// Finalize the current block and compress it.
 		let contents = block.finish();
-		let handle = self.write_compressed_block(contents, self.opts.compression)?;
+		let compression_type = self.compression_selector.select_compression(self.target_level);
+		let handle = self.write_compressed_block(contents, compression_type)?;
 
 		// Add the separator key and block handle to the index.
 		let handle_encoded = handle.encode();
@@ -356,16 +364,14 @@ impl<W: Write> TableWriter<W> {
 
 		// Write meta_index block
 		let meta_block = meta_ix_block.finish();
-		let meta_ix_handle = self.write_compressed_block(meta_block, self.opts.compression)?;
+		let meta_ix_handle = self.write_compressed_block(meta_block, CompressionType::None)?;
 		// println!("meta block: {:?}", meta_block);
 
 		// Write the index block
 		let ix_handle = {
-			let (handle, new_offset) = self.partitioned_index.finish(
-				&mut self.writer,
-				self.opts.compression,
-				self.offset,
-			)?;
+			let compression_type = self.compression_selector.select_compression(self.target_level);
+			let (handle, new_offset) =
+				self.partitioned_index.finish(&mut self.writer, compression_type, self.offset)?;
 			self.offset = new_offset; // Update the offset after writing partitioned blocks
 			handle
 		};
@@ -1360,7 +1366,7 @@ mod tests {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
 
-		let mut b = TableWriter::new(d, 0, opts);
+		let mut b = TableWriter::new(d, 0, opts, 0);
 
 		let data = [("abc", "def"), ("abe", "dee"), ("bcd", "asa"), ("dcc", "a00")];
 		let data2 = [("abd", "def"), ("abf", "dee"), ("ccd", "asa"), ("dcd", "a00")];
@@ -1400,7 +1406,7 @@ mod tests {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
 
-		let mut b = TableWriter::new(d, 0, opts);
+		let mut b = TableWriter::new(d, 0, opts, 0);
 
 		// Test two equal consecutive keys
 		let data = [("abc", "def"), ("abc", "dee"), ("bcd", "asa"), ("bsr", "a00")];
@@ -1442,7 +1448,7 @@ mod tests {
 
 		{
 			// Uses the standard comparator in opt.
-			let mut b = TableWriter::new(&mut d, 0, opt);
+			let mut b = TableWriter::new(&mut d, 0, opt, 0);
 
 			for &(k, v) in data.iter() {
 				b.add(
@@ -1544,7 +1550,7 @@ mod tests {
 		let mut buffer = Vec::with_capacity(10240); // 10KB initial capacity
 
 		// Create TableWriter
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Number of items to generate
 		let num_items = 10001;
@@ -1620,7 +1626,7 @@ mod tests {
 		let mut buffer = Vec::new();
 
 		// Create TableWriter
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Number of items to generate
 		let num_items = 10001;
@@ -1695,7 +1701,7 @@ mod tests {
 	fn test_writer_key_range_empty() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let writer = TableWriter::new(d, 1, opts);
+		let writer = TableWriter::new(d, 1, opts, 0);
 
 		// Key range should be None for an empty table
 		assert!(writer.meta.properties.key_range.is_none());
@@ -1705,7 +1711,7 @@ mod tests {
 	fn test_writer_key_range_single_entry() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add just one key
 		add_key(&mut writer, b"singleton", 1, b"value").unwrap();
@@ -1720,7 +1726,7 @@ mod tests {
 	fn test_writer_key_range_ascending_keys() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add keys in ascending order
 		let keys = ["aaa", "bbb", "ccc", "ddd", "eee"];
@@ -1738,7 +1744,7 @@ mod tests {
 	fn test_writer_key_range_interleaved_pattern() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add keys in a pattern that interleaves
 		let keys = ["a10", "a20", "a15", "a30", "a25"];
@@ -1760,7 +1766,7 @@ mod tests {
 	fn test_writer_key_range_sparse_pattern() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add very sparse keys with large gaps
 		let keys = ["aaaaa", "nnnnn", "zzzzz"];
@@ -1779,7 +1785,7 @@ mod tests {
 	fn test_writer_key_range_clustered_pattern() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add clustered keys - many keys in a narrow range
 		let prefixes = ["aaa", "aab", "aac"];
@@ -1802,7 +1808,7 @@ mod tests {
 	fn test_writer_key_range_binary_keys() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add binary keys
 		let keys = [vec![0x00, 0x01, 0x02], vec![0x10, 0x11, 0x12], vec![0xF0, 0xF1, 0xF2]];
@@ -1821,7 +1827,7 @@ mod tests {
 	fn test_writer_key_range_identical_keys_different_seqnums() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add the same key multiple times with different sequence numbers
 
@@ -1840,7 +1846,7 @@ mod tests {
 	fn test_writer_key_range_unicode_keys() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add keys with unicode characters
 		let keys = ["α", "β", "γ", "δ", "ε"];
@@ -1859,7 +1865,7 @@ mod tests {
 	fn test_writer_key_range_with_special_chars() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add keys with special characters, including control characters
 		let keys = [
@@ -1888,7 +1894,7 @@ mod tests {
 	fn test_writer_key_range_with_mixed_case() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Mixed case keys to test case-sensitivity in key range
 		let keys = ["AAA", "BBB", "aaa", "bbb"];
@@ -1911,7 +1917,7 @@ mod tests {
 	fn test_writer_key_range_with_pseudo_random_keys() {
 		let d = Vec::with_capacity(2048);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Generate 100 pseudo-random keys but add them in sorted order
 		let mut rng = StdRng::seed_from_u64(100);
@@ -1944,7 +1950,7 @@ mod tests {
 	fn test_writer_key_range_with_prefix_pattern() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		// Add keys with common prefixes but different suffixes
 		add_key(&mut writer, b"prefix:aaa", 1, b"value").unwrap();
@@ -1964,7 +1970,7 @@ mod tests {
 	fn test_writer_key_range_boundary_keys() {
 		let d = Vec::with_capacity(512);
 		let opts = default_opts();
-		let mut writer = TableWriter::new(d, 1, opts);
+		let mut writer = TableWriter::new(d, 1, opts, 0);
 
 		let long = "z".repeat(1000);
 		let long = &long.as_str();
@@ -2168,7 +2174,7 @@ mod tests {
 		let opt = Arc::new(opts);
 
 		{
-			let mut b = TableWriter::new(&mut d, 0, opt);
+			let mut b = TableWriter::new(&mut d, 0, opt, 0);
 
 			for &(k, v) in data.iter() {
 				// Use Deletion kind for empty values to indicate tombstones
@@ -2819,7 +2825,7 @@ mod tests {
 		let opts = Arc::new(opts);
 
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 1, opts.clone(), 0);
 
 		// Add enough entries to create multiple data blocks and index partitions
 		for i in 0..100 {
@@ -2902,7 +2908,7 @@ mod tests {
 		// Disable bloom filter so we actually exercise the key comparison logic.
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Add only key_bbb to the table
 		let key = b"key_bbb";
@@ -2943,7 +2949,7 @@ mod tests {
 		// Internal ordering: user_key asc, seq_num DESC (reversed: higher seq_nums sort first)
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let user_key = b"my_key";
 
@@ -3003,7 +3009,7 @@ mod tests {
 		// Snapshot at seq=25 can't see future version at seq=50
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
@@ -3044,7 +3050,7 @@ mod tests {
 	fn test_get_empty_table() {
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
@@ -3061,7 +3067,7 @@ mod tests {
 		// Ensures fix doesn't cause cross-key contamination with different seq_nums
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_a =
 			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 100, InternalKeyKind::Set, 0);
@@ -3108,7 +3114,7 @@ mod tests {
 		// Edge cases with sequence number boundaries (seq=0, seq=MAX, seq=1)
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
@@ -3156,7 +3162,7 @@ mod tests {
 		// So stored(25) > lookup(50) in internal ordering (even though 25 < 50 numerically)
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
@@ -3193,7 +3199,7 @@ mod tests {
 		// Partition index handles sequence numbers correctly across multiple blocks
 		let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		for i in 0..20 {
 			let key = format!("aaa_key_{:03}", i);
@@ -3266,7 +3272,7 @@ mod tests {
 		// Key greater than all stored keys should return None
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
@@ -3295,7 +3301,7 @@ mod tests {
 		// Key between existing keys should return None
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
@@ -3324,7 +3330,7 @@ mod tests {
 		// Tombstones should be found and returned
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_other =
 			InternalKey::new(Bytes::copy_from_slice(b"key_other"), 100, InternalKeyKind::Set, 0);
@@ -3360,7 +3366,7 @@ mod tests {
 		// Prefix of existing keys should not match
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key1 =
 			InternalKey::new(Bytes::copy_from_slice(b"user_data"), 100, InternalKeyKind::Set, 0);
@@ -3389,7 +3395,7 @@ mod tests {
 		// Empty key should return None
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
@@ -3414,7 +3420,7 @@ mod tests {
 		// Binary keys with special bytes handled correctly
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key1 =
 			InternalKey::new(Bytes::copy_from_slice(b"key\x00"), 100, InternalKeyKind::Set, 0);
@@ -3443,7 +3449,7 @@ mod tests {
 		// Non-existent key in multi-block table should return None
 		let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		for i in 0..100 {
 			if i == 50 {
@@ -3477,7 +3483,7 @@ mod tests {
 		// Keys with same prefix but different suffix don't match
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_a =
 			InternalKey::new(Bytes::copy_from_slice(b"prefix_a"), 100, InternalKeyKind::Set, 0);
@@ -3507,7 +3513,7 @@ mod tests {
 		// at the next greater key (correct iterator semantics)
 		let opts = Arc::new(Options::default());
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Add only key_bbb to the table
 		let key = b"key_bbb";
@@ -3552,7 +3558,7 @@ mod tests {
 		// Test that seeking past all keys makes iterator invalid
 		let opts = Arc::new(Options::default());
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key = b"key_bbb";
 		let value = b"value_bbb";
@@ -3579,7 +3585,7 @@ mod tests {
 		// Test that seeking to an existing key positions at that key
 		let opts = Arc::new(Options::default());
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone());
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key = b"key_bbb";
 		let value = b"value_bbb";

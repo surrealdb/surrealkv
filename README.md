@@ -63,6 +63,52 @@ let tree = TreeBuilder::new()
 - `with_block_size()` - Size of data blocks in SSTables (affects read performance)
 - `with_level_count()` - Number of levels in the LSM tree structure
 
+### Compression Configuration
+
+SurrealKV supports per-level compression for SSTable data blocks, allowing different compression algorithms for different LSM levels. By default, no compression is used.
+
+```rust
+use surrealkv::{CompressionType, Options, TreeBuilder};
+
+// Default: No compression (for maximum write performance)
+let tree = TreeBuilder::new()
+    .with_path("path/to/db".into())
+    .build()?;
+
+// Explicitly disable compression (same as default)
+let opts = Options::new()
+    .with_path("path/to/db".into())
+    .without_compression();
+
+let tree = TreeBuilder::with_options(opts).build()?;
+
+// Per-level compression configuration
+let opts = Options::new()
+    .with_path("path/to/db".into())
+    .with_compression_per_level(vec![
+        CompressionType::None,        // L0: No compression for speed
+        CompressionType::SnappyCompression, // L1+: Snappy compression
+    ]);
+
+let tree = TreeBuilder::with_options(opts).build()?;
+
+// Convenience: No compression on L0, Snappy on other levels
+let opts = Options::new()
+    .with_path("path/to/db".into())
+    .with_l0_no_compression();
+
+let tree = TreeBuilder::with_options(opts).build()?;
+```
+
+**Options:**
+- `without_compression()` - Disable compression for all levels (default behavior)
+- `with_compression_per_level()` - Set compression type per level (vector index = level number)
+- `with_l0_no_compression()` - Convenience method for no compression on L0, Snappy compression on other levels
+
+**Compression Types:**
+- `CompressionType::None` - No compression (fastest writes, largest files)
+- `CompressionType::SnappyCompression` - Snappy compression (good balance of speed and compression ratio)
+
 ### Value Log Configuration
 
 The Value Log (VLog) separates large values from the LSM tree for more efficient storage and compaction.

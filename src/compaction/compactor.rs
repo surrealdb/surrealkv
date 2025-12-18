@@ -130,7 +130,8 @@ impl Compactor {
 		input: &CompactionInput,
 	) -> Result<HashMap<u32, i64>> {
 		let file = SysFile::create(path)?;
-		let mut writer = TableWriter::new(file, table_id, self.options.lopts.clone());
+		let mut writer =
+			TableWriter::new(file, table_id, self.options.lopts.clone(), input.target_level);
 
 		// Create a compaction iterator that filters tombstones
 		let max_level = self.options.lopts.level_count - 1;

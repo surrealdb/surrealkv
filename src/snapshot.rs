@@ -1600,7 +1600,7 @@ mod tests {
 			let opts = Arc::new(Options::new());
 			let mut buf = Vec::new();
 			{
-				let mut w = TableWriter::new(&mut buf, 0, opts.clone());
+				let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
 				for (k, v) in data {
 					let ikey =
 						InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0);
@@ -1943,7 +1943,7 @@ mod tests {
 		let table_file_path = opts.sstable_file_path(table_id);
 		let mut file = SysFile::create(&table_file_path)?;
 
-		let mut writer = TableWriter::new(&mut file, table_id, opts.clone());
+		let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
 
 		// Generate incremental keys spanning the range
 		let mut keys = Vec::new();

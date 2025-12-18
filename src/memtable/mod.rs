@@ -205,7 +205,7 @@ impl MemTable {
 
 		{
 			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone());
+			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone(), 0); // Memtables always flush to L0
 
 			let iter = self.iter(false);
 			let iter = Box::new(iter);
