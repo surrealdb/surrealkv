@@ -917,6 +917,10 @@ impl Iterator for KMergeIterator<'_> {
 
 			if exceeds_range {
 				// DON'T re-add this iterator to the heap - all its remaining keys are out of range
+				// If all remaining iterators are out of range, return None
+				if self.heap.is_empty() {
+					return None;
+				}
 				continue;
 			}
 
@@ -925,11 +929,21 @@ impl Iterator for KMergeIterator<'_> {
 			unsafe {
 				let iterators = self.iterators.as_mut();
 				if let Some((key, value)) = iterators[heap_item.iterator_index].next() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: heap_item.iterator_index,
-					});
+					// Check if this next key also exceeds the range end
+					// If it does, don't add it back to the heap
+					let next_key = key.user_key.as_ref();
+					let next_exceeds_range = match &self.range_end {
+						Bound::Included(end) => next_key > end.as_slice(),
+						Bound::Excluded(end) => next_key >= end.as_slice(),
+						Bound::Unbounded => false,
+					};
+					if !next_exceeds_range {
+						self.heap.push(HeapItem {
+							key,
+							value: value.clone(),
+							iterator_index: heap_item.iterator_index,
+						});
+					}
 				}
 			}
 

@@ -9,7 +9,6 @@ use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
 use crate::{
-	cache,
 	compression::CompressionSelector,
 	error::{Error, Result},
 	sstable::{
@@ -608,7 +607,6 @@ pub(crate) struct Table {
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
 	pub file_size: u64,
-	cache_id: cache::CacheID,
 
 	opts: Arc<Options>,             // Shared table options.
 	pub(crate) meta: TableMetadata, // Metadata properties of the table.
@@ -656,13 +654,10 @@ impl Table {
 			None
 		};
 
-		let cache_id = opts.block_cache.new_cache_id();
-
 		Ok(Table {
 			id,
 			file,
 			file_size,
-			cache_id,
 			internal_cmp: Arc::new(InternalKeyComparator::new(opts.comparator.clone())),
 			opts,
 			filter_reader,
@@ -718,8 +713,7 @@ impl Table {
 	}
 
 	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
-		if let Some(block) =
-			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
+		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
 		{
 			return Ok(block.clone());
 		}
@@ -727,7 +721,7 @@ impl Table {
 		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;
 		let b = Arc::new(b);
 
-		self.opts.block_cache.insert_data_block(self.cache_id, location.offset() as u64, b.clone());
+		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, b.clone());
 
 		Ok(b)
 	}
