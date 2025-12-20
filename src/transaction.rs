@@ -109,6 +109,11 @@ pub struct ReadOptions {
 	pub iterate_upper_bound: Option<Vec<u8>>,
 	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
 	pub timestamp: Option<u64>,
+	/// If non-zero, perform bigger reads when doing table iteration.
+	/// If you're running SurrealKV on spinning disks, you should set this to at least 2MB.
+	/// That way SurrealKV's table iteration is doing sequential instead of random reads.
+	/// Default: 0 (no readahead)
+	pub readahead_size: usize,
 }
 
 impl ReadOptions {

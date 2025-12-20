@@ -6,6 +6,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use fs2::FileExt as LockFileExt;
 
 use std::fs::File as SysFile;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 pub trait File: Send + Sync {
 	#[allow(unused)]
@@ -32,6 +34,8 @@ pub trait File: Send + Sync {
 	#[allow(unused)]
 	fn sync_data(&self) -> Result<()>;
 	fn size(&self) -> Result<u64>;
+	fn supports_prefetch(&self) -> bool;
+	fn prefetch(&self, offset: u64, length: usize) -> Result<()>;
 }
 
 pub type InMemoryFile = Vec<u8>;
@@ -107,6 +111,17 @@ impl File for InMemoryFile {
 
 	fn size(&self) -> Result<u64> {
 		Ok(self.len() as u64)
+	}
+
+	fn supports_prefetch(&self) -> bool {
+		false // In-memory files don't support prefetch
+	}
+
+	fn prefetch(&self, _offset: u64, _length: usize) -> Result<()> {
+		Err(Error::Io(std::sync::Arc::new(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"Prefetch not supported for in-memory files",
+		))))
 	}
 }
 
@@ -224,6 +239,50 @@ impl File for SysFile {
 		match SysFile::metadata(self) {
 			Ok(v) => Ok(v.len()),
 			Err(e) => Err(Error::Io(e.into())),
+		}
+	}
+
+	fn supports_prefetch(&self) -> bool {
+		// Basic implementation: assume prefetch is supported on most modern filesystems
+		// In a more sophisticated implementation, this would check filesystem type
+		// and capabilities. For now, return true on Unix systems.
+		#[cfg(target_os = "linux")]
+		{
+			true
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			false
+		}
+	}
+
+	#[allow(unused_variables)]
+	fn prefetch(&self, offset: u64, length: usize) -> Result<()> {
+		// Basic implementation using OS-level prefetch hints
+		// On Linux, we could use posix_fadvise with POSIX_FADV_WILLNEED
+		// For simplicity, we'll implement a no-op that succeeds
+		#[cfg(target_os = "linux")]
+		{
+			// Use posix_fadvise to hint that we'll need this data soon
+			let ret = unsafe {
+				libc::posix_fadvise(
+					self.as_raw_fd(),
+					offset as libc::off_t,
+					length as libc::off_t,
+					libc::POSIX_FADV_WILLNEED,
+				)
+			};
+			if ret == 0 {
+				Ok(())
+			} else {
+				// If posix_fadvise fails, it's not critical - return success anyway
+				// The system will still work, just without prefetch hints
+				Ok(())
+			}
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			Ok(())
 		}
 	}
 }
