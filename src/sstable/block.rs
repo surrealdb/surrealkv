@@ -473,9 +473,14 @@ impl LSMIterator for BlockIterator {
 			self.seek_to_restart_point(self.restart_points.len() - 1);
 		}
 
+		let mut last_entry_start = self.offset;
 		while self.offset < self.restart_offset {
+			last_entry_start = self.offset;
 			self.seek_next_entry();
 		}
+
+		// Set current_entry_offset to the start of the last entry
+		self.current_entry_offset = last_entry_start;
 	}
 
 	// Move to a specific key or the next larger key
@@ -531,7 +536,7 @@ impl LSMIterator for BlockIterator {
 			return false;
 		}
 
-		// Find the first restart point that just less than the current offset
+		// Find the first restart point that is just less than the current offset
 		while self.get_restart_point(self.current_restart_index) >= original {
 			if self.current_restart_index == 0 {
 				self.offset = self.restart_points[self.current_restart_index] as usize;
@@ -542,13 +547,20 @@ impl LSMIterator for BlockIterator {
 		}
 
 		self.seek_to_restart_point(self.current_restart_index);
-		// Loop until end of current entry hits the start of original entry
+		// Iterate forward to find the entry just before the original position
+		let mut prev_offset = self.offset;
 		while self.seek_next_entry().is_some() {
 			if self.offset >= original {
-				break;
+				// We overshot, so the previous entry starts at prev_offset
+				// Position at the previous entry and decode it
+				self.offset = prev_offset;
+				self.current_entry_offset = prev_offset;
+				let _ = self.seek_next_entry(); // Decode the previous entry
+				return true;
 			}
+			prev_offset = self.offset;
 		}
-		true
+		false
 	}
 
 	// Get the current key
