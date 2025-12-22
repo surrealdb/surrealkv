@@ -476,11 +476,11 @@ impl LSMIterator for BlockIterator {
 		let mut last_entry_start = self.offset;
 		while self.offset < self.restart_offset {
 			last_entry_start = self.offset;
-			self.seek_next_entry().expect(&format!(
-				"Block corruption detected: failed to decode entry at offset {} (restart_offset: {})",
+			self.seek_next_entry().unwrap_or_else(|| {
+				panic!("Block corruption detected: failed to decode entry at offset {} (restart_offset: {})",
 				self.offset,
-				self.restart_offset
-			));
+				self.restart_offset)
+			});
 		}
 
 		// Set current_entry_offset to the start of the last entry

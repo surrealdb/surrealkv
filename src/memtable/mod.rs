@@ -64,7 +64,7 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	map: SkipMap<InternalKey, Value>,
+	map: SkipMap<Arc<InternalKey>, Value>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
 	/// WAL number that was current when this memtable started receiving writes.
@@ -102,14 +102,14 @@ impl MemTable {
 		self.wal_number.load(Ordering::Acquire)
 	}
 
-	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(Arc<InternalKey>, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = InternalKey::new(
+		let range = Arc::new(InternalKey::new(
 			Bytes::copy_from_slice(key),
 			seq_no,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
-		)..;
+		))..;
 
 		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
 		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -169,7 +169,7 @@ impl MemTable {
 
 	/// Inserts a key-value pair into the memtable.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
-		self.map.insert(key.clone(), value.clone());
+		self.map.insert(Arc::new(key.clone()), value.clone());
 		key.size() as u32 + value.len() as u32
 	}
 
@@ -239,7 +239,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 
@@ -256,22 +256,22 @@ impl MemTable {
 				// For inclusive start, we want the earliest internal key for this user key
 				// Since internal keys are sorted as (user_key asc, seq_num desc),
 				// we use the highest possible sequence number to get the first entry
-				Bound::Included(InternalKey::new(
+				Bound::Included(Arc::new(InternalKey::new(
 					Bytes::copy_from_slice(key),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
-				))
+				)))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive start, we want to skip all versions of this user key
 				// We use the lowest sequence number to position after all real entries
-				Bound::Excluded(InternalKey::new(
+				Bound::Excluded(Arc::new(InternalKey::new(
 					Bytes::copy_from_slice(key),
 					0,
 					InternalKeyKind::Set,
 					0,
-				))
+				)))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -280,22 +280,22 @@ impl MemTable {
 			Bound::Included(key) => {
 				// For inclusive end, we want to include all versions of this user key
 				// We use the lowest sequence number to include the last entry
-				Bound::Included(InternalKey::new(
+				Bound::Included(Arc::new(InternalKey::new(
 					Bytes::copy_from_slice(key),
 					0,
 					InternalKeyKind::Set,
 					0,
-				))
+				)))
 			}
 			Bound::Excluded(key) => {
 				// For exclusive end, we want to exclude all versions of this user key
 				// We use the highest sequence number to stop before any real entries
-				Bound::Excluded(InternalKey::new(
+				Bound::Excluded(Arc::new(InternalKey::new(
 					Bytes::copy_from_slice(key),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
-				))
+				)))
 			}
 			Bound::Unbounded => Bound::Unbounded,
 		};
@@ -307,7 +307,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 }
