@@ -60,3 +60,7 @@ test-log = "0.2.18"
 [[bench]]
 name = "bplustree_bench"
 harness = false
+
+[[bench]]
+name = "alloc_bench"
+harness = false
