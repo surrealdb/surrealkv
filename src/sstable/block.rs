@@ -476,7 +476,11 @@ impl LSMIterator for BlockIterator {
 		let mut last_entry_start = self.offset;
 		while self.offset < self.restart_offset {
 			last_entry_start = self.offset;
-			self.seek_next_entry();
+			self.seek_next_entry().unwrap_or_else(|| {
+				panic!("Block corruption detected (seek_to_last): failed to decode entry at offset {} (restart_offset: {})",
+				self.offset,
+				self.restart_offset)
+			});
 		}
 
 		// Set current_entry_offset to the start of the last entry
@@ -555,7 +559,11 @@ impl LSMIterator for BlockIterator {
 				// Position at the previous entry and decode it
 				self.offset = prev_offset;
 				self.current_entry_offset = prev_offset;
-				let _ = self.seek_next_entry(); // Decode the previous entry
+				self.seek_next_entry().unwrap_or_else(|| {
+					panic!("Block corruption detected (prev): failed to decode entry at offset {} (restart_offset: {})",
+					self.offset,
+					self.restart_offset)
+				}); // Decode the previous entry
 				return true;
 			}
 			prev_offset = self.offset;

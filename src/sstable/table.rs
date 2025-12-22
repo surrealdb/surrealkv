@@ -1227,7 +1227,7 @@ impl DoubleEndedIterator for TableIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		// If not positioned, position appropriately based on range
 		if !self.positioned {
-			// NEW: Seek to upper bound instead of always seeking to last
+			// Seek to upper bound instead of always seeking to last
 			match &self.range.1 {
 				Bound::Included(_) | Bound::Excluded(_) => {
 					let upper_bound = self.range.1.clone();
