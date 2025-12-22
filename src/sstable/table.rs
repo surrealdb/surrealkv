@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, time::SystemTime};
@@ -16,7 +17,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind,
+		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -24,6 +25,11 @@ use crate::{
 };
 
 use super::meta::KeyRange;
+
+/// A range bound for table iteration, representing inclusive or exclusive bounds
+pub type TableRangeBound = Bound<Vec<u8>>;
+/// A range for table iteration, consisting of start and end bounds
+pub type TableRange = (TableRangeBound, TableRangeBound);
 
 const TABLE_FOOTER_LENGTH: usize = 42; // 2 + 16 + 16 + 8 (format + checksum + meta + index + magic)
 const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
@@ -793,7 +799,11 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(self: &Arc<Self>, keys_only: bool) -> TableIterator {
+	pub(crate) fn iter(
+		self: &Arc<Self>,
+		keys_only: bool,
+		range: Option<TableRange>,
+	) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
@@ -820,6 +830,8 @@ impl Table {
 			current_partition_index: 0,
 			current_partition_iter: None,
 			keys_only,
+			range: range.unwrap_or((Bound::Unbounded, Bound::Unbounded)),
+			reverse_started: false,
 		}
 	}
 
@@ -884,6 +896,10 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
+	/// Range bounds for filtering
+	range: TableRange,
+	/// Whether reverse iteration has started (to distinguish from just positioned)
+	reverse_started: bool,
 }
 
 impl TableIterator {
@@ -1021,14 +1037,17 @@ impl TableIterator {
 				if partition_iter.valid() {
 					let val = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => return false,
+						Err(_) => {
+							return false;
+						}
 						Ok(res) => res,
 					};
 					self.current_partition_iter = Some(partition_iter);
 					if self.load_block(&handle).is_ok() {
 						if let Some(ref mut block_iter) = self.current_block {
 							block_iter.seek_to_last();
-							return block_iter.valid();
+							let valid = block_iter.valid();
+							return valid;
 						}
 					}
 				}
@@ -1038,15 +1057,145 @@ impl TableIterator {
 		self.current_block = None;
 		false
 	}
+
+	fn seek_to_lower_bound(&mut self, bound: &Bound<Vec<u8>>) {
+		match bound {
+			Bound::Included(start) => {
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(start),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+			}
+			Bound::Excluded(start) => {
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(start),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+
+				// Skip ALL versions of the excluded key
+				while self.valid() {
+					let key = self.current_block.as_ref().unwrap().key();
+					let user_key = key.user_key.as_ref();
+					if self.table.opts.comparator.compare(user_key, start) != Ordering::Equal {
+						break;
+					}
+					self.advance();
+				}
+			}
+			Bound::Unbounded => {
+				self.seek_to_first();
+			}
+		}
+	}
+
+	fn seek_to_upper_bound(&mut self, bound: &Bound<Vec<u8>>) {
+		match bound {
+			Bound::Included(end) => {
+				// Seek to find the first key >= upper bound
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(end),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+
+				// If seek went past table end (invalid), start from last key
+				if !self.valid() {
+					self.seek_to_last();
+					return;
+				}
+
+				// Back up if we're beyond the bound (should only need a few steps)
+				while self.valid() {
+					let key = self.current_block.as_ref().unwrap().key();
+					let user_key = key.user_key.as_ref();
+					let cmp = self.table.opts.comparator.compare(user_key, end);
+					if cmp != Ordering::Greater {
+						// Found a key <= bound, we're positioned correctly
+						break;
+					}
+					if !self.prev() {
+						// No more keys, iterator becomes invalid
+						break;
+					}
+				}
+			}
+			Bound::Excluded(end) => {
+				// Seek to find the first key >= upper bound
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(end),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+
+				// If seek went past table end, start from last key
+				if !self.valid() {
+					self.seek_to_last();
+				}
+
+				// Move backward until we find a key < end (strictly less)
+				while self.valid() {
+					let key = self.current_block.as_ref().unwrap().key();
+					let user_key = key.user_key.as_ref();
+					if self.table.opts.comparator.compare(user_key, end) == Ordering::Less {
+						break;
+					}
+					if !self.prev() {
+						break;
+					}
+				}
+			}
+			Bound::Unbounded => {
+				self.seek_to_last();
+			}
+		}
+	}
+
+	/// Check if a user key satisfies the lower bound constraint
+	fn satisfies_lower_bound(&self, user_key: &[u8]) -> bool {
+		match &self.range.0 {
+			Bound::Included(start) => {
+				self.table.opts.comparator.compare(user_key, start) != Ordering::Less
+			}
+			Bound::Excluded(start) => {
+				self.table.opts.comparator.compare(user_key, start) == Ordering::Greater
+			}
+			Bound::Unbounded => true,
+		}
+	}
+
+	/// Check if a user key satisfies the upper bound constraint
+	fn satisfies_upper_bound(&self, user_key: &[u8]) -> bool {
+		match &self.range.1 {
+			Bound::Included(end) => {
+				self.table.opts.comparator.compare(user_key, end) != Ordering::Greater
+			}
+			Bound::Excluded(end) => {
+				self.table.opts.comparator.compare(user_key, end) == Ordering::Less
+			}
+			Bound::Unbounded => true,
+		}
+	}
 }
 
 impl Iterator for TableIterator {
 	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		// If not positioned, position at first entry
+		// If not positioned, position appropriately based on range
 		if !self.positioned {
-			self.seek_to_first();
+			let lower_bound = self.range.0.clone();
+			self.seek_to_lower_bound(&lower_bound);
+			self.positioned = true;
 		}
 
 		// If not valid, return None
@@ -1055,27 +1204,74 @@ impl Iterator for TableIterator {
 		}
 
 		// Get the current item before advancing
-		let current_item = Some((
+		let current_item = (
 			self.current_block.as_ref().unwrap().key(),
 			self.current_block.as_ref().unwrap().value(),
-		));
+		);
+
+		// Check upper bound (lower bound is already handled by seek)
+		let user_key = current_item.0.user_key.as_ref();
+		if !self.satisfies_upper_bound(user_key) {
+			self.mark_exhausted();
+			return None;
+		}
 
 		// Advance for the next call to next()
 		self.advance();
 
-		current_item
+		Some(current_item)
 	}
 }
 
 impl DoubleEndedIterator for TableIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
+		// If not positioned, position appropriately based on range
+		if !self.positioned {
+			// Seek to upper bound instead of always seeking to last
+			match &self.range.1 {
+				Bound::Included(_) | Bound::Excluded(_) => {
+					let upper_bound = self.range.1.clone();
+					self.seek_to_upper_bound(&upper_bound);
+					self.positioned = true;
+					self.reverse_started = false;
+				}
+				Bound::Unbounded => {
+					self.seek_to_last();
+				}
+			}
+		}
+
+		// If positioned but not yet started reverse iteration, return current position first
+		if self.positioned && !self.reverse_started && self.valid() {
+			let item = (
+				self.current_block.as_ref().unwrap().key(),
+				self.current_block.as_ref().unwrap().value(),
+			);
+
+			// Check lower bound for reverse iteration
+			let user_key = item.0.user_key.as_ref();
+			if !self.satisfies_lower_bound(user_key) {
+				return None;
+			}
+			self.reverse_started = true;
+			return Some(item);
+		}
+
 		if !self.prev() {
 			return None;
 		}
-		Some((
+
+		let item = (
 			self.current_block.as_ref().unwrap().key(),
 			self.current_block.as_ref().unwrap().value(),
-		))
+		);
+
+		// Check lower bound for reverse iteration
+		let user_key = item.0.user_key.as_ref();
+		if !self.satisfies_lower_bound(user_key) {
+			return None;
+		}
+		Some(item)
 	}
 }
 
@@ -1151,6 +1347,7 @@ impl LSMIterator for TableIterator {
 							block_iter.seek_to_last();
 							self.positioned = true;
 							self.exhausted = false;
+							self.reverse_started = false;
 						}
 					} else {
 						self.reset();
@@ -1465,6 +1662,35 @@ mod tests {
 		(d, size)
 	}
 
+	fn build_table_with_seq_num(data: Vec<(&str, &str, u64)>) -> (Vec<u8>, usize) {
+		let mut d = Vec::with_capacity(512);
+		let mut opts = default_opts_mut();
+		opts.block_restart_interval = 3;
+		opts.block_size = 32;
+		let opt = Arc::new(opts);
+
+		{
+			let mut b = TableWriter::new(&mut d, 0, opt, 0);
+			for &(k, v, seq) in data.iter() {
+				b.add(
+					InternalKey::new(
+						Bytes::copy_from_slice(k.as_bytes()),
+						seq,
+						InternalKeyKind::Set,
+						0,
+					)
+					.into(),
+					v.as_bytes(),
+				)
+				.unwrap();
+			}
+			b.finish().unwrap();
+		}
+
+		let size = d.len();
+		(d, size)
+	}
+
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)
 	}
@@ -1475,7 +1701,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 
 		let key = InternalKey::new(Bytes::from_static(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode());
@@ -1503,7 +1729,7 @@ mod tests {
 		let opts = default_opts();
 
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 
 		iter.advance();
 		assert!(iter.valid());
@@ -1656,7 +1882,7 @@ mod tests {
 			"Table should contain num_items entries"
 		);
 
-		let iter = table.iter(false);
+		let iter = table.iter(false, None);
 		for (item, (key, value)) in iter.enumerate() {
 			let expected_key = format!("key_{item:05}");
 			let expected_value = format!("value_{item:05}");
@@ -2206,7 +2432,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let iter = table.iter(false);
+		let iter = table.iter(false, None);
 		let mut collected_items = Vec::new();
 
 		for (key, value) in iter {
@@ -2252,7 +2478,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 		let mut seen_keys = Vec::new();
 		let mut iteration_count = 0;
 
@@ -2309,7 +2535,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 
 		for expected_index in 0..data.len() {
 			let advance_result = iter.advance();
@@ -2364,7 +2590,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(false, None).collect();
 			assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
 			let key_str = std::str::from_utf8(&collected[0].0.user_key).unwrap();
@@ -2380,7 +2606,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(false, None).collect();
 			assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
 			let keys: Vec<String> = collected
@@ -2402,7 +2628,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(false, None).collect();
 			assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
 			let mut seen_keys = std::collections::HashSet::new();
@@ -2438,7 +2664,7 @@ mod tests {
 		let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
 		for (seek_key, expected_start_index) in test_cases {
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 
 			let internal_key = InternalKey::new(
 				Bytes::copy_from_slice(seek_key.as_bytes()),
@@ -2504,7 +2730,7 @@ mod tests {
 
 		// Test seek to existing key
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_005"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2537,7 +2763,7 @@ mod tests {
 
 		// Test seek to non-existing key (should find next key)
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_003"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2550,7 +2776,7 @@ mod tests {
 
 		// Test seek past end
 		{
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 			let seek_key =
 				InternalKey::new(Bytes::from_static(b"key_999"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
@@ -2576,7 +2802,7 @@ mod tests {
 		use std::time::Instant;
 
 		let start = Instant::now();
-		let count = table.iter(false).count();
+		let count = table.iter(false, None).count();
 		let duration = start.elapsed();
 
 		assert_eq!(count, 1000, "Should iterate through all 1000 items");
@@ -2585,7 +2811,7 @@ mod tests {
 
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 			let seek_key = InternalKey::new(
 				Bytes::from(format!("key_{i:06}").into_bytes()),
 				1,
@@ -2610,7 +2836,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 		iter.seek_to_first();
 
 		while iter.valid() {
@@ -2646,7 +2872,7 @@ mod tests {
 
 		// Create multiple iterators and verify they work independently
 		for iteration in 0..3 {
-			let collected: Vec<_> = table.iter(false).collect();
+			let collected: Vec<_> = table.iter(false, None).collect();
 
 			assert_eq!(
 				collected.len(),
@@ -2683,7 +2909,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 
 			let result = iter.advance();
 			assert!(!result, "advance() on empty table should return false");
@@ -2700,7 +2926,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 
 			assert!(iter.advance(), "First advance should succeed on single-item table");
 			assert!(iter.valid(), "Iterator should be valid after first advance");
@@ -2716,7 +2942,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let mut iter = table.iter(false);
+			let mut iter = table.iter(false, None);
 
 			// Exhaust the iterator
 			while iter.advance() {
@@ -2741,7 +2967,7 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test with manual advance() loop - need to position first
-		let mut iter1 = table.iter(false);
+		let mut iter1 = table.iter(false, None);
 		iter1.seek_to_first();
 		let mut collected_via_advance = Vec::new();
 		while iter1.valid() {
@@ -2752,7 +2978,7 @@ mod tests {
 		}
 
 		// Test with standard iterator interface
-		let iter2 = table.iter(false);
+		let iter2 = table.iter(false, None);
 		let mut collected_via_next = Vec::new();
 		for (key, value) in iter2 {
 			collected_via_next.push((key, value));
@@ -2794,7 +3020,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let collected: Vec<_> = table.iter(false).collect();
+		let collected: Vec<_> = table.iter(false, None).collect();
 
 		assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
 
@@ -2873,7 +3099,7 @@ mod tests {
 		}
 
 		// Test full iteration
-		let iter = table.iter(false);
+		let iter = table.iter(false, None);
 		let collected: Vec<_> = iter.collect();
 		assert_eq!(collected.len(), 100, "Should iterate through all entries");
 
@@ -3522,7 +3748,7 @@ mod tests {
 
 		// Seek to key_aaa which does NOT exist
 		// key_aaa < key_bbb lexicographically
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 		let lookup_key = InternalKey::new(
 			Bytes::copy_from_slice(b"key_aaa"),
 			2, // Higher seq number for lookup
@@ -3565,7 +3791,7 @@ mod tests {
 			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_zzz which is past all keys
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode());
@@ -3592,7 +3818,7 @@ mod tests {
 			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_bbb which exists
-		let mut iter = table.iter(false);
+		let mut iter = table.iter(false, None);
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode());
@@ -3604,6 +3830,739 @@ mod tests {
 			current_key.user_key.as_ref(),
 			b"key_bbb",
 			"Iterator should be positioned at the exact key"
+		);
+	}
+
+	#[test]
+	fn test_table_iter_upper_bound_included() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Iterate with range (Unbounded, Included("key_005"))
+		let iter =
+			table.iter(false, Some((Bound::Unbounded, Bound::Included(b"key_005".to_vec()))));
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items key_000 through key_005 (6 items)
+		assert_eq!(results.len(), 6, "Should return exactly 6 items");
+		assert_eq!(results[0], "key_000");
+		assert_eq!(results[1], "key_001");
+		assert_eq!(results[2], "key_002");
+		assert_eq!(results[3], "key_003");
+		assert_eq!(results[4], "key_004");
+		assert_eq!(results[5], "key_005");
+
+		// Verify last key is exactly key_005
+		assert_eq!(results.last().unwrap(), "key_005");
+	}
+
+	#[test]
+	fn test_table_iter_upper_bound_excluded() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Iterate with range (Unbounded, Excluded("key_005"))
+		let iter =
+			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_005".to_vec()))));
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items key_000 through key_004 (5 items)
+		assert_eq!(results.len(), 5, "Should return exactly 5 items");
+		assert_eq!(results[0], "key_000");
+		assert_eq!(results[1], "key_001");
+		assert_eq!(results[2], "key_002");
+		assert_eq!(results[3], "key_003");
+		assert_eq!(results[4], "key_004");
+
+		// Verify last key is key_004, not key_005
+		assert_eq!(results.last().unwrap(), "key_004");
+	}
+
+	#[test]
+	fn test_table_iter_unbounded_reverse() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// First test forward iteration to make sure table has data
+		let collected: Vec<_> = table.iter(false, None).collect();
+		assert_eq!(collected.len(), 10, "Forward iteration should return 10 items");
+
+		let forward_keys: Vec<String> = collected
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(&k.user_key).unwrap().to_string())
+			.collect();
+		assert_eq!(
+			forward_keys,
+			vec![
+				"key_000", "key_001", "key_002", "key_003", "key_004", "key_005", "key_006",
+				"key_007", "key_008", "key_009"
+			]
+		);
+
+		// Test unbounded reverse iteration
+		let mut iter = table.iter(false, None);
+		iter.seek_to_last(); // Position at the end for reverse iteration
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+		// Should return all 10 items in reverse order
+		assert_eq!(results.len(), 10, "Should return exactly 10 items");
+		assert_eq!(results[0], "key_009");
+		assert_eq!(results[9], "key_000");
+	}
+
+	#[test]
+	fn test_table_iter_lower_bound_included_reverse() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Iterate with range (Included("key_003"), Unbounded) using next_back()
+		let mut iter =
+			table.iter(false, Some((Bound::Included(b"key_003".to_vec()), Bound::Unbounded)));
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items in reverse: key_009, key_008, ..., key_003 (7 items)
+		assert_eq!(results.len(), 7, "Should return exactly 7 items");
+		assert_eq!(results[0], "key_009");
+		assert_eq!(results[1], "key_008");
+		assert_eq!(results[2], "key_007");
+		assert_eq!(results[3], "key_006");
+		assert_eq!(results[4], "key_005");
+		assert_eq!(results[5], "key_004");
+		assert_eq!(results[6], "key_003");
+
+		// Verify last item returned is key_003
+		assert_eq!(results.last().unwrap(), "key_003");
+	}
+
+	#[test]
+	fn test_table_iter_both_bounds() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Iterate with range (Included("key_002"), Excluded("key_007"))
+		let iter = table.iter(
+			false,
+			Some((Bound::Included(b"key_002".to_vec()), Bound::Excluded(b"key_007".to_vec()))),
+		);
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items key_002, key_003, key_004, key_005, key_006 (5 items)
+		assert_eq!(results.len(), 5, "Should return exactly 5 items");
+		assert_eq!(results[0], "key_002");
+		assert_eq!(results[1], "key_003");
+		assert_eq!(results[2], "key_004");
+		assert_eq!(results[3], "key_005");
+		assert_eq!(results[4], "key_006");
+	}
+
+	#[test]
+	fn test_table_iter_unbounded() {
+		// Use static strings to avoid lifetime issues
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
+		let iter = table.iter(false, Some((Bound::Unbounded, Bound::Unbounded)));
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return all 10 items
+		assert_eq!(results.len(), 10, "Should return exactly 10 items");
+		assert_eq!(results[0], "key_000");
+		assert_eq!(results[9], "key_009");
+	}
+
+	#[test]
+	fn test_table_iter_forward_and_backward() {
+		// Create enough data to span multiple blocks
+		// With block_size=32 and ~15 bytes per entry, 30 entries span ~15 blocks
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			("key_005", "value"),
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+			("key_010", "value"),
+			("key_011", "value"),
+			("key_012", "value"),
+			("key_013", "value"),
+			("key_014", "value"),
+			("key_015", "value"),
+			("key_016", "value"),
+			("key_017", "value"),
+			("key_018", "value"),
+			("key_019", "value"),
+			("key_020", "value"),
+			("key_021", "value"),
+			("key_022", "value"),
+			("key_023", "value"),
+			("key_024", "value"),
+			("key_025", "value"),
+			("key_026", "value"),
+			("key_027", "value"),
+			("key_028", "value"),
+			("key_029", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Test forward iteration
+		let forward_iter = table.iter(false, None);
+		let mut forward_keys = Vec::new();
+		for item in forward_iter {
+			let (key, _) = item;
+			forward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+		assert_eq!(forward_keys.len(), 30);
+		assert_eq!(forward_keys[0], "key_000");
+		assert_eq!(forward_keys[29], "key_029");
+
+		// Test backward iteration on separate iterator
+		let mut backward_iter = table.iter(false, None);
+		let mut backward_keys = Vec::new();
+		while let Some(item) = backward_iter.next_back() {
+			let (key, _) = item;
+			backward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+		assert_eq!(backward_keys.len(), 30);
+		assert_eq!(backward_keys[0], "key_029");
+		assert_eq!(backward_keys[29], "key_000");
+
+		// Test seeking to last and then going backward
+		let mut seek_iter = table.iter(false, None);
+		seek_iter.seek_to_last();
+		let mut seek_backward = Vec::new();
+		while let Some(item) = seek_iter.next_back() {
+			let (key, _) = item;
+			seek_backward.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+		assert_eq!(seek_backward.len(), 30);
+		assert_eq!(seek_backward[0], "key_029");
+		assert_eq!(seek_backward[29], "key_000");
+
+		// Test that forward iteration and backward iteration give complementary results
+		// The forward iterator gives keys in ascending order
+		let expected_forward: Vec<String> = (0..30).map(|i| format!("key_{:03}", i)).collect();
+		assert_eq!(forward_keys, expected_forward);
+
+		// The backward iterator gives keys in descending order
+		let expected_backward: Vec<String> =
+			(0..30).rev().map(|i| format!("key_{:03}", i)).collect();
+		assert_eq!(backward_keys, expected_backward);
+
+		// And seek_to_last + next_back also gives descending order
+		assert_eq!(seek_backward, backward_keys);
+	}
+
+	#[test]
+	fn test_table_iter_upper_bound_excluded_reverse() {
+		// Create table with multiple versions of the same key
+		let data = vec![
+			("key_000", "value", 1),
+			("key_001", "value", 1),
+			("key_002", "value", 1),
+			("key_003", "value", 1),
+			("key_004", "value", 1),
+			("key_005", "value3", 3), // <- Newest version first (highest seq_num)
+			("key_005", "value2", 2), // <- Middle version
+			("key_005", "value", 1),  // <- Oldest version last (lowest seq_num)
+			("key_006", "value", 1),
+			("key_007", "value", 1),
+			("key_008", "value", 1),
+			("key_009", "value", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Reverse iteration with EXCLUDED upper bound
+		let mut iter =
+			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_005".to_vec()))));
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items in reverse: key_004, key_003, key_002, key_001, key_000
+		// Should NOT include any version of key_005 or higher
+		assert_eq!(results.len(), 5, "Should return exactly 5 items");
+		assert_eq!(results[0], "key_004"); // First item in reverse
+		assert_eq!(results[4], "key_000"); // Last item in reverse
+
+		// Verify NO key_005 appears
+		assert!(!results.iter().any(|k| k == "key_005"), "key_005 should not appear in results");
+	}
+
+	#[test]
+	fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
+		let data = vec![
+			("key_000", "value"),
+			("key_001", "value"),
+			("key_002", "value"),
+			("key_003", "value"),
+			("key_004", "value"),
+			// NOTE: key_005 does NOT exist!
+			("key_006", "value"),
+			("key_007", "value"),
+			("key_008", "value"),
+			("key_009", "value"),
+		];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Reverse iteration with INCLUDED upper bound on non-existent key
+		let mut iter =
+			table.iter(false, Some((Bound::Unbounded, Bound::Included(b"key_005".to_vec()))));
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should return items in reverse: key_004, key_003, ..., key_000 (5 items)
+		// Should NOT include key_006 or higher
+		assert_eq!(results.len(), 5, "Should return exactly 5 items");
+		assert_eq!(results[0], "key_004"); // First item should be key_004, NOT key_006!
+		assert_eq!(results[4], "key_000");
+
+		// Without the backward stepping loop, this test would FAIL
+		// because it would start at key_006 instead of key_004
+		assert!(!results.iter().any(|k| k == "key_006"), "key_006 should not appear");
+	}
+
+	#[test]
+	fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
+		let data = vec![
+			("key_000", "v1", 1),
+			("key_001", "v1", 1),
+			("key_002", "v1", 1),
+			("key_003", "v1", 3),
+			("key_003", "v2", 2), // Multiple versions of key_003
+			("key_003", "v3", 1),
+			("key_004", "v1", 2),
+			("key_004", "v1", 1),
+			("key_005", "v1", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Forward iteration with EXCLUDED lower bound
+		let iter =
+			table.iter(false, Some((Bound::Excluded(b"key_003".to_vec()), Bound::Unbounded)));
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+		}
+
+		// Should start at key_004, NOT any version of key_003
+		assert!(results[0] == "key_004", "First result should be key_004, got {}", results[0]);
+
+		// Verify NO version of key_003 appears
+		assert!(!results.iter().any(|k| k == "key_003"), "key_003 should not appear in results");
+	}
+
+	#[test]
+	fn test_table_iter_excluded_bound_across_multiple_blocks() {
+		// Test that excluded lower bound correctly skips ALL versions of a key
+		// even when they span multiple blocks
+		let mut data = vec![];
+
+		// Add many versions of key_003 to force multiple blocks
+		for seq in (1..=100).rev() {
+			data.push(("key_003", "value", seq));
+		}
+		// Add the key we should actually start at
+		data.push(("key_004", "value", 1));
+		data.push(("key_005", "value", 1));
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Forward iteration with excluded lower bound
+		let iter =
+			table.iter(false, Some((Bound::Excluded(b"key_003".to_vec()), Bound::Unbounded)));
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			results.push(user_key);
+		}
+
+		// Should NOT contain any version of key_003
+		assert!(
+			!results.iter().any(|k| k == "key_003"),
+			"key_003 should be completely excluded, but found in results"
+		);
+
+		// First key should be key_004
+		assert_eq!(
+			results.first().unwrap(),
+			"key_004",
+			"First key should be key_004, got {}",
+			results.first().unwrap()
+		);
+
+		// Should have exactly 2 keys (key_004 and key_005)
+		assert_eq!(results.len(), 2, "Should return exactly 2 keys, got {}", results.len());
+	}
+
+	#[test]
+	fn test_table_iter_excluded_bound_across_partitions_reverse() {
+		// Test reverse iteration with excluded upper bound across multiple versions
+		let mut data = vec![];
+
+		// Add keys before the excluded bound
+		data.push(("key_001", "value", 1));
+		data.push(("key_002", "value", 1));
+
+		// Add many versions of key_003 (the excluded upper bound)
+		for seq in (1..=100).rev() {
+			data.push(("key_003", "value", seq));
+		}
+
+		// Add keys after
+		data.push(("key_004", "value", 1));
+		data.push(("key_005", "value", 1));
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Reverse iteration with excluded upper bound
+		let mut iter =
+			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_003".to_vec()))));
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item;
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			results.push(user_key);
+		}
+
+		// Should NOT contain any version of key_003
+		assert!(
+			!results.iter().any(|k| k == "key_003"),
+			"key_003 should be completely excluded, but found in results"
+		);
+
+		// First key in reverse should be key_002
+		assert_eq!(
+			results.first().unwrap(),
+			"key_002",
+			"First key in reverse should be key_002, got {}",
+			results.first().unwrap()
+		);
+
+		// Should have exactly 2 keys (key_002, key_001 in reverse order)
+		assert_eq!(results.len(), 2, "Should return exactly 2 keys");
+		assert_eq!(results[0], "key_002");
+		assert_eq!(results[1], "key_001");
+	}
+
+	#[test]
+	fn test_table_iter_both_bounds_excluded_same_key() {
+		// Test empty range: (Excluded("key_003"), Excluded("key_003"))
+		// This should return no items
+		let data = vec![
+			("key_001", "value", 1),
+			("key_002", "value", 1),
+			("key_003", "value", 100),
+			("key_003", "value", 50),
+			("key_003", "value", 1),
+			("key_004", "value", 1),
+			("key_005", "value", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Forward iteration with both bounds excluded at same key
+		let iter = table.iter(
+			false,
+			Some((Bound::Excluded(b"key_003".to_vec()), Bound::Excluded(b"key_003".to_vec()))),
+		);
+
+		let results: Vec<_> = iter.collect();
+
+		// Should return NO items (empty range)
+		assert_eq!(
+			results.len(),
+			0,
+			"Range (Excluded(X), Excluded(X)) should be empty, got {} items",
+			results.len()
+		);
+	}
+
+	#[test]
+	fn test_table_iter_both_bounds_excluded_same_key_reverse() {
+		// Test empty range in reverse: (Excluded("key_003"), Excluded("key_003"))
+		let data = vec![
+			("key_001", "value", 1),
+			("key_002", "value", 1),
+			("key_003", "value", 100),
+			("key_003", "value", 50),
+			("key_003", "value", 1),
+			("key_004", "value", 1),
+			("key_005", "value", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Reverse iteration with both bounds excluded at same key
+		let mut iter = table.iter(
+			false,
+			Some((Bound::Excluded(b"key_003".to_vec()), Bound::Excluded(b"key_003".to_vec()))),
+		);
+
+		let mut results = Vec::new();
+		while let Some(item) = iter.next_back() {
+			results.push(item);
+		}
+
+		// Should return NO items (empty range)
+		assert_eq!(
+			results.len(),
+			0,
+			"Range (Excluded(X), Excluded(X)) in reverse should be empty, got {} items",
+			results.len()
+		);
+	}
+
+	#[test]
+	fn test_table_iter_excluded_bounds_adjacent_keys() {
+		// Test: (Excluded("key_002"), Excluded("key_004"))
+		// Should only return key_003 (all versions)
+		let data = vec![
+			("key_001", "value", 1),
+			("key_002", "value", 100),
+			("key_002", "value", 50),
+			("key_003", "value", 80),
+			("key_003", "value", 40),
+			("key_003", "value", 10),
+			("key_004", "value", 100),
+			("key_004", "value", 50),
+			("key_005", "value", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Forward iteration
+		let iter = table.iter(
+			false,
+			Some((Bound::Excluded(b"key_002".to_vec()), Bound::Excluded(b"key_004".to_vec()))),
+		);
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			results.push((user_key, key.seq_num()));
+		}
+
+		// Should have exactly 3 items (all versions of key_003)
+		assert_eq!(results.len(), 3, "Should return 3 versions of key_003");
+
+		// All should be key_003
+		assert!(results.iter().all(|(k, _)| k == "key_003"), "All results should be key_003");
+
+		// Should NOT contain key_002 or key_004
+		assert!(
+			!results.iter().any(|(k, _)| k == "key_002" || k == "key_004"),
+			"Should not contain key_002 or key_004"
+		);
+
+		// Verify sequence numbers are in descending order (80, 40, 10)
+		assert_eq!(results[0].1, 80);
+		assert_eq!(results[1].1, 40);
+		assert_eq!(results[2].1, 10);
+	}
+
+	#[test]
+	fn test_table_iter_multiple_versions_at_both_bounds() {
+		// Test with multiple versions at both excluded bounds
+		let data = vec![
+			// Multiple versions of lower bound (excluded)
+			("key_002", "value", 100),
+			("key_002", "value", 90),
+			("key_002", "value", 80),
+			// Keys in range
+			("key_003", "value", 50),
+			("key_004", "value", 50),
+			// Multiple versions of upper bound (excluded)
+			("key_005", "value", 100),
+			("key_005", "value", 90),
+			("key_005", "value", 80),
+			// After upper bound
+			("key_006", "value", 1),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Forward iteration
+		let iter = table.iter(
+			false,
+			Some((Bound::Excluded(b"key_002".to_vec()), Bound::Excluded(b"key_005".to_vec()))),
+		);
+
+		let mut results = Vec::new();
+		for item in iter {
+			let (key, _) = item;
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			results.push(user_key);
+		}
+
+		// Should only have key_003 and key_004
+		assert_eq!(results.len(), 2, "Should return exactly 2 items");
+		assert_eq!(results[0], "key_003");
+		assert_eq!(results[1], "key_004");
+
+		// Should NOT contain any version of key_002 or key_005
+		assert!(
+			!results.iter().any(|k| k == "key_002" || k == "key_005"),
+			"Should not contain any version of excluded bounds"
 		);
 	}
 }

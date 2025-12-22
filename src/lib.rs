@@ -34,7 +34,7 @@ pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOp
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 
 use bytes::Bytes;
-use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
+use sstable::bloom::LevelDBBloomFilter;
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 /// An optimised trait for converting values to bytes only when needed

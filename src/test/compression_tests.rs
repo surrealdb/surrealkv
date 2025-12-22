@@ -126,7 +126,7 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 	let mut count = 0;
 	iter.seek_to_first();
 	while iter.valid() {
@@ -211,8 +211,8 @@ fn test_compression_size_reduction() {
 			.unwrap(),
 	);
 
-	let mut iter_uncompressed = table_uncompressed.iter(false);
-	let mut iter_compressed = table_compressed.iter(false);
+	let mut iter_uncompressed = table_uncompressed.iter(false, None);
+	let mut iter_compressed = table_compressed.iter(false, None);
 
 	iter_uncompressed.seek_to_first();
 	iter_compressed.seek_to_first();
@@ -271,7 +271,7 @@ fn test_compression_mixed_patterns() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 	iter.seek_to_first();
 	let mut count = 0;
 
@@ -306,7 +306,7 @@ fn test_compression_iterator_operations() {
 	};
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 
 	iter.seek_to_first();
 	assert!(iter.valid());
@@ -408,7 +408,7 @@ fn test_compression_large_values() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 	iter.seek_to_first();
 	let mut count = 0;
 
@@ -458,7 +458,7 @@ fn test_compression_checksum_verification() {
 
 	let table =
 		Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer.clone()), size as u64).unwrap());
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 	iter.seek_to_first();
 	assert!(iter.valid(), "Uncorrupted table should be valid");
 
@@ -477,7 +477,7 @@ fn test_compression_checksum_verification() {
 		Ok(corrupted_table) => {
 			// Corruption might be in a data block - try to iterate
 			let corrupted_table = Arc::new(corrupted_table);
-			let mut corrupted_iter = corrupted_table.iter(false);
+			let mut corrupted_iter = corrupted_table.iter(false, None);
 			corrupted_iter.seek_to_first();
 
 			let mut corruption_detected = false;
@@ -935,7 +935,7 @@ fn test_table_writer_with_level_compression() {
 	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), buffer_len).unwrap());
 
 	// Verify the table was created successfully
-	let mut iter = table.iter(false);
+	let mut iter = table.iter(false, None);
 	iter.seek_to_first();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_ref(), b"key1");

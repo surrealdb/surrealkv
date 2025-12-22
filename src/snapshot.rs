@@ -10,8 +10,8 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
+use crate::IterResult;
 use crate::{IntoBytes, Key, Value};
-use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use bytes::Bytes;
 
 /// Type alias for version scan results
@@ -672,9 +672,6 @@ pub(crate) struct KMergeIterator<'a> {
 	/// Interval heap of items ordered by their current key
 	heap: IntervalHeap<HeapItem>,
 
-	/// Range bounds for filtering
-	range_end: Bound<Vec<u8>>,
-
 	/// Whether the iterator has been initialized for forward iteration
 	initialized_lo: bool,
 
@@ -735,45 +732,11 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						let mut table_iter = table.iter(keys_only);
-						// Seek to start if unbounded
-						match &range.0 {
-							Bound::Included(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									INTERNAL_KEY_SEQ_NUM_MAX,
-									InternalKeyKind::Max,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-							}
-							Bound::Excluded(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									0,
-									InternalKeyKind::Delete,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-								// If we're at the excluded key, advance once
-								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
-										table_iter.advance();
-									}
-								}
-							}
-							Bound::Unbounded => {
-								table_iter.seek_to_first();
-							}
-						}
-
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						let table_iter = table.iter(keys_only, Some(range.clone()));
+						iterators.push(Box::new(table_iter.filter(move |item| {
+							// Filter out items that are not visible in this snapshot
+							item.0.seq_num() <= snapshot_seq_num
+						})));
 					}
 				} else {
 					// Level 1+: Tables have non-overlapping key ranges, use binary search
@@ -781,45 +744,11 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						let mut table_iter = table.iter(keys_only);
-						// Seek to start if unbounded
-						match &range.0 {
-							Bound::Included(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									INTERNAL_KEY_SEQ_NUM_MAX,
-									InternalKeyKind::Max,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-							}
-							Bound::Excluded(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									0,
-									InternalKeyKind::Delete,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-								// If we're at the excluded key, advance once
-								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
-										table_iter.advance();
-									}
-								}
-							}
-							Bound::Unbounded => {
-								table_iter.seek_to_first();
-							}
-						}
-
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						let table_iter = table.iter(keys_only, Some(range.clone()));
+						iterators.push(Box::new(table_iter.filter(move |item| {
+							// Filter out items that are not visible in this snapshot
+							item.0.seq_num() <= snapshot_seq_num
+						})));
 					}
 				}
 			}
@@ -836,7 +765,6 @@ impl<'a> KMergeIterator<'a> {
 			_iter_state: boxed_state,
 			iterators: iterators_ptr,
 			heap,
-			range_end: range.1,
 			initialized_lo: false,
 			initialized_hi: false,
 		}
@@ -896,60 +824,20 @@ impl Iterator for KMergeIterator<'_> {
 			self.initialize_lo();
 		}
 
-		loop {
-			if self.heap.is_empty() {
-				return None;
+		let min_item = self.heap.pop_min()?;
+		unsafe {
+			let iterators = self.iterators.as_mut();
+
+			if let Some(next_item) = iterators[min_item.iterator_index].next() {
+				self.heap.push(HeapItem {
+					key: next_item.0,
+					value: next_item.1,
+					iterator_index: min_item.iterator_index,
+				});
 			}
-
-			// Get the smallest item from the heap
-			let heap_item = self.heap.pop_min()?;
-
-			// Check if the key exceeds the range end BEFORE advancing the iterator.
-			// Since keys are sorted, if current key > range_end,
-			// all subsequent keys from this iterator will also be > range_end.
-			// So we drop this iterator from the merge (don't re-add to heap).
-			let user_key = heap_item.key.user_key.as_ref();
-			let exceeds_range = match &self.range_end {
-				Bound::Included(end) => user_key > end.as_slice(),
-				Bound::Excluded(end) => user_key >= end.as_slice(),
-				Bound::Unbounded => false,
-			};
-
-			if exceeds_range {
-				// DON'T re-add this iterator to the heap - all its remaining keys are out of range
-				// If all remaining iterators are out of range, return None
-				if self.heap.is_empty() {
-					return None;
-				}
-				continue;
-			}
-
-			// Only advance and re-add to heap if the current key is in range.
-			// This ensures we don't waste time processing out-of-range keys.
-			unsafe {
-				let iterators = self.iterators.as_mut();
-				if let Some((key, value)) = iterators[heap_item.iterator_index].next() {
-					// Check if this next key also exceeds the range end
-					// If it does, don't add it back to the heap
-					let next_key = key.user_key.as_ref();
-					let next_exceeds_range = match &self.range_end {
-						Bound::Included(end) => next_key > end.as_slice(),
-						Bound::Excluded(end) => next_key >= end.as_slice(),
-						Bound::Unbounded => false,
-					};
-					if !next_exceeds_range {
-						self.heap.push(HeapItem {
-							key,
-							value: value.clone(),
-							iterator_index: heap_item.iterator_index,
-						});
-					}
-				}
-			}
-
-			// Return the key-value pair
-			return Some((heap_item.key, heap_item.value));
 		}
+
+		Some((min_item.key, min_item.value))
 	}
 }
 
@@ -959,47 +847,19 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 			self.initialize_hi();
 		}
 
-		loop {
-			if self.heap.is_empty() {
-				return None;
+		let max_item = self.heap.pop_max()?;
+		unsafe {
+			let iterators = self.iterators.as_mut();
+			if let Some(next_item) = iterators[max_item.iterator_index].next_back() {
+				self.heap.push(HeapItem {
+					key: next_item.0,
+					value: next_item.1,
+					iterator_index: max_item.iterator_index,
+				});
 			}
-
-			// Get the largest item from the heap
-			let heap_item = self.heap.pop_max()?;
-
-			// Pull the previous item from the same iterator and add back to heap if valid
-			unsafe {
-				let iterators = self.iterators.as_mut();
-				if let Some((key, value)) = iterators[heap_item.iterator_index].next_back() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: heap_item.iterator_index,
-					});
-				}
-			}
-
-			// Check if the key exceeds the range end
-			let user_key = heap_item.key.user_key.as_ref();
-			match &self.range_end {
-				Bound::Included(end) => {
-					if user_key > end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Excluded(end) => {
-					if user_key >= end.as_slice() {
-						continue;
-					}
-				}
-				Bound::Unbounded => {
-					// No end bound to check
-				}
-			}
-
-			// Return the key-value pair
-			return Some((heap_item.key, heap_item.value));
 		}
+
+		Some((max_item.key, max_item.value))
 	}
 }
 
@@ -1022,7 +882,7 @@ where
 		}
 	}
 
-	fn skip_to_latest(&mut self, key: &Key) -> Result<()> {
+	fn skip_all_versions_of_key(&mut self, key: &Key) -> Result<()> {
 		loop {
 			let Some(next) = self.inner.peek() else {
 				return Ok(());
@@ -1048,7 +908,7 @@ where
 		let head = self.inner.next()?;
 
 		// Keep only latest version of the key
-		self.skip_to_latest(&head.0.user_key).ok()?;
+		self.skip_all_versions_of_key(&head.0.user_key).ok()?;
 
 		Some(head)
 	}
