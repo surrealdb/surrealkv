@@ -773,4 +773,213 @@ mod tests {
 			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
 		}
 	}
+
+	#[test]
+	fn test_block_prev() {
+		// Test backward iteration using prev()
+		let data = generate_data();
+		let o = make_opts(Some(2)); // Small restart interval to test restart logic
+		let mut builder = BlockWriter::new(o.clone());
+
+		for &(k, v) in data.iter() {
+			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
+		}
+
+		let block_contents = builder.finish();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+
+		// Test prev() from the end
+		block_iter.seek_to_last();
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey3".as_bytes());
+
+		// Go backward one step
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey2".as_bytes());
+
+		// Go backward another step
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
+
+		// Go backward one more step
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "medium_key2".as_bytes());
+
+		// Go backward to the beginning
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "loooongkey1".as_bytes());
+
+		// Go backward to the first key
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
+
+		// Try to go past the beginning
+		assert!(!block_iter.prev());
+		assert!(!block_iter.valid());
+	}
+
+	#[test]
+	fn test_block_double_ended_iteration() {
+		// Test using both next() and next_back() (DoubleEndedIterator)
+		let data = generate_data();
+		let o = make_opts(Some(3));
+		let mut builder = BlockWriter::new(o.clone());
+
+		for &(k, v) in data.iter() {
+			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
+		}
+
+		let block_contents = builder.finish();
+
+		// Test forward iteration with next()
+		let forward_iter = Block::new(block_contents.clone(), o.clone()).iter(false);
+		let mut forward_keys = Vec::new();
+		for item in forward_iter {
+			let internal_key = InternalKey::decode(&item.0);
+			forward_keys.push(String::from_utf8(internal_key.user_key.to_vec()).unwrap());
+		}
+		assert_eq!(
+			forward_keys,
+			vec!["key1", "loooongkey1", "medium_key2", "pkey1", "pkey2", "pkey3"]
+		);
+
+		// Test backward iteration using prev()
+		let mut backward_iter = Block::new(block_contents.clone(), o.clone()).iter(false);
+		backward_iter.seek_to_last();
+		let mut backward_keys = Vec::new();
+		while backward_iter.valid() {
+			let key = backward_iter.key().user_key.clone();
+			backward_keys.push(String::from_utf8(key.to_vec()).unwrap());
+			if !backward_iter.prev() {
+				break;
+			}
+		}
+		assert_eq!(
+			backward_keys,
+			vec!["pkey3", "pkey2", "pkey1", "medium_key2", "loooongkey1", "key1"]
+		);
+
+		// Verify they are complementary
+		assert_eq!(forward_keys, backward_keys.iter().rev().cloned().collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn test_block_prev_from_middle() {
+		// Test prev() starting from the middle of the block
+		let data = generate_data();
+		let o = make_opts(Some(2));
+		let mut builder = BlockWriter::new(o.clone());
+
+		for &(k, v) in data.iter() {
+			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
+		}
+
+		let block_contents = builder.finish();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+
+		// Seek to "pkey1"
+		let seek_key = InternalKey::new(Bytes::from_static(b"pkey1"), 1, InternalKeyKind::Set, 0);
+		block_iter.seek(&seek_key.encode());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
+
+		// Go backward from here
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "medium_key2".as_bytes());
+
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "loooongkey1".as_bytes());
+
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
+
+		// Can't go further back
+		assert!(!block_iter.prev());
+		assert!(!block_iter.valid());
+	}
+
+	#[test]
+	fn test_block_mixed_next_prev() {
+		// Test basic prev() functionality after positioning
+		let data = generate_data();
+		let o = make_opts(Some(3));
+		let mut builder = BlockWriter::new(o.clone());
+
+		for &(k, v) in data.iter() {
+			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
+		}
+
+		let block_contents = builder.finish();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+
+		// Position at "pkey1"
+		let seek_key = InternalKey::new(Bytes::from_static(b"pkey1"), 1, InternalKeyKind::Set, 0);
+		block_iter.seek(&seek_key.encode());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
+
+		// Go backward
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "medium_key2".as_bytes());
+
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "loooongkey1".as_bytes());
+
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
+
+		// Can't go further
+		assert!(!block_iter.prev());
+		assert!(!block_iter.valid());
+	}
+
+	#[test]
+	fn test_block_prev_edge_cases() {
+		// Test edge cases for prev()
+		let data = generate_data();
+		let o = make_opts(Some(5)); // Large restart interval
+		let mut builder = BlockWriter::new(o.clone());
+
+		for &(k, v) in data.iter() {
+			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
+		}
+
+		let block_contents = builder.finish();
+		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+
+		// Test prev() on empty block (shouldn't happen but let's test robustness)
+		let empty_block = BlockWriter::new(o.clone()).finish();
+		let mut empty_iter = Block::new(empty_block, o.clone()).iter(false);
+		assert!(!empty_iter.prev());
+		assert!(!empty_iter.valid());
+
+		// Test prev() when at first entry
+		block_iter.seek_to_first();
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
+
+		assert!(!block_iter.prev()); // Can't go before first
+		assert!(!block_iter.valid());
+
+		// Test prev() after seek_to_last()
+		block_iter.seek_to_last();
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey3".as_bytes());
+
+		// Should be able to go backward
+		assert!(block_iter.prev());
+		assert!(block_iter.valid());
+		assert_eq!(block_iter.key().user_key.as_ref(), "pkey2".as_bytes());
+	}
 }

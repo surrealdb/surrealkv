@@ -10,8 +10,8 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
+use crate::IterResult;
 use crate::{IntoBytes, Key, Value};
-use crate::{IterResult, Iterator as LSMIterator, INTERNAL_KEY_SEQ_NUM_MAX};
 use bytes::Bytes;
 
 /// Type alias for version scan results
@@ -732,45 +732,11 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						let mut table_iter = table.iter(keys_only, Some(range.clone()));
-						// Seek to start if unbounded
-						match &range.0 {
-							Bound::Included(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									INTERNAL_KEY_SEQ_NUM_MAX,
-									InternalKeyKind::Max,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-							}
-							Bound::Excluded(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									0,
-									InternalKeyKind::Delete,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-								// If we're at the excluded key, advance once
-								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
-										table_iter.advance();
-									}
-								}
-							}
-							Bound::Unbounded => {
-								table_iter.seek_to_first();
-							}
-						}
-
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						let table_iter = table.iter(keys_only, Some(range.clone()));
+						iterators.push(Box::new(table_iter.filter(move |item| {
+							// Filter out items that are not visible in this snapshot
+							item.0.seq_num() <= snapshot_seq_num
+						})));
 					}
 				} else {
 					// Level 1+: Tables have non-overlapping key ranges, use binary search
@@ -778,45 +744,11 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						let mut table_iter = table.iter(keys_only, Some(range.clone()));
-						// Seek to start if unbounded
-						match &range.0 {
-							Bound::Included(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									INTERNAL_KEY_SEQ_NUM_MAX,
-									InternalKeyKind::Max,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-							}
-							Bound::Excluded(key) => {
-								let ikey = InternalKey::new(
-									Bytes::copy_from_slice(key),
-									0,
-									InternalKeyKind::Delete,
-									0,
-								);
-								table_iter.seek(&ikey.encode());
-								// If we're at the excluded key, advance once
-								if table_iter.valid() {
-									let current = &table_iter.key();
-									if current.user_key.as_ref() == key.as_slice() {
-										table_iter.advance();
-									}
-								}
-							}
-							Bound::Unbounded => {
-								table_iter.seek_to_first();
-							}
-						}
-
-						if table_iter.valid() {
-							iterators.push(Box::new(table_iter.filter(move |item| {
-								// Filter out items that are not visible in this snapshot
-								item.0.seq_num() <= snapshot_seq_num
-							})));
-						}
+						let table_iter = table.iter(keys_only, Some(range.clone()));
+						iterators.push(Box::new(table_iter.filter(move |item| {
+							// Filter out items that are not visible in this snapshot
+							item.0.seq_num() <= snapshot_seq_num
+						})));
 					}
 				}
 			}

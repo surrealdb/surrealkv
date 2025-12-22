@@ -17,7 +17,7 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind,
+		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
 	},
 	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
@@ -1057,15 +1057,117 @@ impl TableIterator {
 		self.current_block = None;
 		false
 	}
+
+	fn seek_to_upper_bound(&mut self, bound: &Bound<Vec<u8>>) {
+		match bound {
+			Bound::Included(end) => {
+				// Seek to find the first key >= upper bound
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(end),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+
+				// If seek went past table end (invalid), start from last key
+				if !self.valid() {
+					self.seek_to_last();
+					return;
+				}
+
+				// Back up if we're beyond the bound (should only need a few steps)
+				while self.valid() {
+					let key = self.current_block.as_ref().unwrap().key();
+					let user_key = key.user_key.as_ref();
+					let cmp = self.table.opts.comparator.compare(user_key, end);
+					if cmp != Ordering::Greater {
+						// Found a key <= bound, we're positioned correctly
+						break;
+					}
+					if !self.prev() {
+						// No more keys, iterator becomes invalid
+						break;
+					}
+				}
+			}
+			Bound::Excluded(end) => {
+				// Seek to find the first key >= upper bound
+				let seek_key = InternalKey::new(
+					Bytes::copy_from_slice(end),
+					INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Max,
+					0,
+				);
+				self.seek(&seek_key.encode());
+
+				// If seek went past table end, start from last key
+				if !self.valid() {
+					self.seek_to_last();
+				}
+
+				// Move backward until we find a key < end (strictly less)
+				// This works whether we seeked successfully or fell back to last
+				while self.valid() {
+					let key = self.current_block.as_ref().unwrap().key();
+					let user_key = key.user_key.as_ref();
+					if self.table.opts.comparator.compare(user_key, end) == Ordering::Less {
+						break;
+					}
+					if !self.prev() {
+						break;
+					}
+				}
+			}
+			Bound::Unbounded => {
+				self.seek_to_last();
+			}
+		}
+	}
 }
 
 impl Iterator for TableIterator {
 	type Item = (Arc<InternalKey>, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		// If not positioned, position at first entry
+		// If not positioned, position appropriately based on range
 		if !self.positioned {
-			self.seek_to_first();
+			// NEW: Seek to lower bound instead of always seeking to first
+			match &self.range.0 {
+				Bound::Included(start) => {
+					let start_clone = start.clone();
+					let seek_key = InternalKey::new(
+						Bytes::copy_from_slice(&start_clone),
+						INTERNAL_KEY_SEQ_NUM_MAX,
+						InternalKeyKind::Max,
+						0,
+					);
+					self.seek(&seek_key.encode());
+				}
+				Bound::Excluded(start) => {
+					let start_clone = start.clone();
+					let seek_key = InternalKey::new(
+						Bytes::copy_from_slice(&start_clone),
+						INTERNAL_KEY_SEQ_NUM_MAX,
+						InternalKeyKind::Max,
+						0,
+					);
+					self.seek(&seek_key.encode());
+					// If we landed exactly on the excluded key, advance
+					if self.valid() {
+						let key = self.current_block.as_ref().unwrap().key();
+						let user_key = key.user_key.as_ref();
+						if self.table.opts.comparator.compare(user_key, &start_clone)
+							== Ordering::Equal
+						{
+							self.advance();
+						}
+					}
+				}
+				Bound::Unbounded => {
+					self.seek_to_first();
+				}
+			}
 		}
 
 		// If not valid, return None
@@ -1079,27 +1181,8 @@ impl Iterator for TableIterator {
 			self.current_block.as_ref().unwrap().value(),
 		);
 
-		// Check bounds before returning
+		// Check upper bound (lower bound is already handled by seek)
 		let user_key = current_item.0.user_key.as_ref();
-
-		// Check lower bound - skip items that are before the lower bound
-		match &self.range.0 {
-			Bound::Included(start) => {
-				if self.table.opts.comparator.compare(user_key, start) == Ordering::Less {
-					// Skip this item and continue to next
-					self.advance();
-					return self.next();
-				}
-			}
-			Bound::Excluded(start) => {
-				if self.table.opts.comparator.compare(user_key, start) != Ordering::Greater {
-					// Skip this item and continue to next
-					self.advance();
-					return self.next();
-				}
-			}
-			Bound::Unbounded => {}
-		}
 
 		// Check upper bound
 		match &self.range.1 {
@@ -1127,9 +1210,20 @@ impl Iterator for TableIterator {
 
 impl DoubleEndedIterator for TableIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		// If not positioned, position at last entry
+		// If not positioned, position appropriately based on range
 		if !self.positioned {
-			self.seek_to_last();
+			// NEW: Seek to upper bound instead of always seeking to last
+			match &self.range.1 {
+				Bound::Included(_) | Bound::Excluded(_) => {
+					let upper_bound = self.range.1.clone();
+					self.seek_to_upper_bound(&upper_bound);
+					self.positioned = true;
+					self.reverse_started = false;
+				}
+				Bound::Unbounded => {
+					self.seek_to_last();
+				}
+			}
 		}
 
 		// If positioned but not yet started reverse iteration, return current position first
