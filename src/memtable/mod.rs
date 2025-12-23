@@ -12,7 +12,7 @@ use std::{
 use crate::{
 	batch::Batch,
 	error::Result,
-	iter::MergeIterator,
+	iter::CompactionIterator,
 	sstable::{
 		table::{Table, TableWriter},
 		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
@@ -209,8 +209,15 @@ impl MemTable {
 
 			let iter = self.iter(false);
 			let iter = Box::new(iter);
-			let merge_iter = MergeIterator::new(vec![iter], false);
-			for (key, encoded_val) in merge_iter {
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				false,                  // not bottom level (L0 flush)
+				None,                   // no vlog access in flush context
+				false,                  // versioning disabled in flush context
+				0,                      // retention period is 0 in flush context
+				lsm_opts.clock.clone(), // clock is the system clock
+			);
+			for (key, encoded_val) in comp_iter.by_ref() {
 				// The memtable already contains the correct ValueLocation encoding
 				// (either inline or with VLog pointer), so we can use it directly
 				table_writer.add(key, &encoded_val)?;

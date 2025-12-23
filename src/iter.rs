@@ -54,93 +54,6 @@ impl PartialOrd for HeapItem {
 	}
 }
 
-pub(crate) struct MergeIterator<'a> {
-	iterators: Vec<BoxedIterator<'a>>,
-	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem>,
-	// Current key we're processing, to skip duplicate versions
-	current_user_key: Option<Key>,
-	initialized: bool,
-	// If true, skip hard delete entries at the bottom level
-	is_bottom_level: bool,
-}
-
-impl<'a> MergeIterator<'a> {
-	pub(crate) fn new(iterators: Vec<BoxedIterator<'a>>, is_bottom_level: bool) -> Self {
-		let heap = BinaryHeap::with_capacity(iterators.len());
-
-		Self {
-			iterators,
-			heap,
-			current_user_key: None,
-			initialized: false,
-			is_bottom_level,
-		}
-	}
-
-	fn initialize(&mut self) {
-		// Pull the first item from each iterator and add to heap
-		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: idx,
-				});
-			}
-		}
-		self.initialized = true;
-	}
-}
-
-impl Iterator for MergeIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if !self.initialized {
-			self.initialize();
-		}
-
-		loop {
-			// Get the smallest item from the heap
-			let heap_item = self.heap.pop()?;
-
-			// Pull the next item from the same iterator and add back to heap
-			if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: heap_item.iterator_index,
-				});
-			}
-
-			let user_key = heap_item.key.user_key.clone();
-			let is_hard_delete = heap_item.key.is_hard_delete_marker();
-
-			// Check if this is a new user key
-			let is_new_key = match &self.current_user_key {
-				None => true,
-				Some(current) => user_key != current,
-			};
-
-			if is_new_key {
-				// New user key - update tracking
-				self.current_user_key = Some(user_key);
-
-				// At the bottom level, skip hard delete entries since there are no older entries below
-				if is_hard_delete && self.is_bottom_level {
-					continue;
-				}
-
-				// Return this item (most recent version of this user key)
-				return Some((heap_item.key, heap_item.value));
-			}
-			// Same user key - this is an older version, skip it
-			continue;
-		}
-	}
-}
-
 fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Value) -> Result<()> {
 	// Skip empty values (e.g., hard delete entries)
 	if value.is_empty() {
@@ -541,11 +454,18 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Create the merge iterator
-		let merge_iter = MergeIterator::new(vec![iter1, iter2], false);
+		let mut merge_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false,
+			None,
+			false, // versioning disabled
+			0,
+			Arc::new(MockLogicalClock::new()),
+		);
 
 		// Collect all items
 		let mut result = Vec::new();
-		for (key, _) in merge_iter {
+		for (key, _) in merge_iter.by_ref() {
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			let seq = key.seq_num();
 			let kind = key.kind();
@@ -610,11 +530,18 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Test non-bottom level (should keep hard delete entries)
-		let comp_iter = MergeIterator::new(vec![iter1, iter2], false);
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			false,
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::new()),
+		);
 
 		// Collect all items
 		let mut result = Vec::new();
-		for (key, _) in comp_iter {
+		for (key, _) in comp_iter.by_ref() {
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			let seq = key.seq_num();
 			let kind = key.kind();
@@ -675,11 +602,18 @@ mod tests {
 		let iter2 = Box::new(MockIterator::new(items2));
 
 		// Use bottom level
-		let comp_iter = MergeIterator::new(vec![iter1, iter2], true);
+		let mut comp_iter = CompactionIterator::new(
+			vec![iter1, iter2],
+			true, // bottom level
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::new()),
+		);
 
 		// Collect all items
 		let mut bottom_result = Vec::new();
-		for (key, _) in comp_iter {
+		for (key, _) in comp_iter.by_ref() {
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			bottom_result.push(key_str);
 		}

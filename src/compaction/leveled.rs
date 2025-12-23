@@ -336,13 +336,14 @@ mod tests {
 	use tempfile::TempDir;
 
 	use crate::{
+		clock::MockLogicalClock,
 		compaction::{
 			compactor::{CompactionOptions, Compactor},
 			leveled::Strategy,
 			CompactionChoice, CompactionStrategy,
 		},
 		error::Result,
-		iter::MergeIterator,
+		iter::CompactionIterator,
 		levels::{write_manifest_to_disk, Level, LevelManifest, Levels},
 		memtable::ImmutableMemtables,
 		sstable::{
@@ -2041,8 +2042,15 @@ mod tests {
 			Box::new(tombstone_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
 			Box::new(value_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
-		let comp_iter_non_bottom = MergeIterator::new(iterators, false);
-		let non_bottom_result: Vec<_> = comp_iter_non_bottom.collect();
+		let mut comp_iter_non_bottom = CompactionIterator::new(
+			iterators,
+			false,
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::new()),
+		);
+		let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().collect();
 
 		// Non-bottom level should preserve tombstone
 		assert_eq!(non_bottom_result.len(), 1, "Non-bottom level should have 1 entry");
@@ -2059,8 +2067,15 @@ mod tests {
 			Box::new(tombstone_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
 			Box::new(value_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
 		];
-		let comp_iter_bottom = MergeIterator::new(iterators, true);
-		let bottom_result: Vec<_> = comp_iter_bottom.collect();
+		let mut comp_iter_bottom = CompactionIterator::new(
+			iterators,
+			true,
+			None,
+			false,
+			0,
+			Arc::new(MockLogicalClock::new()),
+		);
+		let bottom_result: Vec<_> = comp_iter_bottom.by_ref().collect();
 
 		// Bottom level should filter out tombstones
 		let has_tombstones = bottom_result.iter().any(|(key, _)| key.is_hard_delete_marker());
