@@ -2,7 +2,6 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use std::{
 	fs::File as SysFile,
-	ops::{Bound, RangeBounds},
 	sync::{
 		atomic::{AtomicU32, AtomicU64, Ordering},
 		Arc,
@@ -18,7 +17,7 @@ use crate::{
 		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	},
 	vfs::File,
-	Options, Value,
+	InternalKeyRange, Options, Value,
 };
 
 /// Entry in the immutable memtables list, tracking both the table ID
@@ -250,64 +249,12 @@ impl MemTable {
 		})
 	}
 
-	pub(crate) fn range<R>(
+	pub(crate) fn range(
 		&self,
-		range: R,
+		range: InternalKeyRange,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_
-	where
-		R: RangeBounds<Vec<u8>>,
-	{
-		let start_bound = match range.start_bound() {
-			Bound::Included(key) => {
-				// For inclusive start, we want the earliest internal key for this user key
-				// Since internal keys are sorted as (user_key asc, seq_num desc),
-				// we use the highest possible sequence number to get the first entry
-				Bound::Included(InternalKey::new(
-					Bytes::copy_from_slice(key),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				))
-			}
-			Bound::Excluded(key) => {
-				// For exclusive start, we want to skip all versions of this user key
-				// We use the lowest sequence number to position after all real entries
-				Bound::Excluded(InternalKey::new(
-					Bytes::copy_from_slice(key),
-					0,
-					InternalKeyKind::Set,
-					0,
-				))
-			}
-			Bound::Unbounded => Bound::Unbounded,
-		};
-
-		let end_bound = match range.end_bound() {
-			Bound::Included(key) => {
-				// For inclusive end, we want to include all versions of this user key
-				// We use the lowest sequence number to include the last entry
-				Bound::Included(InternalKey::new(
-					Bytes::copy_from_slice(key),
-					0,
-					InternalKeyKind::Set,
-					0,
-				))
-			}
-			Bound::Excluded(key) => {
-				// For exclusive end, we want to exclude all versions of this user key
-				// We use the highest sequence number to stop before any real entries
-				Bound::Excluded(InternalKey::new(
-					Bytes::copy_from_slice(key),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				))
-			}
-			Bound::Unbounded => Bound::Unbounded,
-		};
-
-		self.map.range((start_bound, end_bound)).map(move |entry| {
+	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
 				Bytes::new()
@@ -324,6 +271,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
+	use crate::user_range_to_internal_range;
 	use std::collections::HashMap;
 
 	fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
@@ -712,7 +660,9 @@ mod tests {
 		]);
 
 		// Test inclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..=s2b("k"), false).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable
+			.range(user_range_to_internal_range(s2b("c")..=s2b("k")), false)
+			.collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -724,7 +674,9 @@ mod tests {
 		assert_eq!(user_keys[4].as_ref(), b"k");
 
 		// Test exclusive range
-		let range_entries: Vec<_> = memtable.range(s2b("c")..s2b("k"), false).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable
+			.range(user_range_to_internal_range(s2b("c")..s2b("k")), false)
+			.collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -747,7 +699,9 @@ mod tests {
 		]);
 
 		// Perform a range query from "a" to "f"
-		let range_entries: Vec<_> = memtable.range(s2b("a")..s2b("f"), false).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable
+			.range(user_range_to_internal_range(s2b("a")..s2b("f")), false)
+			.collect::<Vec<_>>();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();

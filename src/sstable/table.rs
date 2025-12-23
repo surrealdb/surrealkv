@@ -17,19 +17,14 @@ use crate::{
 		filter_block::{FilterBlockReader, FilterBlockWriter},
 		index_block::{TopLevelIndex, TopLevelIndexWriter},
 		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX,
+		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	},
 	vfs::File,
-	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, Iterator as LSMIterator,
-	Options, Value,
+	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, InternalKeyRange,
+	Iterator as LSMIterator, Options, Value,
 };
 
 use super::meta::KeyRange;
-
-/// A range bound for table iteration, representing inclusive or exclusive bounds
-pub type TableRangeBound = Bound<Vec<u8>>;
-/// A range for table iteration, consisting of start and end bounds
-pub type TableRange = (TableRangeBound, TableRangeBound);
 
 const TABLE_FOOTER_LENGTH: usize = 42; // 2 + 16 + 16 + 8 (format + checksum + meta + index + magic)
 const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
@@ -802,7 +797,7 @@ impl Table {
 	pub(crate) fn iter(
 		self: &Arc<Self>,
 		keys_only: bool,
-		range: Option<TableRange>,
+		range: Option<InternalKeyRange>,
 	) -> TableIterator {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
@@ -820,6 +815,8 @@ impl Table {
 			}
 		};
 
+		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+
 		TableIterator {
 			current_block: None,
 			current_block_off: 0,
@@ -830,7 +827,7 @@ impl Table {
 			current_partition_index: 0,
 			current_partition_iter: None,
 			keys_only,
-			range: range.unwrap_or((Bound::Unbounded, Bound::Unbounded)),
+			range,
 			reverse_started: false,
 		}
 	}
@@ -896,8 +893,8 @@ pub(crate) struct TableIterator {
 	current_partition_iter: Option<BlockIterator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
-	/// Range bounds for filtering
-	range: TableRange,
+	/// Range bounds for filtering (InternalKey)
+	range: InternalKeyRange,
 	/// Whether reverse iteration has started (to distinguish from just positioned)
 	reverse_started: bool,
 }
@@ -1058,34 +1055,30 @@ impl TableIterator {
 		false
 	}
 
-	fn seek_to_lower_bound(&mut self, bound: &Bound<Vec<u8>>) {
+	fn seek_to_lower_bound(&mut self, bound: &Bound<InternalKey>) {
 		match bound {
-			Bound::Included(start) => {
-				let seek_key = InternalKey::new(
-					Bytes::copy_from_slice(start),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					0,
-				);
-				self.seek(&seek_key.encode());
+			Bound::Included(internal_key) => {
+				self.seek(&internal_key.encode());
 			}
-			Bound::Excluded(start) => {
+			Bound::Excluded(internal_key) => {
+				// For excluded bound, seek to highest version of the key, then skip all versions
 				let seek_key = InternalKey::new(
-					Bytes::copy_from_slice(start),
+					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
-					0,
+					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
 				self.seek(&seek_key.encode());
 
 				// Skip ALL versions of the excluded key
 				while self.valid() {
-					let key = self.current_block.as_ref().unwrap().key();
-					let user_key = key.user_key.as_ref();
-					if self.table.opts.comparator.compare(user_key, start) != Ordering::Equal {
+					let current_key = self.current_block.as_ref().unwrap().key();
+					if current_key.user_key != internal_key.user_key {
 						break;
 					}
-					self.advance();
+					if !self.advance() {
+						break;
+					}
 				}
 			}
 			Bound::Unbounded => {
@@ -1094,15 +1087,15 @@ impl TableIterator {
 		}
 	}
 
-	fn seek_to_upper_bound(&mut self, bound: &Bound<Vec<u8>>) {
+	fn seek_to_upper_bound(&mut self, bound: &Bound<InternalKey>) {
 		match bound {
-			Bound::Included(end) => {
+			Bound::Included(internal_key) => {
 				// Seek to find the first key >= upper bound
 				let seek_key = InternalKey::new(
-					Bytes::copy_from_slice(end),
+					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
-					0,
+					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
 				self.seek(&seek_key.encode());
 
@@ -1114,9 +1107,12 @@ impl TableIterator {
 
 				// Back up if we're beyond the bound (should only need a few steps)
 				while self.valid() {
-					let key = self.current_block.as_ref().unwrap().key();
-					let user_key = key.user_key.as_ref();
-					let cmp = self.table.opts.comparator.compare(user_key, end);
+					let current_key = self.current_block.as_ref().unwrap().key();
+					let cmp = self
+						.table
+						.opts
+						.comparator
+						.compare(current_key.user_key.as_ref(), internal_key.user_key.as_ref());
 					if cmp != Ordering::Greater {
 						// Found a key <= bound, we're positioned correctly
 						break;
@@ -1127,13 +1123,13 @@ impl TableIterator {
 					}
 				}
 			}
-			Bound::Excluded(end) => {
+			Bound::Excluded(internal_key) => {
 				// Seek to find the first key >= upper bound
 				let seek_key = InternalKey::new(
-					Bytes::copy_from_slice(end),
+					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
-					0,
+					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
 				self.seek(&seek_key.encode());
 
@@ -1144,9 +1140,13 @@ impl TableIterator {
 
 				// Move backward until we find a key < end (strictly less)
 				while self.valid() {
-					let key = self.current_block.as_ref().unwrap().key();
-					let user_key = key.user_key.as_ref();
-					if self.table.opts.comparator.compare(user_key, end) == Ordering::Less {
+					let current_key = self.current_block.as_ref().unwrap().key();
+					let cmp = self
+						.table
+						.opts
+						.comparator
+						.compare(current_key.user_key.as_ref(), internal_key.user_key.as_ref());
+					if cmp == Ordering::Less {
 						break;
 					}
 					if !self.prev() {
@@ -1161,26 +1161,30 @@ impl TableIterator {
 	}
 
 	/// Check if a user key satisfies the lower bound constraint
-	fn satisfies_lower_bound(&self, user_key: &[u8]) -> bool {
+	fn satisfies_lower_bound(&self, internal_key: &InternalKey) -> bool {
 		match &self.range.0 {
 			Bound::Included(start) => {
-				self.table.opts.comparator.compare(user_key, start) != Ordering::Less
+				self.table.opts.comparator.compare(&internal_key.user_key, &start.user_key)
+					!= Ordering::Less
 			}
 			Bound::Excluded(start) => {
-				self.table.opts.comparator.compare(user_key, start) == Ordering::Greater
+				self.table.opts.comparator.compare(&internal_key.user_key, &start.user_key)
+					== Ordering::Greater
 			}
 			Bound::Unbounded => true,
 		}
 	}
 
 	/// Check if a user key satisfies the upper bound constraint
-	fn satisfies_upper_bound(&self, user_key: &[u8]) -> bool {
+	fn satisfies_upper_bound(&self, internal_key: &InternalKey) -> bool {
 		match &self.range.1 {
 			Bound::Included(end) => {
-				self.table.opts.comparator.compare(user_key, end) != Ordering::Greater
+				self.table.opts.comparator.compare(&internal_key.user_key, &end.user_key)
+					!= Ordering::Greater
 			}
 			Bound::Excluded(end) => {
-				self.table.opts.comparator.compare(user_key, end) == Ordering::Less
+				self.table.opts.comparator.compare(&internal_key.user_key, &end.user_key)
+					== Ordering::Less
 			}
 			Bound::Unbounded => true,
 		}
@@ -1210,8 +1214,7 @@ impl Iterator for TableIterator {
 		);
 
 		// Check upper bound (lower bound is already handled by seek)
-		let user_key = current_item.0.user_key.as_ref();
-		if !self.satisfies_upper_bound(user_key) {
+		if !self.satisfies_upper_bound(&current_item.0) {
 			self.mark_exhausted();
 			return None;
 		}
@@ -1249,8 +1252,7 @@ impl DoubleEndedIterator for TableIterator {
 			);
 
 			// Check lower bound for reverse iteration
-			let user_key = item.0.user_key.as_ref();
-			if !self.satisfies_lower_bound(user_key) {
+			if !self.satisfies_lower_bound(&item.0) {
 				return None;
 			}
 			self.reverse_started = true;
@@ -1267,8 +1269,7 @@ impl DoubleEndedIterator for TableIterator {
 		);
 
 		// Check lower bound for reverse iteration
-		let user_key = item.0.user_key.as_ref();
-		if !self.satisfies_lower_bound(user_key) {
+		if !self.satisfies_lower_bound(&item.0) {
 			return None;
 		}
 		Some(item)
@@ -1517,7 +1518,8 @@ mod tests {
 	use std::vec;
 	use test_log::test;
 
-	use crate::sstable::{InternalKey, INTERNAL_KEY_SEQ_NUM_MAX};
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::user_range_to_internal_range;
 
 	use super::*;
 	use rand::rngs::StdRng;
@@ -3854,8 +3856,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Iterate with range (Unbounded, Included("key_005"))
-		let iter =
-			table.iter(false, Some((Bound::Unbounded, Bound::Included(b"key_005".to_vec()))));
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Included(b"key_005".to_vec()),
+			))),
+		);
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -3897,8 +3904,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Iterate with range (Unbounded, Excluded("key_005"))
-		let iter =
-			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_005".to_vec()))));
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Excluded(b"key_005".to_vec()),
+			))),
+		);
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -3990,8 +4002,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Iterate with range (Included("key_003"), Unbounded) using next_back()
-		let mut iter =
-			table.iter(false, Some((Bound::Included(b"key_003".to_vec()), Bound::Unbounded)));
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_003".to_vec()),
+				Bound::Unbounded,
+			))),
+		);
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
@@ -4036,7 +4053,10 @@ mod tests {
 		// Iterate with range (Included("key_002"), Excluded("key_007"))
 		let iter = table.iter(
 			false,
-			Some((Bound::Included(b"key_002".to_vec()), Bound::Excluded(b"key_007".to_vec()))),
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_002".to_vec()),
+				Bound::Excluded(b"key_007".to_vec()),
+			))),
 		);
 
 		let mut results = Vec::new();
@@ -4075,7 +4095,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
-		let iter = table.iter(false, Some((Bound::Unbounded, Bound::Unbounded)));
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::<Vec<u8>>::Unbounded,
+				Bound::<Vec<u8>>::Unbounded,
+			))),
+		);
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -4201,8 +4227,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Reverse iteration with EXCLUDED upper bound
-		let mut iter =
-			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_005".to_vec()))));
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Excluded(b"key_005".to_vec()),
+			))),
+		);
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
@@ -4240,8 +4271,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Reverse iteration with INCLUDED upper bound on non-existent key
-		let mut iter =
-			table.iter(false, Some((Bound::Unbounded, Bound::Included(b"key_005".to_vec()))));
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Included(b"key_005".to_vec()),
+			))),
+		);
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
@@ -4279,8 +4315,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Forward iteration with EXCLUDED lower bound
-		let iter =
-			table.iter(false, Some((Bound::Excluded(b"key_003".to_vec()), Bound::Unbounded)));
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_003".to_vec()),
+				Bound::Unbounded,
+			))),
+		);
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -4314,8 +4355,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Forward iteration with excluded lower bound
-		let iter =
-			table.iter(false, Some((Bound::Excluded(b"key_003".to_vec()), Bound::Unbounded)));
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_003".to_vec()),
+				Bound::Unbounded,
+			))),
+		);
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -4365,8 +4411,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Reverse iteration with excluded upper bound
-		let mut iter =
-			table.iter(false, Some((Bound::Unbounded, Bound::Excluded(b"key_003".to_vec()))));
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Excluded(b"key_003".to_vec()),
+			))),
+		);
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
@@ -4416,7 +4467,10 @@ mod tests {
 		// Forward iteration with both bounds excluded at same key
 		let iter = table.iter(
 			false,
-			Some((Bound::Excluded(b"key_003".to_vec()), Bound::Excluded(b"key_003".to_vec()))),
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_003".to_vec()),
+				Bound::Excluded(b"key_003".to_vec()),
+			))),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -4450,7 +4504,10 @@ mod tests {
 		// Reverse iteration with both bounds excluded at same key
 		let mut iter = table.iter(
 			false,
-			Some((Bound::Excluded(b"key_003".to_vec()), Bound::Excluded(b"key_003".to_vec()))),
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_003".to_vec()),
+				Bound::Excluded(b"key_003".to_vec()),
+			))),
 		);
 
 		let mut results = Vec::new();
@@ -4490,7 +4547,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some((Bound::Excluded(b"key_002".to_vec()), Bound::Excluded(b"key_004".to_vec()))),
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_002".to_vec()),
+				Bound::Excluded(b"key_004".to_vec()),
+			))),
 		);
 
 		let mut results = Vec::new();
@@ -4544,7 +4604,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some((Bound::Excluded(b"key_002".to_vec()), Bound::Excluded(b"key_005".to_vec()))),
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_002".to_vec()),
+				Bound::Excluded(b"key_005".to_vec()),
+			))),
 		);
 
 		let mut results = Vec::new();

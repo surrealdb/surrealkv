@@ -689,6 +689,9 @@ impl<'a> KMergeIterator<'a> {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
 
+		// Convert user-key range to InternalKey range once
+		let internal_range = crate::user_range_to_internal_range(range.clone());
+
 		unsafe {
 			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
 			// Compute query key range for table overlap checks
@@ -705,12 +708,12 @@ impl<'a> KMergeIterator<'a> {
 			};
 
 			// Active memtable with range
-			let active_iter = state_ref.active.range(range.clone(), keys_only);
+			let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
 			iterators.push(Box::new(active_iter));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
-				let iter = memtable.range(range.clone(), keys_only);
+				let iter = memtable.range(internal_range.clone(), keys_only);
 				iterators.push(Box::new(iter));
 			}
 
@@ -725,7 +728,7 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						let table_iter = table.iter(keys_only, Some(range.clone()));
+						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
 						iterators.push(Box::new(table_iter));
 					}
 				} else {
@@ -734,7 +737,7 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						let table_iter = table.iter(keys_only, Some(range.clone()));
+						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
 						iterators.push(Box::new(table_iter));
 					}
 				}
@@ -2452,7 +2455,6 @@ mod tests {
 
 		// Capture snapshot after key1 insert (should see only key1)
 		let snapshot1 = store.begin().unwrap();
-		let snapshot1_seq = snapshot1.snapshot.as_ref().unwrap().seq_num;
 
 		// Insert key2 at seq_num ~2
 		{
@@ -2463,7 +2465,6 @@ mod tests {
 
 		// Capture snapshot after key2 insert (should see key1 and key2)
 		let snapshot2 = store.begin().unwrap();
-		let snapshot2_seq = snapshot2.snapshot.as_ref().unwrap().seq_num;
 
 		// Insert key3 at seq_num ~3
 		{
@@ -2474,7 +2475,6 @@ mod tests {
 
 		// Capture snapshot after key3 insert (should see key1, key2, and key3)
 		let snapshot3 = store.begin().unwrap();
-		let snapshot3_seq = snapshot3.snapshot.as_ref().unwrap().seq_num;
 
 		// Insert key4 at seq_num ~4
 		{
@@ -2485,12 +2485,6 @@ mod tests {
 
 		// Capture snapshot after key4 insert (should see all keys)
 		let snapshot4 = store.begin().unwrap();
-		let snapshot4_seq = snapshot4.snapshot.as_ref().unwrap().seq_num;
-
-		eprintln!(
-			"Snapshot seq nums: s1={}, s2={}, s3={}, s4={}",
-			snapshot1_seq, snapshot2_seq, snapshot3_seq, snapshot4_seq
-		);
 
 		// Test snapshot1 - should only see key1
 		{
@@ -2500,12 +2494,6 @@ mod tests {
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snapshot1 (seq={}) sees: {:?}",
-				snapshot1_seq,
-				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2521,12 +2509,6 @@ mod tests {
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
 
-			eprintln!(
-				"Snapshot2 (seq={}) sees: {:?}",
-				snapshot2_seq,
-				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
-			);
-
 			assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
 			assert_eq!(range[0].0.as_ref(), b"key1");
 			assert_eq!(range[1].0.as_ref(), b"key2");
@@ -2540,12 +2522,6 @@ mod tests {
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snapshot3 (seq={}) sees: {:?}",
-				snapshot3_seq,
-				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2561,12 +2537,6 @@ mod tests {
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snapshot4 (seq={}) sees: {:?}",
-				snapshot4_seq,
-				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2584,11 +2554,6 @@ mod tests {
 				.rev()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snapshot2 backward sees: {:?}",
-				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
 			assert_eq!(range[0].0.as_ref(), b"key2");
@@ -2753,7 +2718,6 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let snap1 = store.begin().unwrap();
-		let snap1_seq = snap1.snapshot.as_ref().unwrap().seq_num;
 
 		// 2. Update key2, insert key4
 		let mut tx = store.begin().unwrap();
@@ -2762,7 +2726,6 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let snap2 = store.begin().unwrap();
-		let snap2_seq = snap2.snapshot.as_ref().unwrap().seq_num;
 
 		// 3. Delete key1, insert key5
 		let mut tx = store.begin().unwrap();
@@ -2771,12 +2734,6 @@ mod tests {
 		tx.commit().await.unwrap();
 
 		let snap3 = store.begin().unwrap();
-		let snap3_seq = snap3.snapshot.as_ref().unwrap().seq_num;
-
-		eprintln!(
-			"\nSequence numbers: snap1={}, snap2={}, snap3={}",
-			snap1_seq, snap2_seq, snap3_seq
-		);
 
 		// Verify snap1: Should see key1(v1), key2(v2), key3(v3)
 		{
@@ -2786,19 +2743,6 @@ mod tests {
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snap1 forward: {:?}",
-				range
-					.iter()
-					.map(|(k, v)| (
-						String::from_utf8_lossy(k.as_ref()).to_string(),
-						v.as_ref()
-							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
-							.unwrap_or_else(|| "None".to_string())
-					))
-					.collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 3);
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2816,19 +2760,6 @@ mod tests {
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snap2 forward: {:?}",
-				range
-					.iter()
-					.map(|(k, v)| (
-						String::from_utf8_lossy(k.as_ref()).to_string(),
-						v.as_ref()
-							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
-							.unwrap_or_else(|| "None".to_string())
-					))
-					.collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 4);
 			assert_eq!(range[0].0.as_ref(), b"key1");
@@ -2848,19 +2779,6 @@ mod tests {
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
 
-			eprintln!(
-				"Snap3 forward: {:?}",
-				range
-					.iter()
-					.map(|(k, v)| (
-						String::from_utf8_lossy(k.as_ref()).to_string(),
-						v.as_ref()
-							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
-							.unwrap_or_else(|| "None".to_string())
-					))
-					.collect::<Vec<_>>()
-			);
-
 			assert_eq!(range.len(), 4);
 			// key1 should NOT be present (deleted)
 			assert_eq!(range[0].0.as_ref(), b"key2");
@@ -2879,19 +2797,6 @@ mod tests {
 				.rev()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
-
-			eprintln!(
-				"Snap2 backward: {:?}",
-				range
-					.iter()
-					.map(|(k, v)| (
-						String::from_utf8_lossy(k.as_ref()).to_string(),
-						v.as_ref()
-							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
-							.unwrap_or_else(|| "None".to_string())
-					))
-					.collect::<Vec<_>>()
-			);
 
 			assert_eq!(range.len(), 4);
 			assert_eq!(range[0].0.as_ref(), b"key4");
