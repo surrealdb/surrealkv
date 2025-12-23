@@ -163,27 +163,6 @@ unused_async = "allow"
 # TODO(Farhan): This must be changed to `warn`.
 unwrap_used = "allow"
 
-# Profiles
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = 'abort'
-strip = true
-
-[profile.bench]
-strip = false
-
-[profile.make]
-inherits = "dev"
-
-[profile.profiling]
-debug = true
-inherits = "release"
-strip = false
-panic = 'unwind'
-
-
 [[bench]]
 name = "bplustree_bench"
 harness = false
