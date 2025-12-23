@@ -308,7 +308,7 @@ impl CommitPipeline {
 		batch.set_starting_seq_num(seq_num);
 
 		// Enqueue operation (single producer)
-		self.pending.enqueue(commit_batch.clone());
+		self.pending.enqueue(commit_batch);
 
 		// Write to WAL and process VLog (serialized under lock)
 		let processed_batch = self.env.write(batch, seq_num, sync)?;

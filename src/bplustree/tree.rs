@@ -136,6 +136,20 @@ const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
 const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
 
+// Helper functions for reading integer types from byte slices without unwrap()
+// These are safe to use when bounds have already been checked
+#[inline(always)]
+fn read_u32_le(buffer: &[u8], offset: usize) -> u32 {
+	// SAFETY: Caller must ensure buffer has at least offset + 4 bytes
+	unsafe { u32::from_le_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 4])) }
+}
+
+#[inline(always)]
+fn read_u64_le(buffer: &[u8], offset: usize) -> u64 {
+	// SAFETY: Caller must ensure buffer has at least offset + 8 bytes
+	unsafe { u64::from_le_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
+}
+
 #[derive(Debug)]
 struct Header {
 	root_offset: u64,
@@ -176,7 +190,7 @@ impl Header {
 			return Err(BPlusTreeError::Deserialization("Invalid magic number".into()));
 		}
 
-		let version = u32::from_le_bytes(buffer[8..12].try_into().unwrap());
+		let version = read_u32_le(buffer, 8);
 		if version != VERSION {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Unsupported version: {}",
@@ -187,11 +201,11 @@ impl Header {
 		Ok(Header {
 			magic,
 			version,
-			root_offset: u64::from_le_bytes(buffer[12..20].try_into().unwrap()),
-			trunk_page_head: u64::from_le_bytes(buffer[20..28].try_into().unwrap()),
-			total_pages: u64::from_le_bytes(buffer[28..36].try_into().unwrap()),
-			first_leaf_offset: u64::from_le_bytes(buffer[36..44].try_into().unwrap()),
-			free_page_count: u32::from_le_bytes(buffer[44..48].try_into().unwrap()),
+			root_offset: read_u64_le(buffer, 12),
+			trunk_page_head: read_u64_le(buffer, 20),
+			total_pages: read_u64_le(buffer, 28),
+			first_leaf_offset: read_u64_le(buffer, 36),
+			free_page_count: read_u32_le(buffer, 44),
 		})
 	}
 }

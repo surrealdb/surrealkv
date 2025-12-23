@@ -120,7 +120,7 @@ impl TopLevelIndexWriter {
 
 		let mut top_level_index = BlockWriter::new(self.opts);
 
-		for block in self.index_blocks.into_iter() {
+		for block in self.index_blocks {
 			let separator_key = block.last_key.clone();
 			let block_data = block.finish();
 
@@ -173,7 +173,7 @@ impl TopLevelIndex {
 		}
 		Ok(TopLevelIndex {
 			id,
-			opts: opt.clone(),
+			opts: opt,
 			blocks,
 			file: f.clone(),
 		})

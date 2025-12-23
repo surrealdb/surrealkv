@@ -277,7 +277,7 @@ impl CoreInner {
 
 		// Step 5: Prepare atomic changeset with both SST and log_number
 		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, table.clone()));
+		changeset.new_tables.push((0, table));
 
 		// Set log_number after WAL rotation
 		changeset.log_number = Some(flushed_wal_number + 1);
@@ -1181,7 +1181,7 @@ impl Core {
 
 		// Initialize VLog GC manager only if VLog is enabled
 		if let Some(ref vlog) = inner.vlog {
-			let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline.clone());
+			let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline);
 			vlog_gc_manager.start();
 			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
 			log::debug!("VLog GC manager started");

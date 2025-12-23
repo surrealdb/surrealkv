@@ -292,7 +292,7 @@ impl<W: Write> TableWriter<W> {
 		// The separator function already returns an encoded InternalKey with the
 		// appropriate user key separator and MAX seq_num/timestamp.
 		let separator_key = self.internal_cmp.separator(&block.last_key, next_key);
-		self.prev_block_last_key = block.last_key.clone();
+		self.prev_block_last_key.clone_from(&block.last_key);
 
 		// Finalize the current block and compress it.
 		let contents = block.finish();
@@ -584,7 +584,7 @@ pub(crate) fn read_table_block(
 		)));
 	}
 
-	let block = decompress_block(&buf, CompressionType::from(compress[0]))?;
+	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
 
 	Ok(Block::new(Bytes::from(block), opt))
 }
@@ -716,7 +716,7 @@ impl Table {
 	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
 		{
-			return Ok(block.clone());
+			return Ok(block);
 		}
 
 		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;

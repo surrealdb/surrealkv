@@ -16,6 +16,14 @@ use std::sync::Arc;
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 
+// Helper function for reading u64 from byte slices without unwrap()
+// Safe to use when bounds have already been checked
+#[inline(always)]
+fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
+	// SAFETY: Caller must ensure buffer has at least offset + 8 bytes
+	unsafe { u64::from_be_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
+}
+
 /// Converts a trailer byte to InternalKeyKind
 /// This centralizes the kind conversion logic to avoid duplication and errors
 fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
@@ -121,8 +129,8 @@ impl InternalKey {
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		let trailer = u64::from_be_bytes(encoded_key[n..n + 8].try_into().unwrap());
-		let timestamp = u64::from_be_bytes(encoded_key[n + 8..].try_into().unwrap());
+		let trailer = read_u64_be(encoded_key, n);
+		let timestamp = read_u64_be(encoded_key, n + 8);
 		let user_key = Bytes::copy_from_slice(&encoded_key[..n]);
 
 		Self {

@@ -569,12 +569,14 @@ impl CompressionType {
 	}
 }
 
-impl From<u8> for CompressionType {
-	fn from(byte: u8) -> Self {
+impl TryFrom<u8> for CompressionType {
+	type Error = Error;
+
+	fn try_from(byte: u8) -> Result<Self> {
 		match byte {
-			0 => Self::None,
-			1 => Self::SnappyCompression,
-			_ => panic!("Unknown compression type"),
+			0 => Ok(Self::None),
+			1 => Ok(Self::SnappyCompression),
+			_ => Err(Error::Compression(format!("Unknown compression type: {}", byte))),
 		}
 	}
 }

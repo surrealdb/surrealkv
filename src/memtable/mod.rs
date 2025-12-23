@@ -230,7 +230,7 @@ impl MemTable {
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		let created_table = Arc::new(Table::new(table_id, lsm_opts.clone(), file, file_size)?);
+		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
 		Ok(created_table)
 	}
 

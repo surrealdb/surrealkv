@@ -432,7 +432,7 @@ impl Snapshot {
 				.encode(),
 				Bound::Excluded(key) => {
 					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.to_vec();
+					let mut next_key = key.clone();
 					next_key.push(0); // Add null byte to make it greater
 					InternalKey::new(
 						Bytes::from(next_key),
@@ -528,7 +528,7 @@ impl Snapshot {
 				};
 
 				// Collect the filtered versions with original InternalKey preserved
-				for (internal_key, encoded_value) in versions_to_output.into_iter() {
+				for (internal_key, encoded_value) in versions_to_output {
 					results.push((internal_key, encoded_value));
 				}
 			}
