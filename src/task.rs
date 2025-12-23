@@ -54,11 +54,11 @@ impl TaskManager {
 
 		// Spawn memtable compaction task
 		{
-			let core = core.clone();
-			let stop_flag = stop_flag.clone();
-			let notify = memtable_notify.clone();
-			let running = memtable_running.clone();
-			let level_notify = level_notify.clone();
+			let core = Arc::clone(&core);
+			let stop_flag = Arc::clone(&stop_flag);
+			let notify = Arc::clone(&memtable_notify);
+			let running = Arc::clone(&memtable_running);
+			let level_notify = Arc::clone(&level_notify);
 
 			let handle = tokio::spawn(async move {
 				loop {
@@ -88,10 +88,10 @@ impl TaskManager {
 
 		// Spawn level compaction task
 		{
-			let core = core.clone();
-			let stop_flag = stop_flag.clone();
-			let notify = level_notify.clone();
-			let running = level_running.clone();
+			let core = Arc::clone(&core);
+			let stop_flag = Arc::clone(&stop_flag);
+			let notify = Arc::clone(&level_notify);
+			let running = Arc::clone(&level_running);
 
 			let handle = tokio::spawn(async move {
 				loop {

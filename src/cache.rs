@@ -125,7 +125,7 @@ impl BlockCache {
 		}
 
 		match item.as_ref()? {
-			Item::Data(block) => Some(block.clone()),
+			Item::Data(block) => Some(Arc::clone(block)),
 			_ => None,
 		}
 	}
@@ -145,7 +145,7 @@ impl BlockCache {
 		}
 
 		match item.as_ref()? {
-			Item::Index(block) => Some(block.clone()),
+			Item::Index(block) => Some(Arc::clone(block)),
 			_ => None,
 		}
 	}

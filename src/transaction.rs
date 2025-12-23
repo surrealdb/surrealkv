@@ -219,7 +219,7 @@ impl Transaction {
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
-			snapshot = Some(Snapshot::new(core.clone(), read_ts));
+			snapshot = Some(Snapshot::new(Arc::clone(&core), read_ts));
 		}
 
 		Ok(Self {
