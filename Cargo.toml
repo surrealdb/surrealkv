@@ -99,6 +99,8 @@ debug_assert_with_mut_call = "warn"
 # https://rust-lang.github.io/rust-clippy/master/#disallowed_methods
 disallowed_methods = "warn"
 
+expl_impl_clone_on_copy = "warn"
+
 # Checks for explicit `.into_iter()` calls in for loops when the loop already implicitly calls it.
 # Removing the explicit call makes the code more concise and idiomatic.
 # https://rust-lang.github.io/rust-clippy/master/#explicit_into_iter_loop
@@ -145,10 +147,25 @@ option_as_ref_cloned = "warn"
 # https://rust-lang.github.io/rust-clippy/master/#redundant_clone
 redundant_clone = "warn"
 
+# Checks for usage of `.as_ref().as_ref()` and suggests `.as_ref()` instead.
+# Using `.as_ref()` directly is more concise and easier to read.
+# https://rust-lang.github.io/rust-clippy/master/#ref_option_ref
+ref_option_ref = "warn"
+
 # Checks for usage of `.contains()` followed by `.insert()` on `HashSet` or `BTreeSet`.
 # Using a single `.insert()` call and checking its return value is more efficient as it avoids double lookup.
 # https://rust-lang.github.io/rust-clippy/master/#set_contains_or_insert
 set_contains_or_insert = "warn"
+
+# Checks for usage of single-character patterns in match arms.
+# Using single-character patterns can make the code more readable and easier to understand.
+# https://rust-lang.github.io/rust-clippy/master/#single_char_pattern
+single_char_pattern = "warn"
+
+# Checks for trivially copyable types that are passed by reference instead of by value.
+# Passing by value is more efficient and avoids unnecessary heap allocations.
+# https://rust-lang.github.io/rust-clippy/master/#trivially_copy_pass_by_ref
+trivially_copy_pass_by_ref = "warn"
 
 # Checks for unnecessary calls to `to_owned()`, `to_string()` and other similar conversion methods
 # that result in unnecessary allocations when a reference would suffice.

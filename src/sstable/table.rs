@@ -1007,10 +1007,12 @@ impl TableIterator {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
+	#[inline]
 	fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
+	#[inline]
 	fn value(&self) -> Value {
 		self.current_block.as_ref().unwrap().value()
 	}
@@ -1542,10 +1544,12 @@ impl LSMIterator for TableIterator {
 		false
 	}
 
+	#[inline]
 	fn key(&self) -> InternalKey {
 		self.key()
 	}
 
+	#[inline]
 	fn value(&self) -> Value {
 		self.value()
 	}

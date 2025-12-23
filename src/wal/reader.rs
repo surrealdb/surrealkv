@@ -325,7 +325,7 @@ impl Reader {
 			}
 
 			// Validate the record type for fragment sequencing
-			validate_record_type(&self.cur_rec_type, fragment_index)?;
+			validate_record_type(self.cur_rec_type, fragment_index)?;
 
 			// Each physical record (header + data) must fit within a single block
 			if (length as usize) > self.buffer_remaining() {

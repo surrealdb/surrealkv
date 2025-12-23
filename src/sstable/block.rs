@@ -506,8 +506,7 @@ impl LSMIterator for BlockIterator {
 			self.seek_to_restart_point(mid);
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
 			let current_key = self.block
-				[self.offset + i..self.offset + i + shared_prefix + non_shared_key]
-				.to_vec();
+				.slice(self.offset + i..self.offset + i + shared_prefix + non_shared_key);
 
 			match self.internal_cmp.compare(&current_key, target) {
 				Ordering::Less => left = mid,
@@ -578,11 +577,13 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Get the current key
+	#[inline]
 	fn key(&self) -> InternalKey {
 		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value
+	#[inline]
 	fn value(&self) -> Value {
 		if self.keys_only {
 			Bytes::new()

@@ -29,7 +29,7 @@ pub enum Mode {
 
 impl Mode {
 	/// Checks if this transaction mode permits mutations
-	pub(crate) fn mutable(&self) -> bool {
+	pub(crate) fn mutable(self) -> bool {
 		match self {
 			Self::ReadWrite => true,
 			Self::ReadOnly => false,
@@ -38,12 +38,12 @@ impl Mode {
 	}
 
 	/// Checks if this is a write-only transaction
-	pub(crate) fn is_write_only(&self) -> bool {
+	pub(crate) fn is_write_only(self) -> bool {
 		matches!(self, Self::WriteOnly)
 	}
 
 	/// Checks if this is a read-only transaction
-	pub(crate) fn is_read_only(&self) -> bool {
+	pub(crate) fn is_read_only(self) -> bool {
 		matches!(self, Self::ReadOnly)
 	}
 }
