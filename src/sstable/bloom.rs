@@ -11,7 +11,7 @@ pub(crate) fn hash(data: &[u8], seed: u32) -> u32 {
 	while i + 4 <= data.len() {
 		let chunk = unsafe {
 			let ptr = data.as_ptr().add(i) as *const u32;
-			ptr.read_unaligned().to_be().to_ne_bytes()
+			ptr.read_unaligned().to_be().to_be_bytes()
 		};
 		h = h.wrapping_add(u32::from_be_bytes(chunk));
 		h = h.wrapping_mul(M);
