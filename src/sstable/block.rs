@@ -572,8 +572,8 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Get the current key
-	fn key(&self) -> Arc<InternalKey> {
-		Arc::new(InternalKey::decode(&self.current_key))
+	fn key(&self) -> InternalKey {
+		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value
@@ -647,7 +647,7 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o).iter(false);
 
 		let mut i = 0;
 		while block_iter.advance() {
@@ -670,7 +670,7 @@ mod tests {
 		}
 
 		let block_contents = builder.finish();
-		let mut iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut iter = Block::new(block_contents, o).iter(false);
 
 		iter.next();
 		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
@@ -705,7 +705,7 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o).iter(false);
 
 		let key = InternalKey::new(Bytes::from_static(b"pkey2"), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
@@ -794,7 +794,7 @@ mod tests {
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o).iter(false);
 
 		// Test prev() from the end
 		block_iter.seek_to_last();
@@ -857,7 +857,7 @@ mod tests {
 		);
 
 		// Test backward iteration using prev()
-		let mut backward_iter = Block::new(block_contents.clone(), o.clone()).iter(false);
+		let mut backward_iter = Block::new(block_contents, o).iter(false);
 		backward_iter.seek_to_last();
 		let mut backward_keys = Vec::new();
 		while backward_iter.valid() {
@@ -888,7 +888,7 @@ mod tests {
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o).iter(false);
 
 		// Seek to "pkey1"
 		let seek_key = InternalKey::new(Bytes::from_static(b"pkey1"), 1, InternalKeyKind::Set, 0);
@@ -926,7 +926,7 @@ mod tests {
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o).iter(false);
 
 		// Position at "pkey1"
 		let seek_key = InternalKey::new(Bytes::from_static(b"pkey1"), 1, InternalKeyKind::Set, 0);
@@ -968,7 +968,7 @@ mod tests {
 
 		// Test prev() on empty block (shouldn't happen but let's test robustness)
 		let empty_block = BlockWriter::new(o.clone()).finish();
-		let mut empty_iter = Block::new(empty_block, o.clone()).iter(false);
+		let mut empty_iter = Block::new(empty_block, o).iter(false);
 		assert!(!empty_iter.prev());
 		assert!(!empty_iter.valid());
 

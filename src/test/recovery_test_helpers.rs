@@ -268,7 +268,7 @@ impl WalTestHelper {
 	pub fn verify_entries(memtable: &Arc<MemTable>, expected_keys: &[String]) {
 		let mut found_keys = Vec::new();
 		for entry in memtable.iter(false) {
-			// entry is (Arc<InternalKey>, Bytes)
+			// entry is (InternalKey, Bytes)
 			let key = String::from_utf8(entry.0.user_key.to_vec()).unwrap();
 			found_keys.push(key);
 		}

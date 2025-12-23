@@ -8,12 +8,12 @@ use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{sstable::InternalKey, Key, Value};
 
-pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
+pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
 
 // Holds a key-value pair and the iterator index
 #[derive(Eq)]
 pub(crate) struct HeapItem {
-	pub(crate) key: Arc<InternalKey>,
+	pub(crate) key: InternalKey,
 	pub(crate) value: Value,
 	pub(crate) iterator_index: usize,
 }
@@ -80,10 +80,10 @@ pub(crate) struct CompactionIterator<'a> {
 	current_user_key: Option<Key>,
 
 	// Buffer for accumulating all versions of the current key
-	accumulated_versions: Vec<(Arc<InternalKey>, Value)>,
+	accumulated_versions: Vec<(InternalKey, Value)>,
 
 	// Buffer for outputting the versions of the current key
-	output_versions: Vec<(Arc<InternalKey>, Value)>,
+	output_versions: Vec<(InternalKey, Value)>,
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
@@ -265,7 +265,7 @@ impl<'a> CompactionIterator<'a> {
 }
 
 impl Iterator for CompactionIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
+	type Item = (InternalKey, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized {
@@ -350,12 +350,8 @@ mod tests {
 	use tempfile::TempDir;
 	use test_log::test;
 
-	fn create_internal_key(
-		user_key: &str,
-		sequence: u64,
-		kind: InternalKeyKind,
-	) -> Arc<InternalKey> {
-		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0).into()
+	fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
+		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0)
 	}
 
 	fn create_internal_key_with_timestamp(
@@ -363,9 +359,8 @@ mod tests {
 		sequence: u64,
 		kind: InternalKeyKind,
 		timestamp: u64,
-	) -> Arc<InternalKey> {
+	) -> InternalKey {
 		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, timestamp)
-			.into()
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {
@@ -390,12 +385,12 @@ mod tests {
 
 	// Creates a mock iterator with predefined entries
 	struct MockIterator {
-		items: Vec<(Arc<InternalKey>, Value)>,
+		items: Vec<(InternalKey, Value)>,
 		index: usize,
 	}
 
 	impl MockIterator {
-		fn new(items: Vec<(Arc<InternalKey>, Value)>) -> Self {
+		fn new(items: Vec<(InternalKey, Value)>) -> Self {
 			Self {
 				items,
 				index: 0,
@@ -404,7 +399,7 @@ mod tests {
 	}
 
 	impl Iterator for MockIterator {
-		type Item = (Arc<InternalKey>, Value);
+		type Item = (InternalKey, Value);
 
 		fn next(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {
@@ -650,9 +645,9 @@ mod tests {
 		let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
 
 		// Put them in different iterators to test different levels
-		let items1 = vec![(key_v1.clone(), value_v1.clone())]; // L0 - oldest
-		let items2 = vec![(key_v2.clone(), value_v2.clone())]; // L1 - middle
-		let items3 = vec![(key_v3.clone(), value_v3.clone())]; // L2 - newest
+		let items1 = vec![(key_v1, value_v1)]; // L0 - oldest
+		let items2 = vec![(key_v2, value_v2)]; // L1 - middle
+		let items3 = vec![(key_v3, value_v3.clone())]; // L2 - newest
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -707,9 +702,9 @@ mod tests {
 		let value_v2 = create_vlog_value(&vlog, user_key.as_bytes(), b"value2");
 		let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
 
-		let items1 = vec![(key_v1.clone(), value_v1.clone())];
-		let items2 = vec![(key_v2.clone(), value_v2.clone())];
-		let items3 = vec![(key_v3.clone(), value_v3.clone())];
+		let items1 = vec![(key_v1, value_v1)];
+		let items2 = vec![(key_v2, value_v2)];
+		let items3 = vec![(key_v3, value_v3.clone())];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -767,8 +762,8 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key.clone(), empty_value.into())];
-		let items2 = vec![(value_key.clone(), actual_value.clone())];
+		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -809,8 +804,8 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key.clone(), empty_value.into())];
-		let items2 = vec![(value_key.clone(), actual_value.clone())];
+		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -869,11 +864,9 @@ mod tests {
 		let key3_val1 = create_vlog_value(&vlog, b"key3", b"value3");
 
 		// Distribute across multiple iterators
-		let items1 =
-			vec![(key1_v2.clone(), key1_val2.clone()), (key2_v2.clone(), key2_val2.into())];
-		let items2 =
-			vec![(key1_v1.clone(), key1_val1.clone()), (key3_v1.clone(), key3_val1.clone())];
-		let items3 = vec![(key2_v1.clone(), key2_val1.clone())];
+		let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2.into())];
+		let items2 = vec![(key1_v1, key1_val1), (key3_v1, key3_val1.clone())];
+		let items3 = vec![(key2_v1, key2_val1)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -954,8 +947,8 @@ mod tests {
 		let value_v1: Vec<u8> = b"value1".to_vec();
 		let value_v2: Vec<u8> = b"value2".to_vec();
 
-		let items1 = vec![(key_v2.clone(), value_v2.into())];
-		let items2 = vec![(key_v1.clone(), value_v1.into())];
+		let items1 = vec![(key_v2, value_v2.into())];
+		let items2 = vec![(key_v1, value_v1.into())];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1016,18 +1009,9 @@ mod tests {
 		let val_c_v1 = create_vlog_value(&vlog, b"key_c", b"value_c_oldest");
 		let val_d_v1 = create_vlog_value(&vlog, b"key_d", b"value_d");
 
-		let items1 =
-			vec![(key_a_v3.clone(), val_a_v3.clone()), (key_c_v3.clone(), val_c_v3.into())];
-		let items2 = vec![
-			(key_a_v2.clone(), val_a_v2.clone()),
-			(key_b_v2.clone(), val_b_v2.clone()),
-			(key_c_v2.clone(), val_c_v2.clone()),
-		];
-		let items3 = vec![
-			(key_a_v1.clone(), val_a_v1.clone()),
-			(key_c_v1.clone(), val_c_v1.clone()),
-			(key_d_v1.clone(), val_d_v1.clone()),
-		];
+		let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3.into())];
+		let items2 = vec![(key_a_v2, val_a_v2), (key_b_v2, val_b_v2.clone()), (key_c_v2, val_c_v2)];
+		let items3 = vec![(key_a_v1, val_a_v1), (key_c_v1, val_c_v1), (key_d_v1, val_d_v1.clone())];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1789,10 +1773,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![
-				(soft_delete_key.clone(), empty_value.into()),
-				(old_value_key.clone(), actual_value.clone()),
-			];
+			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1846,10 +1827,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![
-				(hard_delete_key.clone(), empty_value.into()),
-				(old_value_key.clone(), actual_value.clone()),
-			];
+			let items = vec![(hard_delete_key, empty_value.into()), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1900,10 +1878,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![
-				(soft_delete_key.clone(), empty_value.into()),
-				(old_value_key.clone(), actual_value.clone()),
-			];
+			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1957,10 +1932,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![
-				(soft_delete_key.clone(), empty_value.into()),
-				(old_value_key.clone(), actual_value.clone()),
-			];
+			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -2025,7 +1997,7 @@ mod tests {
 			Some(vlog.clone()),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			clock,
 		);
 
 		let mut result = Vec::new();
@@ -2091,7 +2063,7 @@ mod tests {
 			Some(vlog.clone()),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			clock,
 		);
 
 		let mut result = Vec::new();
@@ -2149,7 +2121,7 @@ mod tests {
 			Some(vlog.clone()),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			clock,
 		);
 
 		let mut result = Vec::new();
@@ -2205,7 +2177,7 @@ mod tests {
 			Some(vlog.clone()),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			clock,
 		);
 
 		let mut result = Vec::new();
@@ -2881,7 +2853,7 @@ mod tests {
 				Some(vlog.clone()),
 				false, // versioning disabled
 				1000,  // retention period (ignored when versioning is disabled)
-				clock.clone(),
+				clock,
 			);
 
 			let mut result = Vec::new();

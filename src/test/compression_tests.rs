@@ -87,10 +87,7 @@ fn build_table_with_compression(
 		let mut builder = TableWriter::new(&mut d, 0, opt, 0);
 		for (k, v) in data.iter() {
 			builder
-				.add(
-					InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0).into(),
-					v,
-				)
+				.add(InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0), v)
 				.unwrap();
 		}
 		builder.finish().unwrap();
@@ -124,7 +121,7 @@ fn test_compression_10k_pairs_roundtrip() {
 		Arc::new(opts)
 	};
 
-	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	let mut iter = table.iter(false, None);
 	let mut count = 0;
@@ -466,7 +463,7 @@ fn test_compression_checksum_verification() {
 	let corruption_offset = buffer.len() / 2;
 	buffer[corruption_offset] ^= 0xFF;
 
-	let corrupted_table_result = Table::new(2, opts.clone(), wrap_buffer(buffer), size as u64);
+	let corrupted_table_result = Table::new(2, opts, wrap_buffer(buffer), size as u64);
 
 	// Corruption should be detected either during construction or iteration
 	match corrupted_table_result {
@@ -926,13 +923,13 @@ fn test_table_writer_with_level_compression() {
 
 		for (key, value) in data {
 			let ikey = InternalKey::new(Bytes::copy_from_slice(&key), 1, InternalKeyKind::Set, 0);
-			writer.add(ikey.into(), &value).unwrap();
+			writer.add(ikey, &value).unwrap();
 		}
 		writer.finish().unwrap();
 	}
 
 	let buffer_len = buffer.len() as u64;
-	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), buffer_len).unwrap());
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), buffer_len).unwrap());
 
 	// Verify the table was created successfully
 	let mut iter = table.iter(false, None);

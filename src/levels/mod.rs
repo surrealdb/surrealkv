@@ -534,7 +534,7 @@ mod tests {
 				0,
 			);
 
-			writer.add(internal_key.into(), value.as_bytes())?;
+			writer.add(internal_key, value.as_bytes())?;
 		}
 
 		// Finish writing the table
@@ -546,7 +546,7 @@ mod tests {
 		let file: Arc<dyn File> = Arc::new(file);
 
 		// Create the table
-		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
+		let table = Table::new(table_id, opts, file, size as u64)?;
 
 		Ok(Arc::new(table))
 	}
@@ -557,7 +557,7 @@ mod tests {
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
-		opts.path = repo_path.clone();
+		opts.path = repo_path;
 		opts.level_count = 3; // Set level count for the manifest
 		let opts = Arc::new(opts);
 
@@ -591,9 +591,9 @@ mod tests {
 
 		let changeset = ManifestChangeSet {
 			new_tables: vec![
-				(0, table1.clone()), // Level 0
-				(0, table2.clone()), // Level 0
-				(1, table3.clone()), // Level 1
+				(0, table1), // Level 0
+				(0, table2), // Level 0
+				(1, table3), // Level 1
 			],
 			new_snapshots: vec![
 				SnapshotInfo {
@@ -898,7 +898,7 @@ mod tests {
 				0,
 			);
 
-			writer.add(internal_key.into(), value.as_bytes())?;
+			writer.add(internal_key, value.as_bytes())?;
 		}
 
 		// Finish writing the table
@@ -910,7 +910,7 @@ mod tests {
 		let file: Arc<dyn File> = Arc::new(file);
 
 		// Create the table
-		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
+		let table = Table::new(table_id, opts, file, size as u64)?;
 
 		Ok(Arc::new(table))
 	}
@@ -921,7 +921,7 @@ mod tests {
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
-		opts.path = repo_path.clone();
+		opts.path = repo_path;
 		opts.level_count = 3;
 		let opts = Arc::new(opts);
 
@@ -948,7 +948,7 @@ mod tests {
 			.expect("Failed to create table 1");
 
 		let changeset1 = ManifestChangeSet {
-			new_tables: vec![(0, table1.clone())],
+			new_tables: vec![(0, table1)],
 			..Default::default()
 		};
 		manifest.apply_changeset(&changeset1).expect("Failed to apply changeset");
@@ -961,7 +961,7 @@ mod tests {
 			.expect("Failed to create table 2");
 
 		let changeset2 = ManifestChangeSet {
-			new_tables: vec![(0, table2.clone())],
+			new_tables: vec![(0, table2)],
 			..Default::default()
 		};
 		manifest.apply_changeset(&changeset2).expect("Failed to apply changeset");
@@ -978,7 +978,7 @@ mod tests {
 			.expect("Failed to create table 3");
 
 		let changeset3 = ManifestChangeSet {
-			new_tables: vec![(0, table3.clone())],
+			new_tables: vec![(0, table3)],
 			..Default::default()
 		};
 		manifest.apply_changeset(&changeset3).expect("Failed to apply changeset");
@@ -1015,7 +1015,7 @@ mod tests {
 			.expect("Failed to create table 4");
 
 		let changeset4 = ManifestChangeSet {
-			new_tables: vec![(0, table4.clone())],
+			new_tables: vec![(0, table4)],
 			..Default::default()
 		};
 		manifest.apply_changeset(&changeset4).expect("Failed to apply changeset");
@@ -1053,11 +1053,11 @@ mod tests {
 
 		// Test 7: Test with overlapping sequence ranges
 		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with table3)
-		let table5 = create_test_table_with_seq_nums(5, 25, 35, opts.clone())
-			.expect("Failed to create table 5");
+		let table5 =
+			create_test_table_with_seq_nums(5, 25, 35, opts).expect("Failed to create table 5");
 
 		let changeset5 = ManifestChangeSet {
-			new_tables: vec![(0, table5.clone())],
+			new_tables: vec![(0, table5)],
 			..Default::default()
 		};
 		manifest.apply_changeset(&changeset5).expect("Failed to apply changeset");
@@ -1087,7 +1087,7 @@ mod tests {
 		// Set up temporary directory for test
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
-		opts.path = repo_path.clone();
+		opts.path = repo_path;
 		opts.level_count = 3;
 		let opts = Arc::new(opts);
 
@@ -1134,8 +1134,7 @@ mod tests {
 
 		// Reload manifest and verify last_sequence is preserved
 		{
-			let reloaded_manifest =
-				LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
+			let reloaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
 
 			// Verify last_sequence after reload
 			assert_eq!(
@@ -1170,7 +1169,7 @@ mod tests {
 		let mut opts = Options::default();
 		let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
 		let repo_path = temp_dir.path().to_path_buf();
-		opts.path = repo_path.clone();
+		opts.path = repo_path;
 		opts.level_count = 3;
 		let opts = Arc::new(opts);
 
@@ -1206,7 +1205,7 @@ mod tests {
 		write_manifest_to_disk(&manifest).expect("Failed to write manifest");
 
 		// Reload and verify
-		let loaded_manifest = LevelManifest::new(opts.clone()).expect("Failed to reload manifest");
+		let loaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
 
 		// Verify format version is still V1
 		assert_eq!(

@@ -168,7 +168,7 @@ impl Properties {
 			file_size,
 			block_size,
 			block_count,
-			compression: CompressionType::from(compression),
+			compression: CompressionType::try_from(compression)?,
 			seqnos: (seqno_start, seqno_end),
 			key_range,
 		})

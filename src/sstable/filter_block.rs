@@ -80,7 +80,7 @@ impl FilterBlockWriter {
 		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the offsets and the base log2 value.
 
 		// Append per-filter offsets to the result.
-		for offset in self.filter_offsets.into_iter() {
+		for offset in self.filter_offsets {
 			offset.encode_fixed(&mut result[ix..ix + 4]);
 			ix += 4;
 		}
@@ -286,7 +286,7 @@ mod tests {
 		let filter_block = filter_writer.finish();
 
 		// Create a FilterBlockReader
-		let filter_reader = FilterBlockReader::new(filter_block, filter_policy.clone());
+		let filter_reader = FilterBlockReader::new(filter_block, filter_policy);
 
 		// Test 1: No false negatives - all keys should be found
 		for key in &keys {

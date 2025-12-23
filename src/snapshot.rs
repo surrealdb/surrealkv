@@ -22,7 +22,7 @@ use interval_heap::IntervalHeap;
 
 #[derive(Eq)]
 struct HeapItem {
-	key: Arc<InternalKey>,
+	key: InternalKey,
 	value: Value,
 	iterator_index: usize,
 }
@@ -432,7 +432,7 @@ impl Snapshot {
 				.encode(),
 				Bound::Excluded(key) => {
 					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.to_vec();
+					let mut next_key = key.clone();
 					next_key.push(0); // Add null byte to make it greater
 					InternalKey::new(
 						Bytes::from(next_key),
@@ -528,7 +528,7 @@ impl Snapshot {
 				};
 
 				// Collect the filtered versions with original InternalKey preserved
-				for (internal_key, encoded_value) in versions_to_output.into_iter() {
+				for (internal_key, encoded_value) in versions_to_output {
 					results.push((internal_key, encoded_value));
 				}
 			}
@@ -807,7 +807,7 @@ impl Drop for KMergeIterator<'_> {
 }
 
 impl Iterator for KMergeIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
+	type Item = (InternalKey, Value);
 	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
@@ -868,10 +868,10 @@ pub(crate) struct SnapshotIterator<'a> {
 	keys_only: bool,
 
 	/// Last user key returned (forward direction)
-	last_key_fwd: Option<Bytes>,
+	last_key_fwd: Bytes,
 
 	/// Buffered item for backward iteration (when we read one too many)
-	buffered_back: Option<(Arc<InternalKey>, Value)>,
+	buffered_back: Option<(InternalKey, Value)>,
 }
 
 impl SnapshotIterator<'_> {
@@ -901,7 +901,7 @@ impl SnapshotIterator<'_> {
 			snapshot_seq_num: seq_num,
 			core,
 			keys_only,
-			last_key_fwd: None,
+			last_key_fwd: Bytes::new(),
 			buffered_back: None,
 		})
 	}
@@ -913,12 +913,12 @@ impl SnapshotIterator<'_> {
 
 	/// Resolves the value and constructs the result
 	#[inline]
-	fn resolve(&self, key: &Arc<InternalKey>, value: &Value) -> IterResult {
+	fn resolve(&self, key: InternalKey, value: Value) -> IterResult {
 		if self.keys_only {
-			Ok((key.user_key.clone(), None))
+			Ok((key.user_key, None))
 		} else {
-			match self.core.resolve_value(value) {
-				Ok(resolved) => Ok((key.user_key.clone(), Some(resolved))),
+			match self.core.resolve_value(&value) {
+				Ok(resolved) => Ok((key.user_key, Some(resolved))),
 				Err(e) => Err(e),
 			}
 		}
@@ -926,7 +926,7 @@ impl SnapshotIterator<'_> {
 
 	/// Get next item from back, checking buffer first
 	#[inline]
-	fn next_back_raw(&mut self) -> Option<(Arc<InternalKey>, Value)> {
+	fn next_back_raw(&mut self) -> Option<(InternalKey, Value)> {
 		self.buffered_back.take().or_else(|| self.merge_iter.next_back())
 	}
 }
@@ -943,14 +943,12 @@ impl Iterator for SnapshotIterator<'_> {
 			}
 
 			// Skip older versions of last returned key
-			if let Some(ref last) = self.last_key_fwd {
-				if key.user_key == *last {
-					continue;
-				}
+			if key.user_key == *self.last_key_fwd {
+				continue;
 			}
 
 			// New key - remember it
-			self.last_key_fwd = Some(key.user_key.clone());
+			self.last_key_fwd = key.user_key.clone();
 
 			// Latest version is tombstone? Skip entire key
 			// (older versions already consumed above)
@@ -958,7 +956,7 @@ impl Iterator for SnapshotIterator<'_> {
 				continue;
 			}
 
-			return Some(self.resolve(&key, &value));
+			return Some(self.resolve(key, value));
 		}
 		None
 	}
@@ -1001,7 +999,7 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 				continue;
 			}
 
-			return Some(self.resolve(&latest_key, &latest_value));
+			return Some(self.resolve(latest_key, latest_value));
 		}
 		None
 	}
@@ -1463,7 +1461,7 @@ mod tests {
 				for (k, v) in data {
 					let ikey =
 						InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0);
-					w.add(ikey.into(), v).unwrap();
+					w.add(ikey, v).unwrap();
 				}
 				w.finish().unwrap();
 			}
@@ -1478,7 +1476,7 @@ mod tests {
 
 		let mut level0 = Level::with_capacity(10);
 		level0.insert(table1);
-		level0.insert(table2.clone());
+		level0.insert(table2);
 
 		let levels = Levels(vec![Arc::new(level0)]);
 
@@ -1833,7 +1831,7 @@ mod tests {
 				0,
 			);
 
-			writer.add(internal_key.into(), value.as_bytes())?;
+			writer.add(internal_key, value.as_bytes())?;
 		}
 
 		let size = writer.finish()?;
@@ -1842,7 +1840,7 @@ mod tests {
 		file.sync_all()?;
 		let file: Arc<dyn File> = Arc::new(file);
 
-		let table = Table::new(table_id, opts.clone(), file, size as u64)?;
+		let table = Table::new(table_id, opts, file, size as u64)?;
 		Ok(Arc::new(table))
 	}
 
@@ -1900,12 +1898,8 @@ mod tests {
 		let table2 = create_test_table_with_range(2, "d", "f", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(3, "g", "i", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![table1, table2, table3],
-			vec![],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [j-z] - all tables are before this range
 		let range = (Bound::Included(b"j".to_vec()), Bound::Included(b"z".to_vec()));
@@ -1929,12 +1923,8 @@ mod tests {
 		let table2 = create_test_table_with_range(2, "p", "r", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(3, "s", "u", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![table1, table2, table3],
-			vec![],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [a-k] - all tables are after this range
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"k".to_vec()));
@@ -1958,12 +1948,8 @@ mod tests {
 		let table2 = create_test_table_with_range(2, "c", "g", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(3, "f", "j", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![table1, table2, table3],
-			vec![],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [d-h] - all tables overlap with this range
 		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
@@ -1994,7 +1980,7 @@ mod tests {
 			vec![table1, table2, table3, table4, table5],
 			vec![],
 			vec![],
-			opts.clone(),
+			opts,
 		);
 
 		// Query range: [f-j] - should include tables [e-g], [i-k], [d-f], [j-m]
@@ -2026,7 +2012,7 @@ mod tests {
 			vec![],
 			vec![table1, table2, table3, table4, table5],
 			vec![],
-			opts.clone(),
+			opts,
 		);
 
 		// Query range: [e-h] - should include tables [e-f], [g-h]
@@ -2051,12 +2037,8 @@ mod tests {
 		let table2 = create_test_table_with_range(12, "g", "i", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(13, "j", "l", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![],
-			vec![table1, table2, table3],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [a-c] - before all tables
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"c".to_vec()));
@@ -2080,12 +2062,8 @@ mod tests {
 		let table2 = create_test_table_with_range(12, "d", "f", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(13, "g", "i", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![],
-			vec![table1, table2, table3],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [m-z] - after all tables
 		let range = (Bound::Included(b"m".to_vec()), Bound::Included(b"z".to_vec()));
@@ -2109,12 +2087,8 @@ mod tests {
 		let table2 = create_test_table_with_range(12, "e", "g", 4, opts.clone()).unwrap();
 		let table3 = create_test_table_with_range(13, "h", "j", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![],
-			vec![table1, table2, table3],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [a-z] - spans all tables
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
@@ -2136,7 +2110,7 @@ mod tests {
 		// Create table with keys: "d1", "d5", "h"
 		let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query with Included bounds - should include all keys from d to h
 		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
@@ -2158,7 +2132,7 @@ mod tests {
 		// Create table with keys: "d1", "d5", "h"
 		let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query with Excluded bounds - "d" and "h" exact matches should be excluded
 		// But "d1", "d5" are > "d" so they should be included
@@ -2182,7 +2156,7 @@ mod tests {
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query with unbounded start
 		let range = (Bound::Unbounded, Bound::Included(b"h".to_vec()));
@@ -2203,7 +2177,7 @@ mod tests {
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query with unbounded end
 		let range = (Bound::Included(b"d".to_vec()), Bound::Unbounded);
@@ -2225,8 +2199,7 @@ mod tests {
 		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
 		let table2 = create_test_table_with_range(2, "n", "z", 4, opts.clone()).unwrap();
 
-		let iter_state =
-			create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
 		// Query with fully unbounded range
 		let range = (Bound::Unbounded, Bound::Unbounded);
@@ -2246,7 +2219,7 @@ mod tests {
 		let opts = Arc::new(opts);
 
 		// Create IterState with no tables
-		let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts);
 
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
 		let iter = KMergeIterator::new_from(iter_state, range, false);
@@ -2266,7 +2239,7 @@ mod tests {
 
 		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query for exact single key
 		let range = (Bound::Included(b"a1".to_vec()), Bound::Included(b"a1".to_vec()));
@@ -2290,7 +2263,7 @@ mod tests {
 
 		let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
+		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Inverted range: start > end
 		let range = (Bound::Included(b"z".to_vec()), Bound::Included(b"a".to_vec()));
@@ -2314,12 +2287,8 @@ mod tests {
 		let l1_table1 = create_test_table_with_range(11, "d", "h", 4, opts.clone()).unwrap();
 		let l1_table2 = create_test_table_with_range(12, "i", "n", 7, opts.clone()).unwrap();
 
-		let iter_state = create_iter_state_with_tables(
-			vec![l0_table],
-			vec![l1_table1, l1_table2],
-			vec![],
-			opts.clone(),
-		);
+		let iter_state =
+			create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);
 
 		// Query that overlaps with both levels
 		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"k".to_vec()));

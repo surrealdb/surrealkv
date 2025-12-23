@@ -183,7 +183,7 @@ impl Compactor {
 		}
 
 		// Add the new table to the changeset
-		changeset.new_tables.push((input.target_level, new_table.clone()));
+		changeset.new_tables.push((input.target_level, new_table));
 
 		// Apply the changeset to remove old tables and add new table
 		manifest.apply_changeset(&changeset)?;

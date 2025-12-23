@@ -569,12 +569,14 @@ impl CompressionType {
 	}
 }
 
-impl From<u8> for CompressionType {
-	fn from(byte: u8) -> Self {
+impl TryFrom<u8> for CompressionType {
+	type Error = Error;
+
+	fn try_from(byte: u8) -> Result<Self> {
 		match byte {
-			0 => Self::None,
-			1 => Self::SnappyCompression,
-			_ => panic!("Unknown compression type"),
+			0 => Ok(Self::None),
+			1 => Ok(Self::SnappyCompression),
+			_ => Err(Error::Compression(format!("Unknown compression type: {}", byte))),
 		}
 	}
 }
@@ -627,7 +629,7 @@ pub(crate) trait Iterator {
 	/// the returned slice is valid only until the next modification of
 	/// the iterator.
 	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<InternalKey>;
+	fn key(&self) -> InternalKey;
 
 	/// Return the value for the current entry.  The underlying storage for
 	/// the returned slice is valid only until the next modification of

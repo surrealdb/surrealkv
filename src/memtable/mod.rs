@@ -230,14 +230,14 @@ impl MemTable {
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		let created_table = Arc::new(Table::new(table_id, lsm_opts.clone(), file, file_size)?);
+		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
 		Ok(created_table)
 	}
 
 	pub(crate) fn iter(
 		&self,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
 		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -245,7 +245,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 
@@ -253,7 +253,7 @@ impl MemTable {
 		&self,
 		range: InternalKeyRange,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
 		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -261,7 +261,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 }
