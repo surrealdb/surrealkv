@@ -133,10 +133,10 @@ impl CoreInner {
 		// TODO: Add a way to recover from the WAL or level manifest
 		// Initialize the transaction oracle for MVCC support
 		// The oracle provides monotonic timestamps for transaction ordering
-		let oracle = Oracle::new(opts.clock.clone());
+		let oracle = Oracle::new(Arc::clone(&opts.clock));
 
 		// Initialize level manifest FIRST to get log_number
-		let manifest = LevelManifest::new(opts.clone())?;
+		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
 		// Initialize WAL starting from manifest.log_number
@@ -167,7 +167,7 @@ impl CoreInner {
 		};
 
 		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(opts.clone(), versioned_index.clone())?))
+			Some(Arc::new(VLog::new(Arc::clone(&opts), versioned_index.clone())?))
 		} else {
 			None
 		};
@@ -257,7 +257,7 @@ impl CoreInner {
 		let table_id = self.level_manifest.read()?.next_table_id();
 		// Track the WAL number that contains this memtable's data
 		// (the old WAL before rotation)
-		immutable_memtables.add(table_id, flushed_wal_number, flushed_memtable.clone());
+		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
 		// Now we can release locks - the memtable is safely in immutable_memtables
 		// and no other thread can race us on this specific data
@@ -265,7 +265,7 @@ impl CoreInner {
 		drop(immutable_memtables);
 
 		// Step 4: Flush the memtable to SST (slow I/O operation, no locks held)
-		let table = flushed_memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+		let table = flushed_memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
 			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
 		})?;
 
@@ -389,14 +389,14 @@ impl CoreInner {
 		let memtable_wal_number = flushed_memtable.get_wal_number();
 
 		// Track the immutable memtable until it's successfully flushed
-		immutable_memtables.add(table_id, memtable_wal_number, flushed_memtable.clone());
+		immutable_memtables.add(table_id, memtable_wal_number, Arc::clone(&flushed_memtable));
 
 		// Release locks before the potentially slow flush operation
 		drop(active_memtable);
 		drop(immutable_memtables);
 
 		// Step 2: Flush the immutable memtable to disk as an SSTable
-		let table = flushed_memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+		let table = flushed_memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
 			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
 		})?;
 
@@ -409,7 +409,7 @@ impl CoreInner {
 		// Step 3: Prepare atomic changeset with both SST and log_number
 		// This ensures crash safety - both updates happen in a single manifest write
 		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, table.clone()));
+		changeset.new_tables.push((0, Arc::clone(&table)));
 
 		// Determine which WAL was flushed and set log_number atomically
 		let wal_that_was_flushed = match flushed_wal_number {
@@ -495,7 +495,7 @@ impl CoreInner {
 		);
 
 		// Flush the memtable to SST using the pre-assigned table_id
-		let table = memtable.flush(table_id, self.opts.clone()).map_err(|e| {
+		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
 			Error::Other(format!(
 				"Failed to flush immutable memtable to SST table_id={}: {}",
 				table_id, e
@@ -510,7 +510,7 @@ impl CoreInner {
 
 		// Prepare changeset - add SST to level 0 and update log_number
 		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, table.clone()));
+		changeset.new_tables.push((0, Arc::clone(&table)));
 
 		// Update log_number to mark this WAL as flushed
 		// log_number indicates "all WALs with number < log_number have been flushed"
@@ -1098,12 +1098,14 @@ impl Core {
 		log::info!("=== Starting LSM tree initialization ===");
 		log::info!("Database path: {:?}", opts.path);
 
-		let inner = Arc::new(CoreInner::new(opts.clone())?);
+		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
 		// Initialize background task manager
-		let task_manager = Arc::new(TaskManager::new(inner.clone()));
+		let task_manager =
+			Arc::new(TaskManager::new(Arc::clone(&inner) as Arc<dyn CompactionOperations>));
 
-		let commit_env = Arc::new(LsmCommitEnv::new(inner.clone(), task_manager.clone())?);
+		let commit_env =
+			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
 
 		let commit_pipeline = CommitPipeline::new(commit_env);
 
@@ -1173,15 +1175,16 @@ impl Core {
 		inner.cleanup_orphaned_sst_files()?;
 
 		let core = Self {
-			inner: inner.clone(),
-			commit_pipeline: commit_pipeline.clone(),
+			inner: Arc::clone(&inner),
+			commit_pipeline: Arc::clone(&commit_pipeline),
 			task_manager: Mutex::new(Some(task_manager)),
 			vlog_gc_manager: Mutex::new(None),
 		};
 
 		// Initialize VLog GC manager only if VLog is enabled
 		if let Some(ref vlog) = inner.vlog {
-			let vlog_gc_manager = VLogGCManager::new(vlog.clone(), commit_pipeline);
+			let vlog_gc_manager =
+				VLogGCManager::new(Arc::clone(vlog), Arc::clone(&commit_pipeline));
 			vlog_gc_manager.start();
 			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
 			log::debug!("VLog GC manager started");
@@ -1336,7 +1339,7 @@ impl Tree {
 		Self::create_directory_structure(&opts)?;
 
 		// Create the core LSM tree components
-		let core = Core::new(opts.clone())?;
+		let core = Core::new(Arc::clone(&opts))?;
 
 		// TODO: Add file to write options manifest
 		// TODO: Add version header in file similar to table in WAL
@@ -1375,13 +1378,13 @@ impl Tree {
 
 	/// Transactions provide a consistent, atomic view of the database.
 	pub fn begin(&self) -> Result<Transaction> {
-		let txn = Transaction::new(self.core.clone(), Mode::ReadWrite)?;
+		let txn = Transaction::new(Arc::clone(&self.core), Mode::ReadWrite)?;
 		Ok(txn)
 	}
 
 	/// Begins a new transaction with the specified mode
 	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-		let txn = Transaction::new(self.core.clone(), mode)?;
+		let txn = Transaction::new(Arc::clone(&self.core), mode)?;
 		Ok(txn)
 	}
 
@@ -1411,7 +1414,7 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
-		let checkpoint = DatabaseCheckpoint::new(self.core.inner.clone());
+		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		checkpoint.create_checkpoint(checkpoint_dir)
 	}
 
@@ -1421,13 +1424,13 @@ impl Tree {
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
 		// Step 1: Restore files from checkpoint
-		let checkpoint = DatabaseCheckpoint::new(self.core.inner.clone());
+		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;
 
 		// Step 2: Reload in-memory state to match restored files
 
 		// Create a new LevelManifest from the current path
-		let new_levels = LevelManifest::new(self.core.inner.opts.clone())?;
+		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
 
 		// Replace the current levels with the reloaded ones
 		{
@@ -1520,7 +1523,7 @@ impl Tree {
 	/// Triggers VLog garbage collection manually
 	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u32>> {
 		match &self.core.vlog {
-			Some(vlog) => vlog.garbage_collect(self.core.commit_pipeline.clone()).await,
+			Some(vlog) => vlog.garbage_collect(Arc::clone(&self.core.commit_pipeline)).await,
 			None => Ok(Vec::new()),
 		}
 	}
@@ -1702,7 +1705,7 @@ impl TreeBuilder {
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
 		let opts = Arc::new(self.opts);
-		let tree = Tree::new(opts.clone())?;
+		let tree = Tree::new(Arc::clone(&opts))?;
 		Ok((tree, opts))
 	}
 }

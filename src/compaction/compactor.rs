@@ -29,9 +29,9 @@ pub(crate) struct CompactionOptions {
 impl CompactionOptions {
 	pub(crate) fn from(tree: &CoreInner) -> Self {
 		Self {
-			lopts: tree.opts.clone(),
-			level_manifest: tree.level_manifest.clone(),
-			immutable_memtables: tree.immutable_memtables.clone(),
+			lopts: Arc::clone(&tree.opts),
+			level_manifest: Arc::clone(&tree.level_manifest),
+			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 		}
 	}
@@ -131,7 +131,7 @@ impl Compactor {
 	) -> Result<HashMap<u32, i64>> {
 		let file = SysFile::create(path)?;
 		let mut writer =
-			TableWriter::new(file, table_id, self.options.lopts.clone(), input.target_level);
+			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
 		// Create a compaction iterator that filters tombstones
 		let max_level = self.options.lopts.level_count - 1;
@@ -143,7 +143,7 @@ impl Compactor {
 			self.options.vlog.clone(),
 			self.options.lopts.enable_versioning,
 			self.options.lopts.versioned_history_retention_ns,
-			self.options.lopts.clock.clone(),
+			Arc::clone(&self.options.lopts.clock),
 		);
 
 		for (key, value) in &mut comp_iter {
@@ -215,6 +215,6 @@ impl Compactor {
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
 
-		Ok(Arc::new(Table::new(table_id, self.options.lopts.clone(), file, file_size)?))
+		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
 	}
 }

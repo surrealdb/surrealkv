@@ -713,7 +713,7 @@ impl VLog {
 		{
 			let handles = self.file_handles.read();
 			if let Some(handle) = handles.get(&file_id) {
-				return Ok(handle.clone());
+				return Ok(Arc::clone(handle));
 			}
 		}
 
@@ -744,8 +744,8 @@ impl VLog {
 
 		let mut handles = self.file_handles.write();
 		// Another thread might have inserted it while we were opening the file
-		let entry = handles.entry(file_id).or_insert_with(|| handle.clone());
-		Ok(entry.clone())
+		let entry = handles.entry(file_id).or_insert_with(|| Arc::clone(&handle));
+		Ok(Arc::clone(entry))
 	}
 
 	/// Retrieves a value using a ValuePointer
@@ -934,7 +934,8 @@ impl VLog {
 
 		// If we found a candidate, try to compact it
 		if let Some((file_id, _)) = candidate_to_compact {
-			let compacted = self.compact_vlog_file_safe(file_id, commit_pipeline.clone()).await?;
+			let compacted =
+				self.compact_vlog_file_safe(file_id, Arc::clone(&commit_pipeline)).await?;
 
 			if compacted {
 				Ok(vec![file_id])
@@ -954,7 +955,7 @@ impl VLog {
 		commit_pipeline: Arc<CommitPipeline>,
 	) -> Result<bool> {
 		// Perform the actual compaction
-		let compacted = self.compact_vlog_file(file_id, commit_pipeline.clone()).await?;
+		let compacted = self.compact_vlog_file(file_id, Arc::clone(&commit_pipeline)).await?;
 
 		if compacted {
 			// Schedule for safe deletion based on iterator count
@@ -1340,11 +1341,11 @@ impl VLogGCManager {
 
 	/// Starts the VLog GC background task
 	pub(crate) fn start(&self) {
-		let vlog = self.vlog.clone();
-		let commit_pipeline = self.commit_pipeline.clone();
-		let stop_flag = self.stop_flag.clone();
-		let notify = self.notify.clone();
-		let running = self.running.clone();
+		let vlog = Arc::clone(&self.vlog);
+		let commit_pipeline = Arc::clone(&self.commit_pipeline);
+		let stop_flag = Arc::clone(&self.stop_flag);
+		let notify = Arc::clone(&self.notify);
+		let running = Arc::clone(&self.running);
 
 		let handle = tokio::spawn(async move {
 			loop {
@@ -1359,7 +1360,7 @@ impl VLogGCManager {
 				}
 
 				running.store(true, Ordering::SeqCst);
-				if let Err(e) = vlog.garbage_collect(commit_pipeline.clone()).await {
+				if let Err(e) = vlog.garbage_collect(Arc::clone(&commit_pipeline)).await {
 					// TODO: Handle error appropriately
 					log::error!("VLog GC task error: {e:?}");
 				}

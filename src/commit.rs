@@ -266,11 +266,11 @@ impl CommitPipeline {
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
 		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, commit_batch.clone(), sync)?;
+		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
 
 		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
-			let env = self.env.clone();
+			let env = Arc::clone(&self.env);
 			env.apply(&processed_batch)
 		};
 

@@ -2184,7 +2184,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				if let NodeType::Internal(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						let mut left_node_mut = self.extract_internal_mut(left_arc.clone());
+						let mut left_node_mut = self.extract_internal_mut(Arc::clone(left_arc));
 						let mut right_node_mut =
 							self.read_internal_node(parent.children[child_idx])?;
 						self.redistribute_internal_from_left(
@@ -2201,7 +2201,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				if let NodeType::Leaf(left_node) = left_arc.as_ref() {
 					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
-						let mut left_node_mut = self.extract_leaf_mut(left_arc.clone());
+						let mut left_node_mut = self.extract_leaf_mut(Arc::clone(left_arc));
 						let mut right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
 						self.redistribute_leaf_from_left(
 							parent,
@@ -2224,7 +2224,7 @@ impl<F: VfsFile> BPlusTree<F> {
 					if !right_node.is_underflow() {
 						let mut left_node_mut =
 							self.read_internal_node(parent.children[child_idx])?;
-						let mut right_node_mut = self.extract_internal_mut(right_arc.clone());
+						let mut right_node_mut = self.extract_internal_mut(Arc::clone(right_arc));
 						self.redistribute_internal_from_right(
 							parent,
 							child_idx,
@@ -2240,7 +2240,7 @@ impl<F: VfsFile> BPlusTree<F> {
 					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
 						let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
-						let mut right_node_mut = self.extract_leaf_mut(right_arc.clone());
+						let mut right_node_mut = self.extract_leaf_mut(Arc::clone(right_arc));
 						self.redistribute_leaf_from_right(
 							parent,
 							child_idx,
