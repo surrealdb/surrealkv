@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::{
-	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value, error::{Error, Result}, sstable::{InternalKey, InternalKeyRef}
+	error::{Error, Result},
+	sstable::InternalKey,
+	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value,
 };
 use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
@@ -574,8 +576,8 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Get the current key
-	fn key(&self) -> InternalKeyRef<'_> {
-		InternalKeyRef::decode(&self.current_key)
+	fn key(&self) -> InternalKey {
+		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value

@@ -209,7 +209,11 @@ impl<W: Write> TableWriter<W> {
 			meta,
 			prev_block_last_key: Vec::new(),
 
-			data_block: Some(BlockWriter::new(Arc::clone(&opts))),
+			data_block: Some(BlockWriter::new(
+				opts.block_size,
+				opts.block_restart_interval,
+				Arc::clone(&opts.comparator),
+			)),
 			partitioned_index: TopLevelIndexWriter::new(
 				Arc::clone(&opts),
 				opts.index_partition_size,
@@ -308,7 +312,11 @@ impl<W: Write> TableWriter<W> {
 		self.partitioned_index.add(&separator_key, &handle_encoded)?;
 
 		// Prepare for the next data block.
-		self.data_block = Some(BlockWriter::new(Arc::clone(&self.opts)));
+		self.data_block = Some(BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.comparator),
+		));
 
 		Ok(())
 	}
@@ -334,7 +342,11 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Initialize meta_index block
-		let mut meta_ix_block = BlockWriter::new(Arc::clone(&self.opts));
+		let mut meta_ix_block = BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.comparator),
+		);
 
 		// Write the filter block to the meta index block if present.
 		if let Some(fblock) = self.filter_block.take() {
@@ -566,7 +578,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 }
 
 pub(crate) fn read_table_block(
-	opt: Arc<Options>,
+	comparator: Arc<dyn Comparator>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
@@ -592,7 +604,7 @@ pub(crate) fn read_table_block(
 
 	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
 
-	Ok(Block::new(Bytes::from(block), opt))
+	Ok(Block::new(Bytes::from(block), comparator))
 }
 
 /// Verify checksum of block
@@ -648,7 +660,7 @@ impl Table {
 		};
 
 		let metaindexblock =
-			read_table_block(Arc::clone(&opts), Arc::clone(&file), &footer.meta_index)?;
+			read_table_block(Arc::clone(&opts.comparator), Arc::clone(&file), &footer.meta_index)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
 		let writer_metadata =
@@ -726,7 +738,8 @@ impl Table {
 			return Ok(block);
 		}
 
-		let b = read_table_block(Arc::clone(&self.opts), Arc::clone(&self.file), location)?;
+		let b =
+			read_table_block(Arc::clone(&self.opts.comparator), Arc::clone(&self.file), location)?;
 		let b = Arc::new(b);
 
 		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
@@ -814,9 +827,14 @@ impl Table {
 					first_block.iter(false)
 				} else {
 					// If there are no partitions, create a proper empty block
-					let empty_writer = BlockWriter::new(Arc::clone(&self.opts));
+					let empty_writer = BlockWriter::new(
+						self.opts.block_size,
+						self.opts.block_restart_interval,
+						Arc::clone(&self.opts.comparator),
+					);
 					let empty_block_data = empty_writer.finish();
-					let empty_block = Block::new(empty_block_data, Arc::clone(&self.opts));
+					let empty_block =
+						Block::new(empty_block_data, Arc::clone(&self.opts.comparator));
 					empty_block.iter(false)
 				}
 			}

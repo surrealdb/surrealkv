@@ -523,11 +523,8 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			let keys_iter = self.keys_at_version(
-				iterate_bounds.low.clone(),
-				iterate_bounds.high,
-				timestamp,
-			)?;
+			let keys_iter =
+				self.keys_at_version(iterate_bounds.low.clone(), iterate_bounds.high, timestamp)?;
 			return Ok(keys_iter.count());
 		}
 
