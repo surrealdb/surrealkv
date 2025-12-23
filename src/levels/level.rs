@@ -109,6 +109,10 @@ impl Levels {
 		Self((0..level_count).map(|_| Arc::new(Level::with_capacity(capacity_per_level))).collect())
 	}
 
+	pub(crate) fn total_tables(&self) -> usize {
+		self.0.iter().map(|level| level.tables.len()).sum()
+	}
+
 	/// Encodes the levels structure to a writer in a binary format
 	/// Format:
 	/// - Number of levels (u8)

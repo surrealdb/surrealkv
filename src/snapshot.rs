@@ -691,7 +691,11 @@ pub(crate) struct KMergeIterator<'iter> {
 impl<'a> KMergeIterator<'a> {
 	fn new_from(iter_state: IterState, query_range: KeyRange, keys_only: bool) -> Self {
 		let boxed_state = Box::new(iter_state);
-		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
+
+		// Pre-allocate capacity for the iterators.
+		// 1 active memtable + immutable memtables + level tables.
+		let mut iterators: Vec<BoxedIterator<'a>> =
+			Vec::with_capacity(1 + boxed_state.immutable.len() + boxed_state.levels.total_tables());
 
 		// Convert user-key range to InternalKey range once
 		let internal_range = crate::user_range_to_internal_range(query_range.clone());
@@ -777,7 +781,7 @@ impl<'a> KMergeIterator<'a> {
 impl Iterator for KMergeIterator<'_> {
 	type Item = (InternalKey, Value);
 
-	#[inline(always)]
+	#[inline]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
 			self.initialize_lo();
@@ -797,7 +801,7 @@ impl Iterator for KMergeIterator<'_> {
 }
 
 impl DoubleEndedIterator for KMergeIterator<'_> {
-	#[inline(always)]
+	#[inline]
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.initialized_hi {
 			self.initialize_hi();

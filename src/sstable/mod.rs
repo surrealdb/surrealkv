@@ -46,13 +46,13 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
-#[inline]
+#[inline(always)]
 fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
-#[inline]
+#[inline(always)]
 fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
@@ -61,11 +61,13 @@ fn is_delete_kind(kind: InternalKeyKind) -> bool {
 }
 
 /// Checks if a key kind represents a hard delete (delete operation)
+#[inline(always)]
 fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
 }
 
 /// Checks if a key kind represents a Replace operation
+#[inline(always)]
 fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
 }
@@ -149,6 +151,7 @@ impl InternalKey {
 		buf
 	}
 
+	#[inline]
 	pub(crate) fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}
