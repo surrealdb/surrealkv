@@ -1,16 +1,16 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::error::{Error, Result};
-
-#[cfg(not(target_arch = "wasm32"))]
-use fs2::FileExt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
-use std::process; // Use fs2 for file locking
+use std::process;
+use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
+use fs2::FileExt;
+
+use crate::error::{Error, Result}; // Use fs2 for file locking
 
 /// LockFile prevents multiple processes from accessing the same database
 /// directory
@@ -37,8 +37,7 @@ use std::process; // Use fs2 for file locking
 ///
 /// The lock is released in two ways:
 /// 1. Explicitly by calling `release()` (typically during database close)
-/// 2. Automatically via the `Drop` implementation when the LockFile goes out of
-///    scope
+/// 2. Automatically via the `Drop` implementation when the LockFile goes out of scope
 ///
 /// Even if `release()` is not called explicitly, the OS will release the file
 /// lock when the process terminates (normal exit or crash).
@@ -128,12 +127,13 @@ impl Drop for LockFile {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fs;
 	use std::sync::{Arc, Barrier};
+
 	use tempfile::TempDir;
 	use test_log::test;
 
+	use super::*;
 	use crate::error::Error;
 	use crate::lsm::TreeBuilder;
 

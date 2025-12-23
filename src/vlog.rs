@@ -5,19 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::batch::Batch;
-use crate::bplustree::tree::DiskBPlusTree;
-use crate::discard::DiscardStats;
-use crate::sstable::InternalKey;
-use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
-use bytes::Bytes;
-
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use bytes::Bytes;
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock};
 
+use crate::batch::Batch;
+use crate::bplustree::tree::DiskBPlusTree;
 use crate::commit::CommitPipeline;
+use crate::discard::DiscardStats;
 use crate::error::{Error, Result};
+use crate::sstable::InternalKey;
+use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
 
 /// VLog format version
 pub const VLOG_FORMAT_VERSION: u16 = 1;
@@ -1522,9 +1521,10 @@ impl DeleteList {
 }
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use tempfile::TempDir;
 	use test_log::test;
+
+	use super::*;
 
 	fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 		let temp_dir = TempDir::new().unwrap();

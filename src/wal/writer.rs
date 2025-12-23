@@ -237,9 +237,11 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fs::File;
+
 	use tempdir::TempDir;
+
+	use super::*;
 
 	#[test]
 	fn test_writer_basic() {

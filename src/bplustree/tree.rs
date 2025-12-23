@@ -228,19 +228,15 @@ trait Node {
 ///
 /// OVERFLOW OWNERSHIP INVARIANT:
 /// - key_overflows contains overflow chains for keys stored in this node
-/// - Each key owns its overflow chain, including keys used as separators in
-///   parents
-/// - Overflows are freed when the owning node is freed via
-///   free_node_with_overflow()
-/// - EXCEPTION: After merge operations, the merged-away node is freed with
-///   free_page() only, because its overflows were transferred to the merged
-///   node via append()
-/// - When keys are transferred between nodes, overflow ownership transfers with
-///   them
+/// - Each key owns its overflow chain, including keys used as separators in parents
+/// - Overflows are freed when the owning node is freed via free_node_with_overflow()
+/// - EXCEPTION: After merge operations, the merged-away node is freed with free_page() only,
+///   because its overflows were transferred to the merged node via append()
+/// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
-	keys: Vec<Bytes>,        // Full keys (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>, // Full keys (reconstructed from page + overflow if needed)
 	key_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for THIS
-	                          * node's keys */
+	                   * node's keys */
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -640,18 +636,15 @@ impl Node for InternalNode {
 /// Leaf node in the B+ tree
 ///
 /// OVERFLOW OWNERSHIP INVARIANT:
-/// - cell_overflows contains overflow chains for the key+value pairs stored in
-///   THIS leaf
+/// - cell_overflows contains overflow chains for the key+value pairs stored in THIS leaf
 /// - Each leaf node owns the overflows for its cells
-/// - Overflows are only freed when this leaf node is freed via
-///   free_node_with_overflow()
-/// - When cells are moved between leaves (redistribution), overflow ownership
-///   transfers with them
+/// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
+/// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Bytes>,         // Full keys (reconstructed from page + overflow if needed)
-	values: Vec<Bytes>,       // Full values (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>,   // Full keys (reconstructed from page + overflow if needed)
+	values: Vec<Bytes>, // Full values (reconstructed from page + overflow if needed)
 	cell_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for cell
-	                           * (key+value) */
+	                     * (key+value) */
 	next_leaf: u64, // 0 means no next leaf
 	prev_leaf: u64, // 0 means no previous leaf
 	offset: u64,
@@ -952,9 +945,8 @@ impl LeafNode {
 	/// algorithm when needed. Takes the new entry (key, value) and its insert
 	/// position into account.
 	///
-	/// - `is_update`: If true, we're updating an existing entry (replacing, not
-	///   adding). The total entry count remains the same. If false, we're
-	///   inserting a new entry.
+	/// - `is_update`: If true, we're updating an existing entry (replacing, not adding). The total
+	///   entry count remains the same. If false, we're inserting a new entry.
 	fn find_split_point_for_insert(
 		&self,
 		new_key: &[u8],
@@ -1348,8 +1340,7 @@ impl TrunkPage {
 		// 3. Number of free pages (4 bytes)
 		buffer.extend_from_slice(&self.num_free_pages.to_le_bytes());
 
-		// 4. Free page numbers (4 bytes each, little-endian to match the rest of the
-		//    code)
+		// 4. Free page numbers (4 bytes each, little-endian to match the rest of the code)
 		for &page in &self.free_pages {
 			buffer.extend_from_slice(&page.to_le_bytes());
 		}
@@ -3243,12 +3234,13 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 mod tests {
 	use std::fs::File;
 	use std::io::Read;
-	use test_log::test;
 
-	use super::*;
 	use rand::rngs::StdRng;
 	use rand::{Rng, SeedableRng};
 	use tempfile::NamedTempFile;
+	use test_log::test;
+
+	use super::*;
 
 	#[derive(Clone)]
 	struct TestComparator;

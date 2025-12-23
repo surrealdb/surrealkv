@@ -168,17 +168,18 @@ impl TaskManager {
 
 #[cfg(test)]
 mod tests {
-	use crate::error::Result;
-	use crate::Error;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 	use std::sync::Arc;
 	use std::time::Duration;
+
 	use test_log::test;
 	use tokio::time;
 
 	use crate::compaction::CompactionStrategy;
+	use crate::error::Result;
 	use crate::lsm::CompactionOperations;
 	use crate::task::TaskManager;
+	use crate::Error;
 
 	// Mock CoreInner for testing
 	struct MockCoreInner {

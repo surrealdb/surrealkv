@@ -5,10 +5,11 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
 
-use bytes::Bytes;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 // This is the maximum valid sequence number that can be stored in the upper 56
 // bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,

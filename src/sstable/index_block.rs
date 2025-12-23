@@ -3,13 +3,14 @@
 use std::io::Write;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
 use crate::sstable::InternalKey;
 use crate::vfs::File;
 use crate::{CompressionType, Options};
-use bytes::Bytes;
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
@@ -245,12 +246,14 @@ impl TopLevelIndex {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
+	use bytes::Bytes;
+	use test_log::test;
+
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::Iterator;
-	use bytes::Bytes;
-	use std::sync::Arc;
-	use test_log::test;
 
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)

@@ -1,3 +1,8 @@
+use std::fs::File;
+use std::io::Write as IoWrite;
+use std::path::Path;
+use std::sync::Arc;
+
 use tempdir::TempDir;
 use test_log::test;
 
@@ -18,10 +23,6 @@ use crate::wal::{
 	RecordType,
 	SegmentRef,
 };
-use std::fs::File;
-use std::io::Write as IoWrite;
-use std::path::Path;
-use std::sync::Arc;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()

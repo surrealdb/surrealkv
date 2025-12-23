@@ -26,18 +26,19 @@ mod wal;
 #[cfg(test)]
 mod test;
 
+use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bytes::Bytes;
+pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
+use sstable::bloom::LevelDBBloomFilter;
+
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
 use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
-pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
-
-use bytes::Bytes;
-use sstable::bloom::LevelDBBloomFilter;
-use std::borrow::Cow;
-use std::path::PathBuf;
-use std::sync::Arc;
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {

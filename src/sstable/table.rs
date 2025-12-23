@@ -9,6 +9,7 @@ use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
+use super::meta::KeyRange;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
@@ -32,8 +33,6 @@ use crate::{
 	Options,
 	Value,
 };
-
-use super::meta::KeyRange;
 
 const TABLE_FOOTER_LENGTH: usize = 42; // 2 + 16 + 16 + 8 (format + checksum + meta + index + magic)
 const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
@@ -1555,14 +1554,14 @@ impl LSMIterator for TableIterator {
 #[cfg(test)]
 mod tests {
 	use std::vec;
-	use test_log::test;
 
-	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::user_range_to_internal_range;
-
-	use super::*;
 	use rand::rngs::StdRng;
 	use rand::{Rng, SeedableRng};
+	use test_log::test;
+
+	use super::*;
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::user_range_to_internal_range;
 
 	fn default_opts() -> Arc<Options> {
 		let mut opts = Options::new();

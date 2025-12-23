@@ -53,16 +53,14 @@ impl Reporter for DefaultReporter {
 ///
 /// * `wal_dir` - Path to the WAL directory
 /// * `memtable` - Memtable to replay entries into
-/// * `min_wal_number` - Minimum WAL number to replay (older segments are
-///   skipped as already flushed)
+/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped as already
+///   flushed)
 ///
 /// # Returns
 ///
-/// * `Ok(Some(max_seq_num))` - Data was replayed successfully, returns highest
-///   sequence number
+/// * `Ok(Some(max_seq_num))` - Data was replayed successfully, returns highest sequence number
 /// * `Ok(None)` - No data recovered (empty or all segments already flushed)
-/// * `Err(WalCorruption{...})` - Corruption detected, contains location for
-///   repair
+/// * `Err(WalCorruption{...})` - Corruption detected, contains location for repair
 /// * `Err(...)` - Other errors (IO, permission, etc.)
 ///
 /// # Partial State on Corruption
@@ -249,10 +247,11 @@ pub(crate) fn replay_wal(
 }
 
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
+	use std::fs;
+
 	use crate::wal::manager::Wal;
 	use crate::wal::reader::Reader;
 	use crate::wal::Options;
-	use std::fs;
 
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
@@ -350,14 +349,16 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+	use std::io::{Seek, Write};
+
+	use tempfile::TempDir;
+	use test_log::test;
+
 	use super::*;
 	use crate::wal::manager::Wal;
 	use crate::wal::Options;
 	use crate::WalRecoveryMode;
-	use std::fs;
-	use std::io::{Seek, Write};
-	use tempfile::TempDir;
-	use test_log::test;
 
 	#[test]
 	fn test_replay_wal_sequence_number_tracking() {

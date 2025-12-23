@@ -61,8 +61,7 @@ impl Comparator for BytewiseComparator {
 	/// 1. Find the common prefix
 	/// 2. If one string is a prefix of the other, return unchanged
 	/// 3. At first differing byte, try to increment and truncate
-	/// 4. If that would exceed limit, scan forward for a non-0xFF byte to
-	///    increment
+	/// 4. If that would exceed limit, scan forward for a non-0xFF byte to increment
 	/// 5. If no shortening possible, return unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		let min_length = std::cmp::min(a.len(), b.len());
@@ -161,8 +160,7 @@ impl Comparator for InternalKeyComparator {
 	/// Generates a separator key between two internal keys.
 	///
 	/// 1. Extract user keys and compute a separator
-	/// 2. If separator is same length or shorter AND logically larger, use max
-	///    seq_num
+	/// 2. If separator is same length or shorter AND logically larger, use max seq_num
 	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
@@ -255,8 +253,7 @@ impl Comparator for TimestampComparator {
 	/// Generates a separator key between two internal keys.
 	///
 	/// 1. Extract user keys and compute a separator
-	/// 2. If separator is same length or shorter AND logically larger, use max
-	///    seq_num/timestamp
+	/// 2. If separator is same length or shorter AND logically larger, use max seq_num/timestamp
 	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
@@ -320,8 +317,9 @@ impl Comparator for TimestampComparator {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use rand::{Rng, SeedableRng};
+
+	use super::*;
 
 	// ============================================================================
 	// Basic Separator Tests

@@ -1,8 +1,9 @@
-use bytes::Bytes;
-use crossbeam_skiplist::SkipMap;
 use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+
+use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
 
 use crate::batch::Batch;
 use crate::error::Result;
@@ -127,8 +128,8 @@ impl MemTable {
 	///
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
-	/// * `starting_seq_num` - The starting sequence number for this batch
-	///   (records get consecutive numbers)
+	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
+	///   numbers)
 	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
 		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
 		let size_before = self.update_memtable_size(record_size);
@@ -271,11 +272,12 @@ impl MemTable {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashMap;
+
 	use test_log::test;
 
 	use super::*;
 	use crate::user_range_to_internal_range;
-	use std::collections::HashMap;
 
 	fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
 		// Skip the tag byte (first byte) and compare the actual value content

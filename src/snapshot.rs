@@ -4,6 +4,8 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::error::{Error, Result};
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
@@ -12,7 +14,6 @@ use crate::memtable::MemTable;
 use crate::sstable::meta::KeyRange;
 use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::{IntoBytes, IterResult, Key, Value};
-use bytes::Bytes;
 
 /// Type alias for version scan results
 pub type VersionScanResult = (Key, Value, u64, bool);
@@ -359,8 +360,7 @@ impl Snapshot {
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
 	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None,
-	///   returns all versions.
+	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
 	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
@@ -975,22 +975,22 @@ impl Drop for SnapshotIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::meta::KeyRange;
-	use crate::{IntoBytes, Options, Tree, TreeBuilder};
-	use bytes::Bytes;
 	use std::collections::HashSet;
+	use std::ops::Bound;
 	use std::sync::Arc;
+
+	use bytes::Bytes;
+	use tempdir::TempDir;
 	use test_log::test;
 
 	use super::{IterState, KMergeIterator};
 	use crate::levels::{Level, Levels};
 	use crate::memtable::MemTable;
+	use crate::sstable::meta::KeyRange;
 	use crate::sstable::table::{Table, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::vfs::File;
-	use std::ops::Bound;
-
-	use tempdir::TempDir;
+	use crate::{IntoBytes, Options, Tree, TreeBuilder};
 
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()

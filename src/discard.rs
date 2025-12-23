@@ -346,9 +346,10 @@ impl Drop for DiscardStats {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use tempfile::TempDir;
 	use test_log::test;
+
+	use super::*;
 
 	#[test]
 	fn test_discard_stats_basic() {

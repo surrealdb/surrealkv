@@ -1,8 +1,9 @@
-use quick_cache::sync::Cache as QCache;
-use quick_cache::{Equivalent, Weighter};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+
+use quick_cache::sync::Cache as QCache;
+use quick_cache::{Equivalent, Weighter};
 
 use crate::sstable::block::Block;
 use crate::Value;

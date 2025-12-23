@@ -1,16 +1,15 @@
 //! Test helper utilities for LSM recovery integration tests
 
 use std::fs::{self, OpenOptions};
-use std::path::Path;
-
-use crate::Tree;
 use std::io::{Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
+use crate::Tree;
 
 pub struct RecoveryTestHelper;
 

@@ -783,8 +783,7 @@ impl Transaction {
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
 	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None,
-	///   returns all versions.
+	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
 	///
 	/// # Returns
 	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
@@ -1274,16 +1273,14 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 mod tests {
 	use std::collections::HashMap;
 	use std::mem::size_of;
-	use test_log::test;
 
 	use bytes::Bytes;
-
-	use crate::lsm::Tree;
-	use crate::{Options, TreeBuilder};
+	use tempdir::TempDir;
+	use test_log::test;
 
 	use super::*;
-
-	use tempdir::TempDir;
+	use crate::lsm::Tree;
+	use crate::{Options, TreeBuilder};
 
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()
@@ -2372,8 +2369,9 @@ mod tests {
 
 	// Double-ended iterator tests
 	mod double_ended_iterator_tests {
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		#[test(tokio::test)]
 		async fn test_reverse_iteration_basic() {
@@ -2753,8 +2751,9 @@ mod tests {
 
 	// Savepoint tests
 	mod savepoint_tests {
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		#[test(tokio::test)]
 		async fn multiple_savepoints() {
@@ -4075,8 +4074,9 @@ mod tests {
 	mod version_tests {
 		use std::collections::HashSet;
 
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		fn create_tree() -> (Tree, TempDir) {
 			let temp_dir = create_temp_directory();

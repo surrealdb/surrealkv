@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::fs::File as SysFile;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
+
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::Result;
 use crate::iter::{BoxedIterator, CompactionIterator};
@@ -8,11 +13,6 @@ use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::VLog;
 use crate::Options as LSMOptions;
-
-use std::collections::HashMap;
-use std::fs::File as SysFile;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 /// Compaction options
 pub(crate) struct CompactionOptions {

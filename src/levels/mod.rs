@@ -6,16 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use iter::LevelManifestIterator;
+pub(crate) use level::{Level, Levels};
+use rand::Rng;
+
 use crate::error::Error;
 use crate::sstable::table::Table;
 use crate::vfs::File;
 use crate::{Options, Result};
-
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use iter::LevelManifestIterator;
-use rand::Rng;
-
-pub(crate) use level::{Level, Levels};
 
 /// Current manifest format version
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
@@ -506,14 +505,15 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::table::TableWriter;
-	use crate::sstable::{InternalKey, InternalKeyKind};
+	use std::fs::{self, File as SysFile};
+	use std::sync::atomic::Ordering;
+
 	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
-	use std::fs::{self, File as SysFile};
-	use std::sync::atomic::Ordering;
+	use crate::sstable::table::TableWriter;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	// Helper function to create a test table with direct file IO
 	fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {

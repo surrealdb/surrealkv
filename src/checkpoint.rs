@@ -562,8 +562,9 @@ impl DatabaseCheckpoint {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use test_log::test;
+
+	use super::*;
 
 	#[test]
 	fn test_checkpoint_metadata_serialization() {

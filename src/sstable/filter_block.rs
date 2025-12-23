@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use crate::FilterPolicy;
 use bytes::Bytes;
 use integer_encoding::FixedInt;
+
+use crate::FilterPolicy;
 
 pub(crate) const FILTER_BASE_LOG2: u32 = 11;
 const FILTER_BASE: u32 = 1 << FILTER_BASE_LOG2;
@@ -168,12 +169,12 @@ impl FilterBlockReader {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::bloom::LevelDBBloomFilter;
-	use crate::sstable::{InternalKey, InternalKeyKind};
 	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
+	use crate::sstable::bloom::LevelDBBloomFilter;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	#[test]
 	fn test_empty() {

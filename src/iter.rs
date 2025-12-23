@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::Result;
-use crate::vlog::{VLog, ValueLocation, ValuePointer};
-
 use crate::sstable::InternalKey;
+use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Key, Value};
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
@@ -348,14 +347,16 @@ impl Iterator for CompactionIterator<'_> {
 }
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
+	use bytes::Bytes;
+	use tempfile::TempDir;
+	use test_log::test;
+
 	use super::*;
 	use crate::clock::MockLogicalClock;
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::{Options, VLogChecksumLevel, Value};
-	use bytes::Bytes;
-	use std::sync::Arc;
-	use tempfile::TempDir;
-	use test_log::test;
 
 	fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
 		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0)
@@ -1198,8 +1199,7 @@ mod tests {
 		// total:
 		// - key1: 3 versions (all within retention)
 		// - key2: 3 versions (all within retention)
-		// - key3: 1 version (only recent one, very old versions filtered out due to
-		//   retention)
+		// - key3: 1 version (only recent one, very old versions filtered out due to retention)
 		assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
 
 		// Verify we get all versions of key1 (all within retention)

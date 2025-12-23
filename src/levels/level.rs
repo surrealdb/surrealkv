@@ -1,9 +1,11 @@
+use std::io::{Read, Write};
+use std::sync::Arc;
+
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+
 use crate::sstable::meta::KeyRange;
 use crate::sstable::table::Table;
 use crate::Result;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
-use std::sync::Arc;
 
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use criterion::{
 	black_box,
 	criterion_group,
@@ -8,7 +10,6 @@ use criterion::{
 	Throughput,
 };
 use rand::Rng;
-use std::sync::Arc;
 use surrealkv::bplustree::tree::new_disk_tree;
 use surrealkv::BytewiseComparator;
 use tempfile::TempDir;

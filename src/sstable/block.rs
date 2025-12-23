@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
+
 use crate::error::{Error, Result};
 use crate::sstable::InternalKey;
 use crate::{Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value};
-use bytes::Bytes;
-use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 pub(crate) type BlockData = Bytes;
 
@@ -593,11 +594,11 @@ impl LSMIterator for BlockIterator {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::Options;
 	use test_log::test;
 
 	use super::*;
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::Options;
 
 	fn generate_data() -> Vec<(&'static [u8], &'static [u8])> {
 		vec![

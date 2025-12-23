@@ -70,8 +70,7 @@ impl Wal {
 	/// # Arguments
 	///
 	/// * `dir` - WAL directory path
-	/// * `min_log_number` - Minimum log number (actual may be higher if
-	///   existing segments exist)
+	/// * `min_log_number` - Minimum log number (actual may be higher if existing segments exist)
 	/// * `opts` - WAL options
 	///
 	/// # Behavior
@@ -310,8 +309,7 @@ impl Wal {
 	///
 	/// # Arguments
 	///
-	/// * `rec` - A reference to the byte slice containing the record to be
-	///   appended.
+	/// * `rec` - A reference to the byte slice containing the record to be appended.
 	///
 	/// # Returns
 	///
@@ -416,9 +414,10 @@ impl Drop for Wal {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use tempdir::TempDir;
 	use test_log::test;
+
+	use super::*;
 
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()
@@ -549,8 +548,9 @@ mod tests {
 
 	#[test]
 	fn test_wal_block_offset_across_sessions() {
-		use crate::wal::reader::Reader;
 		use std::fs::File;
+
+		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
 		let opts = Options::default();
@@ -632,8 +632,9 @@ mod tests {
 	/// causing the reader to fail to decompress them correctly.
 	#[test]
 	fn test_wal_compression_type_detected_on_reopen() {
-		use crate::wal::reader::Reader;
 		use std::fs::File;
+
+		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
 
@@ -681,8 +682,9 @@ mod tests {
 	/// when reopening a compressed WAL.
 	#[test]
 	fn test_wal_compressed_file_detected_on_reopen() {
-		use crate::wal::reader::Reader;
 		use std::fs::File;
+
+		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
 
@@ -731,8 +733,9 @@ mod tests {
 	/// that the Reader correctly detects the compression type from the file.
 	#[test]
 	fn test_wal_compression_type_readable_by_reader() {
-		use crate::wal::reader::Reader;
 		use std::fs::File;
+
+		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
 
@@ -773,8 +776,9 @@ mod tests {
 	/// the Reader correctly reports no compression type.
 	#[test]
 	fn test_wal_no_compression_type_when_disabled() {
-		use crate::wal::reader::Reader;
 		use std::fs::File;
+
+		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
 
@@ -807,11 +811,9 @@ mod tests {
 	/// highest_on_disk)`.
 	///
 	/// This verifies the fix for a data loss bug:
-	/// - Scenario: Crash with segments #1, #2, #3 on disk, manifest
-	///   log_number=1
+	/// - Scenario: Crash with segments #1, #2, #3 on disk, manifest log_number=1
 	/// - Without fix: WAL opens at segment 1, new writes go there
-	/// - If flush updates log_number to 2, then crash → segment 1 skipped →
-	///   DATA LOSS
+	/// - If flush updates log_number to 2, then crash → segment 1 skipped → DATA LOSS
 	/// - With fix: WAL opens at segment 3 (highest), new writes safe
 	#[test]
 	fn test_open_with_min_log_number_uses_highest_segment() {

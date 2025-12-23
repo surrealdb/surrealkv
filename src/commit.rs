@@ -373,11 +373,11 @@ impl Drop for CommitPipeline {
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
+
 	use test_log::test;
 
-	use crate::sstable::InternalKeyKind;
-
 	use super::*;
+	use crate::sstable::InternalKeyKind;
 
 	struct MockEnv;
 

@@ -372,15 +372,16 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fs::File;
 	use std::io::{BufReader, Read, Write};
 	use std::vec::Vec;
+
+	use tempdir::TempDir;
 	use test_log::test;
 
+	use super::*;
 	use crate::wal::manager::Wal;
 	use crate::wal::{Options, SegmentRef};
-	use tempdir::TempDir;
 
 	// BufferReader does not return EOF when the underlying reader returns 0 bytes
 	// read.

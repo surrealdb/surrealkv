@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::levels::{Level, LevelManifest};
-
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
+use crate::levels::{Level, LevelManifest};
 
 /// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -331,9 +330,8 @@ mod tests {
 	use std::sync::{Arc, RwLock};
 
 	use bytes::Bytes;
-	use test_log::test;
-
 	use tempfile::TempDir;
+	use test_log::test;
 
 	use crate::clock::MockLogicalClock;
 	use crate::compaction::compactor::{CompactionOptions, Compactor};
@@ -1283,9 +1281,9 @@ mod tests {
 		// Create a table with the same ID as one in source level to trigger the bug
 		let table_dup = env
 			.create_test_table(
-				1,                                           // Same ID as table1 in source_level
+				1, // Same ID as table1 in source_level
 				create_ordered_entries("a", 5, 8, 90, None), /* a-00005 to a-00012 (overlaps
-				                                              * with table1) */
+				    * with table1) */
 			)
 			.unwrap();
 
