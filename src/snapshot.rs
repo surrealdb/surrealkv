@@ -908,12 +908,6 @@ impl SnapshotIterator<'_> {
 		key.seq_num() <= self.snapshot_seq_num
 	}
 
-	/// Checks if the key is a tombstone
-	#[inline]
-	fn is_tombstone(key: &InternalKey) -> bool {
-		matches!(key.kind(), InternalKeyKind::Delete | InternalKeyKind::SoftDelete)
-	}
-
 	/// Resolves the value and constructs the result
 	#[inline]
 	fn resolve(&self, key: &Arc<InternalKey>, value: &Value) -> IterResult {
@@ -957,7 +951,7 @@ impl Iterator for SnapshotIterator<'_> {
 
 			// Latest version is tombstone? Skip entire key
 			// (older versions already consumed above)
-			if Self::is_tombstone(&key) {
+			if key.is_tombstone() {
 				continue;
 			}
 
@@ -1000,7 +994,7 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 			}
 
 			// Skip tombstones
-			if Self::is_tombstone(&latest_key) {
+			if latest_key.is_tombstone() {
 				continue;
 			}
 
