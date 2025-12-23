@@ -689,6 +689,9 @@ impl<'a> KMergeIterator<'a> {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
 
+		// Convert user-key range to InternalKey range once
+		let internal_range = crate::user_range_to_internal_range(range.clone());
+
 		unsafe {
 			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
 			// Compute query key range for table overlap checks
@@ -705,12 +708,12 @@ impl<'a> KMergeIterator<'a> {
 			};
 
 			// Active memtable with range
-			let active_iter = state_ref.active.range(range.clone(), keys_only);
+			let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
 			iterators.push(Box::new(active_iter));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
-				let iter = memtable.range(range.clone(), keys_only);
+				let iter = memtable.range(internal_range.clone(), keys_only);
 				iterators.push(Box::new(iter));
 			}
 
@@ -725,7 +728,7 @@ impl<'a> KMergeIterator<'a> {
 						{
 							continue;
 						}
-						let table_iter = table.iter(keys_only, Some(range.clone()));
+						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
 						iterators.push(Box::new(table_iter));
 					}
 				} else {
@@ -734,7 +737,7 @@ impl<'a> KMergeIterator<'a> {
 					let end_idx = level.find_last_overlapping_table(&query_range);
 
 					for table in &level.tables[start_idx..end_idx] {
-						let table_iter = table.iter(keys_only, Some(range.clone()));
+						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
 						iterators.push(Box::new(table_iter));
 					}
 				}
