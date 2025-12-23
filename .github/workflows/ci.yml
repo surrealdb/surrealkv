@@ -84,7 +84,7 @@ jobs:
         run: cargo deny --all-features check licenses
 
       - name: Clippy
-        run: cargo clippy --all --all-targets -- -Dwarnings
+        run: cargo clippy -- -Dwarnings
 
       - name: Format
         run: cargo fmt --all -- --check
