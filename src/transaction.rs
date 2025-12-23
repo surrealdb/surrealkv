@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
-use std::ops::Bound;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -10,6 +10,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
+use crate::sstable::meta::{KeyRange, UNBOUNDED_HIGH, UNBOUNDED_LOW};
 use crate::sstable::InternalKeyKind;
 use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
 
@@ -102,13 +103,11 @@ impl WriteOptions {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadOptions {
 	/// Whether to return only keys without values (for range operations)
-	pub keys_only: bool,
-	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
-	pub iterate_lower_bound: Option<Vec<u8>>,
-	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
-	pub iterate_upper_bound: Option<Vec<u8>>,
+	pub(crate) keys_only: bool,
+	/// Iteration bounds
+	pub(crate) iterate_bounds: KeyRange,
 	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
-	pub timestamp: Option<u64>,
+	pub(crate) timestamp: Option<u64>,
 }
 
 impl ReadOptions {
@@ -123,26 +122,26 @@ impl ReadOptions {
 		self
 	}
 
-	/// Sets the lower bound for iteration (inclusive)
 	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
-		self.iterate_lower_bound = bound;
+		if let Some(bound) = bound {
+			self.iterate_bounds.low = bound.into();
+		} else {
+			self.iterate_bounds.low = UNBOUNDED_LOW;
+		}
 	}
 
 	/// Sets the upper bound for iteration (exclusive)
 	pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
-		self.iterate_upper_bound = bound;
+		if let Some(bound) = bound {
+			self.iterate_bounds.high = bound.into();
+		} else {
+			self.iterate_bounds.high = UNBOUNDED_HIGH;
+		}
 	}
 
-	/// Sets the lower bound for iteration (inclusive) - builder pattern
-	pub fn with_iterate_lower_bound(mut self, bound: Option<Vec<u8>>) -> Self {
-		self.iterate_lower_bound = bound;
-		self
-	}
-
-	/// Sets the upper bound for iteration (exclusive) - builder pattern
-	pub fn with_iterate_upper_bound(mut self, bound: Option<Vec<u8>>) -> Self {
-		self.iterate_upper_bound = bound;
-		self
+	/// Sets the lower bound for iteration (inclusive)
+	pub(crate) fn set_iterate_bounds(&mut self, bounds: impl Into<KeyRange>) {
+		self.iterate_bounds = bounds.into();
 	}
 
 	/// Sets the timestamp for point-in-time reads
@@ -474,8 +473,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(KeyRange::new(start.into_bytes(), end.into_bytes()));
 		self.count_with_options(&options)
 	}
 
@@ -491,8 +489,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(KeyRange::new(start.into_bytes(), end.into_bytes()));
 		self.count_with_options(&options)
 	}
 
@@ -517,8 +514,7 @@ impl Transaction {
 		}
 
 		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+		let iterate_bounds = options.iterate_bounds.clone();
 
 		// For versioned queries, use the keys iterator approach
 		// (versioned index has different structure)
@@ -527,20 +523,24 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			let keys_iter = self.keys_at_version(start_key, end_key, timestamp)?;
+			let keys_iter = self.keys_at_version(
+				iterate_bounds.low.clone(),
+				iterate_bounds.high.clone(),
+				timestamp,
+			)?;
 			return Ok(keys_iter.count());
 		}
 
 		// Fast path: get count from snapshot without creating iterators
 		let mut count = match &self.snapshot {
-			Some(snapshot) => snapshot.count_in_range(start_key.clone(), end_key.clone())?,
+			Some(snapshot) => snapshot.count_in_range(iterate_bounds.clone())?,
 			None => return Err(Error::NoSnapshot),
 		};
 
 		// Apply write-set adjustments for uncommitted changes in this transaction
 		for (key, entries) in &self.write_set {
 			// Check if key is in range
-			if key.as_ref() >= start_key.as_slice() && key.as_ref() < end_key.as_slice() {
+			if iterate_bounds.contains(key.as_ref()) {
 				if let Some(latest_entry) = entries.last() {
 					// Check what the key's state was in the snapshot
 					let snapshot_had_key =
@@ -582,8 +582,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_keys_only(true);
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(KeyRange::new(start.into_bytes(), end.into_bytes()));
 		self.keys_with_options(&options)
 	}
 
@@ -609,8 +608,7 @@ impl Transaction {
 	{
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds((start, end));
 		self.keys_with_options(&options)
 	}
 
@@ -637,8 +635,10 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let KeyRange {
+				low: start_key,
+				high: end_key,
+			} = options.iterate_bounds.clone();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
@@ -651,14 +651,12 @@ impl Transaction {
 			}
 		} else {
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let iterate_bounds = options.iterate_bounds.clone();
 
 			// Force keys_only to true for this method
-			let mut options = options.clone();
-			options.keys_only = true;
+			let options = options.clone().with_keys_only(true);
 			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+				TransactionRangeIterator::new_with_options(self, iterate_bounds, &options)?
 					.map(|result| result.map(|(key, _)| key)),
 			))
 		}
@@ -681,8 +679,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(KeyRange::new(start.into_bytes(), end.into_bytes()));
 		self.range_with_options(&options)
 	}
 
@@ -704,8 +701,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(KeyRange::new(start.into_bytes(), end.into_bytes()));
 		self.range_with_options(&options)
 	}
 
@@ -729,8 +725,10 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let KeyRange {
+				low: start_key,
+				high: end_key,
+			} = options.iterate_bounds.clone();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
@@ -743,10 +741,10 @@ impl Transaction {
 			}
 		} else {
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let iterate_bounds = options.iterate_bounds.clone();
+
 			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
+				TransactionRangeIterator::new_with_options(self, iterate_bounds, options)?.map(
 					|result| {
 						result.and_then(|(k, v)| {
 							v.ok_or_else(|| {
@@ -1076,8 +1074,7 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
-		start_key: Vec<u8>,
-		end_key: Vec<u8>,
+		iterate_bounds: KeyRange,
 		options: &ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
@@ -1095,17 +1092,11 @@ impl<'a> TransactionRangeIterator<'a> {
 			None => return Err(Error::NoSnapshot),
 		};
 
-		// Convert range bounds to Bytes for the write set range
-		let start_bytes = Bytes::copy_from_slice(&start_key);
-		let end_bytes = Bytes::copy_from_slice(&end_key);
-
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
+		let iter = snapshot.range(iterate_bounds.clone(), options.keys_only)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
-		// Use inclusive-exclusive range for write set: [start, end)
-		let write_set_range = (Bound::Included(start_bytes), Bound::Excluded(end_bytes));
-		let write_set_iter = tx.write_set.range(write_set_range);
+		let write_set_iter = tx.write_set.range(iterate_bounds);
 
 		Ok(Self {
 			snapshot_iter: boxed_iter.double_ended_peekable(),
@@ -3899,8 +3890,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			let mut options = ReadOptions::default();
-			options.set_iterate_lower_bound(Some(b"key2".to_vec()));
-			options.set_iterate_upper_bound(Some(b"key4".to_vec()));
+			options.set_iterate_bounds((b"key2".to_vec(), b"key4".to_vec()));
 			let count = tx.count_with_options(&options).unwrap();
 			assert_eq!(count, 2); // key2, key3 (key4 is exclusive)
 		}

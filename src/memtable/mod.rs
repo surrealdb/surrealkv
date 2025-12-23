@@ -438,10 +438,6 @@ mod tests {
 		(memtable, last_seq)
 	}
 
-	fn s2b(s: &str) -> Vec<u8> {
-		s.as_bytes().to_vec()
-	}
-
 	#[test]
 	fn test_empty_memtable() {
 		let memtable = Arc::new(MemTable::new());
@@ -459,8 +455,12 @@ mod tests {
 
 	#[test]
 	fn test_single_key() {
-		let (memtable, _) =
-			create_test_memtable(vec![(s2b("key1"), s2b("value1"), InternalKeyKind::Set, None)]);
+		let (memtable, _) = create_test_memtable(vec![(
+			b"key1".to_vec(),
+			b"value1".to_vec(),
+			InternalKeyKind::Set,
+			None,
+		)]);
 
 		// Collect all entries
 		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
@@ -484,9 +484,9 @@ mod tests {
 	#[test]
 	fn test_multiple_keys() {
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("key1"), s2b("value1"), InternalKeyKind::Set, None),
-			(s2b("key3"), s2b("value3"), InternalKeyKind::Set, None),
-			(s2b("key5"), s2b("value5"), InternalKeyKind::Set, None),
+			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, None),
+			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, None),
+			(b"key5".to_vec(), b"value5".to_vec(), InternalKeyKind::Set, None),
 		]);
 
 		// Collect all entries
@@ -513,9 +513,9 @@ mod tests {
 	fn test_sequence_number_ordering() {
 		// Create test with multiple sequence numbers for the same key
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("key1"), s2b("value1"), InternalKeyKind::Set, Some(10)),
-			(s2b("key1"), s2b("value2"), InternalKeyKind::Set, Some(20)), // Higher sequence number
-			(s2b("key1"), s2b("value3"), InternalKeyKind::Set, Some(5)),  // Lower sequence number
+			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
+			(b"key1".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(20)), // Higher sequence number
+			(b"key1".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(5)),  // Lower sequence number
 		]);
 
 		// Collect all entries
@@ -552,9 +552,9 @@ mod tests {
 	fn test_key_updates_with_sequence_numbers() {
 		// Create test with key updates
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("key1"), s2b("old_value"), InternalKeyKind::Set, Some(5)),
-			(s2b("key1"), s2b("new_value"), InternalKeyKind::Set, Some(10)),
-			(s2b("key2"), s2b("value2"), InternalKeyKind::Set, Some(7)),
+			(b"key1".to_vec(), b"old_value".to_vec(), InternalKeyKind::Set, Some(5)),
+			(b"key1".to_vec(), b"new_value".to_vec(), InternalKeyKind::Set, Some(10)),
+			(b"key2".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(7)),
 		]);
 
 		// Test get returns the latest value
@@ -574,10 +574,10 @@ mod tests {
 	fn test_tombstones() {
 		// Create test with deleted entries
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("key1"), s2b("value1"), InternalKeyKind::Set, Some(1)),
-			(s2b("key2"), s2b("value2"), InternalKeyKind::Set, Some(2)),
-			(s2b("key3"), s2b("value3"), InternalKeyKind::Set, Some(3)),
-			(s2b("key2"), vec![], InternalKeyKind::Delete, Some(4)), // Delete key2
+			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(1)),
+			(b"key2".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(2)),
+			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(3)),
+			(b"key2".to_vec(), vec![], InternalKeyKind::Delete, Some(4)), // Delete key2
 		]);
 
 		// Iterator should see all entries including tombstones
@@ -599,10 +599,10 @@ mod tests {
 	fn test_key_kinds() {
 		// Test different key kinds
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("key1"), s2b("value1"), InternalKeyKind::Set, Some(10)),
-			(s2b("key2"), vec![], InternalKeyKind::Delete, Some(20)),
-			(s2b("key3"), s2b("value3"), InternalKeyKind::Set, Some(30)),
-			(s2b("key4"), vec![], InternalKeyKind::Delete, Some(40)),
+			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
+			(b"key2".to_vec(), vec![], InternalKeyKind::Delete, Some(20)),
+			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(30)),
+			(b"key4".to_vec(), vec![], InternalKeyKind::Delete, Some(40)),
 		]);
 
 		// All key types should be visible in the iterator
@@ -650,19 +650,18 @@ mod tests {
 	fn test_range_query() {
 		// Create a memtable with many keys
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("a"), s2b("value-a"), InternalKeyKind::Set, None),
-			(s2b("c"), s2b("value-c"), InternalKeyKind::Set, None),
-			(s2b("e"), s2b("value-e"), InternalKeyKind::Set, None),
-			(s2b("g"), s2b("value-g"), InternalKeyKind::Set, None),
-			(s2b("i"), s2b("value-i"), InternalKeyKind::Set, None),
-			(s2b("k"), s2b("value-k"), InternalKeyKind::Set, None),
-			(s2b("m"), s2b("value-m"), InternalKeyKind::Set, None),
+			(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, None),
+			(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, None),
+			(b"e".to_vec(), b"value-e".to_vec(), InternalKeyKind::Set, None),
+			(b"g".to_vec(), b"value-g".to_vec(), InternalKeyKind::Set, None),
+			(b"i".to_vec(), b"value-i".to_vec(), InternalKeyKind::Set, None),
+			(b"k".to_vec(), b"value-k".to_vec(), InternalKeyKind::Set, None),
+			(b"m".to_vec(), b"value-m".to_vec(), InternalKeyKind::Set, None),
 		]);
 
 		// Test inclusive range
-		let range_entries: Vec<_> = memtable
-			.range(user_range_to_internal_range(s2b("c")..=s2b("k")), false)
-			.collect::<Vec<_>>();
+		let range_entries: Vec<_> =
+			memtable.range(user_range_to_internal_range("c"..="k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -674,9 +673,8 @@ mod tests {
 		assert_eq!(user_keys[4].as_ref(), b"k");
 
 		// Test exclusive range
-		let range_entries: Vec<_> = memtable
-			.range(user_range_to_internal_range(s2b("c")..s2b("k")), false)
-			.collect::<Vec<_>>();
+		let range_entries: Vec<_> =
+			memtable.range(user_range_to_internal_range("c".."k"), false).collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -691,17 +689,16 @@ mod tests {
 	fn test_range_query_with_sequence_numbers() {
 		// Create a memtable with overlapping sequence numbers
 		let (memtable, _) = create_test_memtable(vec![
-			(s2b("a"), s2b("value-a1"), InternalKeyKind::Set, Some(10)),
-			(s2b("a"), s2b("value-a2"), InternalKeyKind::Set, Some(20)), // Updated value
-			(s2b("c"), s2b("value-c1"), InternalKeyKind::Set, Some(15)),
-			(s2b("e"), s2b("value-e1"), InternalKeyKind::Set, Some(25)),
-			(s2b("e"), s2b("value-e2"), InternalKeyKind::Set, Some(15)), // Older version
+			(b"a".to_vec(), b"value-a1".to_vec(), InternalKeyKind::Set, Some(10)),
+			(b"a".to_vec(), b"value-a2".to_vec(), InternalKeyKind::Set, Some(20)), // Updated value
+			(b"c".to_vec(), b"value-c1".to_vec(), InternalKeyKind::Set, Some(15)),
+			(b"e".to_vec(), b"value-e1".to_vec(), InternalKeyKind::Set, Some(25)),
+			(b"e".to_vec(), b"value-e2".to_vec(), InternalKeyKind::Set, Some(15)), // Older version
 		]);
 
 		// Perform a range query from "a" to "f"
-		let range_entries: Vec<_> = memtable
-			.range(user_range_to_internal_range(s2b("a")..s2b("f")), false)
-			.collect::<Vec<_>>();
+		let range_entries: Vec<_> =
+			memtable.range(user_range_to_internal_range("a".."f"), false).collect::<Vec<_>>();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();
@@ -741,10 +738,10 @@ mod tests {
 	fn test_binary_keys() {
 		// Test with binary keys containing nulls and various byte values
 		let (memtable, _) = create_test_memtable(vec![
-			(vec![0, 0, 1], s2b("value1"), InternalKeyKind::Set, None),
-			(vec![0, 1, 0], s2b("value2"), InternalKeyKind::Set, None),
-			(vec![1, 0, 0], s2b("value3"), InternalKeyKind::Set, None),
-			(vec![0xFF, 0xFE, 0xFD], s2b("value4"), InternalKeyKind::Set, None),
+			(vec![0, 0, 1], b"value1".to_vec(), InternalKeyKind::Set, None),
+			(vec![0, 1, 0], b"value2".to_vec(), InternalKeyKind::Set, None),
+			(vec![1, 0, 0], b"value3".to_vec(), InternalKeyKind::Set, None),
+			(vec![0xFF, 0xFE, 0xFD], b"value4".to_vec(), InternalKeyKind::Set, None),
 		]);
 
 		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
@@ -764,9 +761,9 @@ mod tests {
 		// Create a larger dataset to test performance and correctness
 		let mut entries = Vec::new();
 		for i in 0..1000 {
-			let key = format!("key{i:04}");
-			let value = format!("value{i:04}");
-			entries.push((s2b(&key), s2b(&value), InternalKeyKind::Set, None));
+			let key = format!("key{i:04}").as_bytes().to_vec();
+			let value = format!("value{i:04}").as_bytes().to_vec();
+			entries.push((key, value, InternalKeyKind::Set, None));
 		}
 
 		let (memtable, _) = create_test_memtable(entries);

@@ -163,12 +163,11 @@ impl Snapshot {
 	/// - Allocating result structures
 	///
 	/// It only counts the latest version of each key and skips tombstones.
-	pub(crate) fn count_in_range(&self, start: Vec<u8>, end: Vec<u8>) -> Result<usize> {
+	pub(crate) fn count_in_range(&self, range: KeyRange) -> Result<usize> {
 		let mut count = 0usize;
 		let mut last_key: Option<Vec<u8>> = None;
 
 		let iter_state = self.collect_iter_state()?;
-		let range = (Bound::Included(start), Bound::Excluded(end));
 		let merge_iter = KMergeIterator::new_from(iter_state, range, true).filter(move |item| {
 			// Filter out items that are not visible in this snapshot
 			item.0.seq_num() <= self.seq_num
@@ -268,14 +267,11 @@ impl Snapshot {
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
-	pub(crate) fn range<Key: AsRef<[u8]>>(
+	pub(crate) fn range(
 		&self,
-		start: Key,
-		end: Key,
+		range: KeyRange,
 		keys_only: bool,
 	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
-		// Create a range from start (inclusive) to end (exclusive)
-		let range = start.as_ref().to_vec()..end.as_ref().to_vec();
 		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, range, keys_only)
 	}
 
@@ -682,11 +678,7 @@ pub(crate) struct KMergeIterator<'a> {
 }
 
 impl<'a> KMergeIterator<'a> {
-	fn new_from(
-		iter_state: IterState,
-		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
-		keys_only: bool,
-	) -> Self {
+	fn new_from(iter_state: IterState, range: KeyRange, keys_only: bool) -> Self {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
 
@@ -696,17 +688,7 @@ impl<'a> KMergeIterator<'a> {
 		unsafe {
 			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
 			// Compute query key range for table overlap checks
-			let query_range = {
-				let low = match &range.0 {
-					Bound::Included(v) | Bound::Excluded(v) => v.clone(),
-					Bound::Unbounded => Vec::new(),
-				};
-				let high = match &range.1 {
-					Bound::Included(v) | Bound::Excluded(v) => v.clone(),
-					Bound::Unbounded => vec![0xff],
-				};
-				KeyRange::new((Bytes::from(low), Bytes::from(high)))
-			};
+			let query_range = KeyRange::from(range);
 
 			// Active memtable with range
 			let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
@@ -877,10 +859,7 @@ pub(crate) struct SnapshotIterator<'a> {
 
 impl SnapshotIterator<'_> {
 	/// Creates a new iterator over a specific key range
-	fn new_from<R>(core: Arc<Core>, seq_num: u64, range: R, keys_only: bool) -> Result<Self>
-	where
-		R: RangeBounds<Vec<u8>>,
-	{
+	fn new_from(core: Arc<Core>, seq_num: u64, range: KeyRange, keys_only: bool) -> Result<Self> {
 		// Create a temporary snapshot to use the helper method
 		let snapshot = Snapshot {
 			core: Arc::clone(&core),
@@ -888,14 +867,11 @@ impl SnapshotIterator<'_> {
 		};
 		let iter_state = snapshot.collect_iter_state()?;
 
-		let start = range.start_bound().map(|v| v.clone());
-		let end = range.end_bound().map(|v| v.clone());
-
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
 		}
 
-		let merge_iter = KMergeIterator::new_from(iter_state, (start, end), keys_only);
+		let merge_iter = KMergeIterator::new_from(iter_state, range, keys_only);
 
 		Ok(Self {
 			merge_iter,
@@ -1019,7 +995,8 @@ impl Drop for SnapshotIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-	use crate::TreeBuilder;
+	use crate::sstable::meta::KeyRange;
+	use crate::{IntoBytes, TreeBuilder};
 	use crate::{Options, Tree};
 	use bytes::Bytes;
 	use std::collections::HashSet;
@@ -1416,7 +1393,7 @@ mod tests {
 		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Get keys only ([key1, key6) to include key5)
-		let keys_only_iter = tx.range(b"key1", b"key6", true).unwrap();
+		let keys_only_iter = tx.range(("key1".."key6").into(), true).unwrap();
 		let keys_only: Vec<_> = keys_only_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Verify we got all 5 keys
@@ -1432,7 +1409,7 @@ mod tests {
 		}
 
 		// Compare with regular range scan ([key1, key6) to include key5)
-		let regular_range_iter = tx.range(b"key1", b"key6", false).unwrap();
+		let regular_range_iter = tx.range(("key1".."key6").into(), false).unwrap();
 		let regular_range: Vec<_> = regular_range_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(regular_range.len(), keys_only.len());
@@ -1488,9 +1465,9 @@ mod tests {
 		};
 
 		// Range that only overlaps with table2
-		let range = (Bound::Included(b"z0".to_vec()), Bound::Included(b"zz".to_vec()));
+		let range = "z0".."zz";
 
-		let merge_iter = KMergeIterator::new_from(iter_state, range, false);
+		let merge_iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let items: Vec<_> = merge_iter.collect();
 		assert_eq!(items.len(), 2);
@@ -1518,7 +1495,7 @@ mod tests {
 		let tx = tx.snapshot.as_ref().unwrap();
 
 		// Test forward iteration ([key1, key6) to include key5)
-		let forward_iter = tx.range(b"key1", b"key6", false).unwrap();
+		let forward_iter = tx.range(("key1".."key6").into(), false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(forward_items.len(), 5);
@@ -1526,7 +1503,7 @@ mod tests {
 		assert_eq!(forward_items[4].0.as_ref(), b"key5");
 
 		// Test backward iteration ([key1, key6) to include key5)
-		let backward_iter = tx.range(b"key1", b"key6", false).unwrap();
+		let backward_iter = tx.range(("key1".."key6").into(), false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(backward_items.len(), 5);
@@ -1567,23 +1544,23 @@ mod tests {
 
 		// Test forward iteration on first snapshot (should see all keys)
 		let tx1_ref = tx1.snapshot.as_ref().unwrap();
-		let forward_iter1 = tx1_ref.range(b"key1", b"key4", false).unwrap();
+		let forward_iter1 = tx1_ref.range(("key1".."key4").into(), false).unwrap();
 		let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items1.len(), 3);
 
 		// Test backward iteration on first snapshot
-		let backward_iter1 = tx1_ref.range(b"key1", b"key4", false).unwrap();
+		let backward_iter1 = tx1_ref.range(("key1".."key4").into(), false).unwrap();
 		let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items1.len(), 3);
 
 		// Test forward iteration on second snapshot (should not see deleted key)
 		let tx2_ref = tx2.snapshot.as_ref().unwrap();
-		let forward_iter2 = tx2_ref.range(b"key1", b"key4", false).unwrap();
+		let forward_iter2 = tx2_ref.range(("key1".."key4").into(), false).unwrap();
 		let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(forward_items2.len(), 2);
 
 		// Test backward iteration on second snapshot
-		let backward_iter2 = tx2_ref.range(b"key1", b"key4", false).unwrap();
+		let backward_iter2 = tx2_ref.range(("key1".."key4").into(), false).unwrap();
 		let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
 		assert_eq!(backward_items2.len(), 2);
 
@@ -1660,7 +1637,7 @@ mod tests {
 		// Test forward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let forward_iter = snapshot_ref.range(b"key1", b"key6", false).unwrap();
+			let forward_iter = snapshot_ref.range(("key1".."key6").into(), false).unwrap();
 			let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 			assert_eq!(forward_items.len(), 3); // key1, key3, key5
@@ -1672,7 +1649,7 @@ mod tests {
 		// Test backward iteration
 		{
 			let snapshot_ref = tx.snapshot.as_ref().unwrap();
-			let backward_iter = snapshot_ref.range(b"key1", b"key6", false).unwrap();
+			let backward_iter = snapshot_ref.range(("key1".."key6").into(), false).unwrap();
 			let backward_items: Vec<_> =
 				backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
@@ -1715,7 +1692,7 @@ mod tests {
 		{
 			let tx1_ref = tx1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx1_ref
-				.range(b"key1", b"key5", false)
+				.range(("key1".."key5").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1726,7 +1703,7 @@ mod tests {
 		{
 			let tx2_ref = tx2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = tx2_ref
-				.range(b"key1", b"key5", false)
+				.range(("key1".."key5").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -1756,11 +1733,11 @@ mod tests {
 
 		// Test forward iteration
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let forward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
+		let forward_iter = snapshot_ref.range(("key01".."key11").into(), false).unwrap();
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Test backward iteration
-		let backward_iter = snapshot_ref.range(b"key01", b"key11", false).unwrap();
+		let backward_iter = snapshot_ref.range(("key01".."key11").into(), false).unwrap();
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		// Both should have 10 items
@@ -1903,8 +1880,8 @@ mod tests {
 			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [j-z] - all tables are before this range
-		let range = (Bound::Included(b"j".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"j".into_bytes()..b"z".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as all are before range");
@@ -1928,8 +1905,8 @@ mod tests {
 			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [a-k] - all tables are after this range
-		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"k".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"a".into_bytes()..b"k".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as all are after range");
@@ -1953,8 +1930,8 @@ mod tests {
 			create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
 
 		// Query range: [d-h] - all tables overlap with this range
-		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"d".into_bytes()..b"h".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		// All 3 tables should contribute items
@@ -1985,8 +1962,8 @@ mod tests {
 		);
 
 		// Query range: [f-j] - should include tables [e-g], [i-k], [d-f], [j-m]
-		let range = (Bound::Included(b"f".to_vec()), Bound::Included(b"j".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"f".into_bytes()..b"j".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		// Should have items from multiple overlapping tables
@@ -2017,8 +1994,8 @@ mod tests {
 		);
 
 		// Query range: [e-h] - should include tables [e-f], [g-h]
-		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"e".into_bytes()..b"h".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from L1 tables in range");
@@ -2042,8 +2019,8 @@ mod tests {
 			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [a-c] - before all tables
-		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"c".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"a".into_bytes()..b"c".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
@@ -2067,8 +2044,8 @@ mod tests {
 			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [m-z] - after all tables
-		let range = (Bound::Included(b"m".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"m".into_bytes()..b"z".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
@@ -2092,8 +2069,8 @@ mod tests {
 			create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
 
 		// Query range: [a-z] - spans all tables
-		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"a".into_bytes()..b"z".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from all L1 tables");
@@ -2114,8 +2091,8 @@ mod tests {
 		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Query with Included bounds - should include all keys from d to h
-		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"d".into_bytes()..b"h".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let items: Vec<_> = iter.collect();
 		assert!(!items.is_empty(), "Should have items in inclusive range");
@@ -2137,8 +2114,8 @@ mod tests {
 
 		// Query with Excluded bounds - "d" and "h" exact matches should be excluded
 		// But "d1", "d5" are > "d" so they should be included
-		let range = (Bound::Excluded(b"d".to_vec()), Bound::Excluded(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = b"d".into_bytes()..b"h".into_bytes();
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let items: Vec<_> = iter.collect();
 		// Keys "d1" and "d5" should be included (they're > "d" and < "h")
@@ -2161,7 +2138,7 @@ mod tests {
 
 		// Query with unbounded start
 		let range = (Bound::Unbounded, Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should iterate from beginning with unbounded start");
@@ -2182,7 +2159,7 @@ mod tests {
 
 		// Query with unbounded end
 		let range = (Bound::Included(b"d".to_vec()), Bound::Unbounded);
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should iterate to end with unbounded end");
@@ -2203,8 +2180,7 @@ mod tests {
 		let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
 		// Query with fully unbounded range
-		let range = (Bound::Unbounded, Bound::Unbounded);
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let iter = KMergeIterator::new_from(iter_state, KeyRange::unbounded(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should return all keys with fully unbounded range");
@@ -2222,8 +2198,8 @@ mod tests {
 		// Create IterState with no tables
 		let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts);
 
-		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = "a".."z";
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "Iterator with no tables should return no items");
@@ -2244,7 +2220,7 @@ mod tests {
 
 		// Query for exact single key
 		let range = (Bound::Included(b"a1".to_vec()), Bound::Included(b"a1".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let items: Vec<_> = iter.collect();
 		// Should return at most 1 item
@@ -2267,8 +2243,8 @@ mod tests {
 		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
 		// Inverted range: start > end
-		let range = (Bound::Included(b"z".to_vec()), Bound::Included(b"a".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = "z".."a";
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "Inverted range should return no items");
@@ -2292,8 +2268,8 @@ mod tests {
 			create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);
 
 		// Query that overlaps with both levels
-		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"k".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, range, false);
+		let range = "e".."k";
+		let iter = KMergeIterator::new_from(iter_state, range.into(), false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from both L0 and L1 tables");
@@ -2340,7 +2316,7 @@ mod tests {
 		// First range query - this will populate the cache
 		let tx = tree.begin().unwrap();
 		let first_results: Vec<_> = tx
-			.range(b"key_00000000", b"key_00010000")
+			.range("key_00000000", "key_00010000")
 			.unwrap()
 			.collect::<crate::Result<Vec<_>>>()
 			.unwrap();
@@ -2460,7 +2436,7 @@ mod tests {
 		{
 			let snap_ref = snapshot1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2474,7 +2450,7 @@ mod tests {
 		{
 			let snap_ref = snapshot2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2488,7 +2464,7 @@ mod tests {
 		{
 			let snap_ref = snapshot3.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2503,7 +2479,7 @@ mod tests {
 		{
 			let snap_ref = snapshot4.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2519,7 +2495,7 @@ mod tests {
 		{
 			let snap_ref = snapshot2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.rev()
 				.collect::<Result<Vec<_>, _>>()
@@ -2569,7 +2545,7 @@ mod tests {
 		{
 			let snap1_ref = snapshot1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap1_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2581,7 +2557,7 @@ mod tests {
 		{
 			let snap2_ref = snapshot2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap2_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2593,7 +2569,7 @@ mod tests {
 		{
 			let snap3_ref = snapshot3.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap3_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2633,7 +2609,7 @@ mod tests {
 		{
 			let snap_ref = snapshot_before.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2648,7 +2624,7 @@ mod tests {
 		{
 			let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2663,7 +2639,7 @@ mod tests {
 		{
 			let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.rev()
 				.collect::<Result<Vec<_>, _>>()
@@ -2709,7 +2685,7 @@ mod tests {
 		{
 			let snap_ref = snap1.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2726,7 +2702,7 @@ mod tests {
 		{
 			let snap_ref = snap2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2744,7 +2720,7 @@ mod tests {
 		{
 			let snap_ref = snap3.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
@@ -2762,7 +2738,7 @@ mod tests {
 		{
 			let snap_ref = snap2.snapshot.as_ref().unwrap();
 			let range: Vec<_> = snap_ref
-				.range(b"key0", b"key9", false)
+				.range(("key0".."key9").into(), false)
 				.unwrap()
 				.rev()
 				.collect::<Result<Vec<_>, _>>()

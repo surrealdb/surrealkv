@@ -1,13 +1,18 @@
 use std::cmp::{max, min};
 use std::mem::size_of;
+use std::ops::{Bound, Range, RangeBounds};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::IntoBytes;
 use crate::{
 	error::Error,
 	sstable::{table::TableFormat, InternalKey},
 	CompressionType, Result, Value,
 };
+
+pub(crate) const UNBOUNDED_LOW: Bytes = Bytes::from_static(&[]);
+pub(crate) const UNBOUNDED_HIGH: Bytes = Bytes::from_static(&[0xff]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyRange {
@@ -16,10 +21,17 @@ pub(crate) struct KeyRange {
 }
 
 impl KeyRange {
-	pub(crate) fn new(range: (Value, Value)) -> Self {
+	pub(crate) fn new(low: Value, high: Value) -> Self {
 		KeyRange {
-			low: range.0,
-			high: range.1,
+			low,
+			high,
+		}
+	}
+
+	pub(crate) fn unbounded() -> Self {
+		KeyRange {
+			low: UNBOUNDED_LOW,
+			high: UNBOUNDED_HIGH,
 		}
 	}
 
@@ -33,6 +45,87 @@ impl KeyRange {
 		KeyRange {
 			low: min(self.low.clone(), other.low.clone()),
 			high: max(self.high.clone(), other.high.clone()),
+		}
+	}
+}
+
+impl Default for KeyRange {
+	fn default() -> Self {
+		KeyRange::unbounded()
+	}
+}
+
+impl RangeBounds<Bytes> for KeyRange {
+	fn start_bound(&self) -> Bound<&Bytes> {
+		Bound::Included(&self.low)
+	}
+	fn end_bound(&self) -> Bound<&Bytes> {
+		Bound::Excluded(&self.high)
+	}
+}
+
+impl From<Range<&str>> for KeyRange {
+	fn from(range: Range<&str>) -> Self {
+		KeyRange {
+			low: range.start.into_bytes(),
+			high: range.end.into_bytes(),
+		}
+	}
+}
+
+impl From<Range<Bytes>> for KeyRange {
+	fn from(range: Range<Bytes>) -> Self {
+		KeyRange {
+			low: range.start,
+			high: range.end,
+		}
+	}
+}
+
+impl From<(Bound<Bytes>, Bound<Bytes>)> for KeyRange {
+	fn from((low, high): (Bound<Bytes>, Bound<Bytes>)) -> Self {
+		let low = match low {
+			Bound::Included(key) => key.into_bytes(),
+			Bound::Excluded(key) => key.into_bytes(),
+			Bound::Unbounded => UNBOUNDED_LOW,
+		};
+		let high = match high {
+			Bound::Included(key) => key.into_bytes(),
+			Bound::Excluded(key) => key.into_bytes(),
+			Bound::Unbounded => UNBOUNDED_HIGH,
+		};
+
+		KeyRange {
+			low,
+			high,
+		}
+	}
+}
+
+impl From<(Bound<Vec<u8>>, Bound<Vec<u8>>)> for KeyRange {
+	fn from((low, high): (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Self {
+		let low = match low {
+			Bound::Included(key) => key.into_bytes(),
+			Bound::Excluded(key) => key.into_bytes(),
+			Bound::Unbounded => UNBOUNDED_LOW,
+		};
+		let high = match high {
+			Bound::Included(key) => key.into_bytes(),
+			Bound::Excluded(key) => key.into_bytes(),
+			Bound::Unbounded => UNBOUNDED_HIGH,
+		};
+		KeyRange {
+			low: low.into_bytes(),
+			high: high.into_bytes(),
+		}
+	}
+}
+
+impl<T: IntoBytes> From<(T, T)> for KeyRange {
+	fn from((start, end): (T, T)) -> Self {
+		KeyRange {
+			low: start.into_bytes(),
+			high: end.into_bytes(),
 		}
 	}
 }
@@ -145,8 +238,7 @@ impl Properties {
 			let first_element = buf.copy_to_bytes(size_first_element);
 			let size_second_element = buf.get_u64() as usize;
 			let second_element = buf.copy_to_bytes(size_second_element);
-			let range = (first_element, second_element);
-			Some(KeyRange::new(range))
+			Some(KeyRange::new(first_element, second_element))
 		} else {
 			None
 		};

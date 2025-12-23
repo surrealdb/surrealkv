@@ -647,33 +647,34 @@ pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound
 
 /// Converts a user-key range to an InternalKey range for efficient iteration.
 /// This function centralizes the conversion logic used across snapshot, table, and memtable.
-pub(crate) fn user_range_to_internal_range(
-	range: impl std::ops::RangeBounds<Vec<u8>>,
-) -> InternalKeyRange {
-	use bytes::Bytes;
+pub(crate) fn user_range_to_internal_range<R, B>(range: R) -> InternalKeyRange
+where
+	R: std::ops::RangeBounds<B>,
+	B: IntoBytes + Clone,
+{
 	use sstable::{
 		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
 	};
 
 	let start_bound = match range.start_bound() {
 		Bound::Included(key) => Bound::Included(InternalKey::new(
-			Bytes::from(key.clone()),
+			key.clone().into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 		Bound::Excluded(key) => {
-			Bound::Excluded(InternalKey::new(Bytes::from(key.clone()), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
 		Bound::Unbounded => Bound::Unbounded,
 	};
 
 	let end_bound = match range.end_bound() {
 		Bound::Included(key) => {
-			Bound::Included(InternalKey::new(Bytes::from(key.clone()), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
 		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-			Bytes::from(key.clone()),
+			key.clone().into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
