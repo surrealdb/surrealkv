@@ -4,12 +4,10 @@ use std::ops::{Bound, Range, RangeBounds};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::IntoBytes;
-use crate::{
-	error::Error,
-	sstable::{table::TableFormat, InternalKey},
-	CompressionType, Result, Value,
-};
+use crate::error::Error;
+use crate::sstable::table::TableFormat;
+use crate::sstable::InternalKey;
+use crate::{CompressionType, IntoBytes, Result, Value};
 
 pub(crate) const UNBOUNDED_LOW: Bytes = Bytes::from_static(&[]);
 pub(crate) const UNBOUNDED_HIGH: Bytes = Bytes::from_static(&[0xff]);
@@ -59,6 +57,7 @@ impl RangeBounds<Bytes> for KeyRange {
 	fn start_bound(&self) -> Bound<&Bytes> {
 		Bound::Included(&self.low)
 	}
+
 	fn end_bound(&self) -> Bound<&Bytes> {
 		Bound::Excluded(&self.high)
 	}

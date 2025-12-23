@@ -35,7 +35,9 @@ pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, Time
 
 use bytes::Bytes;
 use sstable::bloom::LevelDBBloomFilter;
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
+use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -49,6 +51,7 @@ impl IntoBytes for &[u8] {
 	fn as_slice(&self) -> &[u8] {
 		self
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::copy_from_slice(self)
 	}
@@ -58,6 +61,7 @@ impl<const N: usize> IntoBytes for &[u8; N] {
 	fn as_slice(&self) -> &[u8] {
 		&self[..]
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::copy_from_slice(&self[..])
 	}
@@ -67,6 +71,7 @@ impl IntoBytes for Vec<u8> {
 	fn as_slice(&self) -> &[u8] {
 		self.as_slice()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::from(self)
 	}
@@ -76,6 +81,7 @@ impl IntoBytes for &Vec<u8> {
 	fn as_slice(&self) -> &[u8] {
 		&self[..]
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::copy_from_slice(&self[..])
 	}
@@ -85,6 +91,7 @@ impl IntoBytes for Bytes {
 	fn as_slice(&self) -> &[u8] {
 		self.as_ref()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		self
 	}
@@ -94,6 +101,7 @@ impl IntoBytes for &Bytes {
 	fn as_slice(&self) -> &[u8] {
 		self.as_ref()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		self.clone()
 	}
@@ -103,6 +111,7 @@ impl IntoBytes for &str {
 	fn as_slice(&self) -> &[u8] {
 		self.as_bytes()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::copy_from_slice(self.as_bytes())
 	}
@@ -112,6 +121,7 @@ impl IntoBytes for String {
 	fn as_slice(&self) -> &[u8] {
 		self.as_bytes()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::from(self.into_bytes())
 	}
@@ -121,6 +131,7 @@ impl IntoBytes for &String {
 	fn as_slice(&self) -> &[u8] {
 		self.as_bytes()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::copy_from_slice(self.as_bytes())
 	}
@@ -130,6 +141,7 @@ impl IntoBytes for Box<[u8]> {
 	fn as_slice(&self) -> &[u8] {
 		self.as_ref()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		Bytes::from(self)
 	}
@@ -139,6 +151,7 @@ impl<'a> IntoBytes for Cow<'a, [u8]> {
 	fn as_slice(&self) -> &[u8] {
 		self.as_ref()
 	}
+
 	fn into_bytes(self) -> Bytes {
 		match self {
 			Cow::Borrowed(s) => Bytes::copy_from_slice(s),
@@ -148,7 +161,8 @@ impl<'a> IntoBytes for Cow<'a, [u8]> {
 }
 
 /// Type alias for iterator results containing key-value pairs
-/// Value is optional to support keys-only iteration without allocating empty values
+/// Value is optional to support keys-only iteration without allocating empty
+/// values
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
@@ -204,8 +218,8 @@ pub struct Options {
 	pub vlog_checksum_verification: VLogChecksumLevel,
 	/// If true, disables `VLog` creation entirely
 	pub enable_vlog: bool,
-	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 - 1.0)
-	/// Default: 0.5 (50% discardable data triggers GC)
+	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 -
+	/// 1.0) Default: 0.5 (50% discardable data triggers GC)
 	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
@@ -306,8 +320,8 @@ impl Options {
 	}
 
 	/// Sets compression per level. Vector index corresponds to level number.
-	/// If vector is shorter than level count, last compression type is used for higher levels.
-	/// If vector is empty, global compression setting is used.
+	/// If vector is shorter than level count, last compression type is used for
+	/// higher levels. If vector is empty, global compression setting is used.
 	///
 	/// # Example
 	///
@@ -325,8 +339,10 @@ impl Options {
 		self
 	}
 
-	/// Convenience method: no compression on L0, Snappy compression on other levels.
-	/// Equivalent to `with_compression_per_level(vec![CompressionType::None, CompressionType::SnappyCompression])`.
+	/// Convenience method: no compression on L0, Snappy compression on other
+	/// levels. Equivalent to
+	/// `with_compression_per_level(vec![CompressionType::None,
+	/// CompressionType::SnappyCompression])`.
 	///
 	/// # Example
 	///
@@ -356,7 +372,8 @@ impl Options {
 		self
 	}
 
-	/// Sets the unified block cache capacity (includes data blocks, index blocks, and VLog values)
+	/// Sets the unified block cache capacity (includes data blocks, index
+	/// blocks, and VLog values)
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
 		self
@@ -395,7 +412,8 @@ impl Options {
 	}
 
 	/// Enables or disables versioned queries with timestamp tracking
-	/// When enabled, automatically configures VLog and value threshold for optimal versioned query support
+	/// When enabled, automatically configures VLog and value threshold for
+	/// optimal versioned query support
 	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
 		self.versioned_history_retention_ns = retention_ns;
@@ -410,9 +428,10 @@ impl Options {
 
 	/// Controls whether to flush the active memtable during database shutdown.
 	///
-	/// When enabled, ensures all in-memory data is persisted to SSTables before closing,
-	/// at the cost of slower shutdown. When disabled, allows faster shutdown but unpersisted
-	/// data in the active memtable will be lost if WAL is not enabled.
+	/// When enabled, ensures all in-memory data is persisted to SSTables before
+	/// closing, at the cost of slower shutdown. When disabled, allows faster
+	/// shutdown but unpersisted data in the active memtable will be lost if
+	/// WAL is not enabled.
 	///
 	/// # Arguments
 	///
@@ -426,7 +445,8 @@ impl Options {
 		self
 	}
 
-	/// Sets the WAL recovery mode to control behavior when corruption is detected.
+	/// Sets the WAL recovery mode to control behavior when corruption is
+	/// detected.
 	///
 	/// # Arguments
 	///
@@ -518,7 +538,8 @@ impl Options {
 	}
 
 	/// Validates the configuration options for consistency and correctness
-	/// This should be called when the store starts to catch configuration errors early
+	/// This should be called when the store starts to catch configuration
+	/// errors early
 	pub fn validate(&self) -> Result<()> {
 		// Validate VLog GC discard ratio
 		if !(0.0..=1.0).contains(&self.vlog_gc_discard_ratio) {
@@ -537,7 +558,8 @@ impl Options {
 				));
 			}
 
-			// Versioned queries don't work well with value threshold (values should go to VLog)
+			// Versioned queries don't work well with value threshold (values should go to
+			// VLog)
 			if self.vlog_value_threshold > 0 {
 				return Err(Error::InvalidArgument(
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
@@ -616,13 +638,13 @@ pub(crate) trait Iterator {
 	fn seek(&mut self, target: &[u8]) -> Option<()>;
 
 	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the source.
-	/// REQUIRES: `valid()`
+	/// valid iff the iterator was not positioned at the last entry in the
+	/// source. REQUIRES: `valid()`
 	fn advance(&mut self) -> bool;
 
-	/// Moves to the previous entry in the source.  After this call, the iterator
-	/// is valid iff the iterator was not positioned at the first entry in source.
-	/// REQUIRES: `valid()`
+	/// Moves to the previous entry in the source.  After this call, the
+	/// iterator is valid iff the iterator was not positioned at the first
+	/// entry in source. REQUIRES: `valid()`
 	fn prev(&mut self) -> bool;
 
 	/// Return the key for the current entry.  The underlying storage for
@@ -646,14 +668,18 @@ pub(crate) type InternalKeyRangeBound = Bound<sstable::InternalKey>;
 pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
 /// Converts a user-key range to an InternalKey range for efficient iteration.
-/// This function centralizes the conversion logic used across snapshot, table, and memtable.
+/// This function centralizes the conversion logic used across snapshot, table,
+/// and memtable.
 pub(crate) fn user_range_to_internal_range<R, B>(range: R) -> InternalKeyRange
 where
 	R: std::ops::RangeBounds<B>,
 	B: IntoBytes + Clone,
 {
 	use sstable::{
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+		InternalKey,
+		InternalKeyKind,
+		INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	};
 
 	let start_bound = match range.start_bound() {

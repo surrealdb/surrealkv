@@ -10,9 +10,10 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-// This is the maximum valid sequence number that can be stored in the upper 56 bits of a 64-bit integer.
-// 1 << 56 shifts the number 1 left by 56 bits, resulting in a binary number with a 1 followed by 56 zeros.
-// Subtracting 1 gives a binary number with 56 ones, which is the maximum value for 56 bits.
+// This is the maximum valid sequence number that can be stored in the upper 56
+// bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
+// resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
+// gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 
@@ -169,7 +170,8 @@ impl InternalKey {
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (ascending - older timestamps first)
+	/// First compares by user key, then by timestamp (ascending - older
+	/// timestamps first)
 	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
@@ -183,8 +185,8 @@ impl InternalKey {
 // Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with timestamp as final tiebreaker
-		// First compare by user key (ascending)
+		// Same as InternalKey: user key, then sequence number, then kind, with
+		// timestamp as final tiebreaker First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
 			// If user keys are equal, compare by sequence number (descending)
 			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),

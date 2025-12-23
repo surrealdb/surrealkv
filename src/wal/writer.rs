@@ -3,8 +3,15 @@ use std::io;
 use crc32fast::Hasher;
 
 use super::{
-	BufferedFileWriter, CompressionType, Error, IOError, RecordType, Result, WritableFile,
-	BLOCK_SIZE, HEADER_SIZE,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	WritableFile,
+	BLOCK_SIZE,
+	HEADER_SIZE,
 };
 
 /// Writer for WAL records.
@@ -15,7 +22,8 @@ pub struct Writer {
 	/// Current offset within the current block (0 to BLOCK_SIZE).
 	block_offset: usize,
 
-	/// If true, writes are not automatically flushed. User must call write_buffer().
+	/// If true, writes are not automatically flushed. User must call
+	/// write_buffer().
 	manual_flush: bool,
 
 	/// The compression type to use for records.
@@ -57,8 +65,9 @@ impl Writer {
 
 	/// Adds a record to the WAL.
 	///
-	/// The record is automatically fragmented if it doesn't fit in the current block.
-	/// If manual_flush is false, the data is automatically flushed to disk.
+	/// The record is automatically fragmented if it doesn't fit in the current
+	/// block. If manual_flush is false, the data is automatically flushed to
+	/// disk.
 	///
 	/// # Parameters
 	/// - `slice`: The data to write.

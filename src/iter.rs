@@ -1,12 +1,13 @@
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
-use crate::{sstable::InternalKey, Key, Value};
+use crate::sstable::InternalKey;
+use crate::{Key, Value};
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
 
@@ -92,7 +93,8 @@ pub(crate) struct CompactionIterator<'a> {
 	/// Reference to VLog for populating delete-list
 	vlog: Option<Arc<VLog>>,
 
-	/// Batch of stale entries to add to delete-list: (sequence_number, value_size)
+	/// Batch of stale entries to add to delete-list: (sequence_number,
+	/// value_size)
 	delete_list_batch: Vec<(u64, u64)>,
 
 	/// Versioning configuration
@@ -158,7 +160,8 @@ impl<'a> CompactionIterator<'a> {
 	}
 
 	/// Process all accumulated versions of the current key
-	/// Filters out stale entries and populates output_versions with valid entries
+	/// Filters out stale entries and populates output_versions with valid
+	/// entries
 	fn process_accumulated_versions(&mut self) {
 		if self.accumulated_versions.is_empty() {
 			return;
@@ -186,19 +189,24 @@ impl<'a> CompactionIterator<'a> {
 				// If latest version is DELETE at bottom level, mark ALL versions as stale
 				true
 			} else if is_latest && !is_hard_delete && !is_replace {
-				// Latest version of a regular SET operation: never mark as stale (it's being returned)
+				// Latest version of a regular SET operation: never mark as stale (it's being
+				// returned)
 				false
 			} else if is_latest && is_hard_delete && self.is_bottom_level {
-				// Latest version of a DELETE operation at bottom level: mark as stale (not returned)
+				// Latest version of a DELETE operation at bottom level: mark as stale (not
+				// returned)
 				true
 			} else if is_latest && is_hard_delete && !self.is_bottom_level {
-				// Latest version of a DELETE operation at non-bottom level: don't mark as stale (it's being returned)
+				// Latest version of a DELETE operation at non-bottom level: don't mark as stale
+				// (it's being returned)
 				false
 			} else if is_latest && is_replace {
-				// Latest version of a Replace operation: don't mark as stale (it's being returned)
+				// Latest version of a Replace operation: don't mark as stale (it's being
+				// returned)
 				false
 			} else if is_hard_delete {
-				// For older DELETE operations (hard delete entries): always mark as stale since they don't have VLog values
+				// For older DELETE operations (hard delete entries): always mark as stale since
+				// they don't have VLog values
 				true
 			} else if has_set_with_delete && !is_replace {
 				// If there's a Replace operation, mark all older non-Replace versions as stale
@@ -275,7 +283,8 @@ impl Iterator for CompactionIterator<'_> {
 		loop {
 			// First, return any pending output versions
 			if !self.output_versions.is_empty() {
-				// Remove from front to maintain sequence number order (already sorted descending)
+				// Remove from front to maintain sequence number order (already sorted
+				// descending)
 				return Some(self.output_versions.remove(0));
 			}
 
@@ -340,11 +349,9 @@ impl Iterator for CompactionIterator<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{
-		clock::MockLogicalClock,
-		sstable::{InternalKey, InternalKeyKind},
-		Options, VLogChecksumLevel, Value,
-	};
+	use crate::clock::MockLogicalClock;
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::{Options, VLogChecksumLevel, Value};
 	use bytes::Bytes;
 	use std::sync::Arc;
 	use tempfile::TempDir;
@@ -497,7 +504,8 @@ mod tests {
 		}
 
 		// 3. Check that we have the correct total number of entries
-		// All keys (20) because we get 5 keys with hard delete entries from items1 and 15 other keys from items2
+		// All keys (20) because we get 5 keys with hard delete entries from items1 and
+		// 15 other keys from items2
 		assert_eq!(result.len(), 20, "Wrong number of entries");
 	}
 
@@ -785,7 +793,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Both hard_delete and older value should be added to delete list
-		// At bottom level, both the hard_delete and the older value should be marked as stale
+		// At bottom level, both the hard_delete and the older value should be marked as
+		// stale
 		assert!(
 			vlog.is_stale(200).unwrap(),
 			"hard_delete (seq=200) should be marked as stale at bottom level"
@@ -836,7 +845,8 @@ mod tests {
 		// Only the older value should be added to delete list (not the hard_delete)
 		// Check that the older value (seq=100) is marked as stale
 		assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
-		// Check that the hard_delete (seq=200) is NOT marked as stale (since it was returned)
+		// Check that the hard_delete (seq=200) is NOT marked as stale (since it was
+		// returned)
 		assert!(
 			!vlog.is_stale(200).unwrap(),
 			"hard_delete (seq=200) should NOT be marked as stale since it was returned"
@@ -909,7 +919,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Verify delete list behavior for complex scenario:
-		// Key1: seq=100 should be stale (older version), seq=200 should NOT be stale (latest, returned)
+		// Key1: seq=100 should be stale (older version), seq=200 should NOT be stale
+		// (latest, returned)
 		assert!(
 			vlog.is_stale(100).unwrap(),
 			"Key1 older version (seq=100) should be marked as stale"
@@ -919,7 +930,8 @@ mod tests {
 			"Key1 latest version (seq=200) should NOT be marked as stale since it was returned"
 		);
 
-		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale (latest hard_delete, returned)
+		// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale
+		// (latest hard_delete, returned)
 		assert!(
 			vlog.is_stale(110).unwrap(),
 			"Key2 older version (seq=110) should be marked as stale"
@@ -1056,7 +1068,8 @@ mod tests {
 		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Verify delete list behavior for sequence ordering test:
-		// key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be stale (latest, returned)
+		// key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be
+		// stale (latest, returned)
 		assert!(
 			vlog.is_stale(100).unwrap(),
 			"key_a oldest version (seq=100) should be marked as stale"
@@ -1076,7 +1089,8 @@ mod tests {
 			"key_b only version (seq=250) should NOT be marked as stale since it was returned"
 		);
 
-		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be stale (latest hard_delete, returned)
+		// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be
+		// stale (latest hard_delete, returned)
 		assert!(
 			vlog.is_stale(120).unwrap(),
 			"key_c oldest version (seq=120) should be marked as stale"
@@ -1180,10 +1194,12 @@ mod tests {
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
 
-		// With versioning enabled and retention period of 5 seconds, should get 7 items total:
+		// With versioning enabled and retention period of 5 seconds, should get 7 items
+		// total:
 		// - key1: 3 versions (all within retention)
 		// - key2: 3 versions (all within retention)
-		// - key3: 1 version (only recent one, very old versions filtered out due to retention)
+		// - key3: 1 version (only recent one, very old versions filtered out due to
+		//   retention)
 		assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
 
 		// Verify we get all versions of key1 (all within retention)
@@ -1196,7 +1212,8 @@ mod tests {
 			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
 		assert_eq!(key2_versions.len(), 3, "key2 should have 3 versions within retention");
 
-		// Verify we get only the recent version of key3 (very old versions outside retention)
+		// Verify we get only the recent version of key3 (very old versions outside
+		// retention)
 		let key3_versions: Vec<_> =
 			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
 		assert_eq!(
@@ -1286,8 +1303,9 @@ mod tests {
 		let old_time = current_time - 3_000_000_000; // 3 seconds ago (within retention)
 		let very_old_time = current_time - 10_000_000_000; // 10 seconds ago (OUTSIDE retention)
 
-		// Test case 1: DELETE marker is latest at bottom level - entire key should be discarded
-		// Expected: All versions (DELETE + SETs) marked as stale and discarded
+		// Test case 1: DELETE marker is latest at bottom level - entire key should be
+		// discarded Expected: All versions (DELETE + SETs) marked as stale and
+		// discarded
 		let key1_recent_set =
 			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, recent_time);
 		let key1_old_set =
@@ -1309,8 +1327,9 @@ mod tests {
 		let key3_recent_set =
 			create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Set, recent_time);
 
-		// Test case 4: Very old DELETE marker is latest at bottom level - entire key discarded
-		// Expected: All versions (DELETE + SET) marked as stale and discarded
+		// Test case 4: Very old DELETE marker is latest at bottom level - entire key
+		// discarded Expected: All versions (DELETE + SET) marked as stale and
+		// discarded
 		let key4_old_set =
 			create_internal_key_with_timestamp("key4", 800, InternalKeyKind::Set, old_time);
 		let key4_very_old_delete =
@@ -1409,7 +1428,8 @@ mod tests {
 
 		// Verify staleness behavior:
 
-		// key1: DELETE is latest at bottom level, so ALL versions should be marked as stale
+		// key1: DELETE is latest at bottom level, so ALL versions should be marked as
+		// stale
 		assert!(
 			vlog.is_stale(300).unwrap(),
 			"key1 DELETE (seq=300) SHOULD be marked as stale (latest DELETE at bottom level)"
@@ -1443,7 +1463,8 @@ mod tests {
 			"key3 very old SET (seq=500) SHOULD be marked as stale (outside retention period)"
 		);
 
-		// key4: DELETE is latest at bottom level, so ALL versions should be marked as stale
+		// key4: DELETE is latest at bottom level, so ALL versions should be marked as
+		// stale
 		assert!(
 		vlog.is_stale(900).unwrap(),
 		"key4 very old DELETE (seq=900) SHOULD be marked as stale (latest DELETE at bottom level)"
@@ -1477,8 +1498,8 @@ mod tests {
 		let key1_recent_set =
 			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Set, recent_time);
 
-		// Test case 2: Latest is DELETE at non-bottom level - DELETE should be preserved
-		// Expected: Only DELETE (seq=600) kept, older SETs marked stale
+		// Test case 2: Latest is DELETE at non-bottom level - DELETE should be
+		// preserved Expected: Only DELETE (seq=600) kept, older SETs marked stale
 		let key2_old_set =
 			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
 		let key2_recent_set =
@@ -1527,7 +1548,8 @@ mod tests {
 
 		let result: Vec<_> = comp_iter.by_ref().collect();
 
-		// Without versioning at non-bottom level, should get 3 items (only latest versions):
+		// Without versioning at non-bottom level, should get 3 items (only latest
+		// versions):
 		// - key1: 1 version (latest SET, seq=300)
 		// - key2: 1 version (latest DELETE, seq=600)
 		// - key3: 1 version (DELETE, seq=700)
@@ -1621,8 +1643,8 @@ mod tests {
 		let key1_recent_set =
 			create_internal_key_with_timestamp("key1", 300, InternalKeyKind::Set, recent_time);
 
-		// Test case 2: Latest is DELETE at bottom level - entire key should be discarded
-		// Expected: All versions marked stale, nothing returned
+		// Test case 2: Latest is DELETE at bottom level - entire key should be
+		// discarded Expected: All versions marked stale, nothing returned
 		let key2_old_set =
 			create_internal_key_with_timestamp("key2", 400, InternalKeyKind::Set, old_time);
 		let key2_recent_set =
@@ -1723,7 +1745,8 @@ mod tests {
 			"key1 very old SET (seq=100) SHOULD be marked as stale (older version)"
 		);
 
-		// key2: DELETE is latest at bottom level, ALL versions should be marked as stale
+		// key2: DELETE is latest at bottom level, ALL versions should be marked as
+		// stale
 		assert!(
 			vlog.is_stale(600).unwrap(),
 			"key2 DELETE (seq=600) SHOULD be marked as stale (latest DELETE at bottom level)"
@@ -1796,7 +1819,8 @@ mod tests {
 				"Soft delete (seq=200) should NOT be marked as stale - it respects retention period"
 			);
 
-			// Old value should be marked as stale (older version, respects retention period)
+			// Old value should be marked as stale (older version, respects retention
+			// period)
 			assert!(
 				vlog.is_stale(100).unwrap(),
 				"Old value (seq=100) should be marked as stale - older version beyond retention period"
@@ -2598,7 +2622,8 @@ mod tests {
 
 			// The Replace should be marked as stale
 			assert!(vlog.is_stale(2000).unwrap());
-			// Note: Delete at bottom level doesn't get marked as stale since it's not returned
+			// Note: Delete at bottom level doesn't get marked as stale since
+			// it's not returned
 		}
 
 		// Test case 8: Multiple Replace operations followed by Delete
@@ -2869,7 +2894,8 @@ mod tests {
 
 			// The Replace should be marked as stale
 			assert!(vlog.is_stale(3400).unwrap());
-			// Note: Delete at bottom level doesn't get marked as stale since it's not returned
+			// Note: Delete at bottom level doesn't get marked as stale since
+			// it's not returned
 		}
 	}
 }

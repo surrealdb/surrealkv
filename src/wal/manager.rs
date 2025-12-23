@@ -4,8 +4,17 @@ use std::path::{Path, PathBuf};
 
 use super::writer::Writer;
 use super::{
-	get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
-	RecordType, Result, BLOCK_SIZE, HEADER_SIZE,
+	get_segment_range,
+	segment_name,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	Options,
+	RecordType,
+	Result,
+	BLOCK_SIZE,
+	HEADER_SIZE,
 };
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
@@ -55,19 +64,21 @@ impl Wal {
 
 	/// Opens or creates a WAL instance starting at a specific log number.
 	///
-	/// This is used when the manifest indicates a specific log_number should be used,
-	/// avoiding the creation of intermediate empty WAL files.
+	/// This is used when the manifest indicates a specific log_number should be
+	/// used, avoiding the creation of intermediate empty WAL files.
 	///
 	/// # Arguments
 	///
 	/// * `dir` - WAL directory path
-	/// * `min_log_number` - Minimum log number (actual may be higher if existing segments exist)
+	/// * `min_log_number` - Minimum log number (actual may be higher if
+	///   existing segments exist)
 	/// * `opts` - WAL options
 	///
 	/// # Behavior
 	///
-	/// Uses `max(min_log_number, highest_on_disk)` as the actual starting log number.
-	/// This ensures we never write to a log number lower than existing segments on disk.
+	/// Uses `max(min_log_number, highest_on_disk)` as the actual starting log
+	/// number. This ensures we never write to a log number lower than existing
+	/// segments on disk.
 	pub(crate) fn open_with_min_log_number(
 		dir: &Path,
 		min_log_number: u64,
@@ -115,7 +126,8 @@ impl Wal {
 	}
 
 	/// Creates a new Writer for the given log number.
-	/// If the segment file already exists, appends to it instead of overwriting.
+	/// If the segment file already exists, appends to it instead of
+	/// overwriting.
 	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<Writer> {
 		let extension = opts.file_extension.as_deref().unwrap_or("wal");
 		let file_name = segment_name(log_number, extension);
@@ -129,7 +141,8 @@ impl Wal {
 
 		if existing_size > 0 {
 			// Existing file: detect the compression type from the file itself.
-			// This prevents compression mismatch bugs when reopening with different options.
+			// This prevents compression mismatch bugs when reopening with different
+			// options.
 			let detected_compression = Self::detect_compression_type(&file_path)?;
 
 			// Calculate block_offset from file size
@@ -157,7 +170,8 @@ impl Wal {
 	/// Detects the compression type used in an existing WAL file.
 	///
 	/// Reads the first record's header. If it's a SetCompressionType record,
-	/// parses and returns that compression type. Otherwise returns None (no compression).
+	/// parses and returns that compression type. Otherwise returns None (no
+	/// compression).
 	fn detect_compression_type(file_path: &Path) -> Result<CompressionType> {
 		let mut file = File::open(file_path)?;
 
@@ -296,7 +310,8 @@ impl Wal {
 	///
 	/// # Arguments
 	///
-	/// * `rec` - A reference to the byte slice containing the record to be appended.
+	/// * `rec` - A reference to the byte slice containing the record to be
+	///   appended.
 	///
 	/// # Returns
 	///
@@ -304,8 +319,8 @@ impl Wal {
 	///
 	/// # Errors
 	///
-	/// This function may return an error if the WAL is closed, the provided record
-	/// is empty, or any I/O error occurs during the write.
+	/// This function may return an error if the WAL is closed, the provided
+	/// record is empty, or any I/O error occurs during the write.
 	pub(crate) fn append(&mut self, rec: &[u8]) -> Result<u64> {
 		if self.closed {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "WAL is closed")));
@@ -487,7 +502,8 @@ mod tests {
 			".wal.repair files should be cleaned up"
 		);
 
-		// Verify a new WAL file was created (since directory was empty of valid segments)
+		// Verify a new WAL file was created (since directory was empty of valid
+		// segments)
 		assert!(
 			wal_dir.join("00000000000000000000.wal").exists(),
 			"New WAL file should be created"
@@ -607,12 +623,13 @@ mod tests {
 	}
 
 	/// Test: Verify that reopening a WAL with different compression settings
-	/// correctly uses the file's original compression type (not the new options).
+	/// correctly uses the file's original compression type (not the new
+	/// options).
 	///
-	/// This test verifies the fix for a bug where reopening a WAL with different
-	/// compression options would cause data corruption - new records would be
-	/// compressed differently without a SetCompressionType header, causing the
-	/// reader to fail to decompress them correctly.
+	/// This test verifies the fix for a bug where reopening a WAL with
+	/// different compression options would cause data corruption - new records
+	/// would be compressed differently without a SetCompressionType header,
+	/// causing the reader to fail to decompress them correctly.
 	#[test]
 	fn test_wal_compression_type_detected_on_reopen() {
 		use crate::wal::reader::Reader;
@@ -707,7 +724,8 @@ mod tests {
 	}
 
 	/// Test: Verify that when a WAL is opened with compression enabled,
-	/// the SetCompressionType record is written and can be read back by the Reader.
+	/// the SetCompressionType record is written and can be read back by the
+	/// Reader.
 	///
 	/// This test opens a WAL with compression, writes data, then verifies
 	/// that the Reader correctly detects the compression type from the file.
@@ -738,7 +756,8 @@ mod tests {
 			"Compression type should be None before reading any records"
 		);
 
-		// Read the first data record - this should trigger reading the SetCompressionType record first
+		// Read the first data record - this should trigger reading the
+		// SetCompressionType record first
 		let (data, _) = reader.read().expect("should read first record");
 		assert_eq!(data, b"test_data", "Data should match what was written");
 
@@ -784,12 +803,15 @@ mod tests {
 		);
 	}
 
-	/// Tests that `open_with_min_log_number` uses `max(min_log_number, highest_on_disk)`.
+	/// Tests that `open_with_min_log_number` uses `max(min_log_number,
+	/// highest_on_disk)`.
 	///
 	/// This verifies the fix for a data loss bug:
-	/// - Scenario: Crash with segments #1, #2, #3 on disk, manifest log_number=1
+	/// - Scenario: Crash with segments #1, #2, #3 on disk, manifest
+	///   log_number=1
 	/// - Without fix: WAL opens at segment 1, new writes go there
-	/// - If flush updates log_number to 2, then crash → segment 1 skipped → DATA LOSS
+	/// - If flush updates log_number to 2, then crash → segment 1 skipped →
+	///   DATA LOSS
 	/// - With fix: WAL opens at segment 3 (highest), new writes safe
 	#[test]
 	fn test_open_with_min_log_number_uses_highest_segment() {
@@ -840,8 +862,9 @@ mod tests {
 		assert!(segments.contains(&2), "Segment 2 should exist");
 		assert!(segments.contains(&3), "Segment 3 should exist");
 
-		// Step 2: Test the fix - open with min_log_number=1 (as manifest would say after crash)
-		// The fix should cause WAL to open at segment 3 (highest on disk), not 1
+		// Step 2: Test the fix - open with min_log_number=1 (as manifest would say
+		// after crash) The fix should cause WAL to open at segment 3 (highest on
+		// disk), not 1
 		{
 			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts.clone()).unwrap();
 

@@ -1,5 +1,4 @@
 //! Compression tests for SSTable functionality
-//!
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,10 +9,8 @@ use rand::{Rng, SeedableRng};
 use tempdir::TempDir;
 use test_log::test;
 
-use crate::sstable::{
-	table::{Table, TableWriter},
-	InternalKey, InternalKeyKind,
-};
+use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::{CompressionType, Iterator, Options};
 
 // ========== Helper Functions ==========
@@ -334,7 +331,8 @@ fn test_compression_iterator_operations() {
 	}
 	assert_eq!(forward_count, 10_000);
 
-	// TableIterator prev() has complexity with partitions, so test basic backward movement
+	// TableIterator prev() has complexity with partitions, so test basic backward
+	// movement
 	iter.seek_to_last();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_ref(), &data[9999].0[..]);
@@ -1024,8 +1022,9 @@ async fn test_compression_per_level_with_different_levels() {
 	// Force flush and compaction
 	tree.flush().unwrap();
 
-	// The test mainly verifies that the system doesn't crash with per-level compression
-	// In a real LSM tree, we'd need to trigger compaction to higher levels to fully test
+	// The test mainly verifies that the system doesn't crash with per-level
+	// compression In a real LSM tree, we'd need to trigger compaction to higher
+	// levels to fully test
 
 	let txn = tree.begin().unwrap();
 	let result = txn.get(&keys[0]).unwrap();

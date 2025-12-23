@@ -2,16 +2,12 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::error::Error;
+use crate::batch::Batch;
+use crate::error::{Error, Result};
 use crate::lsm::fsync_directory;
-use crate::wal::list_segment_ids;
-use crate::wal::reader::Reporter;
-use crate::{
-	batch::Batch,
-	error::Result,
-	memtable::MemTable,
-	wal::{get_segment_range, reader::Reader, Error as WalError, SegmentRef},
-};
+use crate::memtable::MemTable;
+use crate::wal::reader::{Reader, Reporter};
+use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef};
 
 /// Default implementation of the Reporter trait for WAL recovery.
 ///
@@ -57,19 +53,22 @@ impl Reporter for DefaultReporter {
 ///
 /// * `wal_dir` - Path to the WAL directory
 /// * `memtable` - Memtable to replay entries into
-/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped as already flushed)
+/// * `min_wal_number` - Minimum WAL number to replay (older segments are
+///   skipped as already flushed)
 ///
 /// # Returns
 ///
-/// * `Ok(Some(max_seq_num))` - Data was replayed successfully, returns highest sequence number
+/// * `Ok(Some(max_seq_num))` - Data was replayed successfully, returns highest
+///   sequence number
 /// * `Ok(None)` - No data recovered (empty or all segments already flushed)
-/// * `Err(WalCorruption{...})` - Corruption detected, contains location for repair
+/// * `Err(WalCorruption{...})` - Corruption detected, contains location for
+///   repair
 /// * `Err(...)` - Other errors (IO, permission, etc.)
 ///
 /// # Partial State on Corruption
 ///
-/// When corruption is detected, the memtable will contain all successfully replayed data
-/// up to the corruption point.
+/// When corruption is detected, the memtable will contain all successfully
+/// replayed data up to the corruption point.
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	memtable: &Arc<MemTable>,
@@ -132,8 +131,9 @@ pub(crate) fn replay_wal(
 	// Process each segment in order from start_segment to last
 	for segment_id in start_segment..=last {
 		// Find this segment in the list
-		// Note: Gaps in segment IDs can be legitimate after cleanup or manual intervention.
-		// We warn and continue rather than fail, allowing partial recovery from available segments.
+		// Note: Gaps in segment IDs can be legitimate after cleanup or manual
+		// intervention. We warn and continue rather than fail, allowing partial
+		// recovery from available segments.
 		let segment = match all_segments.iter().find(|seg| seg.id == segment_id) {
 			Some(seg) => seg,
 			None => {
@@ -402,7 +402,8 @@ mod tests {
 		// Replay the WAL - should replay BOTH segments
 		let max_seq_num_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
-		// Verify both segments are replayed: max_seq_num should be 203 (highest from batch2)
+		// Verify both segments are replayed: max_seq_num should be 203 (highest from
+		// batch2)
 		assert_eq!(
 			max_seq_num_opt,
 			Some(203),
@@ -586,7 +587,8 @@ mod tests {
 		// Since the first record is corrupted, we should recover None (no valid data)
 		assert_eq!(max_seq_num, None, "Should have recovered None when first record is corrupted");
 
-		// Verify that the memtable contains no entries (since first record was corrupted)
+		// Verify that the memtable contains no entries (since first record was
+		// corrupted)
 		let entry_count = recovered_memtable.read().unwrap().iter(false).count();
 		assert_eq!(
 			entry_count, 0,
@@ -668,8 +670,9 @@ mod tests {
 		.unwrap();
 
 		// Verify the repair worked correctly
-		// Since the third batch is corrupted, we should recover data from the first two batches
-		// The max sequence number should be from batch 2 (201), not batch 3 (301)
+		// Since the third batch is corrupted, we should recover data from the first two
+		// batches The max sequence number should be from batch 2 (201), not batch 3
+		// (301)
 		assert_eq!(
 			max_seq_num,
 			Some(201),
@@ -848,7 +851,8 @@ mod tests {
 		wal.append(&encoded1).unwrap();
 		wal.rotate().unwrap();
 
-		// Segment 2: valid data (should NOT be processed due to corruption in segment 1)
+		// Segment 2: valid data (should NOT be processed due to corruption in segment
+		// 1)
 		let mut batch2 = Batch::new(300);
 		batch2.set(b"key2", b"value2", 0).unwrap();
 		wal.append(&batch2.encode().unwrap()).unwrap();
@@ -886,7 +890,8 @@ mod tests {
 			_ => panic!("Expected WalCorruption error in segment 1"),
 		}
 
-		// Verify only segment 0's data is in memtable (segment 2 should NOT be processed)
+		// Verify only segment 0's data is in memtable (segment 2 should NOT be
+		// processed)
 		let entry_count = memtable.iter(false).count();
 		assert_eq!(
 			entry_count, 1,

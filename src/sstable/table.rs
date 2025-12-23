@@ -16,12 +16,21 @@ use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::{size_of_writer_metadata, TableMetadata};
 use crate::sstable::{
-	InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+	InternalKey,
+	InternalKeyKind,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 use crate::vfs::File;
 use crate::{
-	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, InternalKeyRange,
-	Iterator as LSMIterator, Options, Value,
+	Comparator,
+	CompressionType,
+	FilterPolicy,
+	InternalKeyComparator,
+	InternalKeyRange,
+	Iterator as LSMIterator,
+	Options,
+	Value,
 };
 
 use super::meta::KeyRange;

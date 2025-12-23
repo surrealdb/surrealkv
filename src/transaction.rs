@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
+use std::collections::btree_map::Entry as BTreeEntry;
+use std::collections::{btree_map, BTreeMap};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -14,7 +15,8 @@ use crate::sstable::meta::{KeyRange, UNBOUNDED_HIGH, UNBOUNDED_LOW};
 use crate::sstable::InternalKeyKind;
 use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
 
-/// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
+/// `Mode` is an enumeration representing the different modes a transaction can
+/// have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
 	/// `ReadWrite` mode allows the transaction to both read and write data.
@@ -65,7 +67,8 @@ pub enum Durability {
 pub struct WriteOptions {
 	/// Durability level for the write operation
 	pub durability: Durability,
-	/// Optional timestamp for the write operation. If None, uses the current timestamp.
+	/// Optional timestamp for the write operation. If None, uses the current
+	/// timestamp.
 	pub timestamp: Option<u64>,
 }
 
@@ -106,7 +109,8 @@ pub struct ReadOptions {
 	pub(crate) keys_only: bool,
 	/// Iteration bounds
 	pub(crate) iterate_bounds: KeyRange,
-	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
+	/// Optional timestamp for point-in-time reads. If None, reads the latest
+	/// version.
 	pub(crate) timestamp: Option<u64>,
 }
 
@@ -154,16 +158,20 @@ impl ReadOptions {
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction {
-	/// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
+	/// `mode` is the transaction mode. This can be either `ReadWrite`,
+	/// `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
 
-	/// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
+	/// `durability` is the durability level of the transaction. This is used to
+	/// determine how the transaction is committed.
 	durability: Durability,
 
-	/// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
+	/// `snapshot` is the snapshot that the transaction is running in. This is a
+	/// consistent view of the data at the time the transaction started.
 	pub(crate) snapshot: Option<Snapshot>,
 
-	/// `core` is the underlying core for the transaction. This is shared between transactions.
+	/// `core` is the underlying core for the transaction. This is shared
+	/// between transactions.
 	pub(crate) core: Arc<Core>,
 
 	/// `write_set` is a map of keys to entries.
@@ -172,16 +180,19 @@ pub struct Transaction {
 	/// savepoints and rollbacks.
 	pub(crate) write_set: BTreeMap<Bytes, Vec<Entry>>,
 
-	/// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
+	/// `closed` indicates if the transaction is closed. A closed transaction
+	/// cannot make any more changes to the data.
 	closed: bool,
 
 	/// Tracks when this transaction started for deadlock detection
 	pub(crate) start_commit_id: u64,
 
-	/// `savepoints` indicates the current number of stacked savepoints; zero means none.
+	/// `savepoints` indicates the current number of stacked savepoints; zero
+	/// means none.
 	savepoints: u32,
 
-	/// write sequence number is used for real-time ordering of writes within a transaction.
+	/// write sequence number is used for real-time ordering of writes within a
+	/// transaction.
 	write_seqno: u32,
 }
 
@@ -283,7 +294,8 @@ impl Transaction {
 		self.delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	/// Delete all the versions of a key with custom write options. This is a
+	/// hard delete.
 	pub fn delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
 		K: IntoBytes,
@@ -313,7 +325,8 @@ impl Transaction {
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
+	/// Soft deletes a key at a specific timestamp. This will add a tombstone at
+	/// the specified timestamp.
 	pub fn soft_delete_at_version<K>(&mut self, key: K, timestamp: u64) -> Result<()>
 	where
 		K: IntoBytes,
@@ -321,7 +334,8 @@ impl Transaction {
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
-	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
+	/// Soft delete a key, with custom write options. This will add a tombstone
+	/// at the specified timestamp.
 	pub fn soft_delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
 		K: IntoBytes,
@@ -358,7 +372,8 @@ impl Transaction {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Inserts a key-value pair, removing all previous versions, with custom write options.
+	/// Inserts a key-value pair, removing all previous versions, with custom
+	/// write options.
 	pub fn replace_with_options<K, V>(
 		&mut self,
 		key: K,
@@ -435,7 +450,8 @@ impl Transaction {
 			};
 		}
 
-		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
+		// RYOW semantics: Read your own writes. If the value is in the write set,
+		// return it.
 		if let Some(last_entry) =
 			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
 		{
@@ -463,8 +479,9 @@ impl Transaction {
 
 	/// Counts keys in a range at the current timestamp.
 	///
-	/// Returns the number of valid (non-deleted) keys in the range [start, end).
-	/// The range is inclusive of the start key, but exclusive of the end key.
+	/// Returns the number of valid (non-deleted) keys in the range [start,
+	/// end). The range is inclusive of the start key, but exclusive of the end
+	/// key.
 	///
 	/// This is more efficient than creating an iterator and counting manually,
 	/// as it doesn't need to allocate or return the actual keys.
@@ -495,16 +512,17 @@ impl Transaction {
 
 	/// Counts keys with custom read options.
 	///
-	/// Returns the number of valid (non-deleted) keys that match the provided options.
-	/// The options can specify:
+	/// Returns the number of valid (non-deleted) keys that match the provided
+	/// options. The options can specify:
 	/// - Key range bounds (iterate_lower_bound, iterate_upper_bound)
 	/// - Timestamp for versioned queries
 	///
 	/// For versioned queries (when timestamp is specified), this requires
 	/// versioning to be enabled in the database options.
 	///
-	/// This method is optimized to avoid creating full iterators and resolving values
-	/// from the value log, making it much faster than manually counting iterator results.
+	/// This method is optimized to avoid creating full iterators and resolving
+	/// values from the value log, making it much faster than manually counting
+	/// iterator results.
 	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -550,7 +568,8 @@ impl Transaction {
 					match (snapshot_had_key, write_set_has_key) {
 						(false, true) => count += 1,                      // New key added
 						(true, false) => count = count.saturating_sub(1), // Key deleted
-						_ => {}                                           // No change (update or still deleted)
+						_ => {}                                           /* No change (update
+						                                                    * or still deleted) */
 					}
 				}
 			}
@@ -757,16 +776,19 @@ impl Transaction {
 
 	/// Gets all versions of keys in a range.
 	///
-	/// Returns all historical versions of keys within the specified range, including tombstones.
-	/// Range is [start, end) - start is inclusive, end is exclusive.
+	/// Returns all historical versions of keys within the specified range,
+	/// including tombstones. Range is [start, end) - start is inclusive, end
+	/// is exclusive.
 	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
 	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
+	/// * `limit` - Optional maximum number of versions to return. If None,
+	///   returns all versions.
 	///
 	/// # Returns
-	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for each version found.
+	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
+	/// each version found.
 	pub fn scan_all_versions<K>(
 		&self,
 		start: K,
@@ -795,9 +817,11 @@ impl Transaction {
 		}
 	}
 
-	/// Writes a value for a key with custom write options. None is used for deletion.
+	/// Writes a value for a key with custom write options. None is used for
+	/// deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -926,7 +950,8 @@ impl Transaction {
 	///
 	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
 	pub fn set_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -946,7 +971,8 @@ impl Transaction {
 	///
 	/// [`set_savepoint`]: Transaction::set_savepoint
 	pub fn rollback_to_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -1055,7 +1081,8 @@ impl Entry {
 	}
 }
 
-/// An iterator that performs a merging scan over a transaction's snapshot and write set.
+/// An iterator that performs a merging scan over a transaction's snapshot and
+/// write set.
 pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
@@ -1245,12 +1272,14 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, mem::size_of};
+	use std::collections::HashMap;
+	use std::mem::size_of;
 	use test_log::test;
 
 	use bytes::Bytes;
 
-	use crate::{lsm::Tree, Options, TreeBuilder};
+	use crate::lsm::Tree;
+	use crate::{Options, TreeBuilder};
 
 	use super::*;
 
@@ -2940,7 +2969,8 @@ mod tests {
 			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 		}
 
-		// Verify soft deleted key is not visible in range scans ([key1, key4) to include key3)
+		// Verify soft deleted key is not visible in range scans ([key1, key4) to
+		// include key3)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
@@ -3013,7 +3043,8 @@ mod tests {
 			// The key should appear as if it doesn't exist
 			assert!(tx.get(b"key1").unwrap().is_none());
 
-			// Range scan within transaction should not see soft deleted key ([key1, key3) to include key2)
+			// Range scan within transaction should not see soft deleted key ([key1, key3)
+			// to include key2)
 			let range: Vec<_> =
 				tx.range(b"key1", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key2
@@ -3092,7 +3123,8 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Range scan should not include soft deleted keys ([key01, key11) to include key10)
+		// Range scan should not include soft deleted keys ([key01, key11) to include
+		// key10)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
@@ -3150,7 +3182,8 @@ mod tests {
 			assert_eq!(tx.get(b"key4").unwrap().unwrap().as_ref(), b"value4"); // Unchanged
 		}
 
-		// Range scan should only see updated and unchanged keys ([key1, key5) to include key4)
+		// Range scan should only see updated and unchanged keys ([key1, key5) to
+		// include key4)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
@@ -3377,7 +3410,8 @@ mod tests {
 		.unwrap();
 		tx.commit().await.unwrap();
 
-		// Verify the value exists at the earlier timestamp but not at the delete timestamp
+		// Verify the value exists at the earlier timestamp but not at the delete
+		// timestamp
 		let tx = tree.begin().unwrap();
 		let value_before = tx
 			.get_with_options(
@@ -3921,7 +3955,8 @@ mod tests {
 		let all_versions = tx.scan_all_versions(b"key1", b"key5", None).unwrap();
 
 		// Should get all versions of all keys in the range
-		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
+		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of
+									 // key4
 
 		// Group by key to verify we have all versions
 		let mut key_versions: KeyVersionsMap = HashMap::new();
@@ -3997,7 +4032,8 @@ mod tests {
 		let tx = tree.begin().unwrap();
 		let all_versions = tx.scan_all_versions(b"key1", b"key3", None).unwrap();
 
-		// Should get all versions including soft delete markers, exclude hard-deleted keys
+		// Should get all versions including soft delete markers, exclude hard-deleted
+		// keys
 		assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
 
 		// Group by key to verify we have all versions

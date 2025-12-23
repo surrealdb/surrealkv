@@ -1,31 +1,36 @@
 //! Comparator implementations for key ordering.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::cmp::Ordering;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::sstable::{
-	InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+	InternalKey,
+	InternalKeyKind,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 /// A trait for comparing keys in a key-value store.
 ///
-/// This trait defines methods for comparing keys, generating separator keys, generating successor keys,
-/// and retrieving the name of the comparator.
+/// This trait defines methods for comparing keys, generating separator keys,
+/// generating successor keys, and retrieving the name of the comparator.
 pub trait Comparator: Send + Sync {
 	/// Compares two keys `a` and `b`.
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
 
 	/// Generates a separator key between two keys `from` and `to`.
 	///
-	/// This method should return a key that is greater than or equal to `from` and less than `to`.
-	/// It is used to optimize the storage layout by finding a midpoint key.
+	/// This method should return a key that is greater than or equal to `from`
+	/// and less than `to`. It is used to optimize the storage layout by
+	/// finding a midpoint key.
 	fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8>;
 
 	/// Generates the successor key of a given key.
 	///
-	/// This method should return a key that is lexicographically greater than the given key.
-	/// It is used to find the next key in the key space.
+	/// This method should return a key that is lexicographically greater than
+	/// the given key. It is used to find the next key in the key space.
 	fn successor(&self, key: &[u8]) -> Vec<u8>;
 
 	/// Retrieves the name of the comparator.
@@ -50,12 +55,14 @@ impl Comparator for BytewiseComparator {
 	}
 
 	#[inline]
-	/// Generates a separator key between two byte slices `a` (start) and `b` (limit).
+	/// Generates a separator key between two byte slices `a` (start) and `b`
+	/// (limit).
 	///
 	/// 1. Find the common prefix
 	/// 2. If one string is a prefix of the other, return unchanged
 	/// 3. At first differing byte, try to increment and truncate
-	/// 4. If that would exceed limit, scan forward for a non-0xFF byte to increment
+	/// 4. If that would exceed limit, scan forward for a non-0xFF byte to
+	///    increment
 	/// 5. If no shortening possible, return unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		let min_length = std::cmp::min(a.len(), b.len());
@@ -154,7 +161,8 @@ impl Comparator for InternalKeyComparator {
 	/// Generates a separator key between two internal keys.
 	///
 	/// 1. Extract user keys and compute a separator
-	/// 2. If separator is same length or shorter AND logically larger, use max seq_num
+	/// 2. If separator is same length or shorter AND logically larger, use max
+	///    seq_num
 	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
@@ -172,7 +180,8 @@ impl Comparator for InternalKeyComparator {
 			let sep =
 				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
 
-			// Use MAX_SEQUENCE_NUMBER when separator is same length or shorter AND logically larger
+			// Use MAX_SEQUENCE_NUMBER when separator is same length or shorter AND
+			// logically larger
 			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
@@ -214,8 +223,9 @@ impl Comparator for InternalKeyComparator {
 	}
 }
 
-/// A comparator that compares internal keys first by user key, then by timestamp
-/// This is used for versioned queries where we want to order by user key and timestamp
+/// A comparator that compares internal keys first by user key, then by
+/// timestamp This is used for versioned queries where we want to order by user
+/// key and timestamp
 #[derive(Clone)]
 pub struct TimestampComparator {
 	user_comparator: Arc<dyn Comparator>,
@@ -245,7 +255,8 @@ impl Comparator for TimestampComparator {
 	/// Generates a separator key between two internal keys.
 	///
 	/// 1. Extract user keys and compute a separator
-	/// 2. If separator is same length or shorter AND logically larger, use max seq_num/timestamp
+	/// 2. If separator is same length or shorter AND logically larger, use max
+	///    seq_num/timestamp
 	/// 3. Otherwise return the original key unchanged
 	fn separator(&self, a: &[u8], b: &[u8]) -> Vec<u8> {
 		if a == b {
@@ -263,7 +274,8 @@ impl Comparator for TimestampComparator {
 			let sep =
 				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
 
-			// Use MAX_TIMESTAMP when separator is same length or shorter AND logically larger
+			// Use MAX_TIMESTAMP when separator is same length or shorter AND logically
+			// larger
 			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
@@ -286,7 +298,8 @@ impl Comparator for TimestampComparator {
 		let internal_key = InternalKey::decode(key);
 		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
 
-		// If successor is same length or shorter AND logically larger, use max seq_num/timestamp
+		// If successor is same length or shorter AND logically larger, use max
+		// seq_num/timestamp
 		if user_key_succ.len() <= internal_key.user_key.len()
 			&& self.user_comparator.compare(internal_key.user_key.as_ref(), &user_key_succ)
 				== Ordering::Less
@@ -633,7 +646,8 @@ mod tests {
 		InternalKey::new(Bytes::from(user_key.to_vec()), seq, kind, 0).encode()
 	}
 
-	/// Helper to create an encoded internal key with max seq num (for expected separator results)
+	/// Helper to create an encoded internal key with max seq num (for expected
+	/// separator results)
 	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
 		InternalKey::new(
 			Bytes::from(user_key.to_vec()),
@@ -701,8 +715,8 @@ mod tests {
 	fn test_internal_key_short_separator_different_user_keys() {
 		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
 
-		// When user keys are different and correctly ordered, should shorten with max seq
-		// "foo" vs "hello" -> "g" with max seq
+		// When user keys are different and correctly ordered, should shorten with max
+		// seq "foo" vs "hello" -> "g" with max seq
 		let result = cmp.separator(
 			&ikey(b"foo", 100, InternalKeyKind::Set),
 			&ikey(b"hello", 200, InternalKeyKind::Set),

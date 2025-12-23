@@ -1,17 +1,13 @@
 // This commit pipeline is inspired by Pebble's commit pipeline.
 
-use std::sync::{
-	atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-	Arc,
-};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Semaphore};
 
-use crate::{
-	batch::Batch,
-	error::{Error, Result},
-};
+use crate::batch::Batch;
+use crate::error::{Error, Result};
 
 const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
@@ -131,7 +127,8 @@ impl CommitQueue {
 		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
 	}
 
-	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is applied
+	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is
+	// applied
 	fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
 		loop {
 			let ptrs = self.head_tail.load(Ordering::Acquire);

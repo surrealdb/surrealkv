@@ -1,5 +1,11 @@
 use criterion::{
-	black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+	black_box,
+	criterion_group,
+	criterion_main,
+	BatchSize,
+	BenchmarkId,
+	Criterion,
+	Throughput,
 };
 use rand::Rng;
 use std::sync::Arc;

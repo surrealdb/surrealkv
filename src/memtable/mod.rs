@@ -1,24 +1,21 @@
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
-use std::{
-	fs::File as SysFile,
-	sync::{
-		atomic::{AtomicU32, AtomicU64, Ordering},
-		Arc,
-	},
-};
+use std::fs::File as SysFile;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::{
-	batch::Batch,
-	error::Result,
-	iter::CompactionIterator,
-	sstable::{
-		table::{Table, TableWriter},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
-	},
-	vfs::File,
-	InternalKeyRange, Options, Value,
+use crate::batch::Batch;
+use crate::error::Result;
+use crate::iter::CompactionIterator;
+use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::{
+	InternalKey,
+	InternalKeyKind,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
+use crate::vfs::File;
+use crate::{InternalKeyRange, Options, Value};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -37,7 +34,8 @@ pub(crate) struct ImmutableEntry {
 pub(crate) struct ImmutableMemtables(Vec<ImmutableEntry>);
 
 impl ImmutableMemtables {
-	/// Adds an immutable memtable entry with its associated table ID and WAL number.
+	/// Adds an immutable memtable entry with its associated table ID and WAL
+	/// number.
 	pub(crate) fn add(&mut self, table_id: u64, wal_number: u64, memtable: Arc<MemTable>) {
 		self.0.push(ImmutableEntry {
 			table_id,
@@ -124,11 +122,13 @@ impl MemTable {
 
 	/// Adds a batch of operations to the memtable.
 	/// This includes appending the batch to the Write-Ahead Log (WAL),
-	/// applying the batch to the in-memory table, and updating the memtable size and latest sequence number.
+	/// applying the batch to the in-memory table, and updating the memtable
+	/// size and latest sequence number.
 	///
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
-	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive numbers)
+	/// * `starting_seq_num` - The starting sequence number for this batch
+	///   (records get consecutive numbers)
 	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
 		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
 		let size_before = self.update_memtable_size(record_size);
@@ -141,7 +141,8 @@ impl MemTable {
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
 
-		// Pre-allocate empty value Bytes for delete operations to avoid repeated allocations
+		// Pre-allocate empty value Bytes for delete operations to avoid repeated
+		// allocations
 		let empty_val: Value = Bytes::new();
 
 		// Process entries with pre-encoded ValueLocations
@@ -172,13 +173,15 @@ impl MemTable {
 		key.size() as u32 + value.len() as u32
 	}
 
-	/// Updates the size of the memtable by adding the size of the newly added records.
+	/// Updates the size of the memtable by adding the size of the newly added
+	/// records.
 	fn update_memtable_size(&self, record_size: u32) -> u32 {
 		self.map_size.fetch_add(record_size, std::sync::atomic::Ordering::AcqRel)
 	}
 
 	/// Updates the latest sequence number in the memtable.
-	/// This ensures that the memtable always has the highest sequence number of the operations it contains.
+	/// This ensures that the memtable always has the highest sequence number of
+	/// the operations it contains.
 	fn update_latest_sequence_number(&self, current_seq_num: u64) {
 		let mut prev_seq_num = self.latest_seq_num.load(Ordering::Acquire);
 		while current_seq_num > prev_seq_num {
@@ -406,14 +409,16 @@ mod tests {
 		let mut last_seq = 0;
 
 		// For test purposes, if custom sequence numbers are provided, we need to add
-		// each entry individually to ensure they get the exact sequence number specified
+		// each entry individually to ensure they get the exact sequence number
+		// specified
 		for (key, value, kind, custom_seq) in entries {
 			let seq_num = custom_seq.unwrap_or_else(|| {
 				last_seq += 1;
 				last_seq
 			});
 
-			// Create a single-entry batch for each record to ensure exact sequence number assignment
+			// Create a single-entry batch for each record to ensure exact sequence number
+			// assignment
 			let mut batch = Batch::new(seq_num);
 			match kind {
 				InternalKeyKind::Set => {
@@ -514,8 +519,8 @@ mod tests {
 		// Create test with multiple sequence numbers for the same key
 		let (memtable, _) = create_test_memtable(vec![
 			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
-			(b"key1".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(20)), // Higher sequence number
-			(b"key1".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(5)),  // Lower sequence number
+			(b"key1".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(20)), /* Higher sequence number */
+			(b"key1".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(5)), /* Lower sequence number */
 		]);
 
 		// Collect all entries
@@ -567,7 +572,8 @@ mod tests {
 		let result = memtable.get(b"key1", Some(8));
 		assert!(result.is_some());
 		let (_, encoded_val) = result.unwrap();
-		assert_value(&encoded_val, b"old_value"); // Should get the value with seq_num <= 8
+		assert_value(&encoded_val, b"old_value"); // Should get the value with seq_num
+		                                    // <= 8
 	}
 
 	#[test]

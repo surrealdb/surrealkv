@@ -1,5 +1,5 @@
-use quick_cache::Weighter;
-use quick_cache::{sync::Cache as QCache, Equivalent};
+use quick_cache::sync::Cache as QCache;
+use quick_cache::{Equivalent, Weighter};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;

@@ -1,17 +1,12 @@
-use std::{
-	fmt,
-	sync::{
-		atomic::{AtomicBool, Ordering},
-		Arc, Mutex,
-	},
-};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use crate::{
-	compaction::{leveled::Strategy, CompactionStrategy},
-	lsm::CompactionOperations,
-};
+use crate::compaction::leveled::Strategy;
+use crate::compaction::CompactionStrategy;
+use crate::lsm::CompactionOperations;
 
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {
@@ -152,7 +147,8 @@ impl TaskManager {
 		self.memtable_notify.notify_one();
 		self.level_notify.notify_one();
 
-		// Wait for any in-progress compactions to complete (no timeout - wait indefinitely)
+		// Wait for any in-progress compactions to complete (no timeout - wait
+		// indefinitely)
 		while self.memtable_running.load(Ordering::Acquire)
 			|| self.level_running.load(Ordering::Acquire)
 		{
@@ -274,7 +270,8 @@ mod tests {
 
 		for _ in 0..3 {
 			task_manager.wake_up_memtable();
-			time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for task to
+			                                      // complete
 		}
 
 		// Wait for all operations to complete
@@ -307,7 +304,8 @@ mod tests {
 
 		for _ in 0..3 {
 			task_manager.wake_up_level();
-			time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for task to
+			                                      // complete
 		}
 
 		// Wait for all operations to complete
@@ -347,7 +345,8 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_already_running_tasks() {
-		// Create core with longer delays to ensure tasks are still running when we try to wake them again
+		// Create core with longer delays to ensure tasks are still running when we try
+		// to wake them again
 		let core = Arc::new(MockCoreInner::with_delays(100, 100));
 		let task_manager = TaskManager::new(core.clone());
 
@@ -387,7 +386,8 @@ mod tests {
 				tm.wake_up_memtable();
 			}));
 			// Small sleep to ensure some interleaving
-			time::sleep(Duration::from_millis(100)).await; // Allow time for all tasks to complete
+			time::sleep(Duration::from_millis(100)).await; // Allow time for all tasks to
+			                                      // complete
 		}
 
 		for handle in handles {
@@ -443,7 +443,8 @@ mod tests {
 		// Create a mock with error simulation capability
 		let core = Arc::new(MockCoreInner::new());
 
-		// First, check how the mock behaves with a direct call to verify our understanding
+		// First, check how the mock behaves with a direct call to verify our
+		// understanding
 		core.fail_memtable.store(true, Ordering::SeqCst);
 		let direct_result = core.compact_memtable();
 		assert!(direct_result.is_err(), "Should return an error when fail_memtable is true");
@@ -509,7 +510,8 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_task_from_fail() {
-		// Create a core that will fail on the first attempt but succeed on subsequent attempts
+		// Create a core that will fail on the first attempt but succeed on subsequent
+		// attempts
 		let core = Arc::new(MockCoreInner::new());
 		let task_manager = TaskManager::new(core.clone());
 

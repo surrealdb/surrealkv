@@ -1,16 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
-use std::sync::{atomic::AtomicU32, Arc};
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::{meta::KeyRange, InternalKey, InternalKeyKind};
-use crate::IterResult;
-use crate::{IntoBytes, Key, Value};
+use crate::sstable::meta::KeyRange;
+use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::{IntoBytes, IterResult, Key, Value};
 use bytes::Bytes;
 
 /// Type alias for version scan results
@@ -114,9 +115,9 @@ struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
 ///
 /// # Snapshot Isolation in LSM Trees
 ///
-/// Snapshots provide consistent reads by fixing a sequence number at creation time.
-/// All reads through the snapshot only see data with sequence numbers less than
-/// or equal to the snapshot's sequence number.
+/// Snapshots provide consistent reads by fixing a sequence number at creation
+/// time. All reads through the snapshot only see data with sequence numbers
+/// less than or equal to the snapshot's sequence number.
 #[derive(Clone)]
 pub(crate) struct Snapshot {
 	/// Reference to the LSM tree core
@@ -139,7 +140,8 @@ impl Snapshot {
 	}
 
 	/// Collects the iterator state from all LSM components
-	/// This is a helper method used by both iterators and optimized operations like count
+	/// This is a helper method used by both iterators and optimized operations
+	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
 		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
 		let immutable =
@@ -203,7 +205,8 @@ impl Snapshot {
 	/// 2. **Immutable Memtables**: Recent writes being flushed
 	/// 3. **Level**: From SSTables
 	///
-	/// The search stops at the first version found with seq_num <= snapshot seq_num.
+	/// The search stops at the first version found with seq_num <= snapshot
+	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
@@ -356,7 +359,8 @@ impl Snapshot {
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
 	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
+	/// * `limit` - Optional maximum number of versions to return. If None,
+	///   returns all versions.
 	pub(crate) fn scan_all_versions<Key: IntoBytes>(
 		&self,
 		start: Key,
@@ -398,8 +402,9 @@ impl Snapshot {
 	}
 
 	/// Creates a versioned range iterator that implements DoubleEndedIterator
-	/// TODO: This is a temporary solution to avoid the complexity of implementing
-	/// a proper streaming double ended iterator, which will be fixed in the future.
+	/// TODO: This is a temporary solution to avoid the complexity of
+	/// implementing a proper streaming double ended iterator, which will be
+	/// fixed in the future.
 	fn versioned_range_iter<R: RangeBounds<Vec<u8>>>(
 		&self,
 		params: VersionedRangeQueryParams<'_, R>,
@@ -453,7 +458,8 @@ impl Snapshot {
 				)
 				.encode(),
 				Bound::Excluded(key) => {
-					// For excluded bounds, use minimal InternalKey properties so range stops just before this key
+					// For excluded bounds, use minimal InternalKey properties so range stops just
+					// before this key
 					InternalKey::new(Bytes::copy_from_slice(key), 0, InternalKeyKind::Set, 0)
 						.encode()
 				}
@@ -507,9 +513,11 @@ impl Snapshot {
 					break;
 				}
 
-				// If include_latest_only is true, keep only the latest version (highest timestamp)
+				// If include_latest_only is true, keep only the latest version (highest
+				// timestamp)
 				if params.include_latest_only && !versions.is_empty() {
-					// B+tree already provides entries in timestamp order, so just take the last element (highest timestamp)
+					// B+tree already provides entries in timestamp order, so just take the last
+					// element (highest timestamp)
 					let latest_version = versions.pop().unwrap();
 					versions = vec![latest_version];
 				}
@@ -662,7 +670,8 @@ impl Drop for Snapshot {
 pub(crate) struct KMergeIterator<'iter> {
 	/// Array of iterators to merge over.
 	///
-	/// IMPORTANT: Due to self-referential structs, this must be defined before `iter_state` in order to ensure it is dropped before `iter_state`.
+	/// IMPORTANT: Due to self-referential structs, this must be defined before
+	/// `iter_state` in order to ensure it is dropped before `iter_state`.
 	iterators: Vec<BoxedIterator<'iter>>,
 
 	// Owned state
@@ -705,7 +714,8 @@ impl<'a> KMergeIterator<'a> {
 		for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
 			// Optimization: Skip tables that are completely outside the query range
 			if level_idx == 0 {
-				// Level 0: Tables can overlap, so we check all but skip those completely outside range
+				// Level 0: Tables can overlap, so we check all but skip those completely
+				// outside range
 				for table in &level.tables {
 					// Skip tables completely before or after the range
 					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
@@ -768,6 +778,7 @@ impl<'a> KMergeIterator<'a> {
 
 impl Iterator for KMergeIterator<'_> {
 	type Item = (InternalKey, Value);
+
 	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
@@ -880,6 +891,7 @@ impl SnapshotIterator<'_> {
 
 impl Iterator for SnapshotIterator<'_> {
 	type Item = IterResult;
+
 	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
 		while let Some((key, value)) = self.merge_iter.next() {
@@ -966,16 +978,14 @@ impl Drop for SnapshotIterator<'_> {
 #[cfg(test)]
 mod tests {
 	use crate::sstable::meta::KeyRange;
-	use crate::{IntoBytes, TreeBuilder};
-	use crate::{Options, Tree};
+	use crate::{IntoBytes, Options, Tree, TreeBuilder};
 	use bytes::Bytes;
 	use std::collections::HashSet;
 	use std::sync::Arc;
 	use test_log::test;
 
 	use super::{IterState, KMergeIterator};
-	use crate::levels::Level;
-	use crate::levels::Levels;
+	use crate::levels::{Level, Levels};
 	use crate::memtable::MemTable;
 	use crate::sstable::table::{Table, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};

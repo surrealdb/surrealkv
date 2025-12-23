@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
-use quick_cache::{sync::Cache, Weighter};
+use quick_cache::sync::Cache;
+use quick_cache::Weighter;
 
 use crate::vfs::File as VfsFile;
 use crate::{Comparator, Key, Value};
@@ -227,14 +228,19 @@ trait Node {
 ///
 /// OVERFLOW OWNERSHIP INVARIANT:
 /// - key_overflows contains overflow chains for keys stored in this node
-/// - Each key owns its overflow chain, including keys used as separators in parents
-/// - Overflows are freed when the owning node is freed via free_node_with_overflow()
-/// - EXCEPTION: After merge operations, the merged-away node is freed with free_page() only,
-///   because its overflows were transferred to the merged node via append()
-/// - When keys are transferred between nodes, overflow ownership transfers with them
+/// - Each key owns its overflow chain, including keys used as separators in
+///   parents
+/// - Overflows are freed when the owning node is freed via
+///   free_node_with_overflow()
+/// - EXCEPTION: After merge operations, the merged-away node is freed with
+///   free_page() only, because its overflows were transferred to the merged
+///   node via append()
+/// - When keys are transferred between nodes, overflow ownership transfers with
+///   them
 struct InternalNode {
 	keys: Vec<Bytes>,        // Full keys (reconstructed from page + overflow if needed)
-	key_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for THIS node's keys
+	key_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for THIS
+	                          * node's keys */
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -435,7 +441,8 @@ impl InternalNode {
 		self.key_overflows[idx] = overflow;
 	}
 
-	/// Extracts key+overflow for transferring to another node (removes from this node)
+	/// Extracts key+overflow for transferring to another node (removes from
+	/// this node)
 	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
 		if idx >= self.keys.len() {
 			return None;
@@ -633,16 +640,20 @@ impl Node for InternalNode {
 /// Leaf node in the B+ tree
 ///
 /// OVERFLOW OWNERSHIP INVARIANT:
-/// - cell_overflows contains overflow chains for the key+value pairs stored in THIS leaf
+/// - cell_overflows contains overflow chains for the key+value pairs stored in
+///   THIS leaf
 /// - Each leaf node owns the overflows for its cells
-/// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
-/// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
+/// - Overflows are only freed when this leaf node is freed via
+///   free_node_with_overflow()
+/// - When cells are moved between leaves (redistribution), overflow ownership
+///   transfers with them
 struct LeafNode {
 	keys: Vec<Bytes>,         // Full keys (reconstructed from page + overflow if needed)
 	values: Vec<Bytes>,       // Full values (reconstructed from page + overflow if needed)
-	cell_overflows: Vec<u64>, // 0 if no overflow, else first overflow page offset for cell (key+value)
-	next_leaf: u64,           // 0 means no next leaf
-	prev_leaf: u64,           // 0 means no previous leaf
+	cell_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for cell
+	                           * (key+value) */
+	next_leaf: u64, // 0 means no next leaf
+	prev_leaf: u64, // 0 means no previous leaf
 	offset: u64,
 }
 
@@ -804,7 +815,8 @@ impl LeafNode {
 
 	// insert a key-value pair into a leaf node at the correct position
 	// If key already exists, update the value (treat as update)
-	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was updated, None if new
+	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was
+	// updated, None if new
 	fn insert(
 		&mut self,
 		key: &[u8],
@@ -919,7 +931,8 @@ impl LeafNode {
 			right.keys[0].clone()
 		} else {
 			// Right is now empty, use the current last key
-			// This shouldn't happen - right should not become completely empty during rebalancing
+			// This shouldn't happen - right should not become completely empty during
+			// rebalancing
 			self.keys.last().expect(
 				"take_from_right: left node should have at least one key after taking from right"
 			).clone()
@@ -934,12 +947,14 @@ impl LeafNode {
 		self.next_leaf = right.next_leaf;
 	}
 
-	/// Find optimal split point that ensures both resulting leaves fit in a page.
-	/// Uses hybrid approach: simple split for common cases, iterative algorithm when needed.
-	/// Takes the new entry (key, value) and its insert position into account.
+	/// Find optimal split point that ensures both resulting leaves fit in a
+	/// page. Uses hybrid approach: simple split for common cases, iterative
+	/// algorithm when needed. Takes the new entry (key, value) and its insert
+	/// position into account.
 	///
-	/// - `is_update`: If true, we're updating an existing entry (replacing, not adding).
-	///   The total entry count remains the same. If false, we're inserting a new entry.
+	/// - `is_update`: If true, we're updating an existing entry (replacing, not
+	///   adding). The total entry count remains the same. If false, we're
+	///   inserting a new entry.
 	fn find_split_point_for_insert(
 		&self,
 		new_key: &[u8],
@@ -996,7 +1011,8 @@ impl LeafNode {
 		}
 	}
 
-	/// Ensures proper ordering: right page size <= left page size (cntNew[i] <= cntNew[i-1])
+	/// Ensures proper ordering: right page size <= left page size (cntNew[i] <=
+	/// cntNew[i-1])
 	fn find_split_point_for_insert_complex(
 		&self,
 		new_key: &[u8],
@@ -1041,7 +1057,8 @@ impl LeafNode {
 		let total_cells = cell_sizes.len();
 
 		// Phase 2: Sequential left-to-right processing (no recursion)
-		// Process entries sequentially from left to right, stopping at first valid split point
+		// Process entries sequentially from left to right, stopping at first valid
+		// split point
 		let mut current_page_size = LEAF_HEADER_SIZE;
 		let mut split_idx = 0;
 
@@ -1059,8 +1076,8 @@ impl LeafNode {
 			current_page_size = new_page_size;
 		}
 
-		// If we processed all cells without finding a split point, use the last valid position
-		// This shouldn't happen if we're splitting, but handle it gracefully
+		// If we processed all cells without finding a split point, use the last valid
+		// position This shouldn't happen if we're splitting, but handle it gracefully
 		if split_idx == 0 && current_page_size <= max_page_size {
 			// All entries fit in one page - this shouldn't happen if we're splitting
 			// Use middle split as fallback
@@ -1081,7 +1098,8 @@ impl LeafNode {
 		// Ensure cntNew[i] <= cntNew[i-1] (right page <= left page in size)
 		// This ensures proper ordering across pages
 		// If right is larger than left, move cells from right to left (if possible)
-		// To move a cell from right to left, we increase split_idx (which moves the boundary right)
+		// To move a cell from right to left, we increase split_idx (which moves the
+		// boundary right)
 		while sz_right > sz_left && split_idx < total_cells {
 			// Try moving the leftmost cell from right page to left page
 			let cell_to_move = cell_sizes[split_idx];
@@ -1109,7 +1127,8 @@ impl LeafNode {
 
 		// Convert back to original key index
 		// For updates: split_idx directly maps to original array (same size)
-		// For inserts: split_idx is in expanded array (with new entry), needs conversion
+		// For inserts: split_idx is in expanded array (with new entry), needs
+		// conversion
 
 		if is_update {
 			// For updates, split_idx directly maps to original array index
@@ -1130,14 +1149,16 @@ impl LeafNode {
 			} else if split_idx == insert_idx + 1 {
 				// Edge case: split_idx(expanded) == insert_idx + 1
 				// In expanded: left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
-				// Algorithm calculated sz_left for left=[..., NEW_ENTRY] (excluding entry(insert_idx))
-				// To preserve size invariants, we must return insert_idx (not insert_idx + 1)
-				// This ensures left gets [..., NEW_ENTRY] without entry(insert_idx)
+				// Algorithm calculated sz_left for left=[..., NEW_ENTRY] (excluding
+				// entry(insert_idx)) To preserve size invariants, we must return insert_idx
+				// (not insert_idx + 1) This ensures left gets [..., NEW_ENTRY] without
+				// entry(insert_idx)
 				insert_idx
 			} else {
 				// split_idx > insert_idx + 1: some original entries also go left
-				// split_idx=3, insert_idx=1 means: left=[entry0, NEW_ENTRY, entry1], right=[entry2, ...]
-				// In original array, this is split_idx=2 (before entry2)
+				// split_idx=3, insert_idx=1 means: left=[entry0, NEW_ENTRY, entry1],
+				// right=[entry2, ...] In original array, this is split_idx=2 (before
+				// entry2)
 				split_idx - 1
 			}
 		} else {
@@ -1327,7 +1348,8 @@ impl TrunkPage {
 		// 3. Number of free pages (4 bytes)
 		buffer.extend_from_slice(&self.num_free_pages.to_le_bytes());
 
-		// 4. Free page numbers (4 bytes each, little-endian to match the rest of the code)
+		// 4. Free page numbers (4 bytes each, little-endian to match the rest of the
+		//    code)
 		for &page in &self.free_pages {
 			buffer.extend_from_slice(&page.to_le_bytes());
 		}
@@ -1385,7 +1407,8 @@ impl TrunkPage {
 	}
 }
 
-// Overflow page structure for storing large keys/values that don't fit on a single page
+// Overflow page structure for storing large keys/values that don't fit on a
+// single page
 #[derive(Debug, Clone)]
 struct OverflowPage {
 	next_overflow: u64, // 0 means last in chain
@@ -1488,7 +1511,8 @@ pub enum Durability {
 	/// Sync after every write (safe but slow)
 	Always,
 
-	/// Only sync when flush() or close() is called (fast but risks data loss on crash)
+	/// Only sync when flush() or close() is called (fast but risks data loss on
+	/// crash)
 	Manual,
 }
 
@@ -1528,7 +1552,8 @@ fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
 /// Calculate how much of payload to store on page
 /// Returns (bytes_on_page, needs_overflow)
 ///
-/// This minimizes unused space on overflow pages by aligning with overflow page boundaries
+/// This minimizes unused space on overflow pages by aligning with overflow page
+/// boundaries
 fn calculate_overflow(
 	payload_size: usize,
 	min_local: usize,
@@ -1564,7 +1589,8 @@ const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 	}
 }
 
-/// Calculate the on-page size for an internal node entry (key + child pointer + overflow)
+/// Calculate the on-page size for an internal node entry (key + child pointer +
+/// overflow)
 #[inline]
 fn internal_entry_size(key: &[u8]) -> usize {
 	let (min_local, max_local) = calculate_local_limits(false);
@@ -1806,7 +1832,8 @@ impl<F: VfsFile> BPlusTree<F> {
 								new_node_offset,
 							)?;
 
-						// Path should contain the grandparent when splitting an internal node with a parent
+						// Path should contain the grandparent when splitting an internal node with
+						// a parent
 						let (_, next_parent) = path.pop().expect(
 							"handle_splits: path should contain grandparent when splitting internal node with parent"
 						);
@@ -1850,7 +1877,8 @@ impl<F: VfsFile> BPlusTree<F> {
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
 
-		// Handle special case: split_idx=0 means new entry goes left, all original entries go right
+		// Handle special case: split_idx=0 means new entry goes left, all original
+		// entries go right
 		if split_idx == 0 {
 			// Move all original entries to the new leaf
 			new_leaf.keys = std::mem::take(&mut leaf.keys);
@@ -2004,7 +2032,8 @@ impl<F: VfsFile> BPlusTree<F> {
 		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
 
 		// Simple sequential approach: calculate split point based on total keys
-		// Internal node keys are typically similar in size, so simple middle split works well
+		// Internal node keys are typically similar in size, so simple middle split
+		// works well
 		let total_keys = node.keys.len() + 1; // +1 for the new key being inserted
 
 		// Sequential processing: split at middle, adjusting for insert position
@@ -2634,6 +2663,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		self.free_page(offset)
 	}
+
 	fn free_page(&mut self, offset: u64) -> Result<()> {
 		if offset < PAGE_SIZE as u64 || offset >= self.header.total_pages * PAGE_SIZE as u64 {
 			return Err(BPlusTreeError::InvalidOffset);
@@ -2807,7 +2837,8 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	/// Prepare internal node for writing by creating overflow pages for large keys
+	/// Prepare internal node for writing by creating overflow pages for large
+	/// keys
 	fn prepare_internal_node_overflow(&mut self, node: &mut InternalNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(false);
 		let usable_size = INTERNAL_USABLE_SIZE;
@@ -2845,7 +2876,8 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	/// Prepare leaf node for writing by creating overflow pages for large cells (key+value)
+	/// Prepare leaf node for writing by creating overflow pages for large cells
+	/// (key+value)
 	fn prepare_leaf_node_overflow(&mut self, node: &mut LeafNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(true);
 		let usable_size = LEAF_USABLE_SIZE;
@@ -3191,7 +3223,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 					}
 				}
 
-				// Return current entry from stored leaf (no range check needed - pre-calculated!)
+				// Return current entry from stored leaf (no range check needed -
+				// pre-calculated!)
 				let result = Ok((
 					leaf.keys[self.current_idx].clone(),
 					leaf.values[self.current_idx].clone(),
@@ -3213,7 +3246,8 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use rand::{rngs::StdRng, Rng, SeedableRng};
+	use rand::rngs::StdRng;
+	use rand::{Rng, SeedableRng};
 	use tempfile::NamedTempFile;
 
 	#[derive(Clone)]
@@ -4324,9 +4358,9 @@ mod tests {
 				"Some free pages should have been reused"
 			);
 
-			// Step 5: Verify total page count hasn't increased as much as it would without reuse
-			// The increase in total pages should be less than the number of new inserts
-			// because we're reusing free pages
+			// Step 5: Verify total page count hasn't increased as much as it would without
+			// reuse The increase in total pages should be less than the number of new
+			// inserts because we're reusing free pages
 			assert!(
 				tree.header.total_pages - pages_after_insert < 100,
 				"Should have reused pages instead of allocating all new ones"
@@ -5003,7 +5037,8 @@ mod tests {
 
 	#[test]
 	fn test_sequential_split_ordering_guarantee() {
-		// Test that sequential split algorithm ensures right page <= left page (ordering guarantee)
+		// Test that sequential split algorithm ensures right page <= left page
+		// (ordering guarantee)
 		let mut tree = create_test_tree(true);
 
 		// Insert entries that will cause multiple splits
@@ -5023,8 +5058,9 @@ mod tests {
 		}
 
 		// The ordering guarantee is enforced internally by the split algorithm
-		// If splits didn't maintain ordering, we would see panics or incorrect behavior
-		// This test verifies the algorithm works correctly through successful operations
+		// If splits didn't maintain ordering, we would see panics or incorrect
+		// behavior This test verifies the algorithm works correctly through
+		// successful operations
 	}
 
 	#[test]

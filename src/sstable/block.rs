@@ -1,11 +1,9 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::{
-	error::{Error, Result},
-	sstable::InternalKey,
-	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value,
-};
+use crate::error::{Error, Result};
+use crate::sstable::InternalKey;
+use crate::{Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value};
 use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
@@ -78,13 +76,11 @@ impl BlockHandle {
 /// Block Key/value entry:
 ///
 /// ```text
-///
+/// 
 ///     +-------+---------+-----------+---------+--------------------+--------------+----------------+
 ///     | shared (varint) | not shared (varint) | value len (varint) | key (varlen) | value (varlen) |
 ///     +-----------------+---------------------+--------------------+--------------+----------------+
-///
 /// ```
-///
 #[derive(Clone)]
 pub(crate) struct Block {
 	pub(crate) block: BlockData,
@@ -123,55 +119,57 @@ pub(crate) struct BlockWriter {
 	internal_cmp: Arc<dyn Comparator>,
 }
 
-/*
-Block writer logic:
-
-1. Initial state:
-   buffer: []
-   restart_points: [0]
-   restart_counter: 0
-   last_key: []
-
-2. Add key-value pair ("apple", "fruit"):
-   - No shared prefix with previous key.
-   - Serialized entry: [0, 5, 5, "apple", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit"]
-   restart_points: [0]
-   restart_counter: 1
-   last_key: "apple"
-
-   Buffer length: 22 (4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 5 bytes for key, 5 bytes for value)
-
-3. Add key-value pair ("apricot", "fruit"):
-   - Shared prefix with previous key "apple" is "ap" (2 characters).
-   - Serialized entry: [2, 4, 5, "ricot", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit"]
-   restart_points: [0]
-   restart_counter: 2
-   last_key: "apricot"
-
-   Buffer length: 44 (22 bytes + 4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 5 bytes for key suffix, 5 bytes for value)
-
-4. Add key-value pair ("banana", "fruit"):
-   - No shared prefix with previous key.
-   - Restart compression (new restart point at this position).
-   - Serialized entry: [0, 6, 5, "banana", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit", 0, 6, 5, "banana", "fruit"]
-   restart_points: [0, 26]  // new restart point at offset 25
-   restart_counter: 1
-   last_key: "banana"
-
-   Buffer length: 67 (44 bytes + 4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 6 bytes for key, 5 bytes for value)
-
-
-   Finalize:
-
-   67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
-
-*/
+// Block writer logic:
+//
+// 1. Initial state:
+// buffer: []
+// restart_points: [0]
+// restart_counter: 0
+// last_key: []
+//
+// 2. Add key-value pair ("apple", "fruit"):
+// - No shared prefix with previous key.
+// - Serialized entry: [0, 5, 5, "apple", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit"]
+// restart_points: [0]
+// restart_counter: 1
+// last_key: "apple"
+//
+// Buffer length: 22 (4 byte for shared prefix, 4 byte for non-shared key
+// length, 4 byte for value length, 5 bytes for key, 5 bytes for value)
+//
+// 3. Add key-value pair ("apricot", "fruit"):
+// - Shared prefix with previous key "apple" is "ap" (2 characters).
+// - Serialized entry: [2, 4, 5, "ricot", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit"]
+// restart_points: [0]
+// restart_counter: 2
+// last_key: "apricot"
+//
+// Buffer length: 44 (22 bytes + 4 byte for shared prefix, 4 byte for non-shared
+// key length, 4 byte for value length, 5 bytes for key suffix, 5 bytes for
+// value)
+//
+// 4. Add key-value pair ("banana", "fruit"):
+// - No shared prefix with previous key.
+// - Restart compression (new restart point at this position).
+// - Serialized entry: [0, 6, 5, "banana", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit", 0, 6, 5,
+// "banana", "fruit"] restart_points: [0, 26]  // new restart point at offset 25
+// restart_counter: 1
+// last_key: "banana"
+//
+// Buffer length: 67 (44 bytes + 4 byte for shared prefix, 4 byte for non-shared
+// key length, 4 byte for value length, 6 bytes for key, 5 bytes for value)
+//
+//
+// Finalize:
+//
+// 67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
+//
 impl BlockWriter {
 	// Constructor for BlockWriter
 	pub(crate) fn new(
@@ -282,7 +280,8 @@ impl BlockWriter {
 	) -> Result<()> {
 		let non_shared_key_length = key.len() - shared_prefix_length;
 
-		// Write shared prefix length, non-shared key length, and value length as varints
+		// Write shared prefix length, non-shared key length, and value length as
+		// varints
 		self.buffer.write_varint(shared_prefix_length as u64)?;
 		self.buffer.write_varint(non_shared_key_length as u64)?;
 		self.buffer.write_varint(value.len() as u64)?;
@@ -376,7 +375,8 @@ impl BlockIterator {
 		self.current_entry_offset = offset;
 	}
 
-	// Decodes the shared prefix length, non-shared key length, and value size from the block
+	// Decodes the shared prefix length, non-shared key length, and value size from
+	// the block
 	fn decode_entry_lengths(&self, offset: usize) -> Option<(usize, usize, usize, usize)> {
 		let mut i = 0;
 		let (shared_prefix_length, shared_prefix_length_size) =
@@ -426,6 +426,7 @@ impl BlockIterator {
 
 impl Iterator for BlockIterator {
 	type Item = (Key, Value);
+
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.advance() {
 			return None;
@@ -592,10 +593,8 @@ impl LSMIterator for BlockIterator {
 
 #[cfg(test)]
 mod tests {
-	use crate::{
-		sstable::{InternalKey, InternalKeyKind},
-		Options,
-	};
+	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::Options;
 	use test_log::test;
 
 	use super::*;

@@ -1,17 +1,15 @@
-use std::{
-	collections::HashMap,
-	fs::{File, OpenOptions},
-	io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
-	path::{Path, PathBuf},
-	sync::{
-		atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
-		Arc,
-	},
-};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::Arc;
 
-use crate::{batch::Batch, discard::DiscardStats, Value};
-use crate::{bplustree::tree::DiskBPlusTree, Tree, TreeBuilder};
-use crate::{sstable::InternalKey, vfs, CompressionType, Options, VLogChecksumLevel};
+use crate::batch::Batch;
+use crate::bplustree::tree::DiskBPlusTree;
+use crate::discard::DiscardStats;
+use crate::sstable::InternalKey;
+use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
 use bytes::Bytes;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -45,8 +43,11 @@ pub(crate) struct VLogFileHeader {
 }
 
 impl VLogFileHeader {
-	const MAGIC: u32 = 0x564C_4F47; // "VLOG" in hex
-	const SIZE: usize = 31; // 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
+	const MAGIC: u32 = 0x564C_4F47;
+	// "VLOG" in hex
+	const SIZE: usize = 31;
+
+	// 4 + 2 + 4 + 8 + 8 + 1 + 4 = 31 bytes
 
 	pub(crate) fn new(file_id: u32, max_file_size: u64, compression: u8) -> Self {
 		Self {
@@ -194,8 +195,8 @@ impl VLogFileHeader {
 		Ok(())
 	}
 }
-/// ValueLocation represents the value info that can be associated with a key, including the internal
-/// Meta field for various flags and operations.
+/// ValueLocation represents the value info that can be associated with a key,
+/// including the internal Meta field for various flags and operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValueLocation {
 	/// Meta flags for various operations (value pointer etc.)
@@ -536,7 +537,8 @@ pub(crate) struct VLog {
 	/// Discard statistics for GC candidate selection
 	discard_stats: Mutex<DiscardStats>,
 
-	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs across all segments
+	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs
+	/// across all segments
 	pub(crate) delete_list: Arc<DeleteList>,
 
 	/// Options for VLog configuration
@@ -685,7 +687,8 @@ impl VLog {
 
 		// Set next_file_id based on whether we found existing files
 		if let Some(highest_file_id) = max_file_id {
-			// Found existing files, set next_file_id to one past the highest existing file ID
+			// Found existing files, set next_file_id to one past the highest existing file
+			// ID
 			self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
 
 			// Set the last file up as the active writer
@@ -854,7 +857,8 @@ impl VLog {
 		self.num_active_iterators.load(Ordering::SeqCst)
 	}
 
-	/// Deletes files that were marked for deletion when no iterators were active
+	/// Deletes files that were marked for deletion when no iterators were
+	/// active
 	fn delete_pending_files(&self) -> Result<()> {
 		let mut files_to_delete = self.files_to_be_deleted.write();
 		let mut files_map = self.files_map.write();
@@ -874,10 +878,11 @@ impl VLog {
 	}
 
 	/// Selects files based on discard statistics and compacts them
-	/// Attempts to compact the best candidate file (highest discard bytes that meets criteria)
-	/// Only processes one file per invocation
+	/// Attempts to compact the best candidate file (highest discard bytes that
+	/// meets criteria) Only processes one file per invocation
 	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u32>> {
-		// Try to set the gc_in_progress flag to true, if it's already true, return error
+		// Try to set the gc_in_progress flag to true, if it's already true, return
+		// error
 		if self
 			.gc_in_progress
 			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1107,7 +1112,8 @@ impl VLog {
 		}
 
 		// Clean up versioned index BEFORE cleaning delete list
-		// This ensures that when VLog entries are deleted, B+ tree entries are also cleaned up
+		// This ensures that when VLog entries are deleted, B+ tree entries are also
+		// cleaned up
 		if !stale_internal_keys.is_empty() {
 			if let Err(e) = self.cleanup_versioned_index_for_keys(&stale_internal_keys) {
 				log::error!("Failed to clean up versioned index during VLog GC: {e}");
@@ -1215,7 +1221,8 @@ impl VLog {
 	}
 
 	/// Updates discard statistics for a file
-	/// This should be called during LSM compaction when outdated VLog pointers are found
+	/// This should be called during LSM compaction when outdated VLog pointers
+	/// are found
 	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		let mut discard_stats = self.discard_stats.lock();
 
@@ -1260,8 +1267,9 @@ impl VLog {
 		self.delete_list.is_stale(seq_num)
 	}
 
-	/// Cleans up deleted keys from the versioned index atomically during VLog GC
-	/// This ensures that when VLog entries are deleted, corresponding B+ tree entries are also cleaned up
+	/// Cleans up deleted keys from the versioned index atomically during VLog
+	/// GC This ensures that when VLog entries are deleted, corresponding B+
+	/// tree entries are also cleaned up
 	fn cleanup_versioned_index_for_keys(&self, deleted_keys: &[InternalKey]) -> Result<()> {
 		if !self.opts.enable_versioning || deleted_keys.is_empty() {
 			return Ok(());
@@ -1411,7 +1419,8 @@ impl VLogGCManager {
 
 /// Global Delete List using B+ Tree
 /// Uses a dedicated B+ tree for tracking stale user keys.
-/// This provides better performance and consistency with the main LSM tree design.
+/// This provides better performance and consistency with the main LSM tree
+/// design.
 pub(crate) struct DeleteList {
 	/// B+ tree for storing delete list entries (user_key -> value_size)
 	tree: Arc<Tree>,
@@ -1506,7 +1515,8 @@ impl DeleteList {
 
 	async fn close(&self) -> Result<()> {
 		// Close the delete list tree (uses Box::pin to avoid async recursion)
-		// The delete list has its own Tree with enable_vlog: false, so no actual infinite recursion
+		// The delete list has its own Tree with enable_vlog: false, so no actual
+		// infinite recursion
 		Box::pin(self.tree.close()).await
 	}
 }
@@ -1712,7 +1722,8 @@ mod tests {
 			assert_eq!(*retrieved, expected_value);
 		}
 
-		// Check that the next_file_id is set correctly (should be one past the highest file ID)
+		// Check that the next_file_id is set correctly (should be one past the highest
+		// file ID)
 		let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
 		let max_file_id = unique_file_ids.iter().max().unwrap();
 		assert_eq!(
@@ -2033,7 +2044,8 @@ mod tests {
 
 		let mut pointers = Vec::new();
 
-		// Phase 1: Create initial VLog and add some data (but not enough to fill the file)
+		// Phase 1: Create initial VLog and add some data (but not enough to fill the
+		// file)
 		{
 			let vlog1 = VLog::new(Arc::new(opts.clone()), None).unwrap();
 
@@ -2252,7 +2264,8 @@ mod tests {
 			let new_pointer = vlog2.append(new_key, &new_value).unwrap();
 			vlog2.sync().unwrap();
 
-			// New data should go to the highest file ID (since we set it up as active writer)
+			// New data should go to the highest file ID (since we set it up as active
+			// writer)
 			assert_eq!(
 				new_pointer.file_id, highest_file_id,
 				"New data after restart should go to the last existing file"
@@ -2424,7 +2437,8 @@ mod tests {
 			);
 		} // writer2 is dropped here
 
-		// Phase 3: Verification - Read all data back using VLog to ensure no corruption/overwriting
+		// Phase 3: Verification - Read all data back using VLog to ensure no
+		// corruption/overwriting
 		{
 			// Create a VLog instance that can read from our test file
 			let vlog_dir = temp_dir.path().join("vlog");
@@ -2463,7 +2477,8 @@ mod tests {
 			);
 		}
 
-		// Phase 4: Additional verification - Test a third reopen to ensure pattern continues
+		// Phase 4: Additional verification - Test a third reopen to ensure pattern
+		// continues
 		{
 			let mut writer3 = VLogWriter::new(
 				&test_file_path,
@@ -2532,9 +2547,10 @@ mod tests {
 
 		let opts = Options {
 			clock: mock_clock.clone(),
-			vlog_max_file_size: 950, // Small files to force frequent rotations (like VLog compaction test)
+			vlog_max_file_size: 950, /* Small files to force frequent rotations (like VLog
+			                          * compaction test) */
 			vlog_gc_discard_ratio: 0.0, // Disable discard ratio to preserve all values initially
-			level_count: 2,          // Two levels for compaction strategy
+			level_count: 2,             // Two levels for compaction strategy
 			..Options::default()
 		};
 
@@ -2666,7 +2682,8 @@ mod tests {
 		// The key insight: VLog GC only processes files with high discard ratios
 		// Files 0, 1, 2 had high discard ratios (0.97) and were processed
 		// Files 3, 4, 5, 6 had zero discard ratios (0.00) and were NOT processed
-		// This means versions in files 0, 1, 2 were cleaned up, but versions in files 3+ were not
+		// This means versions in files 0, 1, 2 were cleaned up, but versions in files
+		// 3+ were not
 
 		// Verify that versions in processed files (1000, 2000, 3000) are NOT accessible
 		assert_eq!(

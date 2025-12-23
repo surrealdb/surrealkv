@@ -521,9 +521,10 @@ fn test_corruption_end_segment_0() {
 			..
 		}) => {
 			assert_eq!(segment_id, 0);
-			// Note: Random byte corruption can hit CRC which invalidates entire record.
-			// So we may have fewer entries than expected or even none.
-			// The key assertion is that corruption is detected in segment 0.
+			// Note: Random byte corruption can hit CRC which invalidates entire
+			// record. So we may have fewer entries than expected or even
+			// none. The key assertion is that corruption is detected in
+			// segment 0.
 		}
 		_ => panic!("Expected WalCorruption error in segment 0"),
 	}
@@ -686,7 +687,8 @@ fn test_random_byte_corruption() {
 	let memtable = Arc::new(MemTable::new());
 	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Corruption should be detected (or partial recovery happened before corruption)
+	// Corruption should be detected (or partial recovery happened before
+	// corruption)
 	match result {
 		Err(Error::WalCorruption {
 			..
@@ -1017,7 +1019,8 @@ fn test_sequence_gaps_detection() {
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
 
-	// Create segments with some empty (creating potential "gaps" in file-based view)
+	// Create segments with some empty (creating potential "gaps" in file-based
+	// view)
 	let entries_per_segment = vec![30, 0, 30, 0, 30];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 5000);
 

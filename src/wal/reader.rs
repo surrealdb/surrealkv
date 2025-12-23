@@ -3,8 +3,16 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::wal::{
-	calculate_crc32, validate_record_type, CompressionType, CorruptionError, Error, IOError,
-	RecordType, Result, BLOCK_SIZE, HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
+	calculate_crc32,
+	validate_record_type,
+	CompressionType,
+	CorruptionError,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	BLOCK_SIZE,
+	HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
 };
 
 /// Reporter interface for WAL corruption and errors.
@@ -30,7 +38,8 @@ pub trait Reporter {
 /// Reader reads records from a single WAL file using block-based buffering.
 ///
 /// Reads entire 32KB blocks into a buffer. When fewer than HEADER_SIZE bytes
-/// remain, the remainder is discarded (it's padding) and the next block is read.
+/// remain, the remainder is discarded (it's padding) and the next block is
+/// read.
 pub(crate) struct Reader {
 	/// The underlying file handle
 	file: File,
@@ -373,7 +382,8 @@ mod tests {
 	use crate::wal::{Options, SegmentRef};
 	use tempdir::TempDir;
 
-	// BufferReader does not return EOF when the underlying reader returns 0 bytes read.
+	// BufferReader does not return EOF when the underlying reader returns 0 bytes
+	// read.
 	#[test]
 	fn bufreader_eof_and_error() {
 		// Create a temporary directory to hold the file
@@ -490,11 +500,12 @@ mod tests {
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 		// Write many records of size 68 (like the actual bug case)
-		// This size, with 7-byte headers, will eventually leave < 7 bytes at a block boundary
-		// BLOCK_SIZE = 32768, record + header = 75 bytes
-		// 32768 / 75 = 436.9... so after 436 records, we have 32768 - (436 * 75) = 68 bytes left
-		// After one more record (437), we have 68 - 75 = -7, meaning we wrap to next block
-		// The key is that various record counts will leave different remainders
+		// This size, with 7-byte headers, will eventually leave < 7 bytes at a block
+		// boundary BLOCK_SIZE = 32768, record + header = 75 bytes
+		// 32768 / 75 = 436.9... so after 436 records, we have 32768 - (436 * 75) = 68
+		// bytes left After one more record (437), we have 68 - 75 = -7, meaning we
+		// wrap to next block The key is that various record counts will leave
+		// different remainders
 		let record_size = 68;
 		let records_to_write = 1000; // Enough to cross multiple block boundaries
 
@@ -504,7 +515,8 @@ mod tests {
 		}
 		wal.close().expect("should close");
 
-		// Read back all records - this would fail with "Invalid Record Type" before the fix
+		// Read back all records - this would fail with "Invalid Record Type" before the
+		// fix
 		let segments = SegmentRef::read_segments_from_directory(temp_dir.path(), Some("wal"))
 			.expect("should read segments");
 
@@ -742,7 +754,8 @@ mod tests {
 
 	// ==================== Helper Functions ====================
 
-	/// Construct a Vec<u8> of the specified length made out of the supplied partial string.
+	/// Construct a Vec<u8> of the specified length made out of the supplied
+	/// partial string.
 	fn big_string(partial: &str, n: usize) -> Vec<u8> {
 		let mut result = Vec::with_capacity(n);
 		let partial_bytes = partial.as_bytes();
@@ -1226,7 +1239,8 @@ mod tests {
 			let is_bar_record = record.len() == BLOCK_SIZE && has_bar_pattern && !has_foo_pattern;
 			let is_correct_record = record == b"correct";
 
-			// If it has both patterns, it's a corrupted join - this is the bug we're testing for
+			// If it has both patterns, it's a corrupted join - this is the bug we're
+			// testing for
 			assert!(
 				!(has_foo_pattern && has_bar_pattern),
 				"BUG: Record {} appears to be a corrupted join of foo+bar fragments (len={})",
@@ -1262,7 +1276,8 @@ mod tests {
 	/// UnexpectedMiddleType - Middle type without preceding First
 	///
 	/// Tests that a Middle record appearing at the start of a sequence is
-	/// detected as invalid. A Middle must always follow a First or another Middle.
+	/// detected as invalid. A Middle must always follow a First or another
+	/// Middle.
 	#[test]
 	fn unexpected_middle_type() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1345,8 +1360,9 @@ mod tests {
 
 	/// UnexpectedFullType - Full type after First (partial record lost)
 	///
-	/// Tests that a Full record appearing when we expect Middle/Last (after First)
-	/// is detected as invalid. This simulates a partial record being lost.
+	/// Tests that a Full record appearing when we expect Middle/Last (after
+	/// First) is detected as invalid. This simulates a partial record being
+	/// lost.
 	#[test]
 	fn unexpected_full_type() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1383,7 +1399,8 @@ mod tests {
 	/// MissingLast - Fragmented record without Last fragment
 	///
 	/// Tests that when the Last fragment of a multi-block record is missing,
-	/// the record is not returned and earlier complete records are still readable.
+	/// the record is not returned and earlier complete records are still
+	/// readable.
 	#[test]
 	fn missing_last() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1393,7 +1410,8 @@ mod tests {
 		// Write a small record first
 		wal.append(b"complete_record").expect("should append first");
 
-		// Write a large record that spans multiple blocks (2x block size to ensure fragmentation)
+		// Write a large record that spans multiple blocks (2x block size to ensure
+		// fragmentation)
 		let large_data = big_string("bar", BLOCK_SIZE * 2);
 		wal.append(&large_data).expect("should append large");
 
@@ -1407,9 +1425,10 @@ mod tests {
 		let file_path = &segments[0].file_path;
 
 		let file_data = std::fs::read(file_path).expect("should read file");
-		// Calculate where to truncate: keep first record + first fragment of large record
-		// First record is ~22 bytes (7 header + 15 data), First fragment fills rest of first block
-		// Truncate somewhere in the second block to remove Last fragment
+		// Calculate where to truncate: keep first record + first fragment of large
+		// record First record is ~22 bytes (7 header + 15 data), First fragment fills
+		// rest of first block Truncate somewhere in the second block to remove Last
+		// fragment
 		let truncated_len = BLOCK_SIZE + BLOCK_SIZE / 2; // ~1.5 blocks
 		let truncated_len = truncated_len.min(file_data.len() - 100); // Ensure we're removing something
 		std::fs::write(file_path, &file_data[..truncated_len]).expect("should write file");
@@ -1466,7 +1485,8 @@ mod tests {
 		let (data, _) = reader.read().expect("should read first complete record");
 		assert_eq!(data, b"complete_record", "First record should be readable");
 
-		// Second read: large record may succeed or fail depending on where truncation hit
+		// Second read: large record may succeed or fail depending on where truncation
+		// hit
 		let result = reader.read();
 		// If the large record was complete, we might get it
 		// If truncation hit the large record itself, we get an error
@@ -1575,8 +1595,9 @@ mod tests {
 	// The original bug was a false positive at ~6MB in a 33MB WAL file.
 
 	/// Multi-session block boundary stress test.
-	/// Simulates the original bug scenario: writes across multiple sessions hitting block boundaries.
-	/// Uses 68-byte records (the original bug size) across 10+ sessions.
+	/// Simulates the original bug scenario: writes across multiple sessions
+	/// hitting block boundaries. Uses 68-byte records (the original bug size)
+	/// across 10+ sessions.
 	#[test]
 	fn multi_session_block_boundary_stress() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1627,8 +1648,8 @@ mod tests {
 	}
 
 	/// Exact reproduction of the original crud-bench bug scenario.
-	/// Writes 68-byte records until file reaches ~5MB (scaled down from 33MB for test speed).
-	/// The original bug failed at ~6MB mark.
+	/// Writes 68-byte records until file reaches ~5MB (scaled down from 33MB
+	/// for test speed). The original bug failed at ~6MB mark.
 	#[test]
 	fn original_crud_bench_bug_reproduction() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
@@ -1690,8 +1711,8 @@ mod tests {
 	/// This ensures no "magic" remainder value causes false corruption.
 	#[test]
 	fn all_block_boundary_remainders() {
-		// Test various record sizes that will leave different remainders at block boundaries
-		// HEADER_SIZE = 7, BLOCK_SIZE = 32768
+		// Test various record sizes that will leave different remainders at block
+		// boundaries HEADER_SIZE = 7, BLOCK_SIZE = 32768
 		// We want to test remainders 0, 1, 2, 3, 4, 5, 6
 
 		for target_remainder in 0..WAL_RECORD_HEADER_SIZE {
@@ -1700,8 +1721,8 @@ mod tests {
 			let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
 			// Calculate record size to achieve target remainder
-			// After N records: N * (HEADER + record_size) leaves remainder R at block boundary
-			// We use a base size and adjust
+			// After N records: N * (HEADER + record_size) leaves remainder R at block
+			// boundary We use a base size and adjust
 			let base_record_size = 100;
 			let record_plus_header = WAL_RECORD_HEADER_SIZE + base_record_size;
 
@@ -1743,15 +1764,16 @@ mod tests {
 		}
 	}
 
-	/// Fuzz test with random record sizes - no valid data should be marked corrupt.
-	/// Uses deterministic seed for reproducibility.
+	/// Fuzz test with random record sizes - no valid data should be marked
+	/// corrupt. Uses deterministic seed for reproducibility.
 	#[test]
 	fn fuzz_random_record_sizes_no_false_corruption() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");
 		let opts = Options::default();
 		let mut wal = Wal::open(temp_dir.path(), opts).expect("should create WAL");
 
-		// Simple LCG random number generator for reproducibility (no external crate needed)
+		// Simple LCG random number generator for reproducibility (no external crate
+		// needed)
 		let mut seed: u64 = 12345;
 		let mut next_random = || {
 			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1789,7 +1811,8 @@ mod tests {
 		}
 	}
 
-	/// Mixed fragmented (multi-block) and small records across multiple sessions.
+	/// Mixed fragmented (multi-block) and small records across multiple
+	/// sessions.
 	#[test]
 	fn mixed_fragmented_and_small_records() {
 		let temp_dir = TempDir::new("test").expect("should create temp dir");

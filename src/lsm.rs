@@ -1,38 +1,39 @@
 #[cfg(test)]
 use std::collections::HashMap;
-use std::{
-	collections::HashSet,
-	fs::{create_dir_all, File},
-	path::Path,
-	sync::{Arc, Mutex, RwLock},
-};
+use std::collections::HashSet;
+use std::fs::{create_dir_all, File};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
+use crate::batch::Batch;
+use crate::bplustree::tree::DiskBPlusTree;
+use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
+use crate::commit::{CommitEnv, CommitPipeline};
+use crate::compaction::compactor::{CompactionOptions, Compactor};
+use crate::compaction::CompactionStrategy;
+use crate::error::Result;
+use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::lockfile::LockFile;
+use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
+use crate::oracle::Oracle;
+use crate::snapshot::Counter as SnapshotCounter;
+use crate::sstable::table::Table;
+use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX};
+use crate::task::TaskManager;
+use crate::transaction::{Mode, Transaction};
+use crate::vlog::{VLog, VLogGCManager, ValueLocation};
+use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
+use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::{
-	batch::Batch,
-	bplustree::tree::DiskBPlusTree,
-	checkpoint::{CheckpointMetadata, DatabaseCheckpoint},
-	commit::{CommitEnv, CommitPipeline},
-	compaction::{
-		compactor::{CompactionOptions, Compactor},
-		CompactionStrategy,
-	},
-	error::Result,
-	levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet},
-	lockfile::LockFile,
-	memtable::{ImmutableEntry, ImmutableMemtables, MemTable},
-	oracle::Oracle,
-	snapshot::Counter as SnapshotCounter,
-	sstable::{table::Table, InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX},
-	task::TaskManager,
-	transaction::{Mode, Transaction},
-	vlog::{VLog, VLogGCManager, ValueLocation},
-	wal::{
-		self, cleanup_old_segments,
-		recovery::{repair_corrupted_wal_segment, replay_wal},
-		Wal,
-	},
-	BytewiseComparator, Comparator, Error, FilterPolicy, Options, TimestampComparator,
-	VLogChecksumLevel, Value, WalRecoveryMode,
+	BytewiseComparator,
+	Comparator,
+	Error,
+	FilterPolicy,
+	Options,
+	TimestampComparator,
+	VLogChecksumLevel,
+	Value,
+	WalRecoveryMode,
 };
 use bytes::Bytes;
 
@@ -44,12 +45,13 @@ use async_trait::async_trait;
 /// overlapping SSTables and removing deleted entries.
 #[async_trait]
 pub trait CompactionOperations: Send + Sync {
-	/// Flushes the active memtable to disk, converting it into an immutable SSTable.
-	/// This is the first step in the LSM tree's write path.
+	/// Flushes the active memtable to disk, converting it into an immutable
+	/// SSTable. This is the first step in the LSM tree's write path.
 	fn compact_memtable(&self) -> Result<()>;
 
 	/// Performs compaction according to the specified strategy.
-	/// Compaction merges SSTables to reduce read amplification and remove tombstones.
+	/// Compaction merges SSTables to reduce read amplification and remove
+	/// tombstones.
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
 }
 
@@ -58,52 +60,57 @@ pub trait CompactionOperations: Send + Sync {
 ///
 /// # LSM Tree Overview
 /// An LSM tree optimizes for write performance by buffering writes in memory
-/// and periodically flushing them to disk as sorted, immutable files (SSTables).
-/// Reads must check multiple locations: the active memtable, immutable memtables,
-/// and multiple levels of SSTables.
+/// and periodically flushing them to disk as sorted, immutable files
+/// (SSTables). Reads must check multiple locations: the active memtable,
+/// immutable memtables, and multiple levels of SSTables.
 ///
 /// # Components
-/// - **Active Memtable**: An in-memory, mutable data structure (usually a skip list
-///   or B-tree) that receives all new writes.
-/// - **Immutable Memtables**: Former active memtables that are full and awaiting
-///   flush to disk. They serve reads but accept no new writes.
-/// - **SSTables**: Sorted String Tables on disk, organized into levels. Each level
-///   has progressively larger SSTables with non-overlapping key ranges (except L0).
+/// - **Active Memtable**: An in-memory, mutable data structure (usually a skip
+///   list or B-tree) that receives all new writes.
+/// - **Immutable Memtables**: Former active memtables that are full and
+///   awaiting flush to disk. They serve reads but accept no new writes.
+/// - **SSTables**: Sorted String Tables on disk, organized into levels. Each
+///   level has progressively larger SSTables with non-overlapping key ranges
+///   (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read
 ///   performance and remove deleted entries.
 pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
-	/// In LSM trees, all writes first go to an in-memory structure for fast insertion.
-	/// This memtable is typically implemented as a skip list or balanced tree to
-	/// maintain sorted order while supporting concurrent access.
+	/// In LSM trees, all writes first go to an in-memory structure for fast
+	/// insertion. This memtable is typically implemented as a skip list or
+	/// balanced tree to maintain sorted order while supporting concurrent
+	/// access.
 	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
 
 	/// Collection of immutable memtables waiting to be flushed to disk.
 	///
-	/// When the active memtable fills up (reaches max_memtable_size), it becomes
-	/// immutable and a new active memtable is created. These immutable memtables
-	/// continue serving reads while waiting for background threads to flush them
-	/// to disk as SSTables.
+	/// When the active memtable fills up (reaches max_memtable_size), it
+	/// becomes immutable and a new active memtable is created. These immutable
+	/// memtables continue serving reads while waiting for background threads
+	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
 	/// LSM trees organize SSTables into levels:
-	/// - L0: Contains SSTables flushed directly from memtables. May have overlapping key ranges.
-	/// - L1+: Each level is larger than the previous. SSTables have non-overlapping
-	///   key ranges within a level, enabling efficient binary search.
+	/// - L0: Contains SSTables flushed directly from memtables. May have
+	///   overlapping key ranges.
+	/// - L1+: Each level is larger than the previous. SSTables have
+	///   non-overlapping key ranges within a level, enabling efficient binary
+	///   search.
 	pub level_manifest: Arc<RwLock<LevelManifest>>,
 
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
 
-	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency Control).
-	/// Snapshots provide consistent point-in-time views of the data.
+	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency
+	/// Control). Snapshots provide consistent point-in-time views of the data.
 	pub(crate) snapshot_counter: SnapshotCounter,
 
 	/// Oracle managing transaction timestamps for MVCC.
-	/// Provides monotonic timestamps for transaction ordering and conflict resolution.
+	/// Provides monotonic timestamps for transaction ordering and conflict
+	/// resolution.
 	pub(crate) oracle: Arc<Oracle>,
 
 	/// Value Log (VLog)
@@ -123,7 +130,8 @@ pub(crate) struct CoreInner {
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		// Acquire database lock to prevent multiple processes from opening the same database
+		// Acquire database lock to prevent multiple processes from opening the same
+		// database
 		let mut lockfile = LockFile::new(&opts.path);
 		lockfile.acquire()?;
 
@@ -190,11 +198,12 @@ impl CoreInner {
 	///
 	/// Triggers a flush operation to make room for new writes.
 	///
-	/// This is called when the active memtable exceeds the configured size threshold.
-	/// The operation proceeds in stages:
+	/// This is called when the active memtable exceeds the configured size
+	/// threshold. The operation proceeds in stages:
 	/// 1. Acquire memtable write lock and check if flushing is needed
 	/// 2. If flushing, rotate WAL while STILL holding memtable lock
-	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
+	/// 3. Swap memtable while STILL holding the lock (atomically with WAL
+	///    rotation)
 	/// 4. Release locks, then flush memtable to SST and update manifest
 	/// 5. Asynchronously clean up old WAL segments
 	fn make_room_for_write(&self, force: bool) -> Result<()> {
@@ -312,7 +321,8 @@ impl CoreInner {
 		);
 
 		// Step 7: Async WAL cleanup using values we already have
-		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number earlier
+		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number
+		// earlier
 		let min_wal_to_keep = flushed_wal_number + 1; // Same as changeset.log_number
 
 		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
@@ -340,14 +350,15 @@ impl CoreInner {
 
 	/// Flushes active memtable to SST and updates manifest log_number.
 	///
-	/// This is the core flush logic used by both shutdown and normal memtable rotation.
-	/// Unlike `make_room_for_write`, this does NOT rotate the WAL - the caller is responsible
-	/// for WAL rotation if needed.
+	/// This is the core flush logic used by both shutdown and normal memtable
+	/// rotation. Unlike `make_room_for_write`, this does NOT rotate the WAL -
+	/// the caller is responsible for WAL rotation if needed.
 	///
 	/// # Arguments
 	///
-	/// - `flushed_wal_number`: Optional WAL number that was flushed. If provided, log_number
-	///   will be set to `flushed_wal_number + 1`. If None, uses current active WAL number.
+	/// - `flushed_wal_number`: Optional WAL number that was flushed. If
+	///   provided, log_number will be set to `flushed_wal_number + 1`. If None,
+	///   uses current active WAL number.
 	///
 	/// # Returns
 	///
@@ -433,7 +444,8 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset and write to disk ATOMICALLY
-		// This is the critical section - both SST addition and log_number update happen together
+		// This is the critical section - both SST addition and log_number update happen
+		// together
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
@@ -460,8 +472,9 @@ impl CoreInner {
 
 	/// Flushes a single immutable memtable using its pre-assigned table_id.
 	///
-	/// This is used during shutdown to flush immutable memtables that already have
-	/// their table_ids assigned (from when they were moved from active to immutable).
+	/// This is used during shutdown to flush immutable memtables that already
+	/// have their table_ids assigned (from when they were moved from active to
+	/// immutable).
 	///
 	/// # Arguments
 	///
@@ -545,22 +558,24 @@ impl CoreInner {
 	///
 	/// # Critical: Flush Ordering
 	///
-	/// Immutable memtables MUST be flushed BEFORE the active memtable to preserve
-	/// SSTable ordering:
+	/// Immutable memtables MUST be flushed BEFORE the active memtable to
+	/// preserve SSTable ordering:
 	/// - Immutable memtables contain OLDER data (were swapped out earlier)
 	/// - Active memtable contains NEWEST data (currently receiving writes)
 	/// - Table IDs must reflect temporal order (newer data = higher table_id)
 	///
 	/// # Flush Sequence
 	///
-	/// 1. Flush ALL immutable memtables FIRST using their pre-assigned table_ids
+	/// 1. Flush ALL immutable memtables FIRST using their pre-assigned
+	///    table_ids
 	/// 2. Flush active memtable LAST (gets new highest table_id)
 	/// 3. Update manifest log_number to mark all WALs as flushed
 	///
 	/// # WAL Handling
 	///
 	/// This method does NOT rotate the WAL. The final log_number in manifest
-	/// is set to current_wal + 1, indicating all data up to current WAL is persisted.
+	/// is set to current_wal + 1, indicating all data up to current WAL is
+	/// persisted.
 	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
 		log::info!("Flushing all memtables for shutdown...");
 
@@ -580,7 +595,8 @@ impl CoreInner {
 		// These were assigned when the memtable was moved from active to immutable
 		//
 		// We use fail-fast because:
-		// 1. Successfully flushed memtables already updated log_number (their WALs can be deleted)
+		// 1. Successfully flushed memtables already updated log_number (their WALs can
+		//    be deleted)
 		// 2. Failed memtable's WAL is preserved (its wal_number >= current log_number)
 		// 3. On restart, WAL replay recovers all unflushed data
 		let mut flushed_count = 0;
@@ -732,7 +748,8 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Resolves a value, checking if it's a VLog pointer and retrieving from VLog if needed
+	/// Resolves a value, checking if it's a VLog pointer and retrieving from
+	/// VLog if needed
 	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
 		let location = ValueLocation::decode(value)?;
 		location.resolve_value(self.vlog.as_ref())
@@ -951,7 +968,8 @@ pub(crate) struct Core {
 	/// The commit pipeline that handles write batches
 	commit_pipeline: Arc<CommitPipeline>,
 
-	/// Task manager for background operations (stored in Option so we can take it for shutdown)
+	/// Task manager for background operations (stored in Option so we can take
+	/// it for shutdown)
 	task_manager: Mutex<Option<Arc<TaskManager>>>,
 
 	/// VLog garbage collection manager
@@ -967,13 +985,16 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
-	/// Function to replay WAL with configurable recovery behavior on corruption.
+	/// Function to replay WAL with configurable recovery behavior on
+	/// corruption.
 	///
 	/// # Arguments
 	///
 	/// * `wal_path` - Path to the WAL directory
-	/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped)
-	/// * `context` - Context string for error messages (e.g., "Database startup")
+	/// * `min_wal_number` - Minimum WAL number to replay (older segments are
+	///   skipped)
+	/// * `context` - Context string for error messages (e.g., "Database
+	///   startup")
 	/// * `recovery_mode` - Controls behavior on corruption:
 	///   - `AbsoluteConsistency`: Fail immediately on any corruption
 	///   - `TolerateCorruptedWithRepair`: Attempt repair and continue (default)
@@ -983,7 +1004,8 @@ impl Core {
 	///
 	/// * `Ok(Some(seq_num))` - WAL was replayed successfully
 	/// * `Ok(None)` - WAL was skipped (already flushed) or empty
-	/// * `Err(...)` - Error during replay (corruption in AbsoluteConsistency mode, or unrecoverable error)
+	/// * `Err(...)` - Error during replay (corruption in AbsoluteConsistency
+	///   mode, or unrecoverable error)
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
@@ -1044,7 +1066,8 @@ impl Core {
 						}
 
 						// After repair, replay again to recover data from ALL segments.
-						// The initial replay stopped at the corruption point and didn't process subsequent segments.
+						// The initial replay stopped at the corruption point and didn't process
+						// subsequent segments.
 						let retry_memtable = Arc::new(MemTable::default());
 						match replay_wal(wal_path, &retry_memtable, min_wal_number) {
 							Ok(retry_seq_num) => {
@@ -1209,21 +1232,23 @@ impl Core {
 		self.commit_pipeline.get_visible_seq_num()
 	}
 
-	/// Safely closes the LSM tree by shutting down all components in the correct order.
+	/// Safely closes the LSM tree by shutting down all components in the
+	/// correct order.
 	///
 	/// # Shutdown Sequence
 	///
 	/// 1. Commit pipeline shutdown - stops accepting new writes
 	/// 2. Background tasks stopped - waits for ongoing operations
-	/// 3. Active memtable flush - if flush_on_close enabled AND memtable non-empty, flush to SST (NO WAL rotation)
+	/// 3. Active memtable flush - if flush_on_close enabled AND memtable
+	///    non-empty, flush to SST (NO WAL rotation)
 	/// 4. WAL close - sync and close current WAL file
 	/// 5. Directory sync - ensure all metadata is persisted
 	/// 6. Lock release - allow other processes to open the database
 	///
 	/// # Critical: No Empty WAL Creation
 	///
-	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before flushing.
-	/// This prevents creating an empty WAL file on clean shutdown.
+	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
+	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
 		log::info!("Shutting down LSM tree...");
 
@@ -1263,8 +1288,9 @@ impl Core {
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
-		// This is safe now because all background tasks that could write to WAL are stopped
-		// NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may delete the active WAL file
+		// This is safe now because all background tasks that could write to WAL are
+		// stopped NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may
+		// delete the active WAL file
 		let wal_log_number = self.inner.wal.read().get_active_log_number();
 		log::info!("Closing WAL: active_log_number={}", wal_log_number);
 
@@ -1275,8 +1301,8 @@ impl Core {
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
 		// This happens AFTER closing the WAL to prevent deleting the active WAL file.
-		// When memtable flush sets log_number = current_wal + 1, cleanup would delete the
-		// active WAL if done before closing it.
+		// When memtable flush sets log_number = current_wal + 1, cleanup would delete
+		// the active WAL if done before closing it.
 		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
 
@@ -1564,7 +1590,8 @@ pub struct TreeBuilder {
 }
 
 impl TreeBuilder {
-	/// Creates a new TreeBuilder with default options for the specified key type.
+	/// Creates a new TreeBuilder with default options for the specified key
+	/// type.
 	pub fn new() -> Self {
 		Self {
 			opts: Options::default(),
@@ -1573,7 +1600,8 @@ impl TreeBuilder {
 
 	/// Creates a new TreeBuilder with the specified options.
 	///
-	/// This method ensures type safety by requiring the options to use the same key type.
+	/// This method ensures type safety by requiring the options to use the same
+	/// key type.
 	pub fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
@@ -1643,7 +1671,8 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the unified block cache capacity (includes data blocks, index blocks, and VLog values).
+	/// Sets the unified block cache capacity (includes data blocks, index
+	/// blocks, and VLog values).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.opts = self.opts.with_block_cache_capacity(capacity_bytes);
 		self
@@ -1799,7 +1828,8 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, path::PathBuf};
+	use std::collections::HashMap;
+	use std::path::PathBuf;
 	use test_log::test;
 
 	use crate::compaction::leveled::Strategy;
@@ -1812,7 +1842,8 @@ mod tests {
 		TempDir::new("test").unwrap()
 	}
 
-	/// Creates test options with common defaults, allowing customization of specific fields
+	/// Creates test options with common defaults, allowing customization of
+	/// specific fields
 	fn create_test_options(
 		path: PathBuf,
 		customizations: impl FnOnce(&mut Options),
@@ -1826,7 +1857,8 @@ mod tests {
 		Arc::new(opts)
 	}
 
-	/// Creates test options optimized for small memtable testing (triggers frequent flushes)
+	/// Creates test options optimized for small memtable testing (triggers
+	/// frequent flushes)
 	fn create_small_memtable_options(path: PathBuf) -> Arc<Options> {
 		create_test_options(path, |opts| {
 			opts.max_memtable_size = 64 * 1024; // 64KB
@@ -3173,7 +3205,8 @@ mod tests {
 		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
-		// only one should remain because the active VLog file does not get garbage collected
+		// only one should remain because the active VLog file does not get garbage
+		// collected
 		for _ in 0..6 {
 			tree.garbage_collect_vlog().await.unwrap();
 		}
@@ -3284,7 +3317,8 @@ mod tests {
 		tree.core.compact(strategy).unwrap();
 
 		// There could be multiple VLog files, need to garbage collect them all but
-		// only one should remain because the active VLog file does not get garbage collected
+		// only one should remain because the active VLog file does not get garbage
+		// collected
 		for _ in 0..6 {
 			tree.garbage_collect_vlog().await.unwrap();
 		}
@@ -3358,7 +3392,8 @@ mod tests {
 			tree.flush().unwrap();
 		}
 
-		// --- Step 3: Validate current value of key1 (should be last inserted version) ---
+		// --- Step 3: Validate current value of key1 (should be last inserted version)
+		// ---
 		{
 			let tx = tree.begin().unwrap();
 			let current_value = tx.get(&key1).unwrap().unwrap();
@@ -3396,10 +3431,12 @@ mod tests {
 		let strategy = Arc::new(Strategy::default());
 		tree.core.compact(strategy).unwrap();
 
-		// --- Step 8: Run VLog garbage collection (which internally can trigger file compaction) ---
+		// --- Step 8: Run VLog garbage collection (which internally can trigger file
+		// compaction) ---
 		tree.garbage_collect_vlog().await.unwrap();
 
-		// --- Step 9: Verify key1 still returns the correct latest value after compaction ---
+		// --- Step 9: Verify key1 still returns the correct latest value after
+		// compaction ---
 		{
 			let tx = tree.begin().unwrap();
 			let value = tx.get(&key1).unwrap().unwrap();
@@ -3547,8 +3584,8 @@ mod tests {
 				(table1_id, table2_id, next_table_id)
 			};
 
-			// Verify table IDs are increasing (note: tables are stored in reverse order by sequence number)
-			// So the first table in the vector has the higher ID
+			// Verify table IDs are increasing (note: tables are stored in reverse order by
+			// sequence number) So the first table in the vector has the higher ID
 			assert!(
 				table1_id > table2_id,
 				"Table 1 ID should be greater than table 2 ID (newer table first)"
@@ -4142,7 +4179,8 @@ mod tests {
 		let path = temp_dir.path().to_path_buf();
 
 		let opts = create_test_options(path.clone(), |opts| {
-			opts.max_memtable_size = 10 * 1024 * 1024; // Large memtable to prevent auto-flush
+			opts.max_memtable_size = 10 * 1024 * 1024; // Large memtable to prevent
+			                                  // auto-flush
 		});
 
 		// Phase 1: Write data and simulate crash (no clean shutdown)
@@ -4687,7 +4725,8 @@ mod tests {
 
 	#[test_log::test(tokio::test)]
 	async fn test_wal_append_after_crash_recovery() {
-		// This test verifies that after a crash (no flush), WAL is reused and appended to
+		// This test verifies that after a crash (no flush), WAL is reused and appended
+		// to
 		let temp_dir = TempDir::new("test").unwrap();
 		let path = temp_dir.path().to_path_buf();
 
@@ -4915,7 +4954,8 @@ mod tests {
 
 			let sst_before_close = count_ssts();
 
-			// Close WITHOUT explicit flush (shutdown should flush because flush_on_close=true)
+			// Close WITHOUT explicit flush (shutdown should flush because
+			// flush_on_close=true)
 			tree.close().await.unwrap();
 
 			let sst_after_close = count_ssts();
@@ -5046,8 +5086,9 @@ mod tests {
 		}
 	}
 
-	/// Tests that flush_all_memtables_for_shutdown flushes both immutable and active memtables
-	/// in the correct order (immutables first, then active) to preserve SSTable ordering.
+	/// Tests that flush_all_memtables_for_shutdown flushes both immutable and
+	/// active memtables in the correct order (immutables first, then active)
+	/// to preserve SSTable ordering.
 	#[test_log::test(tokio::test)]
 	async fn test_flush_all_memtables_on_close_ordering() {
 		// This test verifies that close() flushes ALL memtables (immutable + active)
@@ -5134,8 +5175,8 @@ mod tests {
 		}
 	}
 
-	/// Tests that pending immutable memtables are flushed during close even when
-	/// the active memtable is empty.
+	/// Tests that pending immutable memtables are flushed during close even
+	/// when the active memtable is empty.
 	#[test_log::test(tokio::test)]
 	async fn test_flush_immutable_memtables_with_empty_active() {
 		let temp_dir = TempDir::new("test").unwrap();
@@ -5178,8 +5219,8 @@ mod tests {
 		}
 	}
 
-	/// Tests that SSTable table_ids are in correct ascending order after flushing
-	/// immutable memtables followed by active memtable.
+	/// Tests that SSTable table_ids are in correct ascending order after
+	/// flushing immutable memtables followed by active memtable.
 	#[test_log::test(tokio::test)]
 	async fn test_sst_table_ids_ordered_correctly_on_close() {
 		let temp_dir = TempDir::new("test").unwrap();
@@ -6008,7 +6049,8 @@ mod tests {
 				Err(Error::WalCorruption {
 					..
 				}) => {
-					// Expected - AbsoluteConsistency correctly fails on corruption
+					// Expected - AbsoluteConsistency correctly fails on
+					// corruption
 				}
 				Err(e) => panic!("Expected WalCorruption error, got: {}", e),
 				Ok(_) => {
@@ -6184,7 +6226,8 @@ mod tests {
 		}
 
 		// Phase 2: Manually create WAL segments 2 and 3 with key2 and key3
-		// This simulates a crash where WAL rotations happened but manifest wasn't updated
+		// This simulates a crash where WAL rotations happened but manifest wasn't
+		// updated
 		let highest_segment_created;
 		{
 			log::info!("Phase 2: Creating additional WAL segments");
@@ -6249,8 +6292,8 @@ mod tests {
 			highest_segment_created = segment_for_key3;
 		}
 
-		// Phase 3: First recovery - open Tree, verify key2/key3 recovered, then write NEW data
-		// This is where the bug manifests:
+		// Phase 3: First recovery - open Tree, verify key2/key3 recovered, then write
+		// NEW data This is where the bug manifests:
 		// - WITHOUT FIX: WAL opens at log_number (1), new writes go to segment 1
 		// - WITH FIX: WAL opens at highest (3), new writes go to segment 3
 		let active_wal_after_recovery;

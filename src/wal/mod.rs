@@ -25,9 +25,9 @@ mod tests;
 ///
 /// # File Format
 ///
-/// A WAL file is broken down into 32KB blocks. Each block contains one or more records.
-/// If a record doesn't fit in the remaining space of a block, it's fragmented across
-/// multiple blocks.
+/// A WAL file is broken down into 32KB blocks. Each block contains one or more
+/// records. If a record doesn't fit in the remaining space of a block, it's
+/// fragmented across multiple blocks.
 ///
 /// ```text
 /// File Layout:
@@ -381,7 +381,8 @@ pub(crate) fn list_segment_ids(dir: &Path, allowed_extension: Option<&str>) -> R
 	Ok(refs)
 }
 
-/// Helper function to check if a file should be included based on extension filtering.
+/// Helper function to check if a file should be included based on extension
+/// filtering.
 pub(crate) fn should_include_file(
 	allowed_extension: Option<&str>,
 	file_extension: Option<String>,
@@ -401,7 +402,8 @@ pub(crate) struct SegmentRef {
 }
 
 impl SegmentRef {
-	/// Creates a vector of SegmentRef instances by reading segments in the specified directory.
+	/// Creates a vector of SegmentRef instances by reading segments in the
+	/// specified directory.
 	pub(crate) fn read_segments_from_directory(
 		directory_path: &Path,
 		allowed_extension: Option<&str>,
@@ -549,11 +551,12 @@ impl WritableFile for BufferedFileWriter {
 
 // ===== Cleanup =====
 
-/// Cleans up old WAL segments based on the minimum log number with unflushed data.
+/// Cleans up old WAL segments based on the minimum log number with unflushed
+/// data.
 ///
-/// This function removes all WAL segments with ID < min_wal_number, since they have
-/// been flushed to SSTables and are no longer needed. The manifest tracks which WALs
-/// have been flushed.
+/// This function removes all WAL segments with ID < min_wal_number, since they
+/// have been flushed to SSTables and are no longer needed. The manifest tracks
+/// which WALs have been flushed.
 ///
 /// # Arguments
 ///

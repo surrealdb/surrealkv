@@ -38,8 +38,9 @@ impl CommitEntry {
 	}
 }
 
-/// Oracle is responsible for managing transaction timestamps and isolation levels.
-/// The current implementation uses Snapshot Isolation (SI) for conflict detection
+/// Oracle is responsible for managing transaction timestamps and isolation
+/// levels. The current implementation uses Snapshot Isolation (SI) for conflict
+/// detection
 pub(crate) struct Oracle {
 	/// Transaction commit queue
 	pub(crate) transaction_commit_id: Arc<AtomicU64>,
@@ -102,7 +103,8 @@ impl Oracle {
 		}
 	}
 
-	/// Prepares a transaction for commit by checking conflicts and assigning a transaction ID.
+	/// Prepares a transaction for commit by checking conflicts and assigning a
+	/// transaction ID.
 	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
 		// Extract only the keys from the transaction's writeset
 		// Keys are already sorted in the BTreeMap, so we maintain sort order
