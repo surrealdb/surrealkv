@@ -78,6 +78,11 @@ assigning_clones = "warn"
 # https://rust-lang.github.io/rust-clippy/master/#bool_assert_comparison
 bool_assert_comparison = "allow"
 
+# Checks for usage of .clone() on a ref-counted pointer, (Rc, Arc, rc::Weak, or sync::Weak),
+# and suggests calling Clone via unified function syntax instead (e.g., Rc::clone(foo)).
+# https://rust-lang.github.io/rust-clippy/master/#clone_on_ref_ptr
+clone_on_ref_ptr = "warn"
+
 # Checks for the usage of `as _` conversion using inferred type.
 # https://rust-lang.github.io/rust-clippy/master/#cloned_instead_of_copied
 cloned_instead_of_copied = "warn"

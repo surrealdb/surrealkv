@@ -204,7 +204,7 @@ impl MemTable {
 
 		{
 			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, lsm_opts.clone(), 0); // Memtables always flush to L0
+			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
 			let iter = self.iter(false);
 			let iter = Box::new(iter);
@@ -214,7 +214,7 @@ impl MemTable {
 				None,                   // no vlog access in flush context
 				false,                  // versioning disabled in flush context
 				0,                      // retention period is 0 in flush context
-				lsm_opts.clock.clone(), // clock is the system clock
+				Arc::clone(&lsm_opts.clock), // clock is the system clock
 			);
 			for (key, encoded_val) in comp_iter.by_ref() {
 				// The memtable already contains the correct ValueLocation encoding

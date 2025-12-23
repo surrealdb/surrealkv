@@ -142,14 +142,14 @@ impl Snapshot {
 	/// Collects the iterator state from all LSM components
 	/// This is a helper method used by both iterators and optimized operations like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let active = guardian::ArcRwLockReadGuardian::take(self.core.active_memtable.clone())?;
+		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
 		let immutable =
-			guardian::ArcRwLockReadGuardian::take(self.core.immutable_memtables.clone())?;
-		let manifest = guardian::ArcRwLockReadGuardian::take(self.core.level_manifest.clone())?;
+			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
+		let manifest = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
 
 		Ok(IterState {
 			active: active.clone(),
-			immutable: immutable.iter().map(|entry| entry.memtable.clone()).collect(),
+			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
 			levels: manifest.levels.clone(),
 		})
 	}
@@ -275,7 +275,7 @@ impl Snapshot {
 	) -> Result<impl DoubleEndedIterator<Item = IterResult>> {
 		// Create a range from start (inclusive) to end (exclusive)
 		let range = start.as_ref().to_vec()..end.as_ref().to_vec();
-		SnapshotIterator::new_from(self.core.clone(), self.seq_num, range, keys_only)
+		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, range, keys_only)
 	}
 
 	/// Queries the versioned index for a specific key at a specific timestamp
@@ -349,7 +349,7 @@ impl Snapshot {
 
 		Ok(ScanAtTimestampIterator {
 			inner: versioned_iter,
-			core: self.core.clone(),
+			core: Arc::clone(&self.core),
 		})
 	}
 
@@ -882,7 +882,7 @@ impl SnapshotIterator<'_> {
 	{
 		// Create a temporary snapshot to use the helper method
 		let snapshot = Snapshot {
-			core: core.clone(),
+			core: Arc::clone(&core),
 			seq_num,
 		};
 		let iter_state = snapshot.collect_iter_state()?;

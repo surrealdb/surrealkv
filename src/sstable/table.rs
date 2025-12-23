@@ -187,7 +187,7 @@ impl<W: Write> TableWriter<W> {
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
-				let mut f = FilterBlockWriter::new(policy.clone());
+				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
 				f.start_block(0);
 				Some(f)
 			} else {
@@ -202,17 +202,17 @@ impl<W: Write> TableWriter<W> {
 
 		TableWriter {
 			writer,
-			opts: opts.clone(),
+			opts: Arc::clone(&opts),
 			compression_selector,
 			target_level,
 			offset: 0,
 			meta,
 			prev_block_last_key: Vec::new(),
 
-			data_block: Some(BlockWriter::new(opts.clone())),
-			partitioned_index: TopLevelIndexWriter::new(opts.clone(), opts.index_partition_size),
+			data_block: Some(BlockWriter::new(Arc::clone(&opts))),
+			partitioned_index: TopLevelIndexWriter::new(Arc::clone(&opts), opts.index_partition_size),
 			filter_block: fb,
-			internal_cmp: Arc::new(InternalKeyComparator::new(opts.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
 		}
 	}
 
@@ -246,7 +246,7 @@ impl<W: Write> TableWriter<W> {
 		// Initialize filter block on first key
 		if self.filter_block.is_none() && self.opts.filter_policy.is_some() {
 			self.filter_block =
-				Some(FilterBlockWriter::new(self.opts.filter_policy.as_ref().unwrap().clone()));
+				Some(FilterBlockWriter::new(Arc::clone(self.opts.filter_policy.as_ref().unwrap())));
 			// The offset is 0 for the entire SST
 			self.filter_block.as_mut().unwrap().start_block(0);
 		}
@@ -305,7 +305,7 @@ impl<W: Write> TableWriter<W> {
 		self.partitioned_index.add(&separator_key, &handle_encoded)?;
 
 		// Prepare for the next data block.
-		self.data_block = Some(BlockWriter::new(self.opts.clone()));
+		self.data_block = Some(BlockWriter::new(Arc::clone(&self.opts)));
 
 		Ok(())
 	}
@@ -331,7 +331,7 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Initialize meta_index block
-		let mut meta_ix_block = BlockWriter::new(self.opts.clone());
+		let mut meta_ix_block = BlockWriter::new(Arc::clone(&self.opts));
 
 		// Write the filter block to the meta index block if present.
 		if let Some(fblock) = self.filter_block.take() {
@@ -567,13 +567,13 @@ pub(crate) fn read_table_block(
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
-	let buf = read_bytes(f.clone(), location)?;
+	let buf = read_bytes(Arc::clone(&f), location)?;
 	let compress = read_bytes(
-		f.clone(),
+		Arc::clone(&f),
 		&BlockHandle::new(location.offset() + location.size(), BLOCK_COMPRESS_LEN),
 	)?;
 	let cksum = read_bytes(
-		f.clone(),
+		Arc::clone(&f),
 		&BlockHandle::new(
 			location.offset() + location.size() + BLOCK_COMPRESS_LEN,
 			BLOCK_CKSUM_LEN,
@@ -634,17 +634,17 @@ impl Table {
 		//    3. [meta block: properties]
 		//    4. [meta block: filter]
 
-		let footer = read_footer(file.clone(), file_size as usize)?;
+		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
 		// println!("meta ix handle: {:?}", footer.meta_index);
 
 		// Using partitioned index
 		let index_block = {
 			let partitioned_index =
-				TopLevelIndex::new(id, opts.clone(), file.clone(), &footer.index)?;
+				TopLevelIndex::new(id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
-		let metaindexblock = read_table_block(opts.clone(), file.clone(), &footer.meta_index)?;
+		let metaindexblock = read_table_block(Arc::clone(&opts), Arc::clone(&file), &footer.meta_index)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
 		let writer_metadata =
@@ -653,7 +653,7 @@ impl Table {
 
 		let filter_reader = if opts.filter_policy.is_some() {
 			// Read the filter block if filter policy is present
-			Self::read_filter_block(&metaindexblock, file.clone(), &opts)?
+			Self::read_filter_block(&metaindexblock, Arc::clone(&file), &opts)?
 		} else {
 			None
 		};
@@ -662,7 +662,7 @@ impl Table {
 			id,
 			file,
 			file_size,
-			internal_cmp: Arc::new(InternalKeyComparator::new(opts.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
 			opts,
 			filter_reader,
 			index_block,
@@ -709,7 +709,7 @@ impl Table {
 				return Ok(Some(read_filter_block(
 					file,
 					&filter_block_location,
-					options.filter_policy.as_ref().unwrap().clone(),
+					Arc::clone(options.filter_policy.as_ref().unwrap()),
 				)?));
 			}
 		}
@@ -717,17 +717,17 @@ impl Table {
 	}
 
 	fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
-		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
-		{
-			return Ok(block);
-		}
+	if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
+	{
+		return Ok(block);
+	}
 
-		let b = read_table_block(self.opts.clone(), self.file.clone(), location)?;
-		let b = Arc::new(b);
+	let b = read_table_block(Arc::clone(&self.opts), Arc::clone(&self.file), location)?;
+	let b = Arc::new(b);
 
-		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, b.clone());
+	self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
 
-		Ok(b)
+	Ok(b)
 	}
 
 	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(InternalKey, Value)>> {
@@ -805,16 +805,16 @@ impl Table {
 		let index_block_iter = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// For partitioned index, start with the first partition
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				if let Ok(first_block) = partitioned_index.first_partition() {
-					first_block.iter(false)
-				} else {
-					// If there are no partitions, create a proper empty block
-					let empty_writer = BlockWriter::new(self.opts.clone());
-					let empty_block_data = empty_writer.finish();
-					let empty_block = Block::new(empty_block_data, self.opts.clone());
-					empty_block.iter(false)
-				}
+			// Note: Index blocks always need full key-value pairs to decode block handles
+			if let Ok(first_block) = partitioned_index.first_partition() {
+				first_block.iter(false)
+			} else {
+				// If there are no partitions, create a proper empty block
+				let empty_writer = BlockWriter::new(Arc::clone(&self.opts));
+				let empty_block_data = empty_writer.finish();
+				let empty_block = Block::new(empty_block_data, Arc::clone(&self.opts));
+				empty_block.iter(false)
+			}
 			}
 		};
 

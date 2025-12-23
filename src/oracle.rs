@@ -114,7 +114,7 @@ impl Oracle {
 		});
 
 		// Insert into queue with version
-		let version = self.atomic_commit(commit_entry.clone())?;
+		let version = self.atomic_commit(Arc::clone(&commit_entry))?;
 
 		// Check for conflicts
 		let has_conflict = self.check_conflicts(version, txn.start_commit_id, &commit_entry)?;

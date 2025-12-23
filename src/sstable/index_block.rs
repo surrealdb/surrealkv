@@ -57,7 +57,7 @@ pub(crate) struct TopLevelIndexWriter {
 impl TopLevelIndexWriter {
 	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> TopLevelIndexWriter {
 		TopLevelIndexWriter {
-			opts: opts.clone(),
+			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
 			current_block: BlockWriter::new(opts),
 			max_block_size,
@@ -87,7 +87,7 @@ impl TopLevelIndexWriter {
 	}
 
 	fn finish_current_block(&mut self) {
-		let new_block = BlockWriter::new(self.opts.clone());
+		let new_block = BlockWriter::new(Arc::clone(&self.opts));
 		let finished_block = std::mem::replace(&mut self.current_block, new_block);
 		self.index_blocks.push(finished_block);
 	}
@@ -159,7 +159,7 @@ impl TopLevelIndex {
 		f: Arc<dyn File>,
 		location: &BlockHandle,
 	) -> Result<Self> {
-		let block = read_table_block(opt.clone(), f.clone(), location)?;
+		let block = read_table_block(Arc::clone(&opt), Arc::clone(&f), location)?;
 		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
@@ -175,7 +175,7 @@ impl TopLevelIndex {
 			id,
 			opts: opt,
 			blocks,
-			file: f.clone(),
+			file: Arc::clone(&f),
 		})
 	}
 
@@ -202,9 +202,9 @@ impl TopLevelIndex {
 		}
 
 		let block_data =
-			read_table_block(self.opts.clone(), self.file.clone(), &block_handle.handle)?;
+			read_table_block(Arc::clone(&self.opts), Arc::clone(&self.file), &block_handle.handle)?;
 		let block = Arc::new(block_data);
-		self.opts.block_cache.insert_index_block(self.id, block_handle.offset(), block.clone());
+		self.opts.block_cache.insert_index_block(self.id, block_handle.offset(), Arc::clone(&block));
 
 		Ok(block)
 	}

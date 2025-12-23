@@ -217,10 +217,10 @@ impl Transaction {
 			core.oracle.register_txn_start(start_commit_id);
 		}
 
-		let mut snapshot = None;
-		if !mode.is_write_only() {
-			snapshot = Some(Snapshot::new(core.clone(), read_ts));
-		}
+	let mut snapshot = None;
+	if !mode.is_write_only() {
+		snapshot = Some(Snapshot::new(Arc::clone(&core), read_ts));
+	}
 
 		Ok(Self {
 			mode,

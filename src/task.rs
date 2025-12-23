@@ -52,15 +52,15 @@ impl TaskManager {
 		let level_running = Arc::new(AtomicBool::new(false));
 		let task_handles = Mutex::new(Some(Vec::new()));
 
-		// Spawn memtable compaction task
-		{
-			let core = core.clone();
-			let stop_flag = stop_flag.clone();
-			let notify = memtable_notify.clone();
-			let running = memtable_running.clone();
-			let level_notify = level_notify.clone();
+	// Spawn memtable compaction task
+	{
+		let core = Arc::clone(&core);
+		let stop_flag = Arc::clone(&stop_flag);
+		let notify = Arc::clone(&memtable_notify);
+		let running = Arc::clone(&memtable_running);
+		let level_notify = Arc::clone(&level_notify);
 
-			let handle = tokio::spawn(async move {
+		let handle = tokio::spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;
@@ -86,14 +86,14 @@ impl TaskManager {
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
-		// Spawn level compaction task
-		{
-			let core = core.clone();
-			let stop_flag = stop_flag.clone();
-			let notify = level_notify.clone();
-			let running = level_running.clone();
+	// Spawn level compaction task
+	{
+		let core = Arc::clone(&core);
+		let stop_flag = Arc::clone(&stop_flag);
+		let notify = Arc::clone(&level_notify);
+		let running = Arc::clone(&level_running);
 
-			let handle = tokio::spawn(async move {
+		let handle = tokio::spawn(async move {
 				loop {
 					// Wait for notification
 					notify.notified().await;

@@ -213,7 +213,7 @@ impl LevelManifest {
 
 			for &table_id in table_ids {
 				// Load the actual table from disk
-				match Self::load_table(table_id, opts.clone()) {
+				match Self::load_table(table_id, Arc::clone(&opts)) {
 					Ok(table) => tables.push(table),
 					Err(err) => {
 						log::error!("Error loading table {table_id}: {err:?}");
@@ -377,10 +377,10 @@ impl LevelManifest {
 				let level_mut = Arc::make_mut(level_ref);
 				if *level == 0 {
 					// Level 0: sorted by sequence number (tables can overlap)
-					level_mut.insert(table.clone());
+					level_mut.insert(Arc::clone(table));
 				} else {
 					// Level 1+: sorted by smallest key (tables cannot overlap)
-					level_mut.insert_sorted_by_key(table.clone());
+					level_mut.insert_sorted_by_key(Arc::clone(table));
 				}
 			}
 

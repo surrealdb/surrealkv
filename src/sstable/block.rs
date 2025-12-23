@@ -93,7 +93,7 @@ pub(crate) struct Block {
 
 impl Block {
 	pub(crate) fn iter(&self, keys_only: bool) -> BlockIterator {
-		BlockIterator::new(self.opts.clone(), self.block.clone(), keys_only)
+		BlockIterator::new(Arc::clone(&self.opts), self.block.clone(), keys_only)
 	}
 
 	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
@@ -176,7 +176,7 @@ impl BlockWriter {
 	// Constructor for BlockWriter
 	pub(crate) fn new(opt: Arc<Options>) -> Self {
 		BlockWriter {
-			internal_cmp: Arc::new(InternalKeyComparator::new(opt.comparator.clone())),
+			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opt.comparator))),
 			buffer: Vec::with_capacity(opt.block_size),
 			restart_interval: opt.block_restart_interval,
 			restart_points: vec![0],
@@ -344,7 +344,7 @@ impl BlockIterator {
 			*restart_point = u32::decode_fixed(&block[start_point..end_point]).unwrap();
 		}
 
-		let internal_comparator = Arc::new(InternalKeyComparator::new(options.comparator.clone()));
+		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&options.comparator)));
 
 		BlockIterator {
 			block,
