@@ -348,7 +348,7 @@ mod tests {
 		// Initialize TopLevelIndex with predefined blocks using user keys only
 		let index = TopLevelIndex {
 			id: 0,
-			opts: opts.clone(),
+			opts,
 			blocks: vec![
 				BlockHandleWithKey::new(b"c".to_vec(), BlockHandle::new(0, 10)),
 				BlockHandleWithKey::new(b"f".to_vec(), BlockHandle::new(10, 10)),
@@ -414,7 +414,7 @@ mod tests {
 
 		// Now read it back
 		let file = wrap_buffer(buffer);
-		let index = TopLevelIndex::new(0, opts.clone(), file, &top_level_handle).unwrap();
+		let index = TopLevelIndex::new(0, opts, file, &top_level_handle).unwrap();
 
 		// Test lookups for various keys
 		for (key, _) in &entries {

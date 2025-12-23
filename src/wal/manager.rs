@@ -860,7 +860,7 @@ mod tests {
 		// Step 3: Edge case - open with min_log_number higher than any segment on disk
 		// max(5, 3) = 5, so should open at 5
 		{
-			let mut wal = Wal::open_with_min_log_number(wal_path, 5, opts.clone()).unwrap();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 5, opts).unwrap();
 
 			assert_eq!(
 				wal.get_active_log_number(),

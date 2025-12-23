@@ -1,25 +1,25 @@
+use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
-use std::{cmp::Ordering, time::SystemTime};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
+use crate::compression::CompressionSelector;
+use crate::error::{Error, Result};
+use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
+use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::meta::{size_of_writer_metadata, TableMetadata};
+use crate::sstable::{
+	InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
+};
+use crate::vfs::File;
 use crate::{
-	compression::CompressionSelector,
-	error::{Error, Result},
-	sstable::{
-		block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter},
-		filter_block::{FilterBlockReader, FilterBlockWriter},
-		index_block::{TopLevelIndex, TopLevelIndexWriter},
-		meta::{size_of_writer_metadata, TableMetadata},
-		InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX,
-	},
-	vfs::File,
 	Comparator, CompressionType, FilterPolicy, InternalKeyComparator, InternalKeyRange,
 	Iterator as LSMIterator, Options, Value,
 };
@@ -161,7 +161,8 @@ impl Footer {
 	}
 }
 
-// Defines a writer for constructing and writing table structures to a storage medium.
+// Defines a writer for constructing and writing table structures to a storage
+// medium.
 pub(crate) struct TableWriter<W: Write> {
 	writer: W,                                 // Underlying writer to write data to.
 	opts: Arc<Options>,                        // Shared table options.
@@ -309,7 +310,8 @@ impl<W: Write> TableWriter<W> {
 		Ok(())
 	}
 
-	// Finalizes the table writing process, writing any pending blocks and the footer.
+	// Finalizes the table writing process, writing any pending blocks and the
+	// footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
 		self.meta.properties.file_size = self.size_estimate() as u64;
@@ -345,7 +347,8 @@ impl<W: Write> TableWriter<W> {
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 
-				// TODO: Add this as part of property as the current trailer will mark it as deleted
+				// TODO: Add this as part of property as the current trailer will mark it as
+				// deleted
 				let filter_key = InternalKey::new(
 					Bytes::copy_from_slice(filter_key.as_bytes()),
 					0,
@@ -866,7 +869,8 @@ impl Table {
 	}
 
 	/// Checks if this table is completely after the given range
-	/// Returns true if table's lowest key is greater than the range's highest key
+	/// Returns true if table's lowest key is greater than the range's highest
+	/// key
 	pub(crate) fn is_after_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
 		self.meta
 			.properties
@@ -895,7 +899,8 @@ pub(crate) struct TableIterator {
 	keys_only: bool,
 	/// Range bounds for filtering (InternalKey)
 	range: InternalKeyRange,
-	/// Whether reverse iteration has started (to distinguish from just positioned)
+	/// Whether reverse iteration has started (to distinguish from just
+	/// positioned)
 	reverse_started: bool,
 }
 
@@ -1061,7 +1066,8 @@ impl TableIterator {
 				self.seek(&internal_key.encode());
 			}
 			Bound::Excluded(internal_key) => {
-				// For excluded bound, seek to highest version of the key, then skip all versions
+				// For excluded bound, seek to highest version of the key, then skip all
+				// versions
 				let seek_key = InternalKey::new(
 					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
@@ -1244,7 +1250,8 @@ impl DoubleEndedIterator for TableIterator {
 			}
 		}
 
-		// If positioned but not yet started reverse iteration, return current position first
+		// If positioned but not yet started reverse iteration, return current position
+		// first
 		if self.positioned && !self.reverse_started && self.valid() {
 			let item = (
 				self.current_block.as_ref().unwrap().key(),
@@ -1409,7 +1416,8 @@ impl LSMIterator for TableIterator {
 								// Try to advance to next block
 								match self.skip_to_next_entry() {
 									Ok(true) => {
-										// Successfully loaded next block and positioned at first entry
+										// Successfully loaded next block and positioned at first
+										// entry
 										return Some(());
 									}
 									Ok(false) => {
@@ -1571,8 +1579,7 @@ mod tests {
 					1,
 					InternalKeyKind::Set,
 					0,
-				)
-				.into(),
+				),
 				data[i].1.as_bytes(),
 			)
 			.unwrap();
@@ -1582,8 +1589,7 @@ mod tests {
 					1,
 					InternalKeyKind::Set,
 					0,
-				)
-				.into(),
+				),
 				data2[i].1.as_bytes(),
 			)
 			.unwrap();
@@ -1606,8 +1612,7 @@ mod tests {
 
 		for &(k, v) in data.iter() {
 			b.add(
-				InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, InternalKeyKind::Set, 0)
-					.into(),
+				InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, InternalKeyKind::Set, 0),
 				v.as_bytes(),
 			)
 			.unwrap();
@@ -1630,8 +1635,9 @@ mod tests {
 		]
 	}
 
-	// Build a table containing raw keys (no format). It returns (vector, length) for convenience
-	// reason, a call f(v, v.len()) doesn't work for borrowing reasons.
+	// Build a table containing raw keys (no format). It returns (vector, length)
+	// for convenience reason, a call f(v, v.len()) doesn't work for borrowing
+	// reasons.
 	fn build_table(data: Vec<(&str, &str)>) -> (Vec<u8>, usize) {
 		let mut d = Vec::with_capacity(512);
 		let mut opts = default_opts_mut();
@@ -1650,8 +1656,7 @@ mod tests {
 						1,
 						InternalKeyKind::Set,
 						0,
-					)
-					.into(),
+					),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1680,8 +1685,7 @@ mod tests {
 						seq,
 						InternalKeyKind::Set,
 						0,
-					)
-					.into(),
+					),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1791,7 +1795,7 @@ mod tests {
 				0,
 			);
 
-			writer.add(internal_key.into(), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		// Finish writing the table
@@ -1799,7 +1803,7 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Create a table reader
-		let table = Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		// Verify the number of entries matches
 		assert_eq!(
@@ -1867,7 +1871,7 @@ mod tests {
 				0,
 			);
 
-			writer.add(internal_key.into(), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		// Finish writing the table
@@ -1875,8 +1879,7 @@ mod tests {
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Create a table reader
-		let table =
-			Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify the number of entries matches
 		assert_eq!(
@@ -1913,10 +1916,8 @@ mod tests {
 		seq: u64,
 		value: &[u8],
 	) -> Result<()> {
-		writer.add(
-			Arc::new(InternalKey::new(Bytes::copy_from_slice(key), seq, InternalKeyKind::Set, 0)),
-			value,
-		)
+		writer
+			.add(InternalKey::new(Bytes::copy_from_slice(key), seq, InternalKeyKind::Set, 0), value)
 	}
 
 	#[test]
@@ -2300,7 +2301,8 @@ mod tests {
 		assert_eq!(&key_range.low[..], expected_low);
 		assert_eq!(&key_range.high[..], expected_high);
 
-		// Test keys in the gaps to ensure the is_key_in_key_range function works properly
+		// Test keys in the gaps to ensure the is_key_in_key_range function works
+		// properly
 		let in_first_gap = "ccc".as_bytes(); // Between bbb and ppp
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			Bytes::copy_from_slice(in_first_gap),
@@ -2407,7 +2409,7 @@ mod tests {
 				};
 
 				b.add(
-					InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, kind, 0).into(),
+					InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, kind, 0),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -3059,15 +3061,14 @@ mod tests {
 				InternalKeyKind::Set,
 				0,
 			);
-			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		let size = writer.finish().unwrap();
 		assert!(size > 0, "Table should have non-zero size");
 
 		// Now read the table back with partitioned index
-		let table =
-			Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 		// Verify it's using partitioned index
 		match &table.index_block {
@@ -3137,10 +3138,10 @@ mod tests {
 		let value = b"value_bbb";
 		let internal_key =
 			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(internal_key), value).unwrap();
+		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		// Try to get key_aaa which does NOT exist
 		// key_aaa < key_bbb lexicographically
@@ -3153,8 +3154,8 @@ mod tests {
 
 		let result = table.get(lookup_key).unwrap();
 
-		// The bug: with >= comparison, this incorrectly returns Some((key_bbb, value_bbb))
-		// The fix: with == comparison, this correctly returns None
+		// The bug: with >= comparison, this incorrectly returns Some((key_bbb,
+		// value_bbb)) The fix: with == comparison, this correctly returns None
 		assert!(
 			result.is_none(),
 			"get() should return None for non-existent key, but got {:?}",
@@ -3167,8 +3168,9 @@ mod tests {
 
 	#[test]
 	fn test_get_same_key_different_sequence_numbers() {
-		// Validates fix returns value when user_key matches, even with different seq_nums
-		// Internal ordering: user_key asc, seq_num DESC (reversed: higher seq_nums sort first)
+		// Validates fix returns value when user_key matches, even with different
+		// seq_nums Internal ordering: user_key asc, seq_num DESC (reversed: higher
+		// seq_nums sort first)
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
@@ -3176,13 +3178,13 @@ mod tests {
 		let user_key = b"my_key";
 
 		let key1 = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key1), b"value_100").unwrap();
+		writer.add(key1, b"value_100").unwrap();
 
 		let key2 = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key2), b"value_50").unwrap();
+		writer.add(key2, b"value_50").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key_higher =
 			InternalKey::new(Bytes::copy_from_slice(user_key), 200, InternalKeyKind::Set, 0);
@@ -3235,22 +3237,22 @@ mod tests {
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let key_bbb =
 			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 75, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let user_key = b"my_key";
 		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key), b"value_50").unwrap();
+		writer.add(key, b"value_50").unwrap();
 
 		let key_zzz =
 			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
@@ -3275,7 +3277,7 @@ mod tests {
 		let writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"any_key"), 100, InternalKeyKind::Set, 0);
@@ -3293,16 +3295,16 @@ mod tests {
 
 		let key_a =
 			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_a), b"value_a_100").unwrap();
+		writer.add(key_a, b"value_a_100").unwrap();
 
 		let key_b = InternalKey::new(Bytes::copy_from_slice(b"key_b"), 50, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_b), b"value_b_50").unwrap();
+		writer.add(key_b, b"value_b_50").unwrap();
 
 		let key_c = InternalKey::new(Bytes::copy_from_slice(b"key_c"), 75, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_c), b"value_c_75").unwrap();
+		writer.add(key_c, b"value_c_75").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_b_low =
 			InternalKey::new(Bytes::copy_from_slice(b"key_b"), 25, InternalKeyKind::Set, 0);
@@ -3340,18 +3342,18 @@ mod tests {
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let user_key = b"boundary_key";
 		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key), b"value_100").unwrap();
+		writer.add(key, b"value_100").unwrap();
 
 		let key_zzz =
 			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_min =
 			InternalKey::new(Bytes::copy_from_slice(user_key), 0, InternalKeyKind::Set, 0);
@@ -3380,30 +3382,31 @@ mod tests {
 	fn test_get_lookup_higher_than_stored() {
 		// Snapshot at seq=50 can see older version at seq=25
 		// Internal ordering: user_key asc, seq_num DESC (reversed!)
-		// stored(25).cmp(lookup(50)) = lookup.seq_num().cmp(stored.seq_num()) = 50.cmp(25) = Greater
-		// So stored(25) > lookup(50) in internal ordering (even though 25 < 50 numerically)
+		// stored(25).cmp(lookup(50)) = lookup.seq_num().cmp(stored.seq_num()) =
+		// 50.cmp(25) = Greater So stored(25) > lookup(50) in internal ordering (even
+		// though 25 < 50 numerically)
 		let opts = Arc::new(Options::new().with_filter_policy(None));
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let key_bbb =
 			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 80, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let user_key = b"mykey";
 		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key), b"value_25").unwrap();
+		writer.add(key, b"value_25").unwrap();
 
 		let key_zzz =
 			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
@@ -3432,13 +3435,13 @@ mod tests {
 				InternalKeyKind::Set,
 				0,
 			);
-			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		let target_key = b"target_key";
 		let key_500 =
 			InternalKey::new(Bytes::copy_from_slice(target_key), 500, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_500), b"value_500").unwrap();
+		writer.add(key_500, b"value_500").unwrap();
 
 		for i in 0..40 {
 			let key = format!("zzz_key_{:03}", i);
@@ -3449,11 +3452,11 @@ mod tests {
 				InternalKeyKind::Set,
 				0,
 			);
-			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		assert!(table.meta.properties.block_count > 1);
 
@@ -3498,18 +3501,18 @@ mod tests {
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let key_bbb =
 			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let key_ccc =
 			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_ccc), b"value_ccc").unwrap();
+		writer.add(key_ccc, b"value_ccc").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
@@ -3527,18 +3530,18 @@ mod tests {
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let key_ccc =
 			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_ccc), b"value_ccc").unwrap();
+		writer.add(key_ccc, b"value_ccc").unwrap();
 
 		let key_eee =
 			InternalKey::new(Bytes::copy_from_slice(b"key_eee"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_eee), b"value_eee").unwrap();
+		writer.add(key_eee, b"value_eee").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
@@ -3556,7 +3559,7 @@ mod tests {
 
 		let key_other =
 			InternalKey::new(Bytes::copy_from_slice(b"key_other"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_other), b"value_other").unwrap();
+		writer.add(key_other, b"value_other").unwrap();
 
 		let key_target = InternalKey::new(
 			Bytes::copy_from_slice(b"key_target"),
@@ -3564,14 +3567,14 @@ mod tests {
 			InternalKeyKind::Delete,
 			0,
 		);
-		writer.add(Arc::new(key_target), b"").unwrap();
+		writer.add(key_target, b"").unwrap();
 
 		let key_zzz =
 			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_zzz), b"value_zzz").unwrap();
+		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key_target"), 100, InternalKeyKind::Set, 0);
@@ -3592,18 +3595,18 @@ mod tests {
 
 		let key1 =
 			InternalKey::new(Bytes::copy_from_slice(b"user_data"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key1), b"value1").unwrap();
+		writer.add(key1, b"value1").unwrap();
 
 		let key2 =
 			InternalKey::new(Bytes::copy_from_slice(b"user_profile"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key2), b"value2").unwrap();
+		writer.add(key2, b"value2").unwrap();
 
 		let key3 =
 			InternalKey::new(Bytes::copy_from_slice(b"username"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key3), b"value3").unwrap();
+		writer.add(key3, b"value3").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"user"), 100, InternalKeyKind::Set, 0);
@@ -3621,14 +3624,14 @@ mod tests {
 
 		let key_aaa =
 			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_aaa), b"value_aaa").unwrap();
+		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let key_bbb =
 			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_bbb), b"value_bbb").unwrap();
+		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b""), 100, InternalKeyKind::Set, 0);
@@ -3646,18 +3649,18 @@ mod tests {
 
 		let key1 =
 			InternalKey::new(Bytes::copy_from_slice(b"key\x00"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key1), b"value0").unwrap();
+		writer.add(key1, b"value0").unwrap();
 
 		let key2 =
 			InternalKey::new(Bytes::copy_from_slice(b"key\x01"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key2), b"value1").unwrap();
+		writer.add(key2, b"value1").unwrap();
 
 		let key3 =
 			InternalKey::new(Bytes::copy_from_slice(b"key\xFF"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key3), b"value_ff").unwrap();
+		writer.add(key3, b"value_ff").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"key\x02"), 100, InternalKeyKind::Set, 0);
@@ -3685,11 +3688,11 @@ mod tests {
 				InternalKeyKind::Set,
 				0,
 			);
-			writer.add(Arc::new(internal_key), value.as_bytes()).unwrap();
+			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		assert!(table.meta.properties.block_count > 1);
 
@@ -3709,18 +3712,18 @@ mod tests {
 
 		let key_a =
 			InternalKey::new(Bytes::copy_from_slice(b"prefix_a"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_a), b"value_a").unwrap();
+		writer.add(key_a, b"value_a").unwrap();
 
 		let key_b =
 			InternalKey::new(Bytes::copy_from_slice(b"prefix_b"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_b), b"value_b").unwrap();
+		writer.add(key_b, b"value_b").unwrap();
 
 		let key_c =
 			InternalKey::new(Bytes::copy_from_slice(b"prefix_c"), 100, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(key_c), b"value_c").unwrap();
+		writer.add(key_c, b"value_c").unwrap();
 
 		let size = writer.finish().unwrap();
-		let table = Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key =
 			InternalKey::new(Bytes::copy_from_slice(b"prefix_d"), 100, InternalKeyKind::Set, 0);
@@ -3742,11 +3745,10 @@ mod tests {
 		let value = b"value_bbb";
 		let internal_key =
 			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(internal_key), value).unwrap();
+		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
-		let table =
-			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_aaa which does NOT exist
 		// key_aaa < key_bbb lexicographically
@@ -3786,11 +3788,10 @@ mod tests {
 		let value = b"value_bbb";
 		let internal_key =
 			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(internal_key), value).unwrap();
+		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
-		let table =
-			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_zzz which is past all keys
 		let mut iter = table.iter(false, None);
@@ -3813,11 +3814,10 @@ mod tests {
 		let value = b"value_bbb";
 		let internal_key =
 			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
-		writer.add(Arc::new(internal_key), value).unwrap();
+		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
-		let table =
-			Arc::new(Table::new(0, opts.clone(), wrap_buffer(buffer), size as u64).unwrap());
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 		// Seek to key_bbb which exists
 		let mut iter = table.iter(false, None);

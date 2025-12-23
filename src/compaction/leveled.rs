@@ -397,7 +397,7 @@ mod tests {
 
 			// Add entries to the table
 			for (key, value) in entries {
-				writer.add(key.into(), &value)?;
+				writer.add(key, &value)?;
 			}
 
 			// Finish writing the table
@@ -418,7 +418,7 @@ mod tests {
 	/// Helper function to create encoded inline values for testing
 	fn create_inline_value(value: &[u8]) -> Vec<u8> {
 		let location = ValueLocation::with_inline_value(Bytes::copy_from_slice(value));
-		location.encode().to_vec()
+		location.encode()
 	}
 
 	/// Helper function to create test entries with automatic value encoding
@@ -502,7 +502,7 @@ mod tests {
 
 		// Create the manifest with next_table_id
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
@@ -921,7 +921,7 @@ mod tests {
 		let next_table_id = max_table_id + 1000;
 
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
@@ -938,7 +938,7 @@ mod tests {
 		let strategy = Arc::new(Strategy::new(4, 2));
 
 		// Create compaction options
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 
 		// Create the compactor
 		let compactor = Compactor::new(compaction_options, strategy);
@@ -1114,10 +1114,10 @@ mod tests {
 		let shared_table_id_counter = Arc::new(AtomicU64::new(next_table_id));
 
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
-			next_table_id: shared_table_id_counter.clone(),
+			next_table_id: shared_table_id_counter,
 			manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
 			snapshots: Vec::new(),
 			log_number: 0,
@@ -1129,8 +1129,8 @@ mod tests {
 
 		// Create the strategy and compactor
 		let strategy = Arc::new(Strategy::new(4, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
-		let compactor = Compactor::new(compaction_options, strategy.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
+		let compactor = Compactor::new(compaction_options, strategy);
 
 		// Run multiple rounds of compaction
 		const COMPACTION_ROUNDS: usize = 15;
@@ -1451,7 +1451,7 @@ mod tests {
 		// Create manifest
 		let manifest_path = env.options.path.join("test_manifest");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1472,7 +1472,7 @@ mod tests {
 
 		// Set up compaction
 		let strategy = Arc::new(Strategy::new(4, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 
 		// Run compaction
@@ -1533,7 +1533,7 @@ mod tests {
 		// Create manifest
 		let manifest_path = env.options.path.join("test_manifest");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1548,7 +1548,7 @@ mod tests {
 
 		// Set up compaction
 		let strategy = Arc::new(Strategy::new(4, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 
 		// Run compaction
@@ -1624,7 +1624,7 @@ mod tests {
 
 		let manifest_path = env.options.path.join("test_manifest");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1638,7 +1638,7 @@ mod tests {
 
 		// Run compaction
 		let strategy = Arc::new(Strategy::new(1, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 		let result = compactor.compact();
 		assert!(result.is_ok(), "Compaction failed");
@@ -1722,7 +1722,7 @@ mod tests {
 		// Create manifest and run compaction
 		let manifest_path = env.options.path.join("test_manifest");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1735,7 +1735,7 @@ mod tests {
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 		perform_compaction_rounds(&compactor, 2);
 
@@ -1850,7 +1850,7 @@ mod tests {
 		// Create manifest and run compaction
 		let manifest_path = env.options.path.join("test_manifest_tombstone");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1863,7 +1863,7 @@ mod tests {
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 		perform_compaction_rounds(&compactor, 2);
 
@@ -1912,15 +1912,15 @@ mod tests {
 
 		// Test survivors have correct values
 		assert!(
-			survivors.get(b"key-000".as_slice()).unwrap().starts_with(b"original-value"),
+			survivors[b"key-000".as_slice()].starts_with(b"original-value"),
 			"key-000 should have original value"
 		);
 		assert!(
-			survivors.get(b"key-007".as_slice()).unwrap().starts_with(b"updated-value"),
+			survivors[b"key-007".as_slice()].starts_with(b"updated-value"),
 			"key-007 should have updated value from Table 2"
 		);
 		assert!(
-			survivors.get(b"key-015".as_slice()).unwrap().starts_with(b"original-value"),
+			survivors[b"key-015".as_slice()].starts_with(b"original-value"),
 			"key-015 should have original value"
 		);
 
@@ -1974,7 +1974,7 @@ mod tests {
 		// Create manifest and run L2→L3 compaction (bottom level)
 		let manifest_path = env.options.path.join("test_manifest_propagation");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -1987,7 +1987,7 @@ mod tests {
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 2));
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 		let compactor = Compactor::new(compaction_options, strategy);
 		compactor.compact().unwrap();
 
@@ -2224,7 +2224,7 @@ mod tests {
 		// Create manifest and run L0→L1 compaction
 		let manifest_path = env.options.path.join("test_manifest_soft_delete");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -2237,10 +2237,9 @@ mod tests {
 		let manifest = Arc::new(RwLock::new(manifest));
 
 		let strategy = Arc::new(Strategy::new(1, 1)); // base_level_size=1, multiplier=1
-		let mut compaction_options =
-			create_compaction_options(env.options.clone(), manifest.clone());
+		let mut compaction_options = create_compaction_options(env.options, manifest.clone());
 		compaction_options.vlog = None;
-		let compactor = Compactor::new(compaction_options, strategy.clone());
+		let compactor = Compactor::new(compaction_options, strategy);
 
 		compactor.compact().unwrap();
 
@@ -2362,7 +2361,7 @@ mod tests {
 				encoded_value,
 			),
 			(
-				InternalKey::new(Bytes::from(key.clone()), 100, InternalKeyKind::SoftDelete, 0),
+				InternalKey::new(Bytes::from(key), 100, InternalKeyKind::SoftDelete, 0),
 				vec![], // Older SoftDelete also has empty value
 			),
 		];
@@ -2372,7 +2371,7 @@ mod tests {
 		// Create manifest and run compaction
 		let manifest_path = env.options.path.join("test_manifest_older_soft_delete");
 		let manifest = LevelManifest {
-			path: manifest_path.clone(),
+			path: manifest_path,
 			levels,
 			hidden_set: HashSet::new(),
 			next_table_id: Arc::new(AtomicU64::new(1000)),
@@ -2386,9 +2385,9 @@ mod tests {
 
 		let strategy = Arc::new(Strategy::new(1, 1));
 		// NOTE: Do NOT set vlog = None - we need VLog enabled to trigger the bug
-		let compaction_options = create_compaction_options(env.options.clone(), manifest.clone());
+		let compaction_options = create_compaction_options(env.options, manifest.clone());
 
-		let compactor = Compactor::new(compaction_options, strategy.clone());
+		let compactor = Compactor::new(compaction_options, strategy);
 
 		// This should NOT panic - older soft deletes should be handled correctly
 		compactor.compact().unwrap();

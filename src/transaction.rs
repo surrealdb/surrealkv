@@ -2719,7 +2719,7 @@ mod tests {
 				}
 
 				// Reverse the forward results
-				let mut forward_reversed = forward_results.clone();
+				let mut forward_reversed = forward_results;
 				forward_reversed.reverse();
 
 				// Results should be identical
@@ -3962,13 +3962,13 @@ mod tests {
 		assert!(!key2_versions[1].2); // Not tombstone
 
 		// Verify key3 has 1 version
-		let key3_versions = key_versions.get(&Bytes::from_static(b"key3")).unwrap();
+		let key3_versions = &key_versions[&Bytes::from_static(b"key3")];
 		assert_eq!(key3_versions.len(), 1);
 		assert_eq!(key3_versions[0].0, b"value3_v1");
 		assert!(!key3_versions[0].2); // Not tombstone
 
 		// Verify key4 has 1 version
-		let key4_versions = key_versions.get(&Bytes::from_static(b"key4")).unwrap();
+		let key4_versions = &key_versions[&Bytes::from_static(b"key4")];
 		assert_eq!(key4_versions.len(), 1);
 		assert_eq!(key4_versions[0].0, b"value4_v1");
 		assert!(!key4_versions[0].2); // Not tombstone

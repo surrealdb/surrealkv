@@ -286,7 +286,7 @@ mod tests {
 		let filter_block = filter_writer.finish();
 
 		// Create a FilterBlockReader
-		let filter_reader = FilterBlockReader::new(filter_block, filter_policy.clone());
+		let filter_reader = FilterBlockReader::new(filter_block, filter_policy);
 
 		// Test 1: No false negatives - all keys should be found
 		for key in &keys {
