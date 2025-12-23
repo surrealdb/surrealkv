@@ -49,8 +49,8 @@ mod tests;
 /// ```
 ///
 /// Where:
-/// - CRC = 32-bit CRC computed over the record type and payload
-/// - Size = Length of the payload data (little-endian)
+/// - CRC = 32-bit CRC computed over the record type and payload (big-endian)
+/// - Size = Length of the payload data (big-endian)
 /// - Type = Type of record (see RecordType enum)
 /// - Payload = Byte stream of the specified size
 pub const BLOCK_SIZE: usize = 32 * 1024;

@@ -178,7 +178,7 @@ impl Wal {
 
 		if record_type == RecordType::SetCompressionType {
 			// Read the compression type byte (length is in bytes 4-5)
-			let length = u16::from_le_bytes([header[4], header[5]]);
+			let length = u16::from_be_bytes([header[4], header[5]]);
 			if length >= 1 {
 				let mut compression_byte = [0u8; 1];
 				file.read_exact(&mut compression_byte)?;

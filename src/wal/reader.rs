@@ -174,8 +174,8 @@ impl Reader {
 	/// Assumes there are at least WAL_RECORD_HEADER_SIZE bytes available.
 	fn parse_header(&mut self) -> (u32, u16, u8) {
 		let header = &self.buffer[self.buffer_offset..self.buffer_offset + WAL_RECORD_HEADER_SIZE];
-		let crc = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-		let length = u16::from_le_bytes([header[4], header[5]]);
+		let crc = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+		let length = u16::from_be_bytes([header[4], header[5]]);
 		let record_type = header[6];
 		self.buffer_offset += WAL_RECORD_HEADER_SIZE;
 		(crc, length, record_type)
@@ -728,8 +728,8 @@ mod tests {
 
 	/// Helper to write a raw WAL record directly to file.
 	fn write_raw_record(file: &mut File, crc: u32, length: u16, record_type: u8, data: &[u8]) {
-		file.write_all(&crc.to_le_bytes()).unwrap();
-		file.write_all(&length.to_le_bytes()).unwrap();
+		file.write_all(&crc.to_be_bytes()).unwrap();
+		file.write_all(&length.to_be_bytes()).unwrap();
 		file.write_all(&[record_type]).unwrap();
 		file.write_all(data).unwrap();
 	}
