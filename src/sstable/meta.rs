@@ -357,7 +357,7 @@ impl TableMetadata {
 		buf.freeze()
 	}
 
-	pub(crate) fn decode(src: &Bytes) -> Result<Self> {
+	pub(crate) fn decode<'de>(src: &'de Bytes) -> Result<TableMetadata> {
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys
@@ -383,7 +383,7 @@ impl TableMetadata {
 		let smallest_point = match cursor.get_u8() {
 			0 => None,
 			1 => {
-				let key_len = cursor.get_u64() as usize;
+				let key_len: usize = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
 				let key_bytes = Bytes::from(key_bytes);

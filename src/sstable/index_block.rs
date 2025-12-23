@@ -59,7 +59,11 @@ impl TopLevelIndexWriter {
 		TopLevelIndexWriter {
 			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
-			current_block: BlockWriter::new(opts),
+			current_block: BlockWriter::new(
+				opts.block_size,
+				opts.block_restart_interval,
+				Arc::clone(&opts.comparator),
+			),
 			max_block_size,
 		}
 	}
@@ -87,7 +91,11 @@ impl TopLevelIndexWriter {
 	}
 
 	fn finish_current_block(&mut self) {
-		let new_block = BlockWriter::new(Arc::clone(&self.opts));
+		let new_block = BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.comparator),
+		);
 		let finished_block = std::mem::replace(&mut self.current_block, new_block);
 		self.index_blocks.push(finished_block);
 	}
@@ -118,7 +126,11 @@ impl TopLevelIndexWriter {
 			self.index_blocks.push(self.current_block);
 		}
 
-		let mut top_level_index = BlockWriter::new(self.opts);
+		let mut top_level_index = BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.comparator),
+		);
 
 		for block in self.index_blocks {
 			let separator_key = block.last_key.clone();
@@ -159,7 +171,7 @@ impl TopLevelIndex {
 		f: Arc<dyn File>,
 		location: &BlockHandle,
 	) -> Result<Self> {
-		let block = read_table_block(Arc::clone(&opt), Arc::clone(&f), location)?;
+		let block = read_table_block(Arc::clone(&opt.comparator), Arc::clone(&f), location)?;
 		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
@@ -201,8 +213,11 @@ impl TopLevelIndex {
 			return Ok(block);
 		}
 
-		let block_data =
-			read_table_block(Arc::clone(&self.opts), Arc::clone(&self.file), &block_handle.handle)?;
+		let block_data = read_table_block(
+			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.file),
+			&block_handle.handle,
+		)?;
 		let block = Arc::new(block_data);
 		self.opts.block_cache.insert_index_block(
 			self.id,

@@ -525,7 +525,7 @@ impl Transaction {
 
 			let keys_iter = self.keys_at_version(
 				iterate_bounds.low.clone(),
-				iterate_bounds.high.clone(),
+				iterate_bounds.high,
 				timestamp,
 			)?;
 			return Ok(keys_iter.count());
