@@ -153,10 +153,7 @@ unnecessary_to_owned = "warn"
 # Checks for functions that are declared `async` but have no `.await`s inside of them.
 # Async functions with no async code create overhead, both mentally and computationally.
 # https://rust-lang.github.io/rust-clippy/master/#unused_async
-#
-# SurrealDB relies on async functions in the AST parser and executor to avoid stack overflows.
-# Warning or denying this lint can cause unexpected errors.
-unused_async = "allow"
+unused_async = "warn"
 
 # Checks for `.unwrap()` or `.unwrap_err()` calls on Results and `.unwrap()` call on `Option`s.
 # https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used
