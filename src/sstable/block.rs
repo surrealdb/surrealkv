@@ -572,8 +572,8 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Get the current key
-	fn key(&self) -> Arc<InternalKey> {
-		Arc::new(InternalKey::decode(&self.current_key))
+	fn key(&self) -> InternalKey {
+		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value

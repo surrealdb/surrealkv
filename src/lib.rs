@@ -627,7 +627,7 @@ pub(crate) trait Iterator {
 	/// the returned slice is valid only until the next modification of
 	/// the iterator.
 	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<InternalKey>;
+	fn key(&self) -> InternalKey;
 
 	/// Return the value for the current entry.  The underlying storage for
 	/// the returned slice is valid only until the next modification of

@@ -22,7 +22,7 @@ use interval_heap::IntervalHeap;
 
 #[derive(Eq)]
 struct HeapItem {
-	key: Arc<InternalKey>,
+	key: InternalKey,
 	value: Value,
 	iterator_index: usize,
 }
@@ -807,7 +807,7 @@ impl Drop for KMergeIterator<'_> {
 }
 
 impl Iterator for KMergeIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
+	type Item = (InternalKey, Value);
 	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
@@ -868,10 +868,10 @@ pub(crate) struct SnapshotIterator<'a> {
 	keys_only: bool,
 
 	/// Last user key returned (forward direction)
-	last_key_fwd: Option<Bytes>,
+	last_key_fwd: Bytes,
 
 	/// Buffered item for backward iteration (when we read one too many)
-	buffered_back: Option<(Arc<InternalKey>, Value)>,
+	buffered_back: Option<(InternalKey, Value)>,
 }
 
 impl SnapshotIterator<'_> {
@@ -901,7 +901,7 @@ impl SnapshotIterator<'_> {
 			snapshot_seq_num: seq_num,
 			core,
 			keys_only,
-			last_key_fwd: None,
+			last_key_fwd: Bytes::new(),
 			buffered_back: None,
 		})
 	}
@@ -913,12 +913,12 @@ impl SnapshotIterator<'_> {
 
 	/// Resolves the value and constructs the result
 	#[inline]
-	fn resolve(&self, key: &Arc<InternalKey>, value: &Value) -> IterResult {
+	fn resolve(&self, key: InternalKey, value: Value) -> IterResult {
 		if self.keys_only {
-			Ok((key.user_key.clone(), None))
+			Ok((key.user_key, None))
 		} else {
-			match self.core.resolve_value(value) {
-				Ok(resolved) => Ok((key.user_key.clone(), Some(resolved))),
+			match self.core.resolve_value(&value) {
+				Ok(resolved) => Ok((key.user_key, Some(resolved))),
 				Err(e) => Err(e),
 			}
 		}
@@ -926,7 +926,7 @@ impl SnapshotIterator<'_> {
 
 	/// Get next item from back, checking buffer first
 	#[inline]
-	fn next_back_raw(&mut self) -> Option<(Arc<InternalKey>, Value)> {
+	fn next_back_raw(&mut self) -> Option<(InternalKey, Value)> {
 		self.buffered_back.take().or_else(|| self.merge_iter.next_back())
 	}
 }
@@ -943,14 +943,12 @@ impl Iterator for SnapshotIterator<'_> {
 			}
 
 			// Skip older versions of last returned key
-			if let Some(ref last) = self.last_key_fwd {
-				if key.user_key == *last {
-					continue;
-				}
+			if key.user_key == *self.last_key_fwd {
+				continue;
 			}
 
 			// New key - remember it
-			self.last_key_fwd = Some(key.user_key.clone());
+			self.last_key_fwd = key.user_key.clone();
 
 			// Latest version is tombstone? Skip entire key
 			// (older versions already consumed above)
@@ -958,7 +956,7 @@ impl Iterator for SnapshotIterator<'_> {
 				continue;
 			}
 
-			return Some(self.resolve(&key, &value));
+			return Some(self.resolve(key, value));
 		}
 		None
 	}
@@ -1001,7 +999,7 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 				continue;
 			}
 
-			return Some(self.resolve(&latest_key, &latest_value));
+			return Some(self.resolve(latest_key, latest_value));
 		}
 		None
 	}

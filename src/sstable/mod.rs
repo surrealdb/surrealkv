@@ -36,11 +36,13 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
+#[inline]
 fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
+#[inline]
 fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
@@ -145,6 +147,7 @@ impl InternalKey {
 		trailer_to_kind(self.trailer)
 	}
 
+	#[inline]
 	pub(crate) fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
 	}

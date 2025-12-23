@@ -8,12 +8,12 @@ use crate::vlog::{VLog, ValueLocation, ValuePointer};
 
 use crate::{sstable::InternalKey, Key, Value};
 
-pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>;
+pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
 
 // Holds a key-value pair and the iterator index
 #[derive(Eq)]
 pub(crate) struct HeapItem {
-	pub(crate) key: Arc<InternalKey>,
+	pub(crate) key: InternalKey,
 	pub(crate) value: Value,
 	pub(crate) iterator_index: usize,
 }
@@ -80,10 +80,10 @@ pub(crate) struct CompactionIterator<'a> {
 	current_user_key: Option<Key>,
 
 	// Buffer for accumulating all versions of the current key
-	accumulated_versions: Vec<(Arc<InternalKey>, Value)>,
+	accumulated_versions: Vec<(InternalKey, Value)>,
 
 	// Buffer for outputting the versions of the current key
-	output_versions: Vec<(Arc<InternalKey>, Value)>,
+	output_versions: Vec<(InternalKey, Value)>,
 
 	// Compaction state
 	/// Collected discard statistics: file_id -> total_discarded_bytes
@@ -265,7 +265,7 @@ impl<'a> CompactionIterator<'a> {
 }
 
 impl Iterator for CompactionIterator<'_> {
-	type Item = (Arc<InternalKey>, Value);
+	type Item = (InternalKey, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized {
@@ -354,7 +354,7 @@ mod tests {
 		user_key: &str,
 		sequence: u64,
 		kind: InternalKeyKind,
-	) -> Arc<InternalKey> {
+	) -> InternalKey {
 		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0).into()
 	}
 
@@ -363,7 +363,7 @@ mod tests {
 		sequence: u64,
 		kind: InternalKeyKind,
 		timestamp: u64,
-	) -> Arc<InternalKey> {
+	) -> InternalKey {
 		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, timestamp)
 			.into()
 	}
@@ -390,12 +390,12 @@ mod tests {
 
 	// Creates a mock iterator with predefined entries
 	struct MockIterator {
-		items: Vec<(Arc<InternalKey>, Value)>,
+		items: Vec<(InternalKey, Value)>,
 		index: usize,
 	}
 
 	impl MockIterator {
-		fn new(items: Vec<(Arc<InternalKey>, Value)>) -> Self {
+		fn new(items: Vec<(InternalKey, Value)>) -> Self {
 			Self {
 				items,
 				index: 0,
@@ -404,7 +404,7 @@ mod tests {
 	}
 
 	impl Iterator for MockIterator {
-		type Item = (Arc<InternalKey>, Value);
+		type Item = (InternalKey, Value);
 
 		fn next(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {

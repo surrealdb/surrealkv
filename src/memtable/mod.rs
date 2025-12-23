@@ -237,7 +237,7 @@ impl MemTable {
 	pub(crate) fn iter(
 		&self,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
 		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -245,7 +245,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 
@@ -253,7 +253,7 @@ impl MemTable {
 		&self,
 		range: InternalKeyRange,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
 		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -261,7 +261,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(Arc::new(key), value)
+			(key, value)
 		})
 	}
 }

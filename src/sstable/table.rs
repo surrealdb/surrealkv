@@ -231,7 +231,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub(crate) fn add(&mut self, key: Arc<InternalKey>, val: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -727,7 +727,7 @@ impl Table {
 		Ok(b)
 	}
 
-	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(Arc<InternalKey>, Value)>> {
+	pub(crate) fn get(&self, key: InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		let key_encoded = &key.encode();
 
 		// Check filter first
@@ -972,7 +972,7 @@ impl TableIterator {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
-	fn key(&self) -> Arc<InternalKey> {
+	fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
@@ -1192,7 +1192,7 @@ impl TableIterator {
 }
 
 impl Iterator for TableIterator {
-	type Item = (Arc<InternalKey>, Value);
+	type Item = (InternalKey, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		// If not positioned, position appropriately based on range
@@ -1504,7 +1504,7 @@ impl LSMIterator for TableIterator {
 		false
 	}
 
-	fn key(&self) -> Arc<InternalKey> {
+	fn key(&self) -> InternalKey {
 		self.key()
 	}
 
