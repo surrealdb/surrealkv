@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
-use std::ptr::NonNull;
 use std::sync::{atomic::AtomicU32, Arc};
 
 use crate::error::{Error, Result};
@@ -660,12 +659,15 @@ impl Drop for Snapshot {
 }
 
 /// A merge iterator that sorts by key+seqno.
-pub(crate) struct KMergeIterator<'a> {
-	// Owned state
-	_iter_state: Box<IterState>,
+pub(crate) struct KMergeIterator<'iter> {
+	/// Array of iterators to merge over.
+	///
+	/// IMPORTANT: Due to self-referential structs, this must be defined before `iter_state` in order to ensure it is dropped before `iter_state`.
+	iterators: Vec<BoxedIterator<'iter>>,
 
-	/// Array of iterators to merge over
-	iterators: NonNull<Vec<BoxedIterator<'a>>>,
+	// Owned state
+	#[allow(dead_code)]
+	iter_state: Box<IterState>,
 
 	/// Interval heap of items ordered by their current key
 	heap: IntervalHeap<HeapItem>,
@@ -685,58 +687,50 @@ impl<'a> KMergeIterator<'a> {
 		// Convert user-key range to InternalKey range once
 		let internal_range = crate::user_range_to_internal_range(range.clone());
 
-		unsafe {
-			let state_ref: &'a IterState = &*(&*boxed_state as *const IterState);
-			// Compute query key range for table overlap checks
-			let query_range = KeyRange::from(range);
+		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
+		// Compute query key range for table overlap checks
+		let query_range = KeyRange::from(range);
 
-			// Active memtable with range
-			let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
-			iterators.push(Box::new(active_iter));
+		// Active memtable with range
+		let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
+		iterators.push(Box::new(active_iter));
 
-			// Immutable memtables with range
-			for memtable in &state_ref.immutable {
-				let iter = memtable.range(internal_range.clone(), keys_only);
-				iterators.push(Box::new(iter));
-			}
+		// Immutable memtables with range
+		for memtable in &state_ref.immutable {
+			let iter = memtable.range(internal_range.clone(), keys_only);
+			iterators.push(Box::new(iter));
+		}
 
-			// Tables - these have native seek support
-			for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
-				// Optimization: Skip tables that are completely outside the query range
-				if level_idx == 0 {
-					// Level 0: Tables can overlap, so we check all but skip those completely outside range
-					for table in &level.tables {
-						// Skip tables completely before or after the range
-						if table.is_before_range(&query_range) || table.is_after_range(&query_range)
-						{
-							continue;
-						}
-						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
-						iterators.push(Box::new(table_iter));
+		// Tables - these have native seek support
+		for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
+			// Optimization: Skip tables that are completely outside the query range
+			if level_idx == 0 {
+				// Level 0: Tables can overlap, so we check all but skip those completely outside range
+				for table in &level.tables {
+					// Skip tables completely before or after the range
+					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
+						continue;
 					}
-				} else {
-					// Level 1+: Tables have non-overlapping key ranges, use binary search
-					let start_idx = level.find_first_overlapping_table(&query_range);
-					let end_idx = level.find_last_overlapping_table(&query_range);
+					let table_iter = table.iter(keys_only, Some(internal_range.clone()));
+					iterators.push(Box::new(table_iter));
+				}
+			} else {
+				// Level 1+: Tables have non-overlapping key ranges, use binary search
+				let start_idx = level.find_first_overlapping_table(&query_range);
+				let end_idx = level.find_last_overlapping_table(&query_range);
 
-					for table in &level.tables[start_idx..end_idx] {
-						let table_iter = table.iter(keys_only, Some(internal_range.clone()));
-						iterators.push(Box::new(table_iter));
-					}
+				for table in &level.tables[start_idx..end_idx] {
+					let table_iter = table.iter(keys_only, Some(internal_range.clone()));
+					iterators.push(Box::new(table_iter));
 				}
 			}
 		}
 
 		let heap = IntervalHeap::with_capacity(iterators.len());
 
-		// Box the iterators and get a raw pointer
-		let boxed_iterators = Box::new(iterators);
-		let iterators_ptr = NonNull::new(Box::into_raw(boxed_iterators))
-			.expect("Box::into_raw should never return null");
-
 		Self {
-			_iter_state: boxed_state,
-			iterators: iterators_ptr,
+			iterators,
+			iter_state: boxed_state,
 			heap,
 			initialized_lo: false,
 			initialized_hi: false,
@@ -745,16 +739,13 @@ impl<'a> KMergeIterator<'a> {
 
 	fn initialize_lo(&mut self) {
 		// Pull the first item from each iterator and add to heap
-		unsafe {
-			let iterators = self.iterators.as_mut();
-			for (idx, iter) in iterators.iter_mut().enumerate() {
-				if let Some((key, value)) = iter.next() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: idx,
-					});
-				}
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if let Some((key, value)) = iter.next() {
+				self.heap.push(HeapItem {
+					key,
+					value,
+					iterator_index: idx,
+				});
 			}
 		}
 		self.initialized_lo = true;
@@ -762,30 +753,16 @@ impl<'a> KMergeIterator<'a> {
 
 	fn initialize_hi(&mut self) {
 		// Pull the last item from each iterator and add to heap
-		unsafe {
-			let iterators = self.iterators.as_mut();
-			for (idx, iter) in iterators.iter_mut().enumerate() {
-				if let Some((key, value)) = iter.next_back() {
-					self.heap.push(HeapItem {
-						key,
-						value,
-						iterator_index: idx,
-					});
-				}
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if let Some((key, value)) = iter.next_back() {
+				self.heap.push(HeapItem {
+					key,
+					value,
+					iterator_index: idx,
+				});
 			}
 		}
 		self.initialized_hi = true;
-	}
-}
-
-impl Drop for KMergeIterator<'_> {
-	fn drop(&mut self) {
-		// Must drop the iterators before iter_state
-		// because the iterators contain references to iter_state
-		unsafe {
-			let _ = Box::from_raw(self.iterators.as_ptr());
-		}
-		// iter_state is dropped automatically after this
 	}
 }
 
@@ -798,16 +775,12 @@ impl Iterator for KMergeIterator<'_> {
 		}
 
 		let min_item = self.heap.pop_min()?;
-		unsafe {
-			let iterators = self.iterators.as_mut();
-
-			if let Some(next_item) = iterators[min_item.iterator_index].next() {
-				self.heap.push(HeapItem {
-					key: next_item.0,
-					value: next_item.1,
-					iterator_index: min_item.iterator_index,
-				});
-			}
+		if let Some(next_item) = self.iterators[min_item.iterator_index].next() {
+			self.heap.push(HeapItem {
+				key: next_item.0,
+				value: next_item.1,
+				iterator_index: min_item.iterator_index,
+			});
 		}
 
 		Some((min_item.key, min_item.value))
@@ -822,15 +795,12 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 		}
 
 		let max_item = self.heap.pop_max()?;
-		unsafe {
-			let iterators = self.iterators.as_mut();
-			if let Some(next_item) = iterators[max_item.iterator_index].next_back() {
-				self.heap.push(HeapItem {
-					key: next_item.0,
-					value: next_item.1,
-					iterator_index: max_item.iterator_index,
-				});
-			}
+		if let Some(next_item) = self.iterators[max_item.iterator_index].next_back() {
+			self.heap.push(HeapItem {
+				key: next_item.0,
+				value: next_item.1,
+				iterator_index: max_item.iterator_index,
+			});
 		}
 
 		Some((max_item.key, max_item.value))
