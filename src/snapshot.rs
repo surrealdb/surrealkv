@@ -17,8 +17,6 @@ use bytes::Bytes;
 /// Type alias for version scan results
 pub type VersionScanResult = (Key, Value, u64, bool);
 
-use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
-
 /// Type alias for versioned entries with key, timestamp, and optional value
 use interval_heap::IntervalHeap;
 
@@ -170,7 +168,10 @@ impl Snapshot {
 
 		let iter_state = self.collect_iter_state()?;
 		let range = (Bound::Included(start), Bound::Excluded(end));
-		let merge_iter = KMergeIterator::new_from(iter_state, self.seq_num, range, true);
+		let merge_iter = KMergeIterator::new_from(iter_state, range, true).filter(move |item| {
+			// Filter out items that are not visible in this snapshot
+			item.0.seq_num() <= self.seq_num
+		});
 
 		for (key, _value) in merge_iter {
 			// Skip tombstones
@@ -682,7 +683,6 @@ pub(crate) struct KMergeIterator<'a> {
 impl<'a> KMergeIterator<'a> {
 	fn new_from(
 		iter_state: IterState,
-		snapshot_seq_num: u64,
 		range: (Bound<Vec<u8>>, Bound<Vec<u8>>),
 		keys_only: bool,
 	) -> Self {
@@ -705,19 +705,12 @@ impl<'a> KMergeIterator<'a> {
 			};
 
 			// Active memtable with range
-			let active_iter =
-				state_ref.active.range(range.clone(), keys_only).filter(move |item| {
-					// Filter out items that are not visible in this snapshot
-					item.0.seq_num() <= snapshot_seq_num
-				});
+			let active_iter = state_ref.active.range(range.clone(), keys_only);
 			iterators.push(Box::new(active_iter));
 
 			// Immutable memtables with range
 			for memtable in &state_ref.immutable {
-				let iter = memtable.range(range.clone(), keys_only).filter(move |item| {
-					// Filter out items that are not visible in this snapshot
-					item.0.seq_num() <= snapshot_seq_num
-				});
+				let iter = memtable.range(range.clone(), keys_only);
 				iterators.push(Box::new(iter));
 			}
 
@@ -733,10 +726,7 @@ impl<'a> KMergeIterator<'a> {
 							continue;
 						}
 						let table_iter = table.iter(keys_only, Some(range.clone()));
-						iterators.push(Box::new(table_iter.filter(move |item| {
-							// Filter out items that are not visible in this snapshot
-							item.0.seq_num() <= snapshot_seq_num
-						})));
+						iterators.push(Box::new(table_iter));
 					}
 				} else {
 					// Level 1+: Tables have non-overlapping key ranges, use binary search
@@ -745,10 +735,7 @@ impl<'a> KMergeIterator<'a> {
 
 					for table in &level.tables[start_idx..end_idx] {
 						let table_iter = table.iter(keys_only, Some(range.clone()));
-						iterators.push(Box::new(table_iter.filter(move |item| {
-							// Filter out items that are not visible in this snapshot
-							item.0.seq_num() <= snapshot_seq_num
-						})));
+						iterators.push(Box::new(table_iter));
 					}
 				}
 			}
@@ -818,7 +805,7 @@ impl Drop for KMergeIterator<'_> {
 
 impl Iterator for KMergeIterator<'_> {
 	type Item = (Arc<InternalKey>, Value);
-
+	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
 			self.initialize_lo();
@@ -842,6 +829,7 @@ impl Iterator for KMergeIterator<'_> {
 }
 
 impl DoubleEndedIterator for KMergeIterator<'_> {
+	#[inline(always)]
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.initialized_hi {
 			self.initialize_hi();
@@ -863,85 +851,24 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 	}
 }
 
-/// Consumes a stream of KVs and emits a new stream to the filter rules
-pub(crate) struct FilterIter<I>
-where
-	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
-{
-	inner: DoubleEndedPeekable<I>,
-}
-
-impl<I> FilterIter<I>
-where
-	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
-{
-	pub fn new(iter: I) -> Self {
-		let iter = iter.double_ended_peekable();
-		Self {
-			inner: iter,
-		}
-	}
-
-	fn skip_all_versions_of_key(&mut self, key: &Key) -> Result<()> {
-		loop {
-			let Some(next) = self.inner.peek() else {
-				return Ok(());
-			};
-
-			// Consume version
-			if next.0.user_key == *key {
-				self.inner.next().expect("should not be empty");
-			} else {
-				return Ok(());
-			}
-		}
-	}
-}
-
-impl<I> Iterator for FilterIter<I>
-where
-	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
-{
-	type Item = (Arc<InternalKey>, Value);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		let head = self.inner.next()?;
-
-		// Keep only latest version of the key
-		self.skip_all_versions_of_key(&head.0.user_key).ok()?;
-
-		Some(head)
-	}
-}
-
-impl<I> DoubleEndedIterator for FilterIter<I>
-where
-	I: DoubleEndedIterator<Item = (Arc<InternalKey>, Value)>,
-{
-	fn next_back(&mut self) -> Option<Self::Item> {
-		loop {
-			let tail = self.inner.next_back()?;
-
-			let prev = match self.inner.peek_back() {
-				Some(prev) => prev,
-				None => {
-					return Some(tail);
-				}
-			};
-
-			if prev.0.user_key < tail.0.user_key {
-				return Some(tail);
-			}
-		}
-	}
-}
-
 pub(crate) struct SnapshotIterator<'a> {
-	// The complete pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
-	pipeline: Box<dyn DoubleEndedIterator<Item = (Arc<InternalKey>, Value)> + 'a>,
+	/// The merge iterator wrapped in peekable for efficient version skipping
+	merge_iter: KMergeIterator<'a>,
+
+	/// Sequence number for visibility
+	snapshot_seq_num: u64,
+
+	/// Core for resolving values
 	core: Arc<Core>,
+
 	/// When true, only return keys without resolving values
 	keys_only: bool,
+
+	/// Last user key returned (forward direction)
+	last_key_fwd: Option<Bytes>,
+
+	/// Buffered item for backward iteration (when we read one too many)
+	buffered_back: Option<(Arc<InternalKey>, Value)>,
 }
 
 impl SnapshotIterator<'_> {
@@ -957,68 +884,129 @@ impl SnapshotIterator<'_> {
 		};
 		let iter_state = snapshot.collect_iter_state()?;
 
-		// Convert bounds to owned for passing to merge iterator
 		let start = range.start_bound().map(|v| v.clone());
 		let end = range.end_bound().map(|v| v.clone());
 
-		// Increment VLog iterator count
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
 		}
 
-		// Build the pipeline: Data Sources → KMergeIterator → FilterIter → .filter()
-		let merge_iter: KMergeIterator<'_> =
-			KMergeIterator::new_from(iter_state, seq_num, (start, end), keys_only);
-		let filter_iter = FilterIter::new(merge_iter);
-		let pipeline = Box::new(filter_iter.filter(|(key, _value)| {
-			key.kind() != InternalKeyKind::Delete && key.kind() != InternalKeyKind::SoftDelete
-		}));
+		let merge_iter = KMergeIterator::new_from(iter_state, (start, end), keys_only);
 
 		Ok(Self {
-			pipeline,
+			merge_iter,
+			snapshot_seq_num: seq_num,
 			core,
 			keys_only,
+			last_key_fwd: None,
+			buffered_back: None,
 		})
+	}
+
+	#[inline]
+	fn is_visible(&self, key: &InternalKey) -> bool {
+		key.seq_num() <= self.snapshot_seq_num
+	}
+
+	/// Checks if the key is a tombstone
+	#[inline]
+	fn is_tombstone(key: &InternalKey) -> bool {
+		matches!(key.kind(), InternalKeyKind::Delete | InternalKeyKind::SoftDelete)
+	}
+
+	/// Resolves the value and constructs the result
+	#[inline]
+	fn resolve(&self, key: &Arc<InternalKey>, value: &Value) -> IterResult {
+		if self.keys_only {
+			Ok((key.user_key.clone(), None))
+		} else {
+			match self.core.resolve_value(value) {
+				Ok(resolved) => Ok((key.user_key.clone(), Some(resolved))),
+				Err(e) => Err(e),
+			}
+		}
+	}
+
+	/// Get next item from back, checking buffer first
+	#[inline]
+	fn next_back_raw(&mut self) -> Option<(Arc<InternalKey>, Value)> {
+		self.buffered_back.take().or_else(|| self.merge_iter.next_back())
 	}
 }
 
 impl Iterator for SnapshotIterator<'_> {
 	type Item = IterResult;
-
+	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
-		if let Some((key, value)) = self.pipeline.next() {
-			if self.keys_only {
-				// For keys-only mode, return None for the value to avoid allocations
-				Some(Ok((key.user_key.clone(), None)))
-			} else {
-				// Resolve value pointers to actual values
-				match self.core.resolve_value(&value) {
-					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
-					Err(e) => Some(Err(e)),
+		while let Some((key, value)) = self.merge_iter.next() {
+			// Skip invisible versions (seq_num > snapshot)
+			// For forward: highest seq comes first, so first visible is latest
+			if !self.is_visible(&key) {
+				continue;
+			}
+
+			// Skip older versions of last returned key
+			if let Some(ref last) = self.last_key_fwd {
+				if key.user_key == *last {
+					continue;
 				}
 			}
-		} else {
-			None
+
+			// New key - remember it
+			self.last_key_fwd = Some(key.user_key.clone());
+
+			// Latest version is tombstone? Skip entire key
+			// (older versions already consumed above)
+			if Self::is_tombstone(&key) {
+				continue;
+			}
+
+			return Some(self.resolve(&key, &value));
 		}
+		None
 	}
 }
 
 impl DoubleEndedIterator for SnapshotIterator<'_> {
+	#[inline(always)]
 	fn next_back(&mut self) -> Option<Self::Item> {
-		if let Some((key, value)) = self.pipeline.next_back() {
-			if self.keys_only {
-				// For keys-only mode, return None for the value to avoid allocations
-				Some(Ok((key.user_key.clone(), None)))
-			} else {
-				// Resolve value pointers to actual values
-				match self.core.resolve_value(&value) {
-					Ok(resolved_value) => Some(Ok((key.user_key.clone(), Some(resolved_value)))),
-					Err(e) => Some(Err(e)),
+		while let Some((first_key, first_value)) = self.next_back_raw() {
+			// Skip invisible
+			if !self.is_visible(&first_key) {
+				continue;
+			}
+
+			let current_user_key = first_key.user_key.clone();
+			let mut latest_key = first_key;
+			let mut latest_value = first_value;
+
+			// Consume all versions of this key, keeping latest visible
+			loop {
+				let Some((key, value)) = self.next_back_raw() else {
+					break;
+				};
+
+				if key.user_key != current_user_key {
+					// Different key - buffer it for next call
+					self.buffered_back = Some((key, value));
+					break;
+				}
+
+				// Same key - check if this version is newer and visible
+				if self.is_visible(&key) {
+					latest_key = key;
+					latest_value = value;
 				}
 			}
-		} else {
-			None
+
+			// Skip tombstones
+			if Self::is_tombstone(&latest_key) {
+				continue;
+			}
+
+			return Some(self.resolve(&latest_key, &latest_value));
 		}
+		None
 	}
 }
 
@@ -1506,7 +1494,7 @@ mod tests {
 		// Range that only overlaps with table2
 		let range = (Bound::Included(b"z0".to_vec()), Bound::Included(b"zz".to_vec()));
 
-		let merge_iter = KMergeIterator::new_from(iter_state, 1, range, false);
+		let merge_iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let items: Vec<_> = merge_iter.collect();
 		assert_eq!(items.len(), 2);
@@ -1924,7 +1912,7 @@ mod tests {
 
 		// Query range: [j-z] - all tables are before this range
 		let range = (Bound::Included(b"j".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as all are before range");
@@ -1953,7 +1941,7 @@ mod tests {
 
 		// Query range: [a-k] - all tables are after this range
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"k".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as all are after range");
@@ -1982,7 +1970,7 @@ mod tests {
 
 		// Query range: [d-h] - all tables overlap with this range
 		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		// All 3 tables should contribute items
@@ -2014,7 +2002,7 @@ mod tests {
 
 		// Query range: [f-j] - should include tables [e-g], [i-k], [d-f], [j-m]
 		let range = (Bound::Included(b"f".to_vec()), Bound::Included(b"j".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		// Should have items from multiple overlapping tables
@@ -2046,7 +2034,7 @@ mod tests {
 
 		// Query range: [e-h] - should include tables [e-f], [g-h]
 		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from L1 tables in range");
@@ -2075,7 +2063,7 @@ mod tests {
 
 		// Query range: [a-c] - before all tables
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"c".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
@@ -2104,7 +2092,7 @@ mod tests {
 
 		// Query range: [m-z] - after all tables
 		let range = (Bound::Included(b"m".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
@@ -2133,7 +2121,7 @@ mod tests {
 
 		// Query range: [a-z] - spans all tables
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from all L1 tables");
@@ -2155,7 +2143,7 @@ mod tests {
 
 		// Query with Included bounds - should include all keys from d to h
 		let range = (Bound::Included(b"d".to_vec()), Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let items: Vec<_> = iter.collect();
 		assert!(!items.is_empty(), "Should have items in inclusive range");
@@ -2178,7 +2166,7 @@ mod tests {
 		// Query with Excluded bounds - "d" and "h" exact matches should be excluded
 		// But "d1", "d5" are > "d" so they should be included
 		let range = (Bound::Excluded(b"d".to_vec()), Bound::Excluded(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let items: Vec<_> = iter.collect();
 		// Keys "d1" and "d5" should be included (they're > "d" and < "h")
@@ -2201,7 +2189,7 @@ mod tests {
 
 		// Query with unbounded start
 		let range = (Bound::Unbounded, Bound::Included(b"h".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should iterate from beginning with unbounded start");
@@ -2222,7 +2210,7 @@ mod tests {
 
 		// Query with unbounded end
 		let range = (Bound::Included(b"d".to_vec()), Bound::Unbounded);
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should iterate to end with unbounded end");
@@ -2245,34 +2233,10 @@ mod tests {
 
 		// Query with fully unbounded range
 		let range = (Bound::Unbounded, Bound::Unbounded);
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should return all keys with fully unbounded range");
-	}
-
-	#[test]
-	fn test_snapshot_seq_num_filtering() {
-		let temp_dir = create_temp_directory();
-		let opts = Options {
-			path: temp_dir.path().to_path_buf(),
-			..Default::default()
-		};
-		let opts = Arc::new(opts);
-
-		// Create table with entries having various seq_nums: 1, 4, 7
-		let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
-
-		let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts.clone());
-
-		// Snapshot at seq_num = 5 should only see entries with seq_num <= 5
-		let range = (Bound::Unbounded, Bound::Unbounded);
-		let iter = KMergeIterator::new_from(iter_state, 5, range, false);
-
-		let items: Vec<_> = iter.collect();
-		for (key, _) in &items {
-			assert!(key.seq_num() <= 5, "All items should have seq_num <= snapshot seq_num");
-		}
 	}
 
 	#[test]
@@ -2288,7 +2252,7 @@ mod tests {
 		let iter_state = create_iter_state_with_tables(vec![], vec![], vec![], opts.clone());
 
 		let range = (Bound::Included(b"a".to_vec()), Bound::Included(b"z".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "Iterator with no tables should return no items");
@@ -2309,7 +2273,7 @@ mod tests {
 
 		// Query for exact single key
 		let range = (Bound::Included(b"a1".to_vec()), Bound::Included(b"a1".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let items: Vec<_> = iter.collect();
 		// Should return at most 1 item
@@ -2333,7 +2297,7 @@ mod tests {
 
 		// Inverted range: start > end
 		let range = (Bound::Included(b"z".to_vec()), Bound::Included(b"a".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert_eq!(count, 0, "Inverted range should return no items");
@@ -2362,7 +2326,7 @@ mod tests {
 
 		// Query that overlaps with both levels
 		let range = (Bound::Included(b"e".to_vec()), Bound::Included(b"k".to_vec()));
-		let iter = KMergeIterator::new_from(iter_state, u64::MAX, range, false);
+		let iter = KMergeIterator::new_from(iter_state, range, false);
 
 		let count = count_kmerge_items(iter);
 		assert!(count > 0, "Should have items from both L0 and L1 tables");
@@ -2479,5 +2443,468 @@ mod tests {
 		);
 
 		tree.close().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert key1 at seq_num ~1
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1_v1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Capture snapshot after key1 insert (should see only key1)
+		let snapshot1 = store.begin().unwrap();
+		let snapshot1_seq = snapshot1.snapshot.as_ref().unwrap().seq_num;
+
+		// Insert key2 at seq_num ~2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key2", b"value2_v1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Capture snapshot after key2 insert (should see key1 and key2)
+		let snapshot2 = store.begin().unwrap();
+		let snapshot2_seq = snapshot2.snapshot.as_ref().unwrap().seq_num;
+
+		// Insert key3 at seq_num ~3
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key3", b"value3_v1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Capture snapshot after key3 insert (should see key1, key2, and key3)
+		let snapshot3 = store.begin().unwrap();
+		let snapshot3_seq = snapshot3.snapshot.as_ref().unwrap().seq_num;
+
+		// Insert key4 at seq_num ~4
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key4", b"value4_v1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Capture snapshot after key4 insert (should see all keys)
+		let snapshot4 = store.begin().unwrap();
+		let snapshot4_seq = snapshot4.snapshot.as_ref().unwrap().seq_num;
+
+		eprintln!(
+			"Snapshot seq nums: s1={}, s2={}, s3={}, s4={}",
+			snapshot1_seq, snapshot2_seq, snapshot3_seq, snapshot4_seq
+		);
+
+		// Test snapshot1 - should only see key1
+		{
+			let snap_ref = snapshot1.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snapshot1 (seq={}) sees: {:?}",
+				snapshot1_seq,
+				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value1_v1");
+		}
+
+		// Test snapshot2 - should see key1 and key2
+		{
+			let snap_ref = snapshot2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snapshot2 (seq={}) sees: {:?}",
+				snapshot2_seq,
+				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+		}
+
+		// Test snapshot3 - should see key1, key2, and key3
+		{
+			let snap_ref = snapshot3.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snapshot3 (seq={}) sees: {:?}",
+				snapshot3_seq,
+				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[2].0.as_ref(), b"key3");
+		}
+
+		// Test snapshot4 - should see all 4 keys
+		{
+			let snap_ref = snapshot4.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snapshot4 (seq={}) sees: {:?}",
+				snapshot4_seq,
+				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(range[3].0.as_ref(), b"key4");
+		}
+
+		// Test backward iteration on snapshot2
+		{
+			let snap_ref = snapshot2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.rev()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snapshot2 backward sees: {:?}",
+				range.iter().map(|(k, _)| String::from_utf8_lossy(k.as_ref())).collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
+			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(range[1].0.as_ref(), b"key1");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert initial value for key1
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value_v1").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Snapshot after v1
+		let snapshot1 = store.begin().unwrap();
+
+		// Update key1 to v2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value_v2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Snapshot after v2
+		let snapshot2 = store.begin().unwrap();
+
+		// Update key1 to v3
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value_v3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Snapshot after v3
+		let snapshot3 = store.begin().unwrap();
+
+		// Each snapshot should see its corresponding version
+		{
+			let snap1_ref = snapshot1.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap1_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 1);
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value_v1");
+		}
+
+		{
+			let snap2_ref = snapshot2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap2_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 1);
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value_v2");
+		}
+
+		{
+			let snap3_ref = snapshot3.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap3_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 1);
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"value_v3");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_snapshot_iterator_seq_num_with_deletions() {
+		let (store, _temp_dir) = create_store();
+
+		// Insert keys 1, 2, 3
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set(b"key1", b"value1").unwrap();
+			tx.set(b"key2", b"value2").unwrap();
+			tx.set(b"key3", b"value3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Snapshot before deletion
+		let snapshot_before = store.begin().unwrap();
+
+		// Delete key2
+		{
+			let mut tx = store.begin().unwrap();
+			tx.delete(b"key2").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Snapshot after deletion
+		let snapshot_after = store.begin().unwrap();
+
+		// Snapshot before should see all 3 keys
+		{
+			let snap_ref = snapshot_before.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 3, "Before deletion: should see all 3 keys");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[2].0.as_ref(), b"key3");
+		}
+
+		// Snapshot after should not see deleted key2
+		{
+			let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 2, "After deletion: should see only 2 keys");
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key3");
+			// key2 should not be present
+		}
+
+		// Test backward iteration after deletion
+		{
+			let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.rev()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			assert_eq!(range.len(), 2, "Backward: should see only 2 keys");
+			assert_eq!(range[0].0.as_ref(), b"key3");
+			assert_eq!(range[1].0.as_ref(), b"key1");
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_snapshot_iterator_seq_num_complex_scenario() {
+		let (store, _temp_dir) = create_store();
+
+		// Timeline:
+		// 1. Insert key1, key2, key3
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"v1").unwrap();
+		tx.set(b"key2", b"v2").unwrap();
+		tx.set(b"key3", b"v3").unwrap();
+		tx.commit().await.unwrap();
+
+		let snap1 = store.begin().unwrap();
+		let snap1_seq = snap1.snapshot.as_ref().unwrap().seq_num;
+
+		// 2. Update key2, insert key4
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key2", b"v2_updated").unwrap();
+		tx.set(b"key4", b"v4").unwrap();
+		tx.commit().await.unwrap();
+
+		let snap2 = store.begin().unwrap();
+		let snap2_seq = snap2.snapshot.as_ref().unwrap().seq_num;
+
+		// 3. Delete key1, insert key5
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.set(b"key5", b"v5").unwrap();
+		tx.commit().await.unwrap();
+
+		let snap3 = store.begin().unwrap();
+		let snap3_seq = snap3.snapshot.as_ref().unwrap().seq_num;
+
+		eprintln!(
+			"\nSequence numbers: snap1={}, snap2={}, snap3={}",
+			snap1_seq, snap2_seq, snap3_seq
+		);
+
+		// Verify snap1: Should see key1(v1), key2(v2), key3(v3)
+		{
+			let snap_ref = snap1.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snap1 forward: {:?}",
+				range
+					.iter()
+					.map(|(k, v)| (
+						String::from_utf8_lossy(k.as_ref()).to_string(),
+						v.as_ref()
+							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
+							.unwrap_or_else(|| "None".to_string())
+					))
+					.collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 3);
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"v1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"v2");
+			assert_eq!(range[2].0.as_ref(), b"key3");
+		}
+
+		// Verify snap2: Should see key1(v1), key2(v2_updated), key3(v3), key4(v4)
+		{
+			let snap_ref = snap2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snap2 forward: {:?}",
+				range
+					.iter()
+					.map(|(k, v)| (
+						String::from_utf8_lossy(k.as_ref()).to_string(),
+						v.as_ref()
+							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
+							.unwrap_or_else(|| "None".to_string())
+					))
+					.collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 4);
+			assert_eq!(range[0].0.as_ref(), b"key1");
+			assert_eq!(range[1].0.as_ref(), b"key2");
+			assert_eq!(range[1].1.as_ref().unwrap().as_ref(), b"v2_updated"); // Updated value
+			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(range[3].0.as_ref(), b"key4");
+		}
+
+		// Verify snap3: Should see key2(v2_updated), key3(v3), key4(v4), key5(v5)
+		// key1 should be deleted
+		{
+			let snap_ref = snap3.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snap3 forward: {:?}",
+				range
+					.iter()
+					.map(|(k, v)| (
+						String::from_utf8_lossy(k.as_ref()).to_string(),
+						v.as_ref()
+							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
+							.unwrap_or_else(|| "None".to_string())
+					))
+					.collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 4);
+			// key1 should NOT be present (deleted)
+			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(range[0].1.as_ref().unwrap().as_ref(), b"v2_updated");
+			assert_eq!(range[1].0.as_ref(), b"key3");
+			assert_eq!(range[2].0.as_ref(), b"key4");
+			assert_eq!(range[3].0.as_ref(), b"key5");
+		}
+
+		// Verify backward iteration on snap2
+		{
+			let snap_ref = snap2.snapshot.as_ref().unwrap();
+			let range: Vec<_> = snap_ref
+				.range(b"key0", b"key9", false)
+				.unwrap()
+				.rev()
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap();
+
+			eprintln!(
+				"Snap2 backward: {:?}",
+				range
+					.iter()
+					.map(|(k, v)| (
+						String::from_utf8_lossy(k.as_ref()).to_string(),
+						v.as_ref()
+							.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).to_string())
+							.unwrap_or_else(|| "None".to_string())
+					))
+					.collect::<Vec<_>>()
+			);
+
+			assert_eq!(range.len(), 4);
+			assert_eq!(range[0].0.as_ref(), b"key4");
+			assert_eq!(range[1].0.as_ref(), b"key3");
+			assert_eq!(range[2].0.as_ref(), b"key2");
+			assert_eq!(range[2].1.as_ref().unwrap().as_ref(), b"v2_updated");
+			assert_eq!(range[3].0.as_ref(), b"key1");
+		}
 	}
 }
