@@ -689,16 +689,14 @@ pub(crate) struct KMergeIterator<'iter> {
 }
 
 impl<'a> KMergeIterator<'a> {
-	fn new_from(iter_state: IterState, range: KeyRange, keys_only: bool) -> Self {
+	fn new_from(iter_state: IterState, query_range: KeyRange, keys_only: bool) -> Self {
 		let boxed_state = Box::new(iter_state);
 		let mut iterators: Vec<BoxedIterator<'a>> = Vec::new();
 
 		// Convert user-key range to InternalKey range once
-		let internal_range = crate::user_range_to_internal_range(range.clone());
+		let internal_range = crate::user_range_to_internal_range(query_range.clone());
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
-		// Compute query key range for table overlap checks
-		let query_range = KeyRange::from(range);
 
 		// Active memtable with range
 		let active_iter = state_ref.active.range(internal_range.clone(), keys_only);

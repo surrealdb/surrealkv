@@ -356,7 +356,7 @@ impl TableMetadata {
 		buf.freeze()
 	}
 
-	pub(crate) fn decode<'de>(src: &'de Bytes) -> Result<TableMetadata> {
+	pub(crate) fn decode(src: &Bytes) -> Result<TableMetadata> {
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys
