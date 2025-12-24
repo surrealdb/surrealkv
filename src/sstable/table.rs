@@ -1015,7 +1015,15 @@ impl TableIterator {
 			if partition_iter.prev() {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
-					Err(_) => return false,
+					Err(e) => {
+						log::error!(
+							"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle. \
+							Value bytes: {:?}, Error: {:?}",
+							val,
+							e
+						);
+						return false;
+					}
 					Ok(res) => res,
 				};
 				if self.load_block(&handle).is_ok() {
@@ -1043,7 +1051,14 @@ impl TableIterator {
 				if partition_iter.valid() {
 					let val = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => {
+						Err(e) => {
+							log::error!(
+								"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle \
+								in partition {}. Value bytes: {:?}, Error: {:?}",
+								self.current_partition_index,
+								val,
+								e
+							);
 							return false;
 						}
 						Ok(res) => res,
@@ -4994,5 +5009,335 @@ mod tests {
 		let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(lookup).unwrap();
 		assert!(result.is_none(), "Should return None when user_key doesn't match");
+	}
+
+	#[test]
+	fn test_reverse_iteration_unbounded_consistency() {
+		// Test that unbounded reverse iteration works correctly
+		let data = vec![("key_000", "value"), ("key_001", "value"), ("key_002", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+
+		// Collect all items in reverse
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 3);
+		assert_eq!(results[0], "key_002"); // Last key first
+		assert_eq!(results[1], "key_001");
+		assert_eq!(results[2], "key_000"); // First key last
+	}
+
+	// ============================================================
+	// BUG #5: Silent error handling in prev()
+	// ============================================================
+
+	#[test]
+	fn test_prev_iteration_across_partitions() {
+		// Test that prev() correctly handles partition boundaries
+		// Use small partition size to force multiple partitions
+		let mut opts = Options::new();
+		opts.block_size = 32; // Very small blocks
+		opts.index_partition_size = 64; // Small partition size
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..20)
+			.map(|i| {
+				// Using static strings via leak for test simplicity
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data.clone());
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Verify multiple partitions
+		let IndexType::Partitioned(ref index) = table.index_block;
+		assert!(index.blocks.len() > 1, "Test requires multiple partitions");
+
+		// Test reverse iteration crosses partitions correctly
+		let mut iter = table.iter(false, None);
+		let mut results = Vec::new();
+
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 20);
+		// First item should be last key
+		assert_eq!(results[0], "key_019");
+		// Last item should be first key
+		assert_eq!(results[19], "key_000");
+	}
+
+	// ============================================================
+	// BUG #6: seek_to_last panic on corrupt block (BlockIterator)
+	// ============================================================
+
+	// Note: This test would need to be in block.rs, but we can test the behavior
+	// at the table level by ensuring seek_to_last works for valid data
+
+	#[test]
+	fn test_seek_to_last_valid_block() {
+		// Ensure seek_to_last works correctly for valid blocks
+		let data = vec![("aaa", "value1"), ("bbb", "value2"), ("ccc", "value3")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+		iter.seek_to_last();
+
+		assert!(iter.valid());
+		let key = iter.key();
+		assert_eq!(key.user_key, b"ccc".to_vec());
+	}
+
+	// ============================================================
+	// Range boundary edge cases
+	// ============================================================
+
+	#[test]
+	fn test_range_at_exact_block_boundary() {
+		// Test range bounds at exact block boundaries
+		let mut opts = Options::new();
+		opts.block_size = 50; // Small blocks to force boundaries
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..10)
+			.map(|i| {
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data);
+		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(src), size as u64).unwrap());
+
+		// Test with bound that might be at a block boundary
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_003".to_vec()),
+				Bound::Included(b"key_006".to_vec()),
+			))),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		assert_eq!(results.len(), 4);
+		assert_eq!(results[0], "key_003");
+		assert_eq!(results[3], "key_006");
+	}
+
+	#[test]
+	fn test_range_with_multiple_versions_at_boundary() {
+		// Test range where boundary key has multiple versions
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10), // Multiple versions of boundary key
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Included bound should include ALL versions
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_002".to_vec()),
+				Bound::Included(b"key_003".to_vec()),
+			))),
+		);
+
+		let results: Vec<(String, u64)> = iter
+			.map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num()))
+			.collect();
+
+		// Should have 3 versions of key_002 + 1 version of key_003 = 4 items
+		assert_eq!(results.len(), 4, "Expected 4 items, got {:?}", results);
+
+		// First 3 should be key_002 with descending seq nums
+		assert_eq!(results[0].0, "key_002");
+		assert_eq!(results[0].1, 100);
+		assert_eq!(results[1].0, "key_002");
+		assert_eq!(results[1].1, 50);
+		assert_eq!(results[2].0, "key_002");
+		assert_eq!(results[2].1, 10);
+		assert_eq!(results[3].0, "key_003");
+	}
+
+	#[test]
+	fn test_excluded_bound_skips_all_versions() {
+		// Test that excluded bound skips ALL versions of a key
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10),
+			("key_003", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded lower bound should skip ALL versions of key_002
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_002".to_vec()),
+				Bound::Unbounded,
+			))),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		// Should only have key_003
+		assert_eq!(results.len(), 1, "Expected 1 item, got {:?}", results);
+		assert_eq!(results[0], "key_003");
+
+		// Verify NO version of key_002 appears
+		assert!(!results.iter().any(|k| k == "key_002"), "key_002 should not appear in results");
+	}
+
+	#[test]
+	fn test_reverse_iteration_with_excluded_upper_bound() {
+		// Test reverse iteration correctly respects excluded upper bound
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded upper bound in reverse
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Excluded(b"key_003".to_vec()),
+			))),
+		);
+
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		// Should get key_002 (both versions) and key_001, NOT key_003 or key_004
+		assert!(!results.iter().any(|k| k == "key_003"), "key_003 should not appear");
+		assert!(!results.iter().any(|k| k == "key_004"), "key_004 should not appear");
+
+		// First in reverse should be key_002 (highest version)
+		assert_eq!(results[0], "key_002");
+	}
+
+	#[test]
+	fn test_empty_range_returns_nothing() {
+		// Test that a range with no matching keys returns nothing
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value"), ("eee", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] - "ccc" doesn't exist
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"ccc".to_vec()),
+				Bound::Included(b"ccc".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range for non-existent key should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_before_table() {
+		// Test range that is completely before all keys in table
+		let data = vec![("mmm", "value"), ("nnn", "value"), ("ooo", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"aaa".to_vec()),
+				Bound::Included(b"bbb".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range before all keys should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_after_table() {
+		// Test range that is completely after all keys in table
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ccc", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"xxx".to_vec()),
+				Bound::Included(b"zzz".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range after all keys should be empty");
+	}
+
+	#[test]
+	fn test_reverse_iteration_empty_range() {
+		// Test reverse iteration with empty range
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] doesn't exist
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"ccc".to_vec()),
+				Bound::Included(b"ccc".to_vec()),
+			))),
+		);
+
+		let result = iter.next_back();
+		assert!(result.is_none(), "Empty range should return None on next_back()");
 	}
 }
