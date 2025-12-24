@@ -225,7 +225,7 @@ impl<W: Write> TableWriter<W> {
 				opts.index_partition_size,
 			),
 			filter_block: fb,
-			internal_cmp: opts.internal_comparator.clone() as Arc<dyn Comparator>,
+			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
 		}
 	}
 
@@ -4789,5 +4789,210 @@ mod tests {
 				found_key.seq_num()
 			);
 		}
+	}
+
+	#[test]
+	fn test_table_get_mvcc_correct_version() {
+		// Scenario: Table has multiple versions of same key
+		// Query at different seq_nums should return correct version
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let user_key = b"my_key";
+
+		// Add versions: seq 100, 75, 50, 25 (stored in this order)
+		for seq in [100u64, 75, 50, 25] {
+			let key = InternalKey::new(user_key.to_vec(), seq, InternalKeyKind::Set, 0);
+			let value = format!("value_at_seq_{}", seq);
+			writer.add(key, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=200: should find seq=100 (newest visible)
+		let lookup = InternalKey::new(user_key.to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 100);
+		assert_eq!(&found_value, b"value_at_seq_100");
+
+		// Query at seq=80: should find seq=75
+		let lookup = InternalKey::new(user_key.to_vec(), 80, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 75);
+
+		// Query at seq=50: should find seq=50 exactly
+		let lookup = InternalKey::new(user_key.to_vec(), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 50);
+
+		// Query at seq=10: should return None (no visible version)
+		let lookup = InternalKey::new(user_key.to_vec(), 10, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none(), "No version should be visible at seq=10");
+	}
+
+	#[test]
+	fn test_table_get_returns_none_for_future_version() {
+		// Scenario: Query for a key where only future versions exist
+		// Expected: Should return None (no visible version)
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Key only has version at seq=100
+		let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key, b"future_value").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=50: version at seq=100 is in the "future"
+		let lookup = InternalKey::new(b"future_key".to_vec(), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(
+			result.is_none(),
+			"Should not see future version at seq=100 when querying at seq=50"
+		);
+	}
+
+	#[test]
+	fn test_table_get_different_user_keys() {
+		// Scenario: Multiple different user keys
+		// Verify no cross-contamination
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let keys = ["apple", "banana", "cherry", "date"];
+		for key in &keys {
+			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			let value = format!("value_for_{}", key);
+			writer.add(ikey, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Each key should return its own value
+		for key in &keys {
+			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let result = table.get(lookup).unwrap();
+			assert!(result.is_some(), "Should find key {}", key);
+			let (found_key, found_value) = result.unwrap();
+			assert_eq!(found_key.user_key, key.as_bytes().to_vec());
+			assert_eq!(String::from_utf8_lossy(&found_value), format!("value_for_{}", key));
+		}
+
+		// Non-existent keys should return None
+		let lookup = InternalKey::new(b"nonexistent".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_table_get_at_block_boundaries() {
+		// Scenario: Force keys across multiple blocks, query at boundaries
+		let opts = Arc::new(
+			Options::new().with_filter_policy(None).with_block_size(64), /* Small blocks to
+			                                                              * force splits */
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add enough keys to span multiple blocks
+		for i in 0..20 {
+			let key = format!("key_{:04}", i);
+			let value = format!("value_{:04}", i);
+			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			writer.add(ikey, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Verify multiple blocks were created
+		assert!(
+			table.meta.properties.num_data_blocks > 1,
+			"Test requires multiple blocks, got {}",
+			table.meta.properties.num_data_blocks
+		);
+
+		// Query for each key
+		for i in 0..20 {
+			let key = format!("key_{:04}", i);
+			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let result = table.get(lookup).unwrap();
+			assert!(result.is_some(), "Should find key {}", key);
+			let (found_key, _) = result.unwrap();
+			assert_eq!(found_key.user_key, key.as_bytes().to_vec());
+		}
+	}
+
+	#[test]
+	fn test_table_get_tombstone_handling() {
+		// Scenario: Key has a tombstone (delete marker)
+		// Table::get should still return the tombstone, caller handles it
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add a set followed by a delete
+		let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(set_key, b"original_value").unwrap();
+
+		let delete_key = InternalKey::new(b"my_key".to_vec(), 50, InternalKeyKind::Delete, 0);
+		writer.add(delete_key, b"").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=200: should get the Set at seq=100
+		let lookup = InternalKey::new(b"my_key".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 100);
+		assert!(!found_key.is_tombstone());
+
+		// Query at seq=75: should get the Delete at seq=50
+		let lookup = InternalKey::new(b"my_key".to_vec(), 75, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 50);
+		assert!(found_key.is_tombstone(), "Should return the tombstone marker");
+	}
+
+	#[test]
+	fn test_table_get_user_key_mismatch() {
+		// Scenario: Seek lands on a different user key
+		// Expected: Should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Only add "apple" and "cherry", not "banana"
+		let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key1, b"apple_value").unwrap();
+
+		let key2 = InternalKey::new(b"cherry".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key2, b"cherry_value").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query for "banana" which doesn't exist
+		// Seek will land on "cherry", but user_key doesn't match
+		let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none(), "Should return None when user_key doesn't match");
 	}
 }

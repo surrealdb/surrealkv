@@ -498,6 +498,17 @@ impl BlockIterator {
 	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
 		self.reset();
 
+		// Guard against empty blocks (corrupt or malformed)
+		if self.restart_points.is_empty() {
+			log::error!(
+				"[BLOCK] Attempted seek on empty/corrupt block with no restart points. \
+				Block size: {}, restart_offset: {}",
+				self.block.len(),
+				self.restart_offset
+			);
+			return Some(()); // Return Some(()) so caller checks valid() which will be false
+		}
+
 		let mut left = 0;
 		let mut right = self.restart_points.len() - 1;
 
@@ -1042,5 +1053,246 @@ mod tests {
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key.as_slice(), "pkey2".as_bytes());
+	}
+
+	#[test]
+	fn test_block_seek_key_not_found_past_end() {
+		// Scenario: Seek for a key greater than all keys in the block
+		// Expected: Iterator should be invalid (valid() returns false)
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		// Add some keys
+		for i in 0..5 {
+			let key = format!("key_{:02}", i);
+			let value = format!("value_{}", i);
+			builder
+				.add(&make_internal_key(key.as_bytes(), InternalKeyKind::Set), value.as_bytes())
+				.unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for a key that is greater than all keys
+		let target = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+
+		assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
+	}
+
+	#[test]
+	fn test_block_seek_key_not_found_before_start() {
+		// Scenario: Seek for a key less than all keys in the block
+		// Expected: Iterator should land on the first key
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		// Add keys starting from "bbb"
+		for i in 0..5 {
+			let key = format!("key_{:02}", i);
+			let value = format!("value_{}", i);
+			builder
+				.add(&make_internal_key(key.as_bytes(), InternalKeyKind::Set), value.as_bytes())
+				.unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for a key that is less than all keys
+		let target = InternalKey::new(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+
+		assert!(iter.valid(), "Iterator should be valid");
+		let found_key = iter.key();
+		assert_eq!(found_key.user_key, b"key_00".to_vec(), "Should land on first key");
+	}
+
+	#[test]
+	fn test_block_seek_exact_match() {
+		// Scenario: Seek for a key that exists exactly
+		// Expected: Iterator lands on that exact key
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		for i in 0..10 {
+			let key = format!("key_{:02}", i);
+			let value = format!("value_{}", i);
+			builder
+				.add(&make_internal_key(key.as_bytes(), InternalKeyKind::Set), value.as_bytes())
+				.unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for key_05 which exists
+		let target = InternalKey::new(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+
+		assert!(iter.valid());
+		let found_key = iter.key();
+		assert_eq!(found_key.user_key, b"key_05".to_vec());
+	}
+
+	#[test]
+	fn test_block_seek_between_keys() {
+		// Scenario: Seek for a key that falls between two existing keys
+		// Expected: Iterator lands on the first key >= target
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		builder.add(&make_internal_key(b"apple", InternalKeyKind::Set), b"v1").unwrap();
+		builder.add(&make_internal_key(b"cherry", InternalKeyKind::Set), b"v2").unwrap();
+		builder.add(&make_internal_key(b"grape", InternalKeyKind::Set), b"v3").unwrap();
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for "banana" which is between "apple" and "cherry"
+		let target = InternalKey::new(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+
+		assert!(iter.valid());
+		let found_key = iter.key();
+		assert_eq!(
+			found_key.user_key,
+			b"cherry".to_vec(),
+			"Should land on 'cherry' which is first key >= 'banana'"
+		);
+	}
+
+	#[test]
+	fn test_block_seek_same_user_key_different_seq_nums() {
+		// Scenario: Multiple versions of the same user key with different seq_nums
+		// Verify descending seq_num ordering works correctly
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		// Add same user key with descending seq_nums (as stored in SSTable)
+		// In InternalKey ordering: (foo, 100) < (foo, 50) < (foo, 1)
+		for seq in [100u64, 75, 50, 25, 1] {
+			let key = InternalKey::new(b"foo".to_vec(), seq, InternalKeyKind::Set, 0);
+			let value = format!("value_seq_{}", seq);
+			builder.add(&key.encode(), value.as_bytes()).unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+
+		// Test 1: Seek for seq=80, should find seq=75 (first key >= (foo, 80))
+		let mut iter = block.iter(false);
+		let target = InternalKey::new(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+		assert!(iter.valid());
+		let found = iter.key();
+		assert_eq!(found.user_key, b"foo".to_vec());
+		assert_eq!(
+			found.seq_num(),
+			75,
+			"Seeking for seq=80 should find seq=75 (latest visible version)"
+		);
+
+		// Test 2: Seek for seq=50, should find exactly seq=50
+		iter.seek(&InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode());
+		assert!(iter.valid());
+		assert_eq!(iter.key().seq_num(), 50);
+
+		// Test 3: Seek for seq=200 (newer than all), should find seq=100
+		iter.seek(&InternalKey::new(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode());
+		assert!(iter.valid());
+		assert_eq!(iter.key().seq_num(), 100, "Should find newest version seq=100");
+	}
+
+	#[test]
+	fn test_block_single_restart_point() {
+		// Scenario: Block with only 1 entry (1 restart point)
+		// Verify binary search handles this edge case
+		let o = make_opts(Some(10)); // Large interval, so only 1 restart point
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		builder.add(&make_internal_key(b"only_key", InternalKeyKind::Set), b"only_value").unwrap();
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for the exact key
+		let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
+		iter.seek(&target.encode());
+		assert!(iter.valid());
+		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+
+		// Seek for key before
+		iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode());
+		assert!(iter.valid());
+		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+
+		// Seek for key after
+		iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode());
+		assert!(!iter.valid(), "Should be invalid when seeking past single entry");
+	}
+
+	#[test]
+	fn test_block_seek_at_restart_point_boundaries() {
+		// Scenario: Seek for keys exactly at restart point boundaries
+		let o = make_opts(Some(2)); // Restart every 2 entries
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		// Add 6 entries = 3 restart points (at entries 0, 2, 4)
+		for i in 0..6 {
+			let key = format!("key_{:02}", i);
+			builder
+				.add(&make_internal_key(key.as_bytes(), InternalKeyKind::Set), b"value")
+				.unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		// Seek for each restart point key
+		for i in [0, 2, 4] {
+			let target_key = format!("key_{:02}", i);
+			let target =
+				InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+			iter.seek(&target.encode());
+			assert!(iter.valid(), "Should find key at restart point {}", i);
+			assert_eq!(iter.key().user_key, target_key.as_bytes().to_vec());
+		}
+	}
+
+	#[test]
+	fn test_block_iterator_valid_after_exhaustion() {
+		// Scenario: Iterate through all entries, then check valid()
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		for i in 0..5 {
+			builder
+				.add(
+					&make_internal_key(format!("key_{}", i).as_bytes(), InternalKeyKind::Set),
+					b"value",
+				)
+				.unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		iter.seek_to_first();
+		let mut count = 0;
+		while iter.valid() {
+			count += 1;
+			iter.advance();
+		}
+		assert_eq!(count, 5);
+		assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 	}
 }
