@@ -239,22 +239,47 @@ impl Snapshot {
 		let level_manifest = self.core.level_manifest.read()?;
 
 		// Check the tables in each level for the key
-		for level in &level_manifest.levels {
-			for table in level.tables.iter() {
-				let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+			if level_idx == 0 {
+				// Level 0: Tables can overlap, check all
+				for table in level.tables.iter() {
+					let ikey =
+						InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
-				if !table.is_key_in_key_range(&ikey) {
-					continue; // Skip this table if the key is not in its range
-				}
-
-				let maybe_item = table.get(ikey)?;
-
-				if let Some(item) = maybe_item {
-					let ikey = &item.0;
-					if ikey.is_tombstone() {
-						return Ok(None); // Key is a tombstone, return None
+					if !table.is_key_in_key_range(&ikey) {
+						continue; // Skip this table if the key is not in its range
 					}
-					return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+
+					let maybe_item = table.get(ikey)?;
+
+					if let Some(item) = maybe_item {
+						let ikey = &item.0;
+						if ikey.is_tombstone() {
+							return Ok(None); // Key is a tombstone, return None
+						}
+						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					}
+				}
+			} else {
+				// Level 1+: Non-overlapping, binary search for the one table
+				let key_range = KeyRange::new(key.to_vec(), key.to_vec());
+				let start_idx = level.find_first_overlapping_table(&key_range);
+				let end_idx = level.find_last_overlapping_table(&key_range);
+
+				// At most one table can contain this exact key
+				for table in &level.tables[start_idx..end_idx] {
+					let ikey =
+						InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+
+					let maybe_item = table.get(ikey)?;
+
+					if let Some(item) = maybe_item {
+						let ikey = &item.0;
+						if ikey.is_tombstone() {
+							return Ok(None); // Key is a tombstone, return None
+						}
+						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					}
 				}
 			}
 		}

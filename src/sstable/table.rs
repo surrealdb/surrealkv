@@ -1379,14 +1379,10 @@ impl TableIterator {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, use full internal key for correct partition lookup
-		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(target) {
-			// Find the partition index
-			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
-				if std::ptr::eq(handle, block_handle) {
-					self.current_partition_index = i;
-					break;
-				}
-			}
+		if let Some((partition_index, block_handle)) =
+			partitioned_index.find_block_handle_by_key(target)
+		{
+			self.current_partition_index = partition_index;
 
 			if let Ok(partition_block) = partitioned_index.load_block(block_handle) {
 				// Note: Index blocks always need full key-value pairs to decode block handles

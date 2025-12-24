@@ -214,7 +214,10 @@ impl TopLevelIndex {
 		})
 	}
 
-	pub(crate) fn find_block_handle_by_key(&self, target: &[u8]) -> Option<&BlockHandleWithKey> {
+	pub(crate) fn find_block_handle_by_key(
+		&self,
+		target: &[u8],
+	) -> Option<(usize, &BlockHandleWithKey)> {
 		let internal_cmp = &self.opts.internal_comparator;
 
 		// Find the partition point in the blocks where the key would fit.
@@ -227,6 +230,7 @@ impl TopLevelIndex {
 		self.blocks
 			.get(index)
 			.filter(|block| internal_cmp.compare(target, &block.separator_key) != Ordering::Greater)
+			.map(|block| (index, block))
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
@@ -250,7 +254,7 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
-		let Some(block_handle) = self.find_block_handle_by_key(target) else {
+		let Some((_index, block_handle)) = self.find_block_handle_by_key(target) else {
 			return Err(Error::BlockNotFound);
 		};
 
@@ -411,7 +415,7 @@ mod tests {
 			let result = index.find_block_handle_by_key(key);
 			match expected {
 				Some(expected_sep_key) => {
-					let handle = result.expect("Expected a block handle but got None");
+					let (_index, handle) = result.expect("Expected a block handle but got None");
 					assert_eq!(&handle.separator_key, expected_sep_key, "Mismatch for key {key:?}");
 				}
 				None => assert!(result.is_none(), "Expected None for key {key:?}, but got Some"),
