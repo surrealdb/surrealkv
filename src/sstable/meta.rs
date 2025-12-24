@@ -1,113 +1,9 @@
-use std::cmp::{max, min};
-use std::ops::{Bound, Range, RangeBounds};
-
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::Error;
 use crate::sstable::table::TableFormat;
 use crate::sstable::InternalKey;
-use crate::{CompressionType, IntoBytes, Key, Result, Value};
-
-pub(crate) const UNBOUNDED_LOW: &[u8] = &[];
-pub(crate) const UNBOUNDED_HIGH: &[u8] = &[0xff];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeyRange {
-	pub(crate) low: Value,
-	pub(crate) high: Value,
-}
-
-impl KeyRange {
-	pub(crate) fn new(low: Value, high: Value) -> Self {
-		KeyRange {
-			low,
-			high,
-		}
-	}
-
-	pub(crate) fn unbounded() -> Self {
-		KeyRange {
-			low: UNBOUNDED_LOW.to_vec(),
-			high: UNBOUNDED_HIGH.to_vec(),
-		}
-	}
-
-	pub(crate) fn overlaps(&self, other: &Self) -> bool {
-		self.high >= other.low && self.low <= other.high
-	}
-
-	/// Creates a new KeyRange that encompasses both input ranges.
-	/// This is useful for finding the total span of multiple ranges.
-	pub(crate) fn merge(&self, other: &Self) -> Self {
-		KeyRange {
-			low: min(self.low.clone(), other.low.clone()),
-			high: max(self.high.clone(), other.high.clone()),
-		}
-	}
-}
-
-impl Default for KeyRange {
-	fn default() -> Self {
-		KeyRange::unbounded()
-	}
-}
-
-impl RangeBounds<Key> for KeyRange {
-	fn start_bound(&self) -> Bound<&Key> {
-		Bound::Included(&self.low)
-	}
-
-	fn end_bound(&self) -> Bound<&Key> {
-		Bound::Excluded(&self.high)
-	}
-}
-
-impl From<Range<&str>> for KeyRange {
-	fn from(range: Range<&str>) -> Self {
-		KeyRange {
-			low: range.start.into_bytes(),
-			high: range.end.into_bytes(),
-		}
-	}
-}
-
-impl From<Range<Key>> for KeyRange {
-	fn from(range: Range<Key>) -> Self {
-		KeyRange {
-			low: range.start,
-			high: range.end,
-		}
-	}
-}
-
-impl From<(Bound<Key>, Bound<Key>)> for KeyRange {
-	fn from((low, high): (Bound<Key>, Bound<Key>)) -> Self {
-		let low = match low {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_LOW.to_vec(),
-		};
-		let high = match high {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_HIGH.to_vec(),
-		};
-
-		KeyRange {
-			low,
-			high,
-		}
-	}
-}
-
-impl<T: IntoBytes> From<(T, T)> for KeyRange {
-	fn from((start, end): (T, T)) -> Self {
-		KeyRange {
-			low: start.into_bytes(),
-			high: end.into_bytes(),
-		}
-	}
-}
+use crate::{CompressionType, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
@@ -148,8 +44,6 @@ pub(crate) struct Properties {
 	// Time metrics
 	pub(crate) oldest_key_time: u64,
 	pub(crate) newest_key_time: u64,
-
-	pub(crate) key_range: Option<KeyRange>,
 }
 
 impl Properties {
@@ -180,7 +74,6 @@ impl Properties {
 			seqnos: (0, 0),
 			oldest_key_time: 0,
 			newest_key_time: 0,
-			key_range: None,
 		}
 	}
 
@@ -212,17 +105,6 @@ impl Properties {
 		buf.put_u64(self.seqnos.1);
 		buf.put_u64(self.oldest_key_time);
 		buf.put_u64(self.newest_key_time);
-		if let Some(ref key_range) = self.key_range {
-			// Write the size of the first element and then the element itself
-			let size_first_element = key_range.low.len() as u64;
-			buf.put_u64(size_first_element); // Write the size
-			buf.extend_from_slice(&key_range.low); // Write the element
-
-			// Write the size of the second element and then the element itself
-			let size_second_element = key_range.high.len() as u64;
-			buf.put_u64(size_second_element); // Write the size
-			buf.extend_from_slice(&key_range.high); // Write the element
-		}
 		buf.to_vec()
 	}
 
@@ -254,16 +136,6 @@ impl Properties {
 		let seqno_end = buf.get_u64();
 		let oldest_key_time = buf.get_u64();
 		let newest_key_time = buf.get_u64();
-		let key_range = if buf.has_remaining() {
-			let size_first_element = buf.get_u64() as usize;
-			let first_element = buf[..size_first_element].to_vec();
-			buf = &buf[size_first_element..];
-			let size_second_element = buf.get_u64() as usize;
-			let second_element = buf[..size_second_element].to_vec();
-			Some(KeyRange::new(first_element, second_element))
-		} else {
-			None
-		};
 
 		Ok(Self {
 			id,
@@ -291,7 +163,6 @@ impl Properties {
 			seqnos: (seqno_start, seqno_end),
 			oldest_key_time,
 			newest_key_time,
-			key_range,
 		})
 	}
 }

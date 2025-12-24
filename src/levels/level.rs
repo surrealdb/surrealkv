@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::sstable::meta::KeyRange;
 use crate::sstable::table::Table;
-use crate::Result;
+use crate::{InternalKeyRange, Result};
 
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.
@@ -57,8 +56,10 @@ impl Level {
 	/// Using for Level 1+ where tables have non-overlapping key ranges
 	pub(crate) fn insert_sorted_by_key(&mut self, table: Arc<Table>) {
 		let insert_pos = self.tables.partition_point(|existing| {
-			match (&existing.meta.properties.key_range, &table.meta.properties.key_range) {
-				(Some(existing_range), Some(new_range)) => existing_range.low < new_range.low,
+			match (&existing.meta.smallest_point, &table.meta.smallest_point) {
+				(Some(existing_smallest), Some(new_smallest)) => {
+					existing_smallest.user_key < new_smallest.user_key
+				}
 				_ => true,
 			}
 		});
@@ -72,28 +73,28 @@ impl Level {
 		len_before > self.tables.len()
 	}
 
-	/// Returns an iterator over tables that overlap with the given key range
+	/// Returns an iterator over tables that overlap with the given range
 	pub(crate) fn overlapping_tables<'a>(
 		&'a self,
-		key_range: &'a KeyRange,
+		range: &'a InternalKeyRange,
 	) -> impl Iterator<Item = &'a Arc<Table>> + 'a {
-		self.tables.iter().filter(move |table| table.overlaps_with_range(key_range))
+		self.tables.iter().filter(move |table| table.overlaps_with_range(range))
 	}
 
 	/// Finds the index of the first table that could potentially overlap with
 	/// the given range. For Level 1+, tables have non-overlapping key ranges
 	/// sorted by their keys. Returns the index of the first table to check, or
 	/// tables.len() if all tables are before the range.
-	pub(crate) fn find_first_overlapping_table(&self, key_range: &KeyRange) -> usize {
+	pub(crate) fn find_first_overlapping_table(&self, range: &InternalKeyRange) -> usize {
 		// Binary search to find first table that is NOT completely before the range
-		self.tables.partition_point(|table| table.is_before_range(key_range))
+		self.tables.partition_point(|table| table.is_before_range(range))
 	}
 
 	/// Finds the index after the last table that could potentially overlap with
 	/// the given range. Returns the exclusive end index for iteration.
-	pub(crate) fn find_last_overlapping_table(&self, key_range: &KeyRange) -> usize {
+	pub(crate) fn find_last_overlapping_table(&self, range: &InternalKeyRange) -> usize {
 		// Find the first table that is completely after the range
-		self.tables.partition_point(|table| !table.is_after_range(key_range))
+		self.tables.partition_point(|table| !table.is_after_range(range))
 	}
 }
 

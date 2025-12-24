@@ -404,15 +404,34 @@ impl BlockIterator {
 		let (shared_prefix, non_shared_key, value_size, i) =
 			self.decode_entry_lengths(self.offset)?;
 
-		self.current_key.truncate(shared_prefix);
-		self.current_key
-			.extend_from_slice(&self.block[self.offset + i..self.offset + i + non_shared_key]);
+		// Bounds validation: ensure we won't read past the restart_offset
+		let key_end = self.offset.checked_add(i)?.checked_add(non_shared_key)?;
+		let value_end = key_end.checked_add(value_size)?;
 
-		self.offset += i + non_shared_key;
+		if key_end > self.restart_offset || value_end > self.restart_offset {
+			log::error!(
+				"[BLOCK] Corruption detected: decoded lengths exceed block bounds. \
+            offset: {}, i: {}, non_shared_key: {}, value_size: {}, \
+            key_end: {}, value_end: {}, restart_offset: {}",
+				self.offset,
+				i,
+				non_shared_key,
+				value_size,
+				key_end,
+				value_end,
+				self.restart_offset
+			);
+			return None;
+		}
+
+		self.current_key.truncate(shared_prefix);
+		self.current_key.extend_from_slice(&self.block[self.offset + i..key_end]);
+
+		self.offset = key_end;
 
 		self.current_value_offset_start = self.offset;
 		self.current_value_offset_end = self.offset + value_size;
-		self.offset += value_size;
+		self.offset = value_end;
 
 		Some(())
 	}
@@ -1294,5 +1313,50 @@ mod tests {
 		}
 		assert_eq!(count, 5);
 		assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
+	}
+
+	#[test]
+	fn test_seek_to_last_empty_block() {
+		// Test that seek_to_last handles empty blocks gracefully
+		let o = make_opts(Some(3));
+		let builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		// Create empty block (just restart points, no entries)
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		iter.seek_to_last();
+
+		// Should be invalid, not panic
+		assert!(!iter.valid(), "Empty block iterator should be invalid after seek_to_last");
+	}
+
+	#[test]
+	fn test_prev_at_first_entry() {
+		// Test that prev() at first entry correctly returns false
+		let o = make_opts(Some(3));
+		let mut builder =
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
+
+		for i in 0..5 {
+			let key =
+				InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set, 0);
+			builder.add(&key.encode(), b"value").unwrap();
+		}
+
+		let block = Block::new(builder.finish(), o.internal_comparator.clone());
+		let mut iter = block.iter(false);
+
+		iter.seek_to_first();
+		assert!(iter.valid());
+
+		let first_key = iter.key();
+		assert_eq!(first_key.user_key, b"key_00".to_vec());
+
+		// prev() at first entry should return false
+		let result = iter.prev();
+		assert!(!result, "prev() at first entry should return false");
+		assert!(!iter.valid(), "Iterator should be invalid after prev() at first entry");
 	}
 }

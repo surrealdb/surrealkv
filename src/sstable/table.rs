@@ -8,7 +8,6 @@ use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
-use super::meta::KeyRange;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
@@ -456,23 +455,6 @@ impl<W: Write> TableWriter<W> {
 		}
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
-
-		let user_key = &key.user_key;
-
-		// Update key range if needed
-		if props.key_range.is_none() {
-			props.key_range = Some(KeyRange {
-				low: user_key.clone(),
-				high: user_key.clone(),
-			});
-		} else if let Some(ref mut range) = props.key_range {
-			if self.opts.comparator.compare(user_key, &range.low) == Ordering::Less {
-				range.low.clone_from(user_key);
-			}
-			if self.opts.comparator.compare(user_key, &range.high) == Ordering::Greater {
-				range.high.clone_from(user_key);
-			}
-		}
 	}
 }
 
@@ -839,50 +821,52 @@ impl Table {
 	}
 
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
-		if let Some(ref range) = self.meta.properties.key_range {
-			return self.opts.comparator.compare(key.user_key.as_slice(), &range.low)
-				>= Ordering::Equal
-				&& self.opts.comparator.compare(key.user_key.as_slice(), &range.high)
-					<= Ordering::Equal;
+		let Some(smallest) = &self.meta.smallest_point else {
+			return true;
+		};
+		let Some(largest) = &self.meta.largest_point else {
+			return true;
+		};
+
+		self.opts.comparator.compare(key.user_key.as_slice(), &smallest.user_key) >= Ordering::Equal
+			&& self.opts.comparator.compare(key.user_key.as_slice(), &largest.user_key)
+				<= Ordering::Equal
+	}
+
+	/// Checks if table is completely before the query range
+	/// Uses USER KEY comparison only (like RocksDB's sstableKeyCompare)
+	pub(crate) fn is_before_range(&self, range: &InternalKeyRange) -> bool {
+		let Some(largest) = &self.meta.largest_point else {
+			return false;
+		};
+
+		match &range.0 {
+			// lower bound
+			Bound::Unbounded => false,
+			Bound::Included(k) | Bound::Excluded(k) => {
+				self.opts.comparator.compare(&largest.user_key, &k.user_key) == Ordering::Less
+			}
 		}
-		true // If no key range is defined, assume the key is in range.
 	}
 
-	/// Checks if this table's key range overlaps with the given key range
-	pub(crate) fn overlaps_with_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| range.overlaps(other_range))
-			.unwrap_or(false)
+	/// Checks if table is completely after the query range
+	pub(crate) fn is_after_range(&self, range: &InternalKeyRange) -> bool {
+		let Some(smallest) = &self.meta.smallest_point else {
+			return false;
+		};
+
+		match &range.1 {
+			// upper bound
+			Bound::Unbounded => false,
+			Bound::Included(k) | Bound::Excluded(k) => {
+				self.opts.comparator.compare(&smallest.user_key, &k.user_key) == Ordering::Greater
+			}
+		}
 	}
 
-	/// Checks if this table is completely before the given range
-	/// Returns true if table's highest key is less than the range's lowest key
-	pub(crate) fn is_before_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| {
-				self.opts.comparator.compare(&range.high, &other_range.low) == Ordering::Less
-			})
-			.unwrap_or(false)
-	}
-
-	/// Checks if this table is completely after the given range
-	/// Returns true if table's lowest key is greater than the range's highest
-	/// key
-	pub(crate) fn is_after_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| {
-				self.opts.comparator.compare(&range.low, &other_range.high) == Ordering::Greater
-			})
-			.unwrap_or(false)
+	/// Checks if table overlaps with query range
+	pub(crate) fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
+		!self.is_before_range(range) && !self.is_after_range(range)
 	}
 }
 
@@ -1015,7 +999,15 @@ impl TableIterator {
 			if partition_iter.prev() {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
-					Err(_) => return false,
+					Err(e) => {
+						log::error!(
+							"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle. \
+							Value bytes: {:?}, Error: {:?}",
+							val,
+							e
+						);
+						return false;
+					}
 					Ok(res) => res,
 				};
 				if self.load_block(&handle).is_ok() {
@@ -1043,7 +1035,14 @@ impl TableIterator {
 				if partition_iter.valid() {
 					let val = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => {
+						Err(e) => {
+							log::error!(
+								"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle \
+								in partition {}. Value bytes: {:?}, Error: {:?}",
+								self.current_partition_index,
+								val,
+								e
+							);
 							return false;
 						}
 						Ok(res) => res,
@@ -1548,7 +1547,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(746, actual);
+		assert_eq!(724, actual);
 	}
 
 	#[test]
@@ -1860,7 +1859,8 @@ mod tests {
 		let writer = TableWriter::new(d, 1, opts, 0);
 
 		// Key range should be None for an empty table
-		assert!(writer.meta.properties.key_range.is_none());
+		assert!(writer.meta.smallest_point.is_none());
+		assert!(writer.meta.largest_point.is_none());
 	}
 
 	#[test]
@@ -1873,9 +1873,14 @@ mod tests {
 		add_key(&mut writer, b"singleton", 1, b"value").unwrap();
 
 		// Key range should have identical low and high bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"singleton");
-		assert_eq!(&range.high[..], b"singleton");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"singleton");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"singleton");
+		}
 	}
 
 	#[test]
@@ -1890,9 +1895,14 @@ mod tests {
 			add_key(&mut writer, key.as_bytes(), i as u64 + 1, b"value").unwrap();
 
 			// Verify range is updated correctly at each step
-			let range = writer.meta.properties.key_range.as_ref().unwrap();
-			assert_eq!(&range.low[..], b"aaa");
-			assert_eq!(&range.high[..], key.as_bytes());
+			assert!(writer.meta.smallest_point.is_some());
+			assert!(writer.meta.largest_point.is_some());
+			if let Some(smallest) = &writer.meta.smallest_point {
+				assert_eq!(&smallest.user_key[..], b"aaa");
+			}
+			if let Some(largest) = &writer.meta.largest_point {
+				assert_eq!(&largest.user_key[..], key.as_bytes());
+			}
 		}
 	}
 
@@ -1913,9 +1923,14 @@ mod tests {
 		}
 
 		// Verify final range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"a10");
-		assert_eq!(&range.high[..], b"a30");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"a10");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"a30");
+		}
 	}
 
 	#[test]
@@ -1931,9 +1946,14 @@ mod tests {
 			add_key(&mut writer, key.as_bytes(), i as u64 + 1, b"value").unwrap();
 
 			// Check range after each addition
-			let range = writer.meta.properties.key_range.as_ref().unwrap();
-			assert_eq!(&range.low[..], b"aaaaa");
-			assert_eq!(&range.high[..], key.as_bytes());
+			assert!(writer.meta.smallest_point.is_some());
+			assert!(writer.meta.largest_point.is_some());
+			if let Some(smallest) = &writer.meta.smallest_point {
+				assert_eq!(&smallest.user_key[..], b"aaaaa");
+			}
+			if let Some(largest) = &writer.meta.largest_point {
+				assert_eq!(&largest.user_key[..], key.as_bytes());
+			}
 		}
 	}
 
@@ -1955,9 +1975,14 @@ mod tests {
 		}
 
 		// Verify final range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"aaa1");
-		assert_eq!(&range.high[..], b"aac5");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"aaa1");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"aac5");
+		}
 	}
 
 	#[test]
@@ -1974,9 +1999,14 @@ mod tests {
 		}
 
 		// Verify range with binary comparison
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], &[0x00, 0x01, 0x02]);
-		assert_eq!(&range.high[..], &[0xF0, 0xF1, 0xF2]);
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], &[0x00, 0x01, 0x02]);
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], &[0xF0, 0xF1, 0xF2]);
+		}
 	}
 
 	#[test]
@@ -1993,9 +2023,14 @@ mod tests {
 		add_key(&mut writer, b"same_key", 10, b"value1").unwrap();
 
 		// Verify range is correct - should be the same key for both bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"same_key");
-		assert_eq!(&range.high[..], b"same_key");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"same_key");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"same_key");
+		}
 	}
 
 	#[test]
@@ -2012,9 +2047,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], "α".as_bytes());
-		assert_eq!(&range.high[..], "ε".as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], "α".as_bytes());
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], "ε".as_bytes());
+		}
 	}
 
 	#[test]
@@ -2041,9 +2081,14 @@ mod tests {
 		}
 
 		// Verify range matches the expected lowest and highest keys
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], sorted_keys.first().unwrap().as_bytes());
-		assert_eq!(&range.high[..], sorted_keys.last().unwrap().as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], sorted_keys.first().unwrap().as_bytes());
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], sorted_keys.last().unwrap().as_bytes());
+		}
 	}
 
 	#[test]
@@ -2064,9 +2109,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"AAA");
-		assert_eq!(&range.high[..], b"bbb");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"AAA");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"bbb");
+		}
 	}
 
 	#[test]
@@ -2097,9 +2147,14 @@ mod tests {
 		}
 
 		// Verify range matches expected bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], &keys.first().unwrap()[..]);
-		assert_eq!(&range.high[..], &keys.last().unwrap()[..]);
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], &keys.first().unwrap()[..]);
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], &keys.last().unwrap()[..]);
+		}
 	}
 
 	#[test]
@@ -2117,9 +2172,14 @@ mod tests {
 		add_key(&mut writer, b"zzzzzz", 4, b"value").unwrap();
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"prefix:aaa");
-		assert_eq!(&range.high[..], b"zzzzzz");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"prefix:aaa");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"zzzzzz");
+		}
 	}
 
 	#[test]
@@ -2142,9 +2202,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"");
-		assert_eq!(&range.high[..], "z".repeat(1000).as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], "z".repeat(1000).as_bytes());
+		}
 	}
 
 	#[test]
@@ -2162,9 +2227,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify the key range was properly persisted and loaded
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Also verify that we can use the range for querying
 		assert!(table.is_key_in_key_range(&InternalKey::new(
@@ -2230,9 +2300,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range was properly persisted with disjoint data
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Test keys in the gaps to ensure the is_key_in_key_range function works
 		// properly
@@ -2278,9 +2353,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Verify block count is greater than 1 (multiple blocks were created)
 		assert!(table.meta.properties.num_data_blocks > 1);
@@ -2314,9 +2394,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range includes tombstones
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], b"aaa");
-		assert_eq!(&key_range.high[..], b"eee");
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"aaa");
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"eee");
+		}
 
 		// Verify tombstone count
 		assert_eq!(table.meta.properties.tombstone_count, 2);
@@ -3693,10 +3778,10 @@ mod tests {
 		// Iterate with range (Unbounded, Included("key_005"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Included(b"key_005".to_vec()),
-			))),
+				Bound::Included(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3741,10 +3826,10 @@ mod tests {
 		// Iterate with range (Unbounded, Excluded("key_005"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3839,10 +3924,10 @@ mod tests {
 		// Iterate with range (Included("key_003"), Unbounded) using next_back()
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3888,10 +3973,10 @@ mod tests {
 		// Iterate with range (Included("key_002"), Excluded("key_007"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_002".to_vec()),
-				Bound::Excluded(b"key_007".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_002".as_slice()),
+				Bound::Excluded(b"key_007".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3930,13 +4015,8 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
-		let iter = table.iter(
-			false,
-			Some(user_range_to_internal_range((
-				Bound::<Vec<u8>>::Unbounded,
-				Bound::<Vec<u8>>::Unbounded,
-			))),
-		);
+		let iter = table
+			.iter(false, Some(user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded)));
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -4064,10 +4144,10 @@ mod tests {
 		// Reverse iteration with EXCLUDED upper bound
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4108,10 +4188,10 @@ mod tests {
 		// Reverse iteration with INCLUDED upper bound on non-existent key
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Included(b"key_005".to_vec()),
-			))),
+				Bound::Included(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4152,10 +4232,10 @@ mod tests {
 		// Forward iteration with EXCLUDED lower bound
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4192,10 +4272,10 @@ mod tests {
 		// Forward iteration with excluded lower bound
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4248,10 +4328,10 @@ mod tests {
 		// Reverse iteration with excluded upper bound
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4302,10 +4382,10 @@ mod tests {
 		// Forward iteration with both bounds excluded at same key
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -4339,10 +4419,10 @@ mod tests {
 		// Reverse iteration with both bounds excluded at same key
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4382,10 +4462,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_002".to_vec()),
-				Bound::Excluded(b"key_004".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
+				Bound::Excluded(b"key_004".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4439,10 +4519,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_002".to_vec()),
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4994,5 +5074,335 @@ mod tests {
 		let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(lookup).unwrap();
 		assert!(result.is_none(), "Should return None when user_key doesn't match");
+	}
+
+	#[test]
+	fn test_reverse_iteration_unbounded_consistency() {
+		// Test that unbounded reverse iteration works correctly
+		let data = vec![("key_000", "value"), ("key_001", "value"), ("key_002", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+
+		// Collect all items in reverse
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 3);
+		assert_eq!(results[0], "key_002"); // Last key first
+		assert_eq!(results[1], "key_001");
+		assert_eq!(results[2], "key_000"); // First key last
+	}
+
+	// ============================================================
+	// BUG #5: Silent error handling in prev()
+	// ============================================================
+
+	#[test]
+	fn test_prev_iteration_across_partitions() {
+		// Test that prev() correctly handles partition boundaries
+		// Use small partition size to force multiple partitions
+		let mut opts = Options::new();
+		opts.block_size = 32; // Very small blocks
+		opts.index_partition_size = 64; // Small partition size
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..20)
+			.map(|i| {
+				// Using static strings via leak for test simplicity
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data.clone());
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Verify multiple partitions
+		let IndexType::Partitioned(ref index) = table.index_block;
+		assert!(index.blocks.len() > 1, "Test requires multiple partitions");
+
+		// Test reverse iteration crosses partitions correctly
+		let mut iter = table.iter(false, None);
+		let mut results = Vec::new();
+
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 20);
+		// First item should be last key
+		assert_eq!(results[0], "key_019");
+		// Last item should be first key
+		assert_eq!(results[19], "key_000");
+	}
+
+	// ============================================================
+	// BUG #6: seek_to_last panic on corrupt block (BlockIterator)
+	// ============================================================
+
+	// Note: This test would need to be in block.rs, but we can test the behavior
+	// at the table level by ensuring seek_to_last works for valid data
+
+	#[test]
+	fn test_seek_to_last_valid_block() {
+		// Ensure seek_to_last works correctly for valid blocks
+		let data = vec![("aaa", "value1"), ("bbb", "value2"), ("ccc", "value3")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+		iter.seek_to_last();
+
+		assert!(iter.valid());
+		let key = iter.key();
+		assert_eq!(key.user_key, b"ccc".to_vec());
+	}
+
+	// ============================================================
+	// Range boundary edge cases
+	// ============================================================
+
+	#[test]
+	fn test_range_at_exact_block_boundary() {
+		// Test range bounds at exact block boundaries
+		let mut opts = Options::new();
+		opts.block_size = 50; // Small blocks to force boundaries
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..10)
+			.map(|i| {
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data);
+		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(src), size as u64).unwrap());
+
+		// Test with bound that might be at a block boundary
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_003".as_slice()),
+				Bound::Included(b"key_006".as_slice()),
+			)),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		assert_eq!(results.len(), 4);
+		assert_eq!(results[0], "key_003");
+		assert_eq!(results[3], "key_006");
+	}
+
+	#[test]
+	fn test_range_with_multiple_versions_at_boundary() {
+		// Test range where boundary key has multiple versions
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10), // Multiple versions of boundary key
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Included bound should include ALL versions
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_002".as_slice()),
+				Bound::Included(b"key_003".as_slice()),
+			)),
+		);
+
+		let results: Vec<(String, u64)> = iter
+			.map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num()))
+			.collect();
+
+		// Should have 3 versions of key_002 + 1 version of key_003 = 4 items
+		assert_eq!(results.len(), 4, "Expected 4 items, got {:?}", results);
+
+		// First 3 should be key_002 with descending seq nums
+		assert_eq!(results[0].0, "key_002");
+		assert_eq!(results[0].1, 100);
+		assert_eq!(results[1].0, "key_002");
+		assert_eq!(results[1].1, 50);
+		assert_eq!(results[2].0, "key_002");
+		assert_eq!(results[2].1, 10);
+		assert_eq!(results[3].0, "key_003");
+	}
+
+	#[test]
+	fn test_excluded_bound_skips_all_versions() {
+		// Test that excluded bound skips ALL versions of a key
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10),
+			("key_003", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded lower bound should skip ALL versions of key_002
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
+				Bound::Unbounded,
+			)),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		// Should only have key_003
+		assert_eq!(results.len(), 1, "Expected 1 item, got {:?}", results);
+		assert_eq!(results[0], "key_003");
+
+		// Verify NO version of key_002 appears
+		assert!(!results.iter().any(|k| k == "key_002"), "key_002 should not appear in results");
+	}
+
+	#[test]
+	fn test_reverse_iteration_with_excluded_upper_bound() {
+		// Test reverse iteration correctly respects excluded upper bound
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded upper bound in reverse
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Unbounded,
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
+		);
+
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		// Should get key_002 (both versions) and key_001, NOT key_003 or key_004
+		assert!(!results.iter().any(|k| k == "key_003"), "key_003 should not appear");
+		assert!(!results.iter().any(|k| k == "key_004"), "key_004 should not appear");
+
+		// First in reverse should be key_002 (highest version)
+		assert_eq!(results[0], "key_002");
+	}
+
+	#[test]
+	fn test_empty_range_returns_nothing() {
+		// Test that a range with no matching keys returns nothing
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value"), ("eee", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] - "ccc" doesn't exist
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"ccc".as_slice()),
+				Bound::Included(b"ccc".as_slice()),
+			)),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range for non-existent key should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_before_table() {
+		// Test range that is completely before all keys in table
+		let data = vec![("mmm", "value"), ("nnn", "value"), ("ooo", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"aaa".as_slice()),
+				Bound::Included(b"bbb".as_slice()),
+			)),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range before all keys should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_after_table() {
+		// Test range that is completely after all keys in table
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ccc", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"xxx".as_slice()),
+				Bound::Included(b"zzz".as_slice()),
+			)),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range after all keys should be empty");
+	}
+
+	#[test]
+	fn test_reverse_iteration_empty_range() {
+		// Test reverse iteration with empty range
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] doesn't exist
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range(
+				Bound::Included(b"ccc".as_slice()),
+				Bound::Included(b"ccc".as_slice()),
+			)),
+		);
+
+		let result = iter.next_back();
+		assert!(result.is_none(), "Empty range should return None on next_back()");
 	}
 }

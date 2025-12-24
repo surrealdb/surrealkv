@@ -667,8 +667,16 @@ mod tests {
 		]);
 
 		// Test inclusive range
-		let range_entries: Vec<_> =
-			memtable.range(user_range_to_internal_range("c"..="k"), false).collect::<Vec<_>>();
+		use std::ops::Bound;
+		let range_entries: Vec<_> = memtable
+			.range(
+				user_range_to_internal_range(
+					Bound::Included("c".as_bytes()),
+					Bound::Included("k".as_bytes()),
+				),
+				false,
+			)
+			.collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -680,8 +688,15 @@ mod tests {
 		assert_eq!(&user_keys[4], b"k");
 
 		// Test exclusive range
-		let range_entries: Vec<_> =
-			memtable.range(user_range_to_internal_range("c".."k"), false).collect::<Vec<_>>();
+		let range_entries: Vec<_> = memtable
+			.range(
+				user_range_to_internal_range(
+					Bound::Included("c".as_bytes()),
+					Bound::Excluded("k".as_bytes()),
+				),
+				false,
+			)
+			.collect::<Vec<_>>();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -704,8 +719,16 @@ mod tests {
 		]);
 
 		// Perform a range query from "a" to "f"
-		let range_entries: Vec<_> =
-			memtable.range(user_range_to_internal_range("a".."f"), false).collect::<Vec<_>>();
+		use std::ops::Bound;
+		let range_entries: Vec<_> = memtable
+			.range(
+				user_range_to_internal_range(
+					Bound::Included("a".as_bytes()),
+					Bound::Excluded("f".as_bytes()),
+				),
+				false,
+			)
+			.collect::<Vec<_>>();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();
