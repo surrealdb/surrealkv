@@ -676,7 +676,7 @@ mod tests {
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 300);
 		assert_eq!(returned_key.kind(), InternalKeyKind::Set);
 		// Verify the correct value is returned (should be value_v3)
@@ -833,7 +833,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "At non-bottom level, hard_delete should be returned");
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 200);
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
 		// Verify hard_delete has empty value
@@ -979,11 +979,11 @@ mod tests {
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 200);
 		// Verify the correct value is returned (should be value_v2)
 		assert_eq!(
-			returned_value.as_ref(),
+			returned_value.as_slice(),
 			b"value2",
 			"Should return the value corresponding to the latest version (seq=200)"
 		);
@@ -1202,19 +1202,16 @@ mod tests {
 		assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
 
 		// Verify we get all versions of key1 (all within retention)
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(key1_versions.len(), 3, "key1 should have 3 versions within retention");
 
 		// Verify we get all versions of key2 (all within retention)
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(key2_versions.len(), 3, "key2 should have 3 versions within retention");
 
 		// Verify we get only the recent version of key3 (very old versions outside
 		// retention)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			1,
@@ -1387,8 +1384,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "Expected 1 item: only key3 with recent SET");
 
 		// Verify key1: Entire key discarded (DELETE is latest at bottom level)
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			0,
@@ -1396,8 +1392,7 @@ mod tests {
 		);
 
 		// Verify key2: DELETE-only key should completely disappear
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			0,
@@ -1405,8 +1400,7 @@ mod tests {
 		);
 
 		// Verify key3: only recent version kept (very old versions outside retention)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			1,
@@ -1415,8 +1409,7 @@ mod tests {
 		assert_eq!(key3_versions[0].0.seq_num(), 700); // Recent SET only
 
 		// Verify key4: Entire key discarded (DELETE is latest at bottom level)
-		let key4_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key4").collect();
+		let key4_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key4").collect();
 		assert_eq!(
 			key4_versions.len(),
 			0,
@@ -1555,8 +1548,7 @@ mod tests {
 		assert_eq!(result.len(), 3, "Expected 3 items: latest version of each key");
 
 		// Verify key1: Only latest SET kept
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			1,
@@ -1565,8 +1557,7 @@ mod tests {
 		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
 
 		// Verify key2: Only latest DELETE kept
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			1,
@@ -1575,8 +1566,7 @@ mod tests {
 		assert_eq!(key2_versions[0].0.seq_num(), 600); // DELETE
 
 		// Verify key3: Only DELETE kept
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(key3_versions.len(), 1, "key3 should have only 1 version (DELETE)");
 		assert_eq!(key3_versions[0].0.seq_num(), 700); // DELETE
 
@@ -1699,8 +1689,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "Expected 1 item: only key1 with latest SET");
 
 		// Verify key1: Only latest SET kept
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			1,
@@ -1709,8 +1698,7 @@ mod tests {
 		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
 
 		// Verify key2: Entire key discarded (DELETE is latest at bottom level)
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			0,
@@ -1718,8 +1706,7 @@ mod tests {
 		);
 
 		// Verify key3: Entire key discarded (DELETE-only at bottom level)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			0,
@@ -2448,13 +2435,13 @@ mod tests {
 
 			// Check key_a
 			let (returned_key_a, _) = &result[0];
-			assert_eq!(returned_key_a.user_key.as_ref(), b"key_a");
+			assert_eq!(&returned_key_a.user_key, b"key_a");
 			assert_eq!(returned_key_a.seq_num(), 1200);
 			assert!(returned_key_a.is_replace());
 
 			// Check key_b
 			let (returned_key_b, _) = &result[1];
-			assert_eq!(returned_key_b.user_key.as_ref(), b"key_b");
+			assert_eq!(&returned_key_b.user_key, b"key_b");
 			assert_eq!(returned_key_b.seq_num(), 1300);
 			assert!(returned_key_b.is_replace());
 

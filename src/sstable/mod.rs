@@ -106,7 +106,7 @@ impl From<u8> for InternalKeyKind {
 
 /// InternalKey is the main key type used throughout the LSM tree
 /// It includes a timestamp field for versioned queries
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct InternalKey {
 	pub(crate) user_key: Key,
 	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
@@ -197,15 +197,5 @@ impl Ord for InternalKey {
 impl PartialOrd for InternalKey {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
-	}
-}
-
-impl Default for InternalKey {
-	fn default() -> Self {
-		Self {
-			user_key: Vec::new(),
-			timestamp: 0,
-			trailer: 0,
-		}
 	}
 }

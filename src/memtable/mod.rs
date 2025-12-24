@@ -288,25 +288,25 @@ mod tests {
 	fn memtable_get() {
 		let memtable = MemTable::new();
 		let key = b"foo".to_vec();
-		let value = b"value";
+		let value = b"value".to_vec();
 
 		let mut batch = Batch::new(1);
-		batch.set(&key, value, 0).unwrap();
+		batch.set(key.clone(), value.clone(), 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
-		assert_value(&res.1, value);
+		assert_value(&res.1, &value);
 	}
 
 	#[test]
 	fn memtable_size() {
 		let memtable = MemTable::new();
 		let key = b"foo".to_vec();
-		let value = b"value";
+		let value = b"value".to_vec();
 
 		let mut batch = Batch::new(1);
-		batch.set(&key, value, 0).unwrap();
+		batch.set(key.clone(), value.clone(), 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -317,11 +317,11 @@ mod tests {
 	fn memtable_lsn() {
 		let memtable = MemTable::new();
 		let key = b"foo".to_vec();
-		let value = b"value";
+		let value = b"value".to_vec();
 		let seq_num = 100;
 
 		let mut batch = Batch::new(seq_num);
-		batch.set(&key, value, 0).unwrap();
+		batch.set(key.clone(), value.clone(), 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -332,74 +332,74 @@ mod tests {
 	fn memtable_add_and_get() {
 		let memtable = MemTable::new();
 		let key1 = b"key1".to_vec();
-		let value1 = b"value1";
+		let value1 = b"value1".to_vec();
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(&key1, value1, 0).unwrap();
+		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
 
 		memtable.add(&batch1).unwrap();
 
 		let key2 = b"key2".to_vec();
-		let value2 = b"value2";
+		let value2 = b"value2".to_vec();
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(&key2, value2, 0).unwrap();
+		batch2.set(key2.clone(), value2.clone(), 0).unwrap();
 
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
-		assert_value(&res.1, value1);
+		assert_value(&res.1, &value1);
 
 		let res = memtable.get(b"key2", None).unwrap();
-		assert_value(&res.1, value2);
+		assert_value(&res.1, &value2);
 	}
 
 	#[test]
 	fn memtable_get_latest_seq_no() {
 		let memtable = MemTable::new();
 		let key1 = b"key1".to_vec();
-		let value1 = &b"value1"[..];
-		let value2 = &b"value2"[..];
-		let value3 = &b"value3"[..];
+		let value1 = b"value1".to_vec();
+		let value2 = b"value2".to_vec();
+		let value3 = b"value3".to_vec();
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(&key1, value1, 0).unwrap();
+		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(&key1, value2, 0).unwrap();
+		batch2.set(key1.clone(), value2.clone(), 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let mut batch3 = Batch::new(3);
-		batch3.set(&key1, value3, 0).unwrap();
+		batch3.set(key1.clone(), value3.clone(), 0).unwrap();
 		memtable.add(&batch3).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
-		assert_value(&res.1, value3);
+		assert_value(&res.1, &value3);
 	}
 
 	#[test]
 	fn memtable_prefix() {
 		let memtable = MemTable::new();
 		let key1 = b"foo".to_vec();
-		let value1 = &b"value1"[..];
+		let value1 = b"value1".to_vec();
 
 		let key2 = b"foo1".to_vec();
-		let value2 = &b"value2"[..];
+		let value2 = b"value2".to_vec();
 
 		let mut batch1 = Batch::new(0);
-		batch1.set(&key1, value1, 0).unwrap();
+		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(1);
-		batch2.set(&key2, value2, 0).unwrap();
+		batch2.set(key2.clone(), value2.clone(), 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
-		assert_value(&res.1, value1);
+		assert_value(&res.1, &value1);
 
 		let res = memtable.get(b"foo1", None).unwrap();
-		assert_value(&res.1, value2);
+		assert_value(&res.1, &value2);
 	}
 
 	type TestEntry = (Vec<u8>, Vec<u8>, InternalKeyKind, Option<u64>);
@@ -423,14 +423,14 @@ mod tests {
 			let mut batch = Batch::new(seq_num);
 			match kind {
 				InternalKeyKind::Set => {
-					batch.set(&key, &value, 0).unwrap();
+					batch.set(key.clone(), value.clone(), 0).unwrap();
 				}
 				InternalKeyKind::Delete => {
-					batch.delete(&key, 0).unwrap();
+					batch.delete(key.clone(), 0).unwrap();
 				}
 				_ => {
 					// For other kinds, use add_record directly
-					batch.add_record(kind, &key, Some(&value), 0).unwrap();
+					batch.add_record(kind, key.clone(), Some(value.clone()), 0).unwrap();
 				}
 			}
 
@@ -474,15 +474,15 @@ mod tests {
 
 		let (key, encoded_value) = &entries[0];
 		let user_key = &key.user_key;
-		assert_eq!(user_key.as_ref(), b"key1");
+		assert_eq!(user_key, b"key1");
 
-		assert_value(encoded_value, b"value1");
+		assert_value(&encoded_value, &b"value1"[..]);
 
 		// Test get method
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
-		assert_eq!(ikey.user_key.as_ref(), b"key1");
+		assert_eq!(&ikey.user_key, b"key1");
 
 		assert_value(&encoded_val, b"value1");
 	}
@@ -503,9 +503,9 @@ mod tests {
 		let user_keys: Vec<_> = entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		// Keys should be in lexicographic order
-		assert_eq!(user_keys[0].as_ref(), b"key1");
-		assert_eq!(user_keys[1].as_ref(), b"key3");
-		assert_eq!(user_keys[2].as_ref(), b"key5");
+		assert_eq!(&user_keys[0], b"key1");
+		assert_eq!(&user_keys[1], b"key3");
+		assert_eq!(&user_keys[2], b"key5");
 
 		// Test individual gets
 		assert!(memtable.get(b"key1", None).is_some());
@@ -532,7 +532,7 @@ mod tests {
 		let mut key1_entries = Vec::new();
 		for (key, encoded_value) in &entries {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
-			if user_key.as_ref() == b"key1" {
+			if &user_key == b"key1" {
 				key1_entries.push((seq_num, encoded_value));
 			}
 		}
@@ -540,18 +540,18 @@ mod tests {
 		// Verify ordering - higher sequence numbers should come first
 		assert_eq!(key1_entries.len(), 3);
 		assert_eq!(key1_entries[0].0, 20);
-		assert_eq!(key1_entries[0].1.as_ref(), b"value2");
+		assert_eq!(key1_entries[0].1, b"value2");
 		assert_eq!(key1_entries[1].0, 10);
-		assert_eq!(key1_entries[1].1.as_ref(), b"value1");
+		assert_eq!(key1_entries[1].1, b"value1");
 		assert_eq!(key1_entries[2].0, 5);
-		assert_eq!(key1_entries[2].1.as_ref(), b"value3");
+		assert_eq!(key1_entries[2].1, b"value3");
 
 		// Test get method - should return the highest sequence number
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
 		assert_eq!(ikey.seq_num(), 20);
-		assert_eq!(encoded_val.as_ref(), b"value2");
+		assert_eq!(&encoded_val, b"value2");
 	}
 
 	#[test]
@@ -624,19 +624,19 @@ mod tests {
 		}
 
 		// Verify all keys are present with correct kinds
-		assert_eq!(key_info[0].0.as_ref(), b"key1");
+		assert_eq!(&key_info[0].0, b"key1");
 		assert_eq!(key_info[0].2, InternalKeyKind::Set);
 		assert!(key_info[0].3 > 0); // Has value
 
-		assert_eq!(key_info[1].0.as_ref(), b"key2");
+		assert_eq!(&key_info[1].0, b"key2");
 		assert_eq!(key_info[1].2, InternalKeyKind::Delete);
 		assert_eq!(key_info[1].3, 0); // No value for delete
 
-		assert_eq!(key_info[2].0.as_ref(), b"key3");
+		assert_eq!(&key_info[2].0, b"key3");
 		assert_eq!(key_info[2].2, InternalKeyKind::Set);
 		assert!(key_info[2].3 > 0); // Has value
 
-		assert_eq!(key_info[3].0.as_ref(), b"key4");
+		assert_eq!(&key_info[3].0, b"key4");
 		assert_eq!(key_info[3].2, InternalKeyKind::Delete);
 		assert_eq!(key_info[3].3, 0); // No value for delete
 
@@ -673,11 +673,11 @@ mod tests {
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		assert_eq!(user_keys.len(), 5);
-		assert_eq!(user_keys[0].as_ref(), b"c");
-		assert_eq!(user_keys[1].as_ref(), b"e");
-		assert_eq!(user_keys[2].as_ref(), b"g");
-		assert_eq!(user_keys[3].as_ref(), b"i");
-		assert_eq!(user_keys[4].as_ref(), b"k");
+		assert_eq!(&user_keys[0], b"c");
+		assert_eq!(&user_keys[1], b"e");
+		assert_eq!(&user_keys[2], b"g");
+		assert_eq!(&user_keys[3], b"i");
+		assert_eq!(&user_keys[4], b"k");
 
 		// Test exclusive range
 		let range_entries: Vec<_> =
@@ -686,10 +686,10 @@ mod tests {
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		assert_eq!(user_keys.len(), 4); // Excludes "k"
-		assert_eq!(user_keys[0].as_ref(), b"c");
-		assert_eq!(user_keys[1].as_ref(), b"e");
-		assert_eq!(user_keys[2].as_ref(), b"g");
-		assert_eq!(user_keys[3].as_ref(), b"i");
+		assert_eq!(&user_keys[0], b"c");
+		assert_eq!(&user_keys[1], b"e");
+		assert_eq!(&user_keys[2], b"g");
+		assert_eq!(&user_keys[3], b"i");
 	}
 
 	#[test]
@@ -718,27 +718,27 @@ mod tests {
 		assert_eq!(entries_info.len(), 5);
 
 		// Key "a" entries (seq 20 then seq 10)
-		assert_eq!(entries_info[0].0.as_ref(), b"a");
+		assert_eq!(&entries_info[0].0, b"a");
 		assert_eq!(entries_info[0].1, 20);
-		assert_eq!(entries_info[0].2.as_ref(), b"value-a2");
+		assert_eq!(entries_info[0].2, b"value-a2");
 
-		assert_eq!(entries_info[1].0.as_ref(), b"a");
+		assert_eq!(entries_info[1].0, b"a");
 		assert_eq!(entries_info[1].1, 10);
-		assert_eq!(entries_info[1].2.as_ref(), b"value-a1");
+		assert_eq!(entries_info[1].2, b"value-a1");
 
 		// Key "c" entry
-		assert_eq!(entries_info[2].0.as_ref(), b"c");
+		assert_eq!(entries_info[2].0, b"c");
 		assert_eq!(entries_info[2].1, 15);
-		assert_eq!(entries_info[2].2.as_ref(), b"value-c1");
+		assert_eq!(entries_info[2].2, b"value-c1");
 
 		// Key "e" entries (seq 25 then seq 15)
-		assert_eq!(entries_info[3].0.as_ref(), b"e");
+		assert_eq!(entries_info[3].0, b"e");
 		assert_eq!(entries_info[3].1, 25);
-		assert_eq!(entries_info[3].2.as_ref(), b"value-e1");
+		assert_eq!(entries_info[3].2, b"value-e1");
 
-		assert_eq!(entries_info[4].0.as_ref(), b"e");
+		assert_eq!(entries_info[4].0, b"e");
 		assert_eq!(entries_info[4].1, 15);
-		assert_eq!(entries_info[4].2.as_ref(), b"value-e2");
+		assert_eq!(entries_info[4].2, b"value-e2");
 	}
 
 	#[test]
@@ -809,8 +809,8 @@ mod tests {
 
 		// Add some data
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1", 0).unwrap();
-		batch.set(b"key2", b"value2", 0).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
 
 		let (record_size, total_size) = memtable.add(&batch).unwrap();
 		assert!(record_size > 0);
@@ -819,7 +819,7 @@ mod tests {
 
 		// Add more data
 		let mut batch2 = Batch::new(2);
-		batch2.set(b"key3", b"value3", 0).unwrap();
+		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
 
 		let (record_size2, total_size2) = memtable.add(&batch2).unwrap();
 		assert!(record_size2 > 0);
@@ -836,19 +836,19 @@ mod tests {
 
 		// Add batch with seq_num 10
 		let mut batch1 = Batch::new(10);
-		batch1.set(b"key1", b"value1", 0).unwrap();
+		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 		memtable.add(&batch1).unwrap();
 		assert_eq!(memtable.lsn(), 10);
 
 		// Add batch with lower seq_num - should not update
 		let mut batch2 = Batch::new(5);
-		batch2.set(b"key2", b"value2", 0).unwrap();
+		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
 		memtable.add(&batch2).unwrap();
 		assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 		// Add batch with higher seq_num
 		let mut batch3 = Batch::new(20);
-		batch3.set(b"key3", b"value3", 0).unwrap();
+		batch3.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
 		memtable.add(&batch3).unwrap();
 		assert_eq!(memtable.lsn(), 20);
 	}
@@ -857,11 +857,11 @@ mod tests {
 	fn test_get_highest_seq_num() {
 		// Add a batch with 5 entries
 		let mut batch = Batch::new(10);
-		batch.set(b"key1", b"value1", 0).unwrap();
-		batch.set(b"key2", b"value2", 0).unwrap();
-		batch.set(b"key3", b"value3", 0).unwrap();
-		batch.set(b"key4", b"value4", 0).unwrap();
-		batch.set(b"key5", b"value5", 0).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		batch.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
+		batch.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap();
+		batch.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap();
 
 		assert_eq!(batch.get_highest_seq_num(), 14);
 	}

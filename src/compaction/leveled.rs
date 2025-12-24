@@ -343,7 +343,7 @@ mod tests {
 	use crate::sstable::table::{Table, TableFormat, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::vlog::ValueLocation;
-	use crate::{CompressionType, Options as LSMOptions};
+	use crate::{CompressionType, Key, Options as LSMOptions, Value};
 
 	/// Test environment setup helpers
 	struct TestEnv {
@@ -531,8 +531,8 @@ mod tests {
 	/// Verifies all expected key-value pairs are present after compaction
 	fn verify_keys_after_compaction(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashSet<(Bytes, Vec<u8>)>,
-	) -> (usize, HashMap<Bytes, Vec<u8>>) {
+		expected_keys: &HashSet<(Key, Value)>,
+	) -> (usize, HashMap<Key, Value>) {
 		let manifest_guard = manifest.read().unwrap();
 		let levels = manifest_guard.levels.get_levels();
 
@@ -570,7 +570,7 @@ mod tests {
 	/// Verifies that all expected keys are present with correct values
 	fn verify_all_keys_present(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashMap<Bytes, Vec<u8>>,
+		expected_keys: &HashMap<Key, Value>,
 	) -> bool {
 		let manifest_guard = manifest.read().unwrap();
 
@@ -1181,9 +1181,9 @@ mod tests {
 
 					for (key, _) in table.iter(false, None) {
 						if min_key.is_none() {
-							min_key = Some(key.user_key.as_ref().to_vec());
+							min_key = Some(key.user_key.clone());
 						}
-						max_key = Some(key.user_key.as_ref().to_vec());
+						max_key = Some(key.user_key);
 					}
 
 					if let (Some(min), Some(max)) = (min_key, max_key) {
@@ -1754,11 +1754,10 @@ mod tests {
 							if location.is_value_pointer() {
 								panic!("Unexpected VLog pointer in test");
 							}
-							all_keys
-								.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
+							all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
 						}
 						InternalKeyKind::Delete => {
-							tombstones.insert(key.user_key.as_ref().to_vec(), key.seq_num());
+							tombstones.insert(key.user_key.clone(), key.seq_num());
 						}
 						_ => {}
 					}
@@ -1880,8 +1879,7 @@ mod tests {
 						if location.is_value_pointer() {
 							panic!("Unexpected VLog pointer in test");
 						}
-						survivors
-							.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
+						survivors.insert(key.user_key.clone(), (*location.value).to_vec());
 					}
 				}
 			}
@@ -2081,8 +2079,7 @@ mod tests {
 		assert!(!has_tombstones, "Bottom level should filter out tombstones");
 
 		// Key should be completely gone after tombstone consumes older value
-		let has_test_key =
-			bottom_result.iter().any(|(key, _)| key.user_key.as_ref() == b"test-key");
+		let has_test_key = bottom_result.iter().any(|(key, _)| &key.user_key == b"test-key");
 		assert!(!has_test_key, "test-key should be completely deleted");
 		assert_eq!(
 			bottom_result.len(),
@@ -2112,7 +2109,7 @@ mod tests {
 				_ => unreachable!(),
 			};
 
-			let internal_key = InternalKey::new(Vec::from(key), seq, kind, 0);
+			let internal_key = InternalKey::new(key, seq, kind, 0);
 
 			let entry_value = match kind {
 				InternalKeyKind::Delete | InternalKeyKind::RangeDelete => vec![],
@@ -2160,11 +2157,11 @@ mod tests {
 		assert!(meta.smallest_point.is_some());
 		assert!(meta.largest_point.is_some());
 		if let Some(ref smallest) = meta.smallest_point {
-			assert_eq!(smallest.user_key.as_ref(), b"key-000");
+			assert_eq!(&smallest.user_key, b"key-000");
 			assert_eq!(smallest.seq_num(), 1000);
 		}
 		if let Some(ref largest) = meta.largest_point {
-			assert_eq!(largest.user_key.as_ref(), b"key-099");
+			assert_eq!(&largest.user_key, b"key-099");
 			assert_eq!(largest.seq_num(), 1099);
 		}
 

@@ -359,7 +359,7 @@ impl<W: Write> TableWriter<W> {
 		if let Some(fblock) = self.filter_block.take() {
 			let filter_key = format!("filter.{}", fblock.filter_name());
 
-			let fblock_data = Vec::from(fblock.finish());
+			let fblock_data = fblock.finish();
 
 			// Only write if we have actual filter data
 			if !fblock_data.is_empty() {
@@ -467,10 +467,10 @@ impl<W: Write> TableWriter<W> {
 			});
 		} else if let Some(ref mut range) = props.key_range {
 			if self.opts.comparator.compare(user_key, &range.low) == Ordering::Less {
-				range.low = user_key.clone();
+				range.low.clone_from(user_key);
 			}
 			if self.opts.comparator.compare(user_key, &range.high) == Ordering::Greater {
-				range.high = user_key.clone();
+				range.high.clone_from(user_key);
 			}
 		}
 	}
@@ -507,7 +507,7 @@ pub(crate) fn compress_block(
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
 			}
-			Ok(Vec::from(buffer))
+			Ok(buffer)
 		}
 		CompressionType::None => Ok(raw_block),
 	}
@@ -572,8 +572,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 		let k = metaindexiter.key();
 		// Verify exact match to avoid using wrong entry
 		assert_eq!(k.user_key.as_slice(), b"meta");
-		let val = metaindexiter.value().to_vec();
-		let buf_bytes = Vec::from(val);
+		let buf_bytes = metaindexiter.value();
 		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
 	}
 	Ok(None)
@@ -606,7 +605,7 @@ pub(crate) fn read_table_block(
 
 	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
 
-	Ok(Block::new(Vec::from(block), comparator))
+	Ok(Block::new(block, comparator))
 }
 
 /// Verify checksum of block
@@ -2987,8 +2986,8 @@ mod tests {
 				"Key mismatch at position {i} between next() and advance()"
 			);
 			assert_eq!(
-				next_val.as_ref(),
-				adv_val.as_ref(),
+				next_val.as_slice(),
+				adv_val.as_slice(),
 				"Value mismatch at position {i} between next() and advance()"
 			);
 		}
@@ -3170,21 +3169,21 @@ mod tests {
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(found_value.as_ref(), b"value_100");
+		assert_eq!(&found_value, b"value_100");
 
 		let lookup_key_between = InternalKey::new(Vec::from(user_key), 75, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_key_between).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(found_value.as_ref(), b"value_50");
+		assert_eq!(&found_value, b"value_50");
 
 		let lookup_key_exact = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_key_exact).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(found_value.as_ref(), b"value_100");
+		assert_eq!(&found_value, b"value_100");
 
 		let different_user_key = b"other_key";
 		let lookup_key_different =
@@ -3281,14 +3280,14 @@ mod tests {
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), b"key_a");
-		assert_eq!(found_value.as_ref(), b"value_a_100");
+		assert_eq!(&found_value, b"value_a_100");
 
 		let lookup_c_exact = InternalKey::new(Vec::from(b"key_c"), 75, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_c_exact).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), b"key_c");
-		assert_eq!(found_value.as_ref(), b"value_c_75");
+		assert_eq!(&found_value, b"value_c_75");
 
 		let lookup_key_b5 = InternalKey::new(Vec::from(b"key_b5"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_key_b5).unwrap();
@@ -3329,7 +3328,7 @@ mod tests {
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(found_value.as_ref(), b"value_100");
+		assert_eq!(&found_value, b"value_100");
 
 		let lookup_one = InternalKey::new(Vec::from(user_key), 1, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_one).unwrap();
@@ -3370,7 +3369,7 @@ mod tests {
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
 		assert_eq!(found_key.seq_num(), 25);
-		assert_eq!(found_value.as_ref(), b"value_25");
+		assert_eq!(&found_value, b"value_25");
 	}
 
 	#[test]
@@ -3411,7 +3410,7 @@ mod tests {
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), target_key);
 		assert_eq!(found_key.seq_num(), 500);
-		assert_eq!(found_value.as_ref(), b"value_500");
+		assert_eq!(&found_value, b"value_500");
 
 		let lookup_exact = InternalKey::new(Vec::from(target_key), 500, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_exact).unwrap();
@@ -3419,7 +3418,7 @@ mod tests {
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), target_key);
 		assert_eq!(found_key.seq_num(), 500);
-		assert_eq!(found_value.as_ref(), b"value_500");
+		assert_eq!(&found_value, b"value_500");
 
 		let lookup_low = InternalKey::new(Vec::from(target_key), 100, InternalKeyKind::Set, 0);
 		let result = table.get(lookup_low).unwrap();

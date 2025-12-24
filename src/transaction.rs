@@ -127,7 +127,7 @@ impl ReadOptions {
 
 	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
 		if let Some(bound) = bound {
-			self.iterate_bounds.low = bound.into();
+			self.iterate_bounds.low = bound;
 		} else {
 			self.iterate_bounds.low = UNBOUNDED_LOW.to_vec();
 		}
@@ -136,7 +136,7 @@ impl ReadOptions {
 	/// Sets the upper bound for iteration (exclusive)
 	pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
 		if let Some(bound) = bound {
-			self.iterate_bounds.high = bound.into();
+			self.iterate_bounds.high = bound;
 		} else {
 			self.iterate_bounds.high = UNBOUNDED_HIGH.to_vec();
 		}
@@ -657,11 +657,9 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.keys_at_version(start_key, end_key, timestamp)?
-						.map(|vec| Ok(Vec::from(vec))),
-				)),
+				Some(snapshot) => {
+					Ok(Box::new(snapshot.keys_at_version(start_key, end_key, timestamp)?.map(Ok)))
+				}
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
@@ -747,11 +745,9 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.range_at_version(start_key, end_key, timestamp)?
-						.map(|result| result.map(|(k, v)| (k.into(), v))),
-				)),
+				Some(snapshot) => {
+					Ok(Box::new(snapshot.range_at_version(start_key, end_key, timestamp)?))
+				}
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
@@ -1315,7 +1311,7 @@ mod tests {
 			// Start a read-only transaction (txn3)
 			let txn3 = store.begin().unwrap();
 			let val = txn3.get(&key1).unwrap().unwrap();
-			assert_eq!(val.as_ref(), value1.as_ref());
+			assert_eq!(&val, &value1);
 		}
 
 		{
@@ -1331,7 +1327,7 @@ mod tests {
 		let val = txn4.get(&key1).unwrap().unwrap();
 
 		// Assert that the value retrieved in txn4 matches value2
-		assert_eq!(val.as_ref(), value2.as_ref());
+		assert_eq!(&val, &value2);
 	}
 
 	#[test(tokio::test)]
@@ -1427,10 +1423,10 @@ mod tests {
 			// Start a new read-write transaction (txn)
 			let mut txn = store.begin().unwrap();
 			txn.set(&key1, &value2).unwrap();
-			assert_eq!(txn.get(&key1).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn.get(&key1).unwrap().unwrap(), &value2);
 			assert!(txn.get(&key3).unwrap().is_none());
 			txn.set(&key2, &value1).unwrap();
-			assert_eq!(txn.get(&key2).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn.get(&key2).unwrap().unwrap(), &value1);
 			txn.commit().await.unwrap();
 		}
 	}
@@ -1494,9 +1490,9 @@ mod tests {
 		{
 			let txn3 = store.begin().unwrap();
 			let val1 = txn3.get(&key1).unwrap().unwrap();
-			assert_eq!(val1.as_ref(), value3.as_ref());
+			assert_eq!(&val1, &value3);
 			let val2 = txn3.get(&key2).unwrap().unwrap();
-			assert_eq!(val2.as_ref(), value5.as_ref());
+			assert_eq!(&val2, &value5);
 		}
 	}
 
@@ -1544,15 +1540,15 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
 
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn2.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+			assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+			assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2);
 			txn2.set(&key1, &value3).unwrap();
 			txn2.set(&key2, &value4).unwrap();
 
 			txn2.commit().await.unwrap();
 
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
 			txn1.commit().await.unwrap();
 		}
 	}
@@ -1817,7 +1813,7 @@ mod tests {
 			let val = txn3.get(&key1).unwrap();
 			assert!(val.is_none());
 			let val = txn3.get(&key2).unwrap().unwrap();
-			assert_eq!(val.as_ref(), value.as_ref());
+			assert_eq!(&val, &value);
 		}
 
 		// Start a read-only transaction (txn4)
@@ -1825,7 +1821,7 @@ mod tests {
 		let val = txn4.get(&key1).unwrap();
 		assert!(val.is_none());
 		let val = txn4.get(&key2).unwrap().unwrap();
-		assert_eq!(val.as_ref(), value.as_ref());
+		assert_eq!(&val, &value);
 	}
 
 	#[test(tokio::test)]
@@ -1886,10 +1882,10 @@ mod tests {
 				tx.range(b"key2", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
-			assert_eq!(range[0].0.as_ref(), b"key2");
-			assert_eq!(range[0].1.as_ref(), b"value2");
-			assert_eq!(range[1].0.as_ref(), b"key3");
-			assert_eq!(range[1].1.as_ref(), b"value3");
+			assert_eq!(&range[0].0, b"key2");
+			assert_eq!(&range[0].1, b"value2");
+			assert_eq!(&range[1].0, b"key3");
+			assert_eq!(&range[1].1, b"value3");
 		}
 	}
 
@@ -1915,9 +1911,9 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(beg, b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key2");
-			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key2");
+			assert_eq!(&range[2].0, b"key3");
 		}
 
 		// Test range with both bounds as empty
@@ -1956,9 +1952,9 @@ mod tests {
 				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key01");
-			assert_eq!(range[1].0.as_ref(), b"key02");
-			assert_eq!(range[2].0.as_ref(), b"key03");
+			assert_eq!(&range[0].0, b"key01");
+			assert_eq!(&range[1].0, b"key02");
+			assert_eq!(&range[2].0, b"key03");
 		}
 	}
 
@@ -2027,9 +2023,9 @@ mod tests {
 				tx.range(b"key1", b"key6").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key3");
-			assert_eq!(range[2].0.as_ref(), b"key5");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key3");
+			assert_eq!(&range[2].0, b"key5");
 		}
 	}
 
@@ -2109,7 +2105,7 @@ mod tests {
 			assert_eq!(range.len(), 5);
 			for (i, item) in range.iter().enumerate().take(5) {
 				let expected_key = format!("key{}", i + 1);
-				assert_eq!(item.0.as_ref(), expected_key.as_bytes());
+				assert_eq!(&item.0, expected_key.as_bytes());
 			}
 		}
 	}
@@ -2136,8 +2132,8 @@ mod tests {
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[2].0, b"key3");
 		}
 
 		// Test single key range ([key2, key3) to include only key2)
@@ -2147,7 +2143,7 @@ mod tests {
 				tx.range(b"key2", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(&range[0].0, b"key2");
 		}
 	}
 
@@ -2171,7 +2167,7 @@ mod tests {
 				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].1.as_ref(), b"value3"); // Latest value
+			assert_eq!(&range[0].1, b"value3"); // Latest value
 		}
 	}
 
@@ -2207,7 +2203,7 @@ mod tests {
 			// Check the keys are in order
 			for (i, key) in keys_only.iter().enumerate().take(6) {
 				let expected_key = format!("key{}", i + 1);
-				assert_eq!(key.as_ref(), expected_key.as_bytes());
+				assert_eq!(key.as_slice(), expected_key.as_bytes());
 			}
 
 			// Compare with regular range
@@ -2224,14 +2220,14 @@ mod tests {
 				if i < 5 {
 					// For keys from storage, check regular values are correct
 					assert_eq!(
-						regular_range[i].1.as_ref(),
+						regular_range[i].1.as_slice(),
 						format!("value{}", i + 1).as_bytes(),
 						"Regular range should have correct values from storage"
 					);
 				} else {
 					// For the key from write set
 					assert_eq!(
-						regular_range[i].1.as_ref(),
+						regular_range[i].1.as_slice(),
 						b"value6",
 						"Regular range should have correct value from write set"
 					);
@@ -2297,17 +2293,17 @@ mod tests {
 			let retrieved3 = txn.get(key3).unwrap().unwrap();
 
 			assert_eq!(
-				retrieved1.as_ref(),
+				retrieved1.as_slice(),
 				large_value1.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
 			assert_eq!(
-				retrieved2.as_ref(),
+				retrieved2.as_slice(),
 				large_value2.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
 			assert_eq!(
-				retrieved3.as_ref(),
+				retrieved3.as_slice(),
 				large_value3.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
@@ -2337,11 +2333,11 @@ mod tests {
 					_ => panic!("Unexpected index"),
 				};
 
-				assert_eq!(returned_key.as_ref(), expected_key, "Key mismatch in range result");
+				assert_eq!(returned_key.as_slice(), expected_key, "Key mismatch in range result");
 
 				// The returned value should be the actual value, not a value pointer
 				assert_eq!(
-					returned_value.as_ref(),
+					returned_value.as_slice(),
 					expected_value.as_bytes(),
 					"Range should return resolved values, not value pointers. \
                      Expected actual value of {} bytes, but got a different value",
@@ -2767,21 +2763,21 @@ mod tests {
 			txn1.set(&key3, &value3).unwrap();
 
 			// Just a sanity check that all three keys are present.
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
-			assert_eq!(txn1.get(&key3).unwrap().unwrap().as_ref(), value3.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
+			assert_eq!(&txn1.get(&key3).unwrap().unwrap(), &value3);
 
 			// Rollback to the latest (second) savepoint. This should make key3
 			// go away while keeping key1 and key2.
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
 			assert!(txn1.get(&key3).unwrap().is_none());
 
 			// Now roll back to the first savepoint. This should only
 			// keep key1 around.
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
 			assert!(txn1.get(&key2).unwrap().is_none());
 			assert!(txn1.get(&key3).unwrap().is_none());
 
@@ -2797,7 +2793,7 @@ mod tests {
 
 			// Start another transaction and check again for the keys.
 			let txn2 = store.begin().unwrap();
-			assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn2.get(&key1).unwrap().unwrap(), &value1);
 			assert!(txn2.get(&key2).unwrap().is_none());
 			assert!(txn2.get(&key3).unwrap().is_none());
 		}
@@ -2819,7 +2815,7 @@ mod tests {
 			txn1.rollback_to_savepoint().unwrap();
 
 			// The read value should be the one before the savepoint.
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value2);
 		}
 
 		#[test(tokio::test)]
@@ -2840,8 +2836,8 @@ mod tests {
 			let range: Vec<_> =
 				txn1.range(b"k1", b"k3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].0.as_ref(), k1.as_ref());
-			assert_eq!(range[0].1.as_ref(), value.as_ref());
+			assert_eq!(&range[0].0, &k1);
+			assert_eq!(&range[0].1, &value);
 		}
 
 		#[test(tokio::test)]
@@ -2864,14 +2860,14 @@ mod tests {
 
 			// Verify the changes
 			assert!(txn1.get(&k1).unwrap().is_none());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), b"modified");
+			assert_eq!(txn1.get(&k2).unwrap().unwrap(), b"modified");
 
 			// Rollback to savepoint
 			txn1.rollback_to_savepoint().unwrap();
 
 			// Verify original values are restored
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
 		}
 
 		#[test(tokio::test)]
@@ -2898,13 +2894,13 @@ mod tests {
 
 			// Rollback to second savepoint (should remove k3)
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
 			assert!(txn1.get(&k3).unwrap().is_none());
 
 			// Rollback to first savepoint (should remove k2)
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
 			assert!(txn1.get(&k2).unwrap().is_none());
 			assert!(txn1.get(&k3).unwrap().is_none());
 
@@ -2932,9 +2928,9 @@ mod tests {
 		// Verify data is visible
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
-			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
+			assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
 		// Soft delete key2
@@ -2947,9 +2943,9 @@ mod tests {
 		// Verify soft deleted key is not visible in reads
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
 			assert!(tx.get(b"key2").unwrap().is_none()); // Should be None after soft delete
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
 		// Verify soft deleted key is not visible in range scans ([key1, key4) to
@@ -2959,8 +2955,8 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key3");
 		}
 	}
 
@@ -2990,7 +2986,7 @@ mod tests {
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
 			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
 		// Both should be invisible to range scans ([key1, key4) to include key3)
@@ -2999,7 +2995,7 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key3
-			assert_eq!(range[0].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key3");
 		}
 	}
 
@@ -3031,7 +3027,7 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key1", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key2
-			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(&range[0].0, b"key2");
 
 			tx.commit().await.unwrap();
 		}
@@ -3040,7 +3036,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none());
-			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+			assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
 		}
 	}
 
@@ -3078,7 +3074,7 @@ mod tests {
 		// Verify the new value is visible
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1_new");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1_new");
 		}
 	}
 
@@ -3118,7 +3114,7 @@ mod tests {
 
 			// Verify specific keys are present/absent
 			let keys: std::collections::HashSet<_> =
-				range.iter().map(|(k, _)| k.as_ref()).collect();
+				range.iter().map(|(k, _)| k.as_slice()).collect();
 			assert!(keys.contains(&b"key01".as_ref()));
 			assert!(!keys.contains(&b"key02".as_ref())); // Soft deleted
 			assert!(keys.contains(&b"key03".as_ref()));
@@ -3161,8 +3157,8 @@ mod tests {
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
 			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3_updated"); // Updated
-			assert_eq!(tx.get(b"key4").unwrap().unwrap().as_ref(), b"value4"); // Unchanged
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3_updated"); // Updated
+			assert_eq!(tx.get(b"key4").unwrap().unwrap(), b"value4"); // Unchanged
 		}
 
 		// Range scan should only see updated and unchanged keys ([key1, key5) to
@@ -3172,8 +3168,8 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key1", b"key5").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key3 and key4
-			assert_eq!(range[0].0.as_ref(), b"key3");
-			assert_eq!(range[1].0.as_ref(), b"key4");
+			assert_eq!(&range[0].0, b"key3");
+			assert_eq!(&range[1].0, b"key4");
 		}
 	}
 
@@ -3203,7 +3199,7 @@ mod tests {
 		// After rollback, key should be visible again
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
 		}
 	}
 
@@ -3241,8 +3237,8 @@ mod tests {
 		let v2 = versions.iter().find(|(_, _, timestamp, _)| *timestamp == ts2).unwrap();
 
 		// Verify values match timestamps
-		assert_eq!(v1.1.as_ref(), b"value1_v1");
-		assert_eq!(v2.1.as_ref(), b"value1_v2");
+		assert_eq!(&v1.1, b"value1_v1");
+		assert_eq!(&v2.1, b"value1_v2");
 
 		// Test get at specific timestamp (earlier version)
 		let value_at_ts1 = tx.get_at_version(b"key1", ts1).unwrap();
@@ -3291,8 +3287,8 @@ mod tests {
 		let val1 = &all_versions[0];
 		let val2 = &all_versions[1];
 		assert!(val1.2 < val2.2);
-		assert_eq!(val1.1.as_ref(), b"value1");
-		assert_eq!(val2.1.as_ref(), b"value2");
+		assert_eq!(&val1.1, b"value1");
+		assert_eq!(&val2.1, b"value2");
 
 		// Test range_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
@@ -3301,7 +3297,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
-		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
+		assert_eq!(&version_at_ts1[0].1, b"value1");
 
 		let version_at_ts2 = tx
 			.range_at_version(b"key1", b"key2", ts2)
@@ -3309,7 +3305,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
-		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
+		assert_eq!(&version_at_ts2[0].1, b"value2");
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
@@ -3352,7 +3348,7 @@ mod tests {
 		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0].2, custom_timestamp); // Check the timestamp
-		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
+		assert_eq!(&versions[0].1, b"value1"); // Check the value
 	}
 
 	#[test(tokio::test)]
@@ -3505,19 +3501,19 @@ mod tests {
 		let keys_at_ts1: Vec<_> =
 			tx.keys_at_version(b"key1", b"key5", ts1).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts1.len(), 3);
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key3"));
-		assert!(!keys_at_ts1.iter().any(|k| k.as_ref() == b"key4")); // key4 didn't exist at ts1
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key3"));
+		assert!(!keys_at_ts1.iter().any(|k| k.as_slice() == b"key4")); // key4 didn't exist at ts1
 
 		// Test keys_at_version at second timestamp
 		let keys_at_ts2: Vec<_> =
 			tx.keys_at_version(b"key1", b"key5", ts2).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts2.len(), 4);
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key3"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key4"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key3"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key4"));
 
 		// Test with .take()
 		let keys_limited: Vec<_> = tx
@@ -3532,8 +3528,8 @@ mod tests {
 		let keys_range: Vec<_> =
 			tx.keys_at_version(b"key2", b"key4", ts2).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_range.len(), 2);
-		assert!(keys_range.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_range.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(keys_range.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_range.iter().any(|k| k.as_slice() == b"key3"));
 	}
 
 	#[test(tokio::test)]
@@ -3562,9 +3558,9 @@ mod tests {
 		let keys: Vec<_> =
 			tx.keys_at_version(b"key1", b"key4", u64::MAX).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
-		assert!(keys.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(!keys.iter().any(|k| k.as_ref() == b"key2")); // Hard deleted
-		assert!(!keys.iter().any(|k| k.as_ref() == b"key3")); // Soft deleted
+		assert!(keys.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(!keys.iter().any(|k| k.as_slice() == b"key2")); // Hard deleted
+		assert!(!keys.iter().any(|k| k.as_slice() == b"key3")); // Soft deleted
 	}
 
 	#[test(tokio::test)]
@@ -3604,10 +3600,10 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts1 {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
+				b"key2" => assert_eq!(value.as_slice(), b"value2"),
+				b"key3" => assert_eq!(value.as_slice(), b"value3"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3627,11 +3623,11 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts2 {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
-				b"key4" => assert_eq!(value.as_ref(), b"value4"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
+				b"key2" => assert_eq!(value.as_slice(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_slice(), b"value3"),
+				b"key4" => assert_eq!(value.as_slice(), b"value4"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3714,8 +3710,8 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_result {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -4085,7 +4081,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4093,7 +4089,7 @@ mod tests {
 			assert_eq!(results.len(), values.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &key);
-				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(v, &values[i]);
 				assert_eq!(*version, (i + 1) as u64);
 				assert!(!(*is_deleted));
 			}
@@ -4115,7 +4111,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4123,7 +4119,7 @@ mod tests {
 			assert_eq!(results.len(), values.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &key);
-				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(v, &values[i]);
 				assert_eq!(*version, (i + 1) as u64);
 				assert!(!(*is_deleted));
 			}
@@ -4142,7 +4138,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4150,7 +4146,7 @@ mod tests {
 			assert_eq!(results.len(), keys.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &keys[i]);
-				assert_eq!(v.as_ref(), value.as_ref());
+				assert_eq!(v, &value);
 				assert_eq!(*version, 1);
 				assert!(!(*is_deleted));
 			}
@@ -4172,7 +4168,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4190,7 +4186,7 @@ mod tests {
 				let (expected_key, expected_value, expected_version, expected_is_deleted) =
 					expected;
 				assert_eq!(k, expected_key);
-				assert_eq!(v.as_ref(), expected_value.as_ref());
+				assert_eq!(&v, &expected_value);
 				assert_eq!(*version, *expected_version);
 				assert_eq!(*is_deleted, *expected_is_deleted);
 			}
@@ -4211,20 +4207,20 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 2);
 			let (k, v, version, is_deleted) = &results[0];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), value.as_ref());
+			assert_eq!(v, &value);
 			assert_eq!(*version, 1);
 			assert!(!(*is_deleted));
 
 			let (k, v, _, is_deleted) = &results[1];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), Vec::new().as_ref());
+			assert_eq!(v, &Vec::<u8>::new());
 			assert!(*is_deleted);
 		}
 
@@ -4247,7 +4243,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4258,10 +4254,10 @@ mod tests {
 				let is_deleted_version = i % 2 == 1;
 				assert_eq!(k, &keys[key_index]);
 				if is_deleted_version {
-					assert_eq!(v.as_ref(), &Vec::new());
+					assert_eq!(v.as_slice(), &Vec::<u8>::new());
 					assert!(*is_deleted);
 				} else {
-					assert_eq!(v.as_ref(), &value);
+					assert_eq!(v.as_slice(), &value);
 					assert_eq!(*version, 1);
 					assert!(!(*is_deleted));
 				}
@@ -4290,7 +4286,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4309,7 +4305,7 @@ mod tests {
 				let (expected_key, expected_value, expected_version, expected_is_deleted) =
 					expected;
 				assert_eq!(k, expected_key);
-				assert_eq!(v.as_ref(), expected_value);
+				assert_eq!(&v, &expected_value);
 				if !expected_is_deleted {
 					assert_eq!(*version, *expected_version);
 				}
@@ -4336,7 +4332,7 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4357,7 +4353,7 @@ mod tests {
 
 			// Inclusive range
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4377,7 +4373,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
@@ -4396,14 +4392,14 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 1);
 			let (k, v, version, is_deleted) = &results[0];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), &value);
+			assert_eq!(v, &value);
 			assert_eq!(*version, 1);
 			assert!(!(*is_deleted));
 		}
@@ -4425,7 +4421,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
@@ -4477,11 +4473,11 @@ mod tests {
 
 			// Define subsets of the entire range
 			let subsets = vec![
-				(keys[0].as_ref(), keys[2].as_ref()),
-				(keys[1].as_ref(), keys[3].as_ref()),
-				(keys[2].as_ref(), keys[4].as_ref()),
-				(keys[3].as_ref(), keys[5].as_ref()),
-				(keys[4].as_ref(), keys[6].as_ref()),
+				(&keys[0], &keys[2]),
+				(&keys[1], &keys[3]),
+				(&keys[2], &keys[4]),
+				(&keys[3], &keys[5]),
+				(&keys[4], &keys[6]),
 			];
 
 			// Scan each subset and collect versions
@@ -4501,9 +4497,7 @@ mod tests {
 						let version = (i + 1) as u64;
 						let result = results
 							.iter()
-							.find(|(k, v, ver, _)| {
-								k == &key && v.as_ref() == value && *ver == version
-							})
+							.find(|(k, v, ver, _)| k == &key && v == value && *ver == version)
 							.unwrap();
 						assert_eq!(result.1.as_ref(), *value);
 						assert_eq!(result.2, version);
@@ -4595,7 +4589,7 @@ mod tests {
 			fn scan_in_batches(
 				store: &Tree,
 				batch_size: usize,
-			) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
+			) -> Vec<Vec<(Key, Value, u64, bool)>> {
 				let mut all_results = Vec::new();
 				let mut last_key = Vec::new();
 				let mut first_iteration = true;
@@ -4617,10 +4611,7 @@ mod tests {
 					let results =
 						txn.scan_all_versions(&start_key, &end_key, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
-						// Convert borrowed key to owned immediately
-						let key_bytes = Vec::from(k.as_ref());
-						let val_bytes = Vec::from(v.to_vec());
-						batch_results.push((key_bytes, val_bytes, ts, is_deleted));
+						batch_results.push((k.clone(), v, ts, is_deleted));
 
 						// Update last_key with a new vector
 						last_key = k.to_vec();
@@ -4682,7 +4673,7 @@ mod tests {
 			// Verify the value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"test_value");
+			assert_eq!(&result, b"test_value");
 
 			// Test Replace with options
 			let mut txn = store.begin().unwrap();
@@ -4693,7 +4684,7 @@ mod tests {
 			// Verify the second value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key2").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"test_value2");
+			assert_eq!(&result, b"test_value2");
 		}
 
 		#[test(tokio::test)]
@@ -4711,7 +4702,7 @@ mod tests {
 			// Verify the latest version exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"value_v5");
+			assert_eq!(&result, b"value_v5");
 
 			// Use Replace to replace all previous versions
 			let mut txn = store.begin().unwrap();
@@ -4721,7 +4712,7 @@ mod tests {
 			// Verify the new value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"replaced_value");
+			assert_eq!(&result, b"replaced_value");
 		}
 
 		#[test(tokio::test)]
@@ -4737,9 +4728,9 @@ mod tests {
 
 			// Verify all values exist
 			let txn = store.begin().unwrap();
-			assert_eq!(txn.get(b"key1").unwrap().unwrap().as_ref(), b"regular_value1");
-			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"replace_value2");
-			assert_eq!(txn.get(b"key3").unwrap().unwrap().as_ref(), b"regular_value3");
+			assert_eq!(txn.get(b"key1").unwrap().unwrap(), b"regular_value1");
+			assert_eq!(txn.get(b"key2").unwrap().unwrap(), b"replace_value2");
+			assert_eq!(txn.get(b"key3").unwrap().unwrap(), b"regular_value3");
 
 			// Update key2 with regular set
 			let mut txn = store.begin().unwrap();
@@ -4748,7 +4739,7 @@ mod tests {
 
 			// Verify the updated value
 			let txn = store.begin().unwrap();
-			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"updated_regular_value2");
+			assert_eq!(txn.get(b"key2").unwrap().unwrap(), b"updated_regular_value2");
 
 			// Use replace on key1
 			let mut txn = store.begin().unwrap();
@@ -4758,7 +4749,7 @@ mod tests {
 			// Verify the final value
 			let txn = store.begin().unwrap();
 			assert_eq!(
-				txn.get(b"key1").unwrap().unwrap().as_ref(),
+				txn.get(b"key1").unwrap().unwrap().as_slice(),
 				b"final_set_with_delete_value1"
 			);
 		}

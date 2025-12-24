@@ -3385,10 +3385,7 @@ mod tests {
 		{
 			let tx = tree.begin().unwrap();
 			let current_value = tx.get(&key1).unwrap().unwrap();
-			assert_eq!(
-				current_value.as_ref(),
-				"value1_version_2".to_string().repeat(10).as_bytes()
-			);
+			assert_eq!(&current_value, "value1_version_2".to_string().repeat(10).as_bytes());
 		}
 
 		// --- Step 4: Insert key3 values which will rotate VLog file ---
@@ -3412,7 +3409,7 @@ mod tests {
 		{
 			let tx = tree.begin().unwrap();
 			let value = tx.get(&key1).unwrap().unwrap();
-			assert_eq!(value.as_ref(), "final_value_key1".repeat(10).as_bytes());
+			assert_eq!(&value, "final_value_key1".repeat(10).as_bytes());
 		}
 
 		// --- Step 7: Trigger manual compaction of the LSM tree ---
@@ -3429,7 +3426,7 @@ mod tests {
 			let tx = tree.begin().unwrap();
 			let value = tx.get(&key1).unwrap().unwrap();
 			assert_eq!(
-                value.as_ref(),
+                &value,
                 "final_value_key1".repeat(10).as_bytes(),
                 "After VLog compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
             );
@@ -3488,7 +3485,7 @@ mod tests {
 					let txn = tree.begin().unwrap();
 					let result = txn.get(key.as_bytes()).unwrap();
 					assert!(result.is_some(), "Key '{}' should exist immediately after flush", key);
-					assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+					assert_eq!(&result.unwrap(), expected_value.as_bytes());
 				}
 			}
 
@@ -3509,7 +3506,7 @@ mod tests {
 					let txn = tree.begin().unwrap();
 					let result = txn.get(key.as_bytes()).unwrap();
 					assert!(result.is_some(), "Key '{}' should exist after restart", key);
-					assert_eq!(result.as_ref().unwrap().as_ref(), expected_value.as_bytes());
+					assert_eq!(&result.unwrap(), expected_value.as_bytes());
 				}
 			}
 
@@ -3666,7 +3663,7 @@ mod tests {
 					let txn = tree.begin().unwrap();
 					let result = txn.get(key.as_bytes()).unwrap();
 					assert!(result.is_some(), "Key '{}' should exist after restart", key);
-					assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+					assert_eq!(&result.unwrap(), expected_value.as_bytes());
 				}
 			}
 
@@ -3749,7 +3746,7 @@ mod tests {
 			let tx = tree1.begin().unwrap();
 			let result = tx.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key '{key}' should exist in first database");
-			assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+			assert_eq!(&result.unwrap(), expected_value.as_bytes());
 		}
 
 		// Drop the first database (this will close it)
@@ -3767,7 +3764,7 @@ mod tests {
 			let tx = tree2.begin().unwrap();
 			let result = tx.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key '{key}' should exist after reopen");
-			assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+			assert_eq!(&result.unwrap(), expected_value.as_bytes());
 		}
 
 		// Add new data and verify it goes to the correct active file
@@ -3782,7 +3779,7 @@ mod tests {
 		let tx = tree2.begin().unwrap();
 		let result = tx.get(new_key.as_bytes()).unwrap();
 		assert!(result.is_some(), "New key should exist after write");
-		assert_eq!(result.unwrap().as_ref(), new_value.as_bytes());
+		assert_eq!(&result.unwrap(), new_value.as_bytes());
 
 		// Verify we can still read from old data after adding new data
 		for i in 0..10 {
@@ -3792,7 +3789,7 @@ mod tests {
 			let tx = tree2.begin().unwrap();
 			let result = tx.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Old key '{key}' should still exist");
-			assert_eq!(result.unwrap().as_ref(), expected_value.as_bytes());
+			assert_eq!(&result.unwrap(), expected_value.as_bytes());
 		}
 
 		// Clean shutdown (drop will close it)
@@ -3820,7 +3817,7 @@ mod tests {
 
 		let txn = tree.begin().unwrap();
 		let result = txn.get(b"test_key").unwrap().unwrap();
-		assert_eq!(result, Bytes::from_static(b"test_value"));
+		assert_eq!(result, b"test_value".to_vec());
 
 		// Test build_with_options
 		let (tree2, opts) = TreeBuilder::new()
@@ -3838,7 +3835,7 @@ mod tests {
 
 		let txn = tree2.begin().unwrap();
 		let result = txn.get(b"key2").unwrap().unwrap();
-		assert_eq!(result, Bytes::from_static(b"value2"));
+		assert_eq!(result, b"value2".to_vec());
 	}
 
 	#[test(tokio::test)]
@@ -3865,7 +3862,7 @@ mod tests {
 			// Verify the latest version exists
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"value_v5");
+			assert_eq!(&result, b"value_v5");
 
 			// Soft delete the key
 			let mut txn = tree.begin().unwrap();
@@ -3885,7 +3882,7 @@ mod tests {
 			// Verify the new key exists
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"other_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"other_value");
+			assert_eq!(&result, b"other_value");
 
 			// Force flush to persist all changes to disk
 			tree.flush().unwrap();
@@ -3909,7 +3906,7 @@ mod tests {
 			// Verify the other key still exists
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"other_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"other_value");
+			assert_eq!(&result, b"other_value");
 
 			// Test range scan to ensure soft deleted key doesn't appear
 			let txn = tree.begin().unwrap();
@@ -3932,8 +3929,8 @@ mod tests {
 
 			// Should contain the other key
 			assert_eq!(range_result.len(), 1);
-			assert_eq!(range_result[0].0.as_ref(), b"other_key");
-			assert_eq!(range_result[0].1.as_ref(), b"other_value");
+			assert_eq!(&range_result[0].0, b"other_key");
+			assert_eq!(&range_result[0].1, b"other_value");
 
 			// Test that we can reinsert the same key after soft delete
 			let mut txn = tree.begin().unwrap();
@@ -3943,7 +3940,7 @@ mod tests {
 			// Verify the new value is visible
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"new_value_after_soft_delete");
+			assert_eq!(&result, b"new_value_after_soft_delete");
 
 			tree.close().await.unwrap();
 		}
@@ -4053,7 +4050,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			let result = txn.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key '{key}' should exist after restore");
-			assert_eq!(result.unwrap().as_ref(), &large_value);
+			assert_eq!(&result.unwrap(), &large_value);
 		}
 
 		// Verify the newer keys don't exist after restore
@@ -6240,9 +6237,15 @@ mod tests {
 			{
 				let mut batch = Batch::new(next_seq);
 				let encoded_value =
-					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value2_from_wal"))
-						.encode();
-				batch.add_record(InternalKeyKind::Set, b"key2", Some(&encoded_value), 0).unwrap();
+					ValueLocation::with_inline_value(b"value2_from_wal".to_vec()).encode();
+				batch
+					.add_record(
+						InternalKeyKind::Set,
+						b"key2".to_vec(),
+						Some(encoded_value.clone()),
+						0,
+					)
+					.unwrap();
 
 				let mut wal = Wal::open_with_min_log_number(
 					&wal_path,
@@ -6261,9 +6264,15 @@ mod tests {
 			{
 				let mut batch = Batch::new(next_seq + 1);
 				let encoded_value =
-					ValueLocation::with_inline_value(bytes::Bytes::from_static(b"value3_from_wal"))
-						.encode();
-				batch.add_record(InternalKeyKind::Set, b"key3", Some(&encoded_value), 0).unwrap();
+					ValueLocation::with_inline_value(b"value3_from_wal".to_vec()).encode();
+				batch
+					.add_record(
+						InternalKeyKind::Set,
+						b"key3".to_vec(),
+						Some(encoded_value.clone()),
+						0,
+					)
+					.unwrap();
 
 				let mut wal = Wal::open_with_min_log_number(
 					&wal_path,

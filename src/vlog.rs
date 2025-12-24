@@ -1058,7 +1058,7 @@ impl VLog {
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
-					let user_key = internal_key.user_key.to_vec();
+					let user_key = internal_key.user_key.clone();
 					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
 					return Err(e);
 				}
@@ -1812,7 +1812,7 @@ mod tests {
 	#[test]
 	fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 
 		// Test encode
 		let encoded = location.encode();
@@ -1875,7 +1875,7 @@ mod tests {
 	fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
-		let inline_location = ValueLocation::with_inline_value(Bytes::from_static(inline_data));
+		let inline_location = ValueLocation::with_inline_value(inline_data.to_vec());
 		assert_eq!(inline_location.encoded_size(), 1 + 1 + inline_data.len()); // meta + version + data
 
 		// Test VLog size
@@ -1889,7 +1889,7 @@ mod tests {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 
 		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
@@ -1915,7 +1915,7 @@ mod tests {
 	#[test]
 	fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 		let encoded = location.encode();
 
 		// Should work without VLog for inline data
@@ -1950,7 +1950,7 @@ mod tests {
 	fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
-		let location = ValueLocation::with_inline_value(Bytes::from(max_inline));
+		let location = ValueLocation::with_inline_value(max_inline);
 		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
@@ -2025,7 +2025,7 @@ mod tests {
 
 		// Retrieve the value to ensure header validation works
 		let retrieved_value = vlog.get(&pointer).unwrap();
-		assert_eq!(retrieved_value.as_ref(), value);
+		assert_eq!(&retrieved_value, value);
 	}
 
 	#[test(tokio::test)]

@@ -97,12 +97,7 @@ impl RecoveryTestHelper {
 		let txn = tree.begin().unwrap();
 		let result = txn.get(key.as_bytes()).unwrap();
 		assert!(result.is_some(), "Key '{}' should exist but was not found", key);
-		assert_eq!(
-			result.unwrap().as_ref(),
-			expected_value.as_bytes(),
-			"Key '{}' has wrong value",
-			key
-		);
+		assert_eq!(result.unwrap(), expected_value.as_bytes(), "Key '{}' has wrong value", key);
 	}
 
 	/// Get manifest log number (using internal access for testing)
@@ -148,7 +143,7 @@ impl WalTestHelper {
 				for i in 0..entry_count {
 					let key = format!("seg{}_key{:04}", seg_idx, i);
 					let value = format!("seg{}_value{:04}", seg_idx, i);
-					batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+					batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
 					current_seq += 1;
 				}
 				wal.append(&batch.encode().unwrap()).unwrap();
@@ -188,7 +183,7 @@ impl WalTestHelper {
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
@@ -202,7 +197,7 @@ impl WalTestHelper {
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
