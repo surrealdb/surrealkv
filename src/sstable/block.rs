@@ -722,7 +722,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.key().user_key, block_iter.value(),)),
 			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -730,7 +730,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.key().user_key, block_iter.value(),)),
 			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -738,7 +738,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.key().user_key, block_iter.value(),)),
 			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
 		);
 
@@ -746,7 +746,7 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
+			Some((block_iter.key().user_key, block_iter.value(),)),
 			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
 		);
 
@@ -863,7 +863,7 @@ mod tests {
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
 			let internal_key = InternalKey::decode(&item.0);
-			forward_keys.push(String::from_utf8(internal_key.user_key.to_vec()).unwrap());
+			forward_keys.push(String::from_utf8(internal_key.user_key.clone()).unwrap());
 		}
 		assert_eq!(
 			forward_keys,
@@ -876,7 +876,7 @@ mod tests {
 		let mut backward_keys = Vec::new();
 		while backward_iter.valid() {
 			let key = backward_iter.key().user_key.clone();
-			backward_keys.push(String::from_utf8(key.to_vec()).unwrap());
+			backward_keys.push(String::from_utf8(key.clone()).unwrap());
 			if !backward_iter.prev() {
 				break;
 			}

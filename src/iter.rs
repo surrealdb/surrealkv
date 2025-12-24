@@ -387,7 +387,7 @@ mod tests {
 
 	fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 		let pointer = vlog.append(key, value).unwrap();
-		ValueLocation::with_pointer(pointer).encode().into()
+		ValueLocation::with_pointer(pointer).encode()
 	}
 
 	// Creates a mock iterator with predefined entries
@@ -439,7 +439,7 @@ mod tests {
 				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -449,7 +449,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -517,7 +517,7 @@ mod tests {
 				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -526,7 +526,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -589,7 +589,7 @@ mod tests {
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				// Create empty Vec<u8> and wrap it in Arc for hard_delete value
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -598,7 +598,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -770,7 +770,7 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items1 = vec![(hard_delete_key, empty_value)];
 		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -813,7 +813,7 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items1 = vec![(hard_delete_key, empty_value)];
 		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -874,7 +874,7 @@ mod tests {
 		let key3_val1 = create_vlog_value(&vlog, b"key3", b"value3");
 
 		// Distribute across multiple iterators
-		let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2.into())];
+		let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2)];
 		let items2 = vec![(key1_v1, key1_val1), (key3_v1, key3_val1.clone())];
 		let items3 = vec![(key2_v1, key2_val1)];
 
@@ -959,8 +959,8 @@ mod tests {
 		let value_v1: Vec<u8> = b"value1".to_vec();
 		let value_v2: Vec<u8> = b"value2".to_vec();
 
-		let items1 = vec![(key_v2, value_v2.into())];
-		let items2 = vec![(key_v1, value_v1.into())];
+		let items1 = vec![(key_v2, value_v2)];
+		let items2 = vec![(key_v1, value_v1)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1021,7 +1021,7 @@ mod tests {
 		let val_c_v1 = create_vlog_value(&vlog, b"key_c", b"value_c_oldest");
 		let val_d_v1 = create_vlog_value(&vlog, b"key_d", b"value_d");
 
-		let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3.into())];
+		let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3)];
 		let items2 = vec![(key_a_v2, val_a_v2), (key_b_v2, val_b_v2.clone()), (key_c_v2, val_c_v2)];
 		let items3 = vec![(key_a_v1, val_a_v1), (key_c_v1, val_c_v1), (key_d_v1, val_d_v1.clone())];
 
@@ -1782,7 +1782,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1837,7 +1837,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(hard_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(hard_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1888,7 +1888,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1942,7 +1942,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -2529,7 +2529,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key5", 1900, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2579,7 +2579,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key6", 2100, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2636,7 +2636,7 @@ mod tests {
 			// Table 3: Delete operation (latest)
 			let key4 = create_internal_key("test_key7", 2500, InternalKeyKind::Delete);
 			let value4 = Vec::new(); // Empty value for delete
-			items3.push((key4, value4.into()));
+			items3.push((key4, value4));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2801,7 +2801,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key10", 3300, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2851,7 +2851,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key11", 3500, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));

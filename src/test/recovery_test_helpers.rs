@@ -263,7 +263,7 @@ impl WalTestHelper {
 		let mut found_keys = Vec::new();
 		for entry in memtable.iter(false) {
 			// entry is (InternalKey, Bytes)
-			let key = String::from_utf8(entry.0.user_key.to_vec()).unwrap();
+			let key = String::from_utf8(entry.0.user_key.clone()).unwrap();
 			found_keys.push(key);
 		}
 		found_keys.sort();

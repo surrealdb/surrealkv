@@ -2756,12 +2756,8 @@ mod tests {
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
 			let mut iter = table.iter(false, None);
-			let seek_key = InternalKey::new(
-				Vec::from(format!("key_{i:06}").into_bytes()),
-				1,
-				InternalKeyKind::Set,
-				0,
-			);
+			let seek_key =
+				InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 			assert!(iter.valid(), "Seek to key_{i:06} should succeed");
 		}
@@ -3724,7 +3720,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_000 through key_005 (6 items)
@@ -3772,7 +3768,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_000 through key_004 (5 items)
@@ -3830,7 +3826,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		// Should return all 10 items in reverse order
 		assert_eq!(results.len(), 10, "Should return exactly 10 items");
@@ -3870,7 +3866,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_009, key_008, ..., key_003 (7 items)
@@ -3919,7 +3915,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_002, key_003, key_004, key_005, key_006 (5 items)
@@ -3963,7 +3959,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return all 10 items
@@ -4018,7 +4014,7 @@ mod tests {
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
 			let (key, _) = item;
-			forward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			forward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(forward_keys.len(), 30);
 		assert_eq!(forward_keys[0], "key_000");
@@ -4029,7 +4025,7 @@ mod tests {
 		let mut backward_keys = Vec::new();
 		while let Some(item) = backward_iter.next_back() {
 			let (key, _) = item;
-			backward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			backward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(backward_keys.len(), 30);
 		assert_eq!(backward_keys[0], "key_029");
@@ -4041,7 +4037,7 @@ mod tests {
 		let mut seek_backward = Vec::new();
 		while let Some(item) = seek_iter.next_back() {
 			let (key, _) = item;
-			seek_backward.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			seek_backward.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(seek_backward.len(), 30);
 		assert_eq!(seek_backward[0], "key_029");
@@ -4095,7 +4091,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, key_002, key_001, key_000
@@ -4139,7 +4135,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, ..., key_000 (5 items)
@@ -4183,7 +4179,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should start at key_004, NOT any version of key_003
@@ -4223,7 +4219,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4279,7 +4275,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4413,7 +4409,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push((user_key, key.seq_num()));
 		}
 
@@ -4470,7 +4466,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4636,7 +4632,7 @@ mod tests {
 
 		// Collect all keys going backwards using the CORRECT inherent prev() method
 		let mut correct_results = Vec::new();
-		correct_results.push(iter.key().user_key.clone());
+		correct_results.push(iter.key().user_key);
 		while iter.prev() {
 			correct_results.push(iter.key().user_key.clone());
 		}
@@ -4652,7 +4648,7 @@ mod tests {
 
 		// Collect all keys going backwards using the BUGGY trait prev() method
 		let mut buggy_results = Vec::new();
-		buggy_results.push(LSMIterator::key(&iter2).user_key.clone());
+		buggy_results.push(LSMIterator::key(&iter2).user_key);
 		while LSMIterator::prev(&mut iter2) {
 			buggy_results.push(LSMIterator::key(&iter2).user_key.clone());
 		}

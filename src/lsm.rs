@@ -3167,7 +3167,7 @@ mod tests {
 			let tx = tree.begin().unwrap();
 			let result = tx.get(*key).unwrap();
 			let expected = format!("value-{}-v2", i + 1);
-			assert_eq!(result.map(|v| v.to_vec()), Some(expected.as_bytes().to_vec()));
+			assert_eq!(result, Some(expected.as_bytes().to_vec()));
 		}
 
 		// Delete all keys
@@ -3276,10 +3276,7 @@ mod tests {
 		for (i, key) in keys.iter().enumerate() {
 			let tx = tree.begin().unwrap();
 			let result = tx.get(*key).unwrap();
-			assert_eq!(
-				result.map(|v| v.to_vec()),
-				Some(format!("value-{}-v4", i + 1).as_bytes().to_vec())
-			);
+			assert_eq!(result, Some(format!("value-{}-v4", i + 1).as_bytes().to_vec()));
 		}
 
 		// Delete all keys
@@ -4183,7 +4180,7 @@ mod tests {
 
 			// Data should be available (recovered from WAL)
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"crash_key").unwrap(), Some(b"crash_value".to_vec().into()));
+			assert_eq!(txn.get(b"crash_key").unwrap(), Some(b"crash_value".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -4403,8 +4400,8 @@ mod tests {
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec().into()));
-			assert_eq!(txn.get(b"extra").unwrap(), Some(b"data".to_vec().into()));
+			assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec()));
+			assert_eq!(txn.get(b"extra").unwrap(), Some(b"data".to_vec()));
 			tree.close().await.unwrap();
 		}
 	}
@@ -4460,9 +4457,9 @@ mod tests {
 			let txn = tree.begin().unwrap();
 
 			// All batches should be accessible (reading doesn't need mut)
-			assert_eq!(txn.get(b"batch1_key_0").unwrap(), Some(b"value1".to_vec().into()));
-			assert_eq!(txn.get(b"batch2_key_0").unwrap(), Some(b"value2".to_vec().into()));
-			assert_eq!(txn.get(b"batch3_key_0").unwrap(), Some(b"value3".to_vec().into()));
+			assert_eq!(txn.get(b"batch1_key_0").unwrap(), Some(b"value1".to_vec()));
+			assert_eq!(txn.get(b"batch2_key_0").unwrap(), Some(b"value2".to_vec()));
+			assert_eq!(txn.get(b"batch3_key_0").unwrap(), Some(b"value3".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -4502,7 +4499,7 @@ mod tests {
 		{
 			let tree = Tree::new(opts.clone()).unwrap();
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"key").unwrap(), Some(b"value".to_vec().into()));
+			assert_eq!(txn.get(b"key").unwrap(), Some(b"value".to_vec()));
 			tree.close().await.unwrap();
 		}
 	}
@@ -4573,11 +4570,11 @@ mod tests {
 
 			// All data should be accessible
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"batch_a_0").unwrap(), Some(b"value_a".to_vec().into()));
-			assert_eq!(txn.get(b"batch_b_0").unwrap(), Some(b"value_b".to_vec().into()));
+			assert_eq!(txn.get(b"batch_a_0").unwrap(), Some(b"value_a".to_vec()));
+			assert_eq!(txn.get(b"batch_b_0").unwrap(), Some(b"value_b".to_vec()));
 			assert_eq!(
 				txn.get(b"batch_c_0").unwrap(),
-				Some(b"value_c".to_vec().into()),
+				Some(b"value_c".to_vec()),
 				"Batch C should be recovered from WAL"
 			);
 
@@ -4608,7 +4605,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			assert_eq!(
 				txn.get(b"key_0").unwrap(),
-				Some(b"value".to_vec().into()),
+				Some(b"value".to_vec()),
 				"Data should be accessible before flush"
 			);
 		}
@@ -4624,7 +4621,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			assert_eq!(
 				txn.get(b"key_0").unwrap(),
-				Some(b"value".to_vec().into()),
+				Some(b"value".to_vec()),
 				"Data should be accessible after flush"
 			);
 		}
@@ -4640,12 +4637,12 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			assert_eq!(
 				txn.get(b"key_0").unwrap(),
-				Some(b"value".to_vec().into()),
+				Some(b"value".to_vec()),
 				"Old data should still be accessible"
 			);
 			assert_eq!(
 				txn.get(b"after_flush").unwrap(),
-				Some(b"value".to_vec().into()),
+				Some(b"value".to_vec()),
 				"New data after flush should be accessible"
 			);
 			drop(txn);
@@ -4820,7 +4817,7 @@ mod tests {
 			// Memtable should be empty (data in SST)
 			// Data should still be accessible
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"test_key").unwrap(), Some(b"test_value".to_vec().into()));
+			assert_eq!(txn.get(b"test_key").unwrap(), Some(b"test_value".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -4884,7 +4881,7 @@ mod tests {
 
 			// Verify cycle 1 data is accessible
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec().into()));
+			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
 			drop(txn);
 
 			for i in 0..50 {
@@ -4919,8 +4916,8 @@ mod tests {
 
 			// Verify both previous cycles' data
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec().into()));
-			assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec().into()));
+			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
+			assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
 			drop(txn);
 
 			for i in 0..50 {
@@ -4949,9 +4946,9 @@ mod tests {
 			let tree = Tree::new(opts.clone()).unwrap();
 
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec().into()));
-			assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec().into()));
-			assert_eq!(txn.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec().into()));
+			assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
+			assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
+			assert_eq!(txn.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -4997,7 +4994,7 @@ mod tests {
 
 			// Data should still be accessible via WAL recovery
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec().into()));
+			assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -5057,7 +5054,7 @@ mod tests {
 
 			// But data should still be accessible via WAL
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"test").unwrap(), Some(b"data".to_vec().into()));
+			assert_eq!(txn.get(b"test").unwrap(), Some(b"data".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -5144,7 +5141,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			assert_eq!(
 				txn.get(b"final_key").unwrap(),
-				Some(b"final_value".to_vec().into()),
+				Some(b"final_value".to_vec()),
 				"Final key should exist after close/reopen"
 			);
 
@@ -5330,12 +5327,12 @@ mod tests {
 		let txn = tree2.begin().unwrap();
 		assert_eq!(
 			txn.get(b"key1").unwrap(),
-			Some(b"value1".to_vec().into()),
+			Some(b"value1".to_vec()),
 			"key1 should exist after reopen"
 		);
 		assert_eq!(
 			txn.get(b"key2").unwrap(),
-			Some(b"value2".to_vec().into()),
+			Some(b"value2".to_vec()),
 			"key2 should exist after reopen"
 		);
 
@@ -5394,12 +5391,12 @@ mod tests {
 		let txn = tree2.begin().unwrap();
 		assert_eq!(
 			txn.get(b"key1").unwrap(),
-			Some(b"value1".to_vec().into()),
+			Some(b"value1".to_vec()),
 			"key1 should exist after reopen"
 		);
 		assert_eq!(
 			txn.get(b"key2").unwrap(),
-			Some(b"value2".to_vec().into()),
+			Some(b"value2".to_vec()),
 			"key2 should exist after reopen"
 		);
 
@@ -5549,7 +5546,7 @@ mod tests {
 				// Check data from current cycle
 				assert_eq!(
 					txn.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
-					Some(b"value".to_vec().into()),
+					Some(b"value".to_vec()),
 					"Data from cycle {} should be recoverable",
 					cycle
 				);
@@ -5558,7 +5555,7 @@ mod tests {
 				for prev_cycle in 1..cycle {
 					assert_eq!(
 						txn.get(format!("cycle{}_key_0", prev_cycle).as_bytes()).unwrap(),
-						Some(b"value".to_vec().into()),
+						Some(b"value".to_vec()),
 						"Data from previous cycle {} should still be accessible",
 						prev_cycle
 					);
@@ -5583,7 +5580,7 @@ mod tests {
 			for cycle in 1..=3 {
 				assert_eq!(
 					txn.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
-					Some(b"value".to_vec().into()),
+					Some(b"value".to_vec()),
 					"Data from cycle {} should be accessible in final check",
 					cycle
 				);
@@ -6087,8 +6084,8 @@ mod tests {
 
 			// Verify data was recovered
 			let txn = tree.begin().unwrap();
-			assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec().into()));
-			assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec().into()));
+			assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+			assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec()));
 
 			tree.close().await.unwrap();
 		}
@@ -6231,12 +6228,7 @@ mod tests {
 				let encoded_value =
 					ValueLocation::with_inline_value(b"value2_from_wal".to_vec()).encode();
 				batch
-					.add_record(
-						InternalKeyKind::Set,
-						b"key2".to_vec(),
-						Some(encoded_value.clone()),
-						0,
-					)
+					.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(encoded_value), 0)
 					.unwrap();
 
 				let mut wal = Wal::open_with_min_log_number(
@@ -6258,12 +6250,7 @@ mod tests {
 				let encoded_value =
 					ValueLocation::with_inline_value(b"value3_from_wal".to_vec()).encode();
 				batch
-					.add_record(
-						InternalKeyKind::Set,
-						b"key3".to_vec(),
-						Some(encoded_value.clone()),
-						0,
-					)
+					.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(encoded_value), 0)
 					.unwrap();
 
 				let mut wal = Wal::open_with_min_log_number(
@@ -6351,17 +6338,13 @@ mod tests {
 			let key4 = txn.get(b"key4_new_after_recovery").unwrap();
 			assert_eq!(
 				key4,
-				Some(b"value4".to_vec().into()),
+				Some(b"value4".to_vec()),
 				"DATA LOSS BUG: key4 written after recovery was lost! \
 				 This happens when WAL opens at log_number instead of highest segment."
 			);
 
 			let key5 = txn.get(b"key5_unflushed").unwrap();
-			assert_eq!(
-				key5,
-				Some(b"value5".to_vec().into()),
-				"DATA LOSS BUG: key5 (unflushed) was lost!"
-			);
+			assert_eq!(key5, Some(b"value5".to_vec()), "DATA LOSS BUG: key5 (unflushed) was lost!");
 
 			log::info!("Phase 4: All data verified - no data loss!");
 
