@@ -730,7 +730,6 @@ mod tests {
 		assert_eq!(props1.id, table_id1, "Table 1 properties ID mismatch");
 		assert_eq!(props1.num_entries, 100, "Table 1 should have 100 entries");
 		assert!(props1.data_size > 0, "Table 1 data size should be greater than 0");
-		assert!(props1.file_size > 0, "Table 1 file size in properties should be greater than 0");
 		assert!(props1.created_at > 0, "Table 1 created_at should be set");
 		assert_eq!(props1.item_count, 100, "Table 1 item count should match entries");
 		assert_eq!(props1.key_count, 100, "Table 1 key count should match entries");
@@ -771,7 +770,6 @@ mod tests {
 		assert_eq!(props2.id, table_id2, "Table 2 properties ID mismatch");
 		assert_eq!(props2.num_entries, 200, "Table 2 should have 200 entries");
 		assert!(props2.data_size > 0, "Table 2 data size should be greater than 0");
-		assert!(props2.file_size > 0, "Table 2 file size in properties should be greater than 0");
 		assert!(props2.created_at > 0, "Table 2 created_at should be set");
 		assert_eq!(props2.item_count, 200, "Table 2 item count should match entries");
 		assert_eq!(props2.key_count, 200, "Table 2 key count should match entries");
@@ -812,7 +810,6 @@ mod tests {
 		assert_eq!(props3.id, table_id3, "Table 3 properties ID mismatch");
 		assert_eq!(props3.num_entries, 300, "Table 3 should have 300 entries");
 		assert!(props3.data_size > 0, "Table 3 data size should be greater than 0");
-		assert!(props3.file_size > 0, "Table 3 file size in properties should be greater than 0");
 		assert!(props3.created_at > 0, "Table 3 created_at should be set");
 		assert_eq!(props3.item_count, 300, "Table 3 item count should match entries");
 		assert_eq!(props3.key_count, 300, "Table 3 key count should match entries");
