@@ -84,7 +84,7 @@ impl BlockHandle {
 #[derive(Clone)]
 pub(crate) struct Block {
 	pub(crate) block: BlockData,
-	comparator: Arc<dyn Comparator>,
+	comparator: Arc<InternalKeyComparator>,
 }
 
 impl Block {
@@ -92,7 +92,7 @@ impl Block {
 		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone(), keys_only)
 	}
 
-	pub(crate) fn new(data: BlockData, comparator: Arc<dyn Comparator>) -> Block {
+	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
@@ -116,7 +116,7 @@ pub(crate) struct BlockWriter {
 	pub(crate) last_key: Vec<u8>,
 	num_entries: usize,
 	/// internal key comparator
-	internal_cmp: Arc<dyn Comparator>,
+	internal_cmp: Arc<InternalKeyComparator>,
 }
 
 // Block writer logic:
@@ -175,10 +175,10 @@ impl BlockWriter {
 	pub(crate) fn new(
 		size: usize,
 		restart_interval: usize,
-		comparator: Arc<dyn Comparator>,
+		internal_cmp: Arc<InternalKeyComparator>,
 	) -> Self {
 		BlockWriter {
-			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&comparator))),
+			internal_cmp,
 			buffer: Vec::with_capacity(size),
 			restart_interval,
 			restart_points: vec![0],
@@ -329,14 +329,18 @@ pub(crate) struct BlockIterator {
 	current_value_offset_start: usize,
 	current_value_offset_end: usize,
 	/// internal key comparator
-	internal_cmp: Arc<dyn Comparator>,
+	internal_cmp: Arc<InternalKeyComparator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
 }
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(comparator: Arc<dyn Comparator>, block: BlockData, keys_only: bool) -> Self {
+	pub(crate) fn new(
+		comparator: Arc<InternalKeyComparator>,
+		block: BlockData,
+		keys_only: bool,
+	) -> Self {
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
 		let mut restart_points = vec![0; num_restarts];
 		let restart_offset = block.len() - 4 * (num_restarts + 1);
@@ -346,8 +350,6 @@ impl BlockIterator {
 			let end_point = start_point + 4;
 			*restart_point = u32::decode_fixed(&block[start_point..end_point]).unwrap();
 		}
-
-		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
 
 		BlockIterator {
 			block,
@@ -359,7 +361,7 @@ impl BlockIterator {
 			restart_offset,
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
-			internal_cmp: internal_comparator,
+			internal_cmp: comparator,
 			keys_only,
 		}
 	}
@@ -626,14 +628,17 @@ mod tests {
 	#[test]
 	fn test_block_empty() {
 		let o = make_opts(None);
-		let builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		let blockc = builder.finish();
 		assert_eq!(blockc.len(), 8);
 		assert_eq!(blockc.as_slice(), &[0, 0, 0, 0, 1, 0, 0, 0]);
 
-		let mut block_iter = Block::new(blockc, o.comparator.clone()).iter(false);
+		let mut block_iter = Block::new(blockc, o.internal_comparator.clone()).iter(false);
 
 		let mut i = 0;
 		while block_iter.advance() {
@@ -647,8 +652,11 @@ mod tests {
 	fn test_block_iter() {
 		let data = generate_data();
 		let o = make_opts(None);
-		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let mut builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
@@ -656,7 +664,8 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, Arc::clone(&o.comparator)).iter(false);
+		let mut block_iter =
+			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		let mut i = 0;
 		while block_iter.advance() {
@@ -672,15 +681,18 @@ mod tests {
 	fn test_block_iter_reverse() {
 		let data = generate_data();
 		let o = make_opts(Some(3));
-		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let mut builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
 		}
 
 		let block_contents = builder.finish();
-		let mut iter = Block::new(block_contents, Arc::clone(&o.comparator)).iter(false);
+		let mut iter = Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		iter.next();
 		assert_eq!(iter.key().user_key.as_slice(), "key1".as_bytes());
@@ -708,7 +720,7 @@ mod tests {
 		let data = generate_data();
 		let o = make_opts(Some(3));
 		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, o.comparator.clone());
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
@@ -716,7 +728,7 @@ mod tests {
 
 		let block_contents = builder.finish();
 
-		let mut block_iter = Block::new(block_contents, o.comparator.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o.internal_comparator.clone()).iter(false);
 
 		let key = InternalKey::new(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
@@ -761,8 +773,11 @@ mod tests {
 		for block_restart_interval in [2, 6, 10] {
 			let data = generate_data();
 			let o = make_opts(Some(block_restart_interval));
-			let mut builder =
-				BlockWriter::new(o.block_size, o.block_restart_interval, o.comparator.clone());
+			let mut builder = BlockWriter::new(
+				o.block_size,
+				o.block_restart_interval,
+				o.internal_comparator.clone(),
+			);
 
 			for &(k, v) in data.iter() {
 				builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
@@ -770,7 +785,8 @@ mod tests {
 
 			let block_contents = builder.finish();
 
-			let mut block_iter = Block::new(block_contents, o.comparator.clone()).iter(false);
+			let mut block_iter =
+				Block::new(block_contents, o.internal_comparator.clone()).iter(false);
 
 			block_iter.seek_to_last();
 			assert!(block_iter.valid());
@@ -800,14 +816,14 @@ mod tests {
 		let data = generate_data();
 		let o = make_opts(Some(2)); // Small restart interval to test restart logic
 		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, o.comparator.clone());
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, o.comparator.clone()).iter(false);
+		let mut block_iter = Block::new(block_contents, o.internal_comparator.clone()).iter(false);
 
 		// Test prev() from the end
 		block_iter.seek_to_last();
@@ -850,7 +866,7 @@ mod tests {
 		let data = generate_data();
 		let o = make_opts(Some(3));
 		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, o.comparator.clone());
+			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
@@ -859,7 +875,8 @@ mod tests {
 		let block_contents = builder.finish();
 
 		// Test forward iteration with next()
-		let forward_iter = Block::new(block_contents.clone(), o.comparator.clone()).iter(false);
+		let forward_iter =
+			Block::new(block_contents.clone(), o.internal_comparator.clone()).iter(false);
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
 			let internal_key = InternalKey::decode(&item.0);
@@ -871,7 +888,8 @@ mod tests {
 		);
 
 		// Test backward iteration using prev()
-		let mut backward_iter = Block::new(block_contents, o.comparator.clone()).iter(false);
+		let mut backward_iter =
+			Block::new(block_contents, o.internal_comparator.clone()).iter(false);
 		backward_iter.seek_to_last();
 		let mut backward_keys = Vec::new();
 		while backward_iter.valid() {
@@ -895,15 +913,19 @@ mod tests {
 		// Test prev() starting from the middle of the block
 		let data = generate_data();
 		let o = make_opts(Some(2));
-		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let mut builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, Arc::clone(&o.comparator)).iter(false);
+		let mut block_iter =
+			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		// Seek to "pkey1"
 		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -934,15 +956,19 @@ mod tests {
 		// Test basic prev() functionality after positioning
 		let data = generate_data();
 		let o = make_opts(Some(3));
-		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let mut builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, Arc::clone(&o.comparator)).iter(false);
+		let mut block_iter =
+			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		// Position at "pkey1"
 		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -973,21 +999,29 @@ mod tests {
 		// Test edge cases for prev()
 		let data = generate_data();
 		let o = make_opts(Some(5)); // Large restart interval
-		let mut builder =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator));
+		let mut builder = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		);
 
 		for &(k, v) in data.iter() {
 			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
 		}
 
 		let block_contents = builder.finish();
-		let mut block_iter = Block::new(block_contents, Arc::clone(&o.comparator)).iter(false);
+		let mut block_iter =
+			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		// Test prev() on empty block (shouldn't happen but let's test robustness)
-		let empty_block =
-			BlockWriter::new(o.block_size, o.block_restart_interval, Arc::clone(&o.comparator))
-				.finish();
-		let mut empty_iter = Block::new(empty_block, Arc::clone(&o.comparator)).iter(false);
+		let empty_block = BlockWriter::new(
+			o.block_size,
+			o.block_restart_interval,
+			Arc::clone(&o.internal_comparator),
+		)
+		.finish();
+		let mut empty_iter =
+			Block::new(empty_block, Arc::clone(&o.internal_comparator)).iter(false);
 		assert!(!empty_iter.prev());
 		assert!(!empty_iter.valid());
 

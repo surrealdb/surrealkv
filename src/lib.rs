@@ -161,6 +161,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
+	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -207,10 +208,14 @@ impl Default for Options {
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
 
+		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
+		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
+
 		Self {
 			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
-			comparator: Arc::new(crate::BytewiseComparator {}),
+			comparator,
+			internal_comparator,
 			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
@@ -253,6 +258,7 @@ impl Options {
 	}
 
 	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
+		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
 		self
 	}

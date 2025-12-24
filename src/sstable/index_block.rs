@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::comparator::{Comparator, InternalKeyComparator};
+use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
@@ -63,7 +63,7 @@ impl TopLevelIndexWriter {
 			current_block: BlockWriter::new(
 				opts.block_size,
 				opts.block_restart_interval,
-				Arc::clone(&opts.comparator),
+				Arc::clone(&opts.internal_comparator),
 			),
 			max_block_size,
 			index_size: 0,
@@ -96,7 +96,7 @@ impl TopLevelIndexWriter {
 		let new_block = BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		);
 		let finished_block = std::mem::replace(&mut self.current_block, new_block);
 		self.index_blocks.push(finished_block);
@@ -130,7 +130,7 @@ impl TopLevelIndexWriter {
 			let new_block = BlockWriter::new(
 				self.opts.block_size,
 				self.opts.block_restart_interval,
-				Arc::clone(&self.opts.comparator),
+				Arc::clone(&self.opts.internal_comparator),
 			);
 			let old_block = std::mem::replace(&mut self.current_block, new_block);
 			self.index_blocks.push(old_block);
@@ -139,7 +139,7 @@ impl TopLevelIndexWriter {
 		let mut top_level_index = BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		);
 
 		// Track number of partitions
@@ -194,7 +194,8 @@ impl TopLevelIndex {
 		f: Arc<dyn File>,
 		location: &BlockHandle,
 	) -> Result<Self> {
-		let block = read_table_block(Arc::clone(&opt.comparator), Arc::clone(&f), location)?;
+		let block =
+			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
 		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
@@ -214,7 +215,7 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn find_block_handle_by_key(&self, target: &[u8]) -> Option<&BlockHandleWithKey> {
-		let internal_cmp = InternalKeyComparator::new(Arc::clone(&self.opts.comparator));
+		let internal_cmp = &self.opts.internal_comparator;
 
 		// Find the partition point in the blocks where the key would fit.
 		// Uses full internal key comparison for correct partition lookup.
@@ -234,7 +235,7 @@ impl TopLevelIndex {
 		}
 
 		let block_data = read_table_block(
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 			Arc::clone(&self.file),
 			&block_handle.handle,
 		)?;

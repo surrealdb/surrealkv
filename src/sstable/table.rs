@@ -218,14 +218,14 @@ impl<W: Write> TableWriter<W> {
 			data_block: Some(BlockWriter::new(
 				opts.block_size,
 				opts.block_restart_interval,
-				Arc::clone(&opts.comparator),
+				Arc::clone(&opts.internal_comparator),
 			)),
 			partitioned_index: TopLevelIndexWriter::new(
 				Arc::clone(&opts),
 				opts.index_partition_size,
 			),
 			filter_block: fb,
-			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
+			internal_cmp: opts.internal_comparator.clone() as Arc<dyn Comparator>,
 		}
 	}
 
@@ -306,7 +306,7 @@ impl<W: Write> TableWriter<W> {
 		self.data_block = Some(BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		));
 
 		Ok(())
@@ -335,7 +335,7 @@ impl<W: Write> TableWriter<W> {
 		let mut meta_ix_block = BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		);
 
 		// Write the filter block to the meta index block if present.
@@ -579,7 +579,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 }
 
 pub(crate) fn read_table_block(
-	comparator: Arc<dyn Comparator>,
+	comparator: Arc<InternalKeyComparator>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
@@ -660,8 +660,11 @@ impl Table {
 			IndexType::Partitioned(partitioned_index)
 		};
 
-		let metaindexblock =
-			read_table_block(Arc::clone(&opts.comparator), Arc::clone(&file), &footer.meta_index)?;
+		let metaindexblock = read_table_block(
+			Arc::clone(&opts.internal_comparator),
+			Arc::clone(&file),
+			&footer.meta_index,
+		)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
 		let writer_metadata =
@@ -679,7 +682,7 @@ impl Table {
 			id,
 			file,
 			file_size,
-			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
+			internal_cmp: Arc::clone(&opts.internal_comparator),
 			opts,
 			filter_reader,
 			index_block,
@@ -735,8 +738,11 @@ impl Table {
 			return Ok(block);
 		}
 
-		let b =
-			read_table_block(Arc::clone(&self.opts.comparator), Arc::clone(&self.file), location)?;
+		let b = read_table_block(
+			Arc::clone(&self.opts.internal_comparator),
+			Arc::clone(&self.file),
+			location,
+		)?;
 		let b = Arc::new(b);
 
 		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
