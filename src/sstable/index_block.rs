@@ -268,7 +268,6 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::Iterator;
 
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)

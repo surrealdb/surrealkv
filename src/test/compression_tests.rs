@@ -10,7 +10,7 @@ use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::{CompressionType, Iterator, Options};
+use crate::{CompressionType, Options};
 
 // ========== Helper Functions ==========
 

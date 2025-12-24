@@ -5,7 +5,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::InternalKey;
-use crate::{Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value};
+use crate::{Comparator, InternalKeyComparator, Key, Value};
 
 pub(crate) type BlockData = Vec<u8>;
 
@@ -455,9 +455,9 @@ impl DoubleEndedIterator for BlockIterator {
 	}
 }
 
-impl LSMIterator for BlockIterator {
+impl BlockIterator {
 	// Checks if the iterator is valid (has a current entry)
-	fn valid(&self) -> bool {
+	pub(crate) fn valid(&self) -> bool {
 		!self.current_key.is_empty()
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
@@ -465,13 +465,13 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Move to the first entry
-	fn seek_to_first(&mut self) {
+	pub(crate) fn seek_to_first(&mut self) {
 		self.seek_to_restart_point(0);
 		self.seek_next_entry();
 	}
 
 	// Move to the last entry
-	fn seek_to_last(&mut self) {
+	pub(crate) fn seek_to_last(&mut self) {
 		if self.restart_points.is_empty() {
 			self.reset();
 		} else {
@@ -493,7 +493,7 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Move to a specific key or the next larger key
-	fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
 		self.reset();
 
 		let mut left = 0;
@@ -526,7 +526,7 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Move to the next entry
-	fn advance(&mut self) -> bool {
+	pub(crate) fn advance(&mut self) -> bool {
 		if self.offset >= self.restart_offset {
 			self.reset();
 			return false;
@@ -537,7 +537,7 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Move to the previous entry
-	fn prev(&mut self) -> bool {
+	pub(crate) fn prev(&mut self) -> bool {
 		let original = self.current_entry_offset;
 		if original == 0 {
 			self.reset();
@@ -577,13 +577,13 @@ impl LSMIterator for BlockIterator {
 
 	// Get the current key
 	#[inline]
-	fn key(&self) -> InternalKey {
+	pub(crate) fn key(&self) -> InternalKey {
 		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value
 	#[inline]
-	fn value(&self) -> Value {
+	pub(crate) fn value(&self) -> Value {
 		if self.keys_only {
 			Vec::new()
 		} else {

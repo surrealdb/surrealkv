@@ -28,7 +28,6 @@ use crate::{
 	FilterPolicy,
 	InternalKeyComparator,
 	InternalKeyRange,
-	Iterator as LSMIterator,
 	Options,
 	Value,
 };
@@ -974,13 +973,13 @@ impl TableIterator {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
-	#[inline]
-	fn key(&self) -> InternalKey {
+	#[cfg(test)]
+	pub(crate) fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
-	#[inline]
-	fn value(&self) -> Value {
+	#[cfg(test)]
+	pub(crate) fn value(&self) -> Value {
 		self.current_block.as_ref().unwrap().value()
 	}
 
@@ -996,7 +995,7 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
-	fn prev(&mut self) -> bool {
+	pub(crate) fn prev(&mut self) -> bool {
 		if let Some(ref mut block) = self.current_block {
 			if block.prev() {
 				return true;
@@ -1282,14 +1281,14 @@ impl DoubleEndedIterator for TableIterator {
 	}
 }
 
-impl LSMIterator for TableIterator {
-	fn valid(&self) -> bool {
+impl TableIterator {
+	pub(crate) fn valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
 			&& self.current_block.as_ref().unwrap().valid()
 	}
 
-	fn seek_to_first(&mut self) {
+	pub(crate) fn seek_to_first(&mut self) {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
@@ -1325,7 +1324,7 @@ impl LSMIterator for TableIterator {
 		self.reset();
 	}
 
-	fn seek_to_last(&mut self) {
+	pub(crate) fn seek_to_last(&mut self) {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
@@ -1370,7 +1369,7 @@ impl LSMIterator for TableIterator {
 		}
 	}
 
-	fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// Extract user key from target for partition lookup (optimization)
@@ -1447,7 +1446,7 @@ impl LSMIterator for TableIterator {
 		Some(())
 	}
 
-	fn advance(&mut self) -> bool {
+	pub(crate) fn advance(&mut self) -> bool {
 		// If exhausted, stay exhausted
 		if self.exhausted {
 			return false;
@@ -1484,20 +1483,6 @@ impl LSMIterator for TableIterator {
 				false
 			}
 		}
-	}
-
-	fn prev(&mut self) -> bool {
-		TableIterator::prev(self)
-	}
-
-	#[inline]
-	fn key(&self) -> InternalKey {
-		self.key()
-	}
-
-	#[inline]
-	fn value(&self) -> Value {
-		self.value()
 	}
 }
 
@@ -4582,8 +4567,6 @@ mod tests {
 		// Uses self.index_block.prev() which only works within the first partition.
 		// The correct inherent prev() method (lines 1022-1083) handles partitions properly.
 
-		use crate::Iterator as LSMIterator; // Import the trait to call method explicitly
-
 		// Use very small index_partition_size to force multiple index partitions
 		// Each data block adds an entry to the index partition
 		// With index_partition_size=50 and block_size=50, we should get multiple partitions
@@ -4643,14 +4626,14 @@ mod tests {
 		// Now test with explicit trait method call
 		// Reset iterator
 		let mut iter2 = table_arc.iter(false, None);
-		LSMIterator::seek_to_last(&mut iter2);
-		assert!(LSMIterator::valid(&iter2), "Iterator should be valid after seek_to_last");
+		iter2.seek_to_last();
+		assert!(iter2.valid(), "Iterator should be valid after seek_to_last");
 
 		// Collect all keys going backwards using the BUGGY trait prev() method
 		let mut buggy_results = Vec::new();
-		buggy_results.push(LSMIterator::key(&iter2).user_key);
-		while LSMIterator::prev(&mut iter2) {
-			buggy_results.push(LSMIterator::key(&iter2).user_key.clone());
+		buggy_results.push(iter2.key().user_key);
+		while iter2.prev() {
+			buggy_results.push(iter2.key().user_key.clone());
 		}
 		let buggy_count = buggy_results.len();
 		println!("Buggy trait prev() found {} keys", buggy_count);

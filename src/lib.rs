@@ -35,7 +35,6 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
 /// An optimised trait for converting values to bytes only when needed
@@ -573,47 +572,6 @@ pub trait FilterPolicy: Send + Sync {
 
 	/// Creates a filter based on given keys
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
-}
-
-pub(crate) trait Iterator {
-	/// An iterator is either positioned at a key/value pair, or
-	/// not valid.  This method returns true iff the iterator is valid.
-	fn valid(&self) -> bool;
-
-	/// Position at the first key in the source.  The iterator is `Valid()`
-	/// after this call iff the source is not empty.
-	fn seek_to_first(&mut self);
-
-	/// Position at the last key in the source.  The iterator is
-	/// `Valid()` after this call iff the source is not empty.
-	fn seek_to_last(&mut self);
-
-	/// Position at the first key in the source that is at or past target.
-	/// The iterator is valid after this call iff the source contains
-	/// an entry that comes at or past target.
-	fn seek(&mut self, target: &[u8]) -> Option<()>;
-
-	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the
-	/// source. REQUIRES: `valid()`
-	fn advance(&mut self) -> bool;
-
-	/// Moves to the previous entry in the source.  After this call, the
-	/// iterator is valid iff the iterator was not positioned at the first
-	/// entry in source. REQUIRES: `valid()`
-	fn prev(&mut self) -> bool;
-
-	/// Return the key for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn key(&self) -> InternalKey;
-
-	/// Return the value for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn value(&self) -> Value;
 }
 
 use std::ops::Bound;
