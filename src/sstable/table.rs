@@ -757,8 +757,8 @@ impl Table {
 
 		let handle = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
-				// First find the correct partition using just the user key (optimization)
-				let partition_block = match partitioned_index.get(key.user_key.as_slice()) {
+				// Use full internal key for correct partition lookup
+				let partition_block = match partitioned_index.get(key_encoded) {
 					Ok(block) => block,
 					Err(_e) => {
 						return Ok(None);
@@ -1372,13 +1372,8 @@ impl TableIterator {
 	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
-		// Extract user key from target for partition lookup (optimization)
-		let target_key = InternalKey::decode(target);
-
-		// For partitioned index, first find the correct partition
-		if let Some(block_handle) =
-			partitioned_index.find_block_handle_by_key(target_key.user_key.as_slice())
-		{
+		// For partitioned index, use full internal key for correct partition lookup
+		if let Some(block_handle) = partitioned_index.find_block_handle_by_key(target) {
 			// Find the partition index
 			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
 				if std::ptr::eq(handle, block_handle) {
@@ -4648,5 +4643,149 @@ mod tests {
 			 crossing partition boundaries.",
 			buggy_count, correct_count
 		);
+	}
+
+	#[test]
+	fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
+		// REGRESSION TEST: The TopLevelIndex stores only user_key, losing seq_num ordering.
+		// When the same user_key has many versions spanning multiple partitions,
+		// Table::get may return None even when a visible version exists.
+		//
+		// Bug location:
+		// - src/sstable/index_block.rs:199-206 - TopLevelIndex construction only stores user_key
+		// - src/sstable/index_block.rs:216-231 - find_block_handle_by_key uses user_key comparison
+		// - src/sstable/table.rs:761 - Table::get uses user_key-only partition lookup
+		//
+		// Scenario:
+		// - Partition 0 ends with internal key (foo, 50) -> stores user_key "foo"
+		// - Partition 1 contains (foo, 49)...(foo, 10) and ends with (goo, 5) -> stores user_key
+		//   "goo"
+		// - Query for (foo, 25) should find entry in partition 1
+		// - BUG: find_block_handle_by_key("foo") returns partition 0, which doesn't contain (foo,
+		//   25)
+
+		// Use very small partition and block sizes to force the same user_key to span partitions
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(50) // Small blocks = more index entries
+				.with_index_partition_size(50), // Small partitions to force user_key to span
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add many versions of the SAME user key with decreasing seq_nums
+		// Internal key ordering: user_key ASC, seq_num DESC
+		// So (foo, 100) < (foo, 99) < ... < (foo, 1) in sort order
+		let user_key = b"foo";
+		let num_versions = 100;
+
+		for seq in (1..=num_versions).rev() {
+			// Entries are added in internal key order (descending seq_num first)
+			let key = InternalKey::new(user_key.to_vec(), seq as u64, InternalKeyKind::Set, 0);
+			writer.add(key, format!("value_at_seq_{}", seq).as_bytes()).unwrap();
+		}
+
+		// Add a different user key at the end to ensure we have a partition boundary after "foo"
+		let key = InternalKey::new(b"goo".to_vec(), 1, InternalKeyKind::Set, 0);
+		writer.add(key, b"value_goo").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify we have multiple partitions (the bug requires this)
+		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
+		let num_partitions = partitioned_index.blocks.len();
+
+		println!("Created table with {} index partitions", num_partitions);
+		for (i, block) in partitioned_index.blocks.iter().enumerate() {
+			let sep_key = InternalKey::decode(&block.separator_key);
+			println!(
+				"  Partition {}: user_key = {:?}, seq = {}",
+				i,
+				String::from_utf8_lossy(&sep_key.user_key),
+				sep_key.seq_num()
+			);
+		}
+
+		assert!(
+			num_partitions >= 2,
+			"Test requires at least 2 index partitions to trigger the bug, got {}. \
+			 Adjust index_partition_size or add more versions.",
+			num_partitions
+		);
+
+		// Check if there are multiple partitions with the same user_key "foo"
+		// If partitions 0 and 1+ both have user_key "foo", the bug is triggerable
+		let foo_partitions: Vec<_> = partitioned_index
+			.blocks
+			.iter()
+			.enumerate()
+			.filter(|(_, b)| InternalKey::decode(&b.separator_key).user_key == b"foo")
+			.collect();
+
+		println!(
+			"Partitions with user_key 'foo': {:?}",
+			foo_partitions.iter().map(|(i, _)| i).collect::<Vec<_>>()
+		);
+
+		// Now test the bug: query for a seq_num that should be in a later partition
+		// If we have (foo, 100), (foo, 99), ..., (foo, 1) spread across partitions:
+		// - Partition 0 might end with (foo, 60) or similar (high seq nums)
+		// - Later partitions contain lower seq nums like (foo, 25)
+		//
+		// Query at seq_num 30: should find (foo, 30) or latest version visible at seq 30
+		let query_seq = 30u64;
+		let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+
+		let result = table.get(lookup_key.clone()).unwrap();
+
+		// The expected result: we should find a version with seq_num <= query_seq
+		// For query_seq=30, we should find (foo, 30) with value "value_at_seq_30"
+		assert!(
+			result.is_some(),
+			"BUG DETECTED: Table::get returned None for (foo, seq={}), but version exists!\n\
+			 The bug is in TopLevelIndex::find_block_handle_by_key which uses user_key-only lookup.\n\
+			 When the same user_key spans multiple partitions, it only searches the first partition\n\
+			 (which contains high seq_nums) and misses entries in later partitions (low seq_nums).",
+			query_seq
+		);
+
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key, user_key.to_vec());
+		println!(
+			"Found key with seq_num={}, value={:?}",
+			found_key.seq_num(),
+			String::from_utf8_lossy(&found_value)
+		);
+
+		// The found seq_num should be <= query_seq (latest visible version)
+		assert!(
+			found_key.seq_num() <= query_seq,
+			"Found version seq_num {} should be <= query seq_num {}",
+			found_key.seq_num(),
+			query_seq
+		);
+
+		// Test multiple query points to ensure correctness across partition boundaries
+		for query_seq in [10, 25, 50, 75, 99] {
+			let lookup = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+
+			let result = table.get(lookup).unwrap();
+			assert!(
+				result.is_some(),
+				"BUG: Table::get returned None for (foo, seq={}), but version should exist!",
+				query_seq
+			);
+
+			let (found_key, _) = result.unwrap();
+			assert!(
+				found_key.seq_num() <= query_seq,
+				"For query seq={}, found seq={} which is greater (should be <=)",
+				query_seq,
+				found_key.seq_num()
+			);
+		}
 	}
 }

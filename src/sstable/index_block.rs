@@ -1,20 +1,21 @@
 // Note: Needs to be tested if a top-level index improves performance as such.
 // TODO: Replace the current non-partitioned index block writer with this
+use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::comparator::{Comparator, InternalKeyComparator};
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
-use crate::sstable::InternalKey;
 use crate::vfs::File;
-use crate::{CompressionType, Key, Options};
+use crate::{CompressionType, Options};
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
-	/// User key of last item in block
-	pub user_key: Key,
+	/// Full encoded separator key (internal key with seq_num)
+	pub separator_key: Vec<u8>,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -22,9 +23,9 @@ pub(crate) struct BlockHandleWithKey {
 
 impl BlockHandleWithKey {
 	#[cfg(test)]
-	pub(crate) fn new(user_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
+	pub(crate) fn new(separator_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
-			user_key,
+			separator_key,
 			handle,
 		}
 	}
@@ -197,11 +198,10 @@ impl TopLevelIndex {
 		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
-			// Extract user key from the encoded internal key
-			let internal_key = InternalKey::decode(&key);
+			// Store full encoded internal key for correct partition lookup
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
-				user_key: internal_key.user_key,
+				separator_key: key,
 				handle,
 			});
 		}
@@ -213,21 +213,19 @@ impl TopLevelIndex {
 		})
 	}
 
-	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
-		// Find the partition point in the blocks where the key would fit.
-		let index = self.blocks.partition_point(|block| block.user_key.as_slice() < user_key);
+	pub(crate) fn find_block_handle_by_key(&self, target: &[u8]) -> Option<&BlockHandleWithKey> {
+		let internal_cmp = InternalKeyComparator::new(Arc::clone(&self.opts.comparator));
 
-		// Attempt to retrieve the block at the found index.
-		let result = self.blocks.get(index).and_then(|block| {
-			// Compare user keys directly
-			if user_key <= block.user_key.as_slice() {
-				Some(block)
-			} else {
-				None
-			}
+		// Find the partition point in the blocks where the key would fit.
+		// Uses full internal key comparison for correct partition lookup.
+		let index = self.blocks.partition_point(|block| {
+			internal_cmp.compare(&block.separator_key, target) == Ordering::Less
 		});
 
-		result
+		// Attempt to retrieve the block at the found index.
+		self.blocks
+			.get(index)
+			.filter(|block| internal_cmp.compare(target, &block.separator_key) != Ordering::Greater)
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
@@ -250,8 +248,8 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn get(&self, user_key: &[u8]) -> Result<Arc<Block>> {
-		let Some(block_handle) = self.find_block_handle_by_key(user_key) else {
+	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
+		let Some(block_handle) = self.find_block_handle_by_key(target) else {
 			return Err(Error::BlockNotFound);
 		};
 
@@ -378,38 +376,42 @@ mod tests {
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
-		// Initialize TopLevelIndex with predefined blocks using user keys only
+		// Create separator keys as full encoded internal keys
+		let sep_c = create_internal_key(b"c".to_vec(), 1);
+		let sep_f = create_internal_key(b"f".to_vec(), 1);
+		let sep_j = create_internal_key(b"j".to_vec(), 1);
+
+		// Initialize TopLevelIndex with predefined blocks using encoded internal keys
 		let index = TopLevelIndex {
 			id: 0,
 			opts,
 			blocks: vec![
-				BlockHandleWithKey::new(b"c".to_vec(), BlockHandle::new(0, 10)),
-				BlockHandleWithKey::new(b"f".to_vec(), BlockHandle::new(10, 10)),
-				BlockHandleWithKey::new(b"j".to_vec(), BlockHandle::new(20, 10)),
+				BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(0, 10)),
+				BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
+				BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 			],
 			file: f.clone(),
 		};
 
-		// A list of tuples where the first element is the key to find,
-		// and the second element is the expected block key result.
-		let test_cases: &[(&[u8], Option<&[u8]>)] = &[
-			(b"a", Some(b"c" as &[u8])),
-			(b"c", Some(b"c")),
-			(b"d", Some(b"f")),
-			(b"e", Some(b"f")),
-			(b"f", Some(b"f")),
-			(b"g", Some(b"j")),
-			(b"j", Some(b"j")),
-			(b"z", None),
+		// A list of tuples where the first element is the encoded internal key to find,
+		// and the second element is the expected separator key result.
+		let test_cases: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
+			(create_internal_key(b"a".to_vec(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"c".to_vec(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"d".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"e".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"f".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"g".to_vec(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"j".to_vec(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"z".to_vec(), 1), None),
 		];
 
 		for (key, expected) in test_cases.iter() {
-			// Pass user key directly instead of encoding as internal key
 			let result = index.find_block_handle_by_key(key);
 			match expected {
-				Some(expected_key) => {
+				Some(expected_sep_key) => {
 					let handle = result.expect("Expected a block handle but got None");
-					assert_eq!(handle.user_key, *expected_key, "Mismatch for key {key:?}");
+					assert_eq!(&handle.separator_key, expected_sep_key, "Mismatch for key {key:?}");
 				}
 				None => assert!(result.is_none(), "Expected None for key {key:?}, but got Some"),
 			}
@@ -449,25 +451,26 @@ mod tests {
 		let file = wrap_buffer(buffer);
 		let index = TopLevelIndex::new(0, opts, file, &top_level_handle).unwrap();
 
-		// Test lookups for various keys
+		// Test lookups for various keys using encoded internal keys
 		for (key, _) in &entries {
-			// Pass user key directly instead of encoding as internal key
-			let block = index.get(key.as_bytes()).unwrap();
+			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
+			let block = index.get(&internal_key).unwrap();
 			assert!(block.size() > 0, "Block should not be empty for key {key}");
 
 			// Verify the block contains the expected handle by checking if we can find it
-			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
 			let mut block_iter = block.iter(false);
 			block_iter.seek(&internal_key);
 			assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
 		}
 
 		// Test lookup for non-existent key before range
-		let block = index.get(b"key_000").unwrap();
+		let key_before = create_internal_key(b"key_000".to_vec(), 1);
+		let block = index.get(&key_before).unwrap();
 		assert!(block.size() > 0, "Should find first block for key before range");
 
 		// Test lookup for non-existent key after range
-		match index.get(b"key_999") {
+		let key_after = create_internal_key(b"key_999".to_vec(), 1);
+		match index.get(&key_after) {
 			Ok(_) => {
 				// This is acceptable - might find the last block
 			}
