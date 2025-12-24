@@ -1706,8 +1706,7 @@ mod tests {
 		}
 		// Add tombstone that should win over other tables
 		let tombstone_key = "key-014".as_bytes().to_vec();
-		let tombstone =
-			InternalKey::new(Vec::from(tombstone_key), 210, InternalKeyKind::Delete, 0);
+		let tombstone = InternalKey::new(Vec::from(tombstone_key), 210, InternalKeyKind::Delete, 0);
 		entries3.push((tombstone, vec![]));
 
 		// Create tables and add to L0
@@ -2359,10 +2358,7 @@ mod tests {
 		let raw_value = b"some-value".to_vec();
 		let encoded_value = create_inline_value(&raw_value);
 		let l1_entries = vec![
-			(
-				InternalKey::new(Vec::from(key.clone()), 200, InternalKeyKind::Set, 0),
-				encoded_value,
-			),
+			(InternalKey::new(Vec::from(key.clone()), 200, InternalKeyKind::Set, 0), encoded_value),
 			(
 				InternalKey::new(Vec::from(key), 100, InternalKeyKind::SoftDelete, 0),
 				vec![], // Older SoftDelete also has empty value

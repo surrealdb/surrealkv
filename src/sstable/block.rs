@@ -504,7 +504,8 @@ impl LSMIterator for BlockIterator {
 			let mid = (left + right).div_ceil(2);
 			self.seek_to_restart_point(mid);
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let current_key = &self.block[self.offset + i..self.offset + i + shared_prefix + non_shared_key];
+			let current_key =
+				&self.block[self.offset + i..self.offset + i + shared_prefix + non_shared_key];
 
 			match self.internal_cmp.compare(&current_key, target) {
 				Ordering::Less => left = mid,

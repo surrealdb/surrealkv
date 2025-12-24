@@ -114,12 +114,7 @@ pub(crate) struct InternalKey {
 }
 
 impl InternalKey {
-	pub(crate) fn new(
-		user_key: Key,
-		seq_num: u64,
-		kind: InternalKeyKind,
-		timestamp: u64,
-	) -> Self {
+	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
 		Self {
 			user_key,
 			timestamp,

@@ -528,12 +528,8 @@ mod tests {
 			let key = format!("key_{i:05}");
 			let value = format!("value_{i:05}");
 
-			let internal_key = InternalKey::new(
-				key.as_bytes().to_vec(),
-				i + 1,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -892,12 +888,8 @@ mod tests {
 			let key = format!("key_{seq_num:05}");
 			let value = format!("value_{seq_num:05}");
 
-			let internal_key = InternalKey::new(
-				key.as_bytes().to_vec(),
-				seq_num,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}

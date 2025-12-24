@@ -241,12 +241,7 @@ impl Snapshot {
 		// Check the tables in each level for the key
 		for level in &level_manifest.levels {
 			for table in level.tables.iter() {
-				let ikey = InternalKey::new(
-					key.to_vec(),
-					self.seq_num,
-					InternalKeyKind::Set,
-					0,
-				);
+				let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
 				if !table.is_key_in_key_range(&ikey) {
 					continue; // Skip this table if the key is not in its range
@@ -422,28 +417,18 @@ impl Snapshot {
 
 			// Convert to InternalKey format for the B+ tree query
 			let start_key = match start_bound {
-				Bound::Included(key) => InternalKey::new(
-					key.to_vec(),
-					0,
-					InternalKeyKind::Set,
-					params.start_ts,
-				)
-				.encode(),
+				Bound::Included(key) => {
+					InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set, params.start_ts)
+						.encode()
+				}
 				Bound::Excluded(key) => {
 					// For excluded bounds, create a key that's lexicographically greater
 					let mut next_key = key.clone();
 					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(
-						next_key,
-						0,
-						InternalKeyKind::Set,
-						params.start_ts,
-					)
-					.encode()
+					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
 				}
 				Bound::Unbounded => {
-					InternalKey::new(Key::new(), 0, InternalKeyKind::Set, params.start_ts)
-						.encode()
+					InternalKey::new(Key::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
 				}
 			};
 
@@ -458,8 +443,7 @@ impl Snapshot {
 				Bound::Excluded(key) => {
 					// For excluded bounds, use minimal InternalKey properties so range stops just
 					// before this key
-					InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set, 0)
-						.encode()
+					InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set, 0).encode()
 				}
 				Bound::Unbounded => InternalKey::new(
 					[0xff].to_vec(),
@@ -1416,8 +1400,7 @@ mod tests {
 			{
 				let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
 				for (k, v) in data {
-					let ikey =
-						InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
+					let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
 					w.add(ikey, v).unwrap();
 				}
 				w.finish().unwrap();
@@ -1781,12 +1764,8 @@ mod tests {
 			let seq_num = seq_start + i as u64;
 			let value = format!("value_{seq_num}");
 
-			let internal_key = InternalKey::new(
-				key.as_bytes().to_vec(),
-				seq_num,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}

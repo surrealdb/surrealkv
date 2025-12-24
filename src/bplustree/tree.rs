@@ -235,7 +235,7 @@ trait Node {
 struct InternalNode {
 	keys: Vec<Key>, // Full keys (reconstructed from page + overflow if needed)
 	key_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for THIS
-	                   * node's keys */
+	                 * node's keys */
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -640,7 +640,7 @@ impl Node for InternalNode {
 /// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
 /// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Key>,   // Full keys (reconstructed from page + overflow if needed)
+	keys: Vec<Key>,     // Full keys (reconstructed from page + overflow if needed)
 	values: Vec<Value>, // Full values (reconstructed from page + overflow if needed)
 	cell_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for cell
 	                     * (key+value) */
@@ -809,12 +809,7 @@ impl LeafNode {
 	// If key already exists, update the value (treat as update)
 	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was
 	// updated, None if new
-	fn insert(
-		&mut self,
-		key: Key,
-		value: Value,
-		compare: &dyn Comparator,
-	) -> (usize, Option<u64>) {
+	fn insert(&mut self, key: Key, value: Value, compare: &dyn Comparator) -> (usize, Option<u64>) {
 		match self.keys.binary_search_by(|k| compare.compare(k, &key)) {
 			Ok(idx) => {
 				// Key exists - update
@@ -832,12 +827,7 @@ impl LeafNode {
 			}
 			Err(idx) => {
 				// Key not found - insert
-				self.insert_cell_with_overflow(
-					idx,
-					key,
-					value,
-					0,
-				);
+				self.insert_cell_with_overflow(idx, key, value, 0);
 				(idx, None)
 			}
 		}
@@ -1885,12 +1875,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				new_leaf.values[0] = value;
 				new_leaf.set_overflow_at(0, 0);
 			} else {
-				leaf.insert_cell_with_overflow(
-					0,
-					key,
-					value,
-					0,
-				);
+				leaf.insert_cell_with_overflow(0, key, value, 0);
 			}
 		} else if idx < split_idx {
 			// New entry goes to left leaf
@@ -1905,12 +1890,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				leaf.values[idx] = value;
 				leaf.set_overflow_at(idx, 0);
 			} else {
-				leaf.insert_cell_with_overflow(
-					idx,
-					key,
-					value,
-					0,
-				);
+				leaf.insert_cell_with_overflow(idx, key, value, 0);
 			}
 		} else {
 			// New entry goes to right leaf
@@ -1927,12 +1907,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				new_leaf.values[right_idx] = value;
 				new_leaf.set_overflow_at(right_idx, 0);
 			} else {
-				new_leaf.insert_cell_with_overflow(
-					right_idx,
-					key,
-					value,
-					0,
-				);
+				new_leaf.insert_cell_with_overflow(right_idx, key, value, 0);
 			}
 		}
 

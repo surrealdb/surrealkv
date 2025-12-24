@@ -1075,7 +1075,6 @@ impl VLog {
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
 
-
 				let size = internal_key.user_key.len() + value.len();
 				let val = if value.is_empty() {
 					None

@@ -825,8 +825,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				Some(value) => {
 					// Small value or no VLog: store inline
-					let value_location =
-						ValueLocation::with_inline_value(value.clone());
+					let value_location = ValueLocation::with_inline_value(value.clone());
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled

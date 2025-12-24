@@ -909,12 +909,7 @@ impl Transaction {
 			} else {
 				commit_timestamp
 			};
-			batch.add_record(
-				entry.kind,
-				entry.key,
-				entry.value,
-				timestamp,
-			)?;
+			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
 		}
 
 		// Write the batch to storage
@@ -1693,19 +1688,10 @@ mod tests {
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn2.get(Vec::from(&[
-				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
-			]))
-			.unwrap();
-			txn2.get(Vec::from(&[
-				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
-			]))
-			.unwrap();
-			txn2.set(
-				Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]),
-				&value1,
-			)
-			.unwrap();
+			txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+			txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+			txn2.set(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]), &value1)
+				.unwrap();
 
 			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
