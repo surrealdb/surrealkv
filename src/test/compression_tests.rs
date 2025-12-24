@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempdir::TempDir;
@@ -84,7 +83,7 @@ fn build_table_with_compression(
 		let mut builder = TableWriter::new(&mut d, 0, opt, 0);
 		for (k, v) in data.iter() {
 			builder
-				.add(InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0), v)
+				.add(InternalKey::new(Vec::from(k), 1, InternalKeyKind::Set, 0), v)
 				.unwrap();
 		}
 		builder.finish().unwrap();
@@ -138,7 +137,7 @@ fn test_compression_10k_pairs_roundtrip() {
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
 		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+			InternalKey::new(Vec::from(&data[idx].0), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Iterator should be valid after seek");
 		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
@@ -315,7 +314,7 @@ fn test_compression_iterator_operations() {
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
 		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+			InternalKey::new(Vec::from(&data[idx].0), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Should find key at index {}", idx);
 		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
@@ -362,7 +361,7 @@ fn test_compression_iterator_operations() {
 	assert_eq!(iter.key().user_key.as_ref(), &data[0].0[..]);
 
 	let mid_key =
-		InternalKey::new(Bytes::copy_from_slice(&data[5000].0), 2, InternalKeyKind::Set, 0);
+		InternalKey::new(Vec::from(&data[5000].0), 2, InternalKeyKind::Set, 0);
 	iter.seek(&mid_key.encode());
 	assert_eq!(iter.key().user_key.as_ref(), &data[5000].0[..]);
 
@@ -424,7 +423,7 @@ fn test_compression_large_values() {
 	let test_indices = [0, 100, 500, 999];
 	for &idx in &test_indices {
 		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+			InternalKey::new(Vec::from(&data[idx].0), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Should find large value at index {}", idx);
 		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
@@ -920,7 +919,7 @@ fn test_table_writer_with_level_compression() {
 			vec![(b"key1".to_vec(), b"value1".to_vec()), (b"key2".to_vec(), b"value2".to_vec())];
 
 		for (key, value) in data {
-			let ikey = InternalKey::new(Bytes::copy_from_slice(&key), 1, InternalKeyKind::Set, 0);
+			let ikey = InternalKey::new(Vec::from(&key), 1, InternalKeyKind::Set, 0);
 			writer.add(ikey, &value).unwrap();
 		}
 		writer.finish().unwrap();

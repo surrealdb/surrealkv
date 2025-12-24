@@ -2,7 +2,6 @@ use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::batch::Batch;
@@ -103,7 +102,7 @@ impl MemTable {
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let range = InternalKey::new(
-			Bytes::copy_from_slice(key),
+			key.to_vec(),
 			seq_no,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
@@ -144,7 +143,7 @@ impl MemTable {
 
 		// Pre-allocate empty value Bytes for delete operations to avoid repeated
 		// allocations
-		let empty_val: Value = Bytes::new();
+		let empty_val = Value::new();
 
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -245,7 +244,7 @@ impl MemTable {
 		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
-				Bytes::new()
+				Value::new()
 			} else {
 				entry.value().clone()
 			};
@@ -261,7 +260,7 @@ impl MemTable {
 		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
-				Bytes::new()
+				Value::new()
 			} else {
 				entry.value().clone()
 			};
@@ -598,9 +597,9 @@ mod tests {
 			*key_counts.entry(user_key).or_insert(0) += 1;
 		}
 
-		assert_eq!(key_counts[&Bytes::from_static(b"key1")], 1);
-		assert_eq!(key_counts[&Bytes::from_static(b"key2")], 2); // Original + tombstone
-		assert_eq!(key_counts[&Bytes::from_static(b"key3")], 1);
+		assert_eq!(key_counts[&b"key1".to_vec()], 1);
+		assert_eq!(key_counts[&b"key2".to_vec()], 2); // Original + tombstone
+		assert_eq!(key_counts[&b"key3".to_vec()], 1);
 	}
 
 	#[test]

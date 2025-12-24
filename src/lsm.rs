@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 
 use crate::batch::Batch;
 use crate::bplustree::tree::DiskBPlusTree;
@@ -827,7 +826,7 @@ impl CommitEnv for LsmCommitEnv {
 				Some(value) => {
 					// Small value or no VLog: store inline
 					let value_location =
-						ValueLocation::with_inline_value(Bytes::copy_from_slice(value));
+						ValueLocation::with_inline_value(value.clone());
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
@@ -849,8 +848,8 @@ impl CommitEnv for LsmCommitEnv {
 			// Add processed entry to batch
 			processed_batch.add_record_with_valueptr(
 				entry.kind,
-				&entry.key,
-				encoded_value.as_deref(),
+				entry.key.clone(),
+				encoded_value,
 				valueptr,
 				timestamp,
 			)?;
@@ -901,7 +900,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 
 				// Insert the new entry (whether it's regular Set or SetWithDelete)
-				versioned_index_guard.insert(encoded_key.as_ref(), encoded_value.as_ref())?;
+				versioned_index_guard.insert(encoded_key, encoded_value)?;
 			}
 		}
 
@@ -1890,7 +1889,7 @@ mod tests {
 		// Read back the key-value pair
 		let txn = tree.begin().unwrap();
 		let result = txn.get(key.as_bytes()).unwrap().unwrap();
-		assert_eq!(result, Bytes::copy_from_slice(value.as_bytes()));
+		assert_eq!(result, value.as_bytes().to_vec());
 	}
 
 	#[test(tokio::test)]
@@ -1923,7 +1922,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			let expected_value = values.last().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(expected_value.as_bytes()));
+			assert_eq!(result, expected_value.as_bytes().to_vec());
 		}
 	}
 
@@ -2012,7 +2011,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				Bytes::copy_from_slice(expected_value.as_bytes()),
+				expected_value.as_bytes().to_vec(),
 				"Key '{key}' should have final value '{expected_value}'"
 			);
 		}
@@ -2097,7 +2096,7 @@ mod tests {
 				let value = result.unwrap();
 				assert_eq!(
 					value,
-					Bytes::copy_from_slice(expected_value.as_bytes()),
+					expected_value.as_bytes().to_vec(),
 					"Key '{}' has incorrect value after reopening. Expected '{}', got '{:?}'",
 					key,
 					expected_value,
@@ -2178,7 +2177,7 @@ mod tests {
 			let txn = tree.begin().unwrap();
 			let result = txn.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key '{key}' should exist after restore");
-			assert_eq!(result.unwrap(), Bytes::copy_from_slice(expected_value.as_bytes()));
+			assert_eq!(result.unwrap(), expected_value.as_bytes().to_vec());
 		}
 
 		// Verify the newer keys don't exist after restore
@@ -2236,7 +2235,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				Bytes::copy_from_slice(format!("pending_value_{i:03}").as_bytes()),
+				format!("pending_value_{i:03}").as_bytes().to_vec(),
 				"Expected pending value before restore"
 			);
 		}
@@ -2253,7 +2252,7 @@ mod tests {
 			let result = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				result,
-				Bytes::copy_from_slice(expected_value.as_bytes()),
+				expected_value.as_bytes().to_vec(),
 				"Key '{key}' should have checkpoint value '{expected_value}', not pending value"
 			);
 		}
@@ -2905,10 +2904,10 @@ mod tests {
 		let txn = tree.begin().unwrap();
 
 		let retrieved_small = txn.get(small_key.as_bytes()).unwrap().unwrap();
-		assert_eq!(retrieved_small, Bytes::copy_from_slice(small_value.as_bytes()));
+		assert_eq!(retrieved_small, small_value.as_bytes().to_vec());
 
 		let retrieved_large = txn.get(large_key.as_bytes()).unwrap().unwrap();
-		assert_eq!(retrieved_large, Bytes::copy_from_slice(large_value.as_bytes()));
+		assert_eq!(retrieved_large, large_value.as_bytes().to_vec());
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -2957,7 +2956,7 @@ mod tests {
 						let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
 						assert_eq!(
 							retrieved,
-							Bytes::copy_from_slice(expected_value.as_bytes()),
+							expected_value.as_bytes().to_vec(),
 							"Reader {reader_id} failed to get correct value for key {key}"
 						);
 					}
@@ -3024,7 +3023,7 @@ mod tests {
 			let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
 			assert_eq!(
 				retrieved,
-				Bytes::copy_from_slice(expected_value.as_bytes()),
+				expected_value.as_bytes().to_vec(),
 				"Key {key} has incorrect value across file rotation"
 			);
 		}
@@ -5641,7 +5640,7 @@ mod tests {
 			// Verify real data still accessible
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"key1").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"value1"));
+			assert_eq!(result, b"value1".to_vec());
 
 			tree.close().await.unwrap();
 		}
@@ -5772,11 +5771,11 @@ mod tests {
 			// Verify WAL data was recovered
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"wal_key").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"wal_value"));
+			assert_eq!(result, b"wal_value".to_vec());
 
 			// Verify committed data still accessible
 			let result = txn.get(b"committed_key").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"committed_value"));
+			assert_eq!(result, b"committed_value".to_vec());
 
 			tree.close().await.unwrap();
 		}
@@ -5879,7 +5878,7 @@ mod tests {
 			// Verify data still accessible
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"key1").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"value"));
+			assert_eq!(result, b"value".to_vec());
 
 			tree.close().await.unwrap();
 		}
@@ -5985,10 +5984,10 @@ mod tests {
 			// Spot check a few specific values
 			let txn = tree.begin().unwrap();
 			let result = txn.get(b"batch0_key0").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"batch0_value0"));
+			assert_eq!(result, b"batch0_value0".to_vec());
 
 			let result = txn.get(b"batch4_key49").unwrap().unwrap();
-			assert_eq!(result, Bytes::copy_from_slice(b"batch4_value49"));
+			assert_eq!(result, b"batch4_value49".to_vec());
 
 			tree.close().await.unwrap();
 		}

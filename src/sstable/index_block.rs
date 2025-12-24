@@ -3,20 +3,18 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
 use crate::sstable::InternalKey;
 use crate::vfs::File;
-use crate::{CompressionType, Options};
+use crate::{CompressionType, Key, Options};
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
 	/// User key of last item in block
-	pub user_key: Bytes,
+	pub user_key: Key,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -26,7 +24,7 @@ impl BlockHandleWithKey {
 	#[cfg(test)]
 	pub(crate) fn new(user_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
-			user_key: Bytes::from(user_key),
+			user_key,
 			handle,
 		}
 	}
@@ -191,12 +189,12 @@ impl TopLevelIndex {
 
 	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
 		// Find the partition point in the blocks where the key would fit.
-		let index = self.blocks.partition_point(|block| block.user_key.as_ref() < user_key);
+		let index = self.blocks.partition_point(|block| block.user_key.as_slice() < user_key);
 
 		// Attempt to retrieve the block at the found index.
 		let result = self.blocks.get(index).and_then(|block| {
 			// Compare user keys directly
-			if user_key <= block.user_key.as_ref() {
+			if user_key <= block.user_key.as_slice() {
 				Some(block)
 			} else {
 				None
@@ -248,7 +246,6 @@ impl TopLevelIndex {
 mod tests {
 	use std::sync::Arc;
 
-	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
@@ -260,7 +257,7 @@ mod tests {
 	}
 
 	fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
-		InternalKey::new(Bytes::from(user_key), sequence, InternalKeyKind::Set, 0).encode()
+		InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
 	}
 
 	#[test]

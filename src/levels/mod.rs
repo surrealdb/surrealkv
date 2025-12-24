@@ -508,7 +508,6 @@ mod tests {
 	use std::fs::{self, File as SysFile};
 	use std::sync::atomic::Ordering;
 
-	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
@@ -530,7 +529,7 @@ mod tests {
 			let value = format!("value_{i:05}");
 
 			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(key.as_bytes()),
+				key.as_bytes().to_vec(),
 				i + 1,
 				InternalKeyKind::Set,
 				0,
@@ -894,7 +893,7 @@ mod tests {
 			let value = format!("value_{seq_num:05}");
 
 			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(key.as_bytes()),
+				key.as_bytes().to_vec(),
 				seq_num,
 				InternalKeyKind::Set,
 				0,

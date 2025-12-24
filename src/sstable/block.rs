@@ -1,14 +1,13 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::InternalKey;
 use crate::{Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Value};
 
-pub(crate) type BlockData = Bytes;
+pub(crate) type BlockData = Vec<u8>;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
 pub(crate) struct BlockHandle {
@@ -224,13 +223,13 @@ impl BlockWriter {
 					  Entries in block: {}\n\
 					  Buffer size: {} bytes",
 					String::from_utf8_lossy(&last_internal_key.user_key),
-					last_internal_key.user_key.as_ref(),
+					last_internal_key.user_key.as_slice(),
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
 					last_internal_key.timestamp,
 					self.last_key.as_slice(),
 					String::from_utf8_lossy(&current_internal_key.user_key),
-					current_internal_key.user_key.as_ref(),
+					current_internal_key.user_key.as_slice(),
 					current_internal_key.seq_num(),
 					current_internal_key.kind(),
 					current_internal_key.timestamp,
@@ -303,7 +302,7 @@ impl BlockWriter {
 		// 2. Append N_RESTARTS
 		self.buffer.write_fixedint(self.restart_points.len() as u32).expect("block write failed");
 
-		Bytes::from(self.buffer)
+		self.buffer
 	}
 
 	// Estimates the current size of the block
@@ -433,11 +432,11 @@ impl Iterator for BlockIterator {
 			return None;
 		}
 		let value = if self.keys_only {
-			Bytes::new()
+			Vec::new()
 		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
+		Some((self.current_key.clone(), value))
 	}
 }
 
@@ -448,11 +447,11 @@ impl DoubleEndedIterator for BlockIterator {
 		}
 
 		let value = if self.keys_only {
-			Bytes::new()
+			Vec::new()
 		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
+		Some((self.current_key.clone(), value))
 	}
 }
 
@@ -505,8 +504,7 @@ impl LSMIterator for BlockIterator {
 			let mid = (left + right).div_ceil(2);
 			self.seek_to_restart_point(mid);
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let current_key = self.block
-				.slice(self.offset + i..self.offset + i + shared_prefix + non_shared_key);
+			let current_key = &self.block[self.offset + i..self.offset + i + shared_prefix + non_shared_key];
 
 			match self.internal_cmp.compare(&current_key, target) {
 				Ordering::Less => left = mid,
@@ -586,9 +584,9 @@ impl LSMIterator for BlockIterator {
 	#[inline]
 	fn value(&self) -> Value {
 		if self.keys_only {
-			Bytes::new()
+			Vec::new()
 		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		}
 	}
 }
@@ -621,7 +619,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(Bytes::copy_from_slice(key), 0, kind, 0).encode()
+		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
 	}
 
 	#[test]
@@ -662,7 +660,7 @@ mod tests {
 		let mut i = 0;
 		while block_iter.advance() {
 			assert_eq!(block_iter.key().user_key.as_ref(), data[i].0);
-			assert_eq!(block_iter.value(), Bytes::copy_from_slice(data[i].1));
+			assert_eq!(block_iter.value(), data[i].1.to_vec());
 			i += 1;
 		}
 

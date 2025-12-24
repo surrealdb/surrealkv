@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use bytes::Bytes;
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock};
 
@@ -219,7 +218,7 @@ impl ValueLocation {
 	/// Creates a ValueLocation that points to a value in VLog
 	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
 		let encoded_pointer = pointer.encode();
-		Self::new(BIT_VALUE_POINTER, Bytes::from(encoded_pointer), VALUE_LOCATION_VERSION)
+		Self::new(BIT_VALUE_POINTER, encoded_pointer, VALUE_LOCATION_VERSION)
 	}
 
 	/// Creates a ValueLocation with inline value
@@ -277,7 +276,7 @@ impl ValueLocation {
 		let mut value = Vec::new();
 		reader.read_to_end(&mut value)?;
 
-		Ok(Self::new(meta, Bytes::from(value), version))
+		Ok(Self::new(meta, value, version))
 	}
 
 	/// Resolves the actual value, handling both inline and pointer cases
@@ -823,9 +822,8 @@ impl VLog {
 			}
 		}
 
-		// Convert to Bytes once, then use zero-copy slice for value
-		let entry_data = Bytes::from(entry_data_vec);
-		let value_bytes = entry_data.slice(value_start..crc_start);
+		// Extract value slice from entry data
+		let value_bytes = entry_data_vec[value_start..crc_start].to_vec();
 
 		// Cache the value in unified block cache for future reads
 		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
@@ -1076,20 +1074,24 @@ impl VLog {
 				// This preserves the original operation (Set, Delete, Merge, etc.)
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
+
+
+				let size = internal_key.user_key.len() + value.len();
 				let val = if value.is_empty() {
 					None
 				} else {
-					Some(value.as_slice())
+					Some(value.clone())
 				};
+
 				batch.add_record(
 					internal_key.kind(),
-					internal_key.user_key.as_ref(),
+					internal_key.user_key,
 					val,
 					internal_key.timestamp,
 				)?;
 
 				// Update batch size tracking
-				batch_size += internal_key.user_key.len() + value.len();
+				batch_size += size;
 
 				// If batch is full, commit it
 				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
@@ -1460,8 +1462,8 @@ impl DeleteList {
 			// Store sequence number -> value_size mapping
 			batch.add_record(
 				crate::sstable::InternalKeyKind::Set,
-				&seq_key,
-				Some(&value_size.to_be_bytes()),
+				seq_key,
+				Some(value_size.to_be_bytes().to_vec()),
 				0,
 			)?;
 		}
@@ -1503,7 +1505,7 @@ impl DeleteList {
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.add_record(crate::sstable::InternalKeyKind::Delete, &seq_key, None, 0)?;
+			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
 		}
 
 		// Commit the batch to the LSM tree using sync commit
@@ -1672,7 +1674,7 @@ mod tests {
 		// Verify that the cache contains the value
 		let cached_value = vlog.opts.block_cache.get_vlog(pointer.file_id, pointer.offset);
 		assert!(cached_value.is_some());
-		assert_eq!(cached_value.unwrap(), Bytes::from(value));
+		assert_eq!(cached_value.unwrap(), value);
 	}
 
 	#[test(tokio::test)]
@@ -1853,9 +1855,9 @@ mod tests {
 	#[test]
 	fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
-			ValueLocation::with_inline_value(Bytes::from_static(b"small data")),
+			ValueLocation::with_inline_value(b"small data".to_vec()),
 			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
-			ValueLocation::with_inline_value(Bytes::new()), // empty data
+			ValueLocation::with_inline_value(Vec::new()), // empty data
 		];
 
 		for location in test_cases {

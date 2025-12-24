@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use crate::Key;
 
 // This is the maximum valid sequence number that can be stored in the upper 56
 // bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
@@ -108,14 +108,14 @@ impl From<u8> for InternalKeyKind {
 /// It includes a timestamp field for versioned queries
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InternalKey {
-	pub(crate) user_key: Bytes,
+	pub(crate) user_key: Key,
 	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
 	pub(crate) trailer: u64,   // (seq_num << 8) | kind
 }
 
 impl InternalKey {
 	pub(crate) fn new(
-		user_key: Bytes,
+		user_key: Key,
 		seq_num: u64,
 		kind: InternalKeyKind,
 		timestamp: u64,
@@ -135,7 +135,7 @@ impl InternalKey {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = read_u64_be(encoded_key, n);
 		let timestamp = read_u64_be(encoded_key, n + 8);
-		let user_key = Bytes::copy_from_slice(&encoded_key[..n]);
+		let user_key = encoded_key[..n].to_vec();
 
 		Self {
 			user_key,
@@ -145,7 +145,7 @@ impl InternalKey {
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = self.user_key.as_ref().to_vec();
+		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
 		buf
@@ -208,7 +208,7 @@ impl PartialOrd for InternalKey {
 impl Default for InternalKey {
 	fn default() -> Self {
 		Self {
-			user_key: Bytes::new(),
+			user_key: Vec::new(),
 			timestamp: 0,
 			trailer: 0,
 		}

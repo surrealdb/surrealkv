@@ -1,6 +1,6 @@
-use bytes::Bytes;
 use integer_encoding::{VarInt, VarIntWriter};
 
+use crate::{Key, Value};
 use crate::error::{Error, Result};
 use crate::sstable::InternalKeyKind;
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
@@ -11,8 +11,8 @@ const BATCH_VERSION: u8 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
 	pub kind: InternalKeyKind,
-	pub key: Bytes,
-	pub value: Option<Bytes>,
+	pub key: Key,
+	pub value: Option<Value>,
 	pub timestamp: u64,
 }
 
@@ -102,12 +102,12 @@ impl Batch {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn set(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+	pub(crate) fn set(&mut self, key: Key, value: Value, timestamp: u64) -> Result<()> {
 		self.add_record(InternalKeyKind::Set, key, Some(value), timestamp)
 	}
 
 	#[cfg(test)]
-	pub(crate) fn delete(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
+	pub(crate) fn delete(&mut self, key: Key, timestamp: u64) -> Result<()> {
 		self.add_record(InternalKeyKind::Delete, key, None, timestamp)
 	}
 
@@ -115,13 +115,13 @@ impl Batch {
 	fn add_record_internal(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
 		let key_len = key.len();
-		let value_len = value.map_or(0, |v| v.len());
+		let value_len = value.as_ref().map_or(0, |v| v.len());
 
 		// Calculate the total size needed for this record
 		let record_size = 1u64 + // kind
@@ -135,8 +135,8 @@ impl Batch {
 
 		let entry = BatchEntry {
 			kind,
-			key: Bytes::copy_from_slice(key),
-			value: value.map(Bytes::copy_from_slice),
+			key,
+			value,
 			timestamp,
 		};
 
@@ -149,8 +149,8 @@ impl Batch {
 	pub(crate) fn add_record(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		timestamp: u64,
 	) -> Result<()> {
 		self.add_record_internal(kind, key, value, None, timestamp)
@@ -159,8 +159,8 @@ impl Batch {
 	pub(crate) fn add_record_with_valueptr(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
@@ -245,7 +245,7 @@ impl Batch {
 			let (key_len, bytes_read) =
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
-			let key = Bytes::copy_from_slice(&data[pos..pos + key_len as usize]);
+			let key = data[pos..pos + key_len as usize].to_vec();
 			pos += key_len as usize;
 
 			// Read value
@@ -253,7 +253,7 @@ impl Batch {
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let value = if value_len > 0 {
-				let value_data = Bytes::copy_from_slice(&data[pos..pos + value_len as usize]);
+				let value_data = data[pos..pos + value_len as usize].to_vec();
 				pos += value_len as usize;
 				Some(value_data)
 			} else {

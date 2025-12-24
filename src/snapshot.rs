@@ -4,8 +4,6 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use crate::error::{Error, Result};
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
@@ -167,7 +165,7 @@ impl Snapshot {
 	/// It only counts the latest version of each key and skips tombstones.
 	pub(crate) fn count_in_range(&self, range: KeyRange) -> Result<usize> {
 		let mut count = 0usize;
-		let mut last_key: Option<Vec<u8>> = None;
+		let mut last_key: Option<Key> = None;
 
 		let iter_state = self.collect_iter_state()?;
 		let merge_iter = KMergeIterator::new_from(iter_state, range, true).filter(move |item| {
@@ -178,18 +176,18 @@ impl Snapshot {
 		for (key, _value) in merge_iter {
 			// Skip tombstones
 			if key.kind() == InternalKeyKind::Delete || key.kind() == InternalKeyKind::SoftDelete {
-				last_key = Some(key.user_key.as_ref().to_vec());
+				last_key = Some(key.user_key.clone());
 				continue;
 			}
 
 			// Only count latest version of each key
 			match &last_key {
-				Some(prev_key) if prev_key == key.user_key.as_ref() => {
+				Some(prev_key) if prev_key == &key.user_key => {
 					continue; // Skip older version
 				}
 				_ => {
 					count += 1;
-					last_key = Some(key.user_key.as_ref().to_vec());
+					last_key = Some(key.user_key.clone());
 				}
 			}
 		}
@@ -244,7 +242,7 @@ impl Snapshot {
 		for level in &level_manifest.levels {
 			for table in level.tables.iter() {
 				let ikey = InternalKey::new(
-					Bytes::copy_from_slice(key),
+					key.to_vec(),
 					self.seq_num,
 					InternalKeyKind::Set,
 					0,
@@ -391,7 +389,7 @@ impl Snapshot {
 				self.core.resolve_value(&encoded_value)?
 			};
 			results.push((
-				Bytes::from(internal_key.user_key.as_ref().to_vec()),
+				internal_key.user_key.clone(),
 				value,
 				internal_key.timestamp,
 				is_tombstone,
@@ -425,7 +423,7 @@ impl Snapshot {
 			// Convert to InternalKey format for the B+ tree query
 			let start_key = match start_bound {
 				Bound::Included(key) => InternalKey::new(
-					Bytes::copy_from_slice(key),
+					key.to_vec(),
 					0,
 					InternalKeyKind::Set,
 					params.start_ts,
@@ -436,7 +434,7 @@ impl Snapshot {
 					let mut next_key = key.clone();
 					next_key.push(0); // Add null byte to make it greater
 					InternalKey::new(
-						Bytes::from(next_key),
+						next_key,
 						0,
 						InternalKeyKind::Set,
 						params.start_ts,
@@ -444,14 +442,14 @@ impl Snapshot {
 					.encode()
 				}
 				Bound::Unbounded => {
-					InternalKey::new(Bytes::new(), 0, InternalKeyKind::Set, params.start_ts)
+					InternalKey::new(Key::new(), 0, InternalKeyKind::Set, params.start_ts)
 						.encode()
 				}
 			};
 
 			let end_key = match end_bound {
 				Bound::Included(key) => InternalKey::new(
-					Bytes::copy_from_slice(key),
+					key.to_vec(),
 					params.snapshot_seq_num,
 					InternalKeyKind::Max,
 					params.end_ts,
@@ -460,11 +458,11 @@ impl Snapshot {
 				Bound::Excluded(key) => {
 					// For excluded bounds, use minimal InternalKey properties so range stops just
 					// before this key
-					InternalKey::new(Bytes::copy_from_slice(key), 0, InternalKeyKind::Set, 0)
+					InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set, 0)
 						.encode()
 				}
 				Bound::Unbounded => InternalKey::new(
-					Bytes::from_static(&[0xff]),
+					[0xff].to_vec(),
 					params.snapshot_seq_num,
 					InternalKeyKind::Max,
 					params.end_ts,
@@ -488,7 +486,7 @@ impl Snapshot {
 					continue;
 				}
 
-				let current_key = internal_key.user_key.as_ref().to_vec();
+				let current_key = internal_key.user_key.clone();
 
 				key_versions
 					.entry(current_key)
@@ -599,7 +597,7 @@ impl Iterator for KeysAtTimestampIterator {
 	type Item = Vec<u8>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		self.inner.next().map(|(internal_key, _)| internal_key.user_key.as_ref().to_vec())
+		self.inner.next().map(|(internal_key, _)| internal_key.user_key.clone())
 	}
 
 	fn size_hint(&self) -> (usize, Option<usize>) {
@@ -609,7 +607,7 @@ impl Iterator for KeysAtTimestampIterator {
 
 impl DoubleEndedIterator for KeysAtTimestampIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		self.inner.next_back().map(|(internal_key, _)| internal_key.user_key.as_ref().to_vec())
+		self.inner.next_back().map(|(internal_key, _)| internal_key.user_key.clone())
 	}
 }
 
@@ -631,7 +629,7 @@ impl Iterator for ScanAtTimestampIterator {
 	fn next(&mut self) -> Option<Self::Item> {
 		self.inner.next().map(|(internal_key, encoded_value)| {
 			match self.core.resolve_value(&encoded_value) {
-				Ok(resolved_value) => Ok((internal_key.user_key.as_ref().to_vec(), resolved_value)),
+				Ok(resolved_value) => Ok((internal_key.user_key.clone(), resolved_value)),
 				Err(e) => Err(e), // Return the error instead of skipping
 			}
 		})
@@ -646,7 +644,7 @@ impl DoubleEndedIterator for ScanAtTimestampIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
 		self.inner.next_back().map(|(internal_key, encoded_value)| {
 			match self.core.resolve_value(&encoded_value) {
-				Ok(resolved_value) => Ok((internal_key.user_key.as_ref().to_vec(), resolved_value)),
+				Ok(resolved_value) => Ok((internal_key.user_key.clone(), resolved_value)),
 				Err(e) => Err(e), // Return the error instead of skipping
 			}
 		})
@@ -834,7 +832,7 @@ pub(crate) struct SnapshotIterator<'a> {
 	keys_only: bool,
 
 	/// Last user key returned (forward direction)
-	last_key_fwd: Bytes,
+	last_key_fwd: Key,
 
 	/// Buffered item for backward iteration (when we read one too many)
 	buffered_back: Option<(InternalKey, Value)>,
@@ -861,7 +859,7 @@ impl SnapshotIterator<'_> {
 			snapshot_seq_num: seq_num,
 			core,
 			keys_only,
-			last_key_fwd: Bytes::new(),
+			last_key_fwd: Vec::new(),
 			buffered_back: None,
 		})
 	}
@@ -983,7 +981,6 @@ mod tests {
 	use std::ops::Bound;
 	use std::sync::Arc;
 
-	use bytes::Bytes;
 	use tempdir::TempDir;
 	use test_log::test;
 
@@ -1420,7 +1417,7 @@ mod tests {
 				let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
 				for (k, v) in data {
 					let ikey =
-						InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0);
+						InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
 					w.add(ikey, v).unwrap();
 				}
 				w.finish().unwrap();
@@ -1785,7 +1782,7 @@ mod tests {
 			let value = format!("value_{seq_num}");
 
 			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(key.as_bytes()),
+				key.as_bytes().to_vec(),
 				seq_num,
 				InternalKeyKind::Set,
 				0,

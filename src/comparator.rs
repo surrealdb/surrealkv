@@ -3,8 +3,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
@@ -184,7 +182,7 @@ impl Comparator for InternalKeyComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					Bytes::from(sep),
+					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -208,7 +206,7 @@ impl Comparator for InternalKeyComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				Bytes::from(user_key_succ),
+				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
@@ -277,7 +275,7 @@ impl Comparator for TimestampComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					Bytes::from(sep),
+					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -302,7 +300,7 @@ impl Comparator for TimestampComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				Bytes::from(user_key_succ),
+				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
@@ -641,14 +639,14 @@ mod tests {
 
 	/// Helper to create an encoded internal key for testing
 	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(Bytes::from(user_key.to_vec()), seq, kind, 0).encode()
+		InternalKey::new(user_key.to_vec(), seq, kind, 0).encode()
 	}
 
 	/// Helper to create an encoded internal key with max seq num (for expected
 	/// separator results)
 	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
 		InternalKey::new(
-			Bytes::from(user_key.to_vec()),
+			user_key.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,

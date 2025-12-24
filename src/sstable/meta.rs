@@ -2,15 +2,15 @@ use std::cmp::{max, min};
 use std::mem::size_of;
 use std::ops::{Bound, Range, RangeBounds};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::Error;
 use crate::sstable::table::TableFormat;
 use crate::sstable::InternalKey;
-use crate::{CompressionType, IntoBytes, Result, Value};
+use crate::{CompressionType, IntoBytes, Key, Result, Value};
 
-pub(crate) const UNBOUNDED_LOW: Bytes = Bytes::from_static(&[]);
-pub(crate) const UNBOUNDED_HIGH: Bytes = Bytes::from_static(&[0xff]);
+pub(crate) const UNBOUNDED_LOW: &[u8] = &[];
+pub(crate) const UNBOUNDED_HIGH: &[u8] = &[0xff];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyRange {
@@ -28,8 +28,8 @@ impl KeyRange {
 
 	pub(crate) fn unbounded() -> Self {
 		KeyRange {
-			low: UNBOUNDED_LOW,
-			high: UNBOUNDED_HIGH,
+			low: UNBOUNDED_LOW.to_vec(),
+			high: UNBOUNDED_HIGH.to_vec(),
 		}
 	}
 
@@ -53,12 +53,12 @@ impl Default for KeyRange {
 	}
 }
 
-impl RangeBounds<Bytes> for KeyRange {
-	fn start_bound(&self) -> Bound<&Bytes> {
+impl RangeBounds<Key> for KeyRange {
+	fn start_bound(&self) -> Bound<&Key> {
 		Bound::Included(&self.low)
 	}
 
-	fn end_bound(&self) -> Bound<&Bytes> {
+	fn end_bound(&self) -> Bound<&Key> {
 		Bound::Excluded(&self.high)
 	}
 }
@@ -72,8 +72,8 @@ impl From<Range<&str>> for KeyRange {
 	}
 }
 
-impl From<Range<Bytes>> for KeyRange {
-	fn from(range: Range<Bytes>) -> Self {
+impl From<Range<Key>> for KeyRange {
+	fn from(range: Range<Key>) -> Self {
 		KeyRange {
 			low: range.start,
 			high: range.end,
@@ -81,41 +81,22 @@ impl From<Range<Bytes>> for KeyRange {
 	}
 }
 
-impl From<(Bound<Bytes>, Bound<Bytes>)> for KeyRange {
-	fn from((low, high): (Bound<Bytes>, Bound<Bytes>)) -> Self {
+impl From<(Bound<Key>, Bound<Key>)> for KeyRange {
+	fn from((low, high): (Bound<Key>, Bound<Key>)) -> Self {
 		let low = match low {
 			Bound::Included(key) => key.into_bytes(),
 			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_LOW,
+			Bound::Unbounded => UNBOUNDED_LOW.to_vec(),
 		};
 		let high = match high {
 			Bound::Included(key) => key.into_bytes(),
 			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_HIGH,
+			Bound::Unbounded => UNBOUNDED_HIGH.to_vec(),
 		};
 
 		KeyRange {
 			low,
 			high,
-		}
-	}
-}
-
-impl From<(Bound<Vec<u8>>, Bound<Vec<u8>>)> for KeyRange {
-	fn from((low, high): (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Self {
-		let low = match low {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_LOW,
-		};
-		let high = match high {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_HIGH,
-		};
-		KeyRange {
-			low: low.into_bytes(),
-			high: high.into_bytes(),
 		}
 	}
 }
@@ -177,7 +158,7 @@ impl Properties {
 		}
 	}
 
-	pub(crate) fn encode(&self) -> Bytes {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = BytesMut::with_capacity(128);
 		buf.put_u64(self.id);
 		buf.put_u8(self.table_format as u8);
@@ -209,10 +190,11 @@ impl Properties {
 			buf.put_u64(size_second_element); // Write the size
 			buf.extend_from_slice(&key_range.high); // Write the element
 		}
-		buf.freeze()
+		buf.to_vec()
 	}
 
-	pub(crate) fn decode(mut buf: Bytes) -> Result<Self> {
+	pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
+		let mut buf = &buf[..];
 		let id = buf.get_u64();
 		let table_format = buf.get_u8();
 		let num_entries = buf.get_u64();
@@ -234,9 +216,10 @@ impl Properties {
 		let seqno_end = buf.get_u64();
 		let key_range = if buf.has_remaining() {
 			let size_first_element = buf.get_u64() as usize;
-			let first_element = buf.copy_to_bytes(size_first_element);
+			let first_element = buf[..size_first_element].to_vec();
+			buf = &buf[size_first_element..];
 			let size_second_element = buf.get_u64() as usize;
-			let second_element = buf.copy_to_bytes(size_second_element);
+			let second_element = buf[..size_second_element].to_vec();
 			Some(KeyRange::new(first_element, second_element))
 		} else {
 			None
@@ -313,7 +296,7 @@ impl TableMetadata {
 		}
 	}
 
-	pub(crate) fn encode(&self) -> Bytes {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = BytesMut::new();
 
 		// Encode has_point_keys as 0 for None, 1 for Some(true), and 2 for Some(false)
@@ -330,7 +313,7 @@ impl TableMetadata {
 		let properties_encoded = self.properties.encode();
 		let properties_encoded_len = properties_encoded.len() as u64;
 		buf.put_u64(properties_encoded_len);
-		buf.put(properties_encoded);
+		buf.extend_from_slice(&properties_encoded);
 
 		// Encode smallest_point and largest_point
 		match &self.smallest_point {
@@ -353,10 +336,10 @@ impl TableMetadata {
 			}
 		}
 
-		buf.freeze()
+		buf.to_vec()
 	}
 
-	pub(crate) fn decode(src: &Bytes) -> Result<TableMetadata> {
+	pub(crate) fn decode(src: &[u8]) -> Result<TableMetadata> {
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys
@@ -375,7 +358,6 @@ impl TableMetadata {
 		let properties_len = cursor.get_u64() as usize;
 		let mut properties_bytes = vec![0u8; properties_len];
 		cursor.copy_to_slice(&mut properties_bytes);
-		let properties_bytes = Bytes::from(properties_bytes);
 		let properties = Properties::decode(properties_bytes)?;
 
 		// Decode smallest_point
@@ -385,7 +367,6 @@ impl TableMetadata {
 				let key_len: usize = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				let key_bytes = Bytes::from(key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
@@ -398,7 +379,6 @@ impl TableMetadata {
 				let key_len = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				let key_bytes = Bytes::from(key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),

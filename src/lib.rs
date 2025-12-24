@@ -30,7 +30,6 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
@@ -45,7 +44,7 @@ pub trait IntoBytes {
 	/// Convert the key to a slice of bytes
 	fn as_slice(&self) -> &[u8];
 	/// Convert the key to an owned bytes slice
-	fn into_bytes(self) -> Bytes;
+	fn into_bytes(self) -> Value;
 }
 
 impl IntoBytes for &[u8] {
@@ -53,8 +52,8 @@ impl IntoBytes for &[u8] {
 		self
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self)
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -63,8 +62,8 @@ impl<const N: usize> IntoBytes for &[u8; N] {
 		&self[..]
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -73,8 +72,8 @@ impl IntoBytes for Vec<u8> {
 		self.as_slice()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
+	fn into_bytes(self) -> Value {
+		self
 	}
 }
 
@@ -83,27 +82,7 @@ impl IntoBytes for &Vec<u8> {
 		&self[..]
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
-	}
-}
-
-impl IntoBytes for Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		self
-	}
-}
-
-impl IntoBytes for &Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-
-	fn into_bytes(self) -> Bytes {
+	fn into_bytes(self) -> Value {
 		self.clone()
 	}
 }
@@ -113,28 +92,8 @@ impl IntoBytes for &str {
 		self.as_bytes()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
-	}
-}
-
-impl IntoBytes for String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self.into_bytes())
-	}
-}
-
-impl IntoBytes for &String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
+	fn into_bytes(self) -> Value {
+		self.as_bytes().to_vec()
 	}
 }
 
@@ -143,23 +102,20 @@ impl IntoBytes for Box<[u8]> {
 		self.as_ref()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
+	fn into_bytes(self) -> Value {
+		self.into_vec()
 	}
 }
 
-impl<'a> IntoBytes for Cow<'a, [u8]> {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
+// impl<'a> IntoBytes for Cow<'a, [u8]> {
+// 	fn as_slice(&self) -> &[u8] {
+// 		self.as_ref()
+// 	}
 
-	fn into_bytes(self) -> Bytes {
-		match self {
-			Cow::Borrowed(s) => Bytes::copy_from_slice(s),
-			Cow::Owned(v) => Bytes::from(v),
-		}
-	}
-}
+// 	fn into_bytes(self) -> Value {
+// 		self.into_owned()
+// 	}
+// }
 
 /// Type alias for iterator results containing key-value pairs
 /// Value is optional to support keys-only iteration without allocating empty
@@ -167,10 +123,10 @@ impl<'a> IntoBytes for Cow<'a, [u8]> {
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
-pub type Key = Bytes;
+pub type Key = Vec<u8>;
 
 /// The Value type used throughout the LSM tree  
-pub type Value = Bytes;
+pub type Value = Vec<u8>;
 
 /// Type alias for version/timestamp values
 pub type Version = u64;
