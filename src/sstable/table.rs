@@ -774,8 +774,8 @@ impl Table {
 				if partition_iter.valid() {
 					let last_key_in_block = partition_iter.key();
 					let val = partition_iter.value();
-					if Ordering::Less
-						== self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
+					if self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
+						!= Ordering::Greater
 					{
 						Some(BlockHandle::decode(&val).unwrap().0)
 					} else {
@@ -817,33 +817,11 @@ impl Table {
 		keys_only: bool,
 		range: Option<InternalKeyRange>,
 	) -> TableIterator {
-		let index_block_iter = match &self.index_block {
-			IndexType::Partitioned(partitioned_index) => {
-				// For partitioned index, start with the first partition
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				if let Ok(first_block) = partitioned_index.first_partition() {
-					first_block.iter(false)
-				} else {
-					// If there are no partitions, create a proper empty block
-					let empty_writer = BlockWriter::new(
-						self.opts.block_size,
-						self.opts.block_restart_interval,
-						Arc::clone(&self.opts.comparator),
-					);
-					let empty_block_data = empty_writer.finish();
-					let empty_block =
-						Block::new(empty_block_data, Arc::clone(&self.opts.comparator));
-					empty_block.iter(false)
-				}
-			}
-		};
-
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
 
 		TableIterator {
 			current_block: None,
 			current_block_off: 0,
-			index_block: index_block_iter,
 			table: Arc::clone(self),
 			positioned: false,
 			exhausted: false,
@@ -907,7 +885,6 @@ pub(crate) struct TableIterator {
 	table: Arc<Table>,
 	current_block: Option<BlockIterator>,
 	current_block_off: usize,
-	index_block: BlockIterator,
 	/// Whether the iterator has been positioned at least once
 	positioned: bool,
 	/// Whether the iterator has been exhausted (reached the end)
@@ -1510,28 +1487,7 @@ impl LSMIterator for TableIterator {
 	}
 
 	fn prev(&mut self) -> bool {
-		if let Some(ref mut block) = self.current_block {
-			if block.prev() {
-				return true;
-			}
-		}
-
-		if self.index_block.prev() && self.index_block.valid() {
-			let val = self.index_block.value();
-			let (handle, _) = match BlockHandle::decode(&val) {
-				Err(_) => return false,
-				Ok(res) => res,
-			};
-			if self.load_block(&handle).is_ok() {
-				if let Some(ref mut block_iter) = self.current_block {
-					block_iter.seek_to_last();
-					return block_iter.valid();
-				}
-			}
-		}
-
-		self.current_block = None;
-		false
+		TableIterator::prev(self)
 	}
 
 	#[inline]
@@ -4527,6 +4483,191 @@ mod tests {
 		assert!(
 			!results.iter().any(|k| k == "key_002" || k == "key_005"),
 			"Should not contain any version of excluded bounds"
+		);
+	}
+
+	#[test]
+	fn test_get_block_boundary_same_user_key_bug() {
+		// REGRESSION TEST: When multiple versions of the same user_key span multiple
+		// data blocks, looking up the exact key at the block boundary incorrectly
+		// returns None due to using < instead of <= in the index comparison.
+		//
+		// Bug location: Table::get() lines 777-778
+		// The check `key_encoded < last_key_in_block` fails when they're equal,
+		// but the key IS in the block (it's the last key).
+
+		// Use very small block_size to force same user_key versions across multiple blocks
+		// Entry sizes: 1st = 24 bytes, subsequent = 20 bytes each
+		// size_estimate includes 8 bytes overhead (restart_points)
+		// After 1st: 32, After 2nd: 52
+		// With block_size=32: before 3rd entry, 52 > 32 → block cut
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None) // Disable bloom filter to test key comparison
+				.with_block_size(32), // Very small block to force split
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let user_key = b"test";
+
+		// Add 4 versions of the same key with descending sequence numbers
+		// (required ordering: user_key ASC, seq_num DESC)
+		// Block 1 will contain: seq 300, 200 (last_key = ("test", 200))
+		// Block 2 will contain: seq 100, 50
+		let key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		writer.add(key1, b"v").unwrap();
+
+		let key2 = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		writer.add(key2, b"v").unwrap();
+
+		let key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		writer.add(key3, b"v").unwrap();
+
+		let key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		writer.add(key4, b"v").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Verify we have multiple data blocks (the bug requires this)
+		assert!(
+			table.meta.properties.num_data_blocks >= 2,
+			"Test requires at least 2 data blocks to trigger the bug, got {}. \
+			 Adjust block_size or add more entries.",
+			table.meta.properties.num_data_blocks
+		);
+
+		// THE BUG: Looking up the exact key at block boundary returns None
+		// This is the last key of block 1, which is also the index separator key
+		// (because same user_key causes separator to fall back to original key)
+		// With block_size=32, the boundary key is ("test", 200)
+		let lookup_boundary_key =
+			InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_boundary_key).unwrap();
+
+		// This assertion will FAIL with the current buggy code
+		assert!(
+			result.is_some(),
+			"BUG: get() returned None for key at block boundary. \
+			 The key ('test', seq=200) exists as the last key of block 1, \
+			 but the index comparison uses < instead of <=, causing it to fail \
+			 when lookup key equals the separator key."
+		);
+
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_slice(), user_key);
+		assert_eq!(found_key.seq_num(), 200);
+		assert_eq!(found_value.as_slice(), b"v");
+
+		// Also verify other keys still work correctly
+		let lookup_key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key1).unwrap();
+		assert!(result.is_some(), "seq=300 should be found");
+
+		let lookup_key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key3).unwrap();
+		assert!(result.is_some(), "seq=100 should be found");
+
+		let lookup_key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key4).unwrap();
+		assert!(result.is_some(), "seq=50 should be found");
+	}
+
+	#[test]
+	fn test_iterator_trait_prev_multi_partition_bug() {
+		// REGRESSION TEST: The Iterator trait's prev() method uses self.index_block
+		// which is only the first partition's iterator, NOT handling multiple partitions.
+		// When we have multiple index partitions and call prev() via the trait,
+		// backward iteration will stop at partition boundaries instead of continuing.
+		//
+		// Bug location: impl LSMIterator for TableIterator::prev() at lines 1512-1535
+		// Uses self.index_block.prev() which only works within the first partition.
+		// The correct inherent prev() method (lines 1022-1083) handles partitions properly.
+
+		use crate::Iterator as LSMIterator; // Import the trait to call method explicitly
+
+		// Use very small index_partition_size to force multiple index partitions
+		// Each data block adds an entry to the index partition
+		// With index_partition_size=50 and block_size=50, we should get multiple partitions
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(50) // Small blocks to create many index entries
+				.with_index_partition_size(50), // Small partitions to force multiple partitions
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add enough keys to create multiple data blocks, which creates multiple index entries,
+		// which in turn creates multiple index partitions
+		let num_keys = 100;
+		for i in 0..num_keys {
+			let key = InternalKey::new(
+				format!("key_{:05}", i).into_bytes(),
+				1000 - i as u64, // Decreasing seq for same ordering
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(key, format!("value_{}", i).as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table_arc = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify we have multiple partitions (the bug requires this)
+		let IndexType::Partitioned(ref partitioned_index) = table_arc.index_block;
+		let num_partitions = partitioned_index.blocks.len();
+		assert!(
+			num_partitions >= 2,
+			"Test requires at least 2 index partitions to trigger the bug, got {}. \
+			 Adjust index_partition_size or add more keys.",
+			num_partitions
+		);
+
+		println!("Created table with {} index partitions", num_partitions);
+
+		// Create iterator and position at the LAST entry
+		let mut iter = table_arc.iter(false, None);
+		iter.seek_to_last();
+		assert!(iter.valid(), "Iterator should be valid after seek_to_last");
+
+		// Collect all keys going backwards using the CORRECT inherent prev() method
+		let mut correct_results = Vec::new();
+		correct_results.push(iter.key().user_key.clone());
+		while iter.prev() {
+			correct_results.push(iter.key().user_key.clone());
+		}
+		let correct_count = correct_results.len();
+		println!("Correct backward iteration found {} keys", correct_count);
+		assert_eq!(correct_count, num_keys as usize, "Should find all keys");
+
+		// Now test with explicit trait method call
+		// Reset iterator
+		let mut iter2 = table_arc.iter(false, None);
+		LSMIterator::seek_to_last(&mut iter2);
+		assert!(LSMIterator::valid(&iter2), "Iterator should be valid after seek_to_last");
+
+		// Collect all keys going backwards using the BUGGY trait prev() method
+		let mut buggy_results = Vec::new();
+		buggy_results.push(LSMIterator::key(&iter2).user_key.clone());
+		while LSMIterator::prev(&mut iter2) {
+			buggy_results.push(LSMIterator::key(&iter2).user_key.clone());
+		}
+		let buggy_count = buggy_results.len();
+		println!("Buggy trait prev() found {} keys", buggy_count);
+
+		// THE BUG: The trait's prev() will stop at partition boundary
+		// It should find all keys, but will find fewer because it only works within first partition
+		assert_eq!(
+			buggy_count, correct_count,
+			"BUG DETECTED: Iterator::prev() trait method only found {} keys, \
+			 but should have found {} keys. The trait method uses self.index_block \
+			 which is only the first partition's iterator and doesn't handle \
+			 crossing partition boundaries.",
+			buggy_count, correct_count
 		);
 	}
 }

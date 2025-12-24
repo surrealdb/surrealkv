@@ -258,14 +258,6 @@ impl TopLevelIndex {
 		let block = self.load_block(block_handle)?;
 		Ok(block)
 	}
-
-	pub(crate) fn first_partition(&self) -> Result<Arc<Block>> {
-		if let Some(first_block_handle) = self.blocks.first() {
-			self.load_block(first_block_handle)
-		} else {
-			Err(Error::BlockNotFound)
-		}
-	}
 }
 
 #[cfg(test)]
