@@ -246,19 +246,19 @@ impl Snapshot {
 		// Read lock on the level manifest
 		let level_manifest = self.core.level_manifest.read()?;
 
+		// CREATE ONCE: Create InternalKey for all table lookups
+		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+
 		// Check the tables in each level for the key
 		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
 			if level_idx == 0 {
 				// Level 0: Tables can overlap, check all
 				for table in level.tables.iter() {
-					let ikey =
-						InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
-
 					if !table.is_key_in_key_range(&ikey) {
 						continue; // Skip this table if the key is not in its range
 					}
 
-					let maybe_item = table.get(ikey)?;
+					let maybe_item = table.get(&ikey)?;
 
 					if let Some(item) = maybe_item {
 						let ikey = &item.0;
@@ -277,10 +277,7 @@ impl Snapshot {
 
 				// At most one table can contain this exact key
 				for table in &level.tables[start_idx..end_idx] {
-					let ikey =
-						InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
-
-					let maybe_item = table.get(ikey)?;
+					let maybe_item = table.get(&ikey)?;
 
 					if let Some(item) = maybe_item {
 						let ikey = &item.0;
@@ -709,6 +706,9 @@ impl<'a> KMergeIterator<'a> {
 	fn new_from(iter_state: IterState, internal_range: InternalKeyRange, keys_only: bool) -> Self {
 		let boxed_state = Box::new(iter_state);
 
+		// WRAP range in Arc to share it
+		let shared_range = Arc::new(internal_range);
+
 		// Pre-allocate capacity for the iterators.
 		// 1 active memtable + immutable memtables + level tables.
 		let mut iterators: Vec<BoxedIterator<'a>> =
@@ -716,13 +716,13 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
-		// Active memtable with range
-		let active_iter = state_ref.active.range(internal_range.clone(), keys_only);
+		// Active memtable with shared range
+		let active_iter = state_ref.active.range((*shared_range).clone(), keys_only);
 		iterators.push(Box::new(active_iter));
 
 		// Immutable memtables with range
 		for memtable in &state_ref.immutable {
-			let iter = memtable.range(internal_range.clone(), keys_only);
+			let iter = memtable.range((*shared_range).clone(), keys_only);
 			iterators.push(Box::new(iter));
 		}
 
@@ -734,21 +734,19 @@ impl<'a> KMergeIterator<'a> {
 				// outside range
 				for table in &level.tables {
 					// Skip tables completely before or after the range
-					if table.is_before_range(&internal_range)
-						|| table.is_after_range(&internal_range)
-					{
+					if table.is_before_range(&shared_range) || table.is_after_range(&shared_range) {
 						continue;
 					}
-					let table_iter = table.iter(keys_only, Some(internal_range.clone()));
+					let table_iter = table.iter(keys_only, Some((*shared_range).clone()));
 					iterators.push(Box::new(table_iter));
 				}
 			} else {
 				// Level 1+: Tables have non-overlapping key ranges, use binary search
-				let start_idx = level.find_first_overlapping_table(&internal_range);
-				let end_idx = level.find_last_overlapping_table(&internal_range);
+				let start_idx = level.find_first_overlapping_table(&shared_range);
+				let end_idx = level.find_last_overlapping_table(&shared_range);
 
 				for table in &level.tables[start_idx..end_idx] {
-					let table_iter = table.iter(keys_only, Some(internal_range.clone()));
+					let table_iter = table.iter(keys_only, Some((*shared_range).clone()));
 					iterators.push(Box::new(table_iter));
 				}
 			}
@@ -953,7 +951,6 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 				continue;
 			}
 
-			let current_user_key = first_key.user_key.clone();
 			let mut latest_key = first_key;
 			let mut latest_value = first_value;
 
@@ -963,7 +960,8 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 					break;
 				};
 
-				if key.user_key != current_user_key {
+				// Compare without cloning - use reference
+				if key.user_key != latest_key.user_key {
 					// Different key - buffer it for next call
 					self.buffered_back = Some((key, value));
 					break;

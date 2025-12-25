@@ -149,10 +149,19 @@ impl Comparator for InternalKeyComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-		key_a.cmp(&key_b)
+		// Zero-copy comparison
+		let user_key_a = InternalKey::user_key_from_encoded(a);
+		let user_key_b = InternalKey::user_key_from_encoded(b);
+
+		match self.user_comparator.compare(user_key_a, user_key_b) {
+			Ordering::Equal => {
+				// Compare seq_num in descending order (higher = more recent)
+				let seq_a = InternalKey::seq_num_from_encoded(a);
+				let seq_b = InternalKey::seq_num_from_encoded(b);
+				seq_b.cmp(&seq_a)
+			}
+			ord => ord,
+		}
 	}
 
 	/// Generates a separator key between two internal keys.
