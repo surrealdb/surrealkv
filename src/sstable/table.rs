@@ -746,7 +746,7 @@ impl Table {
 
 		let handle = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
-				// Use reference to key_encoded
+				// Use internal key comparison to find the partition block
 				let partition_block = match partitioned_index.get(&key_encoded) {
 					Ok(block) => block,
 					Err(_e) => {
@@ -760,11 +760,10 @@ impl Table {
 				partition_iter.seek(&key_encoded);
 
 				if partition_iter.valid() {
-					// Zero-copy comparison using raw bytes
 					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes())
 						!= Ordering::Greater
 					{
-						let val = partition_iter.value_bytes(); // Zero-copy
+						let val = partition_iter.value_bytes();
 						Some(BlockHandle::decode(val).unwrap().0)
 					} else {
 						return Ok(None);
@@ -787,7 +786,6 @@ impl Table {
 		// Go to entry and check if it's the wanted entry.
 		iter.seek(&key_encoded);
 		if iter.valid() {
-			// Zero-copy comparison first - only allocate on match
 			if iter.user_key() == key.user_key.as_slice() {
 				Ok(Some((iter.key(), iter.value())))
 			} else {
@@ -1169,30 +1167,26 @@ impl TableIterator {
 	}
 
 	/// Check if a user key satisfies the lower bound constraint
-	fn satisfies_lower_bound(&self, internal_key: &InternalKey) -> bool {
+	fn satisfies_lower_bound(&self, user_key: &[u8]) -> bool {
 		match &self.range.0 {
 			Bound::Included(start) => {
-				self.table.opts.comparator.compare(&internal_key.user_key, &start.user_key)
-					!= Ordering::Less
+				self.table.opts.comparator.compare(user_key, &start.user_key) != Ordering::Less
 			}
 			Bound::Excluded(start) => {
-				self.table.opts.comparator.compare(&internal_key.user_key, &start.user_key)
-					== Ordering::Greater
+				self.table.opts.comparator.compare(user_key, &start.user_key) == Ordering::Greater
 			}
 			Bound::Unbounded => true,
 		}
 	}
 
 	/// Check if a user key satisfies the upper bound constraint
-	fn satisfies_upper_bound(&self, internal_key: &InternalKey) -> bool {
+	fn satisfies_upper_bound(&self, user_key: &[u8]) -> bool {
 		match &self.range.1 {
 			Bound::Included(end) => {
-				self.table.opts.comparator.compare(&internal_key.user_key, &end.user_key)
-					!= Ordering::Greater
+				self.table.opts.comparator.compare(user_key, &end.user_key) != Ordering::Greater
 			}
 			Bound::Excluded(end) => {
-				self.table.opts.comparator.compare(&internal_key.user_key, &end.user_key)
-					== Ordering::Less
+				self.table.opts.comparator.compare(user_key, &end.user_key) == Ordering::Less
 			}
 			Bound::Unbounded => true,
 		}
@@ -1215,17 +1209,13 @@ impl Iterator for TableIterator {
 			return None;
 		}
 
-		// Get the current item before advancing
-		let current_item = (
-			self.current_block.as_ref().unwrap().key(),
-			self.current_block.as_ref().unwrap().value(),
-		);
-
-		// Check upper bound (lower bound is already handled by seek)
-		if !self.satisfies_upper_bound(&current_item.0) {
+		let block = self.current_block.as_ref().unwrap();
+		if !self.satisfies_upper_bound(block.user_key()) {
 			self.mark_exhausted();
 			return None;
 		}
+
+		let current_item = (block.key(), block.value());
 
 		// Advance for the next call to next()
 		self.advance();
@@ -1255,15 +1245,12 @@ impl DoubleEndedIterator for TableIterator {
 		// If positioned but not yet started reverse iteration, return current position
 		// first
 		if self.positioned && !self.reverse_started && self.valid() {
-			let item = (
-				self.current_block.as_ref().unwrap().key(),
-				self.current_block.as_ref().unwrap().value(),
-			);
-
-			// Check lower bound for reverse iteration
-			if !self.satisfies_lower_bound(&item.0) {
+			let block = self.current_block.as_ref().unwrap();
+			if !self.satisfies_lower_bound(block.user_key()) {
 				return None;
 			}
+
+			let item = (block.key(), block.value());
 			self.reverse_started = true;
 			return Some(item);
 		}
@@ -1272,15 +1259,12 @@ impl DoubleEndedIterator for TableIterator {
 			return None;
 		}
 
-		let item = (
-			self.current_block.as_ref().unwrap().key(),
-			self.current_block.as_ref().unwrap().value(),
-		);
-
-		// Check lower bound for reverse iteration
-		if !self.satisfies_lower_bound(&item.0) {
+		let block = self.current_block.as_ref().unwrap();
+		if !self.satisfies_lower_bound(block.user_key()) {
 			return None;
 		}
+
+		let item = (block.key(), block.value());
 		Some(item)
 	}
 }

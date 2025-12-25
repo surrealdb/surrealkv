@@ -175,29 +175,23 @@ impl Snapshot {
 			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
 			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
 		);
-		let merge_iter =
-			KMergeIterator::new_from(iter_state, internal_range, true).filter(move |item| {
-				// Filter out items that are not visible in this snapshot
-				item.0.seq_num() <= self.seq_num
-			});
+
+		// Filter out items that are not visible in this snapshot
+		let merge_iter = KMergeIterator::new_from(iter_state, internal_range, true)
+			.filter(move |item| item.0.seq_num() <= self.seq_num);
 
 		for (key, _value) in merge_iter {
-			// Skip tombstones
-			if key.kind() == InternalKeyKind::Delete || key.kind() == InternalKeyKind::SoftDelete {
-				last_key = Some(key.user_key.clone());
+			// Skip older versions of the same key
+			if last_key.as_ref().is_some_and(|prev| prev == &key.user_key) {
 				continue;
 			}
 
-			// Only count latest version of each key
-			match &last_key {
-				Some(prev_key) if prev_key == &key.user_key => {
-					continue; // Skip older version
-				}
-				_ => {
-					count += 1;
-					last_key = Some(key.user_key.clone());
-				}
+			// Only count non-tombstone entries
+			if !key.is_tombstone() {
+				count += 1;
 			}
+
+			last_key = Some(key.user_key);
 		}
 
 		Ok(count)
@@ -246,7 +240,6 @@ impl Snapshot {
 		// Read lock on the level manifest
 		let level_manifest = self.core.level_manifest.read()?;
 
-		// CREATE ONCE: Create InternalKey for all table lookups
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
 		// Check the tables in each level for the key
@@ -706,8 +699,7 @@ impl<'a> KMergeIterator<'a> {
 	fn new_from(iter_state: IterState, internal_range: InternalKeyRange, keys_only: bool) -> Self {
 		let boxed_state = Box::new(iter_state);
 
-		// WRAP range in Arc to share it
-		let shared_range = Arc::new(internal_range);
+		let query_range = Arc::new(internal_range);
 
 		// Pre-allocate capacity for the iterators.
 		// 1 active memtable + immutable memtables + level tables.
@@ -716,13 +708,13 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
-		// Active memtable with shared range
-		let active_iter = state_ref.active.range((*shared_range).clone(), keys_only);
+		// Active memtable
+		let active_iter = state_ref.active.range((*query_range).clone(), keys_only);
 		iterators.push(Box::new(active_iter));
 
-		// Immutable memtables with range
+		// Immutable memtables
 		for memtable in &state_ref.immutable {
-			let iter = memtable.range((*shared_range).clone(), keys_only);
+			let iter = memtable.range((*query_range).clone(), keys_only);
 			iterators.push(Box::new(iter));
 		}
 
@@ -734,19 +726,19 @@ impl<'a> KMergeIterator<'a> {
 				// outside range
 				for table in &level.tables {
 					// Skip tables completely before or after the range
-					if table.is_before_range(&shared_range) || table.is_after_range(&shared_range) {
+					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
 						continue;
 					}
-					let table_iter = table.iter(keys_only, Some((*shared_range).clone()));
+					let table_iter = table.iter(keys_only, Some((*query_range).clone()));
 					iterators.push(Box::new(table_iter));
 				}
 			} else {
 				// Level 1+: Tables have non-overlapping key ranges, use binary search
-				let start_idx = level.find_first_overlapping_table(&shared_range);
-				let end_idx = level.find_last_overlapping_table(&shared_range);
+				let start_idx = level.find_first_overlapping_table(&query_range);
+				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
-					let table_iter = table.iter(keys_only, Some((*shared_range).clone()));
+					let table_iter = table.iter(keys_only, Some((*query_range).clone()));
 					iterators.push(Box::new(table_iter));
 				}
 			}
@@ -960,7 +952,6 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 					break;
 				};
 
-				// Compare without cloning - use reference
 				if key.user_key != latest_key.user_key {
 					// Different key - buffer it for next call
 					self.buffered_back = Some((key, value));

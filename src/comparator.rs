@@ -149,7 +149,6 @@ impl Comparator for InternalKeyComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Zero-copy comparison
 		let user_key_a = InternalKey::user_key_from_encoded(a);
 		let user_key_b = InternalKey::user_key_from_encoded(b);
 
