@@ -148,7 +148,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let source_size = source_table.meta.properties.file_size;
+			let source_size = source_table.file_size;
 			let smallest_seq = source_table.meta.properties.seqnos.0;
 
 			choices.push(Choice {
@@ -184,7 +184,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let source_size = source_table.meta.properties.file_size;
+			let source_size = source_table.file_size;
 			let largest_seq = source_table.meta.properties.seqnos.1;
 
 			choices.push(Choice {
@@ -219,7 +219,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let file_size = source_table.meta.properties.file_size;
+			let file_size = source_table.file_size;
 			let num_entries = source_table.meta.properties.num_entries;
 			let num_deletions = source_table.meta.properties.num_deletions;
 
@@ -2136,9 +2136,30 @@ mod tests {
 		assert_eq!(props.data_size, 2975);
 		assert_eq!(props.global_seq_num, 0);
 		assert_eq!(props.num_data_blocks, 1);
-		assert_eq!(props.top_level_index_size, 0);
+
+		assert_eq!(props.index_size, 74, "Index size should be tracked");
+		assert_eq!(props.index_partitions, 1, "Should have 1 index partition for small table");
+		assert_eq!(props.top_level_index_size, 32, "Top-level index size should be tracked");
+		// Verify filter metrics (should have bloom filter by default)
+		assert_eq!(
+			props.filter_size, 135,
+			"Filter size should be tracked with default bloom filter"
+		);
+		assert_eq!(props.raw_key_size, 2300, "Raw key size should be tracked");
+		assert_eq!(props.raw_value_size, 675, "Raw value size should be tracked");
+		assert!(
+			props.raw_key_size + props.raw_value_size == props.data_size,
+			"Raw sizes should be == data_size"
+		);
+
+		// Verify time metrics (timestamps are 0 in this test)
+		assert_eq!(props.oldest_key_time, 0, "Oldest key time is 0 in test");
+		assert_eq!(props.newest_key_time, 0, "Newest key time is 0 in test");
+
+		// Verify range deletion metrics
+		assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");
+
 		assert!(props.created_at > 0);
-		assert_eq!(props.file_size, 3182);
 		assert_eq!(props.block_size, 2757);
 		assert_eq!(props.block_count, 1);
 		assert_eq!(props.compression, CompressionType::None);

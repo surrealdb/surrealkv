@@ -7,7 +7,6 @@ pub(crate) mod table;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use crate::Key;
 
@@ -72,17 +71,6 @@ fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
 }
 
-/// Calculates the size of a key with the given user key length
-/// This centralizes the size calculation logic to avoid duplication
-fn calculate_key_size(user_key_len: usize, has_timestamp: bool) -> usize {
-	let fixed_size = if has_timestamp {
-		std::mem::size_of::<u64>() * 2 + std::mem::size_of::<Arc<[u8]>>()
-	} else {
-		std::mem::size_of::<u64>() + std::mem::size_of::<Arc<[u8]>>()
-	};
-	fixed_size + user_key_len
-}
-
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InternalKeyKind {
@@ -123,7 +111,7 @@ impl InternalKey {
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		calculate_key_size(self.user_key.len(), true)
+		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {

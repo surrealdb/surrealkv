@@ -273,11 +273,7 @@ impl CoreInner {
 			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
 		})?;
 
-		log::debug!(
-			"Created SST table_id={}, file_size={}",
-			table.id,
-			table.meta.properties.file_size
-		);
+		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
 		// Step 5: Prepare atomic changeset with both SST and log_number
 		let mut changeset = ManifestChangeSet::default();
@@ -405,11 +401,7 @@ impl CoreInner {
 			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
 		})?;
 
-		log::debug!(
-			"Created SST table_id={}, file_size={}",
-			table.id,
-			table.meta.properties.file_size
-		);
+		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
 		// Step 3: Prepare atomic changeset with both SST and log_number
 		// This ensures crash safety - both updates happen in a single manifest write
@@ -512,7 +504,7 @@ impl CoreInner {
 		log::debug!(
 			"Created SST from immutable memtable: table_id={}, file_size={}",
 			table.id,
-			table.meta.properties.file_size
+			table.file_size
 		);
 
 		// Prepare changeset - add SST to level 0 and update log_number
@@ -639,7 +631,7 @@ impl CoreInner {
 					log::info!(
 						"Active memtable flushed: table_id={}, file_size={}",
 						table.id,
-						table.meta.properties.file_size
+						table.file_size
 					);
 				}
 				None => {

@@ -47,6 +47,11 @@ pub(crate) struct TopLevelIndexWriter {
 	index_blocks: Vec<BlockWriter>,
 	current_block: BlockWriter,
 	max_block_size: usize,
+
+	// Stats tracked during finish()
+	index_size: u64,
+	num_partitions: u64,
+	top_level_index_size: u64,
 }
 
 impl TopLevelIndexWriter {
@@ -60,22 +65,23 @@ impl TopLevelIndexWriter {
 				Arc::clone(&opts.comparator),
 			),
 			max_block_size,
+			index_size: 0,
+			num_partitions: 0,
+			top_level_index_size: 0,
 		}
 	}
 
-	pub(crate) fn size_estimate(&self) -> usize {
-		// Sum the size of all finished index blocks
-		let finished_blocks_size: usize =
-			self.index_blocks.iter().map(|block| block.size_estimate()).sum();
+	// Query methods - called after finish()
+	pub(crate) fn index_size(&self) -> u64 {
+		self.index_size
+	}
 
-		// Add the size of the current block
-		let total_size = finished_blocks_size + self.current_block.size_estimate();
+	pub(crate) fn num_partitions(&self) -> u64 {
+		self.num_partitions
+	}
 
-		// Add an estimate for the top-level index
-		let top_level_estimate =
-			(self.index_blocks.len() + 1) * (std::mem::size_of::<InternalKey>() + 8);
-
-		total_size + top_level_estimate
+	pub(crate) fn top_level_index_size(&self) -> u64 {
+		self.top_level_index_size
 	}
 
 	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
@@ -106,19 +112,27 @@ impl TopLevelIndexWriter {
 	}
 
 	pub(crate) fn finish<W: Write>(
-		mut self,
+		&mut self,
 		writer: &mut W,
 		compression_type: CompressionType,
 		mut offset: usize,
 	) -> Result<(BlockHandle, usize)> {
+		let start_offset = offset;
+
 		// Only finish current block if it has entries
 		if self.current_block.entries() > 0 {
 			self.finish_current_block();
 		}
 
-		// If no blocks were created, create a single empty block
+		// If no blocks were created, move current_block to index_blocks
 		if self.index_blocks.is_empty() {
-			self.index_blocks.push(self.current_block);
+			let new_block = BlockWriter::new(
+				self.opts.block_size,
+				self.opts.block_restart_interval,
+				Arc::clone(&self.opts.comparator),
+			);
+			let old_block = std::mem::replace(&mut self.current_block, new_block);
+			self.index_blocks.push(old_block);
 		}
 
 		let mut top_level_index = BlockWriter::new(
@@ -127,7 +141,12 @@ impl TopLevelIndexWriter {
 			Arc::clone(&self.opts.comparator),
 		);
 
-		for block in self.index_blocks {
+		// Track number of partitions
+		self.num_partitions = self.index_blocks.len() as u64;
+
+		// Take ownership of index_blocks to iterate and consume
+		let index_blocks = std::mem::take(&mut self.index_blocks);
+		for block in index_blocks {
 			let separator_key = block.last_key.clone();
 			let block_data = block.finish();
 
@@ -144,8 +163,15 @@ impl TopLevelIndexWriter {
 			top_level_index.add(&separator_key, &block_handle.encode())?;
 		}
 
-		let block_data = top_level_index.finish();
-		Self::write_compressed_block(writer, block_data, compression_type, offset)
+		let top_level_data = top_level_index.finish();
+		self.top_level_index_size = top_level_data.len() as u64;
+		let (handle, final_offset) =
+			Self::write_compressed_block(writer, top_level_data, compression_type, offset)?;
+
+		// Track total index size
+		self.index_size = (final_offset - start_offset) as u64;
+
+		Ok((handle, final_offset))
 	}
 }
 

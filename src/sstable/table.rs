@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
-use crate::sstable::meta::{size_of_writer_metadata, TableMetadata};
+use crate::sstable::meta::TableMetadata;
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
@@ -230,21 +230,6 @@ impl<W: Write> TableWriter<W> {
 		}
 	}
 
-	// Estimates the size of the table being written.
-	pub(crate) fn size_estimate(&self) -> usize {
-		let data_block_size = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
-		let index_block_size = self.partitioned_index.size_estimate();
-		let filter_block_size = self.filter_block.as_ref().map_or(0, |b| b.size_estimate());
-
-		// TODO: also add metadata to size estimate
-		data_block_size
-			+ index_block_size
-			+ filter_block_size
-			+ size_of_writer_metadata()
-			+ self.offset
-			+ TABLE_FULL_FOOTER_LENGTH
-	}
-
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
 	pub(crate) fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
@@ -332,7 +317,6 @@ impl<W: Write> TableWriter<W> {
 	// footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
-		self.meta.properties.file_size = self.size_estimate() as u64;
 		self.meta.properties.created_at =
 			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
 
@@ -358,7 +342,6 @@ impl<W: Write> TableWriter<W> {
 		// Write the filter block to the meta index block if present.
 		if let Some(fblock) = self.filter_block.take() {
 			let filter_key = format!("filter.{}", fblock.filter_name());
-
 			let fblock_data = fblock.finish();
 
 			// Only write if we have actual filter data
@@ -366,19 +349,30 @@ impl<W: Write> TableWriter<W> {
 				let fblock_handle =
 					self.write_compressed_block(fblock_data, CompressionType::None)?;
 
+				// Track filter size (data only, matches RocksDB)
+				self.meta.properties.filter_size = fblock_handle.size as u64;
+
+				// Add to meta index
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
-
-				// TODO: Add this as part of property as the current trailer will mark it as
-				// deleted
 				let filter_key =
 					InternalKey::new(Vec::from(filter_key.as_bytes()), 0, InternalKeyKind::Set, 0);
-
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
 
-		// Write meta properties to the meta index block
+		// 2. Write index block
+		let compression_type = self.compression_selector.select_compression(self.target_level);
+		let (ix_handle, new_offset) =
+			self.partitioned_index.finish(&mut self.writer, compression_type, self.offset)?;
+		self.offset = new_offset;
+
+		// 3. Query index stats
+		self.meta.properties.index_size = self.partitioned_index.index_size();
+		self.meta.properties.index_partitions = self.partitioned_index.num_partitions();
+		self.meta.properties.top_level_index_size = self.partitioned_index.top_level_index_size();
+
+		// 4. Write properties block
 		let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
@@ -386,22 +380,11 @@ impl<W: Write> TableWriter<W> {
 		// Write meta_index block
 		let meta_block = meta_ix_block.finish();
 		let meta_ix_handle = self.write_compressed_block(meta_block, CompressionType::None)?;
-		// println!("meta block: {:?}", meta_block);
 
-		// Write the index block
-		let ix_handle = {
-			let compression_type = self.compression_selector.select_compression(self.target_level);
-			let (handle, new_offset) =
-				self.partitioned_index.finish(&mut self.writer, compression_type, self.offset)?;
-			self.offset = new_offset; // Update the offset after writing partitioned blocks
-			handle
-		};
-
-		// Write footer
+		// 6. Write footer
 		let footer = Footer::new(meta_ix_handle, ix_handle);
 		let mut buf = vec![0u8; TABLE_FULL_FOOTER_LENGTH];
 		footer.encode(&mut buf);
-		// println!("footer: {:?}", footer);
 
 		self.offset += self.writer.write(&buf[..])?;
 		self.writer.flush()?;
@@ -444,6 +427,24 @@ impl<W: Write> TableWriter<W> {
 		// Update basic counts
 		props.num_entries += 1;
 		props.item_count += 1;
+
+		// Track raw (uncompressed) sizes
+		props.raw_key_size += key.size() as u64;
+		props.raw_value_size += value.len() as u64;
+
+		// Track timestamp range
+		let ts = key.timestamp;
+		if props.oldest_key_time == 0 || ts < props.oldest_key_time {
+			props.oldest_key_time = ts;
+		}
+		if ts > props.newest_key_time {
+			props.newest_key_time = ts;
+		}
+
+		// Track range deletions
+		if key.kind() == InternalKeyKind::RangeDelete {
+			props.num_range_deletions += 1;
+		}
 
 		if key.is_tombstone() {
 			props.num_deletions += 1;
@@ -1609,7 +1610,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(690, actual);
+		assert_eq!(746, actual);
 	}
 
 	#[test]

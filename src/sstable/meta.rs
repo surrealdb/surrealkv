@@ -1,5 +1,4 @@
 use std::cmp::{max, min};
-use std::mem::size_of;
 use std::ops::{Bound, Range, RangeBounds};
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -119,17 +118,37 @@ pub(crate) struct Properties {
 	pub(crate) data_size: u64,
 	pub(crate) global_seq_num: u64,
 	pub(crate) num_data_blocks: u64,
+
+	// Index metrics
+	pub(crate) index_size: u64,
+	pub(crate) index_partitions: u64,
 	pub(crate) top_level_index_size: u64,
+
+	// Filter metrics
+	pub(crate) filter_size: u64,
+
+	// Raw size metrics (uncompressed)
+	pub(crate) raw_key_size: u64,
+	pub(crate) raw_value_size: u64,
+
 	pub(crate) created_at: u128,
 	pub(crate) item_count: u64,
 	pub(crate) key_count: u64,
 	pub(crate) tombstone_count: u64,
 	pub(crate) num_soft_deletes: u64,
-	pub(crate) file_size: u64,
+
+	// Range deletion metrics
+	pub(crate) num_range_deletions: u64,
+
 	pub(crate) block_size: u32,
 	pub(crate) block_count: u32,
 	pub(crate) compression: CompressionType,
 	pub(crate) seqnos: (u64, u64),
+
+	// Time metrics
+	pub(crate) oldest_key_time: u64,
+	pub(crate) newest_key_time: u64,
+
 	pub(crate) key_range: Option<KeyRange>,
 }
 
@@ -143,23 +162,30 @@ impl Properties {
 			data_size: 0,
 			global_seq_num: 0,
 			num_data_blocks: 0,
+			index_size: 0,
+			index_partitions: 0,
 			top_level_index_size: 0,
+			filter_size: 0,
+			raw_key_size: 0,
+			raw_value_size: 0,
 			created_at: 0,
 			item_count: 0,
 			key_count: 0,
 			tombstone_count: 0,
 			num_soft_deletes: 0,
-			file_size: 0,
+			num_range_deletions: 0,
 			block_size: 0,
 			block_count: 0,
 			compression: CompressionType::None,
 			seqnos: (0, 0),
+			oldest_key_time: 0,
+			newest_key_time: 0,
 			key_range: None,
 		}
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = BytesMut::with_capacity(128);
+		let mut buf = BytesMut::with_capacity(256);
 		buf.put_u64(self.id);
 		buf.put_u8(self.table_format as u8);
 		buf.put_u64(self.num_entries);
@@ -167,18 +193,25 @@ impl Properties {
 		buf.put_u64(self.data_size);
 		buf.put_u64(self.global_seq_num);
 		buf.put_u64(self.num_data_blocks);
+		buf.put_u64(self.index_size);
+		buf.put_u64(self.index_partitions);
 		buf.put_u64(self.top_level_index_size);
+		buf.put_u64(self.filter_size);
+		buf.put_u64(self.raw_key_size);
+		buf.put_u64(self.raw_value_size);
 		buf.put_u128(self.created_at);
 		buf.put_u64(self.item_count);
 		buf.put_u64(self.key_count);
 		buf.put_u64(self.tombstone_count);
 		buf.put_u64(self.num_soft_deletes);
-		buf.put_u64(self.file_size);
+		buf.put_u64(self.num_range_deletions);
 		buf.put_u32(self.block_size);
 		buf.put_u32(self.block_count);
 		buf.put_u8(self.compression as u8);
 		buf.put_u64(self.seqnos.0);
 		buf.put_u64(self.seqnos.1);
+		buf.put_u64(self.oldest_key_time);
+		buf.put_u64(self.newest_key_time);
 		if let Some(ref key_range) = self.key_range {
 			// Write the size of the first element and then the element itself
 			let size_first_element = key_range.low.len() as u64;
@@ -202,18 +235,25 @@ impl Properties {
 		let data_size = buf.get_u64();
 		let global_seq_num = buf.get_u64();
 		let num_data_blocks = buf.get_u64();
+		let index_size = buf.get_u64();
+		let index_partitions = buf.get_u64();
 		let top_level_index_size = buf.get_u64();
+		let filter_size = buf.get_u64();
+		let raw_key_size = buf.get_u64();
+		let raw_value_size = buf.get_u64();
 		let created_at = buf.get_u128();
 		let item_count = buf.get_u64();
 		let key_count = buf.get_u64();
 		let tombstone_count = buf.get_u64();
 		let num_soft_deletes = buf.get_u64();
-		let file_size = buf.get_u64();
+		let num_range_deletions = buf.get_u64();
 		let block_size = buf.get_u32();
 		let block_count = buf.get_u32();
 		let compression = buf.get_u8();
 		let seqno_start = buf.get_u64();
 		let seqno_end = buf.get_u64();
+		let oldest_key_time = buf.get_u64();
+		let newest_key_time = buf.get_u64();
 		let key_range = if buf.has_remaining() {
 			let size_first_element = buf.get_u64() as usize;
 			let first_element = buf[..size_first_element].to_vec();
@@ -233,17 +273,24 @@ impl Properties {
 			data_size,
 			global_seq_num,
 			num_data_blocks,
+			index_size,
+			index_partitions,
 			top_level_index_size,
+			filter_size,
+			raw_key_size,
+			raw_value_size,
 			created_at,
 			item_count,
 			key_count,
 			tombstone_count,
 			num_soft_deletes,
-			file_size,
+			num_range_deletions,
 			block_size,
 			block_count,
 			compression: CompressionType::try_from(compression)?,
 			seqnos: (seqno_start, seqno_end),
+			oldest_key_time,
+			newest_key_time,
 			key_range,
 		})
 	}
@@ -393,21 +440,4 @@ impl TableMetadata {
 			largest_point,
 		})
 	}
-}
-
-pub(crate) fn size_of_writer_metadata() -> usize {
-	size_of::<Option<bool>>()
-		+ size_of::<u64>() * 2
-		+ size_of_properties()
-		+ size_of::<Option<InternalKey>>() * 2
-}
-
-fn size_of_properties() -> usize {
-	size_of::<u64>() * 11
-		+ size_of::<TableFormat>()
-		+ size_of::<u128>()
-		+ size_of::<u32>() * 2
-		+ size_of::<CompressionType>()
-		+ size_of::<(u64, u64)>()
-		+ size_of::<Option<KeyRange>>()
 }

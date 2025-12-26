@@ -28,14 +28,6 @@ impl FilterBlockWriter {
 		}
 	}
 
-	// Estimates the size of the final filter block.
-	pub(crate) fn size_estimate(&self) -> usize {
-		// The size is the sum of the filters' length, the offsets' length times 4
-		// (since each offset is a u32), plus 4 for the offsets' length itself, and 1
-		// for the base log2 value.
-		self.filters.len() + 4 * self.filter_offsets.len() + 4 + 1
-	}
-
 	// Adds a key to the list of keys that will be included in the next filter.
 	pub(crate) fn add_key(&mut self, key: &[u8]) {
 		let key = Vec::from(key);
