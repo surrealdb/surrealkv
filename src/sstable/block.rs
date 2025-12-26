@@ -622,6 +622,24 @@ impl BlockIterator {
 			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		}
 	}
+
+	/// Returns the raw encoded key bytes without allocation
+	#[inline]
+	pub(crate) fn key_bytes(&self) -> &[u8] {
+		&self.current_key
+	}
+
+	/// Returns the raw value bytes without allocation
+	#[inline]
+	pub(crate) fn value_bytes(&self) -> &[u8] {
+		&self.block[self.current_value_offset_start..self.current_value_offset_end]
+	}
+
+	/// Returns user key slice from current key without allocation
+	#[inline]
+	pub(crate) fn user_key(&self) -> &[u8] {
+		InternalKey::user_key_from_encoded(&self.current_key)
+	}
 }
 
 #[cfg(test)]

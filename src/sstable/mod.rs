@@ -127,6 +127,25 @@ impl InternalKey {
 		}
 	}
 
+	/// Extract user key slice without allocation
+	#[inline]
+	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
+		&encoded[..encoded.len() - 16]
+	}
+
+	/// Extract trailer (seq_num + kind) without allocation
+	#[inline]
+	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
+		let n = encoded.len() - 16;
+		read_u64_be(encoded, n)
+	}
+
+	/// Extract seq_num from encoded key without allocation
+	#[inline]
+	pub(crate) fn seq_num_from_encoded(encoded: &[u8]) -> u64 {
+		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
+	}
+
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
