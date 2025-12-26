@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
+use crate::InternalKeyRange;
 
 /// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,24 +90,45 @@ impl Strategy {
 			}
 		}
 
-		// Get key range from selected source tables
+		// Get bounds from selected source tables using smallest_point/largest_point
 		let source_tables: Vec<_> = if source_level_num == 0 {
 			source_level.tables.iter().collect()
 		} else {
 			source_level.tables.iter().take(1).collect()
 		};
 
-		let source_key_range = source_tables
+		// Build InternalKeyRange from smallest_point/largest_point
+		let source_bounds: Option<InternalKeyRange> = source_tables
 			.iter()
-			.filter_map(|t| t.meta.properties.key_range.clone())
-			.fold(None, |acc, range| match acc {
-				None => Some(range),
-				Some(acc_range) => Some(acc_range.merge(&range)),
+			.filter_map(|t| {
+				let smallest = t.meta.smallest_point.as_ref()?;
+				let largest = t.meta.largest_point.as_ref()?;
+				Some((smallest.clone(), largest.clone()))
+			})
+			.fold(None, |acc, (s, l)| {
+				use std::ops::Bound;
+				match acc {
+					None => Some((Bound::Included(s), Bound::Included(l))),
+					Some((Bound::Included(acc_s), Bound::Included(acc_l))) => {
+						let new_s = if s.user_key < acc_s.user_key {
+							s
+						} else {
+							acc_s
+						};
+						let new_l = if l.user_key > acc_l.user_key {
+							l
+						} else {
+							acc_l
+						};
+						Some((Bound::Included(new_s), Bound::Included(new_l)))
+					}
+					_ => acc,
+				}
 			});
 
 		// Find overlapping tables from next level
-		if let Some(source_range) = source_key_range {
-			for table in next_level.overlapping_tables(&source_range) {
+		if let Some(bounds) = source_bounds {
+			for table in next_level.overlapping_tables(&bounds) {
 				if table_id_set.insert(table.id) {
 					tables.push(table.id);
 				}
@@ -2149,10 +2171,13 @@ mod tests {
 		assert_eq!(props.compression, CompressionType::None);
 		assert_eq!(props.seqnos.0, 1000);
 		assert_eq!(props.seqnos.1, 1099);
-		assert!(props.key_range.is_some());
-		if let Some(key_range) = &props.key_range {
-			assert_eq!(&*key_range.low, b"key-000");
-			assert_eq!(&*key_range.high, b"key-099");
+		assert!(meta.smallest_point.is_some());
+		assert!(meta.largest_point.is_some());
+		if let Some(smallest) = &meta.smallest_point {
+			assert_eq!(&smallest.user_key, b"key-000");
+		}
+		if let Some(largest) = &meta.largest_point {
+			assert_eq!(&largest.user_key, b"key-099");
 		}
 
 		// Verify TableMetadata fields

@@ -587,14 +587,11 @@ pub(crate) type InternalKeyRangeBound = Bound<sstable::InternalKey>;
 /// Type alias for InternalKey ranges
 pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
-/// Converts a user-key range to an InternalKey range for efficient iteration.
-/// This function centralizes the conversion logic used across snapshot, table,
-/// and memtable.
-pub(crate) fn user_range_to_internal_range<R, B>(range: R) -> InternalKeyRange
-where
-	R: std::ops::RangeBounds<B>,
-	B: IntoBytes + Clone,
-{
+/// Converts user key bounds to InternalKeyRange for efficient iteration.
+pub(crate) fn user_range_to_internal_range(
+	lower: Bound<&[u8]>,
+	upper: Bound<&[u8]>,
+) -> InternalKeyRange {
 	use sstable::{
 		InternalKey,
 		InternalKeyKind,
@@ -602,30 +599,30 @@ where
 		INTERNAL_KEY_TIMESTAMP_MAX,
 	};
 
-	let start_bound = match range.start_bound() {
+	let start_bound = match lower {
+		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => Bound::Included(InternalKey::new(
-			key.clone().into_bytes(),
+			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 		Bound::Excluded(key) => {
-			Bound::Excluded(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
-		Bound::Unbounded => Bound::Unbounded,
 	};
 
-	let end_bound = match range.end_bound() {
+	let end_bound = match upper {
+		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => {
-			Bound::Included(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
 		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-			key.clone().into_bytes(),
+			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
-		Bound::Unbounded => Bound::Unbounded,
 	};
 
 	(start_bound, end_bound)

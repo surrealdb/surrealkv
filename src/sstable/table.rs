@@ -8,7 +8,6 @@ use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
-use super::meta::KeyRange;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
@@ -456,23 +455,6 @@ impl<W: Write> TableWriter<W> {
 		}
 		props.key_count += 1;
 		props.data_size += (key.encode().len() + value.len()) as u64;
-
-		let user_key = &key.user_key;
-
-		// Update key range if needed
-		if props.key_range.is_none() {
-			props.key_range = Some(KeyRange {
-				low: user_key.clone(),
-				high: user_key.clone(),
-			});
-		} else if let Some(ref mut range) = props.key_range {
-			if self.opts.comparator.compare(user_key, &range.low) == Ordering::Less {
-				range.low.clone_from(user_key);
-			}
-			if self.opts.comparator.compare(user_key, &range.high) == Ordering::Greater {
-				range.high.clone_from(user_key);
-			}
-		}
 	}
 }
 
@@ -839,50 +821,52 @@ impl Table {
 	}
 
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
-		if let Some(ref range) = self.meta.properties.key_range {
-			return self.opts.comparator.compare(key.user_key.as_slice(), &range.low)
-				>= Ordering::Equal
-				&& self.opts.comparator.compare(key.user_key.as_slice(), &range.high)
-					<= Ordering::Equal;
+		let Some(smallest) = &self.meta.smallest_point else {
+			return true;
+		};
+		let Some(largest) = &self.meta.largest_point else {
+			return true;
+		};
+
+		self.opts.comparator.compare(key.user_key.as_slice(), &smallest.user_key) >= Ordering::Equal
+			&& self.opts.comparator.compare(key.user_key.as_slice(), &largest.user_key)
+				<= Ordering::Equal
+	}
+
+	/// Checks if table is completely before the query range
+	/// Uses USER KEY comparison only (like RocksDB's sstableKeyCompare)
+	pub(crate) fn is_before_range(&self, range: &InternalKeyRange) -> bool {
+		let Some(largest) = &self.meta.largest_point else {
+			return false;
+		};
+
+		match &range.0 {
+			// lower bound
+			Bound::Unbounded => false,
+			Bound::Included(k) | Bound::Excluded(k) => {
+				self.opts.comparator.compare(&largest.user_key, &k.user_key) == Ordering::Less
+			}
 		}
-		true // If no key range is defined, assume the key is in range.
 	}
 
-	/// Checks if this table's key range overlaps with the given key range
-	pub(crate) fn overlaps_with_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| range.overlaps(other_range))
-			.unwrap_or(false)
+	/// Checks if table is completely after the query range
+	pub(crate) fn is_after_range(&self, range: &InternalKeyRange) -> bool {
+		let Some(smallest) = &self.meta.smallest_point else {
+			return false;
+		};
+
+		match &range.1 {
+			// upper bound
+			Bound::Unbounded => false,
+			Bound::Included(k) | Bound::Excluded(k) => {
+				self.opts.comparator.compare(&smallest.user_key, &k.user_key) == Ordering::Greater
+			}
+		}
 	}
 
-	/// Checks if this table is completely before the given range
-	/// Returns true if table's highest key is less than the range's lowest key
-	pub(crate) fn is_before_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| {
-				self.opts.comparator.compare(&range.high, &other_range.low) == Ordering::Less
-			})
-			.unwrap_or(false)
-	}
-
-	/// Checks if this table is completely after the given range
-	/// Returns true if table's lowest key is greater than the range's highest
-	/// key
-	pub(crate) fn is_after_range(&self, other_range: &crate::sstable::meta::KeyRange) -> bool {
-		self.meta
-			.properties
-			.key_range
-			.as_ref()
-			.map(|range| {
-				self.opts.comparator.compare(&range.low, &other_range.high) == Ordering::Greater
-			})
-			.unwrap_or(false)
+	/// Checks if table overlaps with query range
+	pub(crate) fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
+		!self.is_before_range(range) && !self.is_after_range(range)
 	}
 }
 
@@ -1563,7 +1547,7 @@ mod tests {
 		}
 
 		let actual = b.finish().unwrap();
-		assert_eq!(746, actual);
+		assert_eq!(724, actual);
 	}
 
 	#[test]
@@ -1875,7 +1859,8 @@ mod tests {
 		let writer = TableWriter::new(d, 1, opts, 0);
 
 		// Key range should be None for an empty table
-		assert!(writer.meta.properties.key_range.is_none());
+		assert!(writer.meta.smallest_point.is_none());
+		assert!(writer.meta.largest_point.is_none());
 	}
 
 	#[test]
@@ -1888,9 +1873,14 @@ mod tests {
 		add_key(&mut writer, b"singleton", 1, b"value").unwrap();
 
 		// Key range should have identical low and high bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"singleton");
-		assert_eq!(&range.high[..], b"singleton");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"singleton");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"singleton");
+		}
 	}
 
 	#[test]
@@ -1905,9 +1895,14 @@ mod tests {
 			add_key(&mut writer, key.as_bytes(), i as u64 + 1, b"value").unwrap();
 
 			// Verify range is updated correctly at each step
-			let range = writer.meta.properties.key_range.as_ref().unwrap();
-			assert_eq!(&range.low[..], b"aaa");
-			assert_eq!(&range.high[..], key.as_bytes());
+			assert!(writer.meta.smallest_point.is_some());
+			assert!(writer.meta.largest_point.is_some());
+			if let Some(smallest) = &writer.meta.smallest_point {
+				assert_eq!(&smallest.user_key[..], b"aaa");
+			}
+			if let Some(largest) = &writer.meta.largest_point {
+				assert_eq!(&largest.user_key[..], key.as_bytes());
+			}
 		}
 	}
 
@@ -1928,9 +1923,14 @@ mod tests {
 		}
 
 		// Verify final range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"a10");
-		assert_eq!(&range.high[..], b"a30");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"a10");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"a30");
+		}
 	}
 
 	#[test]
@@ -1946,9 +1946,14 @@ mod tests {
 			add_key(&mut writer, key.as_bytes(), i as u64 + 1, b"value").unwrap();
 
 			// Check range after each addition
-			let range = writer.meta.properties.key_range.as_ref().unwrap();
-			assert_eq!(&range.low[..], b"aaaaa");
-			assert_eq!(&range.high[..], key.as_bytes());
+			assert!(writer.meta.smallest_point.is_some());
+			assert!(writer.meta.largest_point.is_some());
+			if let Some(smallest) = &writer.meta.smallest_point {
+				assert_eq!(&smallest.user_key[..], b"aaaaa");
+			}
+			if let Some(largest) = &writer.meta.largest_point {
+				assert_eq!(&largest.user_key[..], key.as_bytes());
+			}
 		}
 	}
 
@@ -1970,9 +1975,14 @@ mod tests {
 		}
 
 		// Verify final range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"aaa1");
-		assert_eq!(&range.high[..], b"aac5");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"aaa1");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"aac5");
+		}
 	}
 
 	#[test]
@@ -1989,9 +1999,14 @@ mod tests {
 		}
 
 		// Verify range with binary comparison
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], &[0x00, 0x01, 0x02]);
-		assert_eq!(&range.high[..], &[0xF0, 0xF1, 0xF2]);
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], &[0x00, 0x01, 0x02]);
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], &[0xF0, 0xF1, 0xF2]);
+		}
 	}
 
 	#[test]
@@ -2008,9 +2023,14 @@ mod tests {
 		add_key(&mut writer, b"same_key", 10, b"value1").unwrap();
 
 		// Verify range is correct - should be the same key for both bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"same_key");
-		assert_eq!(&range.high[..], b"same_key");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"same_key");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"same_key");
+		}
 	}
 
 	#[test]
@@ -2027,9 +2047,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], "α".as_bytes());
-		assert_eq!(&range.high[..], "ε".as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], "α".as_bytes());
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], "ε".as_bytes());
+		}
 	}
 
 	#[test]
@@ -2056,9 +2081,14 @@ mod tests {
 		}
 
 		// Verify range matches the expected lowest and highest keys
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], sorted_keys.first().unwrap().as_bytes());
-		assert_eq!(&range.high[..], sorted_keys.last().unwrap().as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], sorted_keys.first().unwrap().as_bytes());
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], sorted_keys.last().unwrap().as_bytes());
+		}
 	}
 
 	#[test]
@@ -2079,9 +2109,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"AAA");
-		assert_eq!(&range.high[..], b"bbb");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"AAA");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"bbb");
+		}
 	}
 
 	#[test]
@@ -2112,9 +2147,14 @@ mod tests {
 		}
 
 		// Verify range matches expected bounds
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], &keys.first().unwrap()[..]);
-		assert_eq!(&range.high[..], &keys.last().unwrap()[..]);
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], &keys.first().unwrap()[..]);
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], &keys.last().unwrap()[..]);
+		}
 	}
 
 	#[test]
@@ -2132,9 +2172,14 @@ mod tests {
 		add_key(&mut writer, b"zzzzzz", 4, b"value").unwrap();
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"prefix:aaa");
-		assert_eq!(&range.high[..], b"zzzzzz");
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"prefix:aaa");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"zzzzzz");
+		}
 	}
 
 	#[test]
@@ -2157,9 +2202,14 @@ mod tests {
 		}
 
 		// Verify range
-		let range = writer.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&range.low[..], b"");
-		assert_eq!(&range.high[..], "z".repeat(1000).as_bytes());
+		assert!(writer.meta.smallest_point.is_some());
+		assert!(writer.meta.largest_point.is_some());
+		if let Some(smallest) = &writer.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"");
+		}
+		if let Some(largest) = &writer.meta.largest_point {
+			assert_eq!(&largest.user_key[..], "z".repeat(1000).as_bytes());
+		}
 	}
 
 	#[test]
@@ -2177,9 +2227,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify the key range was properly persisted and loaded
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Also verify that we can use the range for querying
 		assert!(table.is_key_in_key_range(&InternalKey::new(
@@ -2245,9 +2300,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range was properly persisted with disjoint data
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Test keys in the gaps to ensure the is_key_in_key_range function works
 		// properly
@@ -2293,9 +2353,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], expected_low);
-		assert_eq!(&key_range.high[..], expected_high);
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], expected_low);
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], expected_high);
+		}
 
 		// Verify block count is greater than 1 (multiple blocks were created)
 		assert!(table.meta.properties.num_data_blocks > 1);
@@ -2329,9 +2394,14 @@ mod tests {
 		let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
 
 		// Verify key range includes tombstones
-		let key_range = table.meta.properties.key_range.as_ref().unwrap();
-		assert_eq!(&key_range.low[..], b"aaa");
-		assert_eq!(&key_range.high[..], b"eee");
+		assert!(table.meta.smallest_point.is_some());
+		assert!(table.meta.largest_point.is_some());
+		if let Some(smallest) = &table.meta.smallest_point {
+			assert_eq!(&smallest.user_key[..], b"aaa");
+		}
+		if let Some(largest) = &table.meta.largest_point {
+			assert_eq!(&largest.user_key[..], b"eee");
+		}
 
 		// Verify tombstone count
 		assert_eq!(table.meta.properties.tombstone_count, 2);
@@ -3708,10 +3778,10 @@ mod tests {
 		// Iterate with range (Unbounded, Included("key_005"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Included(b"key_005".to_vec()),
-			))),
+				Bound::Included(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3756,10 +3826,10 @@ mod tests {
 		// Iterate with range (Unbounded, Excluded("key_005"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3854,10 +3924,10 @@ mod tests {
 		// Iterate with range (Included("key_003"), Unbounded) using next_back()
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3903,10 +3973,10 @@ mod tests {
 		// Iterate with range (Included("key_002"), Excluded("key_007"))
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_002".to_vec()),
-				Bound::Excluded(b"key_007".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_002".as_slice()),
+				Bound::Excluded(b"key_007".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -3945,13 +4015,8 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
-		let iter = table.iter(
-			false,
-			Some(user_range_to_internal_range((
-				Bound::<Vec<u8>>::Unbounded,
-				Bound::<Vec<u8>>::Unbounded,
-			))),
-		);
+		let iter = table
+			.iter(false, Some(user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded)));
 
 		let mut results = Vec::new();
 		for item in iter {
@@ -4079,10 +4144,10 @@ mod tests {
 		// Reverse iteration with EXCLUDED upper bound
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4123,10 +4188,10 @@ mod tests {
 		// Reverse iteration with INCLUDED upper bound on non-existent key
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Included(b"key_005".to_vec()),
-			))),
+				Bound::Included(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4167,10 +4232,10 @@ mod tests {
 		// Forward iteration with EXCLUDED lower bound
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4207,10 +4272,10 @@ mod tests {
 		// Forward iteration with excluded lower bound
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4263,10 +4328,10 @@ mod tests {
 		// Reverse iteration with excluded upper bound
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4317,10 +4382,10 @@ mod tests {
 		// Forward iteration with both bounds excluded at same key
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -4354,10 +4419,10 @@ mod tests {
 		// Reverse iteration with both bounds excluded at same key
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_003".to_vec()),
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_003".as_slice()),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4397,10 +4462,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_002".to_vec()),
-				Bound::Excluded(b"key_004".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
+				Bound::Excluded(b"key_004".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -4454,10 +4519,10 @@ mod tests {
 		// Forward iteration
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_002".to_vec()),
-				Bound::Excluded(b"key_005".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
+				Bound::Excluded(b"key_005".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -5127,10 +5192,10 @@ mod tests {
 		// Test with bound that might be at a block boundary
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_003".to_vec()),
-				Bound::Included(b"key_006".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_003".as_slice()),
+				Bound::Included(b"key_006".as_slice()),
+			)),
 		);
 
 		let results: Vec<String> =
@@ -5160,10 +5225,10 @@ mod tests {
 		// Included bound should include ALL versions
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"key_002".to_vec()),
-				Bound::Included(b"key_003".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"key_002".as_slice()),
+				Bound::Included(b"key_003".as_slice()),
+			)),
 		);
 
 		let results: Vec<(String, u64)> = iter
@@ -5201,10 +5266,10 @@ mod tests {
 		// Excluded lower bound should skip ALL versions of key_002
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Excluded(b"key_002".to_vec()),
+			Some(user_range_to_internal_range(
+				Bound::Excluded(b"key_002".as_slice()),
 				Bound::Unbounded,
-			))),
+			)),
 		);
 
 		let results: Vec<String> =
@@ -5236,10 +5301,10 @@ mod tests {
 		// Excluded upper bound in reverse
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
+			Some(user_range_to_internal_range(
 				Bound::Unbounded,
-				Bound::Excluded(b"key_003".to_vec()),
-			))),
+				Bound::Excluded(b"key_003".as_slice()),
+			)),
 		);
 
 		let mut results = Vec::new();
@@ -5267,10 +5332,10 @@ mod tests {
 		// Range [ccc, ccc] - "ccc" doesn't exist
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"ccc".to_vec()),
-				Bound::Included(b"ccc".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"ccc".as_slice()),
+				Bound::Included(b"ccc".as_slice()),
+			)),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -5288,10 +5353,10 @@ mod tests {
 
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"aaa".to_vec()),
-				Bound::Included(b"bbb".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"aaa".as_slice()),
+				Bound::Included(b"bbb".as_slice()),
+			)),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -5309,10 +5374,10 @@ mod tests {
 
 		let iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"xxx".to_vec()),
-				Bound::Included(b"zzz".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"xxx".as_slice()),
+				Bound::Included(b"zzz".as_slice()),
+			)),
 		);
 
 		let results: Vec<_> = iter.collect();
@@ -5331,10 +5396,10 @@ mod tests {
 		// Range [ccc, ccc] doesn't exist
 		let mut iter = table.iter(
 			false,
-			Some(user_range_to_internal_range((
-				Bound::Included(b"ccc".to_vec()),
-				Bound::Included(b"ccc".to_vec()),
-			))),
+			Some(user_range_to_internal_range(
+				Bound::Included(b"ccc".as_slice()),
+				Bound::Included(b"ccc".as_slice()),
+			)),
 		);
 
 		let result = iter.next_back();
