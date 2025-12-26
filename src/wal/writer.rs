@@ -222,8 +222,8 @@ impl Writer {
 
 		// Write header (7-byte format)
 		let mut header = Vec::with_capacity(HEADER_SIZE);
-		header.extend_from_slice(&crc.to_le_bytes());
-		header.extend_from_slice(&(length as u16).to_le_bytes());
+		header.extend_from_slice(&crc.to_be_bytes());
+		header.extend_from_slice(&(length as u16).to_be_bytes());
 		header.push(record_type as u8);
 
 		self.dest.append(&header)?;
