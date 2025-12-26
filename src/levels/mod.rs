@@ -1,22 +1,20 @@
-use std::{
-	collections::{HashMap, HashSet},
-	fs::File as SysFile,
-	io::{Cursor, Read, Write},
-	path::{Path, PathBuf},
-	sync::{
-		atomic::{AtomicU64, Ordering},
-		Arc,
-	},
-	time::{SystemTime, UNIX_EPOCH},
-};
-
-use crate::{error::Error, sstable::table::Table, vfs::File, Options, Result};
+use std::collections::{HashMap, HashSet};
+use std::fs::File as SysFile;
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use iter::LevelManifestIterator;
+pub(crate) use level::{Level, Levels};
 use rand::Rng;
 
-pub(crate) use level::{Level, Levels};
+use crate::error::Error;
+use crate::sstable::table::Table;
+use crate::vfs::File;
+use crate::{Options, Result};
 
 /// Current manifest format version
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
@@ -97,7 +95,8 @@ pub(crate) struct LevelManifest {
 	pub snapshots: Vec<SnapshotInfo>,
 
 	/// Minimum WAL number that contains unflushed data.
-	/// All WAL files with number < log_number have been flushed to SST and can be safely deleted.
+	/// All WAL files with number < log_number have been flushed to SST and can
+	/// be safely deleted.
 	pub(crate) log_number: u64,
 
 	/// Last sequence number persisted in the manifest.
@@ -204,7 +203,8 @@ impl LevelManifest {
 		}
 
 		// Now convert the level data into actual Level objects with Table instances
-		// Use the actual number of levels from the manifest, not the configured level count
+		// Use the actual number of levels from the manifest, not the configured level
+		// count
 		let mut levels_vec = Vec::with_capacity(level_data.len());
 
 		// Load all levels that exist in the manifest
@@ -364,7 +364,8 @@ impl LevelManifest {
 		}
 
 		// Apply log_number if present, but only if it's higher
-		// This prevents race conditions where concurrent flushes could move log_number backward
+		// This prevents race conditions where concurrent flushes could move log_number
+		// backward
 		if let Some(log_num) = changeset.log_number {
 			if log_num > self.log_number {
 				self.log_number = log_num;
@@ -456,7 +457,8 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// Optionally, open and sync the updated file to ensure all changes are flushed to disk.
+	// Optionally, open and sync the updated file to ensure all changes are flushed
+	// to disk.
 	let updated_file = SysFile::open(target_path)?;
 	updated_file.sync_all()?;
 
@@ -503,15 +505,14 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::{table::TableWriter, InternalKey, InternalKeyKind};
-	use bytes::Bytes;
+	use std::fs::{self, File as SysFile};
+	use std::sync::atomic::Ordering;
+
 	use test_log::test;
 
 	use super::*;
-	use std::{
-		fs::{self, File as SysFile},
-		sync::atomic::Ordering,
-	};
+	use crate::sstable::table::TableWriter;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	// Helper function to create a test table with direct file IO
 	fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
@@ -527,12 +528,8 @@ mod tests {
 			let key = format!("key_{i:05}");
 			let value = format!("value_{i:05}");
 
-			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(key.as_bytes()),
-				i + 1,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -733,7 +730,6 @@ mod tests {
 		assert_eq!(props1.id, table_id1, "Table 1 properties ID mismatch");
 		assert_eq!(props1.num_entries, 100, "Table 1 should have 100 entries");
 		assert!(props1.data_size > 0, "Table 1 data size should be greater than 0");
-		assert!(props1.file_size > 0, "Table 1 file size in properties should be greater than 0");
 		assert!(props1.created_at > 0, "Table 1 created_at should be set");
 		assert_eq!(props1.item_count, 100, "Table 1 item count should match entries");
 		assert_eq!(props1.key_count, 100, "Table 1 key count should match entries");
@@ -774,7 +770,6 @@ mod tests {
 		assert_eq!(props2.id, table_id2, "Table 2 properties ID mismatch");
 		assert_eq!(props2.num_entries, 200, "Table 2 should have 200 entries");
 		assert!(props2.data_size > 0, "Table 2 data size should be greater than 0");
-		assert!(props2.file_size > 0, "Table 2 file size in properties should be greater than 0");
 		assert!(props2.created_at > 0, "Table 2 created_at should be set");
 		assert_eq!(props2.item_count, 200, "Table 2 item count should match entries");
 		assert_eq!(props2.key_count, 200, "Table 2 key count should match entries");
@@ -815,7 +810,6 @@ mod tests {
 		assert_eq!(props3.id, table_id3, "Table 3 properties ID mismatch");
 		assert_eq!(props3.num_entries, 300, "Table 3 should have 300 entries");
 		assert!(props3.data_size > 0, "Table 3 data size should be greater than 0");
-		assert!(props3.file_size > 0, "Table 3 file size in properties should be greater than 0");
 		assert!(props3.created_at > 0, "Table 3 created_at should be set");
 		assert_eq!(props3.item_count, 300, "Table 3 item count should match entries");
 		assert_eq!(props3.key_count, 300, "Table 3 key count should match entries");
@@ -891,12 +885,8 @@ mod tests {
 			let key = format!("key_{seq_num:05}");
 			let value = format!("value_{seq_num:05}");
 
-			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(key.as_bytes()),
-				seq_num,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -989,7 +979,8 @@ mod tests {
 			"Should update to highest sequence after adding new table"
 		);
 
-		// Test 5: Verify table ordering - tables should be sorted by largest_seq_num descending
+		// Test 5: Verify table ordering - tables should be sorted by largest_seq_num
+		// descending
 		{
 			let level0 = &manifest.levels.get_levels()[0];
 			assert_eq!(level0.tables.len(), 3, "Should have 3 tables in L0");
@@ -1009,8 +1000,8 @@ mod tests {
 			);
 		}
 
-		// Test 6: Add table with lower sequence numbers (simulating out-of-order insertion)
-		// Create table with sequence numbers 5-8 (largest_seq_num = 8)
+		// Test 6: Add table with lower sequence numbers (simulating out-of-order
+		// insertion) Create table with sequence numbers 5-8 (largest_seq_num = 8)
 		let table4 = create_test_table_with_seq_nums(4, 5, 8, opts.clone())
 			.expect("Failed to create table 4");
 
@@ -1052,7 +1043,8 @@ mod tests {
 		}
 
 		// Test 7: Test with overlapping sequence ranges
-		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with table3)
+		// Create table with sequence numbers 25-35 (largest_seq_num = 35, overlaps with
+		// table3)
 		let table5 =
 			create_test_table_with_seq_nums(5, 25, 35, opts).expect("Failed to create table 5");
 
@@ -1186,7 +1178,8 @@ mod tests {
 			.expect("Failed to create table");
 
 		// Use changeset to atomically set log_number and add table
-		// The changeset will automatically update last_sequence from the table's largest_seq_num
+		// The changeset will automatically update last_sequence from the table's
+		// largest_seq_num
 		let changeset = ManifestChangeSet {
 			log_number: Some(42),
 			new_tables: vec![(0, table)],

@@ -1,25 +1,21 @@
 // Note: Needs to be tested if a top-level index improves performance as such.
 // TODO: Replace the current non-partitioned index block writer with this
+use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::{
-	error::{Error, Result},
-	sstable::{
-		block::{Block, BlockData, BlockHandle, BlockWriter},
-		table::{compress_block, read_table_block, write_block_at_offset},
-		InternalKey,
-	},
-	vfs::File,
-	CompressionType, Options,
-};
-use bytes::Bytes;
+use crate::comparator::Comparator;
+use crate::error::{Error, Result};
+use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
+use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
+use crate::vfs::File;
+use crate::{CompressionType, Options};
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
-	/// User key of last item in block
-	pub user_key: Bytes,
+	/// Full encoded separator key (internal key with seq_num)
+	pub separator_key: Vec<u8>,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -27,9 +23,9 @@ pub(crate) struct BlockHandleWithKey {
 
 impl BlockHandleWithKey {
 	#[cfg(test)]
-	pub(crate) fn new(user_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
+	pub(crate) fn new(separator_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
-			user_key: Bytes::from(user_key),
+			separator_key,
 			handle,
 		}
 	}
@@ -39,8 +35,8 @@ impl BlockHandleWithKey {
 	}
 }
 
-// Represents a top-level index block that contains pointers to other index blocks
-// Link: https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+// Represents a top-level index block that contains pointers to other index
+// blocks Link: https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
 //
 // [index block - partition 1]
 // [index block - partition 2]
@@ -52,6 +48,11 @@ pub(crate) struct TopLevelIndexWriter {
 	index_blocks: Vec<BlockWriter>,
 	current_block: BlockWriter,
 	max_block_size: usize,
+
+	// Stats tracked during finish()
+	index_size: u64,
+	num_partitions: u64,
+	top_level_index_size: u64,
 }
 
 impl TopLevelIndexWriter {
@@ -59,24 +60,29 @@ impl TopLevelIndexWriter {
 		TopLevelIndexWriter {
 			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
-			current_block: BlockWriter::new(opts),
+			current_block: BlockWriter::new(
+				opts.block_size,
+				opts.block_restart_interval,
+				Arc::clone(&opts.internal_comparator),
+			),
 			max_block_size,
+			index_size: 0,
+			num_partitions: 0,
+			top_level_index_size: 0,
 		}
 	}
 
-	pub(crate) fn size_estimate(&self) -> usize {
-		// Sum the size of all finished index blocks
-		let finished_blocks_size: usize =
-			self.index_blocks.iter().map(|block| block.size_estimate()).sum();
+	// Query methods - called after finish()
+	pub(crate) fn index_size(&self) -> u64 {
+		self.index_size
+	}
 
-		// Add the size of the current block
-		let total_size = finished_blocks_size + self.current_block.size_estimate();
+	pub(crate) fn num_partitions(&self) -> u64 {
+		self.num_partitions
+	}
 
-		// Add an estimate for the top-level index
-		let top_level_estimate =
-			(self.index_blocks.len() + 1) * (std::mem::size_of::<InternalKey>() + 8);
-
-		total_size + top_level_estimate
+	pub(crate) fn top_level_index_size(&self) -> u64 {
+		self.top_level_index_size
 	}
 
 	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
@@ -87,7 +93,11 @@ impl TopLevelIndexWriter {
 	}
 
 	fn finish_current_block(&mut self) {
-		let new_block = BlockWriter::new(Arc::clone(&self.opts));
+		let new_block = BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.internal_comparator),
+		);
 		let finished_block = std::mem::replace(&mut self.current_block, new_block);
 		self.index_blocks.push(finished_block);
 	}
@@ -103,24 +113,41 @@ impl TopLevelIndexWriter {
 	}
 
 	pub(crate) fn finish<W: Write>(
-		mut self,
+		&mut self,
 		writer: &mut W,
 		compression_type: CompressionType,
 		mut offset: usize,
 	) -> Result<(BlockHandle, usize)> {
+		let start_offset = offset;
+
 		// Only finish current block if it has entries
 		if self.current_block.entries() > 0 {
 			self.finish_current_block();
 		}
 
-		// If no blocks were created, create a single empty block
+		// If no blocks were created, move current_block to index_blocks
 		if self.index_blocks.is_empty() {
-			self.index_blocks.push(self.current_block);
+			let new_block = BlockWriter::new(
+				self.opts.block_size,
+				self.opts.block_restart_interval,
+				Arc::clone(&self.opts.internal_comparator),
+			);
+			let old_block = std::mem::replace(&mut self.current_block, new_block);
+			self.index_blocks.push(old_block);
 		}
 
-		let mut top_level_index = BlockWriter::new(self.opts);
+		let mut top_level_index = BlockWriter::new(
+			self.opts.block_size,
+			self.opts.block_restart_interval,
+			Arc::clone(&self.opts.internal_comparator),
+		);
 
-		for block in self.index_blocks {
+		// Track number of partitions
+		self.num_partitions = self.index_blocks.len() as u64;
+
+		// Take ownership of index_blocks to iterate and consume
+		let index_blocks = std::mem::take(&mut self.index_blocks);
+		for block in index_blocks {
 			let separator_key = block.last_key.clone();
 			let block_data = block.finish();
 
@@ -137,8 +164,15 @@ impl TopLevelIndexWriter {
 			top_level_index.add(&separator_key, &block_handle.encode())?;
 		}
 
-		let block_data = top_level_index.finish();
-		Self::write_compressed_block(writer, block_data, compression_type, offset)
+		let top_level_data = top_level_index.finish();
+		self.top_level_index_size = top_level_data.len() as u64;
+		let (handle, final_offset) =
+			Self::write_compressed_block(writer, top_level_data, compression_type, offset)?;
+
+		// Track total index size
+		self.index_size = (final_offset - start_offset) as u64;
+
+		Ok((handle, final_offset))
 	}
 }
 
@@ -148,7 +182,8 @@ pub(crate) struct TopLevelIndex {
 	id: u64,
 	opts: Arc<Options>,
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
-	// TODO: Fix this, as this could be problematic if the file is being shared across without any mutex
+	// TODO: Fix this, as this could be problematic if the file is being shared across without any
+	// mutex
 	file: Arc<dyn File>,
 }
 
@@ -159,15 +194,15 @@ impl TopLevelIndex {
 		f: Arc<dyn File>,
 		location: &BlockHandle,
 	) -> Result<Self> {
-		let block = read_table_block(Arc::clone(&opt), Arc::clone(&f), location)?;
+		let block =
+			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
 		let iter = block.iter(false);
 		let mut blocks = Vec::new();
 		for (key, handle) in iter {
-			// Extract user key from the encoded internal key
-			let internal_key = InternalKey::decode(&key);
+			// Store full encoded internal key for correct partition lookup
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
-				user_key: internal_key.user_key,
+				separator_key: key,
 				handle,
 			});
 		}
@@ -179,21 +214,33 @@ impl TopLevelIndex {
 		})
 	}
 
-	pub(crate) fn find_block_handle_by_key(&self, user_key: &[u8]) -> Option<&BlockHandleWithKey> {
-		// Find the partition point in the blocks where the key would fit.
-		let index = self.blocks.partition_point(|block| block.user_key.as_ref() < user_key);
+	pub(crate) fn find_block_handle_by_key(
+		&self,
+		target: &[u8],
+	) -> Option<(usize, &BlockHandleWithKey)> {
+		// Guard against empty/corrupt partitioned index
+		if self.blocks.is_empty() {
+			log::error!(
+				"[INDEX] Attempted lookup on empty/corrupt partitioned index with no blocks. \
+				Table ID: {}",
+				self.id
+			);
+			return None;
+		}
 
-		// Attempt to retrieve the block at the found index.
-		let result = self.blocks.get(index).and_then(|block| {
-			// Compare user keys directly
-			if user_key <= block.user_key.as_ref() {
-				Some(block)
-			} else {
-				None
-			}
+		let internal_cmp = &self.opts.internal_comparator;
+
+		// Find the partition point in the blocks where the key would fit.
+		// Uses full internal key comparison for correct partition lookup.
+		let index = self.blocks.partition_point(|block| {
+			internal_cmp.compare(&block.separator_key, target) == Ordering::Less
 		});
 
-		result
+		// Attempt to retrieve the block at the found index.
+		self.blocks
+			.get(index)
+			.filter(|block| internal_cmp.compare(target, &block.separator_key) != Ordering::Greater)
+			.map(|block| (index, block))
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
@@ -201,8 +248,11 @@ impl TopLevelIndex {
 			return Ok(block);
 		}
 
-		let block_data =
-			read_table_block(Arc::clone(&self.opts), Arc::clone(&self.file), &block_handle.handle)?;
+		let block_data = read_table_block(
+			Arc::clone(&self.opts.internal_comparator),
+			Arc::clone(&self.file),
+			&block_handle.handle,
+		)?;
 		let block = Arc::new(block_data);
 		self.opts.block_cache.insert_index_block(
 			self.id,
@@ -213,39 +263,31 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn get(&self, user_key: &[u8]) -> Result<Arc<Block>> {
-		let Some(block_handle) = self.find_block_handle_by_key(user_key) else {
+	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
+		let Some((_index, block_handle)) = self.find_block_handle_by_key(target) else {
 			return Err(Error::BlockNotFound);
 		};
 
 		let block = self.load_block(block_handle)?;
 		Ok(block)
 	}
-
-	pub(crate) fn first_partition(&self) -> Result<Arc<Block>> {
-		if let Some(first_block_handle) = self.blocks.first() {
-			self.load_block(first_block_handle)
-		} else {
-			Err(Error::BlockNotFound)
-		}
-	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
+	use test_log::test;
+
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::Iterator;
-	use bytes::Bytes;
-	use std::sync::Arc;
-	use test_log::test;
 
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)
 	}
 
 	fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
-		InternalKey::new(Bytes::from(user_key), sequence, InternalKeyKind::Set, 0).encode()
+		InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
 	}
 
 	#[test]
@@ -289,8 +331,8 @@ mod tests {
 
 	//     let top_level_block = writer.finish().unwrap();
 	//     assert_eq!(index_blocks.len(), 0);
-	//     assert!(!top_level_block.is_empty()); // Top-level block should still be created
-	// }
+	//     assert!(!top_level_block.is_empty()); // Top-level block should still be
+	// created }
 
 	#[test]
 	fn test_top_level_index_writer_large_entries() {
@@ -334,14 +376,14 @@ mod tests {
 	//     writer.add(&key1, &handle1).unwrap();
 
 	//     let mut d = Vec::new();
-	//     let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	//     assert!(!top_level_block.0.offset > 0);
+	//     let top_level_block = writer.finish(&mut d, CompressionType::None,
+	// 0).unwrap();     assert!(!top_level_block.0.offset > 0);
 
 	//     let f = wrap_buffer(d);
-	//     let top_level_index = TopLevelIndex::new(0, opts, f, &top_level_block.0).unwrap();
-	//     let block = top_level_index.get(&key1).unwrap();
-	//     // println!("block: {:?}", block.block);
-	// }
+	//     let top_level_index = TopLevelIndex::new(0, opts, f,
+	// &top_level_block.0).unwrap();     let block =
+	// top_level_index.get(&key1).unwrap();     // println!("block: {:?}",
+	// block.block); }
 
 	#[test]
 	fn test_find_block_handle_by_key() {
@@ -349,38 +391,42 @@ mod tests {
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
-		// Initialize TopLevelIndex with predefined blocks using user keys only
+		// Create separator keys as full encoded internal keys
+		let sep_c = create_internal_key(b"c".to_vec(), 1);
+		let sep_f = create_internal_key(b"f".to_vec(), 1);
+		let sep_j = create_internal_key(b"j".to_vec(), 1);
+
+		// Initialize TopLevelIndex with predefined blocks using encoded internal keys
 		let index = TopLevelIndex {
 			id: 0,
 			opts,
 			blocks: vec![
-				BlockHandleWithKey::new(b"c".to_vec(), BlockHandle::new(0, 10)),
-				BlockHandleWithKey::new(b"f".to_vec(), BlockHandle::new(10, 10)),
-				BlockHandleWithKey::new(b"j".to_vec(), BlockHandle::new(20, 10)),
+				BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(0, 10)),
+				BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
+				BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 			],
 			file: f.clone(),
 		};
 
-		// A list of tuples where the first element is the key to find,
-		// and the second element is the expected block key result.
-		let test_cases: &[(&[u8], Option<&[u8]>)] = &[
-			(b"a", Some(b"c" as &[u8])),
-			(b"c", Some(b"c")),
-			(b"d", Some(b"f")),
-			(b"e", Some(b"f")),
-			(b"f", Some(b"f")),
-			(b"g", Some(b"j")),
-			(b"j", Some(b"j")),
-			(b"z", None),
+		// A list of tuples where the first element is the encoded internal key to find,
+		// and the second element is the expected separator key result.
+		let test_cases: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
+			(create_internal_key(b"a".to_vec(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"c".to_vec(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"d".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"e".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"f".to_vec(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"g".to_vec(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"j".to_vec(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"z".to_vec(), 1), None),
 		];
 
 		for (key, expected) in test_cases.iter() {
-			// Pass user key directly instead of encoding as internal key
 			let result = index.find_block_handle_by_key(key);
 			match expected {
-				Some(expected_key) => {
-					let handle = result.expect("Expected a block handle but got None");
-					assert_eq!(handle.user_key, *expected_key, "Mismatch for key {key:?}");
+				Some(expected_sep_key) => {
+					let (_index, handle) = result.expect("Expected a block handle but got None");
+					assert_eq!(&handle.separator_key, expected_sep_key, "Mismatch for key {key:?}");
 				}
 				None => assert!(result.is_none(), "Expected None for key {key:?}, but got Some"),
 			}
@@ -420,25 +466,26 @@ mod tests {
 		let file = wrap_buffer(buffer);
 		let index = TopLevelIndex::new(0, opts, file, &top_level_handle).unwrap();
 
-		// Test lookups for various keys
+		// Test lookups for various keys using encoded internal keys
 		for (key, _) in &entries {
-			// Pass user key directly instead of encoding as internal key
-			let block = index.get(key.as_bytes()).unwrap();
+			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
+			let block = index.get(&internal_key).unwrap();
 			assert!(block.size() > 0, "Block should not be empty for key {key}");
 
 			// Verify the block contains the expected handle by checking if we can find it
-			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
 			let mut block_iter = block.iter(false);
 			block_iter.seek(&internal_key);
 			assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
 		}
 
 		// Test lookup for non-existent key before range
-		let block = index.get(b"key_000").unwrap();
+		let key_before = create_internal_key(b"key_000".to_vec(), 1);
+		let block = index.get(&key_before).unwrap();
 		assert!(block.size() > 0, "Should find first block for key before range");
 
 		// Test lookup for non-existent key after range
-		match index.get(b"key_999") {
+		let key_after = create_internal_key(b"key_999".to_vec(), 1);
+		match index.get(&key_after) {
 			Ok(_) => {
 				// This is acceptable - might find the last block
 			}
@@ -447,5 +494,320 @@ mod tests {
 			}
 			Err(e) => panic!("Unexpected error for key after range: {e:?}"),
 		}
+	}
+
+	#[test]
+	fn test_find_block_handle_by_key_with_descending_seq_nums() {
+		// Tests partition lookup with same user key spanning multiple partitions
+		// using the correct descending sequence number ordering:
+		// (foo, 100) < (foo, 50) < (foo, 1) in InternalKey ordering
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		// Simulate partitions where same user key "foo" spans multiple partitions
+		// Partition 0: contains (foo, 100) to (foo, 60), separator = (foo, 60)
+		// Partition 1: contains (foo, 59) to (foo, 20), separator = (foo, 20)
+		// Partition 2: contains (foo, 19) to (foo, 1), separator = (g, MAX)
+		let sep_foo_60 = create_internal_key(b"foo".to_vec(), 60);
+		let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
+		let sep_g = InternalKey::new(
+			b"g".to_vec(),
+			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode();
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: vec![
+				BlockHandleWithKey::new(sep_foo_60.clone(), BlockHandle::new(0, 100)),
+				BlockHandleWithKey::new(sep_foo_20.clone(), BlockHandle::new(100, 100)),
+				BlockHandleWithKey::new(sep_g.clone(), BlockHandle::new(200, 100)),
+			],
+			file: f,
+		};
+
+		// Test cases: (query_key, expected_partition_index)
+		let test_cases = vec![
+			// Query for (foo, 75): should find partition 0 (75 > 60 in seq, so (foo,75) <
+			// (foo,60))
+			(create_internal_key(b"foo".to_vec(), 75), Some(0)),
+			// Query for (foo, 60): should find partition 0 (exact match with separator)
+			(create_internal_key(b"foo".to_vec(), 60), Some(0)),
+			// Query for (foo, 50): should find partition 1 (50 < 60, so (foo,50) > (foo,60))
+			(create_internal_key(b"foo".to_vec(), 50), Some(1)),
+			// Query for (foo, 20): should find partition 1 (exact match with separator)
+			(create_internal_key(b"foo".to_vec(), 20), Some(1)),
+			// Query for (foo, 10): should find partition 2 (10 < 20, so (foo,10) > (foo,20))
+			(create_internal_key(b"foo".to_vec(), 10), Some(2)),
+			// Query for (banana, 50): should find partition 0 ("banana" < "foo" lexicographically)
+			(create_internal_key(b"banana".to_vec(), 50), Some(0)),
+			// Query for (fz, 50): should find partition 2 ("foo" < "fz" < "g")
+			(create_internal_key(b"fz".to_vec(), 50), Some(2)),
+			// Query for (zebra, 1): should return None ("zebra" > "g")
+			(create_internal_key(b"zebra".to_vec(), 1), None),
+		];
+
+		for (query_key, expected_index) in test_cases {
+			let result = index.find_block_handle_by_key(&query_key);
+			let query_ikey = InternalKey::decode(&query_key);
+			match expected_index {
+				Some(idx) => {
+					let (found_idx, _) = result.unwrap_or_else(|| {
+						panic!(
+							"Expected partition {} for key ({}, seq={}), got None",
+							idx,
+							String::from_utf8_lossy(&query_ikey.user_key),
+							query_ikey.seq_num()
+						)
+					});
+					assert_eq!(
+						found_idx,
+						idx,
+						"Wrong partition for key ({}, seq={}): expected {}, got {}",
+						String::from_utf8_lossy(&query_ikey.user_key),
+						query_ikey.seq_num(),
+						idx,
+						found_idx
+					);
+				}
+				None => {
+					assert!(
+						result.is_none(),
+						"Expected None for key ({}, seq={}), got Some(partition {})",
+						String::from_utf8_lossy(&query_ikey.user_key),
+						query_ikey.seq_num(),
+						result.map(|(i, _)| i).unwrap_or(999)
+					);
+				}
+			}
+		}
+	}
+	#[test]
+	fn test_find_block_handle_by_key_different_user_keys() {
+		// Tests partition lookup with different user keys using shortened separators
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		// Partition 0: contains "apple" keys, separator = (b, MAX) [shortened from apple/banana
+		// boundary] Partition 1: contains "banana", "cherry" keys, separator = (d, MAX)
+		// Partition 2: contains "date" keys, separator = (e, MAX)
+		let sep_b = InternalKey::new(
+			b"b".to_vec(),
+			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode();
+		let sep_d = InternalKey::new(
+			b"d".to_vec(),
+			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode();
+		let sep_e = InternalKey::new(
+			b"e".to_vec(),
+			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode();
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: vec![
+				BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(0, 100)),
+				BlockHandleWithKey::new(sep_d.clone(), BlockHandle::new(100, 100)),
+				BlockHandleWithKey::new(sep_e.clone(), BlockHandle::new(200, 100)),
+			],
+			file: f,
+		};
+
+		let test_cases = vec![
+			// Keys in first partition (< "b")
+			(create_internal_key(b"apple".to_vec(), 100), Some(0)),
+			(create_internal_key(b"aardvark".to_vec(), 50), Some(0)),
+			// Key exactly at separator boundary
+			(
+				InternalKey::new(
+					b"b".to_vec(),
+					crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Separator,
+					crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+				)
+				.encode(),
+				Some(0),
+			),
+			// Keys in second partition ("b" < key <= "d")
+			(create_internal_key(b"banana".to_vec(), 100), Some(1)),
+			(create_internal_key(b"cherry".to_vec(), 50), Some(1)),
+			// Keys in third partition ("d" < key <= "e")
+			(create_internal_key(b"date".to_vec(), 100), Some(2)),
+			// Keys beyond all partitions (> "e")
+			(create_internal_key(b"fig".to_vec(), 100), None),
+			(create_internal_key(b"zebra".to_vec(), 1), None),
+		];
+
+		for (query_key, expected_index) in test_cases {
+			let result = index.find_block_handle_by_key(&query_key);
+			let query_ikey = InternalKey::decode(&query_key);
+			match expected_index {
+				Some(idx) => {
+					let (found_idx, _) = result.unwrap_or_else(|| {
+						panic!(
+							"Expected partition {} for key '{}', got None",
+							idx,
+							String::from_utf8_lossy(&query_ikey.user_key)
+						)
+					});
+					assert_eq!(
+						found_idx,
+						idx,
+						"Wrong partition for key '{}': expected {}, got {}",
+						String::from_utf8_lossy(&query_ikey.user_key),
+						idx,
+						found_idx
+					);
+				}
+				None => {
+					assert!(
+						result.is_none(),
+						"Expected None for key '{}', got Some(partition {})",
+						String::from_utf8_lossy(&query_ikey.user_key),
+						result.map(|(i, _)| i).unwrap_or(999)
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn test_find_block_handle_returns_correct_partition_index() {
+		// Verifies the optimization that returns (index, handle) tuple
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		let sep_keys: Vec<_> = (0..5)
+			.map(|i| create_internal_key(format!("key_{:02}", i).into_bytes(), 100))
+			.collect();
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: sep_keys
+				.iter()
+				.enumerate()
+				.map(|(i, sep)| {
+					BlockHandleWithKey::new(sep.clone(), BlockHandle::new(i * 100, 100))
+				})
+				.collect(),
+			file: f,
+		};
+
+		// Query for each separator key and verify correct index is returned
+		for (expected_idx, sep_key) in sep_keys.iter().enumerate() {
+			let result = index.find_block_handle_by_key(sep_key);
+			assert!(result.is_some(), "Should find block for separator key");
+			let (idx, handle) = result.unwrap();
+			assert_eq!(idx, expected_idx, "Returned index should match partition index");
+			assert_eq!(
+				handle.handle.offset, // <-- Remove parentheses, it's a field not a method
+				expected_idx * 100,
+				"Handle offset should match"
+			);
+		}
+	}
+
+	#[test]
+	fn test_partition_lookup_empty_partition_returns_none() {
+		// Edge case: Query beyond all partitions
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		let sep = create_internal_key(b"zzz".to_vec(), 1);
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
+			file: f,
+		};
+
+		// Query for key beyond the single partition
+		let query = create_internal_key(b"zzzz_beyond".to_vec(), 1);
+		let result = index.find_block_handle_by_key(&query);
+		assert!(result.is_none(), "Should return None for key beyond all partitions");
+	}
+
+	#[test]
+	fn test_partition_lookup_single_partition() {
+		// Edge case: Only one partition
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		let sep = create_internal_key(b"middle".to_vec(), 1);
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
+			file: f,
+		};
+
+		// Query before the separator
+		let query = create_internal_key(b"aaa".to_vec(), 1);
+		let result = index.find_block_handle_by_key(&query);
+		assert!(result.is_some());
+		let (idx, _) = result.unwrap();
+		assert_eq!(idx, 0);
+
+		// Query at the separator
+		let result = index.find_block_handle_by_key(&sep);
+		assert!(result.is_some());
+		let (idx, _) = result.unwrap();
+		assert_eq!(idx, 0);
+
+		// Query after the separator
+		let query = create_internal_key(b"zzz".to_vec(), 1);
+		let result = index.find_block_handle_by_key(&query);
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_partition_lookup_exact_separator_match() {
+		// Edge case: Query key exactly matches a separator
+		let opts = Arc::new(Options::default());
+		let d = Vec::new();
+		let f = wrap_buffer(d);
+
+		let sep_a = create_internal_key(b"aaa".to_vec(), 50);
+		let sep_b = create_internal_key(b"bbb".to_vec(), 50);
+		let sep_c = create_internal_key(b"ccc".to_vec(), 50);
+
+		let index = TopLevelIndex {
+			id: 0,
+			opts,
+			blocks: vec![
+				BlockHandleWithKey::new(sep_a.clone(), BlockHandle::new(0, 100)),
+				BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
+				BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(200, 100)),
+			],
+			file: f,
+		};
+
+		// Query exactly "bbb" at same seq
+		let result = index.find_block_handle_by_key(&sep_b);
+		assert!(result.is_some());
+		let (idx, _) = result.unwrap();
+		assert_eq!(idx, 1, "Exact match should return that partition");
 	}
 }

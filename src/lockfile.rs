@@ -1,33 +1,37 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::error::{Error, Result};
-
-#[cfg(not(target_arch = "wasm32"))]
-use fs2::FileExt;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
-use std::process; // Use fs2 for file locking
+use std::process;
+use std::sync::Arc;
 
-/// LockFile prevents multiple processes from accessing the same database directory
+#[cfg(not(target_arch = "wasm32"))]
+use fs2::FileExt;
+
+use crate::error::{Error, Result}; // Use fs2 for file locking
+
+/// LockFile prevents multiple processes from accessing the same database
+/// directory
 ///
 /// # How it works
 ///
-/// This implementation uses OS-level file locking (via the `fs2` crate) to ensure that only
-/// one process can hold the lock at a time. The lock file contains the PID of the process
-/// that currently holds the lock for debugging purposes.
+/// This implementation uses OS-level file locking (via the `fs2` crate) to
+/// ensure that only one process can hold the lock at a time. The lock file
+/// contains the PID of the process that currently holds the lock for debugging
+/// purposes.
 ///
 /// # Stale Lock Handling
 ///
-/// If a process crashes or is killed while holding the lock, the OS automatically releases
-/// the file lock. This means that stale lock files (with old PIDs written in them) do NOT
-/// block new processes from acquiring the lock. The file content (PID) is purely informational
-/// and has no impact on the actual locking mechanism.
+/// If a process crashes or is killed while holding the lock, the OS
+/// automatically releases the file lock. This means that stale lock files (with
+/// old PIDs written in them) do NOT block new processes from acquiring the
+/// lock. The file content (PID) is purely informational and has no impact on
+/// the actual locking mechanism.
 ///
-/// When a new process acquires the lock, it overwrites the file with its own PID.
+/// When a new process acquires the lock, it overwrites the file with its own
+/// PID.
 ///
 /// # Lock Release
 ///
@@ -35,8 +39,8 @@ use std::process; // Use fs2 for file locking
 /// 1. Explicitly by calling `release()` (typically during database close)
 /// 2. Automatically via the `Drop` implementation when the LockFile goes out of scope
 ///
-/// Even if `release()` is not called explicitly, the OS will release the file lock when
-/// the process terminates (normal exit or crash).
+/// Even if `release()` is not called explicitly, the OS will release the file
+/// lock when the process terminates (normal exit or crash).
 pub(crate) struct LockFile {
 	/// The path to the lock file
 	path: PathBuf,
@@ -123,12 +127,13 @@ impl Drop for LockFile {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fs;
 	use std::sync::{Arc, Barrier};
+
 	use tempfile::TempDir;
 	use test_log::test;
 
+	use super::*;
 	use crate::error::Error;
 	use crate::lsm::TreeBuilder;
 
@@ -202,8 +207,9 @@ mod tests {
 		let lock_path = temp_dir.path().join(LockFile::LOCK_FILE_NAME);
 		fs::write(&lock_path, "99999\n").unwrap();
 
-		// Despite the file existing with a stale PID, we should be able to acquire the lock
-		// because OS-level file locks are automatically released when a process terminates
+		// Despite the file existing with a stale PID, we should be able to acquire the
+		// lock because OS-level file locks are automatically released when a process
+		// terminates
 		let mut lock = LockFile::new(temp_dir.path());
 		assert!(
             lock.acquire().is_ok(),
@@ -261,7 +267,8 @@ mod tests {
 		let temp_path = temp_dir.path().to_path_buf();
 		let threads = 10;
 
-		// Use a barrier to make all threads try to open the database at roughly the same time
+		// Use a barrier to make all threads try to open the database at roughly the
+		// same time
 		let barrier = Arc::new(Barrier::new(threads));
 		let mut handles = vec![];
 
@@ -306,8 +313,8 @@ mod tests {
 	// 	let temp_path = temp_dir.path().to_path_buf();
 	// 	let tasks = 10;
 
-	// 	// Use a barrier to make all tasks try to open the database at roughly the same time
-	// 	let barrier = Arc::new(Barrier::new(tasks));
+	// 	// Use a barrier to make all tasks try to open the database at roughly
+	// the same time 	let barrier = Arc::new(Barrier::new(tasks));
 	// 	let mut handles = vec![];
 
 	// 	for i in 0..tasks {
@@ -319,7 +326,8 @@ mod tests {
 	// 			task_barrier.wait();
 
 	// 			// Try to open the database (with VLog disabled to avoid async issues)
-	// 			let result = TreeBuilder::new().with_path(path).with_enable_vlog(false).build();
+	// 			let result =
+	// TreeBuilder::new().with_path(path).with_enable_vlog(false).build();
 
 	// 			(i, result)
 	// 		});
@@ -334,12 +342,14 @@ mod tests {
 	// 	}
 
 	// 	// Exactly one task should succeed
-	// 	let success_count = results.iter().filter(|(_, result)| result.is_ok()).count();
-	// 	assert_eq!(success_count, 1, "Exactly one task should succeed in acquiring the lock");
+	// 	let success_count = results.iter().filter(|(_, result)|
+	// result.is_ok()).count(); 	assert_eq!(success_count, 1, "Exactly one task
+	// should succeed in acquiring the lock");
 
 	// 	// All other tasks should fail with a lock error
-	// 	let failures = results.iter().filter(|(_, result)| result.is_err()).count();
-	// 	assert_eq!(failures, tasks - 1, "All other tasks should fail with lock error");
+	// 	let failures = results.iter().filter(|(_, result)|
+	// result.is_err()).count(); 	assert_eq!(failures, tasks - 1, "All other
+	// tasks should fail with lock error");
 
 	// 	// Close the successful instance
 	// 	for (_, result) in results {

@@ -1,8 +1,15 @@
+use std::sync::Arc;
+
 use criterion::{
-	black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+	black_box,
+	criterion_group,
+	criterion_main,
+	BatchSize,
+	BenchmarkId,
+	Criterion,
+	Throughput,
 };
 use rand::Rng;
-use std::sync::Arc;
 use surrealkv::bplustree::tree::new_disk_tree;
 use surrealkv::BytewiseComparator;
 use tempfile::TempDir;
@@ -42,7 +49,7 @@ fn benchmark_insert_sequential(c: &mut Criterion) {
 				|(mut tree, data, _temp_dir)| {
 					// Measurement - this is timed
 					for (key, value) in data {
-						tree.insert(black_box(&key), black_box(&value)).unwrap();
+						tree.insert(black_box(key), black_box(value)).unwrap();
 					}
 				},
 				BatchSize::SmallInput,
@@ -76,7 +83,7 @@ fn benchmark_insert_random(c: &mut Criterion) {
 				|(mut tree, data, _temp_dir)| {
 					// Measurement - this is timed
 					for (key, value) in data {
-						tree.insert(black_box(&key), black_box(&value)).unwrap();
+						tree.insert(black_box(key), black_box(value)).unwrap();
 					}
 				},
 				BatchSize::SmallInput,
@@ -104,7 +111,7 @@ fn benchmark_delete_sequential(c: &mut Criterion) {
 
 					// Insert data in setup
 					let data = generate_test_data(size, 16, 64);
-					for (key, value) in &data {
+					for (key, value) in data.clone() {
 						tree.insert(key, value).unwrap();
 					}
 
@@ -141,7 +148,7 @@ fn benchmark_delete_random(c: &mut Criterion) {
 
 					// Insert data in setup
 					let mut data = generate_test_data(size, 16, 64);
-					for (key, value) in &data {
+					for (key, value) in data.clone() {
 						tree.insert(key, value).unwrap();
 					}
 
@@ -182,7 +189,7 @@ fn benchmark_get_operations(c: &mut Criterion) {
 
 					// Insert data in setup
 					let data = generate_test_data(size, 16, 64);
-					for (key, value) in &data {
+					for (key, value) in data.clone() {
 						tree.insert(key, value).unwrap();
 					}
 

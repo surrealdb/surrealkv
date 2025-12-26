@@ -1,9 +1,9 @@
-use bytes::Bytes;
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::InternalKeyKind;
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
+use crate::{Key, Value};
 
 const MAX_BATCH_SIZE: u64 = 1 << 32;
 const BATCH_VERSION: u8 = 1;
@@ -11,8 +11,8 @@ const BATCH_VERSION: u8 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
 	pub kind: InternalKeyKind,
-	pub key: Bytes,
-	pub value: Option<Bytes>,
+	pub key: Key,
+	pub value: Option<Value>,
 	pub timestamp: u64,
 }
 
@@ -102,12 +102,12 @@ impl Batch {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn set(&mut self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+	pub(crate) fn set(&mut self, key: Key, value: Value, timestamp: u64) -> Result<()> {
 		self.add_record(InternalKeyKind::Set, key, Some(value), timestamp)
 	}
 
 	#[cfg(test)]
-	pub(crate) fn delete(&mut self, key: &[u8], timestamp: u64) -> Result<()> {
+	pub(crate) fn delete(&mut self, key: Key, timestamp: u64) -> Result<()> {
 		self.add_record(InternalKeyKind::Delete, key, None, timestamp)
 	}
 
@@ -115,13 +115,13 @@ impl Batch {
 	fn add_record_internal(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
 		let key_len = key.len();
-		let value_len = value.map_or(0, |v| v.len());
+		let value_len = value.as_ref().map_or(0, |v| v.len());
 
 		// Calculate the total size needed for this record
 		let record_size = 1u64 + // kind
@@ -135,8 +135,8 @@ impl Batch {
 
 		let entry = BatchEntry {
 			kind,
-			key: Bytes::copy_from_slice(key),
-			value: value.map(Bytes::copy_from_slice),
+			key,
+			value,
 			timestamp,
 		};
 
@@ -149,8 +149,8 @@ impl Batch {
 	pub(crate) fn add_record(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		timestamp: u64,
 	) -> Result<()> {
 		self.add_record_internal(kind, key, value, None, timestamp)
@@ -159,8 +159,8 @@ impl Batch {
 	pub(crate) fn add_record_with_valueptr(
 		&mut self,
 		kind: InternalKeyKind,
-		key: &[u8],
-		value: Option<&[u8]>,
+		key: Key,
+		value: Option<Value>,
 		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
@@ -245,7 +245,7 @@ impl Batch {
 			let (key_len, bytes_read) =
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
-			let key = Bytes::copy_from_slice(&data[pos..pos + key_len as usize]);
+			let key = data[pos..pos + key_len as usize].to_vec();
 			pos += key_len as usize;
 
 			// Read value
@@ -253,7 +253,7 @@ impl Batch {
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let value = if value_len > 0 {
-				let value_data = Bytes::copy_from_slice(&data[pos..pos + value_len as usize]);
+				let value_data = data[pos..pos + value_len as usize].to_vec();
 				pos += value_len as usize;
 				Some(value_data)
 			} else {
@@ -300,8 +300,9 @@ impl Batch {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use test_log::test;
+
+	use super::*;
 
 	#[test]
 	fn test_batch_new() {
@@ -320,7 +321,7 @@ mod tests {
 	#[test]
 	fn test_batch_encode() {
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1", 0).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 		let encoded = batch.encode().unwrap();
 		assert!(!encoded.is_empty());
 	}
@@ -329,14 +330,14 @@ mod tests {
 	fn test_batch_get_count() {
 		let mut batch = Batch::new(0);
 		assert_eq!(batch.count(), 0);
-		batch.set(b"key1", b"value1", 0).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 		assert_eq!(batch.count(), 1);
 	}
 
 	#[test]
 	fn test_batchreader_new() {
 		let mut batch = Batch::new(100);
-		batch.set(b"key1", b"value1", 0).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 		let encoded = batch.encode().unwrap();
 		let reader = Batch::decode(&encoded).unwrap();
 		assert_eq!(reader.starting_seq_num, 100);
@@ -353,7 +354,7 @@ mod tests {
 	#[test]
 	fn test_batch_read_record() {
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1", 1).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
 		assert_eq!(decoded_batch.starting_seq_num, 1);
@@ -361,8 +362,8 @@ mod tests {
 		let entries = decoded_batch.entries();
 		assert_eq!(entries.len(), 1);
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), b"key1");
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), b"value1");
+		assert_eq!(entries[0].key.as_slice(), b"key1");
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), b"value1");
 		assert_eq!(entries[0].timestamp, 1);
 	}
 
@@ -378,9 +379,9 @@ mod tests {
 	#[test]
 	fn test_batch_multiple_operations() {
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1", 1).unwrap();
-		batch.delete(b"key2", 2).unwrap();
-		batch.set(b"key3", b"value3", 3).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
+		batch.delete(b"key2".to_vec(), 2).unwrap();
+		batch.set(b"key3".to_vec(), b"value3".to_vec(), 3).unwrap();
 
 		assert_eq!(batch.count(), 3);
 
@@ -392,18 +393,18 @@ mod tests {
 		assert_eq!(entries.len(), 3);
 
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), b"key1");
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), b"value1");
+		assert_eq!(entries[0].key.as_slice(), b"key1");
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), b"value1");
 		assert_eq!(entries[0].timestamp, 1);
 
 		assert_eq!(entries[1].kind, InternalKeyKind::Delete);
-		assert_eq!(entries[1].key.as_ref(), b"key2");
+		assert_eq!(entries[1].key.as_slice(), b"key2");
 		assert!(entries[1].value.is_none());
 		assert_eq!(entries[1].timestamp, 2);
 
 		assert_eq!(entries[2].kind, InternalKeyKind::Set);
-		assert_eq!(entries[2].key.as_ref(), b"key3");
-		assert_eq!(entries[2].value.as_ref().unwrap().as_ref(), b"value3");
+		assert_eq!(entries[2].key.as_slice(), b"key3");
+		assert_eq!(entries[2].value.as_ref().unwrap().as_slice(), b"value3");
 		assert_eq!(entries[2].timestamp, 3);
 	}
 
@@ -413,7 +414,7 @@ mod tests {
 		let large_value = vec![b'b'; 1000000];
 
 		let mut batch = Batch::new(1);
-		batch.set(&large_key, &large_value, 1).unwrap();
+		batch.set(large_key.clone(), large_value.clone(), 1).unwrap();
 
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -422,8 +423,8 @@ mod tests {
 		let entries = decoded_batch.entries();
 		assert_eq!(entries.len(), 1);
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), large_key);
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), &large_value);
+		assert_eq!(entries[0].key.as_slice(), &large_key);
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), &large_value);
 		assert_eq!(entries[0].timestamp, 1);
 	}
 
@@ -433,16 +434,16 @@ mod tests {
 		let key = vec![b'a'; 1000];
 		let value = vec![b'b'; (MAX_BATCH_SIZE as usize) - 2000];
 
-		assert!(batch.set(&key, &value, 0).is_ok());
-		assert!(batch.set(&key, &[0], 0).is_err());
+		assert!(batch.set(key.clone(), value, 0).is_ok());
+		assert!(batch.set(key, vec![0], 0).is_err());
 	}
 
 	#[test]
 	fn test_batch_iteration() {
 		let mut batch = Batch::new(1);
-		batch.set(b"key1", b"value1", 1).unwrap();
-		batch.delete(b"key2", 2).unwrap();
-		batch.set(b"key3", b"value3", 3).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
+		batch.delete(b"key2".to_vec(), 2).unwrap();
+		batch.set(b"key3".to_vec(), b"value3".to_vec(), 3).unwrap();
 
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -452,18 +453,18 @@ mod tests {
 		assert_eq!(entries.len(), 3);
 
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), b"key1");
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), b"value1");
+		assert_eq!(entries[0].key.as_slice(), b"key1");
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), b"value1");
 		assert_eq!(entries[0].timestamp, 1);
 
 		assert_eq!(entries[1].kind, InternalKeyKind::Delete);
-		assert_eq!(entries[1].key.as_ref(), b"key2");
+		assert_eq!(entries[1].key.as_slice(), b"key2");
 		assert!(entries[1].value.is_none());
 		assert_eq!(entries[1].timestamp, 2);
 
 		assert_eq!(entries[2].kind, InternalKeyKind::Set);
-		assert_eq!(entries[2].key.as_ref(), b"key3");
-		assert_eq!(entries[2].value.as_ref().unwrap().as_ref(), b"value3");
+		assert_eq!(entries[2].key.as_slice(), b"key3");
+		assert_eq!(entries[2].value.as_ref().unwrap().as_slice(), b"value3");
 		assert_eq!(entries[2].timestamp, 3);
 	}
 
@@ -476,8 +477,8 @@ mod tests {
 	#[test]
 	fn test_batch_empty_key_and_value() {
 		let mut batch = Batch::new(1);
-		batch.set(b"", b"", 0).unwrap();
-		batch.delete(b"", 0).unwrap();
+		batch.set(b"".to_vec(), b"".to_vec(), 0).unwrap();
+		batch.delete(b"".to_vec(), 0).unwrap();
 
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -487,19 +488,19 @@ mod tests {
 		assert_eq!(entries.len(), 2);
 
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), b"");
+		assert_eq!(entries[0].key.as_slice(), b"");
 		assert!(entries[1].value.is_none());
 
 		assert_eq!(entries[1].kind, InternalKeyKind::Delete);
-		assert_eq!(entries[1].key.as_ref(), b"");
+		assert_eq!(entries[1].key.as_slice(), b"");
 		assert!(entries[1].value.is_none());
 	}
 
 	#[test]
 	fn test_batch_unicode_keys_and_values() {
 		let mut batch = Batch::new(1);
-		batch.set("🔑".as_bytes(), "🗝️".as_bytes(), 1).unwrap();
-		batch.set("こんにちは".as_bytes(), "世界".as_bytes(), 2).unwrap();
+		batch.set("🔑".as_bytes().to_vec(), "🗝️".as_bytes().to_vec(), 1).unwrap();
+		batch.set("こんにちは".as_bytes().to_vec(), "世界".as_bytes().to_vec(), 2).unwrap();
 
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -509,21 +510,21 @@ mod tests {
 		assert_eq!(entries.len(), 2);
 
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), "🔑".as_bytes());
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), "🗝️".as_bytes());
+		assert_eq!(entries[0].key.as_slice(), "🔑".as_bytes());
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), "🗝️".as_bytes());
 		assert_eq!(entries[0].timestamp, 1);
 
 		assert_eq!(entries[1].kind, InternalKeyKind::Set);
-		assert_eq!(entries[1].key.as_ref(), "こんにちは".as_bytes());
-		assert_eq!(entries[1].value.as_ref().unwrap().as_ref(), "世界".as_bytes());
+		assert_eq!(entries[1].key.as_slice(), "こんにちは".as_bytes());
+		assert_eq!(entries[1].value.as_ref().unwrap().as_slice(), "世界".as_bytes());
 		assert_eq!(entries[1].timestamp, 2);
 	}
 
 	#[test]
 	fn test_batch_sequence_numbers() {
 		let mut batch = Batch::new(100);
-		batch.set(b"key1", b"value1", 1).unwrap();
-		batch.set(b"key2", b"value2", 2).unwrap();
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
+		batch.set(b"key2".to_vec(), b"value2".to_vec(), 2).unwrap();
 
 		let encoded = batch.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -540,9 +541,9 @@ mod tests {
 			let key = format!("key{i}");
 			let value = format!("value{i}");
 			if i % 2 == 0 {
-				batch.set(key.as_bytes(), value.as_bytes(), i as u64).unwrap();
+				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), i as u64).unwrap();
 			} else {
-				batch.delete(key.as_bytes(), i as u64).unwrap();
+				batch.delete(key.as_bytes().to_vec(), i as u64).unwrap();
 			}
 		}
 
@@ -583,7 +584,7 @@ mod tests {
 
 		// Test with a batch that has data
 		let mut batch_with_data = Batch::new(100);
-		batch_with_data.set(b"key", b"value", 1).unwrap();
+		batch_with_data.set(b"key".to_vec(), b"value".to_vec(), 1).unwrap();
 		let encoded = batch_with_data.encode().unwrap();
 		let decoded_batch = Batch::decode(&encoded).unwrap();
 		assert_eq!(decoded_batch.starting_seq_num, 100);
@@ -594,10 +595,12 @@ mod tests {
 	fn test_add_record_consistent_encoding() {
 		// Test that None and Some(&[]) now encode identically (both as value_len=0)
 		let mut batch_none = Batch::new(100);
-		batch_none.add_record(InternalKeyKind::Delete, b"test_key", None, 100).unwrap();
+		batch_none.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), None, 100).unwrap();
 
 		let mut batch_empty = Batch::new(100);
-		batch_empty.add_record(InternalKeyKind::Delete, b"test_key", Some(&[]), 100).unwrap();
+		batch_empty
+			.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), Some(vec![]), 100)
+			.unwrap();
 
 		let encoded_none = batch_none.encode().unwrap();
 		let encoded_empty = batch_empty.encode().unwrap();
@@ -605,13 +608,14 @@ mod tests {
 		// Now they should encode identically (both write value_len=0)
 		assert_eq!(encoded_none, encoded_empty, "None and Some(&[]) should now encode identically");
 
-		// Test reading them back - both should return None (since both encode as value_len=0)
+		// Test reading them back - both should return None (since both encode as
+		// value_len=0)
 		let decoded_batch_none = Batch::decode(&encoded_none).unwrap();
 		assert_eq!(decoded_batch_none.starting_seq_num, 100);
 		let entries_none = decoded_batch_none.entries();
 		assert_eq!(entries_none.len(), 1);
 		assert_eq!(entries_none[0].kind, InternalKeyKind::Delete);
-		assert_eq!(entries_none[0].key.as_ref(), b"test_key");
+		assert_eq!(entries_none[0].key, b"test_key");
 		assert!(entries_none[0].value.is_none(), "None encodes as value_len=0, reads back as None");
 		assert_eq!(entries_none[0].timestamp, 100);
 
@@ -620,7 +624,7 @@ mod tests {
 		let entries_empty = decoded_batch_empty.entries();
 		assert_eq!(entries_empty.len(), 1);
 		assert_eq!(entries_empty[0].kind, InternalKeyKind::Delete);
-		assert_eq!(entries_empty[0].key.as_ref(), b"test_key");
+		assert_eq!(entries_empty[0].key, b"test_key");
 		assert!(
 			entries_empty[0].value.is_none(),
 			"Some(&[]) also encodes as value_len=0, reads back as None"
@@ -630,7 +634,12 @@ mod tests {
 		// Test with different operation types to ensure they all work
 		let mut batch_merge = Batch::new(300);
 		batch_merge
-			.add_record(InternalKeyKind::Merge, b"merge_key", Some(b"merge_data"), 300)
+			.add_record(
+				InternalKeyKind::Merge,
+				b"merge_key".to_vec(),
+				Some(b"merge_data".to_vec()),
+				300,
+			)
 			.unwrap();
 
 		let encoded_merge = batch_merge.encode().unwrap();
@@ -639,13 +648,15 @@ mod tests {
 		let entries_merge = decoded_batch_merge.entries();
 		assert_eq!(entries_merge.len(), 1);
 		assert_eq!(entries_merge[0].kind, InternalKeyKind::Merge);
-		assert_eq!(entries_merge[0].key.as_ref(), b"merge_key");
-		assert_eq!(entries_merge[0].value.as_ref().unwrap().as_ref(), b"merge_data");
+		assert_eq!(entries_merge[0].key.as_slice(), b"merge_key");
+		assert_eq!(entries_merge[0].value.as_ref().unwrap().as_slice(), b"merge_data");
 		assert_eq!(entries_merge[0].timestamp, 300);
 
 		// Test with Set operations (should still work as before)
 		let mut batch_set = Batch::new(400);
-		batch_set.add_record(InternalKeyKind::Set, b"set_key", Some(b"set_data"), 400).unwrap();
+		batch_set
+			.add_record(InternalKeyKind::Set, b"set_key".to_vec(), Some(b"set_data".to_vec()), 400)
+			.unwrap();
 
 		let encoded_set = batch_set.encode().unwrap();
 		let decoded_batch_set = Batch::decode(&encoded_set).unwrap();
@@ -653,8 +664,8 @@ mod tests {
 		let entries_set = decoded_batch_set.entries();
 		assert_eq!(entries_set.len(), 1);
 		assert_eq!(entries_set[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries_set[0].key.as_ref(), b"set_key");
-		assert_eq!(entries_set[0].value.as_ref().unwrap().as_ref(), b"set_data");
+		assert_eq!(entries_set[0].key.as_slice(), b"set_key");
+		assert_eq!(entries_set[0].value.as_ref().unwrap().as_slice(), b"set_data");
 		assert_eq!(entries_set[0].timestamp, 400);
 	}
 
@@ -664,9 +675,13 @@ mod tests {
 		let mut batch = Batch::new(12345);
 
 		// Add various types of records with different value pointer scenarios
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 1).unwrap();
-		batch.add_record(InternalKeyKind::Delete, b"key2", None, 2).unwrap();
-		batch.add_record(InternalKeyKind::Merge, b"key3", Some(b"merge_value"), 3).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 1)
+			.unwrap();
+		batch.add_record(InternalKeyKind::Delete, b"key2".to_vec(), None, 2).unwrap();
+		batch
+			.add_record(InternalKeyKind::Merge, b"key3".to_vec(), Some(b"merge_value".to_vec()), 3)
+			.unwrap();
 
 		// Add records with value pointers (simulating VLog pointers)
 		let valueptr1 = ValuePointer::new(100, 200, 10, 20, 30);
@@ -675,26 +690,50 @@ mod tests {
 		batch
 			.add_record_with_valueptr(
 				InternalKeyKind::Set,
-				b"key4",
-				Some(b"large_value"),
+				b"key4".to_vec(),
+				Some(b"large_value".to_vec()),
 				Some(valueptr1),
 				4,
 			)
 			.unwrap();
 		batch
-			.add_record_with_valueptr(InternalKeyKind::Set, b"key5", None, Some(valueptr2), 5)
+			.add_record_with_valueptr(
+				InternalKeyKind::Set,
+				b"key5".to_vec(),
+				None,
+				Some(valueptr2),
+				5,
+			)
 			.unwrap();
-		batch.add_record_with_valueptr(InternalKeyKind::Delete, b"key6", None, None, 6).unwrap();
+		batch
+			.add_record_with_valueptr(InternalKeyKind::Delete, b"key6".to_vec(), None, None, 6)
+			.unwrap();
 
 		// Add some edge cases
-		batch.add_record(InternalKeyKind::Set, b"", Some(b"empty_key_value"), 7).unwrap();
-		batch.add_record(InternalKeyKind::Set, b"empty_value_key", Some(b""), 8).unwrap();
-		batch.add_record(InternalKeyKind::Set, b"", Some(b""), 9).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"".to_vec(), Some(b"empty_key_value".to_vec()), 7)
+			.unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"empty_value_key".to_vec(), Some(b"".to_vec()), 8)
+			.unwrap();
+		batch.add_record(InternalKeyKind::Set, b"".to_vec(), Some(b"".to_vec()), 9).unwrap();
 
 		// Add unicode data
-		batch.add_record(InternalKeyKind::Set, "🔑".as_bytes(), Some("🗝️".as_bytes()), 10).unwrap();
 		batch
-			.add_record(InternalKeyKind::Set, "こんにちは".as_bytes(), Some("世界".as_bytes()), 11)
+			.add_record(
+				InternalKeyKind::Set,
+				"🔑".as_bytes().to_vec(),
+				Some("🗝️".as_bytes().to_vec()),
+				10,
+			)
+			.unwrap();
+		batch
+			.add_record(
+				InternalKeyKind::Set,
+				"こんにちは".as_bytes().to_vec(),
+				Some("世界".as_bytes().to_vec()),
+				11,
+			)
 			.unwrap();
 
 		// Verify original batch properties
@@ -723,63 +762,63 @@ mod tests {
 
 		// Check first few entries
 		assert_eq!(entries[0].kind, InternalKeyKind::Set);
-		assert_eq!(entries[0].key.as_ref(), b"key1");
-		assert_eq!(entries[0].value.as_ref().unwrap().as_ref(), b"value1");
+		assert_eq!(entries[0].key.as_slice(), b"key1");
+		assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), b"value1");
 		assert_eq!(entries[0].timestamp, 1);
 
 		assert_eq!(entries[1].kind, InternalKeyKind::Delete);
-		assert_eq!(entries[1].key.as_ref(), b"key2");
+		assert_eq!(entries[1].key.as_slice(), b"key2");
 		assert!(entries[1].value.is_none());
 		assert_eq!(entries[1].timestamp, 2);
 
 		assert_eq!(entries[2].kind, InternalKeyKind::Merge);
-		assert_eq!(entries[2].key.as_ref(), b"key3");
-		assert_eq!(entries[2].value.as_ref().unwrap().as_ref(), b"merge_value");
+		assert_eq!(entries[2].key.as_slice(), b"key3");
+		assert_eq!(entries[2].value.as_ref().unwrap().as_slice(), b"merge_value");
 		assert_eq!(entries[2].timestamp, 3);
 
 		// Check entries with value pointers
 		assert_eq!(entries[3].kind, InternalKeyKind::Set);
-		assert_eq!(entries[3].key.as_ref(), b"key4");
-		assert_eq!(entries[3].value.as_ref().unwrap().as_ref(), b"large_value");
+		assert_eq!(entries[3].key.as_slice(), b"key4");
+		assert_eq!(entries[3].value.as_ref().unwrap().as_slice(), b"large_value");
 		assert_eq!(entries[3].timestamp, 4);
 
 		assert_eq!(entries[4].kind, InternalKeyKind::Set);
-		assert_eq!(entries[4].key.as_ref(), b"key5");
+		assert_eq!(entries[4].key.as_slice(), b"key5");
 		assert!(entries[4].value.is_none());
 		assert_eq!(entries[4].timestamp, 5);
 
 		assert_eq!(entries[5].kind, InternalKeyKind::Delete);
-		assert_eq!(entries[5].key.as_ref(), b"key6");
+		assert_eq!(entries[5].key.as_slice(), b"key6");
 		assert!(entries[5].value.is_none());
 		assert_eq!(entries[5].timestamp, 6);
 
 		// Check edge cases
 		assert_eq!(entries[6].kind, InternalKeyKind::Set);
-		assert_eq!(entries[6].key.as_ref(), b"");
-		assert_eq!(entries[6].value.as_ref().unwrap().as_ref(), b"empty_key_value");
+		assert_eq!(entries[6].key.as_slice(), b"");
+		assert_eq!(entries[6].value.as_ref().unwrap().as_slice(), b"empty_key_value");
 		assert_eq!(entries[6].timestamp, 7);
 
 		assert_eq!(entries[7].kind, InternalKeyKind::Set);
-		assert_eq!(entries[7].key.as_ref(), b"empty_value_key");
+		assert_eq!(entries[7].key.as_slice(), b"empty_value_key");
 		// Empty string values decode as None (this is the intended behavior)
 		assert!(entries[7].value.is_none());
 		assert_eq!(entries[7].timestamp, 8);
 
 		assert_eq!(entries[8].kind, InternalKeyKind::Set);
-		assert_eq!(entries[8].key.as_ref(), b"");
+		assert_eq!(entries[8].key.as_slice(), b"");
 		// Empty string values decode as None (this is the intended behavior)
 		assert!(entries[8].value.is_none());
 		assert_eq!(entries[8].timestamp, 9);
 
 		// Check unicode entries
 		assert_eq!(entries[9].kind, InternalKeyKind::Set);
-		assert_eq!(entries[9].key.as_ref(), "🔑".as_bytes());
-		assert_eq!(entries[9].value.as_ref().unwrap().as_ref(), "🗝️".as_bytes());
+		assert_eq!(entries[9].key.as_slice(), "🔑".as_bytes());
+		assert_eq!(entries[9].value.as_ref().unwrap().as_slice(), "🗝️".as_bytes());
 		assert_eq!(entries[9].timestamp, 10);
 
 		assert_eq!(entries[10].kind, InternalKeyKind::Set);
-		assert_eq!(entries[10].key.as_ref(), "こんにちは".as_bytes());
-		assert_eq!(entries[10].value.as_ref().unwrap().as_ref(), "世界".as_bytes());
+		assert_eq!(entries[10].key.as_slice(), "こんにちは".as_bytes());
+		assert_eq!(entries[10].value.as_ref().unwrap().as_slice(), "世界".as_bytes());
 		assert_eq!(entries[10].timestamp, 11);
 
 		// Verify value pointers are preserved correctly

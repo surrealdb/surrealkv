@@ -1,5 +1,6 @@
-use rand::Rng;
 use std::sync::Arc;
+
+use rand::Rng;
 use surrealkv::{BytewiseComparator, TreeBuilder};
 use tempfile::TempDir;
 use tokio::runtime::{Handle, Runtime};

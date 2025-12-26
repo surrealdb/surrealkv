@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,8 +9,8 @@ use arc_swap::ArcSwap;
 /// Defines the logical clock that SurrealKV will use to measure
 /// commit timestamps and retention periods checks.
 pub trait LogicalClock: Debug + Send + Sync {
-	/// Returns a timestamp (typically measured in nanoseconds since the unix epoch).
-	/// Must return monotonically increasing numbers.
+	/// Returns a timestamp (typically measured in nanoseconds since the unix
+	/// epoch). Must return monotonically increasing numbers.
 	fn now(&self) -> u64;
 }
 
@@ -228,7 +227,8 @@ mod tests {
 
 	#[test]
 	fn test_default_clock_immediate_shutdown() {
-		// Test that the clock shuts down quickly without waiting for full resync interval
+		// Test that the clock shuts down quickly without waiting for full resync
+		// interval
 		for _ in 0..5 {
 			let start = Instant::now();
 			{

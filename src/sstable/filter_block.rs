@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use crate::FilterPolicy;
-use bytes::Bytes;
 use integer_encoding::FixedInt;
+
+use crate::FilterPolicy;
 
 pub(crate) const FILTER_BASE_LOG2: u32 = 11;
 const FILTER_BASE: u32 = 1 << FILTER_BASE_LOG2;
 const FILTER_META_LENGTH: usize = 5; // 4bytes filter offsets length + 1bytes base log
 
-// A writer for writing filter blocks, which are used to quickly test if a key is present in a set of keys.
+// A writer for writing filter blocks, which are used to quickly test if a key
+// is present in a set of keys.
 pub(crate) struct FilterBlockWriter {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used to generate filters.
 	keys: Vec<Vec<u8>>,            // A collection of keys to be added to the filter.
@@ -27,30 +28,26 @@ impl FilterBlockWriter {
 		}
 	}
 
-	// Estimates the size of the final filter block.
-	pub(crate) fn size_estimate(&self) -> usize {
-		// The size is the sum of the filters' length, the offsets' length times 4 (since each offset is a u32),
-		// plus 4 for the offsets' length itself, and 1 for the base log2 value.
-		self.filters.len() + 4 * self.filter_offsets.len() + 4 + 1
-	}
-
 	// Adds a key to the list of keys that will be included in the next filter.
 	pub(crate) fn add_key(&mut self, key: &[u8]) {
 		let key = Vec::from(key);
 		self.keys.push(key);
 	}
 
-	// Starts a new block at a given offset. This may trigger the generation of a new filter if necessary.
+	// Starts a new block at a given offset. This may trigger the generation of a
+	// new filter if necessary.
 	pub(crate) fn start_block(&mut self, block_offset: usize) {
 		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for the current block.
 		let filters_len = self.filter_offsets.len();
 		assert!(filter_index >= filters_len); // Ensure the filter index is not out of bounds.
 		while filter_index > self.filter_offsets.len() {
-			self.generate_filter(); // Generate filters until reaching the required index.
+			self.generate_filter(); // Generate filters until reaching the required
+			               // index.
 		}
 	}
 
-	// Generates a filter for the current set of keys and appends it to the filters vector.
+	// Generates a filter for the current set of keys and appends it to the filters
+	// vector.
 	fn generate_filter(&mut self) {
 		self.filter_offsets.push(self.filters.len() as u32); // Record the current filter's offset.
 		if self.keys.is_empty() {
@@ -68,7 +65,8 @@ impl FilterBlockWriter {
 		self.policy.name()
 	}
 
-	// Finalizes the filter block, returning the complete set of filters and their offsets.
+	// Finalizes the filter block, returning the complete set of filters and their
+	// offsets.
 	pub(crate) fn finish(mut self) -> Vec<u8> {
 		if !self.keys.is_empty() {
 			self.generate_filter(); // Generate a final filter for any remaining keys.
@@ -97,13 +95,14 @@ impl FilterBlockWriter {
 #[derive(Clone)]
 pub(crate) struct FilterBlockReader {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used for checking keys against filters.
-	data: Bytes,                   // The entire filter block data.
+	data: Vec<u8>,                 // The entire filter block data.
 	filter_offsets: Vec<u32>,      // Offsets for each filter within the `data`.
 	base_lg: u32,                  // The base log2 value used to calculate block index.
 }
 
 impl FilterBlockReader {
-	// Constructs a new `FilterBlockReader` from the given filter block data and filter policy.
+	// Constructs a new `FilterBlockReader` from the given filter block data and
+	// filter policy.
 	pub(crate) fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
 		let n = data.len();
 		let base_lg = data[n - 1] as u32; // The last byte is the base log2 value.
@@ -125,13 +124,14 @@ impl FilterBlockReader {
 
 		Self {
 			policy,
-			data: Bytes::from(data),
+			data,
 			filter_offsets,
 			base_lg,
 		}
 	}
 
-	// Checks if a key may be present in the filter block, given a specific block offset.
+	// Checks if a key may be present in the filter block, given a specific block
+	// offset.
 	pub(crate) fn may_contain(&self, key: &[u8], block_offset: usize) -> bool {
 		// Directly use the provided block offset as the block index.
 		let block_index = block_offset >> self.base_lg;
@@ -143,9 +143,11 @@ impl FilterBlockReader {
 
 		let start = self.filter_offsets[block_index] as usize; // Start of the filter in the data.
 		let limit = if block_index + 1 < self.filter_offsets.len() {
-			self.filter_offsets[block_index + 1] as usize // End of the filter in the data.
+			self.filter_offsets[block_index + 1] as usize // End of the filter in the
+		                                         // data.
 		} else {
-			// Subtract the filter offsets array (4 bytes per offset) + 4 bytes for offsets length + 1 byte for base log
+			// Subtract the filter offsets array (4 bytes per offset) + 4 bytes for offsets
+			// length + 1 byte for base log
 			self.data.len() - (4 * self.filter_offsets.len() + 5)
 		};
 
@@ -158,11 +160,11 @@ impl FilterBlockReader {
 
 #[cfg(test)]
 mod tests {
-	use crate::sstable::{bloom::LevelDBBloomFilter, InternalKey, InternalKeyKind};
-	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
+	use crate::sstable::bloom::LevelDBBloomFilter;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	#[test]
 	fn test_empty() {
@@ -268,7 +270,7 @@ mod tests {
 			// Create internal key
 			let user_key = format!("key_{i:05}");
 			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(user_key.as_bytes()),
+				user_key.as_bytes().to_vec(),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -299,12 +301,8 @@ mod tests {
 		for i in 0..num_samples {
 			// Use values outside the range of existing keys
 			let user_key = format!("nonexistent_{:05}", i + num_items);
-			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(user_key.as_bytes()),
-				i as u64,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
 
 			let encoded_key = internal_key.encode();
 
