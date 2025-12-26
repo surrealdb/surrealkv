@@ -104,8 +104,8 @@ impl MemTable {
 		let range = InternalKey::new(
 			key.to_vec(),
 			seq_no,
-			InternalKeyKind::Max,
-			INTERNAL_KEY_TIMESTAMP_MAX,
+			InternalKeyKind::Set, // This field is not checked in the comparator
+			0,                    // This field is not checked in the comparator
 		)..;
 
 		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
