@@ -291,7 +291,7 @@ mod tests {
 		let value = b"value".to_vec();
 
 		let mut batch = Batch::new(1);
-		batch.set(key.clone(), value.clone(), 0).unwrap();
+		batch.set(key, value.clone(), 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -306,7 +306,7 @@ mod tests {
 		let value = b"value".to_vec();
 
 		let mut batch = Batch::new(1);
-		batch.set(key.clone(), value.clone(), 0).unwrap();
+		batch.set(key, value, 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -321,7 +321,7 @@ mod tests {
 		let seq_num = 100;
 
 		let mut batch = Batch::new(seq_num);
-		batch.set(key.clone(), value.clone(), 0).unwrap();
+		batch.set(key, value, 0).unwrap();
 
 		memtable.add(&batch).unwrap();
 
@@ -335,7 +335,7 @@ mod tests {
 		let value1 = b"value1".to_vec();
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
+		batch1.set(key1, value1.clone(), 0).unwrap();
 
 		memtable.add(&batch1).unwrap();
 
@@ -343,7 +343,7 @@ mod tests {
 		let value2 = b"value2".to_vec();
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(key2.clone(), value2.clone(), 0).unwrap();
+		batch2.set(key2, value2.clone(), 0).unwrap();
 
 		memtable.add(&batch2).unwrap();
 
@@ -363,15 +363,15 @@ mod tests {
 		let value3 = b"value3".to_vec();
 
 		let mut batch1 = Batch::new(1);
-		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
+		batch1.set(key1.clone(), value1, 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(2);
-		batch2.set(key1.clone(), value2.clone(), 0).unwrap();
+		batch2.set(key1.clone(), value2, 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let mut batch3 = Batch::new(3);
-		batch3.set(key1.clone(), value3.clone(), 0).unwrap();
+		batch3.set(key1, value3.clone(), 0).unwrap();
 		memtable.add(&batch3).unwrap();
 
 		let res = memtable.get(b"key1", None).unwrap();
@@ -388,11 +388,11 @@ mod tests {
 		let value2 = b"value2".to_vec();
 
 		let mut batch1 = Batch::new(0);
-		batch1.set(key1.clone(), value1.clone(), 0).unwrap();
+		batch1.set(key1, value1.clone(), 0).unwrap();
 		memtable.add(&batch1).unwrap();
 
 		let mut batch2 = Batch::new(1);
-		batch2.set(key2.clone(), value2.clone(), 0).unwrap();
+		batch2.set(key2, value2.clone(), 0).unwrap();
 		memtable.add(&batch2).unwrap();
 
 		let res = memtable.get(b"foo", None).unwrap();
@@ -476,7 +476,7 @@ mod tests {
 		let user_key = &key.user_key;
 		assert_eq!(user_key, b"key1");
 
-		assert_value(&encoded_value, &b"value1"[..]);
+		assert_value(encoded_value, &b"value1"[..]);
 
 		// Test get method
 		let result = memtable.get(b"key1", None);

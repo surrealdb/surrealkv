@@ -28,7 +28,6 @@ use crate::{
 	FilterPolicy,
 	InternalKeyComparator,
 	InternalKeyRange,
-	Iterator as LSMIterator,
 	Options,
 	Value,
 };
@@ -219,14 +218,14 @@ impl<W: Write> TableWriter<W> {
 			data_block: Some(BlockWriter::new(
 				opts.block_size,
 				opts.block_restart_interval,
-				Arc::clone(&opts.comparator),
+				Arc::clone(&opts.internal_comparator),
 			)),
 			partitioned_index: TopLevelIndexWriter::new(
 				Arc::clone(&opts),
 				opts.index_partition_size,
 			),
 			filter_block: fb,
-			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
+			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
 		}
 	}
 
@@ -307,7 +306,7 @@ impl<W: Write> TableWriter<W> {
 		self.data_block = Some(BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		));
 
 		Ok(())
@@ -336,7 +335,7 @@ impl<W: Write> TableWriter<W> {
 		let mut meta_ix_block = BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
-			Arc::clone(&self.opts.comparator),
+			Arc::clone(&self.opts.internal_comparator),
 		);
 
 		// Write the filter block to the meta index block if present.
@@ -580,7 +579,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 }
 
 pub(crate) fn read_table_block(
-	comparator: Arc<dyn Comparator>,
+	comparator: Arc<InternalKeyComparator>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
@@ -661,8 +660,11 @@ impl Table {
 			IndexType::Partitioned(partitioned_index)
 		};
 
-		let metaindexblock =
-			read_table_block(Arc::clone(&opts.comparator), Arc::clone(&file), &footer.meta_index)?;
+		let metaindexblock = read_table_block(
+			Arc::clone(&opts.internal_comparator),
+			Arc::clone(&file),
+			&footer.meta_index,
+		)?;
 		// println!("meta block: {:?}", metaindexblock.block);
 
 		let writer_metadata =
@@ -680,7 +682,7 @@ impl Table {
 			id,
 			file,
 			file_size,
-			internal_cmp: Arc::new(InternalKeyComparator::new(Arc::clone(&opts.comparator))),
+			internal_cmp: Arc::clone(&opts.internal_comparator),
 			opts,
 			filter_reader,
 			index_block,
@@ -736,8 +738,11 @@ impl Table {
 			return Ok(block);
 		}
 
-		let b =
-			read_table_block(Arc::clone(&self.opts.comparator), Arc::clone(&self.file), location)?;
+		let b = read_table_block(
+			Arc::clone(&self.opts.internal_comparator),
+			Arc::clone(&self.file),
+			location,
+		)?;
 		let b = Arc::new(b);
 
 		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
@@ -758,8 +763,8 @@ impl Table {
 
 		let handle = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
-				// First find the correct partition using just the user key (optimization)
-				let partition_block = match partitioned_index.get(key.user_key.as_slice()) {
+				// Use full internal key for correct partition lookup
+				let partition_block = match partitioned_index.get(key_encoded) {
 					Ok(block) => block,
 					Err(_e) => {
 						return Ok(None);
@@ -774,8 +779,8 @@ impl Table {
 				if partition_iter.valid() {
 					let last_key_in_block = partition_iter.key();
 					let val = partition_iter.value();
-					if Ordering::Less
-						== self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
+					if self.internal_cmp.compare(key_encoded, &last_key_in_block.encode())
+						!= Ordering::Greater
 					{
 						Some(BlockHandle::decode(&val).unwrap().0)
 					} else {
@@ -817,33 +822,11 @@ impl Table {
 		keys_only: bool,
 		range: Option<InternalKeyRange>,
 	) -> TableIterator {
-		let index_block_iter = match &self.index_block {
-			IndexType::Partitioned(partitioned_index) => {
-				// For partitioned index, start with the first partition
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				if let Ok(first_block) = partitioned_index.first_partition() {
-					first_block.iter(false)
-				} else {
-					// If there are no partitions, create a proper empty block
-					let empty_writer = BlockWriter::new(
-						self.opts.block_size,
-						self.opts.block_restart_interval,
-						Arc::clone(&self.opts.comparator),
-					);
-					let empty_block_data = empty_writer.finish();
-					let empty_block =
-						Block::new(empty_block_data, Arc::clone(&self.opts.comparator));
-					empty_block.iter(false)
-				}
-			}
-		};
-
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
 
 		TableIterator {
 			current_block: None,
 			current_block_off: 0,
-			index_block: index_block_iter,
 			table: Arc::clone(self),
 			positioned: false,
 			exhausted: false,
@@ -907,7 +890,6 @@ pub(crate) struct TableIterator {
 	table: Arc<Table>,
 	current_block: Option<BlockIterator>,
 	current_block_off: usize,
-	index_block: BlockIterator,
 	/// Whether the iterator has been positioned at least once
 	positioned: bool,
 	/// Whether the iterator has been exhausted (reached the end)
@@ -997,13 +979,13 @@ impl TableIterator {
 		Err(Error::CorruptedBlock("Empty block".to_string()))
 	}
 
-	#[inline]
-	fn key(&self) -> InternalKey {
+	#[cfg(test)]
+	pub(crate) fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
-	#[inline]
-	fn value(&self) -> Value {
+	#[cfg(test)]
+	pub(crate) fn value(&self) -> Value {
 		self.current_block.as_ref().unwrap().value()
 	}
 
@@ -1019,7 +1001,7 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
-	fn prev(&mut self) -> bool {
+	pub(crate) fn prev(&mut self) -> bool {
 		if let Some(ref mut block) = self.current_block {
 			if block.prev() {
 				return true;
@@ -1033,7 +1015,15 @@ impl TableIterator {
 			if partition_iter.prev() {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
-					Err(_) => return false,
+					Err(e) => {
+						log::error!(
+							"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle. \
+							Value bytes: {:?}, Error: {:?}",
+							val,
+							e
+						);
+						return false;
+					}
 					Ok(res) => res,
 				};
 				if self.load_block(&handle).is_ok() {
@@ -1061,7 +1051,14 @@ impl TableIterator {
 				if partition_iter.valid() {
 					let val = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => {
+						Err(e) => {
+							log::error!(
+								"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle \
+								in partition {}. Value bytes: {:?}, Error: {:?}",
+								self.current_partition_index,
+								val,
+								e
+							);
 							return false;
 						}
 						Ok(res) => res,
@@ -1305,14 +1302,14 @@ impl DoubleEndedIterator for TableIterator {
 	}
 }
 
-impl LSMIterator for TableIterator {
-	fn valid(&self) -> bool {
+impl TableIterator {
+	pub(crate) fn valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
 			&& self.current_block.as_ref().unwrap().valid()
 	}
 
-	fn seek_to_first(&mut self) {
+	pub(crate) fn seek_to_first(&mut self) {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
@@ -1348,7 +1345,7 @@ impl LSMIterator for TableIterator {
 		self.reset();
 	}
 
-	fn seek_to_last(&mut self) {
+	pub(crate) fn seek_to_last(&mut self) {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
@@ -1393,23 +1390,14 @@ impl LSMIterator for TableIterator {
 		}
 	}
 
-	fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
-		// Extract user key from target for partition lookup (optimization)
-		let target_key = InternalKey::decode(target);
-
-		// For partitioned index, first find the correct partition
-		if let Some(block_handle) =
-			partitioned_index.find_block_handle_by_key(target_key.user_key.as_slice())
+		// For partitioned index, use full internal key for correct partition lookup
+		if let Some((partition_index, block_handle)) =
+			partitioned_index.find_block_handle_by_key(target)
 		{
-			// Find the partition index
-			for (i, handle) in partitioned_index.blocks.iter().enumerate() {
-				if std::ptr::eq(handle, block_handle) {
-					self.current_partition_index = i;
-					break;
-				}
-			}
+			self.current_partition_index = partition_index;
 
 			if let Ok(partition_block) = partitioned_index.load_block(block_handle) {
 				// Note: Index blocks always need full key-value pairs to decode block handles
@@ -1470,7 +1458,7 @@ impl LSMIterator for TableIterator {
 		Some(())
 	}
 
-	fn advance(&mut self) -> bool {
+	pub(crate) fn advance(&mut self) -> bool {
 		// If exhausted, stay exhausted
 		if self.exhausted {
 			return false;
@@ -1507,41 +1495,6 @@ impl LSMIterator for TableIterator {
 				false
 			}
 		}
-	}
-
-	fn prev(&mut self) -> bool {
-		if let Some(ref mut block) = self.current_block {
-			if block.prev() {
-				return true;
-			}
-		}
-
-		if self.index_block.prev() && self.index_block.valid() {
-			let val = self.index_block.value();
-			let (handle, _) = match BlockHandle::decode(&val) {
-				Err(_) => return false,
-				Ok(res) => res,
-			};
-			if self.load_block(&handle).is_ok() {
-				if let Some(ref mut block_iter) = self.current_block {
-					block_iter.seek_to_last();
-					return block_iter.valid();
-				}
-			}
-		}
-
-		self.current_block = None;
-		false
-	}
-
-	#[inline]
-	fn key(&self) -> InternalKey {
-		self.key()
-	}
-
-	#[inline]
-	fn value(&self) -> Value {
-		self.value()
 	}
 }
 
@@ -2800,12 +2753,8 @@ mod tests {
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
 			let mut iter = table.iter(false, None);
-			let seek_key = InternalKey::new(
-				Vec::from(format!("key_{i:06}").into_bytes()),
-				1,
-				InternalKeyKind::Set,
-				0,
-			);
+			let seek_key =
+				InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode());
 			assert!(iter.valid(), "Seek to key_{i:06} should succeed");
 		}
@@ -3768,7 +3717,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_000 through key_005 (6 items)
@@ -3816,7 +3765,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_000 through key_004 (5 items)
@@ -3874,7 +3823,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		// Should return all 10 items in reverse order
 		assert_eq!(results.len(), 10, "Should return exactly 10 items");
@@ -3914,7 +3863,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_009, key_008, ..., key_003 (7 items)
@@ -3963,7 +3912,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items key_002, key_003, key_004, key_005, key_006 (5 items)
@@ -4007,7 +3956,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return all 10 items
@@ -4062,7 +4011,7 @@ mod tests {
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
 			let (key, _) = item;
-			forward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			forward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(forward_keys.len(), 30);
 		assert_eq!(forward_keys[0], "key_000");
@@ -4073,7 +4022,7 @@ mod tests {
 		let mut backward_keys = Vec::new();
 		while let Some(item) = backward_iter.next_back() {
 			let (key, _) = item;
-			backward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			backward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(backward_keys.len(), 30);
 		assert_eq!(backward_keys[0], "key_029");
@@ -4085,7 +4034,7 @@ mod tests {
 		let mut seek_backward = Vec::new();
 		while let Some(item) = seek_iter.next_back() {
 			let (key, _) = item;
-			seek_backward.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			seek_backward.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(seek_backward.len(), 30);
 		assert_eq!(seek_backward[0], "key_029");
@@ -4139,7 +4088,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, key_002, key_001, key_000
@@ -4183,7 +4132,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, ..., key_000 (5 items)
@@ -4227,7 +4176,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
+			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
 		// Should start at key_004, NOT any version of key_003
@@ -4267,7 +4216,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4323,7 +4272,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4457,7 +4406,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push((user_key, key.seq_num()));
 		}
 
@@ -4514,7 +4463,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item;
-			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
+			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4528,5 +4477,867 @@ mod tests {
 			!results.iter().any(|k| k == "key_002" || k == "key_005"),
 			"Should not contain any version of excluded bounds"
 		);
+	}
+
+	#[test]
+	fn test_get_block_boundary_same_user_key_bug() {
+		// REGRESSION TEST: When multiple versions of the same user_key span multiple
+		// data blocks, looking up the exact key at the block boundary incorrectly
+		// returns None due to using < instead of <= in the index comparison.
+		//
+		// Bug location: Table::get() lines 777-778
+		// The check `key_encoded < last_key_in_block` fails when they're equal,
+		// but the key IS in the block (it's the last key).
+
+		// Use very small block_size to force same user_key versions across multiple blocks
+		// Entry sizes: 1st = 24 bytes, subsequent = 20 bytes each
+		// size_estimate includes 8 bytes overhead (restart_points)
+		// After 1st: 32, After 2nd: 52
+		// With block_size=32: before 3rd entry, 52 > 32 → block cut
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None) // Disable bloom filter to test key comparison
+				.with_block_size(32), // Very small block to force split
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let user_key = b"test";
+
+		// Add 4 versions of the same key with descending sequence numbers
+		// (required ordering: user_key ASC, seq_num DESC)
+		// Block 1 will contain: seq 300, 200 (last_key = ("test", 200))
+		// Block 2 will contain: seq 100, 50
+		let key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		writer.add(key1, b"v").unwrap();
+
+		let key2 = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		writer.add(key2, b"v").unwrap();
+
+		let key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		writer.add(key3, b"v").unwrap();
+
+		let key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		writer.add(key4, b"v").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Verify we have multiple data blocks (the bug requires this)
+		assert!(
+			table.meta.properties.num_data_blocks >= 2,
+			"Test requires at least 2 data blocks to trigger the bug, got {}. \
+			 Adjust block_size or add more entries.",
+			table.meta.properties.num_data_blocks
+		);
+
+		// THE BUG: Looking up the exact key at block boundary returns None
+		// This is the last key of block 1, which is also the index separator key
+		// (because same user_key causes separator to fall back to original key)
+		// With block_size=32, the boundary key is ("test", 200)
+		let lookup_boundary_key =
+			InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_boundary_key).unwrap();
+
+		// This assertion will FAIL with the current buggy code
+		assert!(
+			result.is_some(),
+			"BUG: get() returned None for key at block boundary. \
+			 The key ('test', seq=200) exists as the last key of block 1, \
+			 but the index comparison uses < instead of <=, causing it to fail \
+			 when lookup key equals the separator key."
+		);
+
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key.as_slice(), user_key);
+		assert_eq!(found_key.seq_num(), 200);
+		assert_eq!(found_value.as_slice(), b"v");
+
+		// Also verify other keys still work correctly
+		let lookup_key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key1).unwrap();
+		assert!(result.is_some(), "seq=300 should be found");
+
+		let lookup_key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key3).unwrap();
+		assert!(result.is_some(), "seq=100 should be found");
+
+		let lookup_key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup_key4).unwrap();
+		assert!(result.is_some(), "seq=50 should be found");
+	}
+
+	#[test]
+	fn test_iterator_trait_prev_multi_partition_bug() {
+		// REGRESSION TEST: The Iterator trait's prev() method uses self.index_block
+		// which is only the first partition's iterator, NOT handling multiple partitions.
+		// When we have multiple index partitions and call prev() via the trait,
+		// backward iteration will stop at partition boundaries instead of continuing.
+		//
+		// Bug location: impl LSMIterator for TableIterator::prev() at lines 1512-1535
+		// Uses self.index_block.prev() which only works within the first partition.
+		// The correct inherent prev() method (lines 1022-1083) handles partitions properly.
+
+		// Use very small index_partition_size to force multiple index partitions
+		// Each data block adds an entry to the index partition
+		// With index_partition_size=50 and block_size=50, we should get multiple partitions
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(50) // Small blocks to create many index entries
+				.with_index_partition_size(50), // Small partitions to force multiple partitions
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add enough keys to create multiple data blocks, which creates multiple index entries,
+		// which in turn creates multiple index partitions
+		let num_keys = 100;
+		for i in 0..num_keys {
+			let key = InternalKey::new(
+				format!("key_{:05}", i).into_bytes(),
+				1000 - i as u64, // Decreasing seq for same ordering
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(key, format!("value_{}", i).as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table_arc = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify we have multiple partitions (the bug requires this)
+		let IndexType::Partitioned(ref partitioned_index) = table_arc.index_block;
+		let num_partitions = partitioned_index.blocks.len();
+		assert!(
+			num_partitions >= 2,
+			"Test requires at least 2 index partitions to trigger the bug, got {}. \
+			 Adjust index_partition_size or add more keys.",
+			num_partitions
+		);
+
+		println!("Created table with {} index partitions", num_partitions);
+
+		// Create iterator and position at the LAST entry
+		let mut iter = table_arc.iter(false, None);
+		iter.seek_to_last();
+		assert!(iter.valid(), "Iterator should be valid after seek_to_last");
+
+		// Collect all keys going backwards using the CORRECT inherent prev() method
+		let mut correct_results = Vec::new();
+		correct_results.push(iter.key().user_key);
+		while iter.prev() {
+			correct_results.push(iter.key().user_key.clone());
+		}
+		let correct_count = correct_results.len();
+		println!("Correct backward iteration found {} keys", correct_count);
+		assert_eq!(correct_count, num_keys as usize, "Should find all keys");
+
+		// Now test with explicit trait method call
+		// Reset iterator
+		let mut iter2 = table_arc.iter(false, None);
+		iter2.seek_to_last();
+		assert!(iter2.valid(), "Iterator should be valid after seek_to_last");
+
+		// Collect all keys going backwards using the BUGGY trait prev() method
+		let mut buggy_results = Vec::new();
+		buggy_results.push(iter2.key().user_key);
+		while iter2.prev() {
+			buggy_results.push(iter2.key().user_key.clone());
+		}
+		let buggy_count = buggy_results.len();
+		println!("Buggy trait prev() found {} keys", buggy_count);
+
+		// THE BUG: The trait's prev() will stop at partition boundary
+		// It should find all keys, but will find fewer because it only works within first partition
+		assert_eq!(
+			buggy_count, correct_count,
+			"BUG DETECTED: Iterator::prev() trait method only found {} keys, \
+			 but should have found {} keys. The trait method uses self.index_block \
+			 which is only the first partition's iterator and doesn't handle \
+			 crossing partition boundaries.",
+			buggy_count, correct_count
+		);
+	}
+
+	#[test]
+	fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
+		// REGRESSION TEST: The TopLevelIndex stores only user_key, losing seq_num ordering.
+		// When the same user_key has many versions spanning multiple partitions,
+		// Table::get may return None even when a visible version exists.
+		//
+		// Bug location:
+		// - src/sstable/index_block.rs:199-206 - TopLevelIndex construction only stores user_key
+		// - src/sstable/index_block.rs:216-231 - find_block_handle_by_key uses user_key comparison
+		// - src/sstable/table.rs:761 - Table::get uses user_key-only partition lookup
+		//
+		// Scenario:
+		// - Partition 0 ends with internal key (foo, 50) -> stores user_key "foo"
+		// - Partition 1 contains (foo, 49)...(foo, 10) and ends with (goo, 5) -> stores user_key
+		//   "goo"
+		// - Query for (foo, 25) should find entry in partition 1
+		// - BUG: find_block_handle_by_key("foo") returns partition 0, which doesn't contain (foo,
+		//   25)
+
+		// Use very small partition and block sizes to force the same user_key to span partitions
+		let opts = Arc::new(
+			Options::new()
+				.with_filter_policy(None)
+				.with_block_size(50) // Small blocks = more index entries
+				.with_index_partition_size(50), // Small partitions to force user_key to span
+		);
+
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add many versions of the SAME user key with decreasing seq_nums
+		// Internal key ordering: user_key ASC, seq_num DESC
+		// So (foo, 100) < (foo, 99) < ... < (foo, 1) in sort order
+		let user_key = b"foo";
+		let num_versions = 100;
+
+		for seq in (1..=num_versions).rev() {
+			// Entries are added in internal key order (descending seq_num first)
+			let key = InternalKey::new(user_key.to_vec(), seq as u64, InternalKeyKind::Set, 0);
+			writer.add(key, format!("value_at_seq_{}", seq).as_bytes()).unwrap();
+		}
+
+		// Add a different user key at the end to ensure we have a partition boundary after "foo"
+		let key = InternalKey::new(b"goo".to_vec(), 1, InternalKeyKind::Set, 0);
+		writer.add(key, b"value_goo").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify we have multiple partitions (the bug requires this)
+		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
+		let num_partitions = partitioned_index.blocks.len();
+
+		println!("Created table with {} index partitions", num_partitions);
+		for (i, block) in partitioned_index.blocks.iter().enumerate() {
+			let sep_key = InternalKey::decode(&block.separator_key);
+			println!(
+				"  Partition {}: user_key = {:?}, seq = {}",
+				i,
+				String::from_utf8_lossy(&sep_key.user_key),
+				sep_key.seq_num()
+			);
+		}
+
+		assert!(
+			num_partitions >= 2,
+			"Test requires at least 2 index partitions to trigger the bug, got {}. \
+			 Adjust index_partition_size or add more versions.",
+			num_partitions
+		);
+
+		// Check if there are multiple partitions with the same user_key "foo"
+		// If partitions 0 and 1+ both have user_key "foo", the bug is triggerable
+		let foo_partitions: Vec<_> = partitioned_index
+			.blocks
+			.iter()
+			.enumerate()
+			.filter(|(_, b)| InternalKey::decode(&b.separator_key).user_key == b"foo")
+			.collect();
+
+		println!(
+			"Partitions with user_key 'foo': {:?}",
+			foo_partitions.iter().map(|(i, _)| i).collect::<Vec<_>>()
+		);
+
+		// Now test the bug: query for a seq_num that should be in a later partition
+		// If we have (foo, 100), (foo, 99), ..., (foo, 1) spread across partitions:
+		// - Partition 0 might end with (foo, 60) or similar (high seq nums)
+		// - Later partitions contain lower seq nums like (foo, 25)
+		//
+		// Query at seq_num 30: should find (foo, 30) or latest version visible at seq 30
+		let query_seq = 30u64;
+		let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+
+		let result = table.get(lookup_key.clone()).unwrap();
+
+		// The expected result: we should find a version with seq_num <= query_seq
+		// For query_seq=30, we should find (foo, 30) with value "value_at_seq_30"
+		assert!(
+			result.is_some(),
+			"BUG DETECTED: Table::get returned None for (foo, seq={}), but version exists!\n\
+			 The bug is in TopLevelIndex::find_block_handle_by_key which uses user_key-only lookup.\n\
+			 When the same user_key spans multiple partitions, it only searches the first partition\n\
+			 (which contains high seq_nums) and misses entries in later partitions (low seq_nums).",
+			query_seq
+		);
+
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.user_key, user_key.to_vec());
+		println!(
+			"Found key with seq_num={}, value={:?}",
+			found_key.seq_num(),
+			String::from_utf8_lossy(&found_value)
+		);
+
+		// The found seq_num should be <= query_seq (latest visible version)
+		assert!(
+			found_key.seq_num() <= query_seq,
+			"Found version seq_num {} should be <= query seq_num {}",
+			found_key.seq_num(),
+			query_seq
+		);
+
+		// Test multiple query points to ensure correctness across partition boundaries
+		for query_seq in [10, 25, 50, 75, 99] {
+			let lookup = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+
+			let result = table.get(lookup).unwrap();
+			assert!(
+				result.is_some(),
+				"BUG: Table::get returned None for (foo, seq={}), but version should exist!",
+				query_seq
+			);
+
+			let (found_key, _) = result.unwrap();
+			assert!(
+				found_key.seq_num() <= query_seq,
+				"For query seq={}, found seq={} which is greater (should be <=)",
+				query_seq,
+				found_key.seq_num()
+			);
+		}
+	}
+
+	#[test]
+	fn test_table_get_mvcc_correct_version() {
+		// Scenario: Table has multiple versions of same key
+		// Query at different seq_nums should return correct version
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let user_key = b"my_key";
+
+		// Add versions: seq 100, 75, 50, 25 (stored in this order)
+		for seq in [100u64, 75, 50, 25] {
+			let key = InternalKey::new(user_key.to_vec(), seq, InternalKeyKind::Set, 0);
+			let value = format!("value_at_seq_{}", seq);
+			writer.add(key, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=200: should find seq=100 (newest visible)
+		let lookup = InternalKey::new(user_key.to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, found_value) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 100);
+		assert_eq!(&found_value, b"value_at_seq_100");
+
+		// Query at seq=80: should find seq=75
+		let lookup = InternalKey::new(user_key.to_vec(), 80, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 75);
+
+		// Query at seq=50: should find seq=50 exactly
+		let lookup = InternalKey::new(user_key.to_vec(), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 50);
+
+		// Query at seq=10: should return None (no visible version)
+		let lookup = InternalKey::new(user_key.to_vec(), 10, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none(), "No version should be visible at seq=10");
+	}
+
+	#[test]
+	fn test_table_get_returns_none_for_future_version() {
+		// Scenario: Query for a key where only future versions exist
+		// Expected: Should return None (no visible version)
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Key only has version at seq=100
+		let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key, b"future_value").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=50: version at seq=100 is in the "future"
+		let lookup = InternalKey::new(b"future_key".to_vec(), 50, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(
+			result.is_none(),
+			"Should not see future version at seq=100 when querying at seq=50"
+		);
+	}
+
+	#[test]
+	fn test_table_get_different_user_keys() {
+		// Scenario: Multiple different user keys
+		// Verify no cross-contamination
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		let keys = ["apple", "banana", "cherry", "date"];
+		for key in &keys {
+			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			let value = format!("value_for_{}", key);
+			writer.add(ikey, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Each key should return its own value
+		for key in &keys {
+			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let result = table.get(lookup).unwrap();
+			assert!(result.is_some(), "Should find key {}", key);
+			let (found_key, found_value) = result.unwrap();
+			assert_eq!(found_key.user_key, key.as_bytes().to_vec());
+			assert_eq!(String::from_utf8_lossy(&found_value), format!("value_for_{}", key));
+		}
+
+		// Non-existent keys should return None
+		let lookup = InternalKey::new(b"nonexistent".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none());
+	}
+
+	#[test]
+	fn test_table_get_at_block_boundaries() {
+		// Scenario: Force keys across multiple blocks, query at boundaries
+		let opts = Arc::new(
+			Options::new().with_filter_policy(None).with_block_size(64), /* Small blocks to
+			                                                              * force splits */
+		);
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add enough keys to span multiple blocks
+		for i in 0..20 {
+			let key = format!("key_{:04}", i);
+			let value = format!("value_{:04}", i);
+			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			writer.add(ikey, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Verify multiple blocks were created
+		assert!(
+			table.meta.properties.num_data_blocks > 1,
+			"Test requires multiple blocks, got {}",
+			table.meta.properties.num_data_blocks
+		);
+
+		// Query for each key
+		for i in 0..20 {
+			let key = format!("key_{:04}", i);
+			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let result = table.get(lookup).unwrap();
+			assert!(result.is_some(), "Should find key {}", key);
+			let (found_key, _) = result.unwrap();
+			assert_eq!(found_key.user_key, key.as_bytes().to_vec());
+		}
+	}
+
+	#[test]
+	fn test_table_get_tombstone_handling() {
+		// Scenario: Key has a tombstone (delete marker)
+		// Table::get should still return the tombstone, caller handles it
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Add a set followed by a delete
+		let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(set_key, b"original_value").unwrap();
+
+		let delete_key = InternalKey::new(b"my_key".to_vec(), 50, InternalKeyKind::Delete, 0);
+		writer.add(delete_key, b"").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query at seq=200: should get the Set at seq=100
+		let lookup = InternalKey::new(b"my_key".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 100);
+		assert!(!found_key.is_tombstone());
+
+		// Query at seq=75: should get the Delete at seq=50
+		let lookup = InternalKey::new(b"my_key".to_vec(), 75, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_some());
+		let (found_key, _) = result.unwrap();
+		assert_eq!(found_key.seq_num(), 50);
+		assert!(found_key.is_tombstone(), "Should return the tombstone marker");
+	}
+
+	#[test]
+	fn test_table_get_user_key_mismatch() {
+		// Scenario: Seek lands on a different user key
+		// Expected: Should return None
+		let opts = Arc::new(Options::new().with_filter_policy(None));
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+
+		// Only add "apple" and "cherry", not "banana"
+		let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key1, b"apple_value").unwrap();
+
+		let key2 = InternalKey::new(b"cherry".to_vec(), 100, InternalKeyKind::Set, 0);
+		writer.add(key2, b"cherry_value").unwrap();
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		// Query for "banana" which doesn't exist
+		// Seek will land on "cherry", but user_key doesn't match
+		let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
+		let result = table.get(lookup).unwrap();
+		assert!(result.is_none(), "Should return None when user_key doesn't match");
+	}
+
+	#[test]
+	fn test_reverse_iteration_unbounded_consistency() {
+		// Test that unbounded reverse iteration works correctly
+		let data = vec![("key_000", "value"), ("key_001", "value"), ("key_002", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+
+		// Collect all items in reverse
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 3);
+		assert_eq!(results[0], "key_002"); // Last key first
+		assert_eq!(results[1], "key_001");
+		assert_eq!(results[2], "key_000"); // First key last
+	}
+
+	// ============================================================
+	// BUG #5: Silent error handling in prev()
+	// ============================================================
+
+	#[test]
+	fn test_prev_iteration_across_partitions() {
+		// Test that prev() correctly handles partition boundaries
+		// Use small partition size to force multiple partitions
+		let mut opts = Options::new();
+		opts.block_size = 32; // Very small blocks
+		opts.index_partition_size = 64; // Small partition size
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..20)
+			.map(|i| {
+				// Using static strings via leak for test simplicity
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data.clone());
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Verify multiple partitions
+		let IndexType::Partitioned(ref index) = table.index_block;
+		assert!(index.blocks.len() > 1, "Test requires multiple partitions");
+
+		// Test reverse iteration crosses partitions correctly
+		let mut iter = table.iter(false, None);
+		let mut results = Vec::new();
+
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		assert_eq!(results.len(), 20);
+		// First item should be last key
+		assert_eq!(results[0], "key_019");
+		// Last item should be first key
+		assert_eq!(results[19], "key_000");
+	}
+
+	// ============================================================
+	// BUG #6: seek_to_last panic on corrupt block (BlockIterator)
+	// ============================================================
+
+	// Note: This test would need to be in block.rs, but we can test the behavior
+	// at the table level by ensuring seek_to_last works for valid data
+
+	#[test]
+	fn test_seek_to_last_valid_block() {
+		// Ensure seek_to_last works correctly for valid blocks
+		let data = vec![("aaa", "value1"), ("bbb", "value2"), ("ccc", "value3")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let mut iter = table.iter(false, None);
+		iter.seek_to_last();
+
+		assert!(iter.valid());
+		let key = iter.key();
+		assert_eq!(key.user_key, b"ccc".to_vec());
+	}
+
+	// ============================================================
+	// Range boundary edge cases
+	// ============================================================
+
+	#[test]
+	fn test_range_at_exact_block_boundary() {
+		// Test range bounds at exact block boundaries
+		let mut opts = Options::new();
+		opts.block_size = 50; // Small blocks to force boundaries
+		let opts = Arc::new(opts);
+
+		let data: Vec<(&str, &str)> = (0..10)
+			.map(|i| {
+				let key: &'static str = Box::leak(format!("key_{:03}", i).into_boxed_str());
+				let val: &'static str = Box::leak(format!("val_{:03}", i).into_boxed_str());
+				(key, val)
+			})
+			.collect();
+
+		let (src, size) = build_table(data);
+		let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(src), size as u64).unwrap());
+
+		// Test with bound that might be at a block boundary
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_003".to_vec()),
+				Bound::Included(b"key_006".to_vec()),
+			))),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		assert_eq!(results.len(), 4);
+		assert_eq!(results[0], "key_003");
+		assert_eq!(results[3], "key_006");
+	}
+
+	#[test]
+	fn test_range_with_multiple_versions_at_boundary() {
+		// Test range where boundary key has multiple versions
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10), // Multiple versions of boundary key
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Included bound should include ALL versions
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"key_002".to_vec()),
+				Bound::Included(b"key_003".to_vec()),
+			))),
+		);
+
+		let results: Vec<(String, u64)> = iter
+			.map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num()))
+			.collect();
+
+		// Should have 3 versions of key_002 + 1 version of key_003 = 4 items
+		assert_eq!(results.len(), 4, "Expected 4 items, got {:?}", results);
+
+		// First 3 should be key_002 with descending seq nums
+		assert_eq!(results[0].0, "key_002");
+		assert_eq!(results[0].1, 100);
+		assert_eq!(results[1].0, "key_002");
+		assert_eq!(results[1].1, 50);
+		assert_eq!(results[2].0, "key_002");
+		assert_eq!(results[2].1, 10);
+		assert_eq!(results[3].0, "key_003");
+	}
+
+	#[test]
+	fn test_excluded_bound_skips_all_versions() {
+		// Test that excluded bound skips ALL versions of a key
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_002", "v3", 10),
+			("key_003", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded lower bound should skip ALL versions of key_002
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Excluded(b"key_002".to_vec()),
+				Bound::Unbounded,
+			))),
+		);
+
+		let results: Vec<String> =
+			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+
+		// Should only have key_003
+		assert_eq!(results.len(), 1, "Expected 1 item, got {:?}", results);
+		assert_eq!(results[0], "key_003");
+
+		// Verify NO version of key_002 appears
+		assert!(!results.iter().any(|k| k == "key_002"), "key_002 should not appear in results");
+	}
+
+	#[test]
+	fn test_reverse_iteration_with_excluded_upper_bound() {
+		// Test reverse iteration correctly respects excluded upper bound
+		let data = vec![
+			("key_001", "v1", 10),
+			("key_002", "v1", 100),
+			("key_002", "v2", 50),
+			("key_003", "v1", 10),
+			("key_004", "v1", 10),
+		];
+
+		let (src, size) = build_table_with_seq_num(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Excluded upper bound in reverse
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Unbounded,
+				Bound::Excluded(b"key_003".to_vec()),
+			))),
+		);
+
+		let mut results = Vec::new();
+		while let Some((key, _)) = iter.next_back() {
+			results.push(String::from_utf8(key.user_key).unwrap());
+		}
+
+		// Should get key_002 (both versions) and key_001, NOT key_003 or key_004
+		assert!(!results.iter().any(|k| k == "key_003"), "key_003 should not appear");
+		assert!(!results.iter().any(|k| k == "key_004"), "key_004 should not appear");
+
+		// First in reverse should be key_002 (highest version)
+		assert_eq!(results[0], "key_002");
+	}
+
+	#[test]
+	fn test_empty_range_returns_nothing() {
+		// Test that a range with no matching keys returns nothing
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value"), ("eee", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] - "ccc" doesn't exist
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"ccc".to_vec()),
+				Bound::Included(b"ccc".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range for non-existent key should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_before_table() {
+		// Test range that is completely before all keys in table
+		let data = vec![("mmm", "value"), ("nnn", "value"), ("ooo", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"aaa".to_vec()),
+				Bound::Included(b"bbb".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range before all keys should be empty");
+	}
+
+	#[test]
+	fn test_range_completely_after_table() {
+		// Test range that is completely after all keys in table
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ccc", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		let iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"xxx".to_vec()),
+				Bound::Included(b"zzz".to_vec()),
+			))),
+		);
+
+		let results: Vec<_> = iter.collect();
+		assert_eq!(results.len(), 0, "Range after all keys should be empty");
+	}
+
+	#[test]
+	fn test_reverse_iteration_empty_range() {
+		// Test reverse iteration with empty range
+		let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value")];
+
+		let (src, size) = build_table(data);
+		let opts = default_opts();
+		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+		// Range [ccc, ccc] doesn't exist
+		let mut iter = table.iter(
+			false,
+			Some(user_range_to_internal_range((
+				Bound::Included(b"ccc".to_vec()),
+				Bound::Included(b"ccc".to_vec()),
+			))),
+		);
+
+		let result = iter.next_back();
+		assert!(result.is_none(), "Empty range should return None on next_back()");
 	}
 }

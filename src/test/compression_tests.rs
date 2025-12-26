@@ -10,7 +10,7 @@ use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::{CompressionType, Iterator, Options};
+use crate::{CompressionType, Options};
 
 // ========== Helper Functions ==========
 
@@ -81,7 +81,7 @@ fn build_table_with_compression(
 
 	{
 		let mut builder = TableWriter::new(&mut d, 0, opt, 0);
-		for (k, v) in data.into_iter() {
+		for (k, v) in data {
 			builder.add(InternalKey::new(k, 1, InternalKeyKind::Set, 0), &v).unwrap();
 		}
 		builder.finish().unwrap();
@@ -335,7 +335,7 @@ fn test_compression_iterator_operations() {
 	iter.prev();
 	assert!(iter.valid(), "Should be valid after first prev()");
 
-	let prev_key = iter.key().user_key.to_vec();
+	let prev_key = iter.key().user_key;
 	assert!(prev_key < data[9999].0, "Previous key should be less than last key");
 
 	for _ in 0..10 {
@@ -569,7 +569,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 
 		assert!(!value.is_empty(), "Value should not be empty");
 
-		prev_key = Some(key.to_vec());
+		prev_key = Some(key.clone());
 		scanned_count += 1;
 	}
 
@@ -715,7 +715,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 			assert!(!value.is_empty(), "Value should not be empty");
 			assert_eq!(value.len(), 250, "Value should be 250 bytes");
 
-			prev_key = Some(key.to_vec());
+			prev_key = Some(key.clone());
 			scanned_count += 1;
 		}
 

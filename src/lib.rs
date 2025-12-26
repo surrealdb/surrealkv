@@ -35,7 +35,6 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
 /// An optimised trait for converting values to bytes only when needed
@@ -162,6 +161,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
+	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -208,10 +208,14 @@ impl Default for Options {
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
 
+		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
+		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
+
 		Self {
 			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
-			comparator: Arc::new(crate::BytewiseComparator {}),
+			comparator,
+			internal_comparator,
 			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
@@ -254,6 +258,7 @@ impl Options {
 	}
 
 	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
+		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
 		self
 	}
@@ -573,47 +578,6 @@ pub trait FilterPolicy: Send + Sync {
 
 	/// Creates a filter based on given keys
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
-}
-
-pub(crate) trait Iterator {
-	/// An iterator is either positioned at a key/value pair, or
-	/// not valid.  This method returns true iff the iterator is valid.
-	fn valid(&self) -> bool;
-
-	/// Position at the first key in the source.  The iterator is `Valid()`
-	/// after this call iff the source is not empty.
-	fn seek_to_first(&mut self);
-
-	/// Position at the last key in the source.  The iterator is
-	/// `Valid()` after this call iff the source is not empty.
-	fn seek_to_last(&mut self);
-
-	/// Position at the first key in the source that is at or past target.
-	/// The iterator is valid after this call iff the source contains
-	/// an entry that comes at or past target.
-	fn seek(&mut self, target: &[u8]) -> Option<()>;
-
-	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the
-	/// source. REQUIRES: `valid()`
-	fn advance(&mut self) -> bool;
-
-	/// Moves to the previous entry in the source.  After this call, the
-	/// iterator is valid iff the iterator was not positioned at the first
-	/// entry in source. REQUIRES: `valid()`
-	fn prev(&mut self) -> bool;
-
-	/// Return the key for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn key(&self) -> InternalKey;
-
-	/// Return the value for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn value(&self) -> Value;
 }
 
 use std::ops::Bound;

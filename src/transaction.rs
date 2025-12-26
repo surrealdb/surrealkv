@@ -2384,7 +2384,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key4");
@@ -2429,7 +2429,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key6");
 				assert_eq!(keys[1], b"key5");
@@ -2476,7 +2476,7 @@ mod tests {
 
 				// Check that keys are in reverse order and deleted keys are excluded
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key3");
@@ -2524,7 +2524,7 @@ mod tests {
 
 				// Check that keys are in reverse order and soft deleted keys are excluded
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key3");
@@ -2564,7 +2564,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key10");
 				assert_eq!(keys[1], b"key09");
@@ -2600,8 +2600,7 @@ mod tests {
 				assert_eq!(reverse_results.len(), 3);
 
 				// Check that keys are in reverse order
-				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().to_vec()).collect();
+				let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap()).collect();
 
 				assert_eq!(keys[0], b"key3");
 				assert_eq!(keys[1], b"key2");
@@ -2648,7 +2647,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key6");
 				assert_eq!(keys[1], b"key5");
@@ -3940,7 +3939,7 @@ mod tests {
 		// Group by key to verify we have all versions
 		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
+			key_versions.entry(key).or_default().push((value.clone(), timestamp, is_tombstone));
 		}
 
 		// Verify key1 has 2 versions
@@ -4018,7 +4017,7 @@ mod tests {
 		// Group by key to verify we have all versions
 		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
+			key_versions.entry(key).or_default().push((value.clone(), timestamp, is_tombstone));
 		}
 
 		// Verify key1 is not present (hard deleted)
@@ -4428,7 +4427,7 @@ mod tests {
 			assert_eq!(results.len(), 6); // Take 6 results
 
 			// Collect unique keys from the results
-			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
 
 			// Verify that the number of unique keys is equal to the limit
 			assert_eq!(unique_keys.len(), 2);
@@ -4483,13 +4482,13 @@ mod tests {
 			// Scan each subset and collect versions
 			for subset in subsets {
 				let txn = store.begin().unwrap();
-				let mut end_key = subset.1.to_vec();
+				let mut end_key = subset.1.clone();
 				end_key.push(0);
 				let results: Vec<_> = txn.scan_all_versions(subset.0, &end_key, None).unwrap();
 
 				// Collect unique keys from the results
 				let unique_keys: HashSet<_> =
-					results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+					results.iter().map(|(k, _, _, _)| k.clone()).collect();
 
 				// Verify that the results contain all versions for each key in the subset
 				for key in unique_keys {
@@ -4614,7 +4613,7 @@ mod tests {
 						batch_results.push((k.clone(), v, ts, is_deleted));
 
 						// Update last_key with a new vector
-						last_key = k.to_vec();
+						last_key = k.clone();
 					}
 
 					if batch_results.is_empty() {
