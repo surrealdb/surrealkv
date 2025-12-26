@@ -446,7 +446,7 @@ pub(crate) fn calculate_crc32(record_type: &[u8], data: &[u8]) -> u32 {
 }
 
 /// Validates that a record type is valid for its position in a sequence.
-pub(crate) fn validate_record_type(record_type: &RecordType, i: usize) -> Result<()> {
+pub(crate) fn validate_record_type(record_type: RecordType, i: usize) -> Result<()> {
 	match record_type {
 		RecordType::Full => {
 			if i != 0 {

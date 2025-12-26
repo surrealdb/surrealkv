@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tempdir::TempDir;
@@ -11,7 +10,7 @@ use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::{CompressionType, Iterator, Options};
+use crate::{CompressionType, Options};
 
 // ========== Helper Functions ==========
 
@@ -82,10 +81,8 @@ fn build_table_with_compression(
 
 	{
 		let mut builder = TableWriter::new(&mut d, 0, opt, 0);
-		for (k, v) in data.iter() {
-			builder
-				.add(InternalKey::new(Bytes::copy_from_slice(k), 1, InternalKeyKind::Set, 0), v)
-				.unwrap();
+		for (k, v) in data {
+			builder.add(InternalKey::new(k, 1, InternalKeyKind::Set, 0), &v).unwrap();
 		}
 		builder.finish().unwrap();
 	}
@@ -127,8 +124,8 @@ fn test_compression_10k_pairs_roundtrip() {
 		let key = iter.key();
 		let value = iter.value();
 
-		assert_eq!(key.user_key.as_ref(), &data[count].0[..]);
-		assert_eq!(value.as_ref(), &data[count].1[..]);
+		assert_eq!(key.user_key.as_slice(), &data[count].0[..]);
+		assert_eq!(value.as_slice(), &data[count].1[..]);
 
 		count += 1;
 		iter.advance();
@@ -137,12 +134,11 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
-		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Iterator should be valid after seek");
-		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_ref(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
+		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
 	}
 }
 
@@ -270,8 +266,8 @@ fn test_compression_mixed_patterns() {
 	let mut count = 0;
 
 	while iter.valid() {
-		assert_eq!(iter.key().user_key.as_ref(), &data[count].0[..]);
-		assert_eq!(iter.value().as_ref(), &data[count].1[..]);
+		assert_eq!(iter.key().user_key.as_slice(), &data[count].0[..]);
+		assert_eq!(iter.value().as_slice(), &data[count].1[..]);
 		count += 1;
 		iter.advance();
 	}
@@ -304,28 +300,27 @@ fn test_compression_iterator_operations() {
 
 	iter.seek_to_first();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_ref(), &data[0].0[..]);
-	assert_eq!(iter.value().as_ref(), &data[0].1[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
+	assert_eq!(iter.value().as_slice(), &data[0].1[..]);
 
 	iter.seek_to_last();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_ref(), &data[9999].0[..]);
-	assert_eq!(iter.value().as_ref(), &data[9999].1[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
+	assert_eq!(iter.value().as_slice(), &data[9999].1[..]);
 
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
-		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Should find key at index {}", idx);
-		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_ref(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
+		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
 	}
 
 	iter.seek_to_first();
 	let mut forward_count = 0;
 	while iter.valid() {
-		assert_eq!(iter.key().user_key.as_ref(), &data[forward_count].0[..]);
+		assert_eq!(iter.key().user_key.as_slice(), &data[forward_count].0[..]);
 		forward_count += 1;
 		iter.advance();
 	}
@@ -335,12 +330,12 @@ fn test_compression_iterator_operations() {
 	// movement
 	iter.seek_to_last();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_ref(), &data[9999].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
 
 	iter.prev();
 	assert!(iter.valid(), "Should be valid after first prev()");
 
-	let prev_key = iter.key().user_key.to_vec();
+	let prev_key = iter.key().user_key;
 	assert!(prev_key < data[9999].0, "Previous key should be less than last key");
 
 	for _ in 0..10 {
@@ -352,25 +347,24 @@ fn test_compression_iterator_operations() {
 
 	iter.seek_to_first();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_ref(), &data[0].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
 
 	iter.seek_to_first();
 	assert!(iter.valid());
 	iter.advance();
-	assert_eq!(iter.key().user_key.as_ref(), &data[1].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[1].0[..]);
 	iter.prev();
-	assert_eq!(iter.key().user_key.as_ref(), &data[0].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
 
-	let mid_key =
-		InternalKey::new(Bytes::copy_from_slice(&data[5000].0), 2, InternalKeyKind::Set, 0);
+	let mid_key = InternalKey::new(data[5000].0.clone(), 2, InternalKeyKind::Set, 0);
 	iter.seek(&mid_key.encode());
-	assert_eq!(iter.key().user_key.as_ref(), &data[5000].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[5000].0[..]);
 
 	iter.advance();
 	iter.advance();
-	assert_eq!(iter.key().user_key.as_ref(), &data[5002].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[5002].0[..]);
 	iter.prev();
-	assert_eq!(iter.key().user_key.as_ref(), &data[5001].0[..]);
+	assert_eq!(iter.key().user_key.as_slice(), &data[5001].0[..]);
 }
 
 #[test]
@@ -411,9 +405,14 @@ fn test_compression_large_values() {
 		let key = iter.key();
 		let value = iter.value();
 
-		assert_eq!(key.user_key.as_ref(), &data[count].0[..]);
+		assert_eq!(key.user_key.as_slice(), &data[count].0[..]);
 		assert_eq!(value.len(), data[count].1.len(), "Value length mismatch at index {}", count);
-		assert_eq!(value.as_ref(), &data[count].1[..], "Value content mismatch at index {}", count);
+		assert_eq!(
+			value.as_slice(),
+			&data[count].1[..],
+			"Value content mismatch at index {}",
+			count
+		);
 
 		count += 1;
 		iter.advance();
@@ -423,12 +422,11 @@ fn test_compression_large_values() {
 
 	let test_indices = [0, 100, 500, 999];
 	for &idx in &test_indices {
-		let seek_key =
-			InternalKey::new(Bytes::copy_from_slice(&data[idx].0), 2, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode());
 		assert!(iter.valid(), "Should find large value at index {}", idx);
-		assert_eq!(iter.key().user_key.as_ref(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_ref(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
+		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
 	}
 }
 
@@ -559,19 +557,19 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	while let Some(Ok((key, value))) = iter.next() {
 		if let Some(ref prev) = prev_key {
 			assert!(
-				key.as_ref() > prev.as_slice(),
+				key.as_slice() > prev.as_slice(),
 				"Keys should be in sorted order during range scan"
 			);
 		}
 
 		assert!(
-			keys.iter().any(|k| k.as_slice() == key.as_ref()),
+			keys.iter().any(|k| k.as_slice() == key.as_slice()),
 			"Scanned key should be in original key set"
 		);
 
 		assert!(!value.is_empty(), "Value should not be empty");
 
-		prev_key = Some(key.to_vec());
+		prev_key = Some(key.clone());
 		scanned_count += 1;
 	}
 
@@ -677,7 +675,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 				idx
 			);
 			assert_eq!(
-				actual_value.as_ref(),
+				actual_value.as_slice(),
 				expected_value.as_slice(),
 				"Value content mismatch for key at index {}",
 				idx
@@ -704,20 +702,20 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		while let Some(Ok((key, value))) = iter.next() {
 			if let Some(ref prev) = prev_key {
 				assert!(
-					key.as_ref() > prev.as_slice(),
+					key.as_slice() > prev.as_slice(),
 					"Keys should be in sorted order during range scan after reopen"
 				);
 			}
 
 			assert!(
-				keys.iter().any(|k| k.as_slice() == key.as_ref()),
+				keys.iter().any(|k| k.as_slice() == key.as_slice()),
 				"Scanned key should be in original key set"
 			);
 
 			assert!(!value.is_empty(), "Value should not be empty");
 			assert_eq!(value.len(), 250, "Value should be 250 bytes");
 
-			prev_key = Some(key.to_vec());
+			prev_key = Some(key.clone());
 			scanned_count += 1;
 		}
 
@@ -920,7 +918,7 @@ fn test_table_writer_with_level_compression() {
 			vec![(b"key1".to_vec(), b"value1".to_vec()), (b"key2".to_vec(), b"value2".to_vec())];
 
 		for (key, value) in data {
-			let ikey = InternalKey::new(Bytes::copy_from_slice(&key), 1, InternalKeyKind::Set, 0);
+			let ikey = InternalKey::new(key.clone(), 1, InternalKeyKind::Set, 0);
 			writer.add(ikey, &value).unwrap();
 		}
 		writer.finish().unwrap();
@@ -933,8 +931,8 @@ fn test_table_writer_with_level_compression() {
 	let mut iter = table.iter(false, None);
 	iter.seek_to_first();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_ref(), b"key1");
-	assert_eq!(iter.value().as_ref(), b"value1");
+	assert_eq!(iter.key().user_key.as_slice(), b"key1");
+	assert_eq!(iter.value().as_slice(), b"value1");
 }
 
 #[test(tokio::test)]

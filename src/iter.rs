@@ -317,7 +317,7 @@ impl Iterator for CompactionIterator<'_> {
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
 				None => true,
-				Some(current) => user_key != current,
+				Some(current) => user_key != *current,
 			};
 
 			if is_new_key {
@@ -349,7 +349,6 @@ impl Iterator for CompactionIterator<'_> {
 mod tests {
 	use std::sync::Arc;
 
-	use bytes::Bytes;
 	use tempfile::TempDir;
 	use test_log::test;
 
@@ -359,7 +358,7 @@ mod tests {
 	use crate::{Options, VLogChecksumLevel, Value};
 
 	fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
-		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0)
+		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
 	}
 
 	fn create_internal_key_with_timestamp(
@@ -368,7 +367,7 @@ mod tests {
 		kind: InternalKeyKind,
 		timestamp: u64,
 	) -> InternalKey {
-		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, timestamp)
+		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {
@@ -388,7 +387,7 @@ mod tests {
 
 	fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 		let pointer = vlog.append(key, value).unwrap();
-		ValueLocation::with_pointer(pointer).encode().into()
+		ValueLocation::with_pointer(pointer).encode()
 	}
 
 	// Creates a mock iterator with predefined entries
@@ -440,7 +439,7 @@ mod tests {
 				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -450,7 +449,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -518,7 +517,7 @@ mod tests {
 				// hard_delete for even keys
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -527,7 +526,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -590,7 +589,7 @@ mod tests {
 				let key = create_internal_key(&format!("key-{i:03}"), 200, InternalKeyKind::Delete);
 				// Create empty Vec<u8> and wrap it in Arc for hard_delete value
 				let empty_value: Vec<u8> = Vec::new();
-				items1.push((key, empty_value.into()));
+				items1.push((key, empty_value));
 			}
 		}
 
@@ -599,7 +598,7 @@ mod tests {
 			let key = create_internal_key(&format!("key-{i:03}"), 100, InternalKeyKind::Set);
 			let value_str = format!("value-{i}");
 			let value_vec: Vec<u8> = value_str.into_bytes();
-			items2.push((key, value_vec.into()));
+			items2.push((key, value_vec));
 		}
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -677,7 +676,7 @@ mod tests {
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 300);
 		assert_eq!(returned_key.kind(), InternalKeyKind::Set);
 		// Verify the correct value is returned (should be value_v3)
@@ -771,7 +770,7 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items1 = vec![(hard_delete_key, empty_value)];
 		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -814,7 +813,7 @@ mod tests {
 		let empty_value: Vec<u8> = Vec::new();
 		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-		let items1 = vec![(hard_delete_key, empty_value.into())];
+		let items1 = vec![(hard_delete_key, empty_value)];
 		let items2 = vec![(value_key, actual_value)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
@@ -834,7 +833,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "At non-bottom level, hard_delete should be returned");
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 200);
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
 		// Verify hard_delete has empty value
@@ -875,7 +874,7 @@ mod tests {
 		let key3_val1 = create_vlog_value(&vlog, b"key3", b"value3");
 
 		// Distribute across multiple iterators
-		let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2.into())];
+		let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2)];
 		let items2 = vec![(key1_v1, key1_val1), (key3_v1, key3_val1.clone())];
 		let items3 = vec![(key2_v1, key2_val1)];
 
@@ -960,8 +959,8 @@ mod tests {
 		let value_v1: Vec<u8> = b"value1".to_vec();
 		let value_v2: Vec<u8> = b"value2".to_vec();
 
-		let items1 = vec![(key_v2, value_v2.into())];
-		let items2 = vec![(key_v1, value_v1.into())];
+		let items1 = vec![(key_v2, value_v2)];
+		let items2 = vec![(key_v1, value_v1)];
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -980,11 +979,11 @@ mod tests {
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
-		assert_eq!(returned_key.user_key.as_ref(), user_key.as_bytes());
+		assert_eq!(&returned_key.user_key, user_key.as_bytes());
 		assert_eq!(returned_key.seq_num(), 200);
 		// Verify the correct value is returned (should be value_v2)
 		assert_eq!(
-			returned_value.as_ref(),
+			returned_value.as_slice(),
 			b"value2",
 			"Should return the value corresponding to the latest version (seq=200)"
 		);
@@ -1022,7 +1021,7 @@ mod tests {
 		let val_c_v1 = create_vlog_value(&vlog, b"key_c", b"value_c_oldest");
 		let val_d_v1 = create_vlog_value(&vlog, b"key_d", b"value_d");
 
-		let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3.into())];
+		let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3)];
 		let items2 = vec![(key_a_v2, val_a_v2), (key_b_v2, val_b_v2.clone()), (key_c_v2, val_c_v2)];
 		let items3 = vec![(key_a_v1, val_a_v1), (key_c_v1, val_c_v1), (key_d_v1, val_d_v1.clone())];
 
@@ -1163,12 +1162,12 @@ mod tests {
 
 		// Create items for testing
 		let items1 = vec![
-			(key1_recent_delete, Bytes::new()), // DELETE operation
+			(key1_recent_delete, Vec::new()), // DELETE operation
 			(key1_old_set, val1_old),
 			(key1_recent_set, val1_recent),
 		];
 		let items2 = vec![
-			(key2_old_delete, Bytes::new()), // DELETE operation
+			(key2_old_delete, Vec::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
@@ -1203,19 +1202,16 @@ mod tests {
 		assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
 
 		// Verify we get all versions of key1 (all within retention)
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(key1_versions.len(), 3, "key1 should have 3 versions within retention");
 
 		// Verify we get all versions of key2 (all within retention)
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(key2_versions.len(), 3, "key2 should have 3 versions within retention");
 
 		// Verify we get only the recent version of key3 (very old versions outside
 		// retention)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			1,
@@ -1344,12 +1340,12 @@ mod tests {
 
 		// Create items for testing
 		let items1 = vec![
-			(key1_recent_delete, Bytes::new()), // DELETE operation - should be dropped
+			(key1_recent_delete, Vec::new()), // DELETE operation - should be dropped
 			(key1_old_set, val1_old),
 			(key1_recent_set, val1_recent),
 		];
 		let items2 = vec![
-			(key2_delete, Bytes::new()), // DELETE only - entire key disappears
+			(key2_delete, Vec::new()), // DELETE only - entire key disappears
 		];
 		let items3 = vec![
 			(key3_recent_set, val3_recent),
@@ -1357,7 +1353,7 @@ mod tests {
 			(key3_very_old_set1, val3_very_old1),
 		];
 		let items4 = vec![
-			(key4_very_old_delete, Bytes::new()), // Very old DELETE - dropped
+			(key4_very_old_delete, Vec::new()), // Very old DELETE - dropped
 			(key4_old_set, val4_old),
 		];
 
@@ -1388,8 +1384,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "Expected 1 item: only key3 with recent SET");
 
 		// Verify key1: Entire key discarded (DELETE is latest at bottom level)
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			0,
@@ -1397,8 +1392,7 @@ mod tests {
 		);
 
 		// Verify key2: DELETE-only key should completely disappear
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			0,
@@ -1406,8 +1400,7 @@ mod tests {
 		);
 
 		// Verify key3: only recent version kept (very old versions outside retention)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			1,
@@ -1416,8 +1409,7 @@ mod tests {
 		assert_eq!(key3_versions[0].0.seq_num(), 700); // Recent SET only
 
 		// Verify key4: Entire key discarded (DELETE is latest at bottom level)
-		let key4_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key4").collect();
+		let key4_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key4").collect();
 		assert_eq!(
 			key4_versions.len(),
 			0,
@@ -1525,11 +1517,11 @@ mod tests {
 			(key1_very_old_set, val1_very_old),
 		];
 		let items2 = vec![
-			(key2_delete, Bytes::new()), // DELETE operation
+			(key2_delete, Vec::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
-		let items3 = vec![(key3_delete, Bytes::new())]; // DELETE only
+		let items3 = vec![(key3_delete, Vec::new())]; // DELETE only
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1556,8 +1548,7 @@ mod tests {
 		assert_eq!(result.len(), 3, "Expected 3 items: latest version of each key");
 
 		// Verify key1: Only latest SET kept
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			1,
@@ -1566,8 +1557,7 @@ mod tests {
 		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
 
 		// Verify key2: Only latest DELETE kept
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			1,
@@ -1576,8 +1566,7 @@ mod tests {
 		assert_eq!(key2_versions[0].0.seq_num(), 600); // DELETE
 
 		// Verify key3: Only DELETE kept
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(key3_versions.len(), 1, "key3 should have only 1 version (DELETE)");
 		assert_eq!(key3_versions[0].0.seq_num(), 700); // DELETE
 
@@ -1670,11 +1659,11 @@ mod tests {
 			(key1_very_old_set, val1_very_old),
 		];
 		let items2 = vec![
-			(key2_delete, Bytes::new()), // DELETE operation
+			(key2_delete, Vec::new()), // DELETE operation
 			(key2_recent_set, val2_recent),
 			(key2_old_set, val2_old),
 		];
-		let items3 = vec![(key3_delete, Bytes::new())]; // DELETE only
+		let items3 = vec![(key3_delete, Vec::new())]; // DELETE only
 
 		let iter1 = Box::new(MockIterator::new(items1));
 		let iter2 = Box::new(MockIterator::new(items2));
@@ -1700,8 +1689,7 @@ mod tests {
 		assert_eq!(result.len(), 1, "Expected 1 item: only key1 with latest SET");
 
 		// Verify key1: Only latest SET kept
-		let key1_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key1").collect();
+		let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
 		assert_eq!(
 			key1_versions.len(),
 			1,
@@ -1710,8 +1698,7 @@ mod tests {
 		assert_eq!(key1_versions[0].0.seq_num(), 300); // Latest SET
 
 		// Verify key2: Entire key discarded (DELETE is latest at bottom level)
-		let key2_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key2").collect();
+		let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
 		assert_eq!(
 			key2_versions.len(),
 			0,
@@ -1719,8 +1706,7 @@ mod tests {
 		);
 
 		// Verify key3: Entire key discarded (DELETE-only at bottom level)
-		let key3_versions: Vec<_> =
-			result.iter().filter(|(k, _)| k.user_key.as_ref() == b"key3").collect();
+		let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 		assert_eq!(
 			key3_versions.len(),
 			0,
@@ -1796,7 +1782,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1851,7 +1837,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(hard_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(hard_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1902,7 +1888,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -1956,7 +1942,7 @@ mod tests {
 			let empty_value: Vec<u8> = Vec::new();
 			let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
 
-			let items = vec![(soft_delete_key, empty_value.into()), (old_value_key, actual_value)];
+			let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
 			let iter = Box::new(MockIterator::new(items));
 			let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
@@ -2449,13 +2435,13 @@ mod tests {
 
 			// Check key_a
 			let (returned_key_a, _) = &result[0];
-			assert_eq!(returned_key_a.user_key.as_ref(), b"key_a");
+			assert_eq!(&returned_key_a.user_key, b"key_a");
 			assert_eq!(returned_key_a.seq_num(), 1200);
 			assert!(returned_key_a.is_replace());
 
 			// Check key_b
 			let (returned_key_b, _) = &result[1];
-			assert_eq!(returned_key_b.user_key.as_ref(), b"key_b");
+			assert_eq!(&returned_key_b.user_key, b"key_b");
 			assert_eq!(returned_key_b.seq_num(), 1300);
 			assert!(returned_key_b.is_replace());
 
@@ -2543,7 +2529,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key5", 1900, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2593,7 +2579,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key6", 2100, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2650,7 +2636,7 @@ mod tests {
 			// Table 3: Delete operation (latest)
 			let key4 = create_internal_key("test_key7", 2500, InternalKeyKind::Delete);
 			let value4 = Vec::new(); // Empty value for delete
-			items3.push((key4, value4.into()));
+			items3.push((key4, value4));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2815,7 +2801,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key10", 3300, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));
@@ -2865,7 +2851,7 @@ mod tests {
 			// Table 2: Delete operation (latest)
 			let key2 = create_internal_key("test_key11", 3500, InternalKeyKind::Delete);
 			let value2 = Vec::new(); // Empty value for delete
-			items2.push((key2, value2.into()));
+			items2.push((key2, value2));
 
 			// Create iterators
 			let iter1 = Box::new(MockIterator::new(items1));

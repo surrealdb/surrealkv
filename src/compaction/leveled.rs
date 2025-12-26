@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
+use crate::InternalKeyRange;
 
 /// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,24 +90,45 @@ impl Strategy {
 			}
 		}
 
-		// Get key range from selected source tables
+		// Get bounds from selected source tables using smallest_point/largest_point
 		let source_tables: Vec<_> = if source_level_num == 0 {
 			source_level.tables.iter().collect()
 		} else {
 			source_level.tables.iter().take(1).collect()
 		};
 
-		let source_key_range = source_tables
+		// Build InternalKeyRange from smallest_point/largest_point
+		let source_bounds: Option<InternalKeyRange> = source_tables
 			.iter()
-			.filter_map(|t| t.meta.properties.key_range.clone())
-			.fold(None, |acc, range| match acc {
-				None => Some(range),
-				Some(acc_range) => Some(acc_range.merge(&range)),
+			.filter_map(|t| {
+				let smallest = t.meta.smallest_point.as_ref()?;
+				let largest = t.meta.largest_point.as_ref()?;
+				Some((smallest.clone(), largest.clone()))
+			})
+			.fold(None, |acc, (s, l)| {
+				use std::ops::Bound;
+				match acc {
+					None => Some((Bound::Included(s), Bound::Included(l))),
+					Some((Bound::Included(acc_s), Bound::Included(acc_l))) => {
+						let new_s = if s.user_key < acc_s.user_key {
+							s
+						} else {
+							acc_s
+						};
+						let new_l = if l.user_key > acc_l.user_key {
+							l
+						} else {
+							acc_l
+						};
+						Some((Bound::Included(new_s), Bound::Included(new_l)))
+					}
+					_ => acc,
+				}
 			});
 
 		// Find overlapping tables from next level
-		if let Some(source_range) = source_key_range {
-			for table in next_level.overlapping_tables(&source_range) {
+		if let Some(bounds) = source_bounds {
+			for table in next_level.overlapping_tables(&bounds) {
 				if table_id_set.insert(table.id) {
 					tables.push(table.id);
 				}
@@ -148,7 +170,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let source_size = source_table.meta.properties.file_size;
+			let source_size = source_table.file_size;
 			let smallest_seq = source_table.meta.properties.seqnos.0;
 
 			choices.push(Choice {
@@ -184,7 +206,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let source_size = source_table.meta.properties.file_size;
+			let source_size = source_table.file_size;
 			let largest_seq = source_table.meta.properties.seqnos.1;
 
 			choices.push(Choice {
@@ -219,7 +241,7 @@ impl Strategy {
 		let mut choices = Vec::new();
 
 		for source_table in &source_level.tables {
-			let file_size = source_table.meta.properties.file_size;
+			let file_size = source_table.file_size;
 			let num_entries = source_table.meta.properties.num_entries;
 			let num_deletions = source_table.meta.properties.num_deletions;
 
@@ -329,7 +351,6 @@ mod tests {
 	use std::sync::atomic::AtomicU64;
 	use std::sync::{Arc, RwLock};
 
-	use bytes::Bytes;
 	use tempfile::TempDir;
 	use test_log::test;
 
@@ -344,7 +365,7 @@ mod tests {
 	use crate::sstable::table::{Table, TableFormat, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::vlog::ValueLocation;
-	use crate::{CompressionType, Options as LSMOptions};
+	use crate::{CompressionType, Key, Options as LSMOptions, Value};
 
 	/// Test environment setup helpers
 	struct TestEnv {
@@ -409,7 +430,7 @@ mod tests {
 
 	/// Helper function to create encoded inline values for testing
 	fn create_inline_value(value: &[u8]) -> Vec<u8> {
-		let location = ValueLocation::with_inline_value(Bytes::copy_from_slice(value));
+		let location = ValueLocation::with_inline_value(value.to_vec());
 		location.encode()
 	}
 
@@ -423,12 +444,8 @@ mod tests {
 		let mut entries = Vec::new();
 		for key_val in min_key..=max_key {
 			let user_key = format!("key-{key_val:010}").into_bytes();
-			let key = InternalKey::new(
-				Bytes::from(user_key),
-				min_seq + (key_val - min_key),
-				InternalKeyKind::Set,
-				0,
-			);
+			let key =
+				InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set, 0);
 			let value = format!("{value_prefix}-{key_val}").into_bytes();
 			let encoded_value = create_inline_value(&value);
 			entries.push((key, encoded_value));
@@ -450,8 +467,7 @@ mod tests {
 		for i in 0..count {
 			let key = format!("{}-{:05}", key_prefix, start + i).into_bytes();
 			let value = format!("{}-{:05}", value_prefix, start + i).into_bytes();
-			let internal_key =
-				InternalKey::new(Bytes::from(key), seq_num + i as u64, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, seq_num + i as u64, InternalKeyKind::Set, 0);
 			let encoded_value = create_inline_value(&value);
 			entries.push((internal_key, encoded_value));
 		}
@@ -532,8 +548,8 @@ mod tests {
 	/// Verifies all expected key-value pairs are present after compaction
 	fn verify_keys_after_compaction(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashSet<(Bytes, Vec<u8>)>,
-	) -> (usize, HashMap<Bytes, Vec<u8>>) {
+		expected_keys: &HashSet<(Key, Value)>,
+	) -> (usize, HashMap<Key, Value>) {
 		let manifest_guard = manifest.read().unwrap();
 		let levels = manifest_guard.levels.get_levels();
 
@@ -547,7 +563,7 @@ mod tests {
 
 				for result in iter {
 					count += 1;
-					all_key_values.insert(result.0.user_key.clone(), result.1.to_vec());
+					all_key_values.insert(result.0.user_key.clone(), result.1.clone());
 				}
 			}
 		}
@@ -571,7 +587,7 @@ mod tests {
 	/// Verifies that all expected keys are present with correct values
 	fn verify_all_keys_present(
 		manifest: &RwLock<LevelManifest>,
-		expected_keys: &HashMap<Bytes, Vec<u8>>,
+		expected_keys: &HashMap<Key, Value>,
 	) -> bool {
 		let manifest_guard = manifest.read().unwrap();
 
@@ -584,7 +600,7 @@ mod tests {
 			for table in &level.tables {
 				let iter = table.iter(false, None);
 				for result in iter {
-					all_key_values.insert(result.0.user_key.clone(), result.1.to_vec());
+					all_key_values.insert(result.0.user_key.clone(), result.1.clone());
 				}
 			}
 		}
@@ -826,7 +842,7 @@ mod tests {
 		for i in 0..keys_per_table {
 			// Create a key with table and index - format: "table{:02d}-key-{:03d}"
 			let key = format!("table{table_idx:02}-key-{i:03}").into_bytes();
-			let internal_key = InternalKey::new(Bytes::from(key), seq_num, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set, 0);
 
 			// Create a value that's predictable - format: "value-{:02d}-{:03d}"
 			let value = format!("value-{table_idx:02}-{i:03}").into_bytes();
@@ -991,8 +1007,7 @@ mod tests {
 			for i in 0..keys_per_table {
 				let idx = start_idx + i;
 				let key = format!("L{level}-T{table_idx:02}-K-{idx:05}").into_bytes();
-				let internal_key =
-					InternalKey::new(Bytes::from(key), seq_num, InternalKeyKind::Set, 0);
+				let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set, 0);
 				let value = format!("V-{level}-{table_idx:02}-{idx:05}").into_bytes();
 				let encoded_value = create_inline_value(&value);
 				entries.push((internal_key, encoded_value));
@@ -1182,9 +1197,9 @@ mod tests {
 
 					for (key, _) in table.iter(false, None) {
 						if min_key.is_none() {
-							min_key = Some(key.user_key.as_ref().to_vec());
+							min_key = Some(key.user_key.clone());
 						}
-						max_key = Some(key.user_key.as_ref().to_vec());
+						max_key = Some(key.user_key);
 					}
 
 					if let (Some(min), Some(max)) = (min_key, max_key) {
@@ -1440,7 +1455,7 @@ mod tests {
 			let value_padding = "Y".repeat(4000);
 			let value = format!("{value_base}{value_padding}").into_bytes();
 
-			let internal_key = InternalKey::new(Bytes::from(key), 1000, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, 1000, InternalKeyKind::Set, 0);
 
 			large_entries.push((internal_key, value));
 		}
@@ -1506,7 +1521,7 @@ mod tests {
 			// Create 10 keys, same keys in each table but with different values and seqs
 			for j in 0..10 {
 				let key = format!("key-{j:03}").into_bytes();
-				let key_bytes = Bytes::from(key);
+				let key_bytes = key;
 				let raw_value = format!("value-from-table-{}-seq-{}", i, base_seq + j).into_bytes();
 				let encoded_value = create_inline_value(&raw_value);
 
@@ -1602,7 +1617,7 @@ mod tests {
 		let mut all_entries = Vec::new();
 		for i in 0..100 {
 			let key = format!("key-{i:03}").into_bytes();
-			let key_bytes = Bytes::from(key);
+			let key_bytes = key;
 
 			// Add tombstone first (higher sequence number) for 95% of keys
 			if i < 95 {
@@ -1678,7 +1693,7 @@ mod tests {
 			let raw_value = format!("value-from-table1-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			let internal_key = InternalKey::new(Bytes::from(key), 100 + i, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0);
 			entries1.push((internal_key, encoded_value));
 		}
 
@@ -1689,8 +1704,7 @@ mod tests {
 			let raw_value = format!("value-from-table2-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			let internal_key =
-				InternalKey::new(Bytes::from(key), 150 + i - 10, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set, 0);
 			entries2.push((internal_key, encoded_value));
 		}
 
@@ -1701,14 +1715,12 @@ mod tests {
 			let raw_value = format!("value-from-table3-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			let internal_key =
-				InternalKey::new(Bytes::from(key), 200 + i - 8, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set, 0);
 			entries3.push((internal_key, encoded_value));
 		}
 		// Add tombstone that should win over other tables
 		let tombstone_key = "key-014".as_bytes().to_vec();
-		let tombstone =
-			InternalKey::new(Bytes::from(tombstone_key), 210, InternalKeyKind::Delete, 0);
+		let tombstone = InternalKey::new(tombstone_key, 210, InternalKeyKind::Delete, 0);
 		entries3.push((tombstone, vec![]));
 
 		// Create tables and add to L0
@@ -1756,11 +1768,10 @@ mod tests {
 							if location.is_value_pointer() {
 								panic!("Unexpected VLog pointer in test");
 							}
-							all_keys
-								.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
+							all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
 						}
 						InternalKeyKind::Delete => {
-							tombstones.insert(key.user_key.as_ref().to_vec(), key.seq_num());
+							tombstones.insert(key.user_key.clone(), key.seq_num());
 						}
 						_ => {}
 					}
@@ -1811,10 +1822,7 @@ mod tests {
 			let raw_value = format!("original-value-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			entries1.push((
-				InternalKey::new(Bytes::from(key), 100 + i, InternalKeyKind::Set, 0),
-				encoded_value,
-			));
+			entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 		}
 
 		// Table 2: Mixed updates/deletes (seq 150-159) for keys 5-14
@@ -1829,17 +1837,14 @@ mod tests {
 
 				(InternalKeyKind::Set, encoded_value)
 			};
-			entries2.push((InternalKey::new(Bytes::from(key), 150 + i - 5, kind, 0), value));
+			entries2.push((InternalKey::new(key, 150 + i - 5, kind, 0), value));
 		}
 
 		// Table 3: Final tombstones (seq 200+) for specific keys
 		let mut entries3 = Vec::new();
 		for i in [2, 8, 14, 17] {
 			let key = format!("key-{i:03}").into_bytes();
-			entries3.push((
-				InternalKey::new(Bytes::from(key), 200 + i / 2, InternalKeyKind::Delete, 0),
-				vec![],
-			));
+			entries3.push((InternalKey::new(key, 200 + i / 2, InternalKeyKind::Delete, 0), vec![]));
 		}
 
 		// Add tables to L0
@@ -1882,8 +1887,7 @@ mod tests {
 						if location.is_value_pointer() {
 							panic!("Unexpected VLog pointer in test");
 						}
-						survivors
-							.insert(key.user_key.as_ref().to_vec(), (*location.value).to_vec());
+						survivors.insert(key.user_key.clone(), (*location.value).to_vec());
 					}
 				}
 			}
@@ -1951,7 +1955,7 @@ mod tests {
 
 					(200 + i, InternalKeyKind::Set, encoded_value) // Odd keys = values
 				};
-				l2_entries.push((InternalKey::new(Bytes::from(key), seq, kind, 0), value));
+				l2_entries.push((InternalKey::new(key, seq, kind, 0), value));
 			}
 			let table = env.create_test_table(100 + table_idx, l2_entries).unwrap();
 			Arc::make_mut(&mut levels.get_levels_mut()[2]).insert(table);
@@ -1964,10 +1968,8 @@ mod tests {
 			let raw_value = format!("l3-old-value-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			l3_entries.push((
-				InternalKey::new(Bytes::from(key), 100 + i, InternalKeyKind::Set, 0),
-				encoded_value,
-			));
+			l3_entries
+				.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 		}
 		let l3_table = env.create_test_table(200, l3_entries).unwrap();
 		Arc::make_mut(&mut levels.get_levels_mut()[3]).insert(l3_table);
@@ -2020,7 +2022,7 @@ mod tests {
 
 		// Create tombstone (seq=100) and older value (seq=50) for same key
 		let key = "test-key".as_bytes().to_vec();
-		let key_bytes = Bytes::from(key);
+		let key_bytes = key;
 
 		// Table 1: tombstone entry
 		let mut tombstone_entries = Vec::new();
@@ -2083,8 +2085,7 @@ mod tests {
 		assert!(!has_tombstones, "Bottom level should filter out tombstones");
 
 		// Key should be completely gone after tombstone consumes older value
-		let has_test_key =
-			bottom_result.iter().any(|(key, _)| key.user_key.as_ref() == b"test-key");
+		let has_test_key = bottom_result.iter().any(|(key, _)| &key.user_key == b"test-key");
 		assert!(!has_test_key, "test-key should be completely deleted");
 		assert_eq!(
 			bottom_result.len(),
@@ -2114,7 +2115,7 @@ mod tests {
 				_ => unreachable!(),
 			};
 
-			let internal_key = InternalKey::new(Bytes::from(key), seq, kind, 0);
+			let internal_key = InternalKey::new(key, seq, kind, 0);
 
 			let entry_value = match kind {
 				InternalKeyKind::Delete | InternalKeyKind::RangeDelete => vec![],
@@ -2141,18 +2142,42 @@ mod tests {
 		assert_eq!(props.data_size, 2975);
 		assert_eq!(props.global_seq_num, 0);
 		assert_eq!(props.num_data_blocks, 1);
-		assert_eq!(props.top_level_index_size, 0);
+
+		assert_eq!(props.index_size, 74, "Index size should be tracked");
+		assert_eq!(props.index_partitions, 1, "Should have 1 index partition for small table");
+		assert_eq!(props.top_level_index_size, 32, "Top-level index size should be tracked");
+		// Verify filter metrics (should have bloom filter by default)
+		assert_eq!(
+			props.filter_size, 135,
+			"Filter size should be tracked with default bloom filter"
+		);
+		assert_eq!(props.raw_key_size, 2300, "Raw key size should be tracked");
+		assert_eq!(props.raw_value_size, 675, "Raw value size should be tracked");
+		assert!(
+			props.raw_key_size + props.raw_value_size == props.data_size,
+			"Raw sizes should be == data_size"
+		);
+
+		// Verify time metrics (timestamps are 0 in this test)
+		assert_eq!(props.oldest_key_time, 0, "Oldest key time is 0 in test");
+		assert_eq!(props.newest_key_time, 0, "Newest key time is 0 in test");
+
+		// Verify range deletion metrics
+		assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");
+
 		assert!(props.created_at > 0);
-		assert_eq!(props.file_size, 3182);
 		assert_eq!(props.block_size, 2757);
 		assert_eq!(props.block_count, 1);
 		assert_eq!(props.compression, CompressionType::None);
 		assert_eq!(props.seqnos.0, 1000);
 		assert_eq!(props.seqnos.1, 1099);
-		assert!(props.key_range.is_some());
-		if let Some(key_range) = &props.key_range {
-			assert_eq!(&*key_range.low, b"key-000");
-			assert_eq!(&*key_range.high, b"key-099");
+		assert!(meta.smallest_point.is_some());
+		assert!(meta.largest_point.is_some());
+		if let Some(smallest) = &meta.smallest_point {
+			assert_eq!(&smallest.user_key, b"key-000");
+		}
+		if let Some(largest) = &meta.largest_point {
+			assert_eq!(&largest.user_key, b"key-099");
 		}
 
 		// Verify TableMetadata fields
@@ -2162,11 +2187,11 @@ mod tests {
 		assert!(meta.smallest_point.is_some());
 		assert!(meta.largest_point.is_some());
 		if let Some(ref smallest) = meta.smallest_point {
-			assert_eq!(smallest.user_key.as_ref(), b"key-000");
+			assert_eq!(&smallest.user_key, b"key-000");
 			assert_eq!(smallest.seq_num(), 1000);
 		}
 		if let Some(ref largest) = meta.largest_point {
-			assert_eq!(largest.user_key.as_ref(), b"key-099");
+			assert_eq!(&largest.user_key, b"key-099");
 			assert_eq!(largest.seq_num(), 1099);
 		}
 
@@ -2202,7 +2227,7 @@ mod tests {
 					let encoded_value = create_inline_value(&raw_value);
 					(200 + i, InternalKeyKind::Set, encoded_value)
 				};
-				l0_entries.push((InternalKey::new(Bytes::from(key), seq, kind, 0), value));
+				l0_entries.push((InternalKey::new(key, seq, kind, 0), value));
 			}
 			let table = env.create_test_table(100 + table_idx, l0_entries.clone()).unwrap();
 			Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
@@ -2215,10 +2240,8 @@ mod tests {
 			let raw_value = format!("l1-old-value-{i}").into_bytes();
 			let encoded_value = create_inline_value(&raw_value);
 
-			l1_entries.push((
-				InternalKey::new(Bytes::from(key), 100 + i, InternalKeyKind::Set, 0),
-				encoded_value,
-			));
+			l1_entries
+				.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 		}
 		let l1_table = env.create_test_table(200, l1_entries.clone()).unwrap();
 		Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(l1_table);
@@ -2280,7 +2303,7 @@ mod tests {
 			for (key, value) in table.iter(false, None) {
 				match key.kind() {
 					InternalKeyKind::Set => {
-						let key_str = String::from_utf8(key.user_key.to_vec()).unwrap();
+						let key_str = String::from_utf8(key.user_key.clone()).unwrap();
 
 						// Decode the ValueLocation to get the actual value
 						let location = crate::vlog::ValueLocation::decode(&value).unwrap();
@@ -2308,7 +2331,7 @@ mod tests {
 						}
 					}
 					InternalKeyKind::SoftDelete => {
-						let key_str = String::from_utf8(key.user_key.to_vec()).unwrap();
+						let key_str = String::from_utf8(key.user_key.clone()).unwrap();
 						if key_str.starts_with("key-") {
 							let key_num: usize =
 								key_str.split('-').nth(1).unwrap().parse().unwrap();
@@ -2350,7 +2373,7 @@ mod tests {
 
 		// Create L0 table with latest SoftDelete (seq 300)
 		let l0_entries = vec![(
-			InternalKey::new(Bytes::from(key.clone()), 300, InternalKeyKind::SoftDelete, 0),
+			InternalKey::new(key.clone(), 300, InternalKeyKind::SoftDelete, 0),
 			vec![], // SoftDelete has empty value
 		)];
 		let l0_table = env.create_test_table(100, l0_entries).unwrap();
@@ -2360,12 +2383,9 @@ mod tests {
 		let raw_value = b"some-value".to_vec();
 		let encoded_value = create_inline_value(&raw_value);
 		let l1_entries = vec![
+			(InternalKey::new(key.clone(), 200, InternalKeyKind::Set, 0), encoded_value),
 			(
-				InternalKey::new(Bytes::from(key.clone()), 200, InternalKeyKind::Set, 0),
-				encoded_value,
-			),
-			(
-				InternalKey::new(Bytes::from(key), 100, InternalKeyKind::SoftDelete, 0),
+				InternalKey::new(key, 100, InternalKeyKind::SoftDelete, 0),
 				vec![], // Older SoftDelete also has empty value
 			),
 		];

@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use bytes::Bytes;
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock};
 
@@ -219,7 +218,7 @@ impl ValueLocation {
 	/// Creates a ValueLocation that points to a value in VLog
 	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
 		let encoded_pointer = pointer.encode();
-		Self::new(BIT_VALUE_POINTER, Bytes::from(encoded_pointer), VALUE_LOCATION_VERSION)
+		Self::new(BIT_VALUE_POINTER, encoded_pointer, VALUE_LOCATION_VERSION)
 	}
 
 	/// Creates a ValueLocation with inline value
@@ -277,14 +276,13 @@ impl ValueLocation {
 		let mut value = Vec::new();
 		reader.read_to_end(&mut value)?;
 
-		Ok(Self::new(meta, Bytes::from(value), version))
+		Ok(Self::new(meta, value, version))
 	}
 
 	/// Resolves the actual value, handling both inline and pointer cases
 	// TODO:: Check if this pattern copies the value unnecessarily.
-	pub(crate) fn resolve_value(&self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
+	pub(crate) fn resolve_value(self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
-			// Value is a pointer to VLog
 			if let Some(vlog) = vlog {
 				let pointer = ValuePointer::decode(&self.value)?;
 				vlog.get(&pointer)
@@ -293,7 +291,7 @@ impl ValueLocation {
 			}
 		} else {
 			// Value is stored inline
-			Ok(self.value.clone())
+			Ok(self.value)
 		}
 	}
 }
@@ -823,9 +821,8 @@ impl VLog {
 			}
 		}
 
-		// Convert to Bytes once, then use zero-copy slice for value
-		let entry_data = Bytes::from(entry_data_vec);
-		let value_bytes = entry_data.slice(value_start..crc_start);
+		// Extract value slice from entry data
+		let value_bytes = entry_data_vec[value_start..crc_start].to_vec();
 
 		// Cache the value in unified block cache for future reads
 		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
@@ -1060,7 +1057,7 @@ impl VLog {
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
-					let user_key = internal_key.user_key.to_vec();
+					let user_key = internal_key.user_key.clone();
 					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
 					return Err(e);
 				}
@@ -1076,20 +1073,23 @@ impl VLog {
 				// This preserves the original operation (Set, Delete, Merge, etc.)
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
+
+				let size = internal_key.user_key.len() + value.len();
 				let val = if value.is_empty() {
 					None
 				} else {
-					Some(value.as_slice())
+					Some(value.clone())
 				};
+
 				batch.add_record(
 					internal_key.kind(),
-					internal_key.user_key.as_ref(),
+					internal_key.user_key,
 					val,
 					internal_key.timestamp,
 				)?;
 
 				// Update batch size tracking
-				batch_size += internal_key.user_key.len() + value.len();
+				batch_size += size;
 
 				// If batch is full, commit it
 				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
@@ -1460,8 +1460,8 @@ impl DeleteList {
 			// Store sequence number -> value_size mapping
 			batch.add_record(
 				crate::sstable::InternalKeyKind::Set,
-				&seq_key,
-				Some(&value_size.to_be_bytes()),
+				seq_key,
+				Some(value_size.to_be_bytes().to_vec()),
 				0,
 			)?;
 		}
@@ -1503,7 +1503,7 @@ impl DeleteList {
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.add_record(crate::sstable::InternalKeyKind::Delete, &seq_key, None, 0)?;
+			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
 		}
 
 		// Commit the batch to the LSM tree using sync commit
@@ -1672,7 +1672,7 @@ mod tests {
 		// Verify that the cache contains the value
 		let cached_value = vlog.opts.block_cache.get_vlog(pointer.file_id, pointer.offset);
 		assert!(cached_value.is_some());
-		assert_eq!(cached_value.unwrap(), Bytes::from(value));
+		assert_eq!(cached_value.unwrap(), value);
 	}
 
 	#[test(tokio::test)]
@@ -1811,7 +1811,7 @@ mod tests {
 	#[test]
 	fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 
 		// Test encode
 		let encoded = location.encode();
@@ -1853,9 +1853,9 @@ mod tests {
 	#[test]
 	fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
-			ValueLocation::with_inline_value(Bytes::from_static(b"small data")),
+			ValueLocation::with_inline_value(b"small data".to_vec()),
 			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
-			ValueLocation::with_inline_value(Bytes::new()), // empty data
+			ValueLocation::with_inline_value(Vec::new()), // empty data
 		];
 
 		for location in test_cases {
@@ -1874,7 +1874,7 @@ mod tests {
 	fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
-		let inline_location = ValueLocation::with_inline_value(Bytes::from_static(inline_data));
+		let inline_location = ValueLocation::with_inline_value(inline_data.to_vec());
 		assert_eq!(inline_location.encoded_size(), 1 + 1 + inline_data.len()); // meta + version + data
 
 		// Test VLog size
@@ -1888,7 +1888,7 @@ mod tests {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 
 		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
@@ -1914,7 +1914,7 @@ mod tests {
 	#[test]
 	fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
-		let location = ValueLocation::with_inline_value(Bytes::from_static(test_data));
+		let location = ValueLocation::with_inline_value(test_data.to_vec());
 		let encoded = location.encode();
 
 		// Should work without VLog for inline data
@@ -1937,7 +1937,7 @@ mod tests {
 
 		// Should resolve with VLog
 		let decoded_location = ValueLocation::decode(&encoded).unwrap();
-		let resolved = decoded_location.resolve_value(Some(&Arc::new(vlog))).unwrap();
+		let resolved = decoded_location.clone().resolve_value(Some(&Arc::new(vlog))).unwrap();
 		assert_eq!(&*resolved, value);
 
 		// Should fail without VLog
@@ -1949,7 +1949,7 @@ mod tests {
 	fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
-		let location = ValueLocation::with_inline_value(Bytes::from(max_inline));
+		let location = ValueLocation::with_inline_value(max_inline);
 		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
@@ -2024,7 +2024,7 @@ mod tests {
 
 		// Retrieve the value to ensure header validation works
 		let retrieved_value = vlog.get(&pointer).unwrap();
-		assert_eq!(retrieved_value.as_ref(), value);
+		assert_eq!(&retrieved_value, value);
 	}
 
 	#[test(tokio::test)]

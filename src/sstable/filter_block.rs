@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use integer_encoding::FixedInt;
 
 use crate::FilterPolicy;
@@ -27,14 +26,6 @@ impl FilterBlockWriter {
 			filter_offsets: vec![],
 			filters: vec![],
 		}
-	}
-
-	// Estimates the size of the final filter block.
-	pub(crate) fn size_estimate(&self) -> usize {
-		// The size is the sum of the filters' length, the offsets' length times 4
-		// (since each offset is a u32), plus 4 for the offsets' length itself, and 1
-		// for the base log2 value.
-		self.filters.len() + 4 * self.filter_offsets.len() + 4 + 1
 	}
 
 	// Adds a key to the list of keys that will be included in the next filter.
@@ -104,7 +95,7 @@ impl FilterBlockWriter {
 #[derive(Clone)]
 pub(crate) struct FilterBlockReader {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used for checking keys against filters.
-	data: Bytes,                   // The entire filter block data.
+	data: Vec<u8>,                 // The entire filter block data.
 	filter_offsets: Vec<u32>,      // Offsets for each filter within the `data`.
 	base_lg: u32,                  // The base log2 value used to calculate block index.
 }
@@ -133,7 +124,7 @@ impl FilterBlockReader {
 
 		Self {
 			policy,
-			data: Bytes::from(data),
+			data,
 			filter_offsets,
 			base_lg,
 		}
@@ -169,7 +160,6 @@ impl FilterBlockReader {
 
 #[cfg(test)]
 mod tests {
-	use bytes::Bytes;
 	use test_log::test;
 
 	use super::*;
@@ -280,7 +270,7 @@ mod tests {
 			// Create internal key
 			let user_key = format!("key_{i:05}");
 			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(user_key.as_bytes()),
+				user_key.as_bytes().to_vec(),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -311,12 +301,8 @@ mod tests {
 		for i in 0..num_samples {
 			// Use values outside the range of existing keys
 			let user_key = format!("nonexistent_{:05}", i + num_items);
-			let internal_key = InternalKey::new(
-				Bytes::copy_from_slice(user_key.as_bytes()),
-				i as u64,
-				InternalKeyKind::Set,
-				0,
-			);
+			let internal_key =
+				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
 
 			let encoded_key = internal_key.encode();
 

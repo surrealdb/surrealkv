@@ -4,7 +4,6 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use bytes::Bytes;
 use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
@@ -234,9 +233,9 @@ trait Node {
 ///   because its overflows were transferred to the merged node via append()
 /// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
-	keys: Vec<Bytes>, // Full keys (reconstructed from page + overflow if needed)
+	keys: Vec<Key>, // Full keys (reconstructed from page + overflow if needed)
 	key_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for THIS
-	                   * node's keys */
+	                 * node's keys */
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -324,7 +323,7 @@ impl InternalNode {
 				)));
 			}
 
-			keys.push(Bytes::from(key_data));
+			keys.push(key_data);
 			key_overflows.push(overflow_offset);
 		}
 
@@ -381,7 +380,7 @@ impl InternalNode {
 
 	/// Atomically removes a key and its overflow metadata at the given index.
 	/// Returns (key, overflow_offset) or None if index is out of bounds.
-	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
+	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Key, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -396,7 +395,7 @@ impl InternalNode {
 
 	/// Atomically extracts and returns the key+overflow at idx from parent.
 	/// This is used when a parent key needs to be moved into a child node.
-	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Bytes, u64) {
+	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Key, u64) {
 		let key = parent.keys[idx].clone();
 		let overflow = parent.get_overflow_at(idx);
 		(key, overflow)
@@ -405,16 +404,16 @@ impl InternalNode {
 	/// Insert a key and child pointer with explicit overflow metadata
 	fn insert_key_child_with_overflow(
 		&mut self,
-		key: &[u8],
+		key: Key,
 		overflow: u64,
 		child_offset: u64,
 		compare: &dyn Comparator,
 	) {
 		let mut idx = 0;
-		while idx < self.keys.len() && compare.compare(key, &self.keys[idx]) == Ordering::Greater {
+		while idx < self.keys.len() && compare.compare(&key, &self.keys[idx]) == Ordering::Greater {
 			idx += 1;
 		}
-		self.keys.insert(idx, Bytes::copy_from_slice(key));
+		self.keys.insert(idx, key);
 		self.key_overflows.insert(idx, overflow); // Use provided overflow
 		self.children.insert(idx + 1, child_offset);
 	}
@@ -439,7 +438,7 @@ impl InternalNode {
 
 	/// Extracts key+overflow for transferring to another node (removes from
 	/// this node)
-	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
+	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Key, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -453,7 +452,7 @@ impl InternalNode {
 	}
 
 	/// Inserts a key with its overflow at a specific position
-	fn insert_key_with_overflow(&mut self, idx: usize, key: Bytes, overflow: u64) {
+	fn insert_key_with_overflow(&mut self, idx: usize, key: Key, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.key_overflows.insert(idx, overflow);
 	}
@@ -461,9 +460,9 @@ impl InternalNode {
 	fn redistribute_to_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Bytes,
+		parent_key: Key,
 		parent_overflow: u64,
-	) -> (Bytes, u64) {
+	) -> (Key, u64) {
 		right.insert_key_with_overflow(0, parent_key, parent_overflow);
 
 		let (new_parent_key, new_parent_overflow) =
@@ -479,9 +478,9 @@ impl InternalNode {
 	fn take_from_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Bytes,
+		parent_key: Key,
 		parent_overflow: u64,
-	) -> (Bytes, u64) {
+	) -> (Key, u64) {
 		self.keys.push(parent_key);
 		self.key_overflows.push(parent_overflow);
 
@@ -497,7 +496,7 @@ impl InternalNode {
 	fn merge_from_right(
 		&mut self,
 		mut right: InternalNode,
-		separator: Bytes,
+		separator: Key,
 		separator_overflow: u64,
 	) {
 		self.keys.push(separator);
@@ -557,7 +556,7 @@ impl Node for InternalNode {
 			buffer.extend_from_slice(&(key_len_total as u32).to_le_bytes());
 
 			// Write key data that fits on page
-			buffer.extend_from_slice(&key.as_ref()[..bytes_on_page]);
+			buffer.extend_from_slice(&key[..bytes_on_page]);
 
 			// Write overflow page offset if needed (only if there's overflow)
 			if needs_overflow {
@@ -641,8 +640,8 @@ impl Node for InternalNode {
 /// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
 /// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Bytes>,   // Full keys (reconstructed from page + overflow if needed)
-	values: Vec<Bytes>, // Full values (reconstructed from page + overflow if needed)
+	keys: Vec<Key>,     // Full keys (reconstructed from page + overflow if needed)
+	values: Vec<Value>, // Full values (reconstructed from page + overflow if needed)
 	cell_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for cell
 	                     * (key+value) */
 	next_leaf: u64, // 0 means no next leaf
@@ -675,7 +674,7 @@ impl LeafNode {
 		}
 
 		// Convert buffer to Bytes once for zero-copy slicing
-		let buffer_bytes = Bytes::copy_from_slice(buffer);
+		let buffer_bytes = buffer;
 		let mut pos = 1; // Skip node type
 
 		let num_keys = u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
@@ -762,8 +761,8 @@ impl LeafNode {
 						key_len
 					)));
 				}
-				let key_data = Bytes::copy_from_slice(&cell_data[..key_len]);
-				let value_data = Bytes::copy_from_slice(&cell_data[key_len..]);
+				let key_data = cell_data[..key_len].to_vec();
+				let value_data = cell_data[key_len..].to_vec();
 
 				keys.push(key_data);
 				values.push(value_data);
@@ -784,8 +783,8 @@ impl LeafNode {
 				}
 
 				// Zero-copy slice for key and value
-				let key_data = buffer_bytes.slice(cell_start..cell_start + key_len);
-				let value_data = buffer_bytes.slice(cell_start + key_len..cell_end);
+				let key_data = buffer_bytes[cell_start..cell_start + key_len].to_vec();
+				let value_data = buffer_bytes[cell_start + key_len..cell_end].to_vec();
 
 				keys.push(key_data);
 				values.push(value_data);
@@ -810,17 +809,12 @@ impl LeafNode {
 	// If key already exists, update the value (treat as update)
 	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was
 	// updated, None if new
-	fn insert(
-		&mut self,
-		key: &[u8],
-		value: &[u8],
-		compare: &dyn Comparator,
-	) -> (usize, Option<u64>) {
-		match self.keys.binary_search_by(|k| compare.compare(k, key)) {
+	fn insert(&mut self, key: Key, value: Value, compare: &dyn Comparator) -> (usize, Option<u64>) {
+		match self.keys.binary_search_by(|k| compare.compare(k, &key)) {
 			Ok(idx) => {
 				// Key exists - update
 				let old_overflow = self.get_overflow_at(idx);
-				self.values[idx] = Bytes::copy_from_slice(value);
+				self.values[idx] = value;
 				self.set_overflow_at(idx, 0);
 				(
 					idx,
@@ -833,12 +827,7 @@ impl LeafNode {
 			}
 			Err(idx) => {
 				// Key not found - insert
-				self.insert_cell_with_overflow(
-					idx,
-					Bytes::copy_from_slice(key),
-					Bytes::copy_from_slice(value),
-					0,
-				);
+				self.insert_cell_with_overflow(idx, key, value, 0);
 				(idx, None)
 			}
 		}
@@ -846,7 +835,7 @@ impl LeafNode {
 
 	// delete a key-value pair from a leaf node
 	// Returns (index, value, overflow_offset) so caller can free the overflow chain
-	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Bytes, u64)> {
+	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Value, u64)> {
 		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).ok()?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
@@ -883,14 +872,14 @@ impl LeafNode {
 	}
 
 	/// Inserts a cell (key+value) with overflow at a specific position
-	fn insert_cell_with_overflow(&mut self, idx: usize, key: Bytes, value: Bytes, overflow: u64) {
+	fn insert_cell_with_overflow(&mut self, idx: usize, key: Key, value: Value, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.values.insert(idx, value);
 		self.cell_overflows.insert(idx, overflow);
 	}
 
 	// Redistributes keys from this leaf to the target leaf
-	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Bytes {
+	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Key {
 		// Move last key-value pair from this node to right node
 		let last_key = self.keys.pop().unwrap();
 		let last_value = self.values.pop().unwrap();
@@ -905,7 +894,7 @@ impl LeafNode {
 	}
 
 	// Takes keys from right leaf
-	fn take_from_right(&mut self, right: &mut LeafNode) -> Bytes {
+	fn take_from_right(&mut self, right: &mut LeafNode) -> Key {
 		// Move first key-value pair from right node to this node
 		let first_key = right.keys.remove(0);
 		let first_value = right.values.remove(0);
@@ -1715,7 +1704,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub fn insert(&mut self, key: Key, value: Value) -> Result<()> {
 		let mut path = Vec::new();
 		let mut current_offset = self.header.root_offset;
 		let mut parent_offset = None;
@@ -1727,7 +1716,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				NodeType::Internal(internal) => {
 					path.push((current_offset, parent_offset));
 
-					let child_idx = internal.find_child_index(key, self.compare.as_ref());
+					let child_idx = internal.find_child_index(&key, self.compare.as_ref());
 					parent_offset = Some(current_offset);
 					current_offset = internal.children[child_idx];
 				}
@@ -1735,7 +1724,7 @@ impl<F: VfsFile> BPlusTree<F> {
 					// Need to modify the leaf - extract it from Arc
 					let mut leaf = self.extract_leaf_mut(node);
 
-					if leaf.can_fit_entry(key, value) {
+					if leaf.can_fit_entry(&key, &value) {
 						self.insert_into_leaf(&mut leaf, key, value)?;
 						return Ok(());
 					} else {
@@ -1762,7 +1751,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn handle_splits(
 		&mut self,
 		mut parent_offset: Option<u64>,
-		mut promoted_key: Bytes,
+		mut promoted_key: Key,
 		mut promoted_overflow: u64,
 		mut new_node_offset: u64,
 		mut path: Vec<(u64, Option<u64>)>,
@@ -1806,7 +1795,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 					if would_be_size <= size_threshold {
 						parent.insert_key_child_with_overflow(
-							&promoted_key,
+							promoted_key,
 							promoted_overflow,
 							new_node_offset,
 							self.compare.as_ref(),
@@ -1818,7 +1807,7 @@ impl<F: VfsFile> BPlusTree<F> {
 						let (next_promoted_key, next_promoted_overflow, next_new_node_offset) =
 							self.split_internal_with_child(
 								&mut parent,
-								&promoted_key,
+								promoted_key,
 								promoted_overflow,
 								new_node_offset,
 							)?;
@@ -1839,7 +1828,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: &[u8], value: &[u8]) -> Result<()> {
+	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: Key, value: Value) -> Result<()> {
 		let (_idx, old_overflow) = leaf.insert(key, value, self.compare.as_ref());
 		if let Some(overflow) = old_overflow {
 			self.free_overflow_chain(overflow)?;
@@ -1852,18 +1841,18 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn split_leaf(
 		&mut self,
 		leaf: &mut LeafNode,
-		key: &[u8],
-		value: &[u8],
-	) -> Result<(Bytes, u64, u64)> {
+		key: Key,
+		value: Value,
+	) -> Result<(Key, u64, u64)> {
 		let idx =
-			leaf.keys.binary_search_by(|k| self.compare.compare(k, key)).unwrap_or_else(|idx| idx);
+			leaf.keys.binary_search_by(|k| self.compare.compare(k, &key)).unwrap_or_else(|idx| idx);
 
 		let is_duplicate =
-			idx < leaf.keys.len() && self.compare.compare(key, &leaf.keys[idx]) == Ordering::Equal;
+			idx < leaf.keys.len() && self.compare.compare(&key, &leaf.keys[idx]) == Ordering::Equal;
 
 		// Use size-aware split point that accounts for the new entry
 		// Unified function handles both inserts and updates
-		let split_idx = leaf.find_split_point_for_insert(key, value, idx, is_duplicate);
+		let split_idx = leaf.find_split_point_for_insert(&key, &value, idx, is_duplicate);
 
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
@@ -1883,15 +1872,10 @@ impl<F: VfsFile> BPlusTree<F> {
 				if new_leaf.get_overflow_at(0) != 0 {
 					self.free_overflow_chain(new_leaf.get_overflow_at(0))?;
 				}
-				new_leaf.values[0] = Bytes::copy_from_slice(value);
+				new_leaf.values[0] = value;
 				new_leaf.set_overflow_at(0, 0);
 			} else {
-				leaf.insert_cell_with_overflow(
-					0,
-					Bytes::copy_from_slice(key),
-					Bytes::copy_from_slice(value),
-					0,
-				);
+				leaf.insert_cell_with_overflow(0, key, value, 0);
 			}
 		} else if idx < split_idx {
 			// New entry goes to left leaf
@@ -1903,15 +1887,10 @@ impl<F: VfsFile> BPlusTree<F> {
 				if leaf.get_overflow_at(idx) != 0 {
 					self.free_overflow_chain(leaf.get_overflow_at(idx))?;
 				}
-				leaf.values[idx] = Bytes::copy_from_slice(value);
+				leaf.values[idx] = value;
 				leaf.set_overflow_at(idx, 0);
 			} else {
-				leaf.insert_cell_with_overflow(
-					idx,
-					Bytes::copy_from_slice(key),
-					Bytes::copy_from_slice(value),
-					0,
-				);
+				leaf.insert_cell_with_overflow(idx, key, value, 0);
 			}
 		} else {
 			// New entry goes to right leaf
@@ -1925,15 +1904,10 @@ impl<F: VfsFile> BPlusTree<F> {
 				if new_leaf.get_overflow_at(right_idx) != 0 {
 					self.free_overflow_chain(new_leaf.get_overflow_at(right_idx))?;
 				}
-				new_leaf.values[right_idx] = Bytes::copy_from_slice(value);
+				new_leaf.values[right_idx] = value;
 				new_leaf.set_overflow_at(right_idx, 0);
 			} else {
-				new_leaf.insert_cell_with_overflow(
-					right_idx,
-					Bytes::copy_from_slice(key),
-					Bytes::copy_from_slice(value),
-					0,
-				);
+				new_leaf.insert_cell_with_overflow(right_idx, key, value, 0);
 			}
 		}
 
@@ -1971,13 +1945,13 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn split_internal_with_child(
 		&mut self,
 		node: &mut InternalNode,
-		extra_key: &[u8],
+		extra_key: Key,
 		extra_overflow: u64,
 		extra_child: u64,
-	) -> Result<(Bytes, u64, u64)> {
+	) -> Result<(Key, u64, u64)> {
 		let insert_idx = node
 			.keys
-			.binary_search_by(|key| self.compare.compare(key, extra_key))
+			.binary_search_by(|key| self.compare.compare(key, &extra_key))
 			.unwrap_or_else(|idx| idx);
 
 		let mut split_idx = Self::find_split_point(node, insert_idx);
@@ -2006,7 +1980,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			);
 		} else {
 			let right_insert_idx = insert_idx - split_idx - 1;
-			new_node.keys.insert(right_insert_idx, Bytes::copy_from_slice(extra_key));
+			new_node.keys.insert(right_insert_idx, extra_key);
 			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
 			new_node.children.insert(right_insert_idx + 1, extra_child);
 		}
@@ -2040,7 +2014,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	#[allow(unused)]
-	pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
 		let mut current_offset = self.header.root_offset;
 
 		loop {
@@ -2063,7 +2037,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
+	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Value>> {
 		let mut node_offset = self.header.root_offset;
 		let mut path = Vec::new();
 
@@ -3344,20 +3318,20 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Test insertions
-		tree.insert(b"key1", b"value1").unwrap();
-		tree.insert(b"key2", b"value2").unwrap();
-		tree.insert(b"key3", b"value3").unwrap();
+		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 		// Test retrievals
-		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
-		assert_eq!(tree.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
-		assert_eq!(tree.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+		assert_eq!(tree.get(b"key1").unwrap().unwrap(), b"value1");
+		assert_eq!(tree.get(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tree.get(b"key3").unwrap().unwrap(), b"value3");
 
 		// Test non-existent key
 		assert!(tree.get(b"nonexistent").unwrap().is_none());
 
 		// Test deletions
-		assert_eq!(tree.delete(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		assert_eq!(tree.delete(b"key2").unwrap().unwrap(), b"value2");
 		assert!(tree.get(b"key2").unwrap().is_none());
 	}
 
@@ -3369,7 +3343,7 @@ mod tests {
 		for i in 0..10 {
 			let key = format!("key{:03}", i).into_bytes();
 			let value = format!("value{:03}", i).into_bytes();
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		// Delete even numbered items
@@ -3422,7 +3396,7 @@ mod tests {
 		let values = generate_random_values(TEST_SIZE, 100);
 
 		for i in 0..TEST_SIZE {
-			tree.insert(&keys[i], &values[i]).unwrap();
+			tree.insert(keys[i].clone(), values[i].clone()).unwrap();
 
 			let retrieved = tree.get(&keys[i]).unwrap();
 			assert!(retrieved.is_some(), "Failed to retrieve just-inserted key at index {}", i);
@@ -3512,7 +3486,7 @@ mod tests {
 
 		// Insert all items
 		for (key, value) in data.iter() {
-			tree.insert(key, value).unwrap();
+			tree.insert(key.clone(), value.clone()).unwrap();
 		}
 
 		tree.print_tree_stats().unwrap();
@@ -3598,7 +3572,7 @@ mod tests {
 
 		// Insert all items
 		for (key, value) in data.iter() {
-			tree.insert(key, value).unwrap();
+			tree.insert(key.clone(), value.clone()).unwrap();
 		}
 
 		tree.print_tree_stats().unwrap();
@@ -3666,7 +3640,7 @@ mod tests {
 	#[test]
 	fn test_single_insert_search() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
 	}
 
@@ -3675,12 +3649,12 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert multiple keys to ensure we're working with a leaf node
-		tree.insert(b"key1", b"value1").unwrap();
-		tree.insert(b"key2", b"value2").unwrap();
-		tree.insert(b"key3", b"value3").unwrap();
+		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 		// Update existing key in the same leaf
-		tree.insert(b"key2", b"updated_value2").unwrap();
+		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
 
 		// Verify the update
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
@@ -3693,17 +3667,17 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial key
-		tree.insert(b"key", b"value1").unwrap();
+		tree.insert(b"key".to_vec(), b"value1".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value1".as_ref()));
 
 		// Update multiple times
-		tree.insert(b"key", b"value2").unwrap();
+		tree.insert(b"key".to_vec(), b"value2".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value2".as_ref()));
 
-		tree.insert(b"key", b"value3").unwrap();
+		tree.insert(b"key".to_vec(), b"value3".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value3".as_ref()));
 
-		tree.insert(b"key", b"final_value").unwrap();
+		tree.insert(b"key".to_vec(), b"final_value".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"final_value".as_ref()));
 	}
 
@@ -3712,18 +3686,18 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial keys to create some tree structure
-		tree.insert(b"key1", b"value1").unwrap();
-		tree.insert(b"key2", b"value2").unwrap();
-		tree.insert(b"key3", b"value3").unwrap();
+		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 		// Get initial tree stats
 		let (height_before, nodes_before, keys_before, leaves_before) =
 			tree.calculate_tree_stats().unwrap();
 
 		// Update existing keys - should not create new nodes
-		tree.insert(b"key1", b"updated_value1").unwrap();
-		tree.insert(b"key2", b"updated_value2").unwrap();
-		tree.insert(b"key3", b"updated_value3").unwrap();
+		tree.insert(b"key1".to_vec(), b"updated_value1".to_vec()).unwrap();
+		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
+		tree.insert(b"key3".to_vec(), b"updated_value3".to_vec()).unwrap();
 
 		// Get stats after updates
 		let (height_after, nodes_after, keys_after, leaves_after) =
@@ -3749,7 +3723,7 @@ mod tests {
 		for i in 0..(max_keys * 3) {
 			let key = format!("key{}", i).into_bytes();
 			let value = format!("value{}", i).into_bytes();
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		// Verify all exist
@@ -3778,7 +3752,7 @@ mod tests {
 		let keys = vec![b"b".to_vec(), b"d".to_vec(), b"f".to_vec(), b"h".to_vec(), b"j".to_vec()];
 
 		for key in &keys {
-			tree.insert(key, b"value").unwrap();
+			tree.insert(key.clone(), b"value".to_vec()).unwrap();
 		}
 
 		// Delete middle key to force predecessor/successor use
@@ -3802,7 +3776,7 @@ mod tests {
 		}
 
 		for key in &keys {
-			tree.insert(key, b"value").unwrap();
+			tree.insert(key.clone(), b"value".to_vec()).unwrap();
 		}
 
 		// Delete first and last keys in sequence
@@ -3831,7 +3805,7 @@ mod tests {
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			for (key, value) in &test_data {
-				tree.insert(key, value)?;
+				tree.insert(key.clone(), value.clone())?;
 			}
 		} // BPlusTree is dropped here, file flushed and closed
 
@@ -3843,7 +3817,7 @@ mod tests {
 			for (key, value) in &test_data {
 				assert_eq!(
 					tree.get(key)?,
-					Some(Bytes::from(value.clone())),
+					Some(value.clone()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -3853,10 +3827,10 @@ mod tests {
 			assert_eq!(tree.get(b"mango")?, None, "Non-existent key found unexpectedly");
 
 			// Add new data and verify
-			tree.insert(b"mango", b"orange")?;
+			tree.insert(b"mango".to_vec(), b"orange".to_vec())?;
 			assert_eq!(
 				tree.get(b"mango")?,
-				Some(Bytes::from_static(b"orange")),
+				Some(b"orange".to_vec()),
 				"New insertion failed after reopening"
 			);
 		}
@@ -3866,7 +3840,7 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(
 				tree.get(b"mango")?,
-				Some(Bytes::from_static(b"orange")),
+				Some(b"orange".to_vec()),
 				"New data didn't persist across openings"
 			);
 		}
@@ -3882,9 +3856,9 @@ mod tests {
 		// Insert test data
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
-			tree.insert(b"one", b"1")?;
-			tree.insert(b"two", b"2")?;
-			tree.insert(b"three", b"3")?;
+			tree.insert(b"one".to_vec(), b"1".to_vec())?;
+			tree.insert(b"two".to_vec(), b"2".to_vec())?;
+			tree.insert(b"three".to_vec(), b"3".to_vec())?;
 		}
 
 		// Delete and verify
@@ -3900,7 +3874,7 @@ mod tests {
 			assert_eq!(tree.get(b"two")?, None, "Deleted key still exists after reopening");
 			assert_eq!(
 				tree.get(b"one")?,
-				Some(Bytes::from_static(b"1")),
+				Some(b"1".to_vec()),
 				"Existing key missing after deletion"
 			);
 		}
@@ -3912,9 +3886,9 @@ mod tests {
 	fn test_concurrent_operations() {
 		let mut tree = create_test_tree(true);
 		// Insert and delete same key repeatedly
-		tree.insert(b"key", b"v1").unwrap();
+		tree.insert(b"key".to_vec(), b"v1".to_vec()).unwrap();
 		tree.delete(b"key").unwrap();
-		tree.insert(b"key", b"v2").unwrap();
+		tree.insert(b"key".to_vec(), b"v2".to_vec()).unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"v2".as_ref()));
 	}
 
@@ -3926,7 +3900,7 @@ mod tests {
 		// Create and immediately drop
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-			tree.insert(b"test", b"value").unwrap();
+			tree.insert(b"test".to_vec(), b"value".to_vec()).unwrap();
 			// Explicit drop before end of scope
 			drop(tree);
 		}
@@ -3944,7 +3918,7 @@ mod tests {
 		let path = file.path();
 
 		let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-		tree.insert(b"close", b"test").unwrap();
+		tree.insert(b"close".to_vec(), b"test".to_vec()).unwrap();
 		tree.close().unwrap(); // Explicit close
 	}
 
@@ -4029,7 +4003,7 @@ mod tests {
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			for (key, value) in &test_data {
-				tree.insert(key, value).unwrap();
+				tree.insert(key.clone(), value.clone()).unwrap();
 			}
 			tree.close().unwrap();
 		}
@@ -4040,7 +4014,7 @@ mod tests {
 			for (key, value) in &test_data {
 				assert_eq!(
 					tree.get(key).unwrap(),
-					Some(Bytes::from(value.clone())),
+					Some(value.clone()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -4066,7 +4040,7 @@ mod tests {
 
 		// Insert test data
 		for i in 1..=10 {
-			tree.insert(&serialize_u32(i), &serialize_u32(i * 10)).unwrap();
+			tree.insert(serialize_u32(i), serialize_u32(i * 10)).unwrap();
 		}
 
 		// Test range 3-7
@@ -4085,7 +4059,7 @@ mod tests {
 
 		// Insert enough data to create multiple levels
 		for i in 1..=20 {
-			tree.insert(&serialize_u32(i), &serialize_u32(i * 10)).unwrap();
+			tree.insert(serialize_u32(i), serialize_u32(i * 10)).unwrap();
 		}
 
 		// Test range 5-15
@@ -4103,7 +4077,7 @@ mod tests {
 		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		for i in 1..=10 {
-			tree.insert(&serialize_u32(i), &serialize_u32(i * 10)).unwrap();
+			tree.insert(serialize_u32(i), serialize_u32(i * 10)).unwrap();
 		}
 
 		let results: Vec<_> = tree.range(&serialize_u32(1), &serialize_u32(10)).unwrap().collect();
@@ -4117,7 +4091,7 @@ mod tests {
 		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
 		for i in 1..=5 {
-			tree.insert(&serialize_u32(i), &[]).unwrap();
+			tree.insert(serialize_u32(i), vec![]).unwrap();
 		}
 
 		// Start > end should return empty
@@ -4132,7 +4106,7 @@ mod tests {
 
 		// Insert sparse keys
 		for i in (1..=10).step_by(2) {
-			tree.insert(&serialize_u32(i), &[]).unwrap();
+			tree.insert(serialize_u32(i), vec![]).unwrap();
 		}
 
 		// Range covering missing start/end
@@ -4152,7 +4126,7 @@ mod tests {
 		let file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(file.path(), Arc::new(U32Comparator)).unwrap();
 
-		tree.insert(&serialize_u32(5), &[]).unwrap();
+		tree.insert(serialize_u32(5), vec![]).unwrap();
 
 		// Single key range
 		let results: Vec<_> = tree.range(&serialize_u32(5), &serialize_u32(5)).unwrap().collect();
@@ -4170,7 +4144,7 @@ mod tests {
 
 		// Insert initial data
 		for i in 1..=10 {
-			tree.insert(&serialize_u32(i), &[]).unwrap();
+			tree.insert(serialize_u32(i), vec![]).unwrap();
 		}
 
 		// Delete some keys
@@ -4178,8 +4152,8 @@ mod tests {
 		tree.delete(&serialize_u32(7)).unwrap();
 
 		// Add new keys
-		tree.insert(&serialize_u32(12), &[]).unwrap();
-		tree.insert(&serialize_u32(15), &[]).unwrap();
+		tree.insert(serialize_u32(12), vec![]).unwrap();
+		tree.insert(serialize_u32(15), vec![]).unwrap();
 
 		// Test range scan
 		let results = tree.range(&serialize_u32(5), &serialize_u32(15)).unwrap();
@@ -4196,27 +4170,21 @@ mod tests {
 	#[test]
 	fn test_range() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1", b"value1").unwrap();
-		tree.insert(b"key3", b"value3").unwrap();
-		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
 		let mut iter = tree.range(b"key2", b"key3").unwrap();
-		assert_eq!(
-			iter.next().unwrap().unwrap(),
-			(Bytes::from_static(b"key2"), Bytes::from_static(b"value2"))
-		);
-		assert_eq!(
-			iter.next().unwrap().unwrap(),
-			(Bytes::from_static(b"key3"), Bytes::from_static(b"value3"))
-		);
+		assert_eq!(iter.next().unwrap().unwrap(), (b"key2".to_vec(), b"value2".to_vec()));
+		assert_eq!(iter.next().unwrap().unwrap(), (b"key3".to_vec(), b"value3".to_vec()));
 		assert!(iter.next().is_none());
 	}
 
 	#[test]
 	fn test_range_empty() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"a", b"1").unwrap();
-		tree.insert(b"c", b"3").unwrap();
+		tree.insert(b"a".to_vec(), b"1".to_vec()).unwrap();
+		tree.insert(b"c".to_vec(), b"3".to_vec()).unwrap();
 		let mut iter = tree.range(b"b", b"b").unwrap();
 		assert!(iter.next().is_none());
 	}
@@ -4228,7 +4196,7 @@ mod tests {
 		for i in 0..10000 {
 			let key = format!("key_{:05}", i).into_bytes();
 			let value = format!("value_{:05}", i).into_bytes();
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		// Range scan from key_05009 to key_05500
@@ -4238,10 +4206,7 @@ mod tests {
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();
-			assert_eq!(
-				iter.next().unwrap().unwrap(),
-				(Bytes::from(expected_key), Bytes::from(expected_value))
-			);
+			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
 		}
 		assert!(iter.next().is_none());
 	}
@@ -4265,7 +4230,7 @@ mod tests {
 
 			// First, insert 1026+ keys to ensure we have at least 3 levels
 			for i in 0..insert_count {
-				tree.insert(&key(i), &value(i)).unwrap();
+				tree.insert(key(i), value(i)).unwrap();
 			}
 
 			// Delete a pattern of keys that forces internal node merges
@@ -4300,7 +4265,7 @@ mod tests {
 
 			// Step 1: Insert data
 			for i in 0..insert_count {
-				tree.insert(&key(i), &value(i)).unwrap();
+				tree.insert(key(i), value(i)).unwrap();
 			}
 
 			// Verify initial state
@@ -4341,7 +4306,7 @@ mod tests {
 
 			// Insert some new data - should reuse free pages
 			for i in insert_count..(insert_count + 100) {
-				tree.insert(&key(i), &value(i)).unwrap();
+				tree.insert(key(i), value(i)).unwrap();
 			}
 
 			// Verify some free pages were reused
@@ -4479,7 +4444,7 @@ mod tests {
 				}
 
 				// Insert the unique key-value pair into the tree
-				tree.insert(&unique_key, &fixed_value).unwrap();
+				tree.insert(unique_key.clone(), fixed_value.clone()).unwrap();
 			}
 
 			// After each run, flush and close the tree
@@ -4531,7 +4496,7 @@ mod tests {
 				all_keys.push(unique_key.clone());
 
 				// Insert the unique key-value pair into the tree
-				tree.insert(&unique_key, &fixed_value).unwrap();
+				tree.insert(unique_key.clone(), fixed_value.clone()).unwrap();
 
 				// Verify the key was inserted correctly
 				let result = tree.get(&unique_key).unwrap();
@@ -4608,7 +4573,7 @@ mod tests {
 			let value = vec![b'v'; value_size];
 
 			// Insert and track
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key.clone(), value.clone()).unwrap();
 			all_keys.push((key.clone(), value));
 			active_keys.insert(key);
 
@@ -4655,7 +4620,7 @@ mod tests {
 			let value = vec![b'v'; value_size];
 
 			// Insert and track
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key.clone(), value.clone()).unwrap();
 			all_keys.push((key.clone(), value));
 			active_keys.insert(key);
 
@@ -4990,7 +4955,7 @@ mod tests {
 		for i in 0..test_count {
 			let key = vec![i as u8; large_key_size];
 			let value = vec![i as u8; large_key_size];
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		for i in 0..test_count {
@@ -5004,7 +4969,7 @@ mod tests {
 		for i in 0..test_count {
 			let key = vec![i as u8; large_key_size];
 			let value = vec![i as u8; large_key_size];
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		for i in 0..test_count {
@@ -5038,7 +5003,7 @@ mod tests {
 		for i in 0..100 {
 			let key = format!("key{:04}", i).into_bytes();
 			let value = vec![i as u8; 100]; // Fixed size values
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		// Verify all entries can be retrieved (ensures splits worked correctly)
@@ -5046,7 +5011,7 @@ mod tests {
 			let key = format!("key{:04}", i).into_bytes();
 			let result = tree.get(&key).unwrap();
 			assert!(result.is_some(), "Key {} should exist", i);
-			assert_eq!(result.unwrap().as_ref(), &vec![i as u8; 100]);
+			assert_eq!(result.unwrap(), vec![i as u8; 100]);
 		}
 
 		// The ordering guarantee is enforced internally by the split algorithm
@@ -5075,14 +5040,14 @@ mod tests {
 			let key = format!("key{:04}", i).into_bytes();
 			let value = vec![i as u8; size];
 			keys.push((key.clone(), value.clone()));
-			tree.insert(&key, &value).unwrap();
+			tree.insert(key, value).unwrap();
 		}
 
 		// Verify all entries are still accessible after splits
 		for (key, expected_value) in &keys {
 			let result = tree.get(key).unwrap();
 			assert!(result.is_some(), "Key {:?} should exist", key);
-			assert_eq!(result.unwrap().as_ref(), expected_value.as_slice());
+			assert_eq!(&result.unwrap(), expected_value);
 		}
 	}
 }

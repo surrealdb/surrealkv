@@ -110,7 +110,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..3 {
 		let key = format!("key_seg0_{i:02}");
 		let value = format!("value_seg0_{i:02}");
-		batch1.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch1.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch1.encode().unwrap()).unwrap();
 
@@ -122,7 +122,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..4 {
 		let key = format!("key_seg1_{i:02}");
 		let value = format!("value_seg1_{i:02}");
-		batch2.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch2.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch2.encode().unwrap()).unwrap();
 
@@ -134,7 +134,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..5 {
 		let key = format!("key_seg2_{i:02}");
 		let value = format!("value_seg2_{i:02}");
-		batch3.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch3.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch3.encode().unwrap()).unwrap();
 

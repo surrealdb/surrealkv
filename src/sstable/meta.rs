@@ -1,133 +1,9 @@
-use std::cmp::{max, min};
-use std::mem::size_of;
-use std::ops::{Bound, Range, RangeBounds};
-
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::Error;
 use crate::sstable::table::TableFormat;
 use crate::sstable::InternalKey;
-use crate::{CompressionType, IntoBytes, Result, Value};
-
-pub(crate) const UNBOUNDED_LOW: Bytes = Bytes::from_static(&[]);
-pub(crate) const UNBOUNDED_HIGH: Bytes = Bytes::from_static(&[0xff]);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeyRange {
-	pub(crate) low: Value,
-	pub(crate) high: Value,
-}
-
-impl KeyRange {
-	pub(crate) fn new(low: Value, high: Value) -> Self {
-		KeyRange {
-			low,
-			high,
-		}
-	}
-
-	pub(crate) fn unbounded() -> Self {
-		KeyRange {
-			low: UNBOUNDED_LOW,
-			high: UNBOUNDED_HIGH,
-		}
-	}
-
-	pub(crate) fn overlaps(&self, other: &Self) -> bool {
-		self.high >= other.low && self.low <= other.high
-	}
-
-	/// Creates a new KeyRange that encompasses both input ranges.
-	/// This is useful for finding the total span of multiple ranges.
-	pub(crate) fn merge(&self, other: &Self) -> Self {
-		KeyRange {
-			low: min(self.low.clone(), other.low.clone()),
-			high: max(self.high.clone(), other.high.clone()),
-		}
-	}
-}
-
-impl Default for KeyRange {
-	fn default() -> Self {
-		KeyRange::unbounded()
-	}
-}
-
-impl RangeBounds<Bytes> for KeyRange {
-	fn start_bound(&self) -> Bound<&Bytes> {
-		Bound::Included(&self.low)
-	}
-
-	fn end_bound(&self) -> Bound<&Bytes> {
-		Bound::Excluded(&self.high)
-	}
-}
-
-impl From<Range<&str>> for KeyRange {
-	fn from(range: Range<&str>) -> Self {
-		KeyRange {
-			low: range.start.into_bytes(),
-			high: range.end.into_bytes(),
-		}
-	}
-}
-
-impl From<Range<Bytes>> for KeyRange {
-	fn from(range: Range<Bytes>) -> Self {
-		KeyRange {
-			low: range.start,
-			high: range.end,
-		}
-	}
-}
-
-impl From<(Bound<Bytes>, Bound<Bytes>)> for KeyRange {
-	fn from((low, high): (Bound<Bytes>, Bound<Bytes>)) -> Self {
-		let low = match low {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_LOW,
-		};
-		let high = match high {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_HIGH,
-		};
-
-		KeyRange {
-			low,
-			high,
-		}
-	}
-}
-
-impl From<(Bound<Vec<u8>>, Bound<Vec<u8>>)> for KeyRange {
-	fn from((low, high): (Bound<Vec<u8>>, Bound<Vec<u8>>)) -> Self {
-		let low = match low {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_LOW,
-		};
-		let high = match high {
-			Bound::Included(key) => key.into_bytes(),
-			Bound::Excluded(key) => key.into_bytes(),
-			Bound::Unbounded => UNBOUNDED_HIGH,
-		};
-		KeyRange {
-			low: low.into_bytes(),
-			high: high.into_bytes(),
-		}
-	}
-}
-
-impl<T: IntoBytes> From<(T, T)> for KeyRange {
-	fn from((start, end): (T, T)) -> Self {
-		KeyRange {
-			low: start.into_bytes(),
-			high: end.into_bytes(),
-		}
-	}
-}
+use crate::{CompressionType, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
@@ -138,18 +14,36 @@ pub(crate) struct Properties {
 	pub(crate) data_size: u64,
 	pub(crate) global_seq_num: u64,
 	pub(crate) num_data_blocks: u64,
+
+	// Index metrics
+	pub(crate) index_size: u64,
+	pub(crate) index_partitions: u64,
 	pub(crate) top_level_index_size: u64,
+
+	// Filter metrics
+	pub(crate) filter_size: u64,
+
+	// Raw size metrics (uncompressed)
+	pub(crate) raw_key_size: u64,
+	pub(crate) raw_value_size: u64,
+
 	pub(crate) created_at: u128,
 	pub(crate) item_count: u64,
 	pub(crate) key_count: u64,
 	pub(crate) tombstone_count: u64,
 	pub(crate) num_soft_deletes: u64,
-	pub(crate) file_size: u64,
+
+	// Range deletion metrics
+	pub(crate) num_range_deletions: u64,
+
 	pub(crate) block_size: u32,
 	pub(crate) block_count: u32,
 	pub(crate) compression: CompressionType,
 	pub(crate) seqnos: (u64, u64),
-	pub(crate) key_range: Option<KeyRange>,
+
+	// Time metrics
+	pub(crate) oldest_key_time: u64,
+	pub(crate) newest_key_time: u64,
 }
 
 impl Properties {
@@ -162,23 +56,29 @@ impl Properties {
 			data_size: 0,
 			global_seq_num: 0,
 			num_data_blocks: 0,
+			index_size: 0,
+			index_partitions: 0,
 			top_level_index_size: 0,
+			filter_size: 0,
+			raw_key_size: 0,
+			raw_value_size: 0,
 			created_at: 0,
 			item_count: 0,
 			key_count: 0,
 			tombstone_count: 0,
 			num_soft_deletes: 0,
-			file_size: 0,
+			num_range_deletions: 0,
 			block_size: 0,
 			block_count: 0,
 			compression: CompressionType::None,
 			seqnos: (0, 0),
-			key_range: None,
+			oldest_key_time: 0,
+			newest_key_time: 0,
 		}
 	}
 
-	pub(crate) fn encode(&self) -> Bytes {
-		let mut buf = BytesMut::with_capacity(128);
+	pub(crate) fn encode(&self) -> Vec<u8> {
+		let mut buf = BytesMut::with_capacity(256);
 		buf.put_u64(self.id);
 		buf.put_u8(self.table_format as u8);
 		buf.put_u64(self.num_entries);
@@ -186,33 +86,30 @@ impl Properties {
 		buf.put_u64(self.data_size);
 		buf.put_u64(self.global_seq_num);
 		buf.put_u64(self.num_data_blocks);
+		buf.put_u64(self.index_size);
+		buf.put_u64(self.index_partitions);
 		buf.put_u64(self.top_level_index_size);
+		buf.put_u64(self.filter_size);
+		buf.put_u64(self.raw_key_size);
+		buf.put_u64(self.raw_value_size);
 		buf.put_u128(self.created_at);
 		buf.put_u64(self.item_count);
 		buf.put_u64(self.key_count);
 		buf.put_u64(self.tombstone_count);
 		buf.put_u64(self.num_soft_deletes);
-		buf.put_u64(self.file_size);
+		buf.put_u64(self.num_range_deletions);
 		buf.put_u32(self.block_size);
 		buf.put_u32(self.block_count);
 		buf.put_u8(self.compression as u8);
 		buf.put_u64(self.seqnos.0);
 		buf.put_u64(self.seqnos.1);
-		if let Some(ref key_range) = self.key_range {
-			// Write the size of the first element and then the element itself
-			let size_first_element = key_range.low.len() as u64;
-			buf.put_u64(size_first_element); // Write the size
-			buf.extend_from_slice(&key_range.low); // Write the element
-
-			// Write the size of the second element and then the element itself
-			let size_second_element = key_range.high.len() as u64;
-			buf.put_u64(size_second_element); // Write the size
-			buf.extend_from_slice(&key_range.high); // Write the element
-		}
-		buf.freeze()
+		buf.put_u64(self.oldest_key_time);
+		buf.put_u64(self.newest_key_time);
+		buf.to_vec()
 	}
 
-	pub(crate) fn decode(mut buf: Bytes) -> Result<Self> {
+	pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
+		let mut buf = &buf[..];
 		let id = buf.get_u64();
 		let table_format = buf.get_u8();
 		let num_entries = buf.get_u64();
@@ -220,27 +117,25 @@ impl Properties {
 		let data_size = buf.get_u64();
 		let global_seq_num = buf.get_u64();
 		let num_data_blocks = buf.get_u64();
+		let index_size = buf.get_u64();
+		let index_partitions = buf.get_u64();
 		let top_level_index_size = buf.get_u64();
+		let filter_size = buf.get_u64();
+		let raw_key_size = buf.get_u64();
+		let raw_value_size = buf.get_u64();
 		let created_at = buf.get_u128();
 		let item_count = buf.get_u64();
 		let key_count = buf.get_u64();
 		let tombstone_count = buf.get_u64();
 		let num_soft_deletes = buf.get_u64();
-		let file_size = buf.get_u64();
+		let num_range_deletions = buf.get_u64();
 		let block_size = buf.get_u32();
 		let block_count = buf.get_u32();
 		let compression = buf.get_u8();
 		let seqno_start = buf.get_u64();
 		let seqno_end = buf.get_u64();
-		let key_range = if buf.has_remaining() {
-			let size_first_element = buf.get_u64() as usize;
-			let first_element = buf.copy_to_bytes(size_first_element);
-			let size_second_element = buf.get_u64() as usize;
-			let second_element = buf.copy_to_bytes(size_second_element);
-			Some(KeyRange::new(first_element, second_element))
-		} else {
-			None
-		};
+		let oldest_key_time = buf.get_u64();
+		let newest_key_time = buf.get_u64();
 
 		Ok(Self {
 			id,
@@ -250,18 +145,24 @@ impl Properties {
 			data_size,
 			global_seq_num,
 			num_data_blocks,
+			index_size,
+			index_partitions,
 			top_level_index_size,
+			filter_size,
+			raw_key_size,
+			raw_value_size,
 			created_at,
 			item_count,
 			key_count,
 			tombstone_count,
 			num_soft_deletes,
-			file_size,
+			num_range_deletions,
 			block_size,
 			block_count,
 			compression: CompressionType::try_from(compression)?,
 			seqnos: (seqno_start, seqno_end),
-			key_range,
+			oldest_key_time,
+			newest_key_time,
 		})
 	}
 }
@@ -313,7 +214,7 @@ impl TableMetadata {
 		}
 	}
 
-	pub(crate) fn encode(&self) -> Bytes {
+	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = BytesMut::new();
 
 		// Encode has_point_keys as 0 for None, 1 for Some(true), and 2 for Some(false)
@@ -330,7 +231,7 @@ impl TableMetadata {
 		let properties_encoded = self.properties.encode();
 		let properties_encoded_len = properties_encoded.len() as u64;
 		buf.put_u64(properties_encoded_len);
-		buf.put(properties_encoded);
+		buf.extend_from_slice(&properties_encoded);
 
 		// Encode smallest_point and largest_point
 		match &self.smallest_point {
@@ -353,10 +254,10 @@ impl TableMetadata {
 			}
 		}
 
-		buf.freeze()
+		buf.to_vec()
 	}
 
-	pub(crate) fn decode(src: &Bytes) -> Result<TableMetadata> {
+	pub(crate) fn decode(src: &[u8]) -> Result<TableMetadata> {
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys
@@ -375,7 +276,6 @@ impl TableMetadata {
 		let properties_len = cursor.get_u64() as usize;
 		let mut properties_bytes = vec![0u8; properties_len];
 		cursor.copy_to_slice(&mut properties_bytes);
-		let properties_bytes = Bytes::from(properties_bytes);
 		let properties = Properties::decode(properties_bytes)?;
 
 		// Decode smallest_point
@@ -385,7 +285,6 @@ impl TableMetadata {
 				let key_len: usize = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				let key_bytes = Bytes::from(key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
@@ -398,7 +297,6 @@ impl TableMetadata {
 				let key_len = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				let key_bytes = Bytes::from(key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
@@ -413,21 +311,4 @@ impl TableMetadata {
 			largest_point,
 		})
 	}
-}
-
-pub(crate) fn size_of_writer_metadata() -> usize {
-	size_of::<Option<bool>>()
-		+ size_of::<u64>() * 2
-		+ size_of_properties()
-		+ size_of::<Option<InternalKey>>() * 2
-}
-
-fn size_of_properties() -> usize {
-	size_of::<u64>() * 11
-		+ size_of::<TableFormat>()
-		+ size_of::<u128>()
-		+ size_of::<u32>() * 2
-		+ size_of::<CompressionType>()
-		+ size_of::<(u64, u64)>()
-		+ size_of::<Option<KeyRange>>()
 }

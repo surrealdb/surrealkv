@@ -388,8 +388,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -406,7 +406,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.commit(batch, false).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
@@ -430,8 +432,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i,
 				)
 				.unwrap();
@@ -456,8 +458,8 @@ mod tests {
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						&format!("key{i}").into_bytes(),
-						Some(&[1, 2, 3]),
+						format!("key{i}").into_bytes(),
+						Some(vec![1, 2, 3]),
 						i,
 					)
 					.unwrap();
@@ -497,8 +499,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -526,8 +528,8 @@ mod tests {
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						&format!("key{i}").into_bytes(),
-						Some(&[1, 2, 3]),
+						format!("key{i}").into_bytes(),
+						Some(vec![1, 2, 3]),
 						i,
 					)
 					.unwrap();
@@ -554,7 +556,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
 		assert!(result.is_ok(), "Sync commit failed: {result:?}");
@@ -575,8 +579,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i as u64,
 				)
 				.unwrap();
@@ -610,7 +614,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, true); // sync_wal = true
 		assert!(result.is_ok(), "Sync commit with sync_wal failed: {result:?}");
@@ -626,11 +632,17 @@ mod tests {
 		pipeline.set_seq_num(100);
 
 		let mut batch1 = Batch::new(0);
-		batch1.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch1
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let mut batch2 = Batch::new(0);
-		batch2.add_record(InternalKeyKind::Set, b"key2", Some(b"value2"), 1).unwrap();
-		batch2.add_record(InternalKeyKind::Set, b"key3", Some(b"value3"), 2).unwrap();
+		batch2
+			.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(b"value2".to_vec()), 1)
+			.unwrap();
+		batch2
+			.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(b"value3".to_vec()), 2)
+			.unwrap();
 
 		// Commit first batch
 		pipeline.sync_commit(batch1, false).unwrap();
@@ -649,7 +661,9 @@ mod tests {
 		pipeline.shutdown();
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
 		assert!(result.is_err(), "Sync commit after shutdown should fail");
@@ -694,8 +708,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -714,7 +728,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(env.clone());
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		// Verify initial state
 		assert_eq!(env.write_calls(), 0);
@@ -742,8 +758,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i as u64,
 				)
 				.unwrap();
@@ -779,8 +795,8 @@ mod tests {
 					batch
 						.add_record(
 							InternalKeyKind::Set,
-							&format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
-							Some(&[thread_id as u8, batch_id as u8]),
+							format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
+							Some(vec![thread_id as u8, batch_id as u8]),
 							batch_id,
 						)
 						.unwrap();

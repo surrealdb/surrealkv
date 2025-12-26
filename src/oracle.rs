@@ -3,16 +3,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
 use crate::transaction::Transaction;
+use crate::Key;
 
 /// Entry used for tracking transaction operations in the commit queue
 struct CommitEntry {
-	keys: Arc<Vec<Bytes>>,
+	keys: Arc<Vec<Key>>,
 }
 
 impl CommitEntry {
@@ -108,7 +108,7 @@ impl Oracle {
 	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
 		// Extract only the keys from the transaction's writeset
 		// Keys are already sorted in the BTreeMap, so we maintain sort order
-		let keys: Vec<Bytes> = txn.write_set.keys().cloned().collect();
+		let keys: Vec<Key> = txn.write_set.keys().cloned().collect();
 
 		// Create commit entry
 		let commit_entry = Arc::new(CommitEntry {

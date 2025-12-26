@@ -26,18 +26,15 @@ mod wal;
 #[cfg(test)]
 mod test;
 
-use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
 
 /// An optimised trait for converting values to bytes only when needed
@@ -45,7 +42,7 @@ pub trait IntoBytes {
 	/// Convert the key to a slice of bytes
 	fn as_slice(&self) -> &[u8];
 	/// Convert the key to an owned bytes slice
-	fn into_bytes(self) -> Bytes;
+	fn into_bytes(self) -> Value;
 }
 
 impl IntoBytes for &[u8] {
@@ -53,8 +50,8 @@ impl IntoBytes for &[u8] {
 		self
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self)
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -63,8 +60,8 @@ impl<const N: usize> IntoBytes for &[u8; N] {
 		&self[..]
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -73,8 +70,8 @@ impl IntoBytes for Vec<u8> {
 		self.as_slice()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
+	fn into_bytes(self) -> Value {
+		self
 	}
 }
 
@@ -83,27 +80,7 @@ impl IntoBytes for &Vec<u8> {
 		&self[..]
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
-	}
-}
-
-impl IntoBytes for Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		self
-	}
-}
-
-impl IntoBytes for &Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-
-	fn into_bytes(self) -> Bytes {
+	fn into_bytes(self) -> Value {
 		self.clone()
 	}
 }
@@ -113,28 +90,8 @@ impl IntoBytes for &str {
 		self.as_bytes()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
-	}
-}
-
-impl IntoBytes for String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self.into_bytes())
-	}
-}
-
-impl IntoBytes for &String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
+	fn into_bytes(self) -> Value {
+		self.as_bytes().to_vec()
 	}
 }
 
@@ -143,23 +100,20 @@ impl IntoBytes for Box<[u8]> {
 		self.as_ref()
 	}
 
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
+	fn into_bytes(self) -> Value {
+		self.into_vec()
 	}
 }
 
-impl<'a> IntoBytes for Cow<'a, [u8]> {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
+// impl<'a> IntoBytes for Cow<'a, [u8]> {
+// 	fn as_slice(&self) -> &[u8] {
+// 		self.as_ref()
+// 	}
 
-	fn into_bytes(self) -> Bytes {
-		match self {
-			Cow::Borrowed(s) => Bytes::copy_from_slice(s),
-			Cow::Owned(v) => Bytes::from(v),
-		}
-	}
-}
+// 	fn into_bytes(self) -> Value {
+// 		self.into_owned()
+// 	}
+// }
 
 /// Type alias for iterator results containing key-value pairs
 /// Value is optional to support keys-only iteration without allocating empty
@@ -167,10 +121,10 @@ impl<'a> IntoBytes for Cow<'a, [u8]> {
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
-pub type Key = Bytes;
+pub type Key = Vec<u8>;
 
 /// The Value type used throughout the LSM tree  
-pub type Value = Bytes;
+pub type Value = Vec<u8>;
 
 /// Type alias for version/timestamp values
 pub type Version = u64;
@@ -207,6 +161,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
+	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -253,10 +208,14 @@ impl Default for Options {
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
 
+		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
+		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
+
 		Self {
 			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
-			comparator: Arc::new(crate::BytewiseComparator {}),
+			comparator,
+			internal_comparator,
 			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
@@ -299,6 +258,7 @@ impl Options {
 	}
 
 	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
+		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
 		self
 	}
@@ -620,47 +580,6 @@ pub trait FilterPolicy: Send + Sync {
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
 
-pub(crate) trait Iterator {
-	/// An iterator is either positioned at a key/value pair, or
-	/// not valid.  This method returns true iff the iterator is valid.
-	fn valid(&self) -> bool;
-
-	/// Position at the first key in the source.  The iterator is `Valid()`
-	/// after this call iff the source is not empty.
-	fn seek_to_first(&mut self);
-
-	/// Position at the last key in the source.  The iterator is
-	/// `Valid()` after this call iff the source is not empty.
-	fn seek_to_last(&mut self);
-
-	/// Position at the first key in the source that is at or past target.
-	/// The iterator is valid after this call iff the source contains
-	/// an entry that comes at or past target.
-	fn seek(&mut self, target: &[u8]) -> Option<()>;
-
-	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the
-	/// source. REQUIRES: `valid()`
-	fn advance(&mut self) -> bool;
-
-	/// Moves to the previous entry in the source.  After this call, the
-	/// iterator is valid iff the iterator was not positioned at the first
-	/// entry in source. REQUIRES: `valid()`
-	fn prev(&mut self) -> bool;
-
-	/// Return the key for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn key(&self) -> InternalKey;
-
-	/// Return the value for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn value(&self) -> Value;
-}
-
 use std::ops::Bound;
 
 /// Type alias for InternalKey range bounds
@@ -668,14 +587,11 @@ pub(crate) type InternalKeyRangeBound = Bound<sstable::InternalKey>;
 /// Type alias for InternalKey ranges
 pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
-/// Converts a user-key range to an InternalKey range for efficient iteration.
-/// This function centralizes the conversion logic used across snapshot, table,
-/// and memtable.
-pub(crate) fn user_range_to_internal_range<R, B>(range: R) -> InternalKeyRange
-where
-	R: std::ops::RangeBounds<B>,
-	B: IntoBytes + Clone,
-{
+/// Converts user key bounds to InternalKeyRange for efficient iteration.
+pub(crate) fn user_range_to_internal_range(
+	lower: Bound<&[u8]>,
+	upper: Bound<&[u8]>,
+) -> InternalKeyRange {
 	use sstable::{
 		InternalKey,
 		InternalKeyKind,
@@ -683,30 +599,30 @@ where
 		INTERNAL_KEY_TIMESTAMP_MAX,
 	};
 
-	let start_bound = match range.start_bound() {
+	let start_bound = match lower {
+		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => Bound::Included(InternalKey::new(
-			key.clone().into_bytes(),
+			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 		Bound::Excluded(key) => {
-			Bound::Excluded(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
-		Bound::Unbounded => Bound::Unbounded,
 	};
 
-	let end_bound = match range.end_bound() {
+	let end_bound = match upper {
+		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => {
-			Bound::Included(InternalKey::new(key.clone().into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
 		}
 		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-			key.clone().into_bytes(),
+			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
-		Bound::Unbounded => Bound::Unbounded,
 	};
 
 	(start_bound, end_bound)

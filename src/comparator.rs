@@ -3,8 +3,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
@@ -151,10 +149,18 @@ impl Comparator for InternalKeyComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-		key_a.cmp(&key_b)
+		let user_key_a = InternalKey::user_key_from_encoded(a);
+		let user_key_b = InternalKey::user_key_from_encoded(b);
+
+		match self.user_comparator.compare(user_key_a, user_key_b) {
+			Ordering::Equal => {
+				// Compare seq_num in descending order (higher = more recent)
+				let seq_a = InternalKey::seq_num_from_encoded(a);
+				let seq_b = InternalKey::seq_num_from_encoded(b);
+				seq_b.cmp(&seq_a)
+			}
+			ord => ord,
+		}
 	}
 
 	/// Generates a separator key between two internal keys.
@@ -184,7 +190,7 @@ impl Comparator for InternalKeyComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					Bytes::from(sep),
+					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -208,7 +214,7 @@ impl Comparator for InternalKeyComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				Bytes::from(user_key_succ),
+				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
@@ -277,7 +283,7 @@ impl Comparator for TimestampComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					Bytes::from(sep),
+					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
@@ -302,7 +308,7 @@ impl Comparator for TimestampComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				Bytes::from(user_key_succ),
+				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
@@ -641,14 +647,14 @@ mod tests {
 
 	/// Helper to create an encoded internal key for testing
 	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(Bytes::from(user_key.to_vec()), seq, kind, 0).encode()
+		InternalKey::new(user_key.to_vec(), seq, kind, 0).encode()
 	}
 
 	/// Helper to create an encoded internal key with max seq num (for expected
 	/// separator results)
 	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
 		InternalKey::new(
-			Bytes::from(user_key.to_vec()),
+			user_key.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
@@ -809,5 +815,88 @@ mod tests {
 		let input = ikey(&[0xff, 0xff], 100, InternalKeyKind::Set);
 		let result = cmp.successor(&input);
 		assert_eq!(result, input);
+	}
+
+	#[test]
+	fn test_internal_key_separator_adjacent_user_keys() {
+		// Tests separator generation for adjacent user keys like "a" vs "b"
+		// where shortening may not be possible
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// "a" vs "b" - adjacent bytes, can't shorten
+		let result = cmp.separator(
+			&ikey(b"a", 100, InternalKeyKind::Set),
+			&ikey(b"b", 200, InternalKeyKind::Set),
+		);
+		// Should return original key since can't shorten "a" to something < "b"
+		assert_eq!(result, ikey(b"a", 100, InternalKeyKind::Set));
+
+		// "aaa" vs "aab" - adjacent at last byte
+		let result = cmp.separator(
+			&ikey(b"aaa", 100, InternalKeyKind::Set),
+			&ikey(b"aab", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey(b"aaa", 100, InternalKeyKind::Set));
+	}
+
+	#[test]
+	fn test_internal_key_separator_with_max_seq() {
+		// Verifies separator uses MAX_SEQUENCE_NUMBER when shortening
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// "apple" vs "banana" should produce "b" with MAX seq
+		let result = cmp.separator(
+			&ikey(b"apple", 100, InternalKeyKind::Set),
+			&ikey(b"banana", 200, InternalKeyKind::Set),
+		);
+		assert_eq!(result, ikey_max_seq(b"b"));
+
+		// Verify the separator is in correct order
+		let sep_ikey = InternalKey::decode(&result);
+		assert_eq!(sep_ikey.seq_num(), INTERNAL_KEY_SEQ_NUM_MAX);
+
+		// separator should be >= original and < next
+		assert!(
+			cmp.compare(&ikey(b"apple", 100, InternalKeyKind::Set), &result) != Ordering::Greater
+		);
+		assert!(
+			cmp.compare(&result, &ikey(b"banana", 200, InternalKeyKind::Set)) == Ordering::Less
+		);
+	}
+
+	#[test]
+	fn test_internal_key_ordering_with_seq_nums() {
+		// Explicitly tests that higher seq_num comes first (descending order)
+		let cmp = InternalKeyComparator::new(Arc::new(BytewiseComparator::default()));
+
+		// (foo, 100) should come BEFORE (foo, 50) in the ordering
+		let key_100 = ikey(b"foo", 100, InternalKeyKind::Set);
+		let key_50 = ikey(b"foo", 50, InternalKeyKind::Set);
+
+		assert_eq!(
+			cmp.compare(&key_100, &key_50),
+			Ordering::Less,
+			"(foo, 100) should be < (foo, 50) due to descending seq_num"
+		);
+
+		// (foo, MAX) should come BEFORE all other (foo, *) keys
+		let key_max = InternalKey::new(
+			b"foo".to_vec(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Separator,
+			INTERNAL_KEY_TIMESTAMP_MAX,
+		)
+		.encode();
+
+		assert_eq!(
+			cmp.compare(&key_max, &key_100),
+			Ordering::Less,
+			"(foo, MAX) should be < (foo, 100)"
+		);
+		assert_eq!(
+			cmp.compare(&key_max, &key_50),
+			Ordering::Less,
+			"(foo, MAX) should be < (foo, 50)"
+		);
 	}
 }
