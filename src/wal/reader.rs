@@ -793,7 +793,7 @@ mod tests {
 		let payload_start = header_offset + WAL_RECORD_HEADER_SIZE;
 		let payload_end = payload_start + payload_len;
 		let crc = calculate_crc32(&[type_byte], &data[payload_start..payload_end]);
-		data[header_offset..header_offset + 4].copy_from_slice(&crc.to_le_bytes());
+		data[header_offset..header_offset + 4].copy_from_slice(&crc.to_be_bytes());
 	}
 
 	// ==================== Basic Tests ====================
