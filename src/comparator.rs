@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
+	InternalKeyRef,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
@@ -149,18 +150,9 @@ impl Comparator for InternalKeyComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		let user_key_a = InternalKey::user_key_from_encoded(a);
-		let user_key_b = InternalKey::user_key_from_encoded(b);
-
-		match self.user_comparator.compare(user_key_a, user_key_b) {
-			Ordering::Equal => {
-				// Compare seq_num in descending order (higher = more recent)
-				let seq_a = InternalKey::seq_num_from_encoded(a);
-				let seq_b = InternalKey::seq_num_from_encoded(b);
-				seq_b.cmp(&seq_a)
-			}
-			ord => ord,
-		}
+		let key_a = InternalKeyRef(a);
+		let key_b = InternalKeyRef(b);
+		key_a.cmp(&key_b)
 	}
 
 	/// Generates a separator key between two internal keys.
@@ -174,20 +166,17 @@ impl Comparator for InternalKeyComparator {
 		}
 
 		// Decode keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
+		let key_a = InternalKeyRef(a);
+		let key_b = InternalKeyRef(b);
 
 		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
-			!= Ordering::Equal
-		{
-			let sep =
-				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
+		if self.user_comparator.compare(key_a.user_key(), key_b.user_key()) != Ordering::Equal {
+			let sep = self.user_comparator.separator(key_a.user_key(), key_b.user_key());
 
 			// Use MAX_SEQUENCE_NUMBER when separator is same length or shorter AND
 			// logically larger
-			if sep.len() <= key_a.user_key.len()
-				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
+			if sep.len() <= key_a.user_key().len()
+				&& self.user_comparator.compare(key_a.user_key(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
 					sep,
@@ -205,12 +194,12 @@ impl Comparator for InternalKeyComparator {
 
 	/// Generates a successor key for an internal key.
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = InternalKey::decode(key);
-		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
+		let internal_key = InternalKeyRef(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key());
 
 		// If successor is same length or shorter AND logically larger, use max seq_num
-		if user_key_succ.len() <= internal_key.user_key.len()
-			&& self.user_comparator.compare(internal_key.user_key.as_ref(), &user_key_succ)
+		if user_key_succ.len() <= internal_key.user_key().len()
+			&& self.user_comparator.compare(internal_key.user_key(), &user_key_succ)
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
@@ -249,9 +238,8 @@ impl Comparator for TimestampComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
+		let key_a = InternalKeyRef(a);
+		let key_b = InternalKeyRef(b);
 		// Use the timestamp-based comparison method
 		key_a.cmp_by_timestamp(&key_b)
 	}
@@ -267,20 +255,17 @@ impl Comparator for TimestampComparator {
 		}
 
 		// Decode keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
+		let key_a = InternalKeyRef(a);
+		let key_b = InternalKeyRef(b);
 
 		// If user keys are different, compute a separator for user keys
-		if self.user_comparator.compare(key_a.user_key.as_ref(), key_b.user_key.as_ref())
-			!= Ordering::Equal
-		{
-			let sep =
-				self.user_comparator.separator(key_a.user_key.as_ref(), key_b.user_key.as_ref());
+		if self.user_comparator.compare(key_a.user_key(), key_b.user_key()) != Ordering::Equal {
+			let sep = self.user_comparator.separator(key_a.user_key(), key_b.user_key());
 
 			// Use MAX_TIMESTAMP when separator is same length or shorter AND logically
 			// larger
-			if sep.len() <= key_a.user_key.len()
-				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
+			if sep.len() <= key_a.user_key().len()
+				&& self.user_comparator.compare(key_a.user_key(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
 					sep,
@@ -298,13 +283,13 @@ impl Comparator for TimestampComparator {
 
 	/// Generates a successor key for an internal key.
 	fn successor(&self, key: &[u8]) -> Vec<u8> {
-		let internal_key = InternalKey::decode(key);
-		let user_key_succ = self.user_comparator.successor(internal_key.user_key.as_ref());
+		let internal_key = InternalKeyRef(key);
+		let user_key_succ = self.user_comparator.successor(internal_key.user_key());
 
 		// If successor is same length or shorter AND logically larger, use max
 		// seq_num/timestamp
-		if user_key_succ.len() <= internal_key.user_key.len()
-			&& self.user_comparator.compare(internal_key.user_key.as_ref(), &user_key_succ)
+		if user_key_succ.len() <= internal_key.user_key().len()
+			&& self.user_comparator.compare(internal_key.user_key(), &user_key_succ)
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
@@ -852,7 +837,7 @@ mod tests {
 		assert_eq!(result, ikey_max_seq(b"b"));
 
 		// Verify the separator is in correct order
-		let sep_ikey = InternalKey::decode(&result);
+		let sep_ikey = InternalKey::decode(result.clone());
 		assert_eq!(sep_ikey.seq_num(), INTERNAL_KEY_SEQ_NUM_MAX);
 
 		// separator should be >= original and < next

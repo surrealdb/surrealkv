@@ -491,7 +491,7 @@ impl Snapshot {
 
 			for entry in range_iter {
 				let (encoded_key, encoded_value) = entry?;
-				let internal_key = InternalKey::decode(&encoded_key);
+				let internal_key = InternalKey::decode(encoded_key);
 				assert!(internal_key.seq_num() <= params.snapshot_seq_num);
 
 				if internal_key.timestamp > params.end_ts {

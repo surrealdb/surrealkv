@@ -20,7 +20,7 @@ use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX};
+use crate::sstable::{InternalKey, InternalKeyKind, InternalKeyRef, INTERNAL_KEY_TIMESTAMP_MAX};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
@@ -861,15 +861,15 @@ impl CommitEnv for LsmCommitEnv {
 
 			// Single pass: process each entry individually
 			for (encoded_key, encoded_value) in timestamp_entries {
-				let ikey = InternalKey::decode(&encoded_key);
+				let ikey = InternalKeyRef(&encoded_key);
 
 				if ikey.is_replace() {
 					// For Replace: first delete all existing entries for this user key
-					let user_key = ikey.user_key.clone();
+					let user_key = ikey.user_key();
 					let start_key =
-						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
+						InternalKey::new(user_key.to_vec(), 0, InternalKeyKind::Set, 0).encode();
 					let end_key = InternalKey::new(
-						user_key,
+						user_key.to_vec(),
 						seq_num,
 						InternalKeyKind::Max,
 						INTERNAL_KEY_TIMESTAMP_MAX,

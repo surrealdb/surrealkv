@@ -553,7 +553,7 @@ mod tests {
 
 		for (query_key, expected_index) in test_cases {
 			let result = index.find_block_handle_by_key(&query_key);
-			let query_ikey = InternalKey::decode(&query_key);
+			let query_ikey = InternalKey::decode(query_key.clone());
 			match expected_index {
 				Some(idx) => {
 					let (found_idx, _) = result.unwrap_or_else(|| {
@@ -656,7 +656,7 @@ mod tests {
 
 		for (query_key, expected_index) in test_cases {
 			let result = index.find_block_handle_by_key(&query_key);
-			let query_ikey = InternalKey::decode(&query_key);
+			let query_ikey = InternalKey::decode(query_key.clone());
 			match expected_index {
 				Some(idx) => {
 					let (found_idx, _) = result.unwrap_or_else(|| {

@@ -1017,11 +1017,15 @@ impl VLog {
 		const MAX_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB batch size limit
 		const MAX_BATCH_COUNT: usize = 1000; // Maximum entries per batch
 
+		let mut key_len_buf = [0u8; 4];
+		let mut value_len_buf = [0u8; 4];
+
+		let mut crc32_buf = [0u8; 4];
+
 		// Read the file and process entries
 		loop {
 			// Try to read header: [key_len: 4 bytes][value_len: 4 bytes]
 			source_file.seek(SeekFrom::Start(offset))?;
-			let mut key_len_buf = [0u8; 4];
 			match source_file.read_exact(&mut key_len_buf) {
 				Ok(()) => {}
 				Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1032,7 +1036,6 @@ impl VLog {
 
 			let key_len = u32::from_be_bytes(key_len_buf);
 
-			let mut value_len_buf = [0u8; 4];
 			source_file.read_exact(&mut value_len_buf)?;
 			let value_len = u32::from_be_bytes(value_len_buf);
 
@@ -1045,19 +1048,18 @@ impl VLog {
 			source_file.read_exact(&mut value)?;
 
 			// Read CRC32
-			let mut crc32_buf = [0u8; 4];
 			source_file.read_exact(&mut crc32_buf)?;
 			let _crc32 = u32::from_be_bytes(crc32_buf);
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-			let internal_key = InternalKey::decode(&key);
+			let internal_key = InternalKey::decode(key);
 
 			// Check if this user key is stale using the global delete list
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
-					let user_key = internal_key.user_key.clone();
+					let user_key = internal_key.user_key;
 					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
 					return Err(e);
 				}
@@ -1083,6 +1085,7 @@ impl VLog {
 
 				batch.add_record(
 					internal_key.kind(),
+					// TODO: Remove allocation
 					internal_key.user_key,
 					val,
 					internal_key.timestamp,
@@ -1280,9 +1283,7 @@ impl VLog {
 			let mut total_deleted = 0;
 
 			for internal_key in deleted_keys {
-				// Encode the specific internal key to delete
 				let encoded_key = internal_key.encode();
-
 				if let Err(e) = write_index.delete(&encoded_key) {
 					log::error!("Failed to delete versioned key: {}", e);
 					return Err(e.into());

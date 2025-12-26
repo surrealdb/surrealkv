@@ -7,6 +7,7 @@ pub(crate) mod table;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
+use std::ops::Deref;
 
 use crate::Key;
 
@@ -114,14 +115,14 @@ impl InternalKey {
 		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
 	}
 
-	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
+	pub(crate) fn decode(mut encoded_key: Vec<u8>) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		let trailer = read_u64_be(encoded_key, n);
-		let timestamp = read_u64_be(encoded_key, n + 8);
-		let user_key = encoded_key[..n].to_vec();
+		let trailer = read_u64_be(&encoded_key, n);
+		let timestamp = read_u64_be(&encoded_key, n + 8);
+		encoded_key.truncate(n);
 
 		Self {
-			user_key,
+			user_key: encoded_key,
 			timestamp,
 			trailer,
 		}
@@ -131,19 +132,6 @@ impl InternalKey {
 	#[inline]
 	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
 		&encoded[..encoded.len() - 16]
-	}
-
-	/// Extract trailer (seq_num + kind) without allocation
-	#[inline]
-	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
-		let n = encoded.len() - 16;
-		read_u64_be(encoded, n)
-	}
-
-	/// Extract seq_num from encoded key without allocation
-	#[inline]
-	pub(crate) fn seq_num_from_encoded(encoded: &[u8]) -> u64 {
-		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
@@ -174,18 +162,6 @@ impl InternalKey {
 	pub(crate) fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
 	}
-
-	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (ascending - older
-	/// timestamps first)
-	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
-		// First compare by user key (ascending)
-		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
-			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
-			ordering => ordering,
-		}
-	}
 }
 
 // Used only by memtable, sstable uses internal key comparator
@@ -202,6 +178,82 @@ impl Ord for InternalKey {
 }
 
 impl PartialOrd for InternalKey {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+/// InternalKey is the main key type used throughout the LSM tree
+/// It includes a timestamp field for versioned queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub(crate) struct InternalKeyRef<'key>(pub(crate) &'key [u8]);
+
+impl<'key> InternalKeyRef<'key> {
+	#[inline]
+	pub(crate) fn user_key(&self) -> &'key [u8] {
+		&self.0[..self.0.len() - 16]
+	}
+
+	#[inline]
+	pub(crate) fn timestamp(&self) -> u64 {
+		read_u64_be(self.0, self.0.len() - 8)
+	}
+
+	#[inline]
+	fn trailer(&self) -> u64 {
+		read_u64_be(self.0, self.0.len() - 16)
+	}
+
+	#[inline]
+	pub(crate) fn seq_num(&self) -> u64 {
+		trailer_to_seq_num(self.trailer())
+	}
+
+	#[inline]
+	pub(crate) fn kind(&self) -> InternalKeyKind {
+		trailer_to_kind(self.trailer())
+	}
+
+	#[inline]
+	pub(crate) fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
+	}
+
+	/// Compares this key with another key using timestamp-based ordering
+	/// First compares by user key, then by timestamp (ascending - older
+	/// timestamps first)
+	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
+		// First compare by user key (ascending)
+		match self.user_key().cmp(other.user_key()) {
+			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
+			Ordering::Equal => self.timestamp().cmp(&other.timestamp()),
+			ordering => ordering,
+		}
+	}
+}
+
+impl<'key> Deref for InternalKeyRef<'key> {
+	type Target = [u8];
+
+	fn deref(&self) -> &Self::Target {
+		self.0
+	}
+}
+
+impl<'key> Ord for InternalKeyRef<'key> {
+	fn cmp(&self, other: &Self) -> Ordering {
+		// Same as InternalKey: user key, then sequence number, then kind, with
+		// timestamp as final tiebreaker First compare by user key (ascending)
+		match self.user_key().cmp(other.user_key()) {
+			// If user keys are equal, compare by sequence number (descending)
+			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
+			ordering => ordering,
+		}
+	}
+}
+
+impl<'key> PartialOrd for InternalKeyRef<'key> {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}

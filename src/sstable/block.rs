@@ -4,7 +4,7 @@ use std::sync::Arc;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalKey, InternalKeyRef};
 use crate::{Comparator, InternalKeyComparator, Key, Value};
 
 pub(crate) type BlockData = Vec<u8>;
@@ -199,8 +199,8 @@ impl BlockWriter {
 			let cmp_result = self.internal_cmp.compare(self.last_key.as_slice(), key);
 			if cmp_result != Ordering::Less {
 				// Decode both keys for detailed logging
-				let last_internal_key = InternalKey::decode(self.last_key.as_slice());
-				let current_internal_key = InternalKey::decode(key);
+				let last_internal_key = InternalKeyRef(self.last_key.as_slice());
+				let current_internal_key = InternalKeyRef(key);
 
 				log::error!(
 					"[BLOCK] Key ordering violation detected!\n\
@@ -222,17 +222,17 @@ impl BlockWriter {
 					Block state:\n\
 					  Entries in block: {}\n\
 					  Buffer size: {} bytes",
-					String::from_utf8_lossy(&last_internal_key.user_key),
-					last_internal_key.user_key.as_slice(),
+					String::from_utf8_lossy(last_internal_key.user_key()),
+					last_internal_key.user_key(),
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
-					last_internal_key.timestamp,
+					last_internal_key.timestamp(),
 					self.last_key.as_slice(),
-					String::from_utf8_lossy(&current_internal_key.user_key),
-					current_internal_key.user_key.as_slice(),
+					String::from_utf8_lossy(current_internal_key.user_key()),
+					current_internal_key.user_key(),
 					current_internal_key.seq_num(),
 					current_internal_key.kind(),
-					current_internal_key.timestamp,
+					current_internal_key.timestamp(),
 					key,
 					cmp_result,
 					self.num_entries,
@@ -609,8 +609,8 @@ impl BlockIterator {
 
 	// Get the current key
 	#[inline]
-	pub(crate) fn key(&self) -> InternalKey {
-		InternalKey::decode(&self.current_key)
+	pub(crate) fn key(&self) -> InternalKeyRef<'_> {
+		InternalKeyRef(&self.current_key)
 	}
 
 	// Get the current value
@@ -717,7 +717,7 @@ mod tests {
 
 		let mut i = 0;
 		while block_iter.advance() {
-			assert_eq!(block_iter.key().user_key.as_slice(), data[i].0);
+			assert_eq!(block_iter.key().user_key(), data[i].0);
 			assert_eq!(block_iter.value(), data[i].1.to_vec());
 			i += 1;
 		}
@@ -743,7 +743,7 @@ mod tests {
 		let mut iter = Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		iter.next();
-		assert_eq!(iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(iter.key().user_key(), "key1".as_bytes());
 		assert_eq!(iter.value(), b"value1".to_vec());
 
 		iter.next();
@@ -751,7 +751,7 @@ mod tests {
 
 		iter.prev();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(iter.key().user_key(), "key1".as_bytes());
 		assert_eq!(iter.value(), b"value1".to_vec());
 
 		// Go to the last entry
@@ -759,7 +759,7 @@ mod tests {
 
 		iter.prev();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_slice(), "pkey2".as_bytes());
+		assert_eq!(iter.key().user_key(), "pkey2".as_bytes());
 		assert_eq!(iter.value(), b"value".to_vec());
 	}
 
@@ -782,32 +782,32 @@ mod tests {
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key(), block_iter.value(),)),
+			Some(("pkey2".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
 		let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key(), block_iter.value(),)),
+			Some(("pkey1".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
 		let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
+			Some((block_iter.key().user_key(), block_iter.value(),)),
+			Some(("key1".as_bytes(), "value1".as_bytes().to_vec()))
 		);
 
 		let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key(), block_iter.value(),)),
+			Some(("pkey3".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
 		let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -838,12 +838,12 @@ mod tests {
 
 			block_iter.seek_to_last();
 			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+			assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 			assert_eq!(block_iter.value(), b"value".to_vec());
 
 			block_iter.seek_to_first();
 			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+			assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 			assert_eq!(block_iter.value(), b"value1".to_vec());
 
 			block_iter.next();
@@ -853,7 +853,7 @@ mod tests {
 			block_iter.next();
 			assert!(block_iter.valid());
 
-			assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+			assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 			assert_eq!(block_iter.value(), b"value".to_vec());
 		}
 	}
@@ -876,32 +876,32 @@ mod tests {
 		// Test prev() from the end
 		block_iter.seek_to_last();
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 		// Go backward one step
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey2".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 
 		// Go backward another step
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 		// Go backward one more step
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 		// Go backward to the beginning
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 		// Go backward to the first key
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 		// Try to go past the beginning
 		assert!(!block_iter.prev());
@@ -927,7 +927,7 @@ mod tests {
 			Block::new(block_contents.clone(), o.internal_comparator.clone()).iter(false);
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
-			let internal_key = InternalKey::decode(&item.0);
+			let internal_key = InternalKey::decode(item.0);
 			forward_keys.push(String::from_utf8(internal_key.user_key.clone()).unwrap());
 		}
 		assert_eq!(
@@ -941,7 +941,7 @@ mod tests {
 		backward_iter.seek_to_last();
 		let mut backward_keys = Vec::new();
 		while backward_iter.valid() {
-			let key = backward_iter.key().user_key.clone();
+			let key = backward_iter.key().user_key().to_vec();
 			backward_keys.push(String::from_utf8(key.clone()).unwrap());
 			if !backward_iter.prev() {
 				break;
@@ -979,20 +979,20 @@ mod tests {
 		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 		// Go backward from here
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 		// Can't go further back
 		assert!(!block_iter.prev());
@@ -1022,20 +1022,20 @@ mod tests {
 		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 		// Go backward
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 		// Can't go further
 		assert!(!block_iter.prev());
@@ -1076,7 +1076,7 @@ mod tests {
 		// Test prev() when at first entry
 		block_iter.seek_to_first();
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 		assert!(!block_iter.prev()); // Can't go before first
 		assert!(!block_iter.valid());
@@ -1084,12 +1084,12 @@ mod tests {
 		// Test prev() after seek_to_last()
 		block_iter.seek_to_last();
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 		// Should be able to go backward
 		assert!(block_iter.prev());
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey2".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 	}
 
 	#[test]
@@ -1145,7 +1145,7 @@ mod tests {
 
 		assert!(iter.valid(), "Iterator should be valid");
 		let found_key = iter.key();
-		assert_eq!(found_key.user_key, b"key_00".to_vec(), "Should land on first key");
+		assert_eq!(found_key.user_key(), b"key_00", "Should land on first key");
 	}
 
 	#[test]
@@ -1173,7 +1173,7 @@ mod tests {
 
 		assert!(iter.valid());
 		let found_key = iter.key();
-		assert_eq!(found_key.user_key, b"key_05".to_vec());
+		assert_eq!(found_key.user_key(), b"key_05");
 	}
 
 	#[test]
@@ -1198,7 +1198,7 @@ mod tests {
 		assert!(iter.valid());
 		let found_key = iter.key();
 		assert_eq!(
-			found_key.user_key,
+			found_key.user_key(),
 			b"cherry".to_vec(),
 			"Should land on 'cherry' which is first key >= 'banana'"
 		);
@@ -1228,7 +1228,7 @@ mod tests {
 		iter.seek(&target.encode());
 		assert!(iter.valid());
 		let found = iter.key();
-		assert_eq!(found.user_key, b"foo".to_vec());
+		assert_eq!(found.user_key(), b"foo");
 		assert_eq!(
 			found.seq_num(),
 			75,
@@ -1263,12 +1263,12 @@ mod tests {
 		let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+		assert_eq!(iter.key().user_key(), b"only_key");
 
 		// Seek for key before
 		iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode());
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+		assert_eq!(iter.key().user_key(), b"only_key");
 
 		// Seek for key after
 		iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode());
@@ -1300,7 +1300,7 @@ mod tests {
 				InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&target.encode());
 			assert!(iter.valid(), "Should find key at restart point {}", i);
-			assert_eq!(iter.key().user_key, target_key.as_bytes().to_vec());
+			assert_eq!(iter.key().user_key(), target_key.as_bytes());
 		}
 	}
 
@@ -1370,7 +1370,7 @@ mod tests {
 		assert!(iter.valid());
 
 		let first_key = iter.key();
-		assert_eq!(first_key.user_key, b"key_00".to_vec());
+		assert_eq!(first_key.user_key(), b"key_00");
 
 		// prev() at first entry should return false
 		let result = iter.prev();

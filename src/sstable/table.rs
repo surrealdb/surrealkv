@@ -17,6 +17,7 @@ use crate::sstable::meta::TableMetadata;
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
+	InternalKeyRef,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
@@ -553,7 +554,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	if metaindexiter.valid() {
 		let k = metaindexiter.key();
 		// Verify exact match to avoid using wrong entry
-		assert_eq!(k.user_key.as_slice(), b"meta");
+		assert_eq!(k.user_key(), b"meta");
 		let buf_bytes = metaindexiter.value();
 		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
 	}
@@ -690,7 +691,7 @@ impl Table {
 			let k = metaindexiter.key();
 
 			// Verify exact match to avoid using wrong entry
-			assert_eq!(k.user_key.as_slice(), filter_name.as_bytes());
+			assert_eq!(k.user_key(), filter_name.as_bytes());
 			let val = metaindexiter.value();
 
 			let fbl = BlockHandle::decode(&val);
@@ -733,12 +734,17 @@ impl Table {
 	}
 
 	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
-		// CALL ONCE and store
 		let key_encoded = key.encode();
+		self.get_encoded(InternalKeyRef(&key_encoded))
+	}
+
+	fn get_encoded(&self, key: InternalKeyRef<'_>) -> Result<Option<(InternalKey, Value)>> {
+		// InternalKeyRef already wraps the encoded bytes
+		let key_encoded = &*key;
 
 		// Check filter first
 		if let Some(ref filters) = self.filter_reader {
-			let may_contain = filters.may_contain(key.user_key.as_slice(), 0);
+			let may_contain = filters.may_contain(key.user_key(), 0);
 			if !may_contain {
 				return Ok(None);
 			}
@@ -747,7 +753,7 @@ impl Table {
 		let handle = match &self.index_block {
 			IndexType::Partitioned(partitioned_index) => {
 				// Use internal key comparison to find the partition block
-				let partition_block = match partitioned_index.get(&key_encoded) {
+				let partition_block = match partitioned_index.get(key_encoded) {
 					Ok(block) => block,
 					Err(_e) => {
 						return Ok(None);
@@ -757,10 +763,10 @@ impl Table {
 				// Then search within the partition
 				// Note: Index blocks always need full key-value pairs to decode block handles
 				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek(&key_encoded);
+				partition_iter.seek(key_encoded);
 
 				if partition_iter.valid() {
-					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes())
+					if self.internal_cmp.compare(key_encoded, partition_iter.key_bytes())
 						!= Ordering::Greater
 					{
 						let val = partition_iter.value_bytes();
@@ -784,10 +790,10 @@ impl Table {
 		let mut iter = tb.iter(false);
 
 		// Go to entry and check if it's the wanted entry.
-		iter.seek(&key_encoded);
+		iter.seek(key_encoded);
 		if iter.valid() {
-			if iter.user_key() == key.user_key.as_slice() {
-				Ok(Some((iter.key(), iter.value())))
+			if iter.user_key() == key.user_key() {
+				Ok(Some((InternalKey::decode(iter.key_bytes().to_vec()), iter.value())))
 			} else {
 				Ok(None)
 			}
@@ -962,7 +968,8 @@ impl TableIterator {
 
 	#[cfg(test)]
 	pub(crate) fn key(&self) -> InternalKey {
-		self.current_block.as_ref().unwrap().key()
+		let block = self.current_block.as_ref().unwrap();
+		InternalKey::decode(block.key_bytes().to_vec())
 	}
 
 	#[cfg(test)]
@@ -1079,7 +1086,7 @@ impl TableIterator {
 				// Skip ALL versions of the excluded key
 				while self.valid() {
 					let current_key = self.current_block.as_ref().unwrap().key();
-					if current_key.user_key != internal_key.user_key {
+					if current_key.user_key() != internal_key.user_key {
 						break;
 					}
 					if !self.advance() {
@@ -1118,7 +1125,7 @@ impl TableIterator {
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key(), internal_key.user_key.as_slice());
 					if cmp != Ordering::Greater {
 						// Found a key <= bound, we're positioned correctly
 						break;
@@ -1151,7 +1158,7 @@ impl TableIterator {
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key(), internal_key.user_key.as_slice());
 					if cmp == Ordering::Less {
 						break;
 					}
@@ -1215,7 +1222,7 @@ impl Iterator for TableIterator {
 			return None;
 		}
 
-		let current_item = (block.key(), block.value());
+		let current_item = (InternalKey::decode(block.key_bytes().to_vec()), block.value());
 
 		// Advance for the next call to next()
 		self.advance();
@@ -1250,7 +1257,7 @@ impl DoubleEndedIterator for TableIterator {
 				return None;
 			}
 
-			let item = (block.key(), block.value());
+			let item = (InternalKey::decode(block.key_bytes().to_vec()), block.value());
 			self.reverse_started = true;
 			return Some(item);
 		}
@@ -1264,7 +1271,7 @@ impl DoubleEndedIterator for TableIterator {
 			return None;
 		}
 
-		let item = (block.key(), block.value());
+		let item = (InternalKey::decode(block.key_bytes().to_vec()), block.value());
 		Some(item)
 	}
 }
@@ -4765,7 +4772,7 @@ mod tests {
 
 		println!("Created table with {} index partitions", num_partitions);
 		for (i, block) in partitioned_index.blocks.iter().enumerate() {
-			let sep_key = InternalKey::decode(&block.separator_key);
+			let sep_key = InternalKey::decode(block.separator_key.clone());
 			println!(
 				"  Partition {}: user_key = {:?}, seq = {}",
 				i,
@@ -4787,7 +4794,7 @@ mod tests {
 			.blocks
 			.iter()
 			.enumerate()
-			.filter(|(_, b)| InternalKey::decode(&b.separator_key).user_key == b"foo")
+			.filter(|(_, b)| InternalKey::decode(b.separator_key.clone()).user_key == b"foo")
 			.collect();
 
 		println!(
