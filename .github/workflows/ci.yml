@@ -2,6 +2,9 @@ name: CI
 
 run-name: "CI run '${{ github.head_ref || github.ref_name }}'"
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   push:
@@ -85,11 +88,22 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -Dwarnings
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
       - name: Build WASM
         run: |
           rustup target add wasm32-unknown-unknown
           RUSTFLAGS="-A warnings --cfg getrandom_backend=\"wasm_js\"" cargo build --target wasm32-unknown-unknown
+  
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt
+          default: true
+
+      - name: Format
+        run: cargo +nightly fmt --all -- --check

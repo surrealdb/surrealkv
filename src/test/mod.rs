@@ -1,7 +1,8 @@
 //! Integration tests for SurrealKV
 //!
-//! This module contains integration tests that test the full LSM stack including
-//! WAL recovery, memtable flush, SST interaction, and manifest coordination.
+//! This module contains integration tests that test the full LSM stack
+//! including WAL recovery, memtable flush, SST interaction, and manifest
+//! coordination.
 
 #[cfg(test)]
 pub mod compression_tests;

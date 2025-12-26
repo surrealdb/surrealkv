@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
+
 use tempfile::TempDir;
 use test_log::test;
 
@@ -200,7 +201,13 @@ fn test_crash_immediately_after_rotation() {
 	// Write data to segment 0
 	let mut batch = Batch::new(100);
 	for i in 0..50 {
-		batch.set(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes(), 0).unwrap();
+		batch
+			.set(
+				format!("key{}", i).as_bytes().to_vec(),
+				format!("value{}", i).as_bytes().to_vec(),
+				0,
+			)
+			.unwrap();
 	}
 
 	let opts = Options::default();
@@ -233,7 +240,13 @@ fn test_crash_after_multiple_rapid_rotations() {
 	// Rotate 5 times, each segment gets 1 entry
 	for i in 0..5 {
 		let mut batch = Batch::new(100 + i * 10);
-		batch.set(format!("key{}", i).as_bytes(), format!("val{}", i).as_bytes(), 0).unwrap();
+		batch
+			.set(
+				format!("key{}", i).as_bytes().to_vec(),
+				format!("val{}", i).as_bytes().to_vec(),
+				0,
+			)
+			.unwrap();
 		wal.append(&batch.encode().unwrap()).unwrap();
 
 		if i < 4 {
@@ -260,7 +273,13 @@ fn test_crash_during_wal_write_mid_batch() {
 	// Write complete batch
 	let mut batch1 = Batch::new(100);
 	for i in 0..10 {
-		batch1.set(format!("key{}", i).as_bytes(), format!("val{}", i).as_bytes(), 0).unwrap();
+		batch1
+			.set(
+				format!("key{}", i).as_bytes().to_vec(),
+				format!("val{}", i).as_bytes().to_vec(),
+				0,
+			)
+			.unwrap();
 	}
 
 	let opts = Options::default();
@@ -270,7 +289,13 @@ fn test_crash_during_wal_write_mid_batch() {
 	// Write another batch
 	let mut batch2 = Batch::new(200);
 	for i in 0..10 {
-		batch2.set(format!("key2_{}", i).as_bytes(), format!("val2_{}", i).as_bytes(), 0).unwrap();
+		batch2
+			.set(
+				format!("key2_{}", i).as_bytes().to_vec(),
+				format!("val2_{}", i).as_bytes().to_vec(),
+				0,
+			)
+			.unwrap();
 	}
 	wal.append(&batch2.encode().unwrap()).unwrap();
 	wal.close().unwrap();
@@ -344,7 +369,13 @@ fn test_partial_batch_at_segment_end() {
 	// Create segment with data
 	let mut batch = Batch::new(100);
 	for i in 0..20 {
-		batch.set(format!("key{}", i).as_bytes(), format!("val{}", i).as_bytes(), 0).unwrap();
+		batch
+			.set(
+				format!("key{}", i).as_bytes().to_vec(),
+				format!("val{}", i).as_bytes().to_vec(),
+				0,
+			)
+			.unwrap();
 	}
 
 	let opts = Options::default();
@@ -521,9 +552,10 @@ fn test_corruption_end_segment_0() {
 			..
 		}) => {
 			assert_eq!(segment_id, 0);
-			// Note: Random byte corruption can hit CRC which invalidates entire record.
-			// So we may have fewer entries than expected or even none.
-			// The key assertion is that corruption is detected in segment 0.
+			// Note: Random byte corruption can hit CRC which invalidates entire
+			// record. So we may have fewer entries than expected or even
+			// none. The key assertion is that corruption is detected in
+			// segment 0.
 		}
 		_ => panic!("Expected WalCorruption error in segment 0"),
 	}
@@ -686,7 +718,8 @@ fn test_random_byte_corruption() {
 	let memtable = Arc::new(MemTable::new());
 	let result = replay_wal(wal_dir, &memtable, 0);
 
-	// Corruption should be detected (or partial recovery happened before corruption)
+	// Corruption should be detected (or partial recovery happened before
+	// corruption)
 	match result {
 		Err(Error::WalCorruption {
 			..
@@ -1017,7 +1050,8 @@ fn test_sequence_gaps_detection() {
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
 
-	// Create segments with some empty (creating potential "gaps" in file-based view)
+	// Create segments with some empty (creating potential "gaps" in file-based
+	// view)
 	let entries_per_segment = vec![30, 0, 30, 0, 30];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 5000);
 
@@ -1206,7 +1240,7 @@ fn test_very_large_values_across_segments() {
 		let mut batch = Batch::new(13000 + seg_idx * 10);
 		for i in 0..5 {
 			let key = format!("large_seg{}_key{}", seg_idx, i);
-			batch.set(key.as_bytes(), &large_value, 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), large_value.clone(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1240,7 +1274,7 @@ fn test_many_small_batches() {
 		for batch_idx in 0..100 {
 			let mut batch = Batch::new(14000 + entry_count);
 			let key = format!("s{}_b{}_k", seg_idx, batch_idx);
-			batch.set(key.as_bytes(), b"value", 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), b"value".to_vec(), 0).unwrap();
 			wal.append(&batch.encode().unwrap()).unwrap();
 			entry_count += 1;
 		}
@@ -1277,7 +1311,7 @@ fn test_few_large_batches() {
 		let mut batch = Batch::new(15000 + seg_idx * 200);
 		for i in 0..200 {
 			let key = format!("seg{}_key{:04}", seg_idx, i);
-			batch.set(key.as_bytes(), b"value", 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), b"value".to_vec(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1560,7 +1594,7 @@ fn test_compressed_wal_segments() {
 		for i in 0..50 {
 			let key = format!("compressed_seg{}_k{}", seg_idx, i);
 			let value = format!("compressed_value_{}_{}", seg_idx, i);
-			batch.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1594,7 +1628,7 @@ fn test_mixed_compression_segments() {
 		let mut batch = Batch::new(26000 + seg_idx * 40);
 		for i in 0..40 {
 			let key = format!("uncomp_seg{}_k{}", seg_idx, i);
-			batch.set(key.as_bytes(), b"uncompressed_value", 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), b"uncompressed_value".to_vec(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
@@ -1612,7 +1646,7 @@ fn test_mixed_compression_segments() {
 		let mut batch = Batch::new(26080 + seg_idx * 40);
 		for i in 0..40 {
 			let key = format!("comp_seg{}_k{}", seg_idx, i);
-			batch.set(key.as_bytes(), b"compressed_value", 0).unwrap();
+			batch.set(key.as_bytes().to_vec(), b"compressed_value".to_vec(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 		if seg_idx < 1 {
@@ -1648,7 +1682,7 @@ fn test_compressed_data_corruption() {
 	let mut batch = Batch::new(27000);
 	for i in 0..60 {
 		let key = format!("key{}", i);
-		batch.set(key.as_bytes(), b"compressed_value_data", 0).unwrap();
+		batch.set(key.as_bytes().to_vec(), b"compressed_value_data".to_vec(), 0).unwrap();
 	}
 	wal.append(&batch.encode().unwrap()).unwrap();
 	wal.close().unwrap();

@@ -5,14 +5,15 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
 
-use bytes::Bytes;
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::sync::Arc;
 
-// This is the maximum valid sequence number that can be stored in the upper 56 bits of a 64-bit integer.
-// 1 << 56 shifts the number 1 left by 56 bits, resulting in a binary number with a 1 followed by 56 zeros.
-// Subtracting 1 gives a binary number with 56 ones, which is the maximum value for 56 bits.
+use crate::Key;
+
+// This is the maximum valid sequence number that can be stored in the upper 56
+// bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
+// resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
+// gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 
@@ -44,13 +45,13 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
-#[inline]
+#[inline(always)]
 fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
-#[inline]
+#[inline(always)]
 fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
@@ -59,24 +60,15 @@ fn is_delete_kind(kind: InternalKeyKind) -> bool {
 }
 
 /// Checks if a key kind represents a hard delete (delete operation)
+#[inline(always)]
 fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
 }
 
 /// Checks if a key kind represents a Replace operation
+#[inline(always)]
 fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
-}
-
-/// Calculates the size of a key with the given user key length
-/// This centralizes the size calculation logic to avoid duplication
-fn calculate_key_size(user_key_len: usize, has_timestamp: bool) -> usize {
-	let fixed_size = if has_timestamp {
-		std::mem::size_of::<u64>() * 2 + std::mem::size_of::<Arc<[u8]>>()
-	} else {
-		std::mem::size_of::<u64>() + std::mem::size_of::<Arc<[u8]>>()
-	};
-	fixed_size + user_key_len
 }
 
 #[repr(u8)]
@@ -102,20 +94,15 @@ impl From<u8> for InternalKeyKind {
 
 /// InternalKey is the main key type used throughout the LSM tree
 /// It includes a timestamp field for versioned queries
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct InternalKey {
-	pub(crate) user_key: Bytes,
+	pub(crate) user_key: Key,
 	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
 	pub(crate) trailer: u64,   // (seq_num << 8) | kind
 }
 
 impl InternalKey {
-	pub(crate) fn new(
-		user_key: Bytes,
-		seq_num: u64,
-		kind: InternalKeyKind,
-		timestamp: u64,
-	) -> Self {
+	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
 		Self {
 			user_key,
 			timestamp,
@@ -124,14 +111,14 @@ impl InternalKey {
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		calculate_key_size(self.user_key.len(), true)
+		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = read_u64_be(encoded_key, n);
 		let timestamp = read_u64_be(encoded_key, n + 8);
-		let user_key = Bytes::copy_from_slice(&encoded_key[..n]);
+		let user_key = encoded_key[..n].to_vec();
 
 		Self {
 			user_key,
@@ -140,13 +127,33 @@ impl InternalKey {
 		}
 	}
 
+	/// Extract user key slice without allocation
+	#[inline]
+	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
+		&encoded[..encoded.len() - 16]
+	}
+
+	/// Extract trailer (seq_num + kind) without allocation
+	#[inline]
+	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
+		let n = encoded.len() - 16;
+		read_u64_be(encoded, n)
+	}
+
+	/// Extract seq_num from encoded key without allocation
+	#[inline]
+	pub(crate) fn seq_num_from_encoded(encoded: &[u8]) -> u64 {
+		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
+	}
+
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = self.user_key.as_ref().to_vec();
+		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
 		buf
 	}
 
+	#[inline]
 	pub(crate) fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}
@@ -169,7 +176,8 @@ impl InternalKey {
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (ascending - older timestamps first)
+	/// First compares by user key, then by timestamp (ascending - older
+	/// timestamps first)
 	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
@@ -183,8 +191,8 @@ impl InternalKey {
 // Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with timestamp as final tiebreaker
-		// First compare by user key (ascending)
+		// Same as InternalKey: user key, then sequence number, then kind, with
+		// timestamp as final tiebreaker First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
 			// If user keys are equal, compare by sequence number (descending)
 			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
@@ -196,15 +204,5 @@ impl Ord for InternalKey {
 impl PartialOrd for InternalKey {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
-	}
-}
-
-impl Default for InternalKey {
-	fn default() -> Self {
-		Self {
-			user_key: Bytes::new(),
-			timestamp: 0,
-			trailer: 0,
-		}
 	}
 }

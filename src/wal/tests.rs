@@ -1,3 +1,8 @@
+use std::fs::File;
+use std::io::Write as IoWrite;
+use std::path::Path;
+use std::sync::Arc;
+
 use tempdir::TempDir;
 use test_log::test;
 
@@ -7,13 +12,17 @@ use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::{
-	cleanup_old_segments, get_segment_range, list_segment_ids, parse_segment_name, segment_name,
-	should_include_file, CompressionType, Options, RecordType, SegmentRef,
+	cleanup_old_segments,
+	get_segment_range,
+	list_segment_ids,
+	parse_segment_name,
+	segment_name,
+	should_include_file,
+	CompressionType,
+	Options,
+	RecordType,
+	SegmentRef,
 };
-use std::fs::File;
-use std::io::Write as IoWrite;
-use std::path::Path;
-use std::sync::Arc;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -65,7 +74,8 @@ fn test_cleanup_old_segments() {
 	let latest_segment_id = *segment_ids_before.iter().max().unwrap();
 	let removed_count = cleanup_old_segments(temp_dir.path(), latest_segment_id).unwrap();
 
-	// Verify at least 4 segments were removed (keeping only segments >= latest_segment_id)
+	// Verify at least 4 segments were removed (keeping only segments >=
+	// latest_segment_id)
 	assert!(removed_count >= 4, "Expected at least 4 segments to be removed, got {removed_count}");
 
 	// Verify only the latest segment remains
@@ -100,7 +110,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..3 {
 		let key = format!("key_seg0_{i:02}");
 		let value = format!("value_seg0_{i:02}");
-		batch1.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch1.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch1.encode().unwrap()).unwrap();
 
@@ -112,7 +122,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..4 {
 		let key = format!("key_seg1_{i:02}");
 		let value = format!("value_seg1_{i:02}");
-		batch2.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch2.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch2.encode().unwrap()).unwrap();
 
@@ -124,7 +134,7 @@ fn test_wal_replay_all_segments() {
 	for i in 0..5 {
 		let key = format!("key_seg2_{i:02}");
 		let value = format!("value_seg2_{i:02}");
-		batch3.set(key.as_bytes(), value.as_bytes(), 0).unwrap();
+		batch3.set(key.into_bytes(), value.into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch3.encode().unwrap()).unwrap();
 

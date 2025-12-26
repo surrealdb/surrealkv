@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{btree_map, btree_map::Entry as BTreeEntry, BTreeMap};
+use std::collections::btree_map::Entry as BTreeEntry;
+use std::collections::{btree_map, BTreeMap};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use bytes::Bytes;
 pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
 use crate::batch::Batch;
@@ -13,7 +13,8 @@ use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
 use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
 
-/// `Mode` is an enumeration representing the different modes a transaction can have in an MVCC (Multi-Version Concurrency Control) system.
+/// `Mode` is an enumeration representing the different modes a transaction can
+/// have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
 	/// `ReadWrite` mode allows the transaction to both read and write data.
@@ -26,7 +27,7 @@ pub enum Mode {
 
 impl Mode {
 	/// Checks if this transaction mode permits mutations
-	pub(crate) fn mutable(&self) -> bool {
+	pub(crate) fn mutable(self) -> bool {
 		match self {
 			Self::ReadWrite => true,
 			Self::ReadOnly => false,
@@ -35,12 +36,12 @@ impl Mode {
 	}
 
 	/// Checks if this is a write-only transaction
-	pub(crate) fn is_write_only(&self) -> bool {
+	pub(crate) fn is_write_only(self) -> bool {
 		matches!(self, Self::WriteOnly)
 	}
 
 	/// Checks if this is a read-only transaction
-	pub(crate) fn is_read_only(&self) -> bool {
+	pub(crate) fn is_read_only(self) -> bool {
 		matches!(self, Self::ReadOnly)
 	}
 }
@@ -64,7 +65,8 @@ pub enum Durability {
 pub struct WriteOptions {
 	/// Durability level for the write operation
 	pub durability: Durability,
-	/// Optional timestamp for the write operation. If None, uses the current timestamp.
+	/// Optional timestamp for the write operation. If None, uses the current
+	/// timestamp.
 	pub timestamp: Option<u64>,
 }
 
@@ -102,13 +104,14 @@ impl WriteOptions {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadOptions {
 	/// Whether to return only keys without values (for range operations)
-	pub keys_only: bool,
-	/// Lower bound for iteration (inclusive). If set, iteration will start from this key or later.
-	pub iterate_lower_bound: Option<Vec<u8>>,
-	/// Upper bound for iteration (exclusive). If set, iteration will stop before this key.
-	pub iterate_upper_bound: Option<Vec<u8>>,
-	/// Optional timestamp for point-in-time reads. If None, reads the latest version.
-	pub timestamp: Option<u64>,
+	pub(crate) keys_only: bool,
+	/// Lower bound for iteration (inclusive), None means unbounded
+	pub(crate) lower_bound: Option<Vec<u8>>,
+	/// Upper bound for iteration (exclusive), None means unbounded
+	pub(crate) upper_bound: Option<Vec<u8>>,
+	/// Optional timestamp for point-in-time reads. If None, reads the latest
+	/// version.
+	pub(crate) timestamp: Option<u64>,
 }
 
 impl ReadOptions {
@@ -123,26 +126,19 @@ impl ReadOptions {
 		self
 	}
 
-	/// Sets the lower bound for iteration (inclusive)
 	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
-		self.iterate_lower_bound = bound;
+		self.lower_bound = bound;
 	}
 
 	/// Sets the upper bound for iteration (exclusive)
 	pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
-		self.iterate_upper_bound = bound;
+		self.upper_bound = bound;
 	}
 
-	/// Sets the lower bound for iteration (inclusive) - builder pattern
-	pub fn with_iterate_lower_bound(mut self, bound: Option<Vec<u8>>) -> Self {
-		self.iterate_lower_bound = bound;
-		self
-	}
-
-	/// Sets the upper bound for iteration (exclusive) - builder pattern
-	pub fn with_iterate_upper_bound(mut self, bound: Option<Vec<u8>>) -> Self {
-		self.iterate_upper_bound = bound;
-		self
+	/// Sets the iteration bounds
+	pub(crate) fn set_iterate_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
+		self.lower_bound = lower;
+		self.upper_bound = upper;
 	}
 
 	/// Sets the timestamp for point-in-time reads
@@ -155,34 +151,41 @@ impl ReadOptions {
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction {
-	/// `mode` is the transaction mode. This can be either `ReadWrite`, `ReadOnly`, or `WriteOnly`.
+	/// `mode` is the transaction mode. This can be either `ReadWrite`,
+	/// `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
 
-	/// `durability` is the durability level of the transaction. This is used to determine how the transaction is committed.
+	/// `durability` is the durability level of the transaction. This is used to
+	/// determine how the transaction is committed.
 	durability: Durability,
 
-	/// `snapshot` is the snapshot that the transaction is running in. This is a consistent view of the data at the time the transaction started.
+	/// `snapshot` is the snapshot that the transaction is running in. This is a
+	/// consistent view of the data at the time the transaction started.
 	pub(crate) snapshot: Option<Snapshot>,
 
-	/// `core` is the underlying core for the transaction. This is shared between transactions.
+	/// `core` is the underlying core for the transaction. This is shared
+	/// between transactions.
 	pub(crate) core: Arc<Core>,
 
 	/// `write_set` is a map of keys to entries.
 	/// These are the changes that the transaction intends to make to the data.
 	/// The entries vec is used to keep different values for the same key for
 	/// savepoints and rollbacks.
-	pub(crate) write_set: BTreeMap<Bytes, Vec<Entry>>,
+	pub(crate) write_set: BTreeMap<Key, Vec<Entry>>,
 
-	/// `closed` indicates if the transaction is closed. A closed transaction cannot make any more changes to the data.
+	/// `closed` indicates if the transaction is closed. A closed transaction
+	/// cannot make any more changes to the data.
 	closed: bool,
 
 	/// Tracks when this transaction started for deadlock detection
 	pub(crate) start_commit_id: u64,
 
-	/// `savepoints` indicates the current number of stacked savepoints; zero means none.
+	/// `savepoints` indicates the current number of stacked savepoints; zero
+	/// means none.
 	savepoints: u32,
 
-	/// write sequence number is used for real-time ordering of writes within a transaction.
+	/// write sequence number is used for real-time ordering of writes within a
+	/// transaction.
 	write_seqno: u32,
 }
 
@@ -284,7 +287,8 @@ impl Transaction {
 		self.delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Delete all the versions of a key with custom write options. This is a hard delete.
+	/// Delete all the versions of a key with custom write options. This is a
+	/// hard delete.
 	pub fn delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
 		K: IntoBytes,
@@ -314,7 +318,8 @@ impl Transaction {
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Soft deletes a key at a specific timestamp. This will add a tombstone at the specified timestamp.
+	/// Soft deletes a key at a specific timestamp. This will add a tombstone at
+	/// the specified timestamp.
 	pub fn soft_delete_at_version<K>(&mut self, key: K, timestamp: u64) -> Result<()>
 	where
 		K: IntoBytes,
@@ -322,7 +327,8 @@ impl Transaction {
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
 
-	/// Soft delete a key, with custom write options. This will add a tombstone at the specified timestamp.
+	/// Soft delete a key, with custom write options. This will add a tombstone
+	/// at the specified timestamp.
 	pub fn soft_delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
 		K: IntoBytes,
@@ -359,7 +365,8 @@ impl Transaction {
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Inserts a key-value pair, removing all previous versions, with custom write options.
+	/// Inserts a key-value pair, removing all previous versions, with custom
+	/// write options.
 	pub fn replace_with_options<K, V>(
 		&mut self,
 		key: K,
@@ -436,7 +443,8 @@ impl Transaction {
 			};
 		}
 
-		// RYOW semantics: Read your own writes. If the value is in the write set, return it.
+		// RYOW semantics: Read your own writes. If the value is in the write set,
+		// return it.
 		if let Some(last_entry) =
 			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
 		{
@@ -464,8 +472,9 @@ impl Transaction {
 
 	/// Counts keys in a range at the current timestamp.
 	///
-	/// Returns the number of valid (non-deleted) keys in the range [start, end).
-	/// The range is inclusive of the start key, but exclusive of the end key.
+	/// Returns the number of valid (non-deleted) keys in the range [start,
+	/// end). The range is inclusive of the start key, but exclusive of the end
+	/// key.
 	///
 	/// This is more efficient than creating an iterator and counting manually,
 	/// as it doesn't need to allocate or return the actual keys.
@@ -474,8 +483,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.count_with_options(&options)
 	}
 
@@ -491,23 +499,23 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.count_with_options(&options)
 	}
 
 	/// Counts keys with custom read options.
 	///
-	/// Returns the number of valid (non-deleted) keys that match the provided options.
-	/// The options can specify:
+	/// Returns the number of valid (non-deleted) keys that match the provided
+	/// options. The options can specify:
 	/// - Key range bounds (iterate_lower_bound, iterate_upper_bound)
 	/// - Timestamp for versioned queries
 	///
 	/// For versioned queries (when timestamp is specified), this requires
 	/// versioning to be enabled in the database options.
 	///
-	/// This method is optimized to avoid creating full iterators and resolving values
-	/// from the value log, making it much faster than manually counting iterator results.
+	/// This method is optimized to avoid creating full iterators and resolving
+	/// values from the value log, making it much faster than manually counting
+	/// iterator results.
 	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -516,10 +524,6 @@ impl Transaction {
 			return Err(Error::TransactionWriteOnly);
 		}
 
-		// Get the start and end keys from options
-		let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-		let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
 		// For versioned queries, use the keys iterator approach
 		// (versioned index has different structure)
 		if let Some(timestamp) = options.timestamp {
@@ -527,20 +531,33 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
+			let start_key = options.lower_bound.clone().unwrap_or_default();
+			let end_key = options.upper_bound.clone().unwrap_or_default();
 			let keys_iter = self.keys_at_version(start_key, end_key, timestamp)?;
 			return Ok(keys_iter.count());
 		}
 
 		// Fast path: get count from snapshot without creating iterators
 		let mut count = match &self.snapshot {
-			Some(snapshot) => snapshot.count_in_range(start_key.clone(), end_key.clone())?,
+			Some(snapshot) => {
+				let lower = options.lower_bound.as_deref();
+				let upper = options.upper_bound.as_deref();
+				snapshot.count_in_range(lower, upper)?
+			}
 			None => return Err(Error::NoSnapshot),
 		};
 
 		// Apply write-set adjustments for uncommitted changes in this transaction
 		for (key, entries) in &self.write_set {
 			// Check if key is in range
-			if key.as_ref() >= start_key.as_slice() && key.as_ref() < end_key.as_slice() {
+			let in_range = {
+				let lower_ok =
+					options.lower_bound.as_ref().is_none_or(|k| key.as_slice() >= k.as_slice());
+				let upper_ok =
+					options.upper_bound.as_ref().is_none_or(|k| key.as_slice() < k.as_slice());
+				lower_ok && upper_ok
+			};
+			if in_range {
 				if let Some(latest_entry) = entries.last() {
 					// Check what the key's state was in the snapshot
 					let snapshot_had_key =
@@ -553,7 +570,8 @@ impl Transaction {
 					match (snapshot_had_key, write_set_has_key) {
 						(false, true) => count += 1,                      // New key added
 						(true, false) => count = count.saturating_sub(1), // Key deleted
-						_ => {}                                           // No change (update or still deleted)
+						_ => {}                                           /* No change (update
+						                                                    * or still deleted) */
 					}
 				}
 			}
@@ -582,8 +600,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_keys_only(true);
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.keys_with_options(&options)
 	}
 
@@ -609,8 +626,7 @@ impl Transaction {
 	{
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.keys_with_options(&options)
 	}
 
@@ -637,26 +653,21 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.clone().unwrap_or_default();
+			let end_key = options.upper_bound.clone().unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.keys_at_version(start_key, end_key, timestamp)?
-						.map(|vec| Ok(Bytes::from(vec))),
-				)),
+				Some(snapshot) => {
+					Ok(Box::new(snapshot.keys_at_version(start_key, end_key, timestamp)?.map(Ok)))
+				}
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
-
 			// Force keys_only to true for this method
-			let mut options = options.clone();
-			options.keys_only = true;
+			let options = options.clone().with_keys_only(true);
+			let start_key = options.lower_bound.clone().unwrap_or_default();
+			let end_key = options.upper_bound.clone().unwrap_or_default();
 			Ok(Box::new(
 				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
 					.map(|result| result.map(|(key, _)| key)),
@@ -681,8 +692,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.range_with_options(&options)
 	}
 
@@ -704,8 +714,7 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_lower_bound(Some(start.as_slice().to_vec()));
-		options.set_iterate_upper_bound(Some(end.as_slice().to_vec()));
+		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.range_with_options(&options)
 	}
 
@@ -729,22 +738,19 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.clone().unwrap_or_default();
+			let end_key = options.upper_bound.clone().unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => Ok(Box::new(
-					snapshot
-						.range_at_version(start_key, end_key, timestamp)?
-						.map(|result| result.map(|(k, v)| (k.into(), v))),
-				)),
+				Some(snapshot) => {
+					Ok(Box::new(snapshot.range_at_version(start_key, end_key, timestamp)?))
+				}
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			// Get the start and end keys from options
-			let start_key = options.iterate_lower_bound.clone().unwrap_or_default();
-			let end_key = options.iterate_upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.clone().unwrap_or_default();
+			let end_key = options.upper_bound.clone().unwrap_or_default();
 			Ok(Box::new(
 				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
 					|result| {
@@ -762,8 +768,9 @@ impl Transaction {
 
 	/// Gets all versions of keys in a range.
 	///
-	/// Returns all historical versions of keys within the specified range, including tombstones.
-	/// Range is [start, end) - start is inclusive, end is exclusive.
+	/// Returns all historical versions of keys within the specified range,
+	/// including tombstones. Range is [start, end) - start is inclusive, end
+	/// is exclusive.
 	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
@@ -771,7 +778,8 @@ impl Transaction {
 	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
 	///
 	/// # Returns
-	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for each version found.
+	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
+	/// each version found.
 	pub fn scan_all_versions<K>(
 		&self,
 		start: K,
@@ -800,9 +808,11 @@ impl Transaction {
 		}
 	}
 
-	/// Writes a value for a key with custom write options. None is used for deletion.
+	/// Writes a value for a key with custom write options. None is used for
+	/// deletion.
 	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -892,12 +902,7 @@ impl Transaction {
 			} else {
 				commit_timestamp
 			};
-			batch.add_record(
-				entry.kind,
-				&entry.key,
-				entry.value.as_ref().map(|bytes| bytes.as_ref()),
-				timestamp,
-			)?;
+			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
 		}
 
 		// Write the batch to storage
@@ -931,7 +936,8 @@ impl Transaction {
 	///
 	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
 	pub fn set_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -951,7 +957,8 @@ impl Transaction {
 	///
 	/// [`set_savepoint`]: Transaction::set_savepoint
 	pub fn rollback_to_savepoint(&mut self) -> Result<()> {
-		// If the transaction mode is not mutable (i.e., it's read-only), return an error.
+		// If the transaction mode is not mutable (i.e., it's read-only), return an
+		// error.
 		if !self.mode.mutable() {
 			return Err(Error::TransactionReadOnly);
 		}
@@ -992,10 +999,10 @@ impl Drop for Transaction {
 #[derive(Clone)]
 pub(crate) struct Entry {
 	/// The key being written
-	pub(crate) key: Bytes,
+	pub(crate) key: Key,
 
 	/// The value (None for deletes)
-	pub(crate) value: Option<Bytes>,
+	pub(crate) value: Option<Value>,
 
 	/// Type of operation (Set, Delete, etc.)
 	pub(crate) kind: InternalKeyKind,
@@ -1060,13 +1067,14 @@ impl Entry {
 	}
 }
 
-/// An iterator that performs a merging scan over a transaction's snapshot and write set.
+/// An iterator that performs a merging scan over a transaction's snapshot and
+/// write set.
 pub(crate) struct TransactionRangeIterator<'a> {
 	/// Iterator over the consistent snapshot
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
-	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Bytes, Vec<Entry>>>,
+	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Key, Vec<Entry>>>,
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
@@ -1095,16 +1103,16 @@ impl<'a> TransactionRangeIterator<'a> {
 			None => return Err(Error::NoSnapshot),
 		};
 
-		// Convert range bounds to Bytes for the write set range
-		let start_bytes = Bytes::copy_from_slice(&start_key);
-		let end_bytes = Bytes::copy_from_slice(&end_key);
-
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(start_bytes.clone(), end_bytes.clone(), options.keys_only)?;
+		let iter = snapshot.range(
+			Some(start_key.as_slice()),
+			Some(end_key.as_slice()),
+			options.keys_only,
+		)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)
-		let write_set_range = (Bound::Included(start_bytes), Bound::Excluded(end_bytes));
+		let write_set_range = (Bound::Included(start_key), Bound::Excluded(end_key));
 		let write_set_iter = tx.write_set.range(write_set_range);
 
 		Ok(Self {
@@ -1183,7 +1191,7 @@ impl Iterator for TransactionRangeIterator<'_> {
 				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
 					(self.snapshot_iter.peek(), self.write_set_iter.peek())
 				{
-					match snap_key.as_ref().cmp(ws_key.as_ref()) {
+					match snap_key.cmp(ws_key) {
 						Ordering::Less => self.snapshot_iter.next(),
 						Ordering::Greater => self.read_from_write_set(),
 						Ordering::Equal => {
@@ -1232,7 +1240,7 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
 					(self.snapshot_iter.peek_back(), self.write_set_iter.peek_back())
 				{
-					match snap_key.as_ref().cmp(ws_key.as_ref()) {
+					match snap_key.as_slice().cmp(ws_key.as_slice()) {
 						Ordering::Greater => self.snapshot_iter.next_back(),
 						Ordering::Less => self.read_from_write_set_back(),
 						Ordering::Equal => {
@@ -1257,16 +1265,15 @@ impl DoubleEndedIterator for TransactionRangeIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, mem::size_of};
-	use test_log::test;
-
-	use bytes::Bytes;
-
-	use crate::{lsm::Tree, Options, TreeBuilder};
-
-	use super::*;
+	use std::collections::HashMap;
+	use std::mem::size_of;
 
 	use tempdir::TempDir;
+	use test_log::test;
+
+	use super::*;
+	use crate::lsm::Tree;
+	use crate::{Options, TreeBuilder};
 
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()
@@ -1291,10 +1298,10 @@ mod tests {
 		let (store, _temp_dir) = create_store();
 
 		// Define key-value pairs for the test
-		let key1 = Bytes::from("foo1");
-		let key2 = Bytes::from("foo2");
-		let value1 = Bytes::from("baz");
-		let value2 = Bytes::from("bar");
+		let key1 = Vec::from("foo1");
+		let key2 = Vec::from("foo2");
+		let value1 = Vec::from("baz");
+		let value2 = Vec::from("bar");
 
 		{
 			// Start a new read-write transaction (txn1)
@@ -1308,7 +1315,7 @@ mod tests {
 			// Start a read-only transaction (txn3)
 			let txn3 = store.begin().unwrap();
 			let val = txn3.get(&key1).unwrap().unwrap();
-			assert_eq!(val.as_ref(), value1.as_ref());
+			assert_eq!(&val, &value1);
 		}
 
 		{
@@ -1324,17 +1331,17 @@ mod tests {
 		let val = txn4.get(&key1).unwrap().unwrap();
 
 		// Assert that the value retrieved in txn4 matches value2
-		assert_eq!(val.as_ref(), value2.as_ref());
+		assert_eq!(&val, &value2);
 	}
 
 	#[test(tokio::test)]
 	async fn mvcc_snapshot_isolation() {
 		let (store, _) = create_store();
 
-		let key1 = Bytes::from("key1");
-		let key2 = Bytes::from("key2");
-		let value1 = Bytes::from("baz");
-		let value2 = Bytes::from("bar");
+		let key1 = Vec::from("key1");
+		let key2 = Vec::from("key2");
+		let value1 = Vec::from("baz");
+		let value2 = Vec::from("bar");
 
 		// no conflict
 		{
@@ -1370,7 +1377,7 @@ mod tests {
 
 		// conflict when the read key was updated by another transaction
 		{
-			let key = Bytes::from("key3");
+			let key = Vec::from("key3");
 
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
@@ -1393,11 +1400,11 @@ mod tests {
 	async fn ryow() {
 		let (store, _) = create_store();
 
-		let key1 = Bytes::from("k1");
-		let key2 = Bytes::from("k2");
-		let key3 = Bytes::from("k3");
-		let value1 = Bytes::from("v1");
-		let value2 = Bytes::from("v2");
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let key3 = Vec::from("k3");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
 
 		// Set a key, delete it and read it in the same transaction. Should return None.
 		{
@@ -1420,10 +1427,10 @@ mod tests {
 			// Start a new read-write transaction (txn)
 			let mut txn = store.begin().unwrap();
 			txn.set(&key1, &value2).unwrap();
-			assert_eq!(txn.get(&key1).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn.get(&key1).unwrap().unwrap(), &value2);
 			assert!(txn.get(&key3).unwrap().is_none());
 			txn.set(&key2, &value1).unwrap();
-			assert_eq!(txn.get(&key2).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn.get(&key2).unwrap().unwrap(), &value1);
 			txn.commit().await.unwrap();
 		}
 	}
@@ -1432,10 +1439,10 @@ mod tests {
 	async fn create_hermitage_store() -> Tree {
 		let (store, _) = create_store();
 
-		let key1 = Bytes::from("k1");
-		let key2 = Bytes::from("k2");
-		let value1 = Bytes::from("v1");
-		let value2 = Bytes::from("v2");
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
 		// Start a new read-write transaction (txn)
 		let mut txn = store.begin().unwrap();
 		txn.set(&key1, &value1).unwrap();
@@ -1452,12 +1459,12 @@ mod tests {
 	#[test(tokio::test)]
 	async fn g0_tests() {
 		let store = create_hermitage_store().await;
-		let key1 = Bytes::from("k1");
-		let key2 = Bytes::from("k2");
-		let value3 = Bytes::from("v3");
-		let value4 = Bytes::from("v4");
-		let value5 = Bytes::from("v5");
-		let value6 = Bytes::from("v6");
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value3 = Vec::from("v3");
+		let value4 = Vec::from("v4");
+		let value5 = Vec::from("v5");
+		let value6 = Vec::from("v6");
 
 		{
 			let mut txn1 = store.begin().unwrap();
@@ -1487,9 +1494,9 @@ mod tests {
 		{
 			let txn3 = store.begin().unwrap();
 			let val1 = txn3.get(&key1).unwrap().unwrap();
-			assert_eq!(val1.as_ref(), value3.as_ref());
+			assert_eq!(&val1, &value3);
 			let val2 = txn3.get(&key2).unwrap().unwrap();
-			assert_eq!(val2.as_ref(), value5.as_ref());
+			assert_eq!(&val2, &value5);
 		}
 	}
 
@@ -1498,8 +1505,8 @@ mod tests {
 	async fn p4() {
 		let store = create_hermitage_store().await;
 
-		let key1 = Bytes::from("k1");
-		let value3 = Bytes::from("v3");
+		let key1 = Vec::from("k1");
+		let value3 = Vec::from("v3");
 
 		{
 			let mut txn1 = store.begin().unwrap();
@@ -1526,26 +1533,26 @@ mod tests {
 	async fn g_single_tests() {
 		let store = create_hermitage_store().await;
 
-		let key1 = Bytes::from("k1");
-		let key2 = Bytes::from("k2");
-		let value1 = Bytes::from("v1");
-		let value2 = Bytes::from("v2");
-		let value3 = Bytes::from("v3");
-		let value4 = Bytes::from("v4");
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
+		let value3 = Vec::from("v3");
+		let value4 = Vec::from("v4");
 
 		{
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
 
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn2.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
+			assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
+			assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2);
 			txn2.set(&key1, &value3).unwrap();
 			txn2.set(&key2, &value4).unwrap();
 
 			txn2.commit().await.unwrap();
 
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
 			txn1.commit().await.unwrap();
 		}
 	}
@@ -1643,15 +1650,15 @@ mod tests {
 		let (store, _) = create_store();
 
 		// Define key-value pairs for the test
-		let key1 = Bytes::copy_from_slice(&[
+		let key1 = Vec::from(&[
 			47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72,
 			52,
 		]);
-		let key2 = Bytes::copy_from_slice(&[
+		let key2 = Vec::from(&[
 			47, 33, 104, 98, 0, 0, 1, 141, 141, 42, 113, 8, 47, 166, 192, 229, 30, 101, 24, 73,
 			242, 185, 36, 233, 242, 54, 96, 72, 52,
 		]);
-		let value1 = Bytes::from("baz");
+		let value1 = Vec::from("baz");
 
 		{
 			// Start a new read-write transaction (txn)
@@ -1661,7 +1668,7 @@ mod tests {
 			txn.commit().await.unwrap();
 		}
 
-		let key3 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+		let key3 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
 		{
 			// Start a new read-write transaction (txn)
 			let mut txn = store.begin().unwrap();
@@ -1669,44 +1676,35 @@ mod tests {
 			txn.commit().await.unwrap();
 		}
 
-		let key4 = Bytes::copy_from_slice(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
+		let key4 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
 		let txn1 = store.begin().unwrap();
 		txn1.get(&key4).unwrap();
 
 		{
 			let mut txn2 = store.begin().unwrap();
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn2.get(Bytes::copy_from_slice(&[
-				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
-			]))
-			.unwrap();
-			txn2.get(Bytes::copy_from_slice(&[
-				47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0,
-			]))
-			.unwrap();
-			txn2.set(
-				Bytes::copy_from_slice(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]),
-				&value1,
-			)
-			.unwrap();
+			txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+			txn2.get(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0])).unwrap();
+			txn2.set(Vec::from(&[47, 33, 110, 115, 116, 101, 115, 116, 45, 110, 115, 0]), &value1)
+				.unwrap();
 
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
 			txn2.set(
-				Bytes::copy_from_slice(&[
+				Vec::from(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
 					72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
 					69, 0,
@@ -1715,20 +1713,20 @@ mod tests {
 			)
 			.unwrap();
 
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
 			txn2.set(
-				Bytes::copy_from_slice(&[
+				Vec::from(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71,
 					72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 					42, 117, 115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
@@ -1737,7 +1735,7 @@ mod tests {
 			)
 			.unwrap();
 
-			txn2.get(Bytes::copy_from_slice(&[
+			txn2.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
@@ -1748,36 +1746,36 @@ mod tests {
 
 		{
 			let mut txn3 = store.begin().unwrap();
-			txn3.get(Bytes::copy_from_slice(&[
+			txn3.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
-			txn3.get(Bytes::copy_from_slice(&[
+			txn3.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 33, 116,
 				98, 117, 115, 101, 114, 0,
 			]))
 			.unwrap();
-			txn3.delete(Bytes::copy_from_slice(&[
+			txn3.delete(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 42, 48, 49, 72, 80, 54, 72, 71, 72,
 				50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0, 42, 117,
 				115, 101, 114, 0, 42, 0, 0, 0, 1, 106, 111, 104, 110, 0,
 			]))
 			.unwrap();
-			txn3.get(Bytes::copy_from_slice(&[
+			txn3.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
-			txn3.get(Bytes::copy_from_slice(&[
+			txn3.get(Vec::from(&[
 				47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54, 72,
 				71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74, 69, 0,
 			]))
 			.unwrap();
 			txn3.set(
-				Bytes::copy_from_slice(&[
+				Vec::from(&[
 					47, 42, 116, 101, 115, 116, 45, 110, 115, 0, 33, 100, 98, 48, 49, 72, 80, 54,
 					72, 71, 72, 50, 50, 51, 89, 82, 49, 54, 51, 90, 52, 78, 56, 72, 69, 90, 80, 74,
 					69, 0,
@@ -1794,9 +1792,9 @@ mod tests {
 		let (store, _) = create_store();
 
 		// Define key-value pairs for the test
-		let key1 = Bytes::from("foo1");
-		let value = Bytes::from("baz");
-		let key2 = Bytes::from("foo2");
+		let key1 = Vec::from("foo1");
+		let value = Vec::from("baz");
+		let key2 = Vec::from("foo2");
 
 		{
 			// Start a new read-write transaction (txn1)
@@ -1819,7 +1817,7 @@ mod tests {
 			let val = txn3.get(&key1).unwrap();
 			assert!(val.is_none());
 			let val = txn3.get(&key2).unwrap().unwrap();
-			assert_eq!(val.as_ref(), value.as_ref());
+			assert_eq!(&val, &value);
 		}
 
 		// Start a read-only transaction (txn4)
@@ -1827,7 +1825,7 @@ mod tests {
 		let val = txn4.get(&key1).unwrap();
 		assert!(val.is_none());
 		let val = txn4.get(&key2).unwrap().unwrap();
-		assert_eq!(val.as_ref(), value.as_ref());
+		assert_eq!(&val, &value);
 	}
 
 	#[test(tokio::test)]
@@ -1835,9 +1833,9 @@ mod tests {
 		let (store, _) = create_store();
 
 		// Key-value pair for the test
-		let key = Bytes::from("test_key");
-		let value1 = Bytes::from("test_value1");
-		let value2 = Bytes::from("test_value2");
+		let key = Vec::from("test_key");
+		let value1 = Vec::from("test_value1");
+		let value2 = Vec::from("test_value2");
 
 		// Insert key-value pair in a new transaction
 		{
@@ -1888,10 +1886,10 @@ mod tests {
 				tx.range(b"key2", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
-			assert_eq!(range[0].0.as_ref(), b"key2");
-			assert_eq!(range[0].1.as_ref(), b"value2");
-			assert_eq!(range[1].0.as_ref(), b"key3");
-			assert_eq!(range[1].1.as_ref(), b"value3");
+			assert_eq!(&range[0].0, b"key2");
+			assert_eq!(&range[0].1, b"value2");
+			assert_eq!(&range[1].0, b"key3");
+			assert_eq!(&range[1].1, b"value3");
 		}
 	}
 
@@ -1917,9 +1915,9 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(beg, b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key2");
-			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key2");
+			assert_eq!(&range[2].0, b"key3");
 		}
 
 		// Test range with both bounds as empty
@@ -1958,9 +1956,9 @@ mod tests {
 				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key01");
-			assert_eq!(range[1].0.as_ref(), b"key02");
-			assert_eq!(range[2].0.as_ref(), b"key03");
+			assert_eq!(&range[0].0, b"key01");
+			assert_eq!(&range[1].0, b"key02");
+			assert_eq!(&range[2].0, b"key03");
 		}
 	}
 
@@ -1993,11 +1991,11 @@ mod tests {
 				tx.range(b"a", b"f").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 5);
-			assert_eq!(range[0], (Bytes::from_static(b"a"), Bytes::from_static(b"1")));
-			assert_eq!(range[1], (Bytes::from_static(b"b"), Bytes::from_static(b"2")));
-			assert_eq!(range[2], (Bytes::from_static(b"c"), Bytes::from_static(b"3_modified")));
-			assert_eq!(range[3], (Bytes::from_static(b"d"), Bytes::from_static(b"4")));
-			assert_eq!(range[4], (Bytes::from_static(b"e"), Bytes::from_static(b"5")));
+			assert_eq!(range[0], (Vec::from(b"a"), Vec::from(b"1")));
+			assert_eq!(range[1], (Vec::from(b"b"), Vec::from(b"2")));
+			assert_eq!(range[2], (Vec::from(b"c"), Vec::from(b"3_modified")));
+			assert_eq!(range[3], (Vec::from(b"d"), Vec::from(b"4")));
+			assert_eq!(range[4], (Vec::from(b"e"), Vec::from(b"5")));
 		}
 	}
 
@@ -2029,9 +2027,9 @@ mod tests {
 				tx.range(b"key1", b"key6").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key3");
-			assert_eq!(range[2].0.as_ref(), b"key5");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key3");
+			assert_eq!(&range[2].0, b"key5");
 		}
 	}
 
@@ -2061,7 +2059,7 @@ mod tests {
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[1], (Bytes::from_static(b"key2"), Bytes::from_static(b"new_value2")));
+			assert_eq!(range[1], (Vec::from(b"key2"), Vec::from(b"new_value2")));
 		}
 	}
 
@@ -2111,7 +2109,7 @@ mod tests {
 			assert_eq!(range.len(), 5);
 			for (i, item) in range.iter().enumerate().take(5) {
 				let expected_key = format!("key{}", i + 1);
-				assert_eq!(item.0.as_ref(), expected_key.as_bytes());
+				assert_eq!(&item.0, expected_key.as_bytes());
 			}
 		}
 	}
@@ -2138,8 +2136,8 @@ mod tests {
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[2].0, b"key3");
 		}
 
 		// Test single key range ([key2, key3) to include only key2)
@@ -2149,7 +2147,7 @@ mod tests {
 				tx.range(b"key2", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(&range[0].0, b"key2");
 		}
 	}
 
@@ -2173,7 +2171,7 @@ mod tests {
 				.collect::<Vec<_>>();
 
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].1.as_ref(), b"value3"); // Latest value
+			assert_eq!(&range[0].1, b"value3"); // Latest value
 		}
 	}
 
@@ -2209,7 +2207,7 @@ mod tests {
 			// Check the keys are in order
 			for (i, key) in keys_only.iter().enumerate().take(6) {
 				let expected_key = format!("key{}", i + 1);
-				assert_eq!(key.as_ref(), expected_key.as_bytes());
+				assert_eq!(key.as_slice(), expected_key.as_bytes());
 			}
 
 			// Compare with regular range
@@ -2226,14 +2224,14 @@ mod tests {
 				if i < 5 {
 					// For keys from storage, check regular values are correct
 					assert_eq!(
-						regular_range[i].1.as_ref(),
+						regular_range[i].1.as_slice(),
 						format!("value{}", i + 1).as_bytes(),
 						"Regular range should have correct values from storage"
 					);
 				} else {
 					// For the key from write set
 					assert_eq!(
-						regular_range[i].1.as_ref(),
+						regular_range[i].1.as_slice(),
 						b"value6",
 						"Regular range should have correct value from write set"
 					);
@@ -2299,17 +2297,17 @@ mod tests {
 			let retrieved3 = txn.get(key3).unwrap().unwrap();
 
 			assert_eq!(
-				retrieved1.as_ref(),
+				retrieved1.as_slice(),
 				large_value1.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
 			assert_eq!(
-				retrieved2.as_ref(),
+				retrieved2.as_slice(),
 				large_value2.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
 			assert_eq!(
-				retrieved3.as_ref(),
+				retrieved3.as_slice(),
 				large_value3.as_bytes(),
 				"get() should resolve value pointers correctly"
 			);
@@ -2339,11 +2337,11 @@ mod tests {
 					_ => panic!("Unexpected index"),
 				};
 
-				assert_eq!(returned_key.as_ref(), expected_key, "Key mismatch in range result");
+				assert_eq!(returned_key.as_slice(), expected_key, "Key mismatch in range result");
 
 				// The returned value should be the actual value, not a value pointer
 				assert_eq!(
-					returned_value.as_ref(),
+					returned_value.as_slice(),
 					expected_value.as_bytes(),
 					"Range should return resolved values, not value pointers. \
                      Expected actual value of {} bytes, but got a different value",
@@ -2355,8 +2353,9 @@ mod tests {
 
 	// Double-ended iterator tests
 	mod double_ended_iterator_tests {
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		#[test(tokio::test)]
 		async fn test_reverse_iteration_basic() {
@@ -2389,7 +2388,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key4");
@@ -2434,7 +2433,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key6");
 				assert_eq!(keys[1], b"key5");
@@ -2481,7 +2480,7 @@ mod tests {
 
 				// Check that keys are in reverse order and deleted keys are excluded
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key3");
@@ -2529,7 +2528,7 @@ mod tests {
 
 				// Check that keys are in reverse order and soft deleted keys are excluded
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key5");
 				assert_eq!(keys[1], b"key3");
@@ -2569,7 +2568,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key10");
 				assert_eq!(keys[1], b"key09");
@@ -2605,8 +2604,7 @@ mod tests {
 				assert_eq!(reverse_results.len(), 3);
 
 				// Check that keys are in reverse order
-				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().to_vec()).collect();
+				let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap()).collect();
 
 				assert_eq!(keys[0], b"key3");
 				assert_eq!(keys[1], b"key2");
@@ -2653,7 +2651,7 @@ mod tests {
 
 				// Check that keys are in reverse order
 				let keys: Vec<Vec<u8>> =
-					reverse_results.into_iter().map(|r| r.unwrap().0.to_vec()).collect();
+					reverse_results.into_iter().map(|r| r.unwrap().0).collect();
 
 				assert_eq!(keys[0], b"key6");
 				assert_eq!(keys[1], b"key5");
@@ -2736,20 +2734,21 @@ mod tests {
 
 	// Savepoint tests
 	mod savepoint_tests {
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		#[test(tokio::test)]
 		async fn multiple_savepoints() {
 			let (store, _) = create_store();
 
 			// Key-value pair for the test
-			let key1 = Bytes::from("test_key1");
-			let value1 = Bytes::from("test_value1");
-			let key2 = Bytes::from("test_key2");
-			let value2 = Bytes::from("test_value2");
-			let key3 = Bytes::from("test_key3");
-			let value3 = Bytes::from("test_value3");
+			let key1 = Vec::from("test_key1");
+			let value1 = Vec::from("test_value1");
+			let key2 = Vec::from("test_key2");
+			let value2 = Vec::from("test_value2");
+			let key3 = Vec::from("test_key3");
+			let value3 = Vec::from("test_value3");
 
 			// Start the transaction and write key1.
 			let mut txn1 = store.begin().unwrap();
@@ -2767,21 +2766,21 @@ mod tests {
 			txn1.set(&key3, &value3).unwrap();
 
 			// Just a sanity check that all three keys are present.
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
-			assert_eq!(txn1.get(&key3).unwrap().unwrap().as_ref(), value3.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
+			assert_eq!(&txn1.get(&key3).unwrap().unwrap(), &value3);
 
 			// Rollback to the latest (second) savepoint. This should make key3
 			// go away while keeping key1 and key2.
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&key2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&key2).unwrap().unwrap(), &value2);
 			assert!(txn1.get(&key3).unwrap().is_none());
 
 			// Now roll back to the first savepoint. This should only
 			// keep key1 around.
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn1.get(&key1).unwrap().unwrap(), &value1);
 			assert!(txn1.get(&key2).unwrap().is_none());
 			assert!(txn1.get(&key3).unwrap().is_none());
 
@@ -2797,7 +2796,7 @@ mod tests {
 
 			// Start another transaction and check again for the keys.
 			let txn2 = store.begin().unwrap();
-			assert_eq!(txn2.get(&key1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn2.get(&key1).unwrap().unwrap(), &value1);
 			assert!(txn2.get(&key2).unwrap().is_none());
 			assert!(txn2.get(&key3).unwrap().is_none());
 		}
@@ -2806,10 +2805,10 @@ mod tests {
 		async fn savepoint_rollback_on_updated_key() {
 			let (store, _) = create_store();
 
-			let k1 = Bytes::from("k1");
-			let value1 = Bytes::from("value1");
-			let value2 = Bytes::from("value2");
-			let value3 = Bytes::from("value3");
+			let k1 = Vec::from("k1");
+			let value1 = Vec::from("value1");
+			let value2 = Vec::from("value2");
+			let value3 = Vec::from("value3");
 
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&k1, &value1).unwrap();
@@ -2819,16 +2818,16 @@ mod tests {
 			txn1.rollback_to_savepoint().unwrap();
 
 			// The read value should be the one before the savepoint.
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value2);
 		}
 
 		#[test(tokio::test)]
 		async fn savepoint_rollback_with_range_scan() {
 			let (store, _) = create_store();
 
-			let k1 = Bytes::from("k1");
-			let value = Bytes::from("value1");
-			let value2 = Bytes::from("value2");
+			let k1 = Vec::from("k1");
+			let value = Vec::from("value1");
+			let value2 = Vec::from("value2");
 
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&k1, &value).unwrap();
@@ -2840,18 +2839,18 @@ mod tests {
 			let range: Vec<_> =
 				txn1.range(b"k1", b"k3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1);
-			assert_eq!(range[0].0.as_ref(), k1.as_ref());
-			assert_eq!(range[0].1.as_ref(), value.as_ref());
+			assert_eq!(&range[0].0, &k1);
+			assert_eq!(&range[0].1, &value);
 		}
 
 		#[test(tokio::test)]
 		async fn savepoint_with_deletes() {
 			let (store, _) = create_store();
 
-			let k1 = Bytes::from("k1");
-			let k2 = Bytes::from("k2");
-			let value1 = Bytes::from("value1");
-			let value2 = Bytes::from("value2");
+			let k1 = Vec::from("k1");
+			let k2 = Vec::from("k2");
+			let value1 = Vec::from("value1");
+			let value2 = Vec::from("value2");
 
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&k1, &value1).unwrap();
@@ -2864,26 +2863,26 @@ mod tests {
 
 			// Verify the changes
 			assert!(txn1.get(&k1).unwrap().is_none());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), b"modified");
+			assert_eq!(txn1.get(&k2).unwrap().unwrap(), b"modified");
 
 			// Rollback to savepoint
 			txn1.rollback_to_savepoint().unwrap();
 
 			// Verify original values are restored
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
 		}
 
 		#[test(tokio::test)]
 		async fn savepoint_nested_operations() {
 			let (store, _) = create_store();
 
-			let k1 = Bytes::from("k1");
-			let k2 = Bytes::from("k2");
-			let k3 = Bytes::from("k3");
-			let value1 = Bytes::from("value1");
-			let value2 = Bytes::from("value2");
-			let value3 = Bytes::from("value3");
+			let k1 = Vec::from("k1");
+			let k2 = Vec::from("k2");
+			let k3 = Vec::from("k3");
+			let value1 = Vec::from("value1");
+			let value2 = Vec::from("value2");
+			let value3 = Vec::from("value3");
 
 			let mut txn1 = store.begin().unwrap();
 			txn1.set(&k1, &value1).unwrap();
@@ -2898,13 +2897,13 @@ mod tests {
 
 			// Rollback to second savepoint (should remove k3)
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
-			assert_eq!(txn1.get(&k2).unwrap().unwrap().as_ref(), value2.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
+			assert_eq!(&txn1.get(&k2).unwrap().unwrap(), &value2);
 			assert!(txn1.get(&k3).unwrap().is_none());
 
 			// Rollback to first savepoint (should remove k2)
 			txn1.rollback_to_savepoint().unwrap();
-			assert_eq!(txn1.get(&k1).unwrap().unwrap().as_ref(), value1.as_ref());
+			assert_eq!(&txn1.get(&k1).unwrap().unwrap(), &value1);
 			assert!(txn1.get(&k2).unwrap().is_none());
 			assert!(txn1.get(&k3).unwrap().is_none());
 
@@ -2932,9 +2931,9 @@ mod tests {
 		// Verify data is visible
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
-			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
+			assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
 		// Soft delete key2
@@ -2947,19 +2946,20 @@ mod tests {
 		// Verify soft deleted key is not visible in reads
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
 			assert!(tx.get(b"key2").unwrap().is_none()); // Should be None after soft delete
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
-		// Verify soft deleted key is not visible in range scans ([key1, key4) to include key3)
+		// Verify soft deleted key is not visible in range scans ([key1, key4) to
+		// include key3)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
-			assert_eq!(range[0].0.as_ref(), b"key1");
-			assert_eq!(range[1].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[1].0, b"key3");
 		}
 	}
 
@@ -2989,7 +2989,7 @@ mod tests {
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
 			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3");
 		}
 
 		// Both should be invisible to range scans ([key1, key4) to include key3)
@@ -2998,7 +2998,7 @@ mod tests {
 			let range: Vec<_> =
 				tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key3
-			assert_eq!(range[0].0.as_ref(), b"key3");
+			assert_eq!(&range[0].0, b"key3");
 		}
 	}
 
@@ -3025,11 +3025,12 @@ mod tests {
 			// The key should appear as if it doesn't exist
 			assert!(tx.get(b"key1").unwrap().is_none());
 
-			// Range scan within transaction should not see soft deleted key ([key1, key3) to include key2)
+			// Range scan within transaction should not see soft deleted key ([key1, key3)
+			// to include key2)
 			let range: Vec<_> =
 				tx.range(b"key1", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 1); // Only key2
-			assert_eq!(range[0].0.as_ref(), b"key2");
+			assert_eq!(&range[0].0, b"key2");
 
 			tx.commit().await.unwrap();
 		}
@@ -3038,7 +3039,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none());
-			assert_eq!(tx.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+			assert_eq!(tx.get(b"key2").unwrap().unwrap(), b"value2");
 		}
 	}
 
@@ -3076,7 +3077,7 @@ mod tests {
 		// Verify the new value is visible
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1_new");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1_new");
 		}
 	}
 
@@ -3104,7 +3105,8 @@ mod tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Range scan should not include soft deleted keys ([key01, key11) to include key10)
+		// Range scan should not include soft deleted keys ([key01, key11) to include
+		// key10)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
@@ -3115,7 +3117,7 @@ mod tests {
 
 			// Verify specific keys are present/absent
 			let keys: std::collections::HashSet<_> =
-				range.iter().map(|(k, _)| k.as_ref()).collect();
+				range.iter().map(|(k, _)| k.as_slice()).collect();
 			assert!(keys.contains(&b"key01".as_ref()));
 			assert!(!keys.contains(&b"key02".as_ref())); // Soft deleted
 			assert!(keys.contains(&b"key03".as_ref()));
@@ -3158,18 +3160,19 @@ mod tests {
 			let tx = store.begin().unwrap();
 			assert!(tx.get(b"key1").unwrap().is_none()); // Soft deleted
 			assert!(tx.get(b"key2").unwrap().is_none()); // Hard deleted
-			assert_eq!(tx.get(b"key3").unwrap().unwrap().as_ref(), b"value3_updated"); // Updated
-			assert_eq!(tx.get(b"key4").unwrap().unwrap().as_ref(), b"value4"); // Unchanged
+			assert_eq!(tx.get(b"key3").unwrap().unwrap(), b"value3_updated"); // Updated
+			assert_eq!(tx.get(b"key4").unwrap().unwrap(), b"value4"); // Unchanged
 		}
 
-		// Range scan should only see updated and unchanged keys ([key1, key5) to include key4)
+		// Range scan should only see updated and unchanged keys ([key1, key5) to
+		// include key4)
 		{
 			let tx = store.begin().unwrap();
 			let range: Vec<_> =
 				tx.range(b"key1", b"key5").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
 			assert_eq!(range.len(), 2); // Only key3 and key4
-			assert_eq!(range[0].0.as_ref(), b"key3");
-			assert_eq!(range[1].0.as_ref(), b"key4");
+			assert_eq!(&range[0].0, b"key3");
+			assert_eq!(&range[1].0, b"key4");
 		}
 	}
 
@@ -3199,7 +3202,7 @@ mod tests {
 		// After rollback, key should be visible again
 		{
 			let tx = store.begin().unwrap();
-			assert_eq!(tx.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(tx.get(b"key1").unwrap().unwrap(), b"value1");
 		}
 	}
 
@@ -3226,7 +3229,7 @@ mod tests {
 		// Test regular get (should return latest)
 		let tx = tree.begin().unwrap();
 		let value = tx.get(b"key1").unwrap();
-		assert_eq!(value, Some(Bytes::from_static(b"value1_v2")));
+		assert_eq!(value, Some(Vec::from(b"value1_v2")));
 
 		// Get all versions to verify timestamps and values
 		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
@@ -3237,16 +3240,16 @@ mod tests {
 		let v2 = versions.iter().find(|(_, _, timestamp, _)| *timestamp == ts2).unwrap();
 
 		// Verify values match timestamps
-		assert_eq!(v1.1.as_ref(), b"value1_v1");
-		assert_eq!(v2.1.as_ref(), b"value1_v2");
+		assert_eq!(&v1.1, b"value1_v1");
+		assert_eq!(&v2.1, b"value1_v2");
 
 		// Test get at specific timestamp (earlier version)
 		let value_at_ts1 = tx.get_at_version(b"key1", ts1).unwrap();
-		assert_eq!(value_at_ts1, Some(Bytes::from_static(b"value1_v1")));
+		assert_eq!(value_at_ts1, Some(Vec::from(b"value1_v1")));
 
 		// Test get at later timestamp (should return latest version as of that time)
 		let value_at_ts2 = tx.get_at_version(b"key1", ts2).unwrap();
-		assert_eq!(value_at_ts2, Some(Bytes::from_static(b"value1_v2")));
+		assert_eq!(value_at_ts2, Some(Vec::from(b"value1_v2")));
 	}
 
 	#[test(tokio::test)]
@@ -3287,8 +3290,8 @@ mod tests {
 		let val1 = &all_versions[0];
 		let val2 = &all_versions[1];
 		assert!(val1.2 < val2.2);
-		assert_eq!(val1.1.as_ref(), b"value1");
-		assert_eq!(val2.1.as_ref(), b"value2");
+		assert_eq!(&val1.1, b"value1");
+		assert_eq!(&val2.1, b"value2");
 
 		// Test range_at_version with specific timestamp to get point-in-time view
 		let version_at_ts1 = tx
@@ -3297,7 +3300,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts1.len(), 1);
-		assert_eq!(version_at_ts1[0].1.as_ref(), b"value1");
+		assert_eq!(&version_at_ts1[0].1, b"value1");
 
 		let version_at_ts2 = tx
 			.range_at_version(b"key1", b"key2", ts2)
@@ -3305,7 +3308,7 @@ mod tests {
 			.collect::<std::result::Result<Vec<_>, _>>()
 			.unwrap();
 		assert_eq!(version_at_ts2.len(), 1);
-		assert_eq!(version_at_ts2[0].1.as_ref(), b"value2");
+		assert_eq!(&version_at_ts2[0].1, b"value2");
 
 		// Test with timestamp after delete - should show nothing
 		let version_at_ts3 = tx
@@ -3332,12 +3335,12 @@ mod tests {
 		// Verify we can get the value at that timestamp
 		let tx = tree.begin().unwrap();
 		let value = tx.get_at_version(b"key1", custom_timestamp).unwrap();
-		assert_eq!(value, Some(Bytes::from_static(b"value1")));
+		assert_eq!(value, Some(Vec::from(b"value1")));
 
 		// Verify we can get the value at a later timestamp
 		let later_timestamp = custom_timestamp + 1000000;
 		let value = tx.get_at_version(b"key1", later_timestamp).unwrap();
-		assert_eq!(value, Some(Bytes::from_static(b"value1")));
+		assert_eq!(value, Some(Vec::from(b"value1")));
 
 		// Verify we can't get the value at an earlier timestamp
 		let earlier_timestamp = custom_timestamp - 5;
@@ -3348,7 +3351,7 @@ mod tests {
 		let versions = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
 		assert_eq!(versions.len(), 1);
 		assert_eq!(versions[0].2, custom_timestamp); // Check the timestamp
-		assert_eq!(versions[0].1.as_ref(), b"value1"); // Check the value
+		assert_eq!(&versions[0].1, b"value1"); // Check the value
 	}
 
 	#[test(tokio::test)]
@@ -3377,7 +3380,7 @@ mod tests {
 				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
-		assert_eq!(value, Some(Bytes::from_static(b"value1")));
+		assert_eq!(value, Some(Vec::from(b"value1")));
 
 		// Test soft_delete_with_options with timestamp
 		let delete_timestamp = 200;
@@ -3389,7 +3392,8 @@ mod tests {
 		.unwrap();
 		tx.commit().await.unwrap();
 
-		// Verify the value exists at the earlier timestamp but not at the delete timestamp
+		// Verify the value exists at the earlier timestamp but not at the delete
+		// timestamp
 		let tx = tree.begin().unwrap();
 		let value_before = tx
 			.get_with_options(
@@ -3397,7 +3401,7 @@ mod tests {
 				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
-		assert_eq!(value_before, Some(Bytes::from_static(b"value1")));
+		assert_eq!(value_before, Some(Vec::from(b"value1")));
 
 		let value_after = tx
 			.get_with_options(
@@ -3500,19 +3504,19 @@ mod tests {
 		let keys_at_ts1: Vec<_> =
 			tx.keys_at_version(b"key1", b"key5", ts1).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts1.len(), 3);
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_at_ts1.iter().any(|k| k.as_ref() == b"key3"));
-		assert!(!keys_at_ts1.iter().any(|k| k.as_ref() == b"key4")); // key4 didn't exist at ts1
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_at_ts1.iter().any(|k| k.as_slice() == b"key3"));
+		assert!(!keys_at_ts1.iter().any(|k| k.as_slice() == b"key4")); // key4 didn't exist at ts1
 
 		// Test keys_at_version at second timestamp
 		let keys_at_ts2: Vec<_> =
 			tx.keys_at_version(b"key1", b"key5", ts2).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_at_ts2.len(), 4);
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key3"));
-		assert!(keys_at_ts2.iter().any(|k| k.as_ref() == b"key4"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key3"));
+		assert!(keys_at_ts2.iter().any(|k| k.as_slice() == b"key4"));
 
 		// Test with .take()
 		let keys_limited: Vec<_> = tx
@@ -3527,8 +3531,8 @@ mod tests {
 		let keys_range: Vec<_> =
 			tx.keys_at_version(b"key2", b"key4", ts2).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys_range.len(), 2);
-		assert!(keys_range.iter().any(|k| k.as_ref() == b"key2"));
-		assert!(keys_range.iter().any(|k| k.as_ref() == b"key3"));
+		assert!(keys_range.iter().any(|k| k.as_slice() == b"key2"));
+		assert!(keys_range.iter().any(|k| k.as_slice() == b"key3"));
 	}
 
 	#[test(tokio::test)]
@@ -3557,9 +3561,9 @@ mod tests {
 		let keys: Vec<_> =
 			tx.keys_at_version(b"key1", b"key4", u64::MAX).unwrap().map(|r| r.unwrap()).collect();
 		assert_eq!(keys.len(), 1, "Should have only 1 key after deletes");
-		assert!(keys.iter().any(|k| k.as_ref() == b"key1"));
-		assert!(!keys.iter().any(|k| k.as_ref() == b"key2")); // Hard deleted
-		assert!(!keys.iter().any(|k| k.as_ref() == b"key3")); // Soft deleted
+		assert!(keys.iter().any(|k| k.as_slice() == b"key1"));
+		assert!(!keys.iter().any(|k| k.as_slice() == b"key2")); // Hard deleted
+		assert!(!keys.iter().any(|k| k.as_slice() == b"key3")); // Soft deleted
 	}
 
 	#[test(tokio::test)]
@@ -3599,10 +3603,10 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts1 {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
+				b"key2" => assert_eq!(value.as_slice(), b"value2"),
+				b"key3" => assert_eq!(value.as_slice(), b"value3"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3622,11 +3626,11 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_at_ts2 {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
-				b"key2" => assert_eq!(value.as_ref(), b"value2_updated"),
-				b"key3" => assert_eq!(value.as_ref(), b"value3"),
-				b"key4" => assert_eq!(value.as_ref(), b"value4"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
+				b"key2" => assert_eq!(value.as_slice(), b"value2_updated"),
+				b"key3" => assert_eq!(value.as_slice(), b"value3"),
+				b"key4" => assert_eq!(value.as_slice(), b"value4"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3709,8 +3713,8 @@ mod tests {
 		let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 		for (key, value) in &scan_result {
 			found_keys.insert(key.as_ref());
-			match key.as_ref() {
-				b"key1" => assert_eq!(value.as_ref(), b"value1"),
+			match key.as_slice() {
+				b"key1" => assert_eq!(value.as_slice(), b"value1"),
 				_ => panic!("Unexpected key: {:?}", key),
 			}
 		}
@@ -3899,8 +3903,7 @@ mod tests {
 		{
 			let tx = store.begin().unwrap();
 			let mut options = ReadOptions::default();
-			options.set_iterate_lower_bound(Some(b"key2".to_vec()));
-			options.set_iterate_upper_bound(Some(b"key4".to_vec()));
+			options.set_iterate_bounds(Some(b"key2".to_vec()), Some(b"key4".to_vec()));
 			let count = tx.count_with_options(&options).unwrap();
 			assert_eq!(count, 2); // key2, key3 (key4 is exclusive)
 		}
@@ -3934,16 +3937,17 @@ mod tests {
 		let all_versions = tx.scan_all_versions(b"key1", b"key5", None).unwrap();
 
 		// Should get all versions of all keys in the range
-		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of key4
+		assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of
+									 // key4
 
 		// Group by key to verify we have all versions
 		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
+			key_versions.entry(key).or_default().push((value.clone(), timestamp, is_tombstone));
 		}
 
 		// Verify key1 has 2 versions
-		let key1_versions = key_versions.get_mut(&Bytes::from_static(b"key1")).unwrap();
+		let key1_versions = key_versions.get_mut(&Vec::from(b"key1")).unwrap();
 		assert_eq!(key1_versions.len(), 2);
 		// Sort by timestamp to get chronological order
 		key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
@@ -3953,7 +3957,7 @@ mod tests {
 		assert!(!key1_versions[1].2); // Not tombstone
 
 		// Verify key2 has 2 versions
-		let key2_versions = key_versions.get_mut(&Bytes::from_static(b"key2")).unwrap();
+		let key2_versions = key_versions.get_mut(&Vec::from(b"key2")).unwrap();
 		assert_eq!(key2_versions.len(), 2);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
@@ -3962,13 +3966,13 @@ mod tests {
 		assert!(!key2_versions[1].2); // Not tombstone
 
 		// Verify key3 has 1 version
-		let key3_versions = &key_versions[&Bytes::from_static(b"key3")];
+		let key3_versions = &key_versions[&Vec::from(b"key3")];
 		assert_eq!(key3_versions.len(), 1);
 		assert_eq!(key3_versions[0].0, b"value3_v1");
 		assert!(!key3_versions[0].2); // Not tombstone
 
 		// Verify key4 has 1 version
-		let key4_versions = &key_versions[&Bytes::from_static(b"key4")];
+		let key4_versions = &key_versions[&Vec::from(b"key4")];
 		assert_eq!(key4_versions.len(), 1);
 		assert_eq!(key4_versions[0].0, b"value4_v1");
 		assert!(!key4_versions[0].2); // Not tombstone
@@ -4010,20 +4014,21 @@ mod tests {
 		let tx = tree.begin().unwrap();
 		let all_versions = tx.scan_all_versions(b"key1", b"key3", None).unwrap();
 
-		// Should get all versions including soft delete markers, exclude hard-deleted keys
+		// Should get all versions including soft delete markers, exclude hard-deleted
+		// keys
 		assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
 
 		// Group by key to verify we have all versions
 		let mut key_versions: KeyVersionsMap = HashMap::new();
 		for (key, value, timestamp, is_tombstone) in all_versions {
-			key_versions.entry(key).or_default().push((value.to_vec(), timestamp, is_tombstone));
+			key_versions.entry(key).or_default().push((value.clone(), timestamp, is_tombstone));
 		}
 
 		// Verify key1 is not present (hard deleted)
-		assert!(!key_versions.contains_key(&Bytes::from_static(b"key1")));
+		assert!(!key_versions.contains_key(&Vec::from(b"key1")));
 
 		// Verify key2 has 3 versions (2 regular values + 1 soft delete marker)
-		let key2_versions = key_versions.get_mut(&Bytes::from_static(b"key2")).unwrap();
+		let key2_versions = key_versions.get_mut(&Vec::from(b"key2")).unwrap();
 		assert_eq!(key2_versions.len(), 3);
 		key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
 		assert_eq!(key2_versions[0].0, b"value2_v1");
@@ -4052,8 +4057,9 @@ mod tests {
 	mod version_tests {
 		use std::collections::HashSet;
 
-		use super::*;
 		use test_log::test;
+
+		use super::*;
 
 		fn create_tree() -> (Tree, TempDir) {
 			let temp_dir = create_temp_directory();
@@ -4065,10 +4071,10 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_insert_multiple_versions_in_same_tx() {
 			let (store, _tmp_dir) = create_tree();
-			let key = Bytes::from("key1");
+			let key = Vec::from("key1");
 
 			// Insert multiple versions of the same key
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
@@ -4078,7 +4084,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4086,7 +4092,7 @@ mod tests {
 			assert_eq!(results.len(), values.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &key);
-				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(v, &values[i]);
 				assert_eq!(*version, (i + 1) as u64);
 				assert!(!(*is_deleted));
 			}
@@ -4095,10 +4101,10 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_single_key_multiple_versions() {
 			let (store, _tmp_dir) = create_tree();
-			let key = Bytes::from("key1");
+			let key = Vec::from("key1");
 
 			// Insert multiple versions of the same key
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
@@ -4108,7 +4114,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4116,7 +4122,7 @@ mod tests {
 			assert_eq!(results.len(), values.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &key);
-				assert_eq!(v.as_ref(), values[i].as_ref());
+				assert_eq!(v, &values[i]);
 				assert_eq!(*version, (i + 1) as u64);
 				assert!(!(*is_deleted));
 			}
@@ -4125,8 +4131,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_single_version_each() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let value = Bytes::from("value1");
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let value = Vec::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
@@ -4135,7 +4141,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4143,7 +4149,7 @@ mod tests {
 			assert_eq!(results.len(), keys.len());
 			for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
 				assert_eq!(k, &keys[i]);
-				assert_eq!(v.as_ref(), value.as_ref());
+				assert_eq!(v, &value);
 				assert_eq!(*version, 1);
 				assert!(!(*is_deleted));
 			}
@@ -4152,8 +4158,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			for key in &keys {
 				for (i, value) in values.iter().enumerate() {
@@ -4165,7 +4171,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4183,7 +4189,7 @@ mod tests {
 				let (expected_key, expected_value, expected_version, expected_is_deleted) =
 					expected;
 				assert_eq!(k, expected_key);
-				assert_eq!(v.as_ref(), expected_value.as_ref());
+				assert_eq!(&v, &expected_value);
 				assert_eq!(*version, *expected_version);
 				assert_eq!(*is_deleted, *expected_is_deleted);
 			}
@@ -4192,8 +4198,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_deleted_records() {
 			let (store, _tmp_dir) = create_tree();
-			let key = Bytes::from("key1");
-			let value = Bytes::from("value1");
+			let key = Vec::from("key1");
+			let value = Vec::from("value1");
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
@@ -4204,28 +4210,28 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 2);
 			let (k, v, version, is_deleted) = &results[0];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), value.as_ref());
+			assert_eq!(v, &value);
 			assert_eq!(*version, 1);
 			assert!(!(*is_deleted));
 
 			let (k, v, _, is_deleted) = &results[1];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), Bytes::new().as_ref());
+			assert_eq!(v, &Vec::<u8>::new());
 			assert!(*is_deleted);
 		}
 
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_single_version_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let value = Bytes::from("value1");
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let value = Vec::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
@@ -4240,7 +4246,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4251,10 +4257,10 @@ mod tests {
 				let is_deleted_version = i % 2 == 1;
 				assert_eq!(k, &keys[key_index]);
 				if is_deleted_version {
-					assert_eq!(v.as_ref(), &Bytes::new());
+					assert_eq!(v.as_slice(), &Vec::<u8>::new());
 					assert!(*is_deleted);
 				} else {
-					assert_eq!(v.as_ref(), &value);
+					assert_eq!(v.as_slice(), &value);
 					assert_eq!(*version, 1);
 					assert!(!(*is_deleted));
 				}
@@ -4264,8 +4270,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_multiple_keys_multiple_versions_each_deleted() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			for key in &keys {
 				for (i, value) in values.iter().enumerate() {
@@ -4283,7 +4289,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4293,7 +4299,7 @@ mod tests {
 				for (i, value) in values.iter().enumerate() {
 					expected_results.push((key.clone(), value.clone(), (i + 1) as u64, false));
 				}
-				expected_results.push((key.clone(), Bytes::new(), 0, true));
+				expected_results.push((key.clone(), Vec::new(), 0, true));
 			}
 
 			assert_eq!(results.len(), expected_results.len());
@@ -4302,7 +4308,7 @@ mod tests {
 				let (expected_key, expected_value, expected_version, expected_is_deleted) =
 					expected;
 				assert_eq!(k, expected_key);
-				assert_eq!(v.as_ref(), expected_value);
+				assert_eq!(&v, &expected_value);
 				if !expected_is_deleted {
 					assert_eq!(*version, *expected_version);
 				}
@@ -4313,8 +4319,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_soft_and_hard_delete() {
 			let (store, _tmp_dir) = create_tree();
-			let key = Bytes::from("key1");
-			let value = Bytes::from("value1");
+			let key = Vec::from("key1");
+			let value = Vec::from("value1");
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
@@ -4329,7 +4335,7 @@ mod tests {
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
@@ -4339,8 +4345,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_range_boundaries() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let value = Bytes::from("value1");
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let value = Vec::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
@@ -4350,7 +4356,7 @@ mod tests {
 
 			// Inclusive range
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, None).unwrap();
@@ -4360,8 +4366,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_limit() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let value = Bytes::from("value1");
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let value = Vec::from("value1");
 
 			for key in &keys {
 				let mut txn = store.begin().unwrap();
@@ -4370,7 +4376,7 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
@@ -4381,22 +4387,22 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_single_key_single_version() {
 			let (store, _tmp_dir) = create_tree();
-			let key = Bytes::from("key1");
-			let value = Bytes::from("value1");
+			let key = Vec::from("key1");
+			let value = Vec::from("value1");
 
 			let mut txn = store.begin().unwrap();
 			txn.set_at_version(&key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 
 			let txn = store.begin().unwrap();
-			let mut end_key = key.as_ref().to_vec();
+			let mut end_key = key.clone();
 			end_key.push(0);
 			let results: Vec<_> = txn.scan_all_versions(key.as_ref(), &end_key, None).unwrap();
 
 			assert_eq!(results.len(), 1);
 			let (k, v, version, is_deleted) = &results[0];
 			assert_eq!(k, &key);
-			assert_eq!(v.as_ref(), &value);
+			assert_eq!(v, &value);
 			assert_eq!(*version, 1);
 			assert!(!(*is_deleted));
 		}
@@ -4404,8 +4410,8 @@ mod tests {
 		#[test(tokio::test)]
 		async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
 			let (store, _tmp_dir) = create_tree();
-			let keys = vec![Bytes::from("key1"), Bytes::from("key2"), Bytes::from("key3")];
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			// Insert multiple versions for each key
 			for key in &keys {
@@ -4418,14 +4424,14 @@ mod tests {
 			}
 
 			let txn = store.begin().unwrap();
-			let mut end_key = keys.last().unwrap().as_ref().to_vec();
+			let mut end_key = keys.last().unwrap().clone();
 			end_key.push(0);
 			let results: Vec<_> =
 				txn.scan_all_versions(keys.first().unwrap().as_ref(), &end_key, Some(2)).unwrap();
 			assert_eq!(results.len(), 6); // Take 6 results
 
 			// Collect unique keys from the results
-			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
 
 			// Verify that the number of unique keys is equal to the limit
 			assert_eq!(unique_keys.len(), 2);
@@ -4448,15 +4454,15 @@ mod tests {
 		async fn test_scan_all_versions_with_subsets() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = vec![
-				Bytes::from("key1"),
-				Bytes::from("key2"),
-				Bytes::from("key3"),
-				Bytes::from("key4"),
-				Bytes::from("key5"),
-				Bytes::from("key6"),
-				Bytes::from("key7"),
+				Vec::from("key1"),
+				Vec::from("key2"),
+				Vec::from("key3"),
+				Vec::from("key4"),
+				Vec::from("key5"),
+				Vec::from("key6"),
+				Vec::from("key7"),
 			];
-			let values = [Bytes::from("value1"), Bytes::from("value2"), Bytes::from("value3")];
+			let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
 			// Insert multiple versions for each key
 			for key in &keys {
@@ -4470,23 +4476,23 @@ mod tests {
 
 			// Define subsets of the entire range
 			let subsets = vec![
-				(keys[0].as_ref(), keys[2].as_ref()),
-				(keys[1].as_ref(), keys[3].as_ref()),
-				(keys[2].as_ref(), keys[4].as_ref()),
-				(keys[3].as_ref(), keys[5].as_ref()),
-				(keys[4].as_ref(), keys[6].as_ref()),
+				(&keys[0], &keys[2]),
+				(&keys[1], &keys[3]),
+				(&keys[2], &keys[4]),
+				(&keys[3], &keys[5]),
+				(&keys[4], &keys[6]),
 			];
 
 			// Scan each subset and collect versions
 			for subset in subsets {
 				let txn = store.begin().unwrap();
-				let mut end_key = subset.1.to_vec();
+				let mut end_key = subset.1.clone();
 				end_key.push(0);
 				let results: Vec<_> = txn.scan_all_versions(subset.0, &end_key, None).unwrap();
 
 				// Collect unique keys from the results
 				let unique_keys: HashSet<_> =
-					results.iter().map(|(k, _, _, _)| k.to_vec()).collect();
+					results.iter().map(|(k, _, _, _)| k.clone()).collect();
 
 				// Verify that the results contain all versions for each key in the subset
 				for key in unique_keys {
@@ -4494,9 +4500,7 @@ mod tests {
 						let version = (i + 1) as u64;
 						let result = results
 							.iter()
-							.find(|(k, v, ver, _)| {
-								k == &key && v.as_ref() == value && *ver == version
-							})
+							.find(|(k, v, ver, _)| k == &key && v == value && *ver == version)
 							.unwrap();
 						assert_eq!(result.1.as_ref(), *value);
 						assert_eq!(result.2, version);
@@ -4529,11 +4533,11 @@ mod tests {
 			assert_eq!(
 				results,
 				vec![
-					(Bytes::from_static(b"key1"), Bytes::from_static(b"value1_v2"), 2, false),
-					(Bytes::from_static(b"key2"), Bytes::from_static(b"value2_v2"), 2, false),
-					(Bytes::from_static(b"key3"), Bytes::from_static(b"value3"), 1, false),
-					(Bytes::from_static(b"key4"), Bytes::from_static(b"value4"), 1, false),
-					(Bytes::from_static(b"key5"), Bytes::from_static(b"value5"), 1, false),
+					(Vec::from(b"key1"), Vec::from(b"value1_v2"), 2, false),
+					(Vec::from(b"key2"), Vec::from(b"value2_v2"), 2, false),
+					(Vec::from(b"key3"), Vec::from(b"value3"), 1, false),
+					(Vec::from(b"key4"), Vec::from(b"value4"), 1, false),
+					(Vec::from(b"key5"), Vec::from(b"value5"), 1, false),
 				]
 			);
 
@@ -4557,18 +4561,18 @@ mod tests {
 		async fn test_scan_all_versions_with_batches() {
 			let (store, _tmp_dir) = create_tree();
 			let keys = [
-				Bytes::from("key1"),
-				Bytes::from("key2"),
-				Bytes::from("key3"),
-				Bytes::from("key4"),
-				Bytes::from("key5"),
+				Vec::from("key1"),
+				Vec::from("key2"),
+				Vec::from("key3"),
+				Vec::from("key4"),
+				Vec::from("key5"),
 			];
 			let versions = [
-				vec![Bytes::from("v1"), Bytes::from("v2"), Bytes::from("v3"), Bytes::from("v4")],
-				vec![Bytes::from("v1"), Bytes::from("v2")],
-				vec![Bytes::from("v1"), Bytes::from("v2"), Bytes::from("v3"), Bytes::from("v4")],
-				vec![Bytes::from("v1")],
-				vec![Bytes::from("v1")],
+				vec![Vec::from("v1"), Vec::from("v2"), Vec::from("v3"), Vec::from("v4")],
+				vec![Vec::from("v1"), Vec::from("v2")],
+				vec![Vec::from("v1"), Vec::from("v2"), Vec::from("v3"), Vec::from("v4")],
+				vec![Vec::from("v1")],
+				vec![Vec::from("v1")],
 			];
 
 			// Insert multiple versions for each key
@@ -4588,7 +4592,7 @@ mod tests {
 			fn scan_in_batches(
 				store: &Tree,
 				batch_size: usize,
-			) -> Vec<Vec<(Bytes, Bytes, u64, bool)>> {
+			) -> Vec<Vec<(Key, Value, u64, bool)>> {
 				let mut all_results = Vec::new();
 				let mut last_key = Vec::new();
 				let mut first_iteration = true;
@@ -4610,13 +4614,10 @@ mod tests {
 					let results =
 						txn.scan_all_versions(&start_key, &end_key, Some(batch_size)).unwrap();
 					for (k, v, ts, is_deleted) in results {
-						// Convert borrowed key to owned immediately
-						let key_bytes = Bytes::copy_from_slice(k.as_ref());
-						let val_bytes = Bytes::from(v.to_vec());
-						batch_results.push((key_bytes, val_bytes, ts, is_deleted));
+						batch_results.push((k.clone(), v, ts, is_deleted));
 
 						// Update last_key with a new vector
-						last_key = k.to_vec();
+						last_key = k.clone();
 					}
 
 					if batch_results.is_empty() {
@@ -4636,21 +4637,21 @@ mod tests {
 			// Verify the results
 			let expected_results = [
 				vec![
-					(Bytes::from("key1"), Bytes::from("v1"), 1, false),
-					(Bytes::from("key1"), Bytes::from("v2"), 2, false),
-					(Bytes::from("key1"), Bytes::from("v3"), 3, false),
-					(Bytes::from("key1"), Bytes::from("v4"), 4, false),
-					(Bytes::from("key2"), Bytes::from("v1"), 1, false),
-					(Bytes::from("key2"), Bytes::from("v2"), 2, false),
+					(Vec::from("key1"), Vec::from("v1"), 1, false),
+					(Vec::from("key1"), Vec::from("v2"), 2, false),
+					(Vec::from("key1"), Vec::from("v3"), 3, false),
+					(Vec::from("key1"), Vec::from("v4"), 4, false),
+					(Vec::from("key2"), Vec::from("v1"), 1, false),
+					(Vec::from("key2"), Vec::from("v2"), 2, false),
 				],
 				vec![
-					(Bytes::from("key3"), Bytes::from("v1"), 1, false),
-					(Bytes::from("key3"), Bytes::from("v2"), 2, false),
-					(Bytes::from("key3"), Bytes::from("v3"), 3, false),
-					(Bytes::from("key3"), Bytes::from("v4"), 4, false),
-					(Bytes::from("key4"), Bytes::from("v1"), 1, false),
+					(Vec::from("key3"), Vec::from("v1"), 1, false),
+					(Vec::from("key3"), Vec::from("v2"), 2, false),
+					(Vec::from("key3"), Vec::from("v3"), 3, false),
+					(Vec::from("key3"), Vec::from("v4"), 4, false),
+					(Vec::from("key4"), Vec::from("v1"), 1, false),
 				],
-				vec![(Bytes::from("key5"), Bytes::from("v1"), 1, false)],
+				vec![(Vec::from("key5"), Vec::from("v1"), 1, false)],
 			];
 
 			assert_eq!(all_results.len(), expected_results.len());
@@ -4675,7 +4676,7 @@ mod tests {
 			// Verify the value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"test_value");
+			assert_eq!(&result, b"test_value");
 
 			// Test Replace with options
 			let mut txn = store.begin().unwrap();
@@ -4686,7 +4687,7 @@ mod tests {
 			// Verify the second value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key2").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"test_value2");
+			assert_eq!(&result, b"test_value2");
 		}
 
 		#[test(tokio::test)]
@@ -4704,7 +4705,7 @@ mod tests {
 			// Verify the latest version exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"value_v5");
+			assert_eq!(&result, b"value_v5");
 
 			// Use Replace to replace all previous versions
 			let mut txn = store.begin().unwrap();
@@ -4714,7 +4715,7 @@ mod tests {
 			// Verify the new value exists
 			let txn = store.begin().unwrap();
 			let result = txn.get(b"test_key").unwrap().unwrap();
-			assert_eq!(result.as_ref(), b"replaced_value");
+			assert_eq!(&result, b"replaced_value");
 		}
 
 		#[test(tokio::test)]
@@ -4730,9 +4731,9 @@ mod tests {
 
 			// Verify all values exist
 			let txn = store.begin().unwrap();
-			assert_eq!(txn.get(b"key1").unwrap().unwrap().as_ref(), b"regular_value1");
-			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"replace_value2");
-			assert_eq!(txn.get(b"key3").unwrap().unwrap().as_ref(), b"regular_value3");
+			assert_eq!(txn.get(b"key1").unwrap().unwrap(), b"regular_value1");
+			assert_eq!(txn.get(b"key2").unwrap().unwrap(), b"replace_value2");
+			assert_eq!(txn.get(b"key3").unwrap().unwrap(), b"regular_value3");
 
 			// Update key2 with regular set
 			let mut txn = store.begin().unwrap();
@@ -4741,7 +4742,7 @@ mod tests {
 
 			// Verify the updated value
 			let txn = store.begin().unwrap();
-			assert_eq!(txn.get(b"key2").unwrap().unwrap().as_ref(), b"updated_regular_value2");
+			assert_eq!(txn.get(b"key2").unwrap().unwrap(), b"updated_regular_value2");
 
 			// Use replace on key1
 			let mut txn = store.begin().unwrap();
@@ -4751,7 +4752,7 @@ mod tests {
 			// Verify the final value
 			let txn = store.begin().unwrap();
 			assert_eq!(
-				txn.get(b"key1").unwrap().unwrap().as_ref(),
+				txn.get(b"key1").unwrap().unwrap().as_slice(),
 				b"final_set_with_delete_value1"
 			);
 		}
