@@ -4,11 +4,12 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
+use bytes::{Bytes, BytesMut};
 use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
 use crate::vfs::File as VfsFile;
-use crate::{Comparator, Key, Value};
+use crate::Comparator;
 
 // Cache for local limits (constant for a given PAGE_SIZE)
 static LEAF_LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
@@ -233,9 +234,9 @@ trait Node {
 ///   because its overflows were transferred to the merged node via append()
 /// - When keys are transferred between nodes, overflow ownership transfers with them
 struct InternalNode {
-	keys: Vec<Key>, // Full keys (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>, // Full keys (reconstructed from page + overflow if needed)
 	key_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for THIS
-	                 * node's keys */
+	                   * node's keys */
 	children: Vec<u64>,
 	offset: u64,
 }
@@ -252,7 +253,7 @@ impl InternalNode {
 
 	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
 	where
-		F: Fn(u64) -> Result<Vec<u8>>,
+		F: Fn(u64) -> Result<Bytes>,
 	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
@@ -291,7 +292,7 @@ impl InternalNode {
 			}
 
 			// Read key data from page
-			let mut key_data = buffer_slice[..bytes_on_page].to_vec();
+			let mut key_data = BytesMut::from(&buffer_slice[..bytes_on_page]);
 			buffer_slice = &buffer_slice[bytes_on_page..];
 
 			// Check if there's overflow
@@ -323,7 +324,7 @@ impl InternalNode {
 				)));
 			}
 
-			keys.push(key_data);
+			keys.push(key_data.freeze());
 			key_overflows.push(overflow_offset);
 		}
 
@@ -380,7 +381,7 @@ impl InternalNode {
 
 	/// Atomically removes a key and its overflow metadata at the given index.
 	/// Returns (key, overflow_offset) or None if index is out of bounds.
-	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Key, u64)> {
+	fn remove_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -395,7 +396,7 @@ impl InternalNode {
 
 	/// Atomically extracts and returns the key+overflow at idx from parent.
 	/// This is used when a parent key needs to be moved into a child node.
-	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Key, u64) {
+	fn extract_parent_key(parent: &mut InternalNode, idx: usize) -> (Bytes, u64) {
 		let key = parent.keys[idx].clone();
 		let overflow = parent.get_overflow_at(idx);
 		(key, overflow)
@@ -404,7 +405,7 @@ impl InternalNode {
 	/// Insert a key and child pointer with explicit overflow metadata
 	fn insert_key_child_with_overflow(
 		&mut self,
-		key: Key,
+		key: Bytes,
 		overflow: u64,
 		child_offset: u64,
 		compare: &dyn Comparator,
@@ -438,7 +439,7 @@ impl InternalNode {
 
 	/// Extracts key+overflow for transferring to another node (removes from
 	/// this node)
-	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Key, u64)> {
+	fn extract_key_with_overflow(&mut self, idx: usize) -> Option<(Bytes, u64)> {
 		if idx >= self.keys.len() {
 			return None;
 		}
@@ -452,7 +453,7 @@ impl InternalNode {
 	}
 
 	/// Inserts a key with its overflow at a specific position
-	fn insert_key_with_overflow(&mut self, idx: usize, key: Key, overflow: u64) {
+	fn insert_key_with_overflow(&mut self, idx: usize, key: Bytes, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.key_overflows.insert(idx, overflow);
 	}
@@ -460,9 +461,9 @@ impl InternalNode {
 	fn redistribute_to_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Key,
+		parent_key: Bytes,
 		parent_overflow: u64,
-	) -> (Key, u64) {
+	) -> (Bytes, u64) {
 		right.insert_key_with_overflow(0, parent_key, parent_overflow);
 
 		let (new_parent_key, new_parent_overflow) =
@@ -478,9 +479,9 @@ impl InternalNode {
 	fn take_from_right(
 		&mut self,
 		right: &mut InternalNode,
-		parent_key: Key,
+		parent_key: Bytes,
 		parent_overflow: u64,
-	) -> (Key, u64) {
+	) -> (Bytes, u64) {
 		self.keys.push(parent_key);
 		self.key_overflows.push(parent_overflow);
 
@@ -496,7 +497,7 @@ impl InternalNode {
 	fn merge_from_right(
 		&mut self,
 		mut right: InternalNode,
-		separator: Key,
+		separator: Bytes,
 		separator_overflow: u64,
 	) {
 		self.keys.push(separator);
@@ -640,8 +641,8 @@ impl Node for InternalNode {
 /// - Overflows are only freed when this leaf node is freed via free_node_with_overflow()
 /// - When cells are moved between leaves (redistribution), overflow ownership transfers with them
 struct LeafNode {
-	keys: Vec<Key>,     // Full keys (reconstructed from page + overflow if needed)
-	values: Vec<Value>, // Full values (reconstructed from page + overflow if needed)
+	keys: Vec<Bytes>,   // Full keys (reconstructed from page + overflow if needed)
+	values: Vec<Bytes>, // Full values (reconstructed from page + overflow if needed)
 	cell_overflows: Vec<u64>, /* 0 if no overflow, else first overflow page offset for cell
 	                     * (key+value) */
 	next_leaf: u64, // 0 means no next leaf
@@ -663,7 +664,7 @@ impl LeafNode {
 
 	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
 	where
-		F: Fn(u64) -> Result<Vec<u8>>,
+		F: Fn(u64) -> Result<Bytes>,
 	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
@@ -739,7 +740,7 @@ impl LeafNode {
 				pos += 8;
 
 				// For overflow case, we need to allocate and combine
-				let mut cell_data = Vec::with_capacity(payload_len);
+				let mut cell_data = BytesMut::with_capacity(payload_len);
 				cell_data.extend_from_slice(&buffer_bytes[cell_start..cell_start + bytes_on_page]);
 				let overflow_data = read_overflow(overflow)?;
 				cell_data.extend_from_slice(&overflow_data);
@@ -761,8 +762,8 @@ impl LeafNode {
 						key_len
 					)));
 				}
-				let key_data = cell_data[..key_len].to_vec();
-				let value_data = cell_data[key_len..].to_vec();
+				let key_data = cell_data.split_to(key_len).freeze();
+				let value_data = cell_data.freeze();
 
 				keys.push(key_data);
 				values.push(value_data);
@@ -783,8 +784,10 @@ impl LeafNode {
 				}
 
 				// Zero-copy slice for key and value
-				let key_data = buffer_bytes[cell_start..cell_start + key_len].to_vec();
-				let value_data = buffer_bytes[cell_start + key_len..cell_end].to_vec();
+				let key_data =
+					Bytes::copy_from_slice(&buffer_bytes[cell_start..cell_start + key_len]);
+				let value_data =
+					Bytes::copy_from_slice(&buffer_bytes[cell_start + key_len..cell_end]);
 
 				keys.push(key_data);
 				values.push(value_data);
@@ -809,7 +812,12 @@ impl LeafNode {
 	// If key already exists, update the value (treat as update)
 	// Returns (index, old_overflow) where old_overflow is Some(offset) if key was
 	// updated, None if new
-	fn insert(&mut self, key: Key, value: Value, compare: &dyn Comparator) -> (usize, Option<u64>) {
+	fn insert(
+		&mut self,
+		key: Bytes,
+		value: Bytes,
+		compare: &dyn Comparator,
+	) -> (usize, Option<u64>) {
 		match self.keys.binary_search_by(|k| compare.compare(k, &key)) {
 			Ok(idx) => {
 				// Key exists - update
@@ -835,7 +843,7 @@ impl LeafNode {
 
 	// delete a key-value pair from a leaf node
 	// Returns (index, value, overflow_offset) so caller can free the overflow chain
-	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Value, u64)> {
+	fn delete(&mut self, key: &[u8], compare: &dyn Comparator) -> Option<(usize, Bytes, u64)> {
 		let idx = self.keys.binary_search_by(|k| compare.compare(k, key)).ok()?;
 		let value = self.values.remove(idx);
 		self.keys.remove(idx);
@@ -872,14 +880,14 @@ impl LeafNode {
 	}
 
 	/// Inserts a cell (key+value) with overflow at a specific position
-	fn insert_cell_with_overflow(&mut self, idx: usize, key: Key, value: Value, overflow: u64) {
+	fn insert_cell_with_overflow(&mut self, idx: usize, key: Bytes, value: Bytes, overflow: u64) {
 		self.keys.insert(idx, key);
 		self.values.insert(idx, value);
 		self.cell_overflows.insert(idx, overflow);
 	}
 
 	// Redistributes keys from this leaf to the target leaf
-	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Key {
+	fn redistribute_to_right(&mut self, right: &mut LeafNode) -> Bytes {
 		// Move last key-value pair from this node to right node
 		let last_key = self.keys.pop().unwrap();
 		let last_value = self.values.pop().unwrap();
@@ -894,7 +902,7 @@ impl LeafNode {
 	}
 
 	// Takes keys from right leaf
-	fn take_from_right(&mut self, right: &mut LeafNode) -> Key {
+	fn take_from_right(&mut self, right: &mut LeafNode) -> Bytes {
 		// Move first key-value pair from right node to this node
 		let first_key = right.keys.remove(0);
 		let first_value = right.values.remove(0);
@@ -1392,7 +1400,7 @@ impl TrunkPage {
 #[derive(Debug, Clone)]
 struct OverflowPage {
 	next_overflow: u64, // 0 means last in chain
-	data: Vec<u8>,      // Payload data
+	data: Bytes,        // Payload data
 	offset: u64,        // Offset of this overflow page
 }
 
@@ -1400,7 +1408,7 @@ impl OverflowPage {
 	fn new(offset: u64) -> Self {
 		OverflowPage {
 			next_overflow: 0,
-			data: Vec::new(),
+			data: Bytes::new(),
 			offset,
 		}
 	}
@@ -1463,7 +1471,7 @@ impl OverflowPage {
 		}
 
 		// Read data
-		let data = buffer[13..13 + data_len].to_vec();
+		let data = Bytes::copy_from_slice(&buffer[13..13 + data_len]);
 
 		Ok(OverflowPage {
 			next_overflow,
@@ -1704,7 +1712,9 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	pub fn insert(&mut self, key: Key, value: Value) -> Result<()> {
+	pub fn insert(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
+		let key = Bytes::copy_from_slice(key.as_ref());
+		let value = Bytes::copy_from_slice(value.as_ref());
 		let mut path = Vec::new();
 		let mut current_offset = self.header.root_offset;
 		let mut parent_offset = None;
@@ -1751,7 +1761,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn handle_splits(
 		&mut self,
 		mut parent_offset: Option<u64>,
-		mut promoted_key: Key,
+		mut promoted_key: Bytes,
 		mut promoted_overflow: u64,
 		mut new_node_offset: u64,
 		mut path: Vec<(u64, Option<u64>)>,
@@ -1828,7 +1838,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: Key, value: Value) -> Result<()> {
+	fn insert_into_leaf(&mut self, leaf: &mut LeafNode, key: Bytes, value: Bytes) -> Result<()> {
 		let (_idx, old_overflow) = leaf.insert(key, value, self.compare.as_ref());
 		if let Some(overflow) = old_overflow {
 			self.free_overflow_chain(overflow)?;
@@ -1841,9 +1851,9 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn split_leaf(
 		&mut self,
 		leaf: &mut LeafNode,
-		key: Key,
-		value: Value,
-	) -> Result<(Key, u64, u64)> {
+		key: Bytes,
+		value: Bytes,
+	) -> Result<(Bytes, u64, u64)> {
 		let idx =
 			leaf.keys.binary_search_by(|k| self.compare.compare(k, &key)).unwrap_or_else(|idx| idx);
 
@@ -1945,10 +1955,10 @@ impl<F: VfsFile> BPlusTree<F> {
 	fn split_internal_with_child(
 		&mut self,
 		node: &mut InternalNode,
-		extra_key: Key,
+		extra_key: Bytes,
 		extra_overflow: u64,
 		extra_child: u64,
-	) -> Result<(Key, u64, u64)> {
+	) -> Result<(Bytes, u64, u64)> {
 		let insert_idx = node
 			.keys
 			.binary_search_by(|key| self.compare.compare(key, &extra_key))
@@ -2014,7 +2024,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	#[allow(unused)]
-	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+	pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut current_offset = self.header.root_offset;
 
 		loop {
@@ -2037,7 +2047,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Value>> {
+	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut node_offset = self.header.root_offset;
 		let mut path = Vec::new();
 
@@ -2975,7 +2985,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			// Create and write the overflow page
 			let mut overflow_page = OverflowPage::new(page_offset);
-			overflow_page.data = chunk_data.to_vec();
+			overflow_page.data = Bytes::copy_from_slice(chunk_data);
 			overflow_page.next_overflow = 0; // Will be updated if there's more data
 
 			self.write_node(&NodeType::Overflow(overflow_page.clone()))?;
@@ -2996,12 +3006,12 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	/// Read data from an overflow chain starting at the given offset
-	fn read_overflow_chain(&self, first_page: u64) -> Result<Vec<u8>> {
+	fn read_overflow_chain(&self, first_page: u64) -> Result<Bytes> {
 		if first_page == 0 {
-			return Ok(Vec::new());
+			return Ok(Bytes::new());
 		}
 
-		let mut result = Vec::new();
+		let mut result = BytesMut::new();
 		let mut current_offset = first_page;
 
 		while current_offset != 0 {
@@ -3017,7 +3027,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		Ok(result)
+		Ok(result.freeze())
 	}
 
 	fn free_overflow_chain(&mut self, first_page: u64) -> Result<()> {
@@ -3105,7 +3115,7 @@ impl<F: VfsFile> BPlusTree<F> {
 pub struct RangeScanIterator<'a, F: VfsFile> {
 	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
-	end_key: Vec<u8>,
+	end_key: Bytes,
 	current_idx: usize,
 	current_end_idx: usize, // Pre-calculated end position in current leaf
 	reached_end: bool,
@@ -3143,7 +3153,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		Ok(RangeScanIterator {
 			tree,
 			current_leaf: Some(leaf),
-			end_key: end_key.to_vec(),
+			end_key: Bytes::copy_from_slice(end_key),
 			current_idx,
 			current_end_idx,
 			reached_end: false,
@@ -3152,7 +3162,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 }
 
 impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
-	type Item = Result<(Key, Value)>;
+	type Item = Result<(Bytes, Bytes)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
@@ -3174,7 +3184,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 						Ok(arc_node) => match arc_node.as_ref() {
 							NodeType::Leaf(next_leaf) => {
 								let next_end_idx = next_leaf.keys.partition_point(|k| {
-									self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
+									self.tree.compare.compare(k, self.end_key.as_ref())
+										!= Ordering::Greater
 								});
 
 								self.current_leaf = Some(next_leaf.clone());
@@ -3323,15 +3334,15 @@ mod tests {
 		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 		// Test retrievals
-		assert_eq!(tree.get(b"key1").unwrap().unwrap(), b"value1");
-		assert_eq!(tree.get(b"key2").unwrap().unwrap(), b"value2");
-		assert_eq!(tree.get(b"key3").unwrap().unwrap(), b"value3");
+		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+		assert_eq!(tree.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		assert_eq!(tree.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 
 		// Test non-existent key
 		assert!(tree.get(b"nonexistent").unwrap().is_none());
 
 		// Test deletions
-		assert_eq!(tree.delete(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tree.delete(b"key2").unwrap().unwrap().as_ref(), b"value2");
 		assert!(tree.get(b"key2").unwrap().is_none());
 	}
 
@@ -3816,8 +3827,8 @@ mod tests {
 			// Verify existing data
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.get(key)?,
-					Some(value.clone()),
+					tree.get(key)?.as_ref().map(|b| b.as_ref()),
+					Some(value.as_slice()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -3829,8 +3840,8 @@ mod tests {
 			// Add new data and verify
 			tree.insert(b"mango".to_vec(), b"orange".to_vec())?;
 			assert_eq!(
-				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
+				Some(b"orange".as_ref()),
 				"New insertion failed after reopening"
 			);
 		}
@@ -3839,8 +3850,8 @@ mod tests {
 		{
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(
-				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
+				Some(b"orange".as_ref()),
 				"New data didn't persist across openings"
 			);
 		}
@@ -3873,8 +3884,8 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(tree.get(b"two")?, None, "Deleted key still exists after reopening");
 			assert_eq!(
-				tree.get(b"one")?,
-				Some(b"1".to_vec()),
+				tree.get(b"one")?.as_ref().map(|b| b.as_ref()),
+				Some(b"1".as_ref()),
 				"Existing key missing after deletion"
 			);
 		}
@@ -4013,8 +4024,8 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.get(key).unwrap(),
-					Some(value.clone()),
+					tree.get(key).unwrap().as_ref().map(|b| b.as_ref()),
+					Some(value.as_slice()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -4026,7 +4037,7 @@ mod tests {
 		n.to_be_bytes().to_vec()
 	}
 
-	fn deserialize_pair(pair: (Key, Value)) -> (u32, u32) {
+	fn deserialize_pair(pair: (Bytes, Bytes)) -> (u32, u32) {
 		(
 			u32::from_be_bytes((&*pair.0).try_into().unwrap()),
 			u32::from_be_bytes((&*pair.1).try_into().unwrap()),
@@ -4175,8 +4186,10 @@ mod tests {
 		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
 		let mut iter = tree.range(b"key2", b"key3").unwrap();
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key2".to_vec(), b"value2".to_vec()));
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key3".to_vec(), b"value3".to_vec()));
+		let (k1, v1) = iter.next().unwrap().unwrap();
+		assert_eq!((k1.as_ref(), v1.as_ref()), (b"key2".as_ref(), b"value2".as_ref()));
+		let (k2, v2) = iter.next().unwrap().unwrap();
+		assert_eq!((k2.as_ref(), v2.as_ref()), (b"key3".as_ref(), b"value3".as_ref()));
 		assert!(iter.next().is_none());
 	}
 
@@ -4206,7 +4219,11 @@ mod tests {
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();
-			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
+			let (k, v) = iter.next().unwrap().unwrap();
+			assert_eq!(
+				(k.as_ref(), v.as_ref()),
+				(expected_key.as_slice(), expected_value.as_slice())
+			);
 		}
 		assert!(iter.next().is_none());
 	}
