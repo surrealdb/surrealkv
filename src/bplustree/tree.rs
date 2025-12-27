@@ -253,7 +253,7 @@ impl InternalNode {
 
 	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
 	where
-		F: Fn(u64) -> Result<Vec<u8>>,
+		F: Fn(u64) -> Result<Bytes>,
 	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
@@ -664,7 +664,7 @@ impl LeafNode {
 
 	fn deserialize<F>(buffer: &[u8], offset: u64, read_overflow: &F) -> Result<Self>
 	where
-		F: Fn(u64) -> Result<Vec<u8>>,
+		F: Fn(u64) -> Result<Bytes>,
 	{
 		if buffer.len() != PAGE_SIZE {
 			return Err(BPlusTreeError::Deserialization(format!(
@@ -740,7 +740,7 @@ impl LeafNode {
 				pos += 8;
 
 				// For overflow case, we need to allocate and combine
-				let mut cell_data = Vec::with_capacity(payload_len);
+				let mut cell_data = BytesMut::with_capacity(payload_len);
 				cell_data.extend_from_slice(&buffer_bytes[cell_start..cell_start + bytes_on_page]);
 				let overflow_data = read_overflow(overflow)?;
 				cell_data.extend_from_slice(&overflow_data);
@@ -762,8 +762,8 @@ impl LeafNode {
 						key_len
 					)));
 				}
-				let key_data = Bytes::from(cell_data[..key_len].to_vec());
-				let value_data = Bytes::from(cell_data[key_len..].to_vec());
+				let key_data = cell_data.split_to(key_len).freeze();
+				let value_data = cell_data.freeze();
 
 				keys.push(key_data);
 				values.push(value_data);
@@ -1400,7 +1400,7 @@ impl TrunkPage {
 #[derive(Debug, Clone)]
 struct OverflowPage {
 	next_overflow: u64, // 0 means last in chain
-	data: Vec<u8>,      // Payload data
+	data: Bytes,        // Payload data
 	offset: u64,        // Offset of this overflow page
 }
 
@@ -1408,7 +1408,7 @@ impl OverflowPage {
 	fn new(offset: u64) -> Self {
 		OverflowPage {
 			next_overflow: 0,
-			data: Vec::new(),
+			data: Bytes::new(),
 			offset,
 		}
 	}
@@ -1471,7 +1471,7 @@ impl OverflowPage {
 		}
 
 		// Read data
-		let data = buffer[13..13 + data_len].to_vec();
+		let data = Bytes::copy_from_slice(&buffer[13..13 + data_len]);
 
 		Ok(OverflowPage {
 			next_overflow,
@@ -2024,7 +2024,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	#[allow(unused)]
-	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+	pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut current_offset = self.header.root_offset;
 
 		loop {
@@ -2038,7 +2038,7 @@ impl<F: VfsFile> BPlusTree<F> {
 				NodeType::Leaf(leaf) => {
 					return Ok(leaf
 						.find_key(key, self.compare.as_ref())
-						.map(|idx| leaf.values[idx].to_vec()));
+						.map(|idx| leaf.values[idx].clone()));
 				}
 				NodeType::Overflow(_) => {
 					return Err(BPlusTreeError::UnexpectedOverflowPage(current_offset));
@@ -2047,7 +2047,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		}
 	}
 
-	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+	pub fn delete(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
 		let mut node_offset = self.header.root_offset;
 		let mut path = Vec::new();
 
@@ -2083,7 +2083,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 							self.handle_empty_root()?;
 
-							return Ok(Some(value.to_vec()));
+							return Ok(Some(value));
 						}
 						None => {
 							return Ok(None);
@@ -2985,7 +2985,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 			// Create and write the overflow page
 			let mut overflow_page = OverflowPage::new(page_offset);
-			overflow_page.data = chunk_data.to_vec();
+			overflow_page.data = Bytes::copy_from_slice(chunk_data);
 			overflow_page.next_overflow = 0; // Will be updated if there's more data
 
 			self.write_node(&NodeType::Overflow(overflow_page.clone()))?;
@@ -3006,12 +3006,12 @@ impl<F: VfsFile> BPlusTree<F> {
 	}
 
 	/// Read data from an overflow chain starting at the given offset
-	fn read_overflow_chain(&self, first_page: u64) -> Result<Vec<u8>> {
+	fn read_overflow_chain(&self, first_page: u64) -> Result<Bytes> {
 		if first_page == 0 {
-			return Ok(Vec::new());
+			return Ok(Bytes::new());
 		}
 
-		let mut result = Vec::new();
+		let mut result = BytesMut::new();
 		let mut current_offset = first_page;
 
 		while current_offset != 0 {
@@ -3027,7 +3027,7 @@ impl<F: VfsFile> BPlusTree<F> {
 			}
 		}
 
-		Ok(result)
+		Ok(result.freeze())
 	}
 
 	fn free_overflow_chain(&mut self, first_page: u64) -> Result<()> {
@@ -3115,7 +3115,7 @@ impl<F: VfsFile> BPlusTree<F> {
 pub struct RangeScanIterator<'a, F: VfsFile> {
 	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
-	end_key: Vec<u8>,
+	end_key: Bytes,
 	current_idx: usize,
 	current_end_idx: usize, // Pre-calculated end position in current leaf
 	reached_end: bool,
@@ -3153,7 +3153,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		Ok(RangeScanIterator {
 			tree,
 			current_leaf: Some(leaf),
-			end_key: end_key.to_vec(),
+			end_key: Bytes::copy_from_slice(end_key),
 			current_idx,
 			current_end_idx,
 			reached_end: false,
@@ -3162,7 +3162,7 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 }
 
 impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
-	type Item = Result<(Vec<u8>, Vec<u8>)>;
+	type Item = Result<(Bytes, Bytes)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
@@ -3184,7 +3184,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 						Ok(arc_node) => match arc_node.as_ref() {
 							NodeType::Leaf(next_leaf) => {
 								let next_end_idx = next_leaf.keys.partition_point(|k| {
-									self.tree.compare.compare(k, &self.end_key) != Ordering::Greater
+									self.tree.compare.compare(k, self.end_key.as_ref())
+										!= Ordering::Greater
 								});
 
 								self.current_leaf = Some(next_leaf.clone());
@@ -3201,8 +3202,8 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 				// Return current entry from stored leaf (no range check needed -
 				// pre-calculated!)
 				let result = Ok((
-					leaf.keys[self.current_idx].to_vec(),
-					leaf.values[self.current_idx].to_vec(),
+					leaf.keys[self.current_idx].clone(),
+					leaf.values[self.current_idx].clone(),
 				));
 				self.current_idx += 1;
 				return Some(result);
@@ -3333,15 +3334,15 @@ mod tests {
 		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 		// Test retrievals
-		assert_eq!(tree.get(b"key1").unwrap().unwrap(), b"value1");
-		assert_eq!(tree.get(b"key2").unwrap().unwrap(), b"value2");
-		assert_eq!(tree.get(b"key3").unwrap().unwrap(), b"value3");
+		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+		assert_eq!(tree.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
+		assert_eq!(tree.get(b"key3").unwrap().unwrap().as_ref(), b"value3");
 
 		// Test non-existent key
 		assert!(tree.get(b"nonexistent").unwrap().is_none());
 
 		// Test deletions
-		assert_eq!(tree.delete(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(tree.delete(b"key2").unwrap().unwrap().as_ref(), b"value2");
 		assert!(tree.get(b"key2").unwrap().is_none());
 	}
 
@@ -3826,8 +3827,8 @@ mod tests {
 			// Verify existing data
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.get(key)?,
-					Some(value.clone()),
+					tree.get(key)?.as_ref().map(|b| b.as_ref()),
+					Some(value.as_slice()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -3839,8 +3840,8 @@ mod tests {
 			// Add new data and verify
 			tree.insert(b"mango".to_vec(), b"orange".to_vec())?;
 			assert_eq!(
-				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
+				Some(b"orange".as_ref()),
 				"New insertion failed after reopening"
 			);
 		}
@@ -3849,8 +3850,8 @@ mod tests {
 		{
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(
-				tree.get(b"mango")?,
-				Some(b"orange".to_vec()),
+				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
+				Some(b"orange".as_ref()),
 				"New data didn't persist across openings"
 			);
 		}
@@ -3883,8 +3884,8 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
 			assert_eq!(tree.get(b"two")?, None, "Deleted key still exists after reopening");
 			assert_eq!(
-				tree.get(b"one")?,
-				Some(b"1".to_vec()),
+				tree.get(b"one")?.as_ref().map(|b| b.as_ref()),
+				Some(b"1".as_ref()),
 				"Existing key missing after deletion"
 			);
 		}
@@ -4023,8 +4024,8 @@ mod tests {
 			let tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
 			for (key, value) in &test_data {
 				assert_eq!(
-					tree.get(key).unwrap(),
-					Some(value.clone()),
+					tree.get(key).unwrap().as_ref().map(|b| b.as_ref()),
+					Some(value.as_slice()),
 					"Key {:?} not found after reopening",
 					String::from_utf8_lossy(key)
 				);
@@ -4036,7 +4037,7 @@ mod tests {
 		n.to_be_bytes().to_vec()
 	}
 
-	fn deserialize_pair(pair: (Vec<u8>, Vec<u8>)) -> (u32, u32) {
+	fn deserialize_pair(pair: (Bytes, Bytes)) -> (u32, u32) {
 		(
 			u32::from_be_bytes((&*pair.0).try_into().unwrap()),
 			u32::from_be_bytes((&*pair.1).try_into().unwrap()),
@@ -4185,8 +4186,10 @@ mod tests {
 		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
 		let mut iter = tree.range(b"key2", b"key3").unwrap();
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key2".to_vec(), b"value2".to_vec()));
-		assert_eq!(iter.next().unwrap().unwrap(), (b"key3".to_vec(), b"value3".to_vec()));
+		let (k1, v1) = iter.next().unwrap().unwrap();
+		assert_eq!((k1.as_ref(), v1.as_ref()), (b"key2".as_ref(), b"value2".as_ref()));
+		let (k2, v2) = iter.next().unwrap().unwrap();
+		assert_eq!((k2.as_ref(), v2.as_ref()), (b"key3".as_ref(), b"value3".as_ref()));
 		assert!(iter.next().is_none());
 	}
 
@@ -4216,7 +4219,11 @@ mod tests {
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();
-			assert_eq!(iter.next().unwrap().unwrap(), (expected_key, expected_value));
+			let (k, v) = iter.next().unwrap().unwrap();
+			assert_eq!(
+				(k.as_ref(), v.as_ref()),
+				(expected_key.as_slice(), expected_value.as_slice())
+			);
 		}
 		assert!(iter.next().is_none());
 	}
