@@ -139,15 +139,15 @@ const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
 // Helper functions for reading integer types from byte slices without unwrap()
 // These are safe to use when bounds have already been checked
 #[inline(always)]
-fn read_u32_le(buffer: &[u8], offset: usize) -> u32 {
+fn read_u32_be(buffer: &[u8], offset: usize) -> u32 {
 	// SAFETY: Caller must ensure buffer has at least offset + 4 bytes
-	unsafe { u32::from_le_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 4])) }
+	unsafe { u32::from_be_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 4])) }
 }
 
 #[inline(always)]
-fn read_u64_le(buffer: &[u8], offset: usize) -> u64 {
+fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
 	// SAFETY: Caller must ensure buffer has at least offset + 8 bytes
-	unsafe { u64::from_le_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
+	unsafe { u64::from_be_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
 }
 
 #[derive(Debug)]
@@ -165,12 +165,12 @@ impl Header {
 	fn serialize(&self) -> [u8; 48] {
 		let mut buffer = [0u8; 48];
 		buffer[0..8].copy_from_slice(&self.magic);
-		buffer[8..12].copy_from_slice(&self.version.to_le_bytes());
-		buffer[12..20].copy_from_slice(&self.root_offset.to_le_bytes());
-		buffer[20..28].copy_from_slice(&self.trunk_page_head.to_le_bytes());
-		buffer[28..36].copy_from_slice(&self.total_pages.to_le_bytes());
-		buffer[36..44].copy_from_slice(&self.first_leaf_offset.to_le_bytes());
-		buffer[44..48].copy_from_slice(&self.free_page_count.to_le_bytes());
+		buffer[8..12].copy_from_slice(&self.version.to_be_bytes());
+		buffer[12..20].copy_from_slice(&self.root_offset.to_be_bytes());
+		buffer[20..28].copy_from_slice(&self.trunk_page_head.to_be_bytes());
+		buffer[28..36].copy_from_slice(&self.total_pages.to_be_bytes());
+		buffer[36..44].copy_from_slice(&self.first_leaf_offset.to_be_bytes());
+		buffer[44..48].copy_from_slice(&self.free_page_count.to_be_bytes());
 		buffer
 	}
 
@@ -190,7 +190,7 @@ impl Header {
 			return Err(BPlusTreeError::Deserialization("Invalid magic number".into()));
 		}
 
-		let version = read_u32_le(buffer, 8);
+		let version = read_u32_be(buffer, 8);
 		if version != VERSION {
 			return Err(BPlusTreeError::Deserialization(format!(
 				"Unsupported version: {}",
@@ -201,11 +201,11 @@ impl Header {
 		Ok(Header {
 			magic,
 			version,
-			root_offset: read_u64_le(buffer, 12),
-			trunk_page_head: read_u64_le(buffer, 20),
-			total_pages: read_u64_le(buffer, 28),
-			first_leaf_offset: read_u64_le(buffer, 36),
-			free_page_count: read_u32_le(buffer, 44),
+			root_offset: read_u64_be(buffer, 12),
+			trunk_page_head: read_u64_be(buffer, 20),
+			total_pages: read_u64_be(buffer, 28),
+			first_leaf_offset: read_u64_be(buffer, 36),
+			free_page_count: read_u32_be(buffer, 44),
 		})
 	}
 }
@@ -264,7 +264,7 @@ impl InternalNode {
 
 		let mut buffer_slice = &buffer[1..]; // Skip node type
 
-		let num_keys = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+		let num_keys = u32::from_be_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 		buffer_slice = &buffer_slice[4..];
 
 		let (min_local, max_local) = calculate_local_limits(false);
@@ -275,7 +275,7 @@ impl InternalNode {
 
 		for _ in 0..num_keys {
 			// Read total key length
-			let key_len_total = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+			let key_len_total = u32::from_be_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 			buffer_slice = &buffer_slice[4..];
 
 			// Calculate bytes on page
@@ -302,7 +302,7 @@ impl InternalNode {
 						"Buffer too small for overflow pointer".into(),
 					));
 				}
-				let overflow = u64::from_le_bytes(buffer_slice[..8].try_into().unwrap());
+				let overflow = u64::from_be_bytes(buffer_slice[..8].try_into().unwrap());
 				buffer_slice = &buffer_slice[8..];
 
 				// Read overflow data and append to key
@@ -327,7 +327,7 @@ impl InternalNode {
 			key_overflows.push(overflow_offset);
 		}
 
-		let num_children = u32::from_le_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
+		let num_children = u32::from_be_bytes(buffer_slice[..4].try_into().unwrap()) as usize;
 		buffer_slice = &buffer_slice[4..];
 
 		// Validation for child count
@@ -346,7 +346,7 @@ impl InternalNode {
 					"Buffer too small for child pointer".into(),
 				));
 			}
-			children.push(u64::from_le_bytes(buffer_slice[..8].try_into().unwrap()));
+			children.push(u64::from_be_bytes(buffer_slice[..8].try_into().unwrap()));
 			buffer_slice = &buffer_slice[8..];
 		}
 
@@ -539,7 +539,7 @@ impl Node for InternalNode {
 		buffer.push(NODE_TYPE_INTERNAL);
 
 		// 2. Number of keys (4 bytes)
-		buffer.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
+		buffer.extend_from_slice(&(self.keys.len() as u32).to_be_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(false);
 		let usable_size = INTERNAL_USABLE_SIZE;
@@ -553,7 +553,7 @@ impl Node for InternalNode {
 				calculate_overflow(key_len_total, min_local, max_local, usable_size);
 
 			// Write total key length
-			buffer.extend_from_slice(&(key_len_total as u32).to_le_bytes());
+			buffer.extend_from_slice(&(key_len_total as u32).to_be_bytes());
 
 			// Write key data that fits on page
 			buffer.extend_from_slice(&key[..bytes_on_page]);
@@ -561,16 +561,16 @@ impl Node for InternalNode {
 			// Write overflow page offset if needed (only if there's overflow)
 			if needs_overflow {
 				let overflow_offset = self.get_overflow_at(i);
-				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
+				buffer.extend_from_slice(&overflow_offset.to_be_bytes());
 			}
 		}
 
 		// 4. Number of children (4 bytes)
-		buffer.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
+		buffer.extend_from_slice(&(self.children.len() as u32).to_be_bytes());
 
 		// 5. Child pointers (8 bytes each)
 		for &child in &self.children {
-			buffer.extend_from_slice(&child.to_le_bytes());
+			buffer.extend_from_slice(&child.to_be_bytes());
 		}
 
 		// 6. Calculate total space used
@@ -677,13 +677,13 @@ impl LeafNode {
 		let buffer_bytes = buffer;
 		let mut pos = 1; // Skip node type
 
-		let num_keys = u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+		let num_keys = u32::from_be_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
 		pos += 4;
 
 		// Next and prev leaf pointers
-		let next_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		let next_leaf = u64::from_be_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
 		pos += 8;
-		let prev_leaf = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+		let prev_leaf = u64::from_be_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
 		pos += 8;
 
 		let (min_local, max_local) = calculate_local_limits(true);
@@ -699,7 +699,7 @@ impl LeafNode {
 				return Err(BPlusTreeError::Deserialization("Truncated key length".into()));
 			}
 			let key_len =
-				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+				u32::from_be_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
 			pos += 4;
 
 			// Read value length
@@ -707,7 +707,7 @@ impl LeafNode {
 				return Err(BPlusTreeError::Deserialization("Truncated value length".into()));
 			}
 			let value_len =
-				u32::from_le_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
+				u32::from_be_bytes(buffer_bytes[pos..pos + 4].try_into().unwrap()) as usize;
 			pos += 4;
 
 			// Calculate combined payload size and overflow
@@ -735,7 +735,7 @@ impl LeafNode {
 						"Buffer too small for cell overflow pointer".into(),
 					));
 				}
-				let overflow = u64::from_le_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
+				let overflow = u64::from_be_bytes(buffer_bytes[pos..pos + 8].try_into().unwrap());
 				pos += 8;
 
 				// For overflow case, we need to allocate and combine
@@ -1177,13 +1177,13 @@ impl Node for LeafNode {
 		buffer.push(NODE_TYPE_LEAF);
 
 		// 2. Number of keys (4 bytes)
-		buffer.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
+		buffer.extend_from_slice(&(self.keys.len() as u32).to_be_bytes());
 
 		// 3. Next leaf pointer (8 bytes)
-		buffer.extend_from_slice(&self.next_leaf.to_le_bytes());
+		buffer.extend_from_slice(&self.next_leaf.to_be_bytes());
 
 		// 4. Previous leaf pointer (8 bytes)
-		buffer.extend_from_slice(&self.prev_leaf.to_le_bytes());
+		buffer.extend_from_slice(&self.prev_leaf.to_be_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(true);
 		let usable_size = LEAF_USABLE_SIZE;
@@ -1195,8 +1195,8 @@ impl Node for LeafNode {
 			let payload_len = key_len + value_len;
 
 			// Write key and value lengths
-			buffer.extend_from_slice(&(key_len as u32).to_le_bytes());
-			buffer.extend_from_slice(&(value_len as u32).to_le_bytes());
+			buffer.extend_from_slice(&(key_len as u32).to_be_bytes());
+			buffer.extend_from_slice(&(value_len as u32).to_be_bytes());
 
 			// Calculate overflow for combined payload
 			let (bytes_on_page, needs_overflow) =
@@ -1213,7 +1213,7 @@ impl Node for LeafNode {
 			// Write cell overflow page offset if needed
 			if needs_overflow {
 				let overflow_offset = self.get_overflow_at(i);
-				buffer.extend_from_slice(&overflow_offset.to_le_bytes());
+				buffer.extend_from_slice(&overflow_offset.to_be_bytes());
 			}
 		}
 
@@ -1324,14 +1324,14 @@ impl TrunkPage {
 		buffer.push(TRUNK_PAGE_TYPE);
 
 		// 2. Next trunk pointer (8 bytes)
-		buffer.extend_from_slice(&self.next_trunk.to_le_bytes());
+		buffer.extend_from_slice(&self.next_trunk.to_be_bytes());
 
 		// 3. Number of free pages (4 bytes)
-		buffer.extend_from_slice(&self.num_free_pages.to_le_bytes());
+		buffer.extend_from_slice(&self.num_free_pages.to_be_bytes());
 
-		// 4. Free page numbers (4 bytes each, little-endian to match the rest of the code)
+		// 4. Free page numbers (4 bytes each, big-endian to match the rest of the code)
 		for &page in &self.free_pages {
-			buffer.extend_from_slice(&page.to_le_bytes());
+			buffer.extend_from_slice(&page.to_be_bytes());
 		}
 
 		// 5. Pad to fill available space
@@ -1354,10 +1354,10 @@ impl TrunkPage {
 		}
 
 		// Read next trunk pointer (8 bytes)
-		let next_trunk = u64::from_le_bytes(buffer[1..9].try_into().unwrap());
+		let next_trunk = u64::from_be_bytes(buffer[1..9].try_into().unwrap());
 
 		// Read number of free pages (4 bytes)
-		let num_free_pages = u32::from_le_bytes(buffer[9..13].try_into().unwrap()) as usize;
+		let num_free_pages = u32::from_be_bytes(buffer[9..13].try_into().unwrap()) as usize;
 
 		// Check if num_free_pages is reasonable
 		if num_free_pages > TRUNK_PAGE_MAX_ENTRIES {
@@ -1367,7 +1367,7 @@ impl TrunkPage {
 			)));
 		}
 
-		// Read free page numbers (4 bytes each, little-endian)
+		// Read free page numbers (4 bytes each, big-endian)
 		let mut free_pages = Vec::with_capacity(num_free_pages);
 		for i in 0..num_free_pages {
 			let start = TRUNK_PAGE_HEADER_SIZE + i * 4;
@@ -1375,7 +1375,7 @@ impl TrunkPage {
 			if end > buffer.len() {
 				return Err(BPlusTreeError::Deserialization("Truncated trunk page data".into()));
 			}
-			free_pages.push(u32::from_le_bytes(buffer[start..end].try_into().unwrap()));
+			free_pages.push(u32::from_be_bytes(buffer[start..end].try_into().unwrap()));
 		}
 
 		Ok(TrunkPage {
@@ -1412,10 +1412,10 @@ impl OverflowPage {
 		buffer.push(NODE_TYPE_OVERFLOW);
 
 		// 2. Next overflow pointer (8 bytes)
-		buffer.extend_from_slice(&self.next_overflow.to_le_bytes());
+		buffer.extend_from_slice(&self.next_overflow.to_be_bytes());
 
 		// 3. Data length (4 bytes)
-		buffer.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+		buffer.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
 
 		// 4. Data
 		buffer.extend_from_slice(&self.data);
@@ -1449,10 +1449,10 @@ impl OverflowPage {
 		}
 
 		// Read next overflow pointer (8 bytes)
-		let next_overflow = u64::from_le_bytes(buffer[1..9].try_into().unwrap());
+		let next_overflow = u64::from_be_bytes(buffer[1..9].try_into().unwrap());
 
 		// Read data length (4 bytes)
-		let data_len = u32::from_le_bytes(buffer[9..13].try_into().unwrap()) as usize;
+		let data_len = u32::from_be_bytes(buffer[9..13].try_into().unwrap()) as usize;
 
 		// Validate data length
 		if data_len > PAGE_SIZE - 13 {
@@ -3249,24 +3249,24 @@ mod tests {
 
 	impl Comparator for U32Comparator {
 		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-			let a_num = u32::from_le_bytes(a.try_into().unwrap());
-			let b_num = u32::from_le_bytes(b.try_into().unwrap());
+			let a_num = u32::from_be_bytes(a.try_into().unwrap());
+			let b_num = u32::from_be_bytes(b.try_into().unwrap());
 			a_num.cmp(&b_num)
 		}
 
 		fn separator(&self, from: &[u8], to: &[u8]) -> Vec<u8> {
-			let from_num = u32::from_le_bytes(from.try_into().unwrap());
-			let to_num = u32::from_le_bytes(to.try_into().unwrap());
+			let from_num = u32::from_be_bytes(from.try_into().unwrap());
+			let to_num = u32::from_be_bytes(to.try_into().unwrap());
 			if from_num < to_num {
-				((from_num + to_num) / 2).to_le_bytes().to_vec()
+				((from_num + to_num) / 2).to_be_bytes().to_vec()
 			} else {
 				from.to_vec()
 			}
 		}
 
 		fn successor(&self, key: &[u8]) -> Vec<u8> {
-			let key_num = u32::from_le_bytes(key.try_into().unwrap());
-			(key_num + 1).to_le_bytes().to_vec()
+			let key_num = u32::from_be_bytes(key.try_into().unwrap());
+			(key_num + 1).to_be_bytes().to_vec()
 		}
 
 		fn name(&self) -> &str {
@@ -3949,7 +3949,7 @@ mod tests {
 	fn detect_invalid_magic() {
 		let mut buffer = [0u8; 48];
 		buffer[0..8].copy_from_slice(b"BADMAGIC");
-		buffer[8..12].copy_from_slice(&1u32.to_le_bytes());
+		buffer[8..12].copy_from_slice(&1u32.to_be_bytes());
 
 		match Header::deserialize(&buffer) {
 			Err(BPlusTreeError::Deserialization(e)) => {
@@ -3963,7 +3963,7 @@ mod tests {
 	fn detect_invalid_version() {
 		let mut buffer = [0u8; 48];
 		buffer[0..8].copy_from_slice(&MAGIC);
-		buffer[8..12].copy_from_slice(&2u32.to_le_bytes()); // Unsupported version
+		buffer[8..12].copy_from_slice(&2u32.to_be_bytes()); // Unsupported version
 
 		match Header::deserialize(&buffer) {
 			Err(BPlusTreeError::Deserialization(e)) => {
@@ -4023,13 +4023,13 @@ mod tests {
 	}
 
 	fn serialize_u32(n: u32) -> Vec<u8> {
-		n.to_le_bytes().to_vec()
+		n.to_be_bytes().to_vec()
 	}
 
 	fn deserialize_pair(pair: (Key, Value)) -> (u32, u32) {
 		(
-			u32::from_le_bytes((&*pair.0).try_into().unwrap()),
-			u32::from_le_bytes((&*pair.1).try_into().unwrap()),
+			u32::from_be_bytes((&*pair.0).try_into().unwrap()),
+			u32::from_be_bytes((&*pair.1).try_into().unwrap()),
 		)
 	}
 
@@ -4115,7 +4115,7 @@ mod tests {
 		assert_eq!(
 			results
 				.into_iter()
-				.map(|res| res.map(|(k, _)| u32::from_le_bytes((&*k).try_into().unwrap())).unwrap())
+				.map(|res| res.map(|(k, _)| u32::from_be_bytes((&*k).try_into().unwrap())).unwrap())
 				.collect::<Vec<_>>(),
 			expected
 		);
@@ -4161,7 +4161,7 @@ mod tests {
 		assert_eq!(
 			results
 				.into_iter()
-				.map(|res| res.map(|(k, _)| u32::from_le_bytes((&*k).try_into().unwrap())).unwrap())
+				.map(|res| res.map(|(k, _)| u32::from_be_bytes((&*k).try_into().unwrap())).unwrap())
 				.collect::<Vec<_>>(),
 			expected
 		);
