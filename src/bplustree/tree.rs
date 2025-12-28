@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use quick_cache::sync::Cache;
@@ -10,10 +10,6 @@ use quick_cache::Weighter;
 
 use crate::vfs::File as VfsFile;
 use crate::Comparator;
-
-// Cache for local limits (constant for a given PAGE_SIZE)
-static LEAF_LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
-static INTERNAL_LIMITS: OnceLock<(usize, usize)> = OnceLock::new();
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<File>;
@@ -131,11 +127,13 @@ const TRUNK_PAGE_MAX_ENTRIES: usize = (PAGE_SIZE - TRUNK_PAGE_HEADER_SIZE) / TRU
 // Constants for size calculation
 const LEAF_HEADER_SIZE: usize = 1 + 4 + 8 + 8; // type(1) + key_count(4) + next_leaf(8) + prev_leaf(8) = 21 bytes
 const INTERNAL_HEADER_SIZE: usize = 1 + 4 + 4; // type(1) + key_count(4) + child_count(4) = 9 bytes
-const LEAF_USABLE_SIZE: usize = PAGE_SIZE - LEAF_HEADER_SIZE;
-const INTERNAL_USABLE_SIZE: usize = PAGE_SIZE - INTERNAL_HEADER_SIZE;
 const KEY_SIZE_PREFIX: usize = 4; // 4 bytes for key length
 const VALUE_SIZE_PREFIX: usize = 4; // 4 bytes for value length
 const CHILD_PTR_SIZE: usize = 8; // 8 bytes per child pointer
+/// Size of an overflow pointer
+const OVERFLOW_PTR_SIZE: usize = 8;
+// Overflow page: 1 (type) + 8 (next_ptr) + 4 (data_len) + data
+const OVERFLOW_PAGE_CAPACITY: usize = PAGE_SIZE - 13; // = 4083
 
 // Helper functions for reading integer types from byte slices without unwrap()
 // These are safe to use when bounds have already been checked
@@ -269,7 +267,6 @@ impl InternalNode {
 		buffer_slice = &buffer_slice[4..];
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 
 		let mut keys = Vec::with_capacity(num_keys);
 		let mut key_overflows = Vec::with_capacity(num_keys);
@@ -281,7 +278,7 @@ impl InternalNode {
 
 			// Calculate bytes on page
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(key_len_total, min_local, max_local, usable_size);
+				calculate_overflow(key_len_total, min_local, max_local);
 
 			if bytes_on_page > buffer_slice.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
@@ -515,7 +512,6 @@ impl InternalNode {
 
 	fn calculate_size_and_max_key(&self) -> (usize, usize) {
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 		let mut size = INTERNAL_HEADER_SIZE + self.children.len() * CHILD_PTR_SIZE;
 		let mut max_key_len = 0;
 
@@ -524,7 +520,7 @@ impl InternalNode {
 			max_key_len = max_key_len.max(key_len);
 
 			let (key_bytes_on_page, needs_overflow) =
-				calculate_overflow(key_len, min_local, max_local, usable_size);
+				calculate_overflow(key_len, min_local, max_local);
 			size += KEY_SIZE_PREFIX + key_bytes_on_page + overflow_ptr_size(needs_overflow);
 		}
 
@@ -543,7 +539,6 @@ impl Node for InternalNode {
 		buffer.extend_from_slice(&(self.keys.len() as u32).to_be_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// 3. Serialize keys with overflow support
 		for (i, key) in self.keys.iter().enumerate() {
@@ -551,7 +546,7 @@ impl Node for InternalNode {
 
 			// Determine how much to store on page
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(key_len_total, min_local, max_local, usable_size);
+				calculate_overflow(key_len_total, min_local, max_local);
 
 			// Write total key length
 			buffer.extend_from_slice(&(key_len_total as u32).to_be_bytes());
@@ -595,12 +590,11 @@ impl Node for InternalNode {
 		let mut size = INTERNAL_HEADER_SIZE;
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// Size for all keys accounting for overflow
 		for key in &self.keys {
 			let (key_bytes_on_page, needs_overflow) =
-				calculate_overflow(key.len(), min_local, max_local, usable_size);
+				calculate_overflow(key.len(), min_local, max_local);
 			size += KEY_SIZE_PREFIX + key_bytes_on_page;
 			size += overflow_ptr_size(needs_overflow);
 		}
@@ -620,9 +614,8 @@ impl Node for InternalNode {
 		let max_key_size = self_max_key.max(other_max_key);
 
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 		let (separator_on_page, separator_overflow) =
-			calculate_overflow(max_key_size, min_local, max_local, usable_size);
+			calculate_overflow(max_key_size, min_local, max_local);
 		let separator_size =
 			KEY_SIZE_PREFIX + separator_on_page + overflow_ptr_size(separator_overflow);
 
@@ -688,7 +681,6 @@ impl LeafNode {
 		pos += 8;
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 
 		let mut keys = Vec::with_capacity(num_keys);
 		let mut values = Vec::with_capacity(num_keys);
@@ -714,7 +706,7 @@ impl LeafNode {
 			// Calculate combined payload size and overflow
 			let payload_len = key_len + value_len;
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(payload_len, min_local, max_local, usable_size);
+				calculate_overflow(payload_len, min_local, max_local);
 
 			if pos + bytes_on_page > buffer_bytes.len() {
 				return Err(BPlusTreeError::Deserialization(format!(
@@ -937,175 +929,11 @@ impl LeafNode {
 		self.next_leaf = right.next_leaf;
 	}
 
-	/// Find optimal split point that ensures both resulting leaves fit in a
-	/// page. Uses hybrid approach: simple split for common cases, iterative
-	/// algorithm when needed. Takes the new entry (key, value) and its insert
-	/// position into account.
-	///
-	/// - `is_update`: If true, we're updating an existing entry (replacing, not adding). The total
-	///   entry count remains the same. If false, we're inserting a new entry.
-	fn find_split_point(
-		&self,
-		new_key: &[u8],
-		new_value: &[u8],
-		insert_idx: usize,
-		is_update: bool,
-	) -> usize {
-		let max_page_size = PAGE_SIZE;
-
-		// Phase 1: Calculate actual cell sizes for all entries including the new one
-		let capacity = if is_update {
-			self.keys.len() // For updates, total stays the same
-		} else {
-			self.keys.len() + 1 // For inserts, we add one entry
-		};
-		let mut cell_sizes = Vec::with_capacity(capacity);
-
-		// Build cell sizes array with new entry inserted/replaced at correct position
-		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
-			if i == insert_idx {
-				// Add new entry size at this position
-				let size = leaf_entry_size(new_key, new_value);
-				cell_sizes.push(size);
-
-				// For updates, skip the old entry (we're replacing it, not adding)
-				// For inserts, continue to add the old entry after the new one
-				if is_update {
-					continue; // Skip adding the old entry
-				}
-			}
-
-			let size = leaf_entry_size(key, value);
-			cell_sizes.push(size);
-		}
-
-		// Handle case where insert_idx is at the end (only for inserts, not updates)
-		if !is_update && insert_idx >= self.keys.len() {
-			let size = leaf_entry_size(new_key, new_value);
-			cell_sizes.push(size);
-		}
-
-		let total_cells = cell_sizes.len();
-
-		// Phase 2: Sequential left-to-right processing (no recursion)
-		// Process entries sequentially from left to right, stopping at first valid
-		// split point
-		let mut current_page_size = LEAF_HEADER_SIZE;
-		let mut split_idx = 0;
-
-		// Process entries sequentially from left to right
-		for (i, &cell_size) in cell_sizes.iter().enumerate().take(total_cells) {
-			let new_page_size = current_page_size + cell_size;
-
-			// If adding this cell would exceed page size, split before it
-			// But ensure we have at least one cell on the left page
-			if new_page_size > max_page_size && current_page_size > LEAF_HEADER_SIZE {
-				split_idx = i;
-				break;
-			}
-
-			current_page_size = new_page_size;
-		}
-
-		// If we processed all cells without finding a split point, use the last valid
-		// position This shouldn't happen if we're splitting, but handle it gracefully
-		if split_idx == 0 && current_page_size <= max_page_size {
-			// All entries fit in one page - this shouldn't happen if we're splitting
-			// Use middle split as fallback
-			split_idx = total_cells / 2;
-			if split_idx == 0 {
-				split_idx = 1; // Ensure at least one cell on left
-			}
-		} else if split_idx == 0 {
-			// First cell itself is too large - split after it
-			split_idx = 1;
-		}
-
-		// Calculate sizes for both pages
-		let mut sz_left = LEAF_HEADER_SIZE + cell_sizes[..split_idx].iter().sum::<usize>();
-		let mut sz_right = LEAF_HEADER_SIZE + cell_sizes[split_idx..].iter().sum::<usize>();
-
-		// Phase 3: Ordering check and adjustment
-		// Ensure cntNew[i] <= cntNew[i-1] (right page <= left page in size)
-		// This ensures proper ordering across pages
-		// If right is larger than left, move cells from right to left (if possible)
-		// To move a cell from right to left, we increase split_idx (which moves the
-		// boundary right)
-		while sz_right > sz_left && split_idx < total_cells {
-			// Try moving the leftmost cell from right page to left page
-			let cell_to_move = cell_sizes[split_idx];
-			let new_left = sz_left + cell_to_move;
-			let new_right = sz_right - cell_to_move;
-
-			// Only move if both pages still fit and it improves ordering
-			if new_left <= max_page_size && new_right <= max_page_size {
-				sz_left = new_left;
-				sz_right = new_right;
-				split_idx += 1;
-			} else {
-				// Can't improve further without violating size constraints
-				break;
-			}
-		}
-
-		// Verify both pages fit (should always be true after sequential processing)
-		if sz_left > max_page_size || sz_right > max_page_size {
-			panic!(
-				"find_split_point: pages don't fit after sequential processing (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
-				split_idx, total_cells, sz_left, sz_right, max_page_size
-			);
-		}
-
-		// Convert back to original key index
-		// For updates: split_idx directly maps to original array (same size)
-		// For inserts: split_idx is in expanded array (with new entry), needs
-		// conversion
-
-		if is_update {
-			// For updates, split_idx directly maps to original array index
-			split_idx
-		} else if insert_idx < split_idx {
-			// New entry is on left side of split
-			// In expanded array: [entry0, ..., NEW_ENTRY, entry(insert_idx), ...]
-			// If split_idx=1: left=[NEW_ENTRY], right=[entry0, entry1, ...]
-			// In original array, this means split at index 0 (before entry0)
-			// But we can't use 0 because split_off(0) would put everything on right!
-			// Instead, we need to ensure at least the new entry goes left.
-			// If split_idx=1, we want: left gets new_entry, right gets all original entries
-			// So we return 0, but the split logic must handle this specially
-			if split_idx == 1 {
-				// Special case: new entry alone on left, all original entries on right
-				// Return 0, but the caller must insert new entry into left before splitting
-				0
-			} else if split_idx == insert_idx + 1 {
-				// Edge case: split_idx(expanded) == insert_idx + 1
-				// In expanded: left=[..., NEW_ENTRY], right=[entry(insert_idx), ...]
-				// Algorithm calculated sz_left for left=[..., NEW_ENTRY] (excluding
-				// entry(insert_idx)) To preserve size invariants, we must return insert_idx
-				// (not insert_idx + 1) This ensures left gets [..., NEW_ENTRY] without
-				// entry(insert_idx)
-				insert_idx
-			} else {
-				// split_idx > insert_idx + 1: some original entries also go left
-				// split_idx=3, insert_idx=1 means: left=[entry0, NEW_ENTRY, entry1],
-				// right=[entry2, ...] In original array, this is split_idx=2 (before
-				// entry2)
-				split_idx - 1
-			}
-		} else {
-			// New entry is on right side or at split point
-			// split_idx in expanded array directly maps to original array
-			split_idx
-		}
-	}
-
 	// Check if this leaf can fit another key-value pair
 	fn can_fit_entry(&self, key: &[u8], value: &[u8]) -> bool {
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 		let payload_len = key.len() + value.len();
-		let (bytes_on_page, needs_overflow) =
-			calculate_overflow(payload_len, min_local, max_local, usable_size);
+		let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, min_local, max_local);
 
 		let entry_size =
 			KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow);
@@ -1136,7 +964,6 @@ impl Node for LeafNode {
 		buffer.extend_from_slice(&self.prev_leaf.to_be_bytes());
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 
 		// 5. Serialize cells (key+value pairs) with overflow support
 		for (i, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
@@ -1150,7 +977,7 @@ impl Node for LeafNode {
 
 			// Calculate overflow for combined payload
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(payload_len, min_local, max_local, usable_size);
+				calculate_overflow(payload_len, min_local, max_local);
 
 			// Create combined cell data
 			let mut cell_data = Vec::with_capacity(payload_len);
@@ -1188,13 +1015,12 @@ impl Node for LeafNode {
 		let mut size = LEAF_HEADER_SIZE;
 
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 
 		// Size for all cells accounting for overflow
 		for (key, value) in self.keys.iter().zip(&self.values) {
 			let payload_len = key.len() + value.len();
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(payload_len, min_local, max_local, usable_size);
+				calculate_overflow(payload_len, min_local, max_local);
 
 			// Key and value length prefixes
 			size += KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX;
@@ -1446,57 +1272,30 @@ pub enum Durability {
 	Manual,
 }
 
-/// - maxLocal = (usableSize - 12) * 64 / 255 - 23
-/// - minLocal = (usableSize - 12) * 32 / 255 - 23
-/// - maxLeaf = usableSize - 35
-/// - minLeaf = (usableSize - 12) * 32 / 255 - 23
-fn calculate_local_limits_internal(is_leaf: bool) -> (usize, usize) {
-	let usable_size = if is_leaf {
-		LEAF_USABLE_SIZE
-	} else {
-		INTERNAL_USABLE_SIZE
-	};
-
-	if is_leaf {
-		let max_leaf = usable_size.saturating_sub(35);
-		let min_leaf = ((usable_size.saturating_sub(12)) * 32 / 255).saturating_sub(23);
-		(min_leaf, max_leaf)
-	} else {
-		let max_local = ((usable_size.saturating_sub(12)) * 64 / 255).saturating_sub(23);
-		let min_local = ((usable_size.saturating_sub(12)) * 32 / 255).saturating_sub(23);
-		(min_local, max_local)
-	}
-}
-
-/// Get cached local limits (cached version of calculate_local_limits_internal)
-/// This is much faster since the limits are constant for a given PAGE_SIZE
+/// This ensures at least 4 cells fit per page, making splits always possible
 #[inline]
 fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
-	if is_leaf {
-		*LEAF_LIMITS.get_or_init(|| calculate_local_limits_internal(true))
+	let usable_size = if is_leaf {
+		PAGE_SIZE - LEAF_HEADER_SIZE // 4075
 	} else {
-		*INTERNAL_LIMITS.get_or_init(|| calculate_local_limits_internal(false))
-	}
+		PAGE_SIZE - INTERNAL_HEADER_SIZE // 4087
+	};
+
+	// Consistent formula: ensures ~25% max per cell, minimum 4 cells per page
+	let max_local = ((usable_size.saturating_sub(12)) * 64 / 255).saturating_sub(23);
+	let min_local = ((usable_size.saturating_sub(12)) * 32 / 255).saturating_sub(23);
+
+	(min_local, max_local)
 }
 
 /// Calculate how much of payload to store on page
 /// Returns (bytes_on_page, needs_overflow)
-///
-/// This minimizes unused space on overflow pages by aligning with overflow page
-/// boundaries
-fn calculate_overflow(
-	payload_size: usize,
-	min_local: usize,
-	max_local: usize,
-	usable_size: usize,
-) -> (usize, bool) {
+fn calculate_overflow(payload_size: usize, min_local: usize, max_local: usize) -> (usize, bool) {
 	if payload_size <= max_local {
 		(payload_size, false)
 	} else {
-		// Minimize unused space on overflow pages
-		// Overflow page size is usable_size - 4 (4 bytes for next page pointer)
-		let overflow_page_size = usable_size.saturating_sub(4);
-		let surplus = min_local + (payload_size.saturating_sub(min_local)) % overflow_page_size;
+		// SQLite's K formula: minimize wasted space on last overflow page
+		let surplus = min_local + (payload_size - min_local) % OVERFLOW_PAGE_CAPACITY;
 		let bytes_on_page = if surplus <= max_local {
 			surplus
 		} else {
@@ -1506,8 +1305,35 @@ fn calculate_overflow(
 	}
 }
 
-/// Size of an overflow pointer
-const OVERFLOW_PTR_SIZE: usize = 8;
+/// Calculate on-page size for a leaf cell
+fn leaf_cell_size(key: &[u8], value: &[u8]) -> usize {
+	let (min_local, max_local) = calculate_local_limits(true);
+	let payload_len = key.len() + value.len();
+	let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, min_local, max_local);
+
+	KEY_SIZE_PREFIX
+		+ VALUE_SIZE_PREFIX
+		+ bytes_on_page
+		+ if needs_overflow {
+			8
+		} else {
+			0
+		}
+}
+
+/// Calculate on-page size for an internal entry
+fn internal_entry_size(key: &[u8]) -> usize {
+	let (min_local, max_local) = calculate_local_limits(false);
+	let (bytes_on_page, needs_overflow) = calculate_overflow(key.len(), min_local, max_local);
+
+	KEY_SIZE_PREFIX
+		+ bytes_on_page
+		+ if needs_overflow {
+			8
+		} else {
+			0
+		}
+}
 
 /// Size of overflow pointer if needed
 #[inline]
@@ -1519,23 +1345,12 @@ const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 	}
 }
 
-/// Calculate the on-page size for an internal node entry (key + child pointer +
-/// overflow)
-#[inline]
-fn internal_entry_size(key: &[u8]) -> usize {
-	let (min_local, max_local) = calculate_local_limits(false);
-	let (key_on_page, needs_overflow) =
-		calculate_overflow(key.len(), min_local, max_local, INTERNAL_USABLE_SIZE);
-	KEY_SIZE_PREFIX + key_on_page + CHILD_PTR_SIZE + overflow_ptr_size(needs_overflow)
-}
-
 /// Calculate the on-page size for a leaf node entry (key+value + overflow)
 #[inline]
 fn leaf_entry_size(key: &[u8], value: &[u8]) -> usize {
 	let (min_local, max_local) = calculate_local_limits(true);
 	let payload_len = key.len() + value.len();
-	let (bytes_on_page, needs_overflow) =
-		calculate_overflow(payload_len, min_local, max_local, LEAF_USABLE_SIZE);
+	let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, min_local, max_local);
 	KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow)
 }
 
@@ -1733,12 +1548,8 @@ impl<F: VfsFile> BPlusTree<F> {
 					let mut parent = self.read_internal_node(offset)?;
 
 					let (min_local, max_local) = calculate_local_limits(false);
-					let (key_on_page, key_overflow) = calculate_overflow(
-						promoted_key.len(),
-						min_local,
-						max_local,
-						INTERNAL_USABLE_SIZE,
-					);
+					let (key_on_page, key_overflow) =
+						calculate_overflow(promoted_key.len(), min_local, max_local);
 					let entry_size = KEY_SIZE_PREFIX
 						+ key_on_page + CHILD_PTR_SIZE
 						+ overflow_ptr_size(key_overflow);
@@ -1788,287 +1599,6 @@ impl<F: VfsFile> BPlusTree<F> {
 		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
 		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
 		Ok(())
-	}
-
-	fn split_leaf(
-		&mut self,
-		leaf: &mut LeafNode,
-		key: Bytes,
-		value: Bytes,
-	) -> Result<(Bytes, u64, u64)> {
-		let idx =
-			leaf.keys.binary_search_by(|k| self.compare.compare(k, &key)).unwrap_or_else(|idx| idx);
-
-		let is_duplicate =
-			idx < leaf.keys.len() && self.compare.compare(&key, &leaf.keys[idx]) == Ordering::Equal;
-
-		// Use size-aware split point that accounts for the new entry
-		// Unified function handles both inserts and updates
-		let split_idx = leaf.find_split_point(&key, &value, idx, is_duplicate);
-
-		let new_leaf_offset = self.allocate_page()?;
-		let mut new_leaf = LeafNode::new(new_leaf_offset);
-
-		// Handle special case: split_idx=0 means new entry goes left, all original
-		// entries go right
-		if split_idx == 0 {
-			// Move all original entries to the new leaf
-			new_leaf.keys = std::mem::take(&mut leaf.keys);
-			new_leaf.values = std::mem::take(&mut leaf.values);
-			new_leaf.cell_overflows = std::mem::take(&mut leaf.cell_overflows);
-
-			// Insert new entry into the (now empty) left leaf
-			if is_duplicate {
-				// If duplicate and split_idx=0, the duplicate must be at idx=0
-				// But we've already moved it to new_leaf, so update it there
-				if new_leaf.get_overflow_at(0) != 0 {
-					self.free_overflow_chain(new_leaf.get_overflow_at(0))?;
-				}
-				new_leaf.values[0] = value;
-				new_leaf.set_overflow_at(0, 0);
-			} else {
-				leaf.insert_cell_with_overflow(0, key, value, 0);
-			}
-		} else if idx < split_idx {
-			// New entry goes to left leaf
-			new_leaf.keys = leaf.keys.split_off(split_idx);
-			new_leaf.values = leaf.values.split_off(split_idx);
-			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
-
-			if is_duplicate {
-				if leaf.get_overflow_at(idx) != 0 {
-					self.free_overflow_chain(leaf.get_overflow_at(idx))?;
-				}
-				leaf.values[idx] = value;
-				leaf.set_overflow_at(idx, 0);
-			} else {
-				leaf.insert_cell_with_overflow(idx, key, value, 0);
-			}
-		} else {
-			// New entry goes to right leaf
-			let right_idx = idx - split_idx;
-
-			new_leaf.keys = leaf.keys.split_off(split_idx);
-			new_leaf.values = leaf.values.split_off(split_idx);
-			new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
-
-			if is_duplicate {
-				if new_leaf.get_overflow_at(right_idx) != 0 {
-					self.free_overflow_chain(new_leaf.get_overflow_at(right_idx))?;
-				}
-				new_leaf.values[right_idx] = value;
-				new_leaf.set_overflow_at(right_idx, 0);
-			} else {
-				new_leaf.insert_cell_with_overflow(right_idx, key, value, 0);
-			}
-		}
-
-		new_leaf.next_leaf = leaf.next_leaf;
-		new_leaf.prev_leaf = leaf.offset;
-		leaf.next_leaf = new_leaf.offset;
-
-		let promoted_key = new_leaf.keys[0].clone();
-		let promoted_overflow = 0;
-
-		let next_leaf_update = if new_leaf.next_leaf != 0 {
-			Some(new_leaf.next_leaf)
-		} else {
-			None
-		};
-
-		let new_leaf_offset = new_leaf.offset;
-
-		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf.offset));
-		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
-		self.write_node_owned(NodeType::Leaf(new_leaf))?;
-
-		if let Some(next_offset) = next_leaf_update {
-			let next_node = self.read_node(next_offset)?;
-			if matches!(next_node.as_ref(), NodeType::Leaf(_)) {
-				let mut next_leaf = self.extract_leaf_mut(next_node);
-				next_leaf.prev_leaf = new_leaf_offset;
-				self.write_node_owned(NodeType::Leaf(next_leaf))?;
-			}
-		}
-
-		Ok((promoted_key, promoted_overflow, new_leaf_offset))
-	}
-
-	fn split_internal_with_child(
-		&mut self,
-		node: &mut InternalNode,
-		extra_key: Bytes,
-		extra_overflow: u64,
-		extra_child: u64,
-	) -> Result<(Bytes, u64, u64)> {
-		let insert_idx = node
-			.keys
-			.binary_search_by(|key| self.compare.compare(key, &extra_key))
-			.unwrap_or_else(|idx| idx);
-
-		// Find split point in EXPANDED array (includes extra_key at insert_idx)
-		let expanded_split_idx = Self::find_split_point(node, insert_idx, &extra_key);
-
-		let new_node_offset = self.allocate_page()?;
-		let mut new_node = InternalNode::new(new_node_offset);
-
-		// Three cases based on where extra_key falls relative to split point
-		let (promoted_key, promoted_overflow) = if expanded_split_idx == insert_idx {
-			// Case 1: extra_key IS the promoted key - don't insert it into either child
-
-			// Convert expanded index to original for split_off
-			// Since extra_key is at expanded_split_idx, original split point is same
-			let orig_split = expanded_split_idx;
-
-			new_node.keys = node.keys.split_off(orig_split);
-			new_node.key_overflows = node.key_overflows.split_off(orig_split);
-			new_node.children = node.children.split_off(orig_split + 1);
-
-			// extra_key goes to parent as the promoted key
-			// extra_child goes to the RIGHT side (new_node) as its first child
-			new_node.children.insert(0, extra_child);
-
-			(extra_key, extra_overflow)
-		} else if expanded_split_idx < insert_idx {
-			// Case 2: Promoted key is from original array, extra_key goes to RIGHT
-
-			let orig_split = expanded_split_idx;
-			let promoted = (node.keys[orig_split].clone(), node.get_overflow_at(orig_split));
-
-			new_node.keys = node.keys.split_off(orig_split + 1);
-			new_node.key_overflows = node.key_overflows.split_off(orig_split + 1);
-			new_node.children = node.children.split_off(orig_split + 1);
-
-			// Remove promoted key from left
-			node.keys.truncate(orig_split);
-			node.key_overflows.truncate(orig_split);
-
-			// Insert extra_key into right (new_node)
-			// In expanded array: extra was at insert_idx, split was at expanded_split_idx
-			// In right array: position = insert_idx - expanded_split_idx - 1
-			let right_insert_idx = insert_idx - expanded_split_idx - 1;
-			new_node.keys.insert(right_insert_idx, extra_key);
-			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
-			new_node.children.insert(right_insert_idx + 1, extra_child);
-
-			promoted
-		} else {
-			// Case 3: Promoted key is from original array (after extra_key position),
-			//         extra_key goes to LEFT
-
-			// expanded_split_idx > insert_idx, so original index = expanded - 1
-			let orig_split = expanded_split_idx - 1;
-			let promoted = (node.keys[orig_split].clone(), node.get_overflow_at(orig_split));
-
-			new_node.keys = node.keys.split_off(orig_split + 1);
-			new_node.key_overflows = node.key_overflows.split_off(orig_split + 1);
-			new_node.children = node.children.split_off(orig_split + 1);
-
-			// Remove promoted key from left
-			node.keys.truncate(orig_split);
-			node.key_overflows.truncate(orig_split);
-
-			// Insert extra_key into left (node) using binary search
-			node.insert_key_child_with_overflow(
-				extra_key,
-				extra_overflow,
-				extra_child,
-				self.compare.as_ref(),
-			);
-
-			promoted
-		};
-
-		let node_owned = std::mem::replace(node, InternalNode::new(node.offset));
-		self.write_node_owned(NodeType::Internal(node_owned))?;
-		self.write_node_owned(NodeType::Internal(new_node))?;
-
-		Ok((promoted_key, promoted_overflow, new_node_offset))
-	}
-
-	/// Processes entries left-to-right, returns split index in EXPANDED array
-	/// (the array that conceptually includes extra_key at insert_idx)
-	fn find_split_point(node: &InternalNode, insert_idx: usize, extra_key: &[u8]) -> usize {
-		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
-
-		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
-
-		// Calculate actual entry sizes for all keys including the new one
-		let mut entry_sizes = Vec::with_capacity(node.keys.len() + 1);
-
-		for (i, key) in node.keys.iter().enumerate() {
-			if i == insert_idx {
-				// Insert the new key's size at this position
-				let (bytes_on_page, needs_overflow) =
-					calculate_overflow(extra_key.len(), min_local, max_local, usable_size);
-				let size = KEY_SIZE_PREFIX
-					+ bytes_on_page + overflow_ptr_size(needs_overflow)
-					+ CHILD_PTR_SIZE;
-				entry_sizes.push(size);
-			}
-
-			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(key.len(), min_local, max_local, usable_size);
-			let size = KEY_SIZE_PREFIX
-				+ bytes_on_page
-				+ overflow_ptr_size(needs_overflow)
-				+ CHILD_PTR_SIZE;
-			entry_sizes.push(size);
-		}
-
-		// Handle insert at end
-		if insert_idx >= node.keys.len() {
-			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(extra_key.len(), min_local, max_local, usable_size);
-			let size = KEY_SIZE_PREFIX
-				+ bytes_on_page
-				+ overflow_ptr_size(needs_overflow)
-				+ CHILD_PTR_SIZE;
-			entry_sizes.push(size);
-		}
-
-		let total_entries = entry_sizes.len();
-		let max_page_size = PAGE_SIZE;
-
-		// Base size: header + first child pointer (n+1 children for n keys)
-		let base_size = INTERNAL_HEADER_SIZE + CHILD_PTR_SIZE;
-
-		// Phase 1: Fill left page until it can't fit more
-		let mut current_size = base_size;
-		let mut split_idx = 1; // Start at 1 to ensure at least one entry on left
-
-		for (i, &entry_size) in entry_sizes.iter().enumerate().take(total_entries - 1) {
-			let new_size = current_size + entry_size;
-			if new_size > max_page_size && current_size > base_size {
-				split_idx = i;
-				break;
-			}
-			current_size = new_size;
-			split_idx = i + 1;
-		}
-
-		// Phase 2: Verify right page fits
-		let right_size: usize = base_size + entry_sizes[split_idx + 1..].iter().sum::<usize>();
-
-		// If right is too big, try to find better split point
-		let mut adjusted_split = split_idx;
-		if right_size > max_page_size {
-			for test_split in (1..split_idx).rev() {
-				let test_right: usize =
-					base_size + entry_sizes[test_split + 1..].iter().sum::<usize>();
-				let test_left: usize = base_size + entry_sizes[..test_split].iter().sum::<usize>();
-				if test_right <= max_page_size && test_left <= max_page_size {
-					adjusted_split = test_split;
-					break;
-				}
-			}
-		}
-
-		// Ensure at least one key on each side (in expanded array)
-		adjusted_split.clamp(1, total_entries.saturating_sub(2).max(1))
-
-		// NOTE: We return the EXPANDED array index, NOT converted to original
 	}
 
 	#[allow(unused)]
@@ -2864,7 +2394,6 @@ impl<F: VfsFile> BPlusTree<F> {
 	/// keys
 	fn prepare_internal_node_overflow(&mut self, node: &mut InternalNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(false);
-		let usable_size = INTERNAL_USABLE_SIZE;
 
 		// Ensure key_overflows vec is properly sized
 		while node.key_overflows.len() < node.keys.len() {
@@ -2874,7 +2403,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		// Check each key to see if it needs overflow
 		for (i, key) in node.keys.iter().enumerate() {
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(key.len(), min_local, max_local, usable_size);
+				calculate_overflow(key.len(), min_local, max_local);
 
 			if needs_overflow {
 				let overflow_data = &key[bytes_on_page..];
@@ -2903,7 +2432,6 @@ impl<F: VfsFile> BPlusTree<F> {
 	/// (key+value)
 	fn prepare_leaf_node_overflow(&mut self, node: &mut LeafNode) -> Result<()> {
 		let (min_local, max_local) = calculate_local_limits(true);
-		let usable_size = LEAF_USABLE_SIZE;
 
 		// Ensure overflow vec is properly sized
 		while node.cell_overflows.len() < node.keys.len() {
@@ -2914,7 +2442,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		for (i, (key, value)) in node.keys.iter().zip(&node.values).enumerate() {
 			let payload_len = key.len() + value.len();
 			let (bytes_on_page, needs_overflow) =
-				calculate_overflow(payload_len, min_local, max_local, usable_size);
+				calculate_overflow(payload_len, min_local, max_local);
 
 			if needs_overflow {
 				let mut cell_data = Vec::with_capacity(payload_len);
@@ -3157,6 +2685,246 @@ impl<F: VfsFile> BPlusTree<F> {
 	#[cfg(test)]
 	fn print_tree_stats(&mut self) -> Result<()> {
 		Ok(())
+	}
+
+	/// Split a leaf node after inserting a new entry.
+	///
+	/// INVARIANTS:
+	/// - Before insert: sum(cell_sizes) ≤ 4075 (fits in page)
+	/// - After insert: sum ≤ 4075 + max_cell ≤ 4075 + 1011 = 5086
+	/// - With max_cell ≤ 1011 and 4 cells guaranteed to fit, split always succeeds
+	fn split_leaf(
+		&mut self,
+		leaf: &mut LeafNode,
+		key: Bytes,
+		value: Bytes,
+	) -> Result<(Bytes, u64, u64)> {
+		// STEP 1: Insert the new entry
+		let (_, old_overflow) = leaf.insert(key, value, self.compare.as_ref());
+		if let Some(ov) = old_overflow {
+			self.free_overflow_chain(ov)?;
+		}
+
+		let n = leaf.keys.len();
+		assert!(n >= 2, "Need at least 2 entries to split");
+
+		// STEP 2: Pre-compute cell sizes
+		let cell_sizes: Vec<usize> =
+			leaf.keys.iter().zip(&leaf.values).map(|(k, v)| leaf_cell_size(k, v)).collect();
+
+		let total_size: usize = cell_sizes.iter().sum();
+
+		// STEP 3: Find valid split point using prefix sums
+		let mut prefix_sum = vec![0usize; n + 1];
+		for i in 0..n {
+			prefix_sum[i + 1] = prefix_sum[i] + cell_sizes[i];
+		}
+
+		// Valid split at k means:
+		// - Left (cells 0..k): LEAF_HEADER_SIZE + prefix_sum[k] ≤ PAGE_SIZE
+		// - Right (cells k..n): LEAF_HEADER_SIZE + (total - prefix_sum[k]) ≤ PAGE_SIZE
+		//
+		// Equivalent to: prefix_sum[k] ∈ [total - 4075, 4075]
+
+		let lower_bound = total_size.saturating_sub(PAGE_SIZE - LEAF_HEADER_SIZE);
+		let upper_bound = PAGE_SIZE - LEAF_HEADER_SIZE;
+
+		let mut split_idx = None;
+		let mut best_diff = usize::MAX;
+
+		for (k, item) in prefix_sum.iter().enumerate().take(n).skip(1) {
+			if *item >= lower_bound && *item <= upper_bound {
+				let left_size = *item;
+				let right_size = total_size - *item;
+				let diff = (left_size as isize - right_size as isize).unsigned_abs();
+
+				if diff < best_diff {
+					best_diff = diff;
+					split_idx = Some(k);
+				}
+			}
+		}
+
+		let split_idx = split_idx
+			.expect("BUG: No valid split point found. This indicates max_local is too large.");
+
+		// STEP 4: Perform the split
+		let new_leaf_offset = self.allocate_page()?;
+		let mut new_leaf = LeafNode::new(new_leaf_offset);
+
+		new_leaf.keys = leaf.keys.split_off(split_idx);
+		new_leaf.values = leaf.values.split_off(split_idx);
+		new_leaf.cell_overflows = leaf.cell_overflows.split_off(split_idx);
+
+		// STEP 5: Update linked list
+		new_leaf.next_leaf = leaf.next_leaf;
+		new_leaf.prev_leaf = leaf.offset;
+		leaf.next_leaf = new_leaf.offset;
+
+		// STEP 6: Get separator key (copy of first key in right leaf)
+		let separator_key = new_leaf.keys[0].clone();
+
+		// STEP 7: Validate (debug only)
+		#[cfg(debug_assertions)]
+		{
+			let left_size = LEAF_HEADER_SIZE + prefix_sum[split_idx];
+			let right_size = LEAF_HEADER_SIZE + (total_size - prefix_sum[split_idx]);
+			assert!(left_size <= PAGE_SIZE, "Left leaf {} > PAGE_SIZE {}", left_size, PAGE_SIZE);
+			assert!(right_size <= PAGE_SIZE, "Right leaf {} > PAGE_SIZE {}", right_size, PAGE_SIZE);
+			assert!(!leaf.keys.is_empty(), "Left leaf empty after split");
+			assert!(!new_leaf.keys.is_empty(), "Right leaf empty after split");
+		}
+
+		// STEP 8: Write nodes
+		let next_leaf_offset = new_leaf.next_leaf;
+		let leaf_offset = leaf.offset;
+		let leaf_owned = std::mem::replace(leaf, LeafNode::new(leaf_offset));
+		self.write_node_owned(NodeType::Leaf(leaf_owned))?;
+
+		let new_offset = new_leaf.offset;
+		self.write_node_owned(NodeType::Leaf(new_leaf))?;
+
+		// Update next leaf's prev pointer
+		if next_leaf_offset != 0 {
+			let next_node = self.read_node(next_leaf_offset)?;
+			if let NodeType::Leaf(_) = next_node.as_ref() {
+				let mut next_leaf_node = self.extract_leaf_mut(next_node);
+				next_leaf_node.prev_leaf = new_offset;
+				self.write_node_owned(NodeType::Leaf(next_leaf_node))?;
+			}
+		}
+
+		Ok((separator_key, 0, new_offset))
+	}
+
+	// =========================================================================
+	// INTERNAL NODE SPLIT
+	// =========================================================================
+
+	/// Split an internal node after inserting a new key+child.
+	///
+	/// INVARIANTS:
+	/// - With max_entry ≤ 1011, at least 4 keys fit per page
+	/// - After split: each side has ≥ 1 key, which always fits
+	fn split_internal_with_child(
+		&mut self,
+		node: &mut InternalNode,
+		extra_key: Bytes,
+		extra_overflow: u64,
+		extra_child: u64,
+	) -> Result<(Bytes, u64, u64)> {
+		// STEP 1: Insert the new key+child
+		node.insert_key_child_with_overflow(
+			extra_key,
+			extra_overflow,
+			extra_child,
+			self.compare.as_ref(),
+		);
+
+		let n = node.keys.len();
+		assert!(n >= 2, "Need at least 2 keys to split internal node");
+
+		// STEP 2: Pre-compute entry sizes
+		let entry_sizes: Vec<usize> = node.keys.iter().map(|k| internal_entry_size(k)).collect();
+
+		// STEP 3: Compute prefix sums for key sizes
+		let mut key_prefix = vec![0usize; n + 1];
+		for i in 0..n {
+			key_prefix[i + 1] = key_prefix[i] + entry_sizes[i];
+		}
+		let total_key_size = key_prefix[n];
+
+		// STEP 4: Find valid split point
+		//
+		// After removing promoted key at index p:
+		// - Left: p keys, p+1 children
+		// - Right: n-1-p keys, n-p children
+		//
+		// Left size = INTERNAL_HEADER_SIZE + key_prefix[p] + (p+1) * CHILD_PTR_SIZE
+		// Right size = INTERNAL_HEADER_SIZE + (total_key_size - key_prefix[p+1]) + (n-p) *
+		// CHILD_PTR_SIZE
+
+		let mut best_p = n / 2;
+		let mut best_diff = usize::MAX;
+		let mut found_valid = false;
+
+		for p in 1..(n.saturating_sub(1).max(1) + 1) {
+			if p >= n {
+				break;
+			}
+
+			let left_key_size = key_prefix[p];
+			let right_key_size = total_key_size - key_prefix[p + 1];
+
+			let left_size = INTERNAL_HEADER_SIZE + left_key_size + (p + 1) * CHILD_PTR_SIZE;
+			let right_size = INTERNAL_HEADER_SIZE + right_key_size + (n - p) * CHILD_PTR_SIZE;
+
+			if left_size <= PAGE_SIZE && right_size <= PAGE_SIZE {
+				found_valid = true;
+				let diff = (left_size as isize - right_size as isize).unsigned_abs();
+				if diff < best_diff {
+					best_diff = diff;
+					best_p = p;
+				}
+			}
+		}
+
+		assert!(found_valid, "BUG: No valid internal split point found");
+
+		// STEP 5: Extract promoted key
+		let promoted_key = node.keys.remove(best_p);
+		let promoted_overflow = if best_p < node.key_overflows.len() {
+			node.key_overflows.remove(best_p)
+		} else {
+			0
+		};
+
+		// STEP 6: Split remaining keys and children
+		let new_node_offset = self.allocate_page()?;
+		let mut new_node = InternalNode::new(new_node_offset);
+
+		new_node.keys = node.keys.split_off(best_p);
+		new_node.key_overflows = node.key_overflows.split_off(best_p);
+		new_node.children = node.children.split_off(best_p + 1);
+
+		// STEP 7: Validate
+		#[cfg(debug_assertions)]
+		{
+			assert_eq!(
+				node.children.len(),
+				node.keys.len() + 1,
+				"Left: children {} != keys {} + 1",
+				node.children.len(),
+				node.keys.len()
+			);
+			assert_eq!(
+				new_node.children.len(),
+				new_node.keys.len() + 1,
+				"Right: children {} != keys {} + 1",
+				new_node.children.len(),
+				new_node.keys.len()
+			);
+			assert!(
+				node.current_size() <= PAGE_SIZE,
+				"Left internal {} > PAGE_SIZE",
+				node.current_size()
+			);
+			assert!(
+				new_node.current_size() <= PAGE_SIZE,
+				"Right internal {} > PAGE_SIZE",
+				new_node.current_size()
+			);
+		}
+
+		// STEP 8: Write nodes
+		let node_offset = node.offset;
+		let node_owned = std::mem::replace(node, InternalNode::new(node_offset));
+		self.write_node_owned(NodeType::Internal(node_owned))?;
+
+		let new_offset = new_node.offset;
+		self.write_node_owned(NodeType::Internal(new_node))?;
+
+		Ok((promoted_key, promoted_overflow, new_offset))
 	}
 }
 
