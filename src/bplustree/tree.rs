@@ -135,6 +135,12 @@ const OVERFLOW_PTR_SIZE: usize = 8;
 // Overflow page: 1 (type) + 8 (next_ptr) + 4 (data_len) + data
 const OVERFLOW_PAGE_CAPACITY: usize = PAGE_SIZE - 13; // = 4083
 
+// Pre-computed constants (no runtime calculation needed)
+const LEAF_MIN_LOCAL: usize = 486; // ((4075 - 12) * 32 / 255) - 23
+const LEAF_MAX_LOCAL: usize = 996; // ((4075 - 12) * 64 / 255) - 23
+const INTERNAL_MIN_LOCAL: usize = 488; // ((4087 - 12) * 32 / 255) - 23
+const INTERNAL_MAX_LOCAL: usize = 999; // ((4087 - 12) * 64 / 255) - 23
+
 // Helper functions for reading integer types from byte slices without unwrap()
 // These are safe to use when bounds have already been checked
 #[inline(always)]
@@ -931,19 +937,12 @@ impl LeafNode {
 
 	// Check if this leaf can fit another key-value pair
 	fn can_fit_entry(&self, key: &[u8], value: &[u8]) -> bool {
-		let (min_local, max_local) = calculate_local_limits(true);
-		let payload_len = key.len() + value.len();
-		let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, min_local, max_local);
-
-		let entry_size =
-			KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow);
-
-		self.current_size() + entry_size <= PAGE_SIZE
+		self.current_size() + leaf_cell_size(key, value) <= PAGE_SIZE
 	}
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		self.current_size() * 100 < Self::max_size() * 50
+		self.current_size() * 100 < Self::max_size() * 35
 	}
 }
 
@@ -1273,23 +1272,15 @@ pub enum Durability {
 }
 
 /// This ensures at least 4 cells fit per page, making splits always possible
-#[inline]
 fn calculate_local_limits(is_leaf: bool) -> (usize, usize) {
-	let usable_size = if is_leaf {
-		PAGE_SIZE - LEAF_HEADER_SIZE // 4075
+	if is_leaf {
+		(LEAF_MIN_LOCAL, LEAF_MAX_LOCAL)
 	} else {
-		PAGE_SIZE - INTERNAL_HEADER_SIZE // 4087
-	};
-
-	// Consistent formula: ensures ~25% max per cell, minimum 4 cells per page
-	let max_local = ((usable_size.saturating_sub(12)) * 64 / 255).saturating_sub(23);
-	let min_local = ((usable_size.saturating_sub(12)) * 32 / 255).saturating_sub(23);
-
-	(min_local, max_local)
+		(INTERNAL_MIN_LOCAL, INTERNAL_MAX_LOCAL)
+	}
 }
 
 /// Calculate how much of payload to store on page
-/// Returns (bytes_on_page, needs_overflow)
 fn calculate_overflow(payload_size: usize, min_local: usize, max_local: usize) -> (usize, bool) {
 	if payload_size <= max_local {
 		(payload_size, false)
@@ -1336,22 +1327,12 @@ fn internal_entry_size(key: &[u8]) -> usize {
 }
 
 /// Size of overflow pointer if needed
-#[inline]
 const fn overflow_ptr_size(needs_overflow: bool) -> usize {
 	if needs_overflow {
 		OVERFLOW_PTR_SIZE
 	} else {
 		0
 	}
-}
-
-/// Calculate the on-page size for a leaf node entry (key+value + overflow)
-#[inline]
-fn leaf_entry_size(key: &[u8], value: &[u8]) -> usize {
-	let (min_local, max_local) = calculate_local_limits(true);
-	let payload_len = key.len() + value.len();
-	let (bytes_on_page, needs_overflow) = calculate_overflow(payload_len, min_local, max_local);
-	KEY_SIZE_PREFIX + VALUE_SIZE_PREFIX + bytes_on_page + overflow_ptr_size(needs_overflow)
 }
 
 pub struct BPlusTree<F: VfsFile> {
@@ -1992,7 +1973,7 @@ impl<F: VfsFile> BPlusTree<F> {
 	) -> Result<()> {
 		let last_idx = left_node.keys.len() - 1;
 		let last_entry_size = if last_idx < left_node.keys.len() {
-			leaf_entry_size(&left_node.keys[last_idx], &left_node.values[last_idx])
+			leaf_cell_size(&left_node.keys[last_idx], &left_node.values[last_idx])
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Left node is unexpectedly empty during redistribution".into(),
@@ -2023,7 +2004,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		right_node: &mut LeafNode,
 	) -> Result<()> {
 		let first_entry_size = if !right_node.keys.is_empty() {
-			leaf_entry_size(&right_node.keys[0], &right_node.values[0])
+			leaf_cell_size(&right_node.keys[0], &right_node.values[0])
 		} else {
 			return Err(BPlusTreeError::Serialization(
 				"Right node is unexpectedly empty during redistribution".into(),
@@ -2709,16 +2690,15 @@ impl<F: VfsFile> BPlusTree<F> {
 		assert!(n >= 2, "Need at least 2 entries to split");
 
 		// STEP 2: Pre-compute cell sizes
-		let cell_sizes: Vec<usize> =
-			leaf.keys.iter().zip(&leaf.values).map(|(k, v)| leaf_cell_size(k, v)).collect();
+		let mut prefix_sum = Vec::with_capacity(n + 1);
+		prefix_sum.push(0);
 
-		let total_size: usize = cell_sizes.iter().sum();
-
-		// STEP 3: Find valid split point using prefix sums
-		let mut prefix_sum = vec![0usize; n + 1];
-		for i in 0..n {
-			prefix_sum[i + 1] = prefix_sum[i] + cell_sizes[i];
+		let mut running_sum = 0usize;
+		for (k, v) in leaf.keys.iter().zip(&leaf.values) {
+			running_sum += leaf_cell_size(k, v);
+			prefix_sum.push(running_sum);
 		}
+		let total_size = running_sum;
 
 		// Valid split at k means:
 		// - Left (cells 0..k): LEAF_HEADER_SIZE + prefix_sum[k] ≤ PAGE_SIZE
