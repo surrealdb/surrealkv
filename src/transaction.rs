@@ -265,15 +265,15 @@ impl Transaction {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
-				key,
-				Some(value),
+				key.into_bytes(),
+				Some(value.into_bytes()),
 				InternalKeyKind::Set,
 				self.savepoints,
 				write_seqno,
 				timestamp,
 			)
 		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
+			Entry::new(key.into_bytes(), Some(value.into_bytes()), InternalKeyKind::Set, self.savepoints, write_seqno)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -296,15 +296,15 @@ impl Transaction {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
+				key.into_bytes(),
+				None,
 				InternalKeyKind::Delete,
 				self.savepoints,
 				write_seqno,
 				timestamp,
 			)
 		} else {
-			Entry::new(key, None::<&[u8]>, InternalKeyKind::Delete, self.savepoints, write_seqno)
+			Entry::new(key.into_bytes(), None, InternalKeyKind::Delete, self.savepoints, write_seqno)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -336,8 +336,8 @@ impl Transaction {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
+				key.into_bytes(),
+				None,
 				InternalKeyKind::SoftDelete,
 				self.savepoints,
 				write_seqno,
@@ -345,8 +345,8 @@ impl Transaction {
 			)
 		} else {
 			Entry::new(
-				key,
-				None::<&[u8]>,
+				key.into_bytes(),
+				None,
 				InternalKeyKind::SoftDelete,
 				self.savepoints,
 				write_seqno,
@@ -380,15 +380,15 @@ impl Transaction {
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
 			Entry::new_with_timestamp(
-				key,
-				Some(value),
+				key.into_bytes(),
+				Some(value.into_bytes()),
 				InternalKeyKind::Replace,
 				self.savepoints,
 				write_seqno,
 				timestamp,
 			)
 		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
+			Entry::new(key.into_bytes(), Some(value.into_bytes()), InternalKeyKind::Replace, self.savepoints, write_seqno)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -1018,16 +1018,16 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	fn new<K: IntoBytes, V: IntoBytes>(
-		key: K,
-		value: Option<V>,
+	fn new(
+		key: Key,
+		value: Option<Value>,
 		kind: InternalKeyKind,
 		savepoint_no: u32,
 		seqno: u32,
 	) -> Entry {
 		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
+			key,
+			value,
 			kind,
 			savepoint_no,
 			seqno,
@@ -1035,17 +1035,17 @@ impl Entry {
 		}
 	}
 
-	fn new_with_timestamp<K: IntoBytes, V: IntoBytes>(
-		key: K,
-		value: Option<V>,
+	fn new_with_timestamp(
+		key: Key,
+		value: Option<Value>,
 		kind: InternalKeyKind,
 		savepoint_no: u32,
 		seqno: u32,
 		timestamp: u64,
 	) -> Entry {
 		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
+			key,
+			value,
 			kind,
 			savepoint_no,
 			seqno,

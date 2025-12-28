@@ -565,7 +565,7 @@ impl Iterator for VersionedRangeIterator {
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if self.index < self.results.len() {
-			let result = self.results[self.index].clone();
+			let result = std::mem::take(&mut self.results[self.index]);
 			self.index += 1;
 			Some(result)
 		} else {
@@ -581,10 +581,9 @@ impl Iterator for VersionedRangeIterator {
 
 impl DoubleEndedIterator for VersionedRangeIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		if self.index < self.results.len() {
-			let result = self.results[self.results.len() - 1].clone();
-			self.results.pop();
-			Some(result)
+		let len = self.results.len();
+		if self.index < len {
+			self.results.pop()
 		} else {
 			None
 		}

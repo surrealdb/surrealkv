@@ -135,7 +135,8 @@ impl InternalKey {
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = self.user_key.clone();
+		let mut buf = Vec::with_capacity(self.user_key.len() + 16);
+		buf.extend_from_slice(&self.user_key);
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
 		buf
