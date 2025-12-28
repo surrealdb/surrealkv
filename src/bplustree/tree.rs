@@ -222,9 +222,6 @@ trait Node {
 	fn max_size() -> usize {
 		PAGE_SIZE
 	}
-
-	// Check if this node could merge with another node
-	fn can_merge_with(&self, other: &Self) -> bool;
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +529,23 @@ impl InternalNode {
 
 		(size, max_key_len)
 	}
+
+	fn can_merge_with(&self, other: &Self, separator: &Bytes) -> bool {
+		let (self_size, _) = self.calculate_size_and_max_key();
+		let (other_size, _) = other.calculate_size_and_max_key();
+
+		let combined_size = self_size + other_size;
+		let actual_merged_size = combined_size - INTERNAL_HEADER_SIZE;
+
+		let (min_local, max_local) = calculate_local_limits(false);
+		let (separator_on_page, needs_overflow) =
+			calculate_overflow(separator.len(), min_local, max_local);
+		let separator_size =
+			KEY_SIZE_PREFIX + separator_on_page + overflow_ptr_size(needs_overflow);
+
+		let with_separator = actual_merged_size + separator_size;
+		with_separator <= Self::max_size()
+	}
 }
 
 impl Node for InternalNode {
@@ -609,25 +623,6 @@ impl Node for InternalNode {
 		size += self.children.len() * CHILD_PTR_SIZE;
 
 		size
-	}
-
-	fn can_merge_with(&self, other: &Self) -> bool {
-		let (self_size, self_max_key) = self.calculate_size_and_max_key();
-		let (other_size, other_max_key) = other.calculate_size_and_max_key();
-
-		let combined_size = self_size + other_size;
-		let actual_merged_size = combined_size - INTERNAL_HEADER_SIZE;
-		let max_key_size = self_max_key.max(other_max_key);
-
-		let (min_local, max_local) = calculate_local_limits(false);
-		let (separator_on_page, separator_overflow) =
-			calculate_overflow(max_key_size, min_local, max_local);
-		let separator_size =
-			KEY_SIZE_PREFIX + separator_on_page + overflow_ptr_size(separator_overflow);
-
-		let with_separator = actual_merged_size + separator_size;
-
-		with_separator <= Self::max_size()
 	}
 }
 
@@ -944,6 +939,13 @@ impl LeafNode {
 	fn is_underflow(&self) -> bool {
 		self.current_size() * 100 < Self::max_size() * 35
 	}
+
+	fn can_merge_with(&self, other: &Self) -> bool {
+		let combined_size = self.current_size() + other.current_size();
+		let actual_merged_size = combined_size - LEAF_HEADER_SIZE;
+
+		actual_merged_size <= Self::max_size()
+	}
 }
 
 impl Node for LeafNode {
@@ -1032,13 +1034,6 @@ impl Node for LeafNode {
 		}
 
 		size
-	}
-
-	fn can_merge_with(&self, other: &Self) -> bool {
-		let combined_size = self.current_size() + other.current_size();
-		let actual_merged_size = combined_size - LEAF_HEADER_SIZE;
-
-		actual_merged_size <= Self::max_size()
 	}
 }
 
@@ -1743,9 +1738,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		// Try to borrow from left sibling first
 		if let Some(ref left_arc) = left_sibling_node {
 			if is_internal {
-				// For internal nodes
 				if let NodeType::Internal(left_node) = left_arc.as_ref() {
-					// Check if left sibling has enough to redistribute and is not in underflow
 					if !left_node.is_underflow() {
 						let mut left_node_mut = self.extract_internal_mut(Arc::clone(left_arc));
 						let mut right_node_mut =
@@ -1759,21 +1752,17 @@ impl<F: VfsFile> BPlusTree<F> {
 						return Ok(());
 					}
 				}
-			} else {
-				// For leaf nodes
-				if let NodeType::Leaf(left_node) = left_arc.as_ref() {
-					// Check if left sibling has enough to redistribute and is not in underflow
-					if !left_node.is_underflow() {
-						let mut left_node_mut = self.extract_leaf_mut(Arc::clone(left_arc));
-						let mut right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
-						self.redistribute_leaf_from_left(
-							parent,
-							child_idx - 1,
-							&mut left_node_mut,
-							&mut right_node_mut,
-						)?;
-						return Ok(());
-					}
+			} else if let NodeType::Leaf(left_node) = left_arc.as_ref() {
+				if !left_node.is_underflow() {
+					let mut left_node_mut = self.extract_leaf_mut(Arc::clone(left_arc));
+					let mut right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+					self.redistribute_leaf_from_left(
+						parent,
+						child_idx - 1,
+						&mut left_node_mut,
+						&mut right_node_mut,
+					)?;
+					return Ok(());
 				}
 			}
 		}
@@ -1781,9 +1770,7 @@ impl<F: VfsFile> BPlusTree<F> {
 		// Try to borrow from right sibling if left redistribution wasn't possible
 		if let Some(ref right_arc) = right_sibling_node {
 			if is_internal {
-				// For internal nodes
 				if let NodeType::Internal(right_node) = right_arc.as_ref() {
-					// Check if right sibling has enough to redistribute and is not in underflow
 					if !right_node.is_underflow() {
 						let mut left_node_mut =
 							self.read_internal_node(parent.children[child_idx])?;
@@ -1797,21 +1784,17 @@ impl<F: VfsFile> BPlusTree<F> {
 						return Ok(());
 					}
 				}
-			} else {
-				// For leaf nodes
-				if let NodeType::Leaf(right_node) = right_arc.as_ref() {
-					// Check if right sibling has enough to redistribute and is not in underflow
-					if !right_node.is_underflow() {
-						let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
-						let mut right_node_mut = self.extract_leaf_mut(Arc::clone(right_arc));
-						self.redistribute_leaf_from_right(
-							parent,
-							child_idx,
-							&mut left_node_mut,
-							&mut right_node_mut,
-						)?;
-						return Ok(());
-					}
+			} else if let NodeType::Leaf(right_node) = right_arc.as_ref() {
+				if !right_node.is_underflow() {
+					let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
+					let mut right_node_mut = self.extract_leaf_mut(Arc::clone(right_arc));
+					self.redistribute_leaf_from_right(
+						parent,
+						child_idx,
+						&mut left_node_mut,
+						&mut right_node_mut,
+					)?;
+					return Ok(());
 				}
 			}
 		}
@@ -1824,13 +1807,18 @@ impl<F: VfsFile> BPlusTree<F> {
 			if is_internal {
 				let mut left_node_mut = self.extract_internal_mut(left_arc);
 				let right_node_mut = self.read_internal_node(parent.children[child_idx])?;
-				self.merge_internal_nodes(
-					parent,
-					left_idx,
-					child_idx,
-					&mut left_node_mut,
-					right_node_mut,
-				)?;
+
+				// FIXED: Pass actual separator to can_merge_with
+				let separator = &parent.keys[left_idx];
+				if left_node_mut.can_merge_with(&right_node_mut, separator) {
+					self.merge_internal_nodes(
+						parent,
+						left_idx,
+						child_idx,
+						&mut left_node_mut,
+						right_node_mut,
+					)?;
+				}
 			} else {
 				let mut left_node_mut = self.extract_leaf_mut(left_arc);
 				let right_node_mut = self.read_leaf_node(parent.children[child_idx])?;
@@ -1842,20 +1830,28 @@ impl<F: VfsFile> BPlusTree<F> {
 					right_node_mut,
 				)?;
 			}
+			return Ok(());
 		}
+
 		// Otherwise merge with right sibling
-		else if let Some(right_arc) = right_sibling_node {
+		if let Some(right_arc) = right_sibling_node {
 			let right_idx = child_idx + 1;
 			if is_internal {
 				let mut left_node_mut = self.read_internal_node(parent.children[child_idx])?;
 				let right_node_mut = self.extract_internal_mut(right_arc);
-				self.merge_internal_nodes(
-					parent,
-					child_idx,
-					right_idx,
-					&mut left_node_mut,
-					right_node_mut,
-				)?;
+
+				// FIXED: Pass actual separator to can_merge_with
+				// Separator between child_idx and right_idx is at parent.keys[child_idx]
+				let separator = &parent.keys[child_idx];
+				if left_node_mut.can_merge_with(&right_node_mut, separator) {
+					self.merge_internal_nodes(
+						parent,
+						child_idx,
+						right_idx,
+						&mut left_node_mut,
+						right_node_mut,
+					)?;
+				}
 			} else {
 				let mut left_node_mut = self.read_leaf_node(parent.children[child_idx])?;
 				let right_node_mut = self.extract_leaf_mut(right_arc);
@@ -1868,8 +1864,6 @@ impl<F: VfsFile> BPlusTree<F> {
 				)?;
 			}
 		}
-		// There should always be a sibling to merge with unless this is the root
-		// which is handled separately in handle_empty_root
 
 		Ok(())
 	}
@@ -1901,30 +1895,59 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node: &mut InternalNode,
 		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let last_entry_size = if !left_node.keys.is_empty() {
-			let last_key = left_node.keys.last().unwrap();
-			internal_entry_size(last_key)
-		} else {
+		if left_node.keys.is_empty() {
 			return Err(BPlusTreeError::Serialization(
 				"Left internal node is unexpectedly empty during redistribution".into(),
 			));
-		};
+		}
 
-		// Calculate sizes once
+		// What left will lose (last key + child)
+		let last_key = left_node.keys.last().unwrap();
+		let left_loses = internal_entry_size(last_key) + CHILD_PTR_SIZE;
+
+		// What right will gain (parent key + child)
+		let parent_key = &parent.keys[left_idx];
+		let right_gains = internal_entry_size(parent_key) + CHILD_PTR_SIZE;
+
 		let left_size = left_node.current_size();
 		let right_size = right_node.current_size();
 
-		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
-			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
-			let (new_parent_key, new_parent_overflow) =
-				left_node.redistribute_to_right(right_node, parent_key, parent_overflow);
+		let left_after = left_size - left_loses;
+		let right_after = right_size + right_gains;
 
-			parent.keys[left_idx] = new_parent_key;
-			parent.set_overflow_at(left_idx, new_parent_overflow);
-
-			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
-			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
+		// Validate both child nodes fit
+		if right_after > PAGE_SIZE || left_after > PAGE_SIZE {
+			return Ok(());
 		}
+
+		// CRITICAL: Validate parent size change
+		// Old parent key goes down, left's last key goes up
+		let old_parent_entry_size = internal_entry_size(parent_key);
+		let new_parent_entry_size = internal_entry_size(last_key);
+		let parent_after = parent.current_size() - old_parent_entry_size + new_parent_entry_size;
+
+		if parent_after > PAGE_SIZE {
+			return Ok(()); // Skip redistribution, would overflow parent
+		}
+
+		// Check if redistribution improves balance
+		let before_diff = (left_size as i64 - right_size as i64).abs();
+		let after_diff = (left_after as i64 - right_after as i64).abs();
+
+		if after_diff >= before_diff {
+			return Ok(());
+		}
+
+		// Proceed with redistribution
+		let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
+		let (new_parent_key, new_parent_overflow) =
+			left_node.redistribute_to_right(right_node, parent_key, parent_overflow);
+
+		parent.keys[left_idx] = new_parent_key;
+		parent.set_overflow_at(left_idx, new_parent_overflow);
+
+		self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+		self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 
 		Ok(())
 	}
@@ -1936,30 +1959,59 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node: &mut InternalNode,
 		right_node: &mut InternalNode,
 	) -> Result<()> {
-		let first_entry_size = if !right_node.keys.is_empty() {
-			internal_entry_size(&right_node.keys[0])
-		} else {
+		if right_node.keys.is_empty() {
 			return Err(BPlusTreeError::Serialization(
 				"Right internal node is unexpectedly empty during redistribution".into(),
 			));
-		};
+		}
 
-		// Calculate sizes once
+		// What right will lose (first key + child)
+		let first_key = &right_node.keys[0];
+		let right_loses = internal_entry_size(first_key) + CHILD_PTR_SIZE;
+
+		// What left will gain (parent key + child)
+		let parent_key = &parent.keys[left_idx];
+		let left_gains = internal_entry_size(parent_key) + CHILD_PTR_SIZE;
+
 		let left_size = left_node.current_size();
 		let right_size = right_node.current_size();
 
-		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
-			let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
+		let left_after = left_size + left_gains;
+		let right_after = right_size - right_loses;
 
-			let (new_parent_key, new_parent_overflow) =
-				left_node.take_from_right(right_node, parent_key, parent_overflow);
-
-			parent.keys[left_idx] = new_parent_key;
-			parent.set_overflow_at(left_idx, new_parent_overflow);
-
-			self.write_node_owned(NodeType::Internal(left_node.clone()))?;
-			self.write_node_owned(NodeType::Internal(right_node.clone()))?;
+		// Validate both child nodes fit
+		if left_after > PAGE_SIZE || right_after > PAGE_SIZE {
+			return Ok(());
 		}
+
+		// CRITICAL: Validate parent size change
+		// Old parent key goes down, right's first key goes up
+		let old_parent_entry_size = internal_entry_size(parent_key);
+		let new_parent_entry_size = internal_entry_size(first_key);
+		let parent_after = parent.current_size() - old_parent_entry_size + new_parent_entry_size;
+
+		if parent_after > PAGE_SIZE {
+			return Ok(()); // Skip redistribution, would overflow parent
+		}
+
+		// Check if redistribution improves balance
+		let before_diff = (left_size as i64 - right_size as i64).abs();
+		let after_diff = (left_after as i64 - right_after as i64).abs();
+
+		if after_diff >= before_diff {
+			return Ok(());
+		}
+
+		// Proceed with redistribution
+		let (parent_key, parent_overflow) = InternalNode::extract_parent_key(parent, left_idx);
+		let (new_parent_key, new_parent_overflow) =
+			left_node.take_from_right(right_node, parent_key, parent_overflow);
+
+		parent.keys[left_idx] = new_parent_key;
+		parent.set_overflow_at(left_idx, new_parent_overflow);
+
+		self.write_node_owned(NodeType::Internal(left_node.clone()))?;
+		self.write_node_owned(NodeType::Internal(right_node.clone()))?;
 
 		Ok(())
 	}
@@ -1971,27 +2023,52 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node: &mut LeafNode,
 		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let last_idx = left_node.keys.len() - 1;
-		let last_entry_size = if last_idx < left_node.keys.len() {
-			leaf_cell_size(&left_node.keys[last_idx], &left_node.values[last_idx])
-		} else {
+		if left_node.keys.is_empty() {
 			return Err(BPlusTreeError::Serialization(
-				"Left node is unexpectedly empty during redistribution".into(),
+				"Left leaf node is unexpectedly empty during redistribution".into(),
 			));
-		};
+		}
 
-		// Calculate sizes once
+		let last_idx = left_node.keys.len() - 1;
+		let last_key = &left_node.keys[last_idx];
+		let last_value = &left_node.values[last_idx];
+		let last_entry_size = leaf_cell_size(last_key, last_value);
+
 		let left_size = left_node.current_size();
 		let right_size = right_node.current_size();
 
-		if Self::should_redistribute_with_sizes(left_size, right_size, last_entry_size, true) {
-			let new_separator = left_node.redistribute_to_right(right_node);
+		// Check leaf nodes would fit
+		let left_after = left_size - last_entry_size;
+		let right_after = right_size + last_entry_size;
 
-			parent.keys[left_idx] = new_separator;
-
-			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
-			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
+		if left_after > PAGE_SIZE || right_after > PAGE_SIZE {
+			return Ok(());
 		}
+
+		// CRITICAL: Check parent can accommodate new separator
+		let old_sep = &parent.keys[left_idx];
+		let old_sep_entry_size = internal_entry_size(old_sep);
+		let new_sep_entry_size = internal_entry_size(last_key); // last_key becomes new separator
+
+		let parent_after = parent.current_size() - old_sep_entry_size + new_sep_entry_size;
+		if parent_after > PAGE_SIZE {
+			return Ok(()); // Skip redistribution, would overflow parent
+		}
+
+		// Check if redistribution improves balance
+		let before_diff = (left_size as i64 - right_size as i64).abs();
+		let after_diff = (left_after as i64 - right_after as i64).abs();
+
+		if after_diff >= before_diff {
+			return Ok(()); // Doesn't improve balance
+		}
+
+		// Proceed with redistribution
+		let new_separator = left_node.redistribute_to_right(right_node);
+		parent.keys[left_idx] = new_separator;
+
+		self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+		self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
 
 		Ok(())
 	}
@@ -2003,60 +2080,61 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node: &mut LeafNode,
 		right_node: &mut LeafNode,
 	) -> Result<()> {
-		let first_entry_size = if !right_node.keys.is_empty() {
-			leaf_cell_size(&right_node.keys[0], &right_node.values[0])
-		} else {
+		if right_node.keys.is_empty() {
 			return Err(BPlusTreeError::Serialization(
-				"Right node is unexpectedly empty during redistribution".into(),
+				"Right leaf node is unexpectedly empty during redistribution".into(),
 			));
-		};
+		}
 
-		// Calculate sizes once
+		let first_key = &right_node.keys[0];
+		let first_value = &right_node.values[0];
+		let first_entry_size = leaf_cell_size(first_key, first_value);
+
 		let left_size = left_node.current_size();
 		let right_size = right_node.current_size();
 
-		if Self::should_redistribute_with_sizes(left_size, right_size, first_entry_size, false) {
-			let new_separator = left_node.take_from_right(right_node);
+		// Check leaf nodes would fit
+		let left_after = left_size + first_entry_size;
+		let right_after = right_size - first_entry_size;
 
-			parent.keys[left_idx] = new_separator;
-
-			self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
-			self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
+		if left_after > PAGE_SIZE || right_after > PAGE_SIZE {
+			return Ok(());
 		}
 
-		Ok(())
-	}
+		// CRITICAL: Check parent can accommodate new separator
+		// After taking from right, the NEW first key of right becomes the separator
+		let old_sep = &parent.keys[left_idx];
+		let old_sep_entry_size = internal_entry_size(old_sep);
 
-	fn should_redistribute_with_sizes(
-		left_size: usize,
-		right_size: usize,
-		entry_size: usize,
-		taking_from_left: bool,
-	) -> bool {
-		let total_size = left_size + right_size;
-		let target_size = total_size / 2;
-
-		let before_left_diff = ((left_size as i64) - (target_size as i64)).abs();
-		let before_right_diff = ((right_size as i64) - (target_size as i64)).abs();
-		let before_total_diff = before_left_diff + before_right_diff;
-
-		let (after_left_size, after_right_size) = if taking_from_left {
-			if entry_size > left_size {
-				return false;
-			}
-			(left_size - entry_size, right_size + entry_size)
+		// New separator will be right's second key (which becomes first after removal)
+		let new_sep_entry_size = if right_node.keys.len() > 1 {
+			internal_entry_size(&right_node.keys[1])
 		} else {
-			if entry_size > right_size {
-				return false;
-			}
-			(left_size + entry_size, right_size - entry_size)
+			// Right will be empty after this, use moved key as separator
+			internal_entry_size(first_key)
 		};
 
-		let after_left_diff = ((after_left_size as i64) - (target_size as i64)).abs();
-		let after_right_diff = ((after_right_size as i64) - (target_size as i64)).abs();
-		let after_total_diff = after_left_diff + after_right_diff;
+		let parent_after = parent.current_size() - old_sep_entry_size + new_sep_entry_size;
+		if parent_after > PAGE_SIZE {
+			return Ok(()); // Skip redistribution, would overflow parent
+		}
 
-		after_total_diff < before_total_diff
+		// Check if redistribution improves balance
+		let before_diff = (left_size as i64 - right_size as i64).abs();
+		let after_diff = (left_after as i64 - right_after as i64).abs();
+
+		if after_diff >= before_diff {
+			return Ok(()); // Doesn't improve balance
+		}
+
+		// Proceed with redistribution
+		let new_separator = left_node.take_from_right(right_node);
+		parent.keys[left_idx] = new_separator;
+
+		self.write_node_owned(NodeType::Leaf(left_node.clone()))?;
+		self.write_node_owned(NodeType::Leaf(right_node.clone()))?;
+
+		Ok(())
 	}
 
 	fn merge_internal_nodes(
@@ -2067,10 +2145,6 @@ impl<F: VfsFile> BPlusTree<F> {
 		left_node: &mut InternalNode,
 		right_node: InternalNode,
 	) -> Result<()> {
-		if !left_node.can_merge_with(&right_node) {
-			return Ok(());
-		}
-
 		let right_offset = parent.children[right_idx];
 		let (separator, separator_overflow) = parent.remove_key_with_overflow(left_idx).unwrap();
 
@@ -4426,7 +4500,9 @@ mod tests {
 				rng.random_range(10..200)
 			};
 
-			let mut key = format!("additional_{:05}_", i).into_bytes();
+			let prefix = format!("additional_{:05}_", i).into_bytes();
+			let key_size = key_size.max(prefix.len()); // Ensure key_size >= prefix length
+			let mut key = prefix;
 			key.extend(vec![b'k'; key_size - key.len()]);
 
 			let value_size = rng.random_range(10..100);
