@@ -273,7 +273,13 @@ impl Transaction {
 				timestamp,
 			)
 		} else {
-			Entry::new(key.into_bytes(), Some(value.into_bytes()), InternalKeyKind::Set, self.savepoints, write_seqno)
+			Entry::new(
+				key.into_bytes(),
+				Some(value.into_bytes()),
+				InternalKeyKind::Set,
+				self.savepoints,
+				write_seqno,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -304,7 +310,13 @@ impl Transaction {
 				timestamp,
 			)
 		} else {
-			Entry::new(key.into_bytes(), None, InternalKeyKind::Delete, self.savepoints, write_seqno)
+			Entry::new(
+				key.into_bytes(),
+				None,
+				InternalKeyKind::Delete,
+				self.savepoints,
+				write_seqno,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -388,7 +400,13 @@ impl Transaction {
 				timestamp,
 			)
 		} else {
-			Entry::new(key.into_bytes(), Some(value.into_bytes()), InternalKeyKind::Replace, self.savepoints, write_seqno)
+			Entry::new(
+				key.into_bytes(),
+				Some(value.into_bytes()),
+				InternalKeyKind::Replace,
+				self.savepoints,
+				write_seqno,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -399,7 +417,7 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_with_options(key, &ReadOptions::default())
+		self.get_with_options(key, ReadOptions::default())
 	}
 
 	/// Gets a value for a key at a specific timestamp.
@@ -407,11 +425,11 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
+		self.get_with_options(key, ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key, with custom read options.
-	pub fn get_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
+	pub fn get_with_options<K>(&self, key: K, options: ReadOptions) -> Result<Option<Value>>
 	where
 		K: IntoBytes,
 	{
@@ -419,6 +437,7 @@ impl Transaction {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
+
 		// If the key is empty, return an error.
 		if key.as_slice().is_empty() {
 			return Err(Error::EmptyKey);
@@ -438,7 +457,7 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			return match &self.snapshot {
-				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
+				Some(snapshot) => snapshot.get_at_version(key.into_bytes(), timestamp),
 				None => Err(Error::NoSnapshot),
 			};
 		}
@@ -484,7 +503,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default();
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
+		self.count_with_options(options)
 	}
 
 	/// Counts keys in a range at a specific timestamp.
@@ -500,7 +519,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
+		self.count_with_options(options)
 	}
 
 	/// Counts keys with custom read options.
@@ -516,7 +535,7 @@ impl Transaction {
 	/// This method is optimized to avoid creating full iterators and resolving
 	/// values from the value log, making it much faster than manually counting
 	/// iterator results.
-	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
+	pub fn count_with_options(&self, options: ReadOptions) -> Result<usize> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -531,8 +550,8 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.unwrap_or_default();
+			let end_key = options.upper_bound.unwrap_or_default();
 			let keys_iter = self.keys_at_version(start_key, end_key, timestamp)?;
 			return Ok(keys_iter.count());
 		}
@@ -601,7 +620,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_keys_only(true);
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
+		self.keys_with_options(options)
 	}
 
 	/// Gets keys in a key range at a specific timestamp.
@@ -627,7 +646,7 @@ impl Transaction {
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
+		self.keys_with_options(options)
 	}
 
 	/// Gets keys in a key range, with custom read options.
@@ -643,7 +662,7 @@ impl Transaction {
 	/// fetch or resolve values from disk.
 	pub fn keys_with_options(
 		&self,
-		options: &ReadOptions,
+		options: ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
@@ -653,8 +672,8 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.unwrap_or_default();
+			let end_key = options.upper_bound.unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
@@ -665,11 +684,9 @@ impl Transaction {
 			}
 		} else {
 			// Force keys_only to true for this method
-			let options = options.clone().with_keys_only(true);
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let options = options.with_keys_only(true);
 			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+				TransactionRangeIterator::new_with_options(self, options)?
 					.map(|result| result.map(|(key, _)| key)),
 			))
 		}
@@ -693,7 +710,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default();
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_with_options(&options)
+		self.range_with_options(options)
 	}
 
 	/// Gets keys and values in a range, at a specific timestamp.
@@ -715,7 +732,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_with_options(&options)
+		self.range_with_options(options)
 	}
 
 	/// Gets keys and values in a range, with custom read options.
@@ -728,7 +745,7 @@ impl Transaction {
 	/// range, inclusive of the start key, but not the end key.
 	pub fn range_with_options(
 		&self,
-		options: &ReadOptions,
+		options: ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
@@ -737,9 +754,15 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let ReadOptions {
+				lower_bound: start_key,
+				upper_bound: end_key,
+				timestamp: _,
+				keys_only: _,
+			} = options;
+
+			let start_key = start_key.unwrap_or_default();
+			let end_key = end_key.unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
@@ -749,20 +772,14 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
-					|result| {
-						result.and_then(|(k, v)| {
-							v.ok_or_else(|| {
-								Error::InvalidArgument("Expected value for range query".to_string())
-							})
-							.map(|value| (k, value))
-						})
-					},
-				),
-			))
+			Ok(Box::new(TransactionRangeIterator::new_with_options(self, options)?.map(|result| {
+				result.and_then(|(k, v)| {
+					v.ok_or_else(|| {
+						Error::InvalidArgument("Expected value for range query".to_string())
+					})
+					.map(|value| (k, value))
+				})
+			})))
 		}
 	}
 
@@ -803,7 +820,9 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
+			Some(snapshot) => {
+				snapshot.scan_all_versions(start.into_bytes(), end.into_bytes(), limit)
+			}
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -1084,9 +1103,12 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
-		start_key: Vec<u8>,
-		end_key: Vec<u8>,
-		options: &ReadOptions,
+		ReadOptions {
+			lower_bound: start_key,
+			upper_bound: end_key,
+			timestamp: _,
+			keys_only,
+		}: ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
 		if tx.closed {
@@ -1097,6 +1119,9 @@ impl<'a> TransactionRangeIterator<'a> {
 			return Err(Error::TransactionWriteOnly);
 		}
 
+		let start_key = start_key.unwrap_or_default();
+		let end_key = end_key.unwrap_or_default();
+
 		// Get snapshot
 		let snapshot = match &tx.snapshot {
 			Some(snap) => snap,
@@ -1104,11 +1129,8 @@ impl<'a> TransactionRangeIterator<'a> {
 		};
 
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(
-			Some(start_key.as_slice()),
-			Some(end_key.as_slice()),
-			options.keys_only,
-		)?;
+		let iter =
+			snapshot.range(Some(start_key.as_slice()), Some(end_key.as_slice()), keys_only)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)
@@ -1118,7 +1140,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		Ok(Self {
 			snapshot_iter: boxed_iter.double_ended_peekable(),
 			write_set_iter: write_set_iter.double_ended_peekable(),
-			keys_only: options.keys_only,
+			keys_only,
 		})
 	}
 
@@ -3377,7 +3399,7 @@ mod tests {
 		let value = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+				ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value, Some(Vec::from(b"value1")));
@@ -3398,7 +3420,7 @@ mod tests {
 		let value_before = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+				ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value_before, Some(Vec::from(b"value1")));
@@ -3406,7 +3428,7 @@ mod tests {
 		let value_after = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
+				ReadOptions::default().with_timestamp(Some(delete_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value_after, None);
@@ -3904,7 +3926,7 @@ mod tests {
 			let tx = store.begin().unwrap();
 			let mut options = ReadOptions::default();
 			options.set_iterate_bounds(Some(b"key2".to_vec()), Some(b"key4".to_vec()));
-			let count = tx.count_with_options(&options).unwrap();
+			let count = tx.count_with_options(options).unwrap();
 			assert_eq!(count, 2); // key2, key3 (key4 is exclusive)
 		}
 	}

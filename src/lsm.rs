@@ -568,7 +568,7 @@ impl CoreInner {
 		// We need to collect them first to avoid holding the lock during I/O
 		let immutables_to_flush: Vec<ImmutableEntry> = {
 			let immutable_guard = self.immutable_memtables.read()?;
-			immutable_guard.iter().cloned().collect()
+			immutable_guard.clone().into_inner()
 		};
 
 		let immutable_count = immutables_to_flush.len();

@@ -75,7 +75,13 @@ impl CheckpointMetadata {
 
 	/// Serializes the metadata to binary format
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
-		let mut buf = Vec::new();
+		let mut buf = Vec::with_capacity(
+			4 + // version
+			8 + // timestamp
+			8 + // sequence number
+			8 + // sstable count
+			8, // total size
+		);
 
 		// Write version first for compatibility checking
 		buf.write_u32::<BigEndian>(self.version).map_err(|e| Error::Io(Arc::new(e)))?;

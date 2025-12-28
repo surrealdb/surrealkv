@@ -101,8 +101,8 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 
 	// Insert data first
 	for _ in 0..count {
-		let key: [u8; 16] = rng.random();
-		let value: [u8; 64] = rng.random();
+		let key: Vec<u8> = rng.random::<[u8; 16]>().to_vec();
+		let value: Vec<u8> = rng.random::<[u8; 64]>().to_vec();
 		txn.set(&key, &value).unwrap();
 		keys.push(key);
 	}
@@ -114,13 +114,13 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 	keys.sort();
 
 	// Use a sentinel value that's guaranteed to be after all keys (all 0xFF)
-	let end_bound = [0xFFu8; 16];
+	let end_bound = [0xFFu8; 16].to_vec();
 
 	b.counter(count).bench_local(|| {
 		{
 			let txn = tree.begin().unwrap();
 			// Scan entire range from first key to end_bound (covers all keys)
-			let range_iter = txn.range(&keys[0], &end_bound).unwrap();
+			let range_iter = txn.range(keys[0].clone(), end_bound.clone()).unwrap();
 			let _results: Vec<_> = range_iter.map(|r| r.unwrap()).collect();
 		}
 	});

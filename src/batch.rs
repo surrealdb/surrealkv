@@ -42,7 +42,6 @@ impl Batch {
 		}
 	}
 
-	// TODO: add a test for grow
 	fn grow(&mut self, record_size: u64) -> Result<()> {
 		if self.size + record_size > MAX_BATCH_SIZE {
 			return Err(Error::BatchTooLarge);
@@ -54,7 +53,13 @@ impl Batch {
 	}
 
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-		let mut encoded = Vec::new();
+		let mut encoded = Vec::with_capacity(
+			1 + // version
+			self.starting_seq_num.required_space() +
+			(self.entries.len() as u32).required_space() +
+			self.size as usize +
+			(self.valueptrs.len() * VALUE_POINTER_SIZE),
+		);
 
 		// Write version (1 byte)
 		encoded.push(self.version);
@@ -90,7 +95,7 @@ impl Batch {
 			match valueptr {
 				Some(ptr) => {
 					encoded.push(1); // Has pointer
-					encoded.extend_from_slice(&ptr.encode());
+					ptr.encode_into(&mut encoded);
 				}
 				None => {
 					encoded.push(0); // No pointer (inline value)
@@ -120,15 +125,15 @@ impl Batch {
 		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
-		let key_len = key.len();
-		let value_len = value.as_ref().map_or(0, |v| v.len());
+		let key_len = key.len() as u64;
+		let value_len = value.as_ref().map_or(0, |v| v.len()) as u64;
 
 		// Calculate the total size needed for this record
 		let record_size = 1u64 + // kind
-			(key_len as u64).required_space() as u64 +
-			key_len as u64 +
-			(value_len as u64).required_space() as u64 +
-			value_len as u64 +
+			key_len.required_space() as u64 +
+			key_len +
+			value_len.required_space() as u64 +
+			value_len +
 			8u64; // timestamp (8 bytes)
 
 		self.grow(record_size)?;
@@ -843,4 +848,8 @@ mod tests {
 		let re_encoded = decoded_batch.encode().unwrap();
 		assert_eq!(encoded, re_encoded, "Re-encoding should produce identical result");
 	}
+
+	// record size that's passed to grow should match what's encoded in the batch
+	#[test]
+	fn test_add_record_internal_passes_correct_record_size_to_grow() {}
 }

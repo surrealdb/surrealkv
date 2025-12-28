@@ -25,7 +25,7 @@ pub(crate) struct ImmutableEntry {
 	pub memtable: Arc<MemTable>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ImmutableMemtables(Vec<ImmutableEntry>);
 
 impl ImmutableMemtables {
@@ -52,6 +52,10 @@ impl ImmutableMemtables {
 
 	pub(crate) fn is_empty(&self) -> bool {
 		self.0.is_empty()
+	}
+
+	pub(crate) fn into_inner(self) -> Vec<ImmutableEntry> {
+		self.0
 	}
 }
 

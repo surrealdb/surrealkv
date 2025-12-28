@@ -332,16 +332,20 @@ impl ValuePointer {
 		}
 	}
 
-	/// Encodes the pointer as bytes for storage
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
+		self.encode_into(&mut encoded);
+		encoded
+	}
+
+	/// Encodes the pointer as bytes for storage
+	pub(crate) fn encode_into(&self, encoded: &mut Vec<u8>) {
 		encoded.push(self.version);
 		encoded.extend_from_slice(&self.file_id.to_be_bytes());
 		encoded.extend_from_slice(&self.offset.to_be_bytes());
 		encoded.extend_from_slice(&self.key_size.to_be_bytes());
 		encoded.extend_from_slice(&self.value_size.to_be_bytes());
 		encoded.extend_from_slice(&self.checksum.to_be_bytes());
-		encoded
 	}
 
 	/// Decodes a pointer from bytes
@@ -1085,7 +1089,6 @@ impl VLog {
 
 				batch.add_record(
 					internal_key.kind(),
-					// TODO: Remove allocation
 					internal_key.user_key,
 					val,
 					internal_key.timestamp,
