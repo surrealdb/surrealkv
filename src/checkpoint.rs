@@ -51,7 +51,7 @@ pub struct CheckpointMetadata {
 
 impl CheckpointMetadata {
 	/// Creates new checkpoint metadata with current version
-	pub fn new(
+	pub const fn new(
 		timestamp: u64,
 		sequence_number: u64,
 		sstable_count: usize,
@@ -68,7 +68,7 @@ impl CheckpointMetadata {
 
 	/// Checks if this metadata version is compatible with current
 	/// implementation
-	pub fn is_compatible(&self) -> bool {
+	pub const fn is_compatible(&self) -> bool {
 		// For now, we only support version 1
 		self.version == CHECKPOINT_VERSION
 	}
@@ -154,7 +154,7 @@ pub(crate) struct DatabaseCheckpoint {
 
 impl DatabaseCheckpoint {
 	/// Creates a new database checkpoint manager
-	pub fn new(core: Arc<CoreInner>) -> Self {
+	pub const fn new(core: Arc<CoreInner>) -> Self {
 		Self {
 			core,
 		}

@@ -41,12 +41,12 @@ pub const BLOCK_COMPRESS_LEN: usize = 1;
 
 const MASK_DELTA: u32 = 0xa282_ead8;
 
-pub(crate) fn mask(crc: u32) -> u32 {
+pub(crate) const fn mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(MASK_DELTA)
 }
 
 /// Return the crc whose masked representation is `masked`.
-pub(crate) fn unmask(masked: u32) -> u32 {
+pub(crate) const fn unmask(masked: u32) -> u32 {
 	let rot = masked.wrapping_sub(MASK_DELTA);
 	rot.rotate_left(15)
 }
@@ -62,7 +62,7 @@ pub enum TableFormat {
 }
 
 impl TableFormat {
-	pub(crate) fn from_u8(val: u8) -> Result<Self> {
+	pub(crate) const fn from_u8(val: u8) -> Result<Self> {
 		match val {
 			1 => Ok(TableFormat::LSMV1),
 			_ => Err(Error::InvalidTableFormat),
@@ -79,7 +79,7 @@ pub(crate) struct Footer {
 }
 
 impl Footer {
-	pub(crate) fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
+	pub(crate) const fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
 		Footer {
 			meta_index: metaix,
 			index,

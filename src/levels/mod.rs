@@ -143,12 +143,12 @@ impl LevelManifest {
 	}
 
 	/// Returns the minimum WAL number that contains unflushed data
-	pub(crate) fn get_log_number(&self) -> u64 {
+	pub(crate) const fn get_log_number(&self) -> u64 {
 		self.log_number
 	}
 
 	/// Returns the last sequence number persisted in the manifest
-	pub(crate) fn get_last_sequence(&self) -> u64 {
+	pub(crate) const fn get_last_sequence(&self) -> u64 {
 		self.last_sequence
 	}
 

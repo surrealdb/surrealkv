@@ -27,7 +27,7 @@ pub enum Mode {
 
 impl Mode {
 	/// Checks if this transaction mode permits mutations
-	pub(crate) fn mutable(self) -> bool {
+	pub(crate) const fn mutable(self) -> bool {
 		match self {
 			Self::ReadWrite => true,
 			Self::ReadOnly => false,
@@ -36,12 +36,12 @@ impl Mode {
 	}
 
 	/// Checks if this is a write-only transaction
-	pub(crate) fn is_write_only(self) -> bool {
+	pub(crate) const fn is_write_only(self) -> bool {
 		matches!(self, Self::WriteOnly)
 	}
 
 	/// Checks if this is a read-only transaction
-	pub(crate) fn is_read_only(self) -> bool {
+	pub(crate) const fn is_read_only(self) -> bool {
 		matches!(self, Self::ReadOnly)
 	}
 }
@@ -86,13 +86,13 @@ impl WriteOptions {
 	}
 
 	/// Sets the durability level for write operations
-	pub fn with_durability(mut self, durability: Durability) -> Self {
+	pub const fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
 		self
 	}
 
 	/// Sets the timestamp for write operations
-	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+	pub const fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
 		self.timestamp = timestamp;
 		self
 	}
@@ -121,7 +121,7 @@ impl ReadOptions {
 	}
 
 	/// Sets whether to return only keys without values
-	pub fn with_keys_only(mut self, keys_only: bool) -> Self {
+	pub const fn with_keys_only(mut self, keys_only: bool) -> Self {
 		self.keys_only = keys_only;
 		self
 	}
@@ -142,7 +142,7 @@ impl ReadOptions {
 	}
 
 	/// Sets the timestamp for point-in-time reads
-	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+	pub const fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
 		self.timestamp = timestamp;
 		self
 	}
@@ -191,18 +191,18 @@ pub struct Transaction {
 
 impl Transaction {
 	/// Bump the write sequence number and return it.
-	fn next_write_seqno(&mut self) -> u32 {
+	const fn next_write_seqno(&mut self) -> u32 {
 		self.write_seqno += 1;
 		self.write_seqno
 	}
 
 	/// Sets the durability level for this transaction
-	pub fn set_durability(&mut self, durability: Durability) {
+	pub const fn set_durability(&mut self, durability: Durability) {
 		self.durability = durability;
 	}
 
 	/// Sets the durability level for this transaction
-	pub fn with_durability(mut self, durability: Durability) -> Self {
+	pub const fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
 		self
 	}
@@ -954,7 +954,7 @@ impl Transaction {
 	/// corresponding calls to [`rollback_to_savepoint`].
 	///
 	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
-	pub fn set_savepoint(&mut self) -> Result<()> {
+	pub const fn set_savepoint(&mut self) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an
 		// error.
 		if !self.mode.mutable() {
@@ -1037,7 +1037,7 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	fn new(
+	const fn new(
 		key: Key,
 		value: Option<Value>,
 		kind: InternalKeyKind,
@@ -1054,7 +1054,7 @@ impl Entry {
 		}
 	}
 
-	fn new_with_timestamp(
+	const fn new_with_timestamp(
 		key: Key,
 		value: Option<Value>,
 		kind: InternalKeyKind,

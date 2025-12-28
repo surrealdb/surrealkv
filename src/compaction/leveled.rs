@@ -54,7 +54,7 @@ impl Strategy {
 		}
 	}
 
-	fn calculate_level_size_limit(&self, level: u8) -> usize {
+	const fn calculate_level_size_limit(&self, level: u8) -> usize {
 		if level == 0 {
 			return self.base_level_size;
 		}

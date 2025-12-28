@@ -8,7 +8,7 @@ pub struct CompressionSelector {
 
 impl CompressionSelector {
 	/// Create a new CompressionSelector with per-level compression settings.
-	pub fn new(per_level: Vec<CompressionType>) -> Self {
+	pub const fn new(per_level: Vec<CompressionType>) -> Self {
 		Self {
 			per_level_compression: per_level,
 		}

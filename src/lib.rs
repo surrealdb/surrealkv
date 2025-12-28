@@ -375,7 +375,7 @@ impl Options {
 	/// Enables or disables versioned queries with timestamp tracking
 	/// When enabled, automatically configures VLog and value threshold for
 	/// optimal versioned query support
-	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
+	pub const fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
 		self.versioned_history_retention_ns = retention_ns;
 		if value {

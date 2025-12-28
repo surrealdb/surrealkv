@@ -21,14 +21,14 @@ pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
 #[inline(always)]
-fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
+const fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
 	// SAFETY: Caller must ensure buffer has at least offset + 8 bytes
 	unsafe { u64::from_be_bytes(*(buffer.as_ptr().add(offset) as *const [u8; 8])) }
 }
 
 /// Converts a trailer byte to InternalKeyKind
 /// This centralizes the kind conversion logic to avoid duplication and errors
-fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
+const fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 	let kind_byte = trailer as u8;
 	match kind_byte {
 		0 => InternalKeyKind::Delete,
@@ -47,13 +47,13 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
 #[inline(always)]
-fn trailer_to_seq_num(trailer: u64) -> u64 {
+const fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
 #[inline(always)]
-fn is_delete_kind(kind: InternalKeyKind) -> bool {
+const fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
 		InternalKeyKind::Delete | InternalKeyKind::SoftDelete | InternalKeyKind::RangeDelete
@@ -62,13 +62,13 @@ fn is_delete_kind(kind: InternalKeyKind) -> bool {
 
 /// Checks if a key kind represents a hard delete (delete operation)
 #[inline(always)]
-fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
+const fn is_hard_delete_marker(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Delete | InternalKeyKind::RangeDelete)
 }
 
 /// Checks if a key kind represents a Replace operation
 #[inline(always)]
-fn is_replace_kind(kind: InternalKeyKind) -> bool {
+const fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
 }
 
@@ -103,7 +103,12 @@ pub(crate) struct InternalKey {
 }
 
 impl InternalKey {
-	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
+	pub(crate) const fn new(
+		user_key: Key,
+		seq_num: u64,
+		kind: InternalKeyKind,
+		timestamp: u64,
+	) -> Self {
 		Self {
 			user_key,
 			timestamp,
@@ -143,24 +148,24 @@ impl InternalKey {
 	}
 
 	#[inline]
-	pub(crate) fn seq_num(&self) -> u64 {
+	pub(crate) const fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}
 
-	pub(crate) fn kind(&self) -> InternalKeyKind {
+	pub(crate) const fn kind(&self) -> InternalKeyKind {
 		trailer_to_kind(self.trailer)
 	}
 
 	#[inline]
-	pub(crate) fn is_tombstone(&self) -> bool {
+	pub(crate) const fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
 	}
 
-	pub(crate) fn is_hard_delete_marker(&self) -> bool {
+	pub(crate) const fn is_hard_delete_marker(&self) -> bool {
 		is_hard_delete_marker(self.kind())
 	}
 
-	pub(crate) fn is_replace(&self) -> bool {
+	pub(crate) const fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
 	}
 }
@@ -197,27 +202,27 @@ impl<'key> InternalKeyRef<'key> {
 	}
 
 	#[inline]
-	pub(crate) fn timestamp(&self) -> u64 {
+	pub(crate) const fn timestamp(&self) -> u64 {
 		read_u64_be(self.0, self.0.len() - 8)
 	}
 
 	#[inline]
-	fn trailer(&self) -> u64 {
+	const fn trailer(&self) -> u64 {
 		read_u64_be(self.0, self.0.len() - 16)
 	}
 
 	#[inline]
-	pub(crate) fn seq_num(&self) -> u64 {
+	pub(crate) const fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer())
 	}
 
 	#[inline]
-	pub(crate) fn kind(&self) -> InternalKeyKind {
+	pub(crate) const fn kind(&self) -> InternalKeyKind {
 		trailer_to_kind(self.trailer())
 	}
 
 	#[inline]
-	pub(crate) fn is_replace(&self) -> bool {
+	pub(crate) const fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
 	}
 

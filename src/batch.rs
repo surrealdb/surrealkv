@@ -32,7 +32,7 @@ impl Default for Batch {
 }
 
 impl Batch {
-	pub(crate) fn new(starting_seq_num: u64) -> Self {
+	pub(crate) const fn new(starting_seq_num: u64) -> Self {
 		Self {
 			entries: Vec::new(),
 			valueptrs: Vec::new(),
@@ -187,7 +187,7 @@ impl Batch {
 	}
 
 	/// Set the starting sequence number for this batch
-	pub(crate) fn set_starting_seq_num(&mut self, seq_num: u64) {
+	pub(crate) const fn set_starting_seq_num(&mut self, seq_num: u64) {
 		self.starting_seq_num = seq_num;
 	}
 

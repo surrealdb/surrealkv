@@ -190,14 +190,14 @@ impl Options {
 
 	/// Sets the maximum file size.
 	#[allow(unused)]
-	pub(crate) fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+	pub(crate) const fn with_max_file_size(mut self, max_file_size: u64) -> Self {
 		self.max_file_size = max_file_size;
 		self
 	}
 
 	/// Sets the compression type.
 	#[allow(unused)]
-	pub(crate) fn with_compression(mut self, compression_type: CompressionType) -> Self {
+	pub(crate) const fn with_compression(mut self, compression_type: CompressionType) -> Self {
 		self.compression_type = compression_type;
 		self
 	}
@@ -274,7 +274,7 @@ impl IOError {
 		}
 	}
 
-	pub(crate) fn kind(&self) -> io::ErrorKind {
+	pub(crate) const fn kind(&self) -> io::ErrorKind {
 		self.kind
 	}
 }

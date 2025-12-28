@@ -30,7 +30,7 @@ impl BlockHandleWithKey {
 		}
 	}
 
-	pub(crate) fn offset(&self) -> u64 {
+	pub(crate) const fn offset(&self) -> u64 {
 		self.handle.offset as u64
 	}
 }
@@ -73,15 +73,15 @@ impl TopLevelIndexWriter {
 	}
 
 	// Query methods - called after finish()
-	pub(crate) fn index_size(&self) -> u64 {
+	pub(crate) const fn index_size(&self) -> u64 {
 		self.index_size
 	}
 
-	pub(crate) fn num_partitions(&self) -> u64 {
+	pub(crate) const fn num_partitions(&self) -> u64 {
 		self.num_partitions
 	}
 
-	pub(crate) fn top_level_index_size(&self) -> u64 {
+	pub(crate) const fn top_level_index_size(&self) -> u64 {
 		self.top_level_index_size
 	}
 

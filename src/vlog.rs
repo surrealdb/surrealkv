@@ -178,7 +178,7 @@ impl VLogFileHeader {
 		})
 	}
 
-	pub(crate) fn is_compatible(&self) -> bool {
+	pub(crate) const fn is_compatible(&self) -> bool {
 		self.version == VLOG_FORMAT_VERSION
 	}
 
@@ -207,7 +207,7 @@ pub(crate) struct ValueLocation {
 
 impl ValueLocation {
 	/// Creates a new ValueLocation
-	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
+	pub(crate) const fn new(meta: u8, value: Value, version: u8) -> Self {
 		Self {
 			meta,
 			value,
@@ -222,17 +222,17 @@ impl ValueLocation {
 	}
 
 	/// Creates a ValueLocation with inline value
-	pub(crate) fn with_inline_value(value: Value) -> Self {
+	pub(crate) const fn with_inline_value(value: Value) -> Self {
 		Self::new(0, value, VALUE_LOCATION_VERSION)
 	}
 
 	/// Checks if the value is a pointer to VLog
-	pub(crate) fn is_value_pointer(&self) -> bool {
+	pub(crate) const fn is_value_pointer(&self) -> bool {
 		(self.meta & BIT_VALUE_POINTER) != 0
 	}
 
 	/// Calculates the encoded size of this ValueLocation
-	pub(crate) fn encoded_size(&self) -> usize {
+	pub(crate) const fn encoded_size(&self) -> usize {
 		// meta (1 byte) + version (1 byte) + value length
 		1 + 1 + self.value.len()
 	}
@@ -315,7 +315,7 @@ pub(crate) struct ValuePointer {
 
 impl ValuePointer {
 	/// Creates a new ValuePointer
-	pub(crate) fn new(
+	pub(crate) const fn new(
 		file_id: u32,
 		offset: u64,
 		key_size: u32,
@@ -374,7 +374,7 @@ impl ValuePointer {
 	}
 
 	/// Calculates the total entry size (header + key + value + crc32)
-	pub(crate) fn total_entry_size(&self) -> u64 {
+	pub(crate) const fn total_entry_size(&self) -> u64 {
 		8 + self.key_size as u64 + self.value_size as u64 + 4
 	}
 }
@@ -387,7 +387,7 @@ pub(crate) struct VLogFile {
 }
 
 impl VLogFile {
-	fn new(_id: u32, path: PathBuf, _size: u64) -> Self {
+	const fn new(path: PathBuf) -> Self {
 		Self {
 			path,
 		}
@@ -486,7 +486,7 @@ impl VLogWriter {
 	}
 
 	/// Gets the current size of the file
-	fn size(&self) -> u64 {
+	const fn size(&self) -> u64 {
 		self.current_offset
 	}
 }
@@ -609,7 +609,7 @@ impl VLog {
 				)?;
 
 				// Register the new file for GC safety
-				self.register_vlog_file(file_id, file_path, 0); // Start with size 0
+				self.register_vlog_file(file_id, file_path);
 
 				// Update the active writer ID
 				self.active_writer_id.store(file_id, Ordering::SeqCst);
@@ -673,10 +673,7 @@ impl VLog {
 						file_handles.insert(file_id, handle);
 
 						// Also register in files_map
-						files_map.insert(
-							file_id,
-							Arc::new(VLogFile::new(file_id, file_path, file_size)),
-						);
+						files_map.insert(file_id, Arc::new(VLogFile::new(file_path)));
 					}
 					Err(e) => {
 						log::error!("Failed to pre-open VLog file {file_name_str}: {e}");
@@ -1194,9 +1191,9 @@ impl VLog {
 	}
 
 	/// Registers a VLog file in the files map for tracking
-	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
+	fn register_vlog_file(&self, file_id: u32, path: PathBuf) {
 		let mut files_map = self.files_map.write();
-		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
+		files_map.insert(file_id, Arc::new(VLogFile::new(path)));
 	}
 
 	/// Cleans up any leftover temporary files from interrupted compactions

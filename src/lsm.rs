@@ -776,7 +776,7 @@ struct LsmCommitEnv {
 
 impl LsmCommitEnv {
 	/// Creates a new commit environment for the LSM tree
-	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
+	pub(crate) const fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
 		Ok(Self {
 			core,
 			task_manager: Some(task_manager),
@@ -1583,7 +1583,7 @@ impl TreeBuilder {
 	///
 	/// This method ensures type safety by requiring the options to use the same
 	/// key type.
-	pub fn with_options(opts: Options) -> Self {
+	pub const fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
 		}

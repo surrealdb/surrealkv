@@ -87,13 +87,13 @@ impl CommitQueue {
 		}
 	}
 
-	fn unpack(&self, ptrs: u64) -> (u32, u32) {
+	const fn unpack(&self, ptrs: u64) -> (u32, u32) {
 		let head = (ptrs >> DEQUEUE_BITS) as u32;
 		let tail = ptrs as u32;
 		(head, tail)
 	}
 
-	fn pack(&self, head: u32, tail: u32) -> u64 {
+	const fn pack(&self, head: u32, tail: u32) -> u64 {
 		((head as u64) << DEQUEUE_BITS) | (tail as u64)
 	}
 

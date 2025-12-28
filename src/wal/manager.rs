@@ -370,7 +370,7 @@ impl Wal {
 	}
 
 	/// Returns the active log number
-	pub(crate) fn get_active_log_number(&self) -> u64 {
+	pub(crate) const fn get_active_log_number(&self) -> u64 {
 		self.active_log_number
 	}
 

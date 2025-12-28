@@ -16,18 +16,18 @@ pub(crate) struct BlockHandle {
 }
 
 impl BlockHandle {
-	pub(crate) fn new(offset: usize, size: usize) -> BlockHandle {
+	pub(crate) const fn new(offset: usize, size: usize) -> BlockHandle {
 		BlockHandle {
 			offset,
 			size,
 		}
 	}
 
-	pub(crate) fn offset(&self) -> usize {
+	pub(crate) const fn offset(&self) -> usize {
 		self.offset
 	}
 
-	pub(crate) fn size(&self) -> usize {
+	pub(crate) const fn size(&self) -> usize {
 		self.size
 	}
 
@@ -311,7 +311,7 @@ impl BlockWriter {
 	}
 
 	// Returns the number of entries in the block
-	pub(crate) fn entries(&self) -> usize {
+	pub(crate) const fn entries(&self) -> usize {
 		self.num_entries
 	}
 }

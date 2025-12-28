@@ -164,12 +164,12 @@ impl Levels {
 	}
 
 	/// Returns a reference to all levels
-	pub(crate) fn get_levels(&self) -> &Vec<Arc<Level>> {
+	pub(crate) const fn get_levels(&self) -> &Vec<Arc<Level>> {
 		&self.0
 	}
 
 	/// Returns a mutable reference to all levels
-	pub(crate) fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level>> {
+	pub(crate) const fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level>> {
 		&mut self.0
 	}
 }

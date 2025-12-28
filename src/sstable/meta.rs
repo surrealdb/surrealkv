@@ -47,7 +47,7 @@ pub(crate) struct Properties {
 }
 
 impl Properties {
-	pub(crate) fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Properties {
 			id: 0,
 			table_format: TableFormat::LSMV1,
@@ -178,7 +178,7 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
-	pub(crate) fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		TableMetadata {
 			smallest_point: None,
 			largest_point: None,
@@ -199,7 +199,7 @@ impl TableMetadata {
 		self.has_point_keys = Some(true);
 	}
 
-	pub(crate) fn update_seq_num(&mut self, seq_num: u64) {
+	pub(crate) const fn update_seq_num(&mut self, seq_num: u64) {
 		// Handle first sequence number specially
 		if self.largest_seq_num == 0 && self.smallest_seq_num == 0 {
 			self.smallest_seq_num = seq_num;
