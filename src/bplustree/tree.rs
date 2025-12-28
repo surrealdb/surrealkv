@@ -944,65 +944,7 @@ impl LeafNode {
 	///
 	/// - `is_update`: If true, we're updating an existing entry (replacing, not adding). The total
 	///   entry count remains the same. If false, we're inserting a new entry.
-	fn find_split_point_for_insert(
-		&self,
-		new_key: &[u8],
-		new_value: &[u8],
-		insert_idx: usize,
-		is_update: bool,
-	) -> usize {
-		debug_assert!(!self.keys.is_empty(), "Cannot split empty leaf");
-
-		let (_min_local, max_local) = calculate_local_limits(true);
-		let new_payload = new_key.len() + new_value.len();
-
-		// Check if new entry needs overflow
-		let new_needs_overflow = new_payload > max_local;
-
-		// Only use expensive algorithm if NEW entry needs overflow
-		// For existing overflow entries, the fast path is usually sufficient
-		// This avoids O(n) iteration through all entries on every split
-		let needs_complex_split = new_needs_overflow;
-
-		if !needs_complex_split {
-			// Fast path: Simple split (like old algorithm)
-			let total = if is_update {
-				self.keys.len() // For updates, total stays the same
-			} else {
-				self.keys.len() + 1 // For inserts, we add one entry
-			};
-			let split_idx_expanded = if insert_idx < total / 2 {
-				total / 2 - 1
-			} else {
-				total / 2
-			};
-
-			// Convert from expanded array index to original array index (for inserts only)
-			// Simple rule: if NEW is before split point, subtract 1; otherwise use as-is
-			if is_update {
-				// For updates, split_idx directly maps to original array index
-				split_idx_expanded
-			} else {
-				// For inserts: convert expanded index to original index
-				// If NEW is before split point, split_idx_expanded counts NEW, so subtract 1
-				// If NEW is at or after split point, split_idx_expanded doesn't count NEW yet
-				let split_idx = if insert_idx < split_idx_expanded {
-					split_idx_expanded - 1
-				} else {
-					split_idx_expanded
-				};
-				// Clamp to valid range [0, keys.len()]
-				split_idx.min(self.keys.len())
-			}
-		} else {
-			// Slow path: Complex iterative algorithm only when necessary
-			self.find_split_point_for_insert_complex(new_key, new_value, insert_idx, is_update)
-		}
-	}
-
-	/// Ensures proper ordering: right page size <= left page size (cntNew[i] <=
-	/// cntNew[i-1])
-	fn find_split_point_for_insert_complex(
+	fn find_split_point(
 		&self,
 		new_key: &[u8],
 		new_value: &[u8],
@@ -1109,7 +1051,7 @@ impl LeafNode {
 		// Verify both pages fit (should always be true after sequential processing)
 		if sz_left > max_page_size || sz_right > max_page_size {
 			panic!(
-				"find_split_point_for_insert_complex: pages don't fit after sequential processing (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
+				"find_split_point: pages don't fit after sequential processing (split_idx={}, total_cells={}, sz_left={}, sz_right={}, max_page_size={})",
 				split_idx, total_cells, sz_left, sz_right, max_page_size
 			);
 		}
@@ -1862,7 +1804,7 @@ impl<F: VfsFile> BPlusTree<F> {
 
 		// Use size-aware split point that accounts for the new entry
 		// Unified function handles both inserts and updates
-		let split_idx = leaf.find_split_point_for_insert(&key, &value, idx, is_duplicate);
+		let split_idx = leaf.find_split_point(&key, &value, idx, is_duplicate);
 
 		let new_leaf_offset = self.allocate_page()?;
 		let mut new_leaf = LeafNode::new(new_leaf_offset);
@@ -1964,36 +1906,78 @@ impl<F: VfsFile> BPlusTree<F> {
 			.binary_search_by(|key| self.compare.compare(key, &extra_key))
 			.unwrap_or_else(|idx| idx);
 
-		let mut split_idx = Self::find_split_point(node, insert_idx);
-
-		split_idx = split_idx.min(node.keys.len() - 1);
+		// Find split point in EXPANDED array (includes extra_key at insert_idx)
+		let expanded_split_idx = Self::find_split_point(node, insert_idx, &extra_key);
 
 		let new_node_offset = self.allocate_page()?;
 		let mut new_node = InternalNode::new(new_node_offset);
 
-		let promoted_key = node.keys[split_idx].clone();
-		let promoted_overflow = node.get_overflow_at(split_idx);
+		// Three cases based on where extra_key falls relative to split point
+		let (promoted_key, promoted_overflow) = if expanded_split_idx == insert_idx {
+			// Case 1: extra_key IS the promoted key - don't insert it into either child
 
-		new_node.keys = node.keys.split_off(split_idx + 1);
-		new_node.key_overflows = node.key_overflows.split_off(split_idx + 1);
-		new_node.children = node.children.split_off(split_idx + 1);
+			// Convert expanded index to original for split_off
+			// Since extra_key is at expanded_split_idx, original split point is same
+			let orig_split = expanded_split_idx;
 
-		node.keys.truncate(split_idx);
-		node.key_overflows.truncate(split_idx);
+			new_node.keys = node.keys.split_off(orig_split);
+			new_node.key_overflows = node.key_overflows.split_off(orig_split);
+			new_node.children = node.children.split_off(orig_split + 1);
 
-		if insert_idx <= split_idx {
+			// extra_key goes to parent as the promoted key
+			// extra_child goes to the RIGHT side (new_node) as its first child
+			new_node.children.insert(0, extra_child);
+
+			(extra_key, extra_overflow)
+		} else if expanded_split_idx < insert_idx {
+			// Case 2: Promoted key is from original array, extra_key goes to RIGHT
+
+			let orig_split = expanded_split_idx;
+			let promoted = (node.keys[orig_split].clone(), node.get_overflow_at(orig_split));
+
+			new_node.keys = node.keys.split_off(orig_split + 1);
+			new_node.key_overflows = node.key_overflows.split_off(orig_split + 1);
+			new_node.children = node.children.split_off(orig_split + 1);
+
+			// Remove promoted key from left
+			node.keys.truncate(orig_split);
+			node.key_overflows.truncate(orig_split);
+
+			// Insert extra_key into right (new_node)
+			// In expanded array: extra was at insert_idx, split was at expanded_split_idx
+			// In right array: position = insert_idx - expanded_split_idx - 1
+			let right_insert_idx = insert_idx - expanded_split_idx - 1;
+			new_node.keys.insert(right_insert_idx, extra_key);
+			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
+			new_node.children.insert(right_insert_idx + 1, extra_child);
+
+			promoted
+		} else {
+			// Case 3: Promoted key is from original array (after extra_key position),
+			//         extra_key goes to LEFT
+
+			// expanded_split_idx > insert_idx, so original index = expanded - 1
+			let orig_split = expanded_split_idx - 1;
+			let promoted = (node.keys[orig_split].clone(), node.get_overflow_at(orig_split));
+
+			new_node.keys = node.keys.split_off(orig_split + 1);
+			new_node.key_overflows = node.key_overflows.split_off(orig_split + 1);
+			new_node.children = node.children.split_off(orig_split + 1);
+
+			// Remove promoted key from left
+			node.keys.truncate(orig_split);
+			node.key_overflows.truncate(orig_split);
+
+			// Insert extra_key into left (node) using binary search
 			node.insert_key_child_with_overflow(
 				extra_key,
 				extra_overflow,
 				extra_child,
 				self.compare.as_ref(),
 			);
-		} else {
-			let right_insert_idx = insert_idx - split_idx - 1;
-			new_node.keys.insert(right_insert_idx, extra_key);
-			new_node.key_overflows.insert(right_insert_idx, extra_overflow);
-			new_node.children.insert(right_insert_idx + 1, extra_child);
-		}
+
+			promoted
+		};
 
 		let node_owned = std::mem::replace(node, InternalNode::new(node.offset));
 		self.write_node_owned(NodeType::Internal(node_owned))?;
@@ -2002,25 +1986,89 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok((promoted_key, promoted_overflow, new_node_offset))
 	}
 
-	/// Processes entries left-to-right, ensures ordering (right <= left)
-	fn find_split_point(node: &InternalNode, insert_idx: usize) -> usize {
+	/// Processes entries left-to-right, returns split index in EXPANDED array
+	/// (the array that conceptually includes extra_key at insert_idx)
+	fn find_split_point(node: &InternalNode, insert_idx: usize, extra_key: &[u8]) -> usize {
 		debug_assert!(!node.keys.is_empty(), "Internal node must have at least 1 key to split");
 
-		// Simple sequential approach: calculate split point based on total keys
-		// Internal node keys are typically similar in size, so simple middle split
-		// works well
-		let total_keys = node.keys.len() + 1; // +1 for the new key being inserted
+		let (min_local, max_local) = calculate_local_limits(false);
+		let usable_size = INTERNAL_USABLE_SIZE;
 
-		// Sequential processing: split at middle, adjusting for insert position
-		let split_idx = total_keys / 2;
+		// Calculate actual entry sizes for all keys including the new one
+		let mut entry_sizes = Vec::with_capacity(node.keys.len() + 1);
 
-		// Adjust split point based on where new key is being inserted
-		// This ensures the new key goes to the correct side
-		if split_idx > insert_idx {
-			split_idx - 1
-		} else {
-			split_idx
+		for (i, key) in node.keys.iter().enumerate() {
+			if i == insert_idx {
+				// Insert the new key's size at this position
+				let (bytes_on_page, needs_overflow) =
+					calculate_overflow(extra_key.len(), min_local, max_local, usable_size);
+				let size = KEY_SIZE_PREFIX
+					+ bytes_on_page + overflow_ptr_size(needs_overflow)
+					+ CHILD_PTR_SIZE;
+				entry_sizes.push(size);
+			}
+
+			let (bytes_on_page, needs_overflow) =
+				calculate_overflow(key.len(), min_local, max_local, usable_size);
+			let size = KEY_SIZE_PREFIX
+				+ bytes_on_page
+				+ overflow_ptr_size(needs_overflow)
+				+ CHILD_PTR_SIZE;
+			entry_sizes.push(size);
 		}
+
+		// Handle insert at end
+		if insert_idx >= node.keys.len() {
+			let (bytes_on_page, needs_overflow) =
+				calculate_overflow(extra_key.len(), min_local, max_local, usable_size);
+			let size = KEY_SIZE_PREFIX
+				+ bytes_on_page
+				+ overflow_ptr_size(needs_overflow)
+				+ CHILD_PTR_SIZE;
+			entry_sizes.push(size);
+		}
+
+		let total_entries = entry_sizes.len();
+		let max_page_size = PAGE_SIZE;
+
+		// Base size: header + first child pointer (n+1 children for n keys)
+		let base_size = INTERNAL_HEADER_SIZE + CHILD_PTR_SIZE;
+
+		// Phase 1: Fill left page until it can't fit more
+		let mut current_size = base_size;
+		let mut split_idx = 1; // Start at 1 to ensure at least one entry on left
+
+		for (i, &entry_size) in entry_sizes.iter().enumerate().take(total_entries - 1) {
+			let new_size = current_size + entry_size;
+			if new_size > max_page_size && current_size > base_size {
+				split_idx = i;
+				break;
+			}
+			current_size = new_size;
+			split_idx = i + 1;
+		}
+
+		// Phase 2: Verify right page fits
+		let right_size: usize = base_size + entry_sizes[split_idx + 1..].iter().sum::<usize>();
+
+		// If right is too big, try to find better split point
+		let mut adjusted_split = split_idx;
+		if right_size > max_page_size {
+			for test_split in (1..split_idx).rev() {
+				let test_right: usize =
+					base_size + entry_sizes[test_split + 1..].iter().sum::<usize>();
+				let test_left: usize = base_size + entry_sizes[..test_split].iter().sum::<usize>();
+				if test_right <= max_page_size && test_left <= max_page_size {
+					adjusted_split = test_split;
+					break;
+				}
+			}
+		}
+
+		// Ensure at least one key on each side (in expanded array)
+		adjusted_split.clamp(1, total_entries.saturating_sub(2).max(1))
+
+		// NOTE: We return the EXPANDED array index, NOT converted to original
 	}
 
 	#[allow(unused)]
