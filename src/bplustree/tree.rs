@@ -507,7 +507,7 @@ impl InternalNode {
 
 	// Check if node is considered to be in underflow state
 	fn is_underflow(&self) -> bool {
-		self.current_size() * 100 < Self::max_size() * 50
+		self.current_size() * 100 < Self::max_size() * 35
 	}
 
 	fn calculate_size_and_max_key(&self) -> (usize, usize) {
