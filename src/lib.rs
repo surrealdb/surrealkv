@@ -227,7 +227,7 @@ impl Default for Options {
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
-			vlog_value_threshold: 4096, // 4KB default
+			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,

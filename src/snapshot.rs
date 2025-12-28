@@ -498,7 +498,10 @@ impl Snapshot {
 
 				let current_key = internal_key.user_key.clone();
 
-				key_versions.entry(current_key).or_default().push((internal_key, encoded_value));
+				key_versions
+					.entry(current_key)
+					.or_default()
+					.push((internal_key, encoded_value.to_vec()));
 			}
 
 			// Filter out keys where the latest version is a hard delete
