@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
-use crate::error::Result;
+use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
@@ -20,6 +20,7 @@ pub(crate) struct CompactionOptions {
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
+	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
 }
 
 impl CompactionOptions {
@@ -29,6 +30,7 @@ impl CompactionOptions {
 			level_manifest: Arc::clone(&tree.level_manifest),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
+			error_handler: Arc::clone(&tree.error_handler),
 		}
 	}
 }
@@ -142,7 +144,8 @@ impl Compactor {
 			Arc::clone(&self.options.lopts.clock),
 		);
 
-		for (key, value) in &mut comp_iter {
+		for item in &mut comp_iter {
+			let (key, value) = item?;
 			writer.add(key, &value)?;
 		}
 
@@ -186,7 +189,12 @@ impl Compactor {
 		manifest.apply_changeset(&changeset)?;
 
 		// Persist the updated manifest
-		write_manifest_to_disk(&manifest)?;
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			self.options
+				.error_handler
+				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
+			return Err(e);
+		}
 
 		manifest.unhide_tables(&input.tables_to_merge);
 

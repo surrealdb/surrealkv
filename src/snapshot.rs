@@ -177,10 +177,16 @@ impl Snapshot {
 		);
 
 		// Filter out items that are not visible in this snapshot
-		let merge_iter = KMergeIterator::new_from(iter_state, internal_range, true)
-			.filter(move |item| item.0.seq_num() <= self.seq_num);
+		let merge_iter = KMergeIterator::new_from(iter_state, internal_range, true).filter_map(
+			move |item_result| match item_result {
+				Ok(item) if item.0.seq_num() <= self.seq_num => Some(Ok(item)),
+				Ok(_) => None,
+				Err(e) => Some(Err(e)),
+			},
+		);
 
-		for (key, _value) in merge_iter {
+		for item in merge_iter {
+			let (key, _value) = item?;
 			// Skip older versions of the same key
 			if last_key.as_ref().is_some_and(|prev| prev == &key.user_key) {
 				continue;
@@ -758,10 +764,11 @@ impl<'a> KMergeIterator<'a> {
 		}
 	}
 
-	fn initialize_lo(&mut self) {
+	fn initialize_lo(&mut self) -> Result<()> {
 		// Pull the first item from each iterator and add to heap
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next() {
+			if let Some(item_result) = iter.next() {
+				let (key, value) = item_result?;
 				self.heap.push(HeapItem {
 					key,
 					value,
@@ -770,12 +777,14 @@ impl<'a> KMergeIterator<'a> {
 			}
 		}
 		self.initialized_lo = true;
+		Ok(())
 	}
 
-	fn initialize_hi(&mut self) {
+	fn initialize_hi(&mut self) -> Result<()> {
 		// Pull the last item from each iterator and add to heap
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next_back() {
+			if let Some(item_result) = iter.next_back() {
+				let (key, value) = item_result?;
 				self.heap.push(HeapItem {
 					key,
 					value,
@@ -784,28 +793,45 @@ impl<'a> KMergeIterator<'a> {
 			}
 		}
 		self.initialized_hi = true;
+		Ok(())
 	}
 }
 
 impl Iterator for KMergeIterator<'_> {
-	type Item = (InternalKey, Value);
+	type Item = Result<(InternalKey, Value)>;
 
 	#[inline]
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized_lo {
-			self.initialize_lo();
+			if let Err(e) = self.initialize_lo() {
+				log::error!("[KMERGE_ITER] Error initializing lo: {}", e);
+				return Some(Err(e));
+			}
 		}
 
 		let min_item = self.heap.pop_min()?;
-		if let Some(next_item) = self.iterators[min_item.iterator_index].next() {
-			self.heap.push(HeapItem {
-				key: next_item.0,
-				value: next_item.1,
-				iterator_index: min_item.iterator_index,
-			});
+
+		if let Some(item_result) = self.iterators[min_item.iterator_index].next() {
+			match item_result {
+				Ok((key, value)) => {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: min_item.iterator_index,
+					});
+				}
+				Err(e) => {
+					log::error!(
+						"[KMERGE_ITER] Error from iterator {}: {}",
+						min_item.iterator_index,
+						e
+					);
+					return Some(Err(e));
+				}
+			}
 		}
 
-		Some((min_item.key, min_item.value))
+		Some(Ok((min_item.key, min_item.value)))
 	}
 }
 
@@ -813,19 +839,35 @@ impl DoubleEndedIterator for KMergeIterator<'_> {
 	#[inline]
 	fn next_back(&mut self) -> Option<Self::Item> {
 		if !self.initialized_hi {
-			self.initialize_hi();
+			if let Err(e) = self.initialize_hi() {
+				log::error!("[KMERGE_ITER] Error initializing hi: {}", e);
+				return Some(Err(e));
+			}
 		}
 
 		let max_item = self.heap.pop_max()?;
-		if let Some(next_item) = self.iterators[max_item.iterator_index].next_back() {
-			self.heap.push(HeapItem {
-				key: next_item.0,
-				value: next_item.1,
-				iterator_index: max_item.iterator_index,
-			});
+
+		if let Some(item_result) = self.iterators[max_item.iterator_index].next_back() {
+			match item_result {
+				Ok((key, value)) => {
+					self.heap.push(HeapItem {
+						key,
+						value,
+						iterator_index: max_item.iterator_index,
+					});
+				}
+				Err(e) => {
+					log::error!(
+						"[KMERGE_ITER] Error from iterator {}: {}",
+						max_item.iterator_index,
+						e
+					);
+					return Some(Err(e));
+				}
+			}
 		}
 
-		Some((max_item.key, max_item.value))
+		Some(Ok((max_item.key, max_item.value)))
 	}
 }
 
@@ -900,8 +942,11 @@ impl SnapshotIterator<'_> {
 
 	/// Get next item from back, checking buffer first
 	#[inline]
-	fn next_back_raw(&mut self) -> Option<(InternalKey, Value)> {
-		self.buffered_back.take().or_else(|| self.merge_iter.next_back())
+	fn next_back_raw(&mut self) -> Option<Result<(InternalKey, Value)>> {
+		if let Some(buffered) = self.buffered_back.take() {
+			return Some(Ok(buffered));
+		}
+		self.merge_iter.next_back()
 	}
 }
 
@@ -910,7 +955,14 @@ impl Iterator for SnapshotIterator<'_> {
 
 	#[inline(always)]
 	fn next(&mut self) -> Option<Self::Item> {
-		while let Some((key, value)) = self.merge_iter.next() {
+		while let Some(item_result) = self.merge_iter.next() {
+			let (key, value) = match item_result {
+				Ok(kv) => kv,
+				Err(e) => {
+					log::error!("[SNAPSHOT_ITER] Error from merge iterator: {}", e);
+					return Some(Err(e));
+				}
+			};
 			// Skip invisible versions (seq_num > snapshot)
 			// For forward: highest seq comes first, so first visible is latest
 			if !self.is_visible(&key) {
@@ -940,7 +992,14 @@ impl Iterator for SnapshotIterator<'_> {
 impl DoubleEndedIterator for SnapshotIterator<'_> {
 	#[inline(always)]
 	fn next_back(&mut self) -> Option<Self::Item> {
-		while let Some((first_key, first_value)) = self.next_back_raw() {
+		while let Some(first_result) = self.next_back_raw() {
+			let (first_key, first_value) = match first_result {
+				Ok(kv) => kv,
+				Err(e) => {
+					log::error!("[SNAPSHOT_ITER] Error from merge iterator (back): {}", e);
+					return Some(Err(e));
+				}
+			};
 			// Skip invisible
 			if !self.is_visible(&first_key) {
 				continue;
@@ -951,8 +1010,16 @@ impl DoubleEndedIterator for SnapshotIterator<'_> {
 
 			// Consume all versions of this key, keeping latest visible
 			loop {
-				let Some((key, value)) = self.next_back_raw() else {
+				let Some(item_result) = self.next_back_raw() else {
 					break;
+				};
+
+				let (key, value) = match item_result {
+					Ok(kv) => kv,
+					Err(e) => {
+						log::error!("[SNAPSHOT_ITER] Error from merge iterator (back): {}", e);
+						return Some(Err(e));
+					}
 				};
 
 				if key.user_key != latest_key.user_key {
@@ -1464,7 +1531,7 @@ mod tests {
 		);
 		let merge_iter = KMergeIterator::new_from(iter_state, internal_range, false);
 
-		let items: Vec<_> = merge_iter.collect();
+		let items: Vec<_> = merge_iter.map(|r| r.unwrap()).collect();
 		assert_eq!(items.len(), 2);
 		assert_eq!(items[0].0.user_key.as_slice(), b"z1");
 		assert_eq!(items[1].0.user_key.as_slice(), b"z2");
@@ -2264,7 +2331,7 @@ mod tests {
 		);
 		let iter = KMergeIterator::new_from(iter_state, internal_range, false);
 
-		let items: Vec<_> = iter.collect();
+		let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
 		// Should return at most 1 item
 		for (key, _) in &items {
 			assert_eq!(key.user_key.as_slice(), b"a1");

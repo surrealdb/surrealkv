@@ -6,6 +6,7 @@ use tokio::sync::Notify;
 
 use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
+use crate::error::BackgroundErrorReason;
 use crate::lsm::CompactionOperations;
 
 /// Manages background tasks for the LSM tree
@@ -68,8 +69,8 @@ impl TaskManager {
 					log::debug!("Memtable flush task starting");
 
 					if let Err(e) = core.compact_memtable() {
-						// TODO: Handle error appropriately
 						log::error!("Memtable compaction task error: {e:?}");
+						core.error_handler().set_error(e, BackgroundErrorReason::MemtablaFlush);
 					} else {
 						log::debug!("Memtable flush task completed successfully");
 						// If memtable compaction succeeded, trigger level compaction
@@ -103,8 +104,8 @@ impl TaskManager {
 					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
 					if let Err(e) = core.compact(strategy) {
-						// TODO: Handle error appropriately
 						log::error!("Level compaction task error: {e:?}");
+						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
 					} else {
 						log::debug!("Level compaction completed successfully");
 					}
@@ -176,7 +177,7 @@ mod tests {
 	use tokio::time;
 
 	use crate::compaction::CompactionStrategy;
-	use crate::error::Result;
+	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
 	use crate::task::TaskManager;
 	use crate::Error;
@@ -247,6 +248,10 @@ mod tests {
 			// Only increment counter on success
 			self.level_compactions.fetch_add(1, Ordering::SeqCst);
 			Ok(())
+		}
+
+		fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
+			Arc::new(BackgroundErrorHandler::new())
 		}
 	}
 

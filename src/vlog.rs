@@ -1315,6 +1315,9 @@ pub(crate) struct VLogGCManager {
 	/// Reference to the commit pipeline for coordinating writes during GC
 	commit_pipeline: Arc<CommitPipeline>,
 
+	/// Background error handler for reporting GC errors
+	error_handler: Arc<crate::error::BackgroundErrorHandler>,
+
 	/// Flag to signal the GC task to stop
 	stop_flag: Arc<std::sync::atomic::AtomicBool>,
 
@@ -1330,7 +1333,11 @@ pub(crate) struct VLogGCManager {
 
 impl VLogGCManager {
 	/// Creates a new VLog GC manager
-	pub(crate) fn new(vlog: Arc<VLog>, commit_pipeline: Arc<CommitPipeline>) -> Self {
+	pub(crate) fn new(
+		vlog: Arc<VLog>,
+		commit_pipeline: Arc<CommitPipeline>,
+		error_handler: Arc<crate::error::BackgroundErrorHandler>,
+	) -> Self {
 		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let notify = Arc::new(tokio::sync::Notify::new());
@@ -1339,6 +1346,7 @@ impl VLogGCManager {
 		Self {
 			vlog,
 			commit_pipeline,
+			error_handler,
 			stop_flag,
 			running,
 			notify,
@@ -1350,6 +1358,7 @@ impl VLogGCManager {
 	pub(crate) fn start(&self) {
 		let vlog = Arc::clone(&self.vlog);
 		let commit_pipeline = Arc::clone(&self.commit_pipeline);
+		let error_handler = Arc::clone(&self.error_handler);
 		let stop_flag = Arc::clone(&self.stop_flag);
 		let notify = Arc::clone(&self.notify);
 		let running = Arc::clone(&self.running);
@@ -1368,8 +1377,8 @@ impl VLogGCManager {
 
 				running.store(true, Ordering::SeqCst);
 				if let Err(e) = vlog.garbage_collect(Arc::clone(&commit_pipeline)).await {
-					// TODO: Handle error appropriately
-					log::error!("VLog GC task error: {e:?}");
+					log::error!("Error in VLog GC: {e:?}");
+					error_handler.set_error(e, crate::error::BackgroundErrorReason::VLogGC);
 				}
 				running.store(false, Ordering::SeqCst);
 			}

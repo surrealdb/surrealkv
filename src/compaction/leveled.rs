@@ -358,7 +358,7 @@ mod tests {
 	use crate::compaction::compactor::{CompactionOptions, Compactor};
 	use crate::compaction::leveled::Strategy;
 	use crate::compaction::{CompactionChoice, CompactionStrategy};
-	use crate::error::Result;
+	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::iter::CompactionIterator;
 	use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 	use crate::memtable::ImmutableMemtables;
@@ -542,6 +542,7 @@ mod tests {
 			level_manifest: manifest,
 			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 			vlog: Some(vlog),
+			error_handler: Arc::new(BackgroundErrorHandler::new()),
 		}
 	}
 
@@ -562,8 +563,9 @@ mod tests {
 				let iter = table.iter(false, None);
 
 				for result in iter {
+					let (key, value) = result.unwrap();
 					count += 1;
-					all_key_values.insert(result.0.user_key.clone(), result.1.clone());
+					all_key_values.insert(key.user_key.clone(), value.clone());
 				}
 			}
 		}
@@ -600,7 +602,8 @@ mod tests {
 			for table in &level.tables {
 				let iter = table.iter(false, None);
 				for result in iter {
-					all_key_values.insert(result.0.user_key.clone(), result.1.clone());
+					let (key, value) = result.unwrap();
+					all_key_values.insert(key.user_key.clone(), value.clone());
 				}
 			}
 		}
@@ -1195,7 +1198,8 @@ mod tests {
 					let mut min_key = None;
 					let mut max_key = None;
 
-					for (key, _) in table.iter(false, None) {
+					for item in table.iter(false, None) {
+						let (key, _) = item.unwrap();
 						if min_key.is_none() {
 							min_key = Some(key.user_key.clone());
 						}
@@ -1583,13 +1587,13 @@ mod tests {
 			for table in &level.tables {
 				let iter = table.iter(false, None);
 				for result in iter {
+					let (key, encoded_value) = result.unwrap();
 					// Decode the ValueLocation before comparing
-					let encoded_value = result.1.clone();
 					let location = ValueLocation::decode(&encoded_value).unwrap();
 					if location.is_value_pointer() {
 						panic!("Unexpected VLog pointer in test");
 					}
-					all_keys.insert(result.0.user_key.clone(), (*location.value).to_vec());
+					all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
 				}
 			}
 		}
@@ -1666,7 +1670,8 @@ mod tests {
 		let mut remaining_keys = Vec::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, _) in table.iter(false, None) {
+				for item in table.iter(false, None) {
+					let (key, _) = item.unwrap();
 					if key.kind() == InternalKeyKind::Set {
 						let key_str = String::from_utf8_lossy(&key.user_key);
 						remaining_keys.push(key_str.to_string());
@@ -1760,7 +1765,8 @@ mod tests {
 		let mut tombstones = HashMap::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, encoded_value) in table.iter(false, None) {
+				for item in table.iter(false, None) {
+					let (key, encoded_value) = item.unwrap();
 					match key.kind() {
 						InternalKeyKind::Set => {
 							// Decode the ValueLocation
@@ -1880,7 +1886,8 @@ mod tests {
 		let mut survivors = HashMap::new();
 		for level in levels {
 			for table in &level.tables {
-				for (key, encoded_value) in table.iter(false, None) {
+				for item in table.iter(false, None) {
+					let (key, encoded_value) = item.unwrap();
 					if key.kind() == InternalKeyKind::Set {
 						// Decode the ValueLocation
 						let location = ValueLocation::decode(&encoded_value).unwrap();
@@ -2001,7 +2008,8 @@ mod tests {
 		let mut tombstones = 0;
 		let mut values = 0;
 		for table in &levels[3].tables {
-			for (key, _) in table.iter(false, None) {
+			for item in table.iter(false, None) {
+				let (key, _) = item.unwrap();
 				match key.kind() {
 					InternalKeyKind::Delete => tombstones += 1,
 					InternalKeyKind::Set => values += 1,
@@ -2053,7 +2061,7 @@ mod tests {
 			0,
 			Arc::new(MockLogicalClock::new()),
 		);
-		let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().collect();
+		let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 		// Non-bottom level should preserve tombstone
 		assert_eq!(non_bottom_result.len(), 1, "Non-bottom level should have 1 entry");
@@ -2078,7 +2086,7 @@ mod tests {
 			0,
 			Arc::new(MockLogicalClock::new()),
 		);
-		let bottom_result: Vec<_> = comp_iter_bottom.by_ref().collect();
+		let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 		// Bottom level should filter out tombstones
 		let has_tombstones = bottom_result.iter().any(|(key, _)| key.is_hard_delete_marker());
@@ -2279,7 +2287,8 @@ mod tests {
 
 		// Count entries in L1 (bottom level) after compaction
 		for table in &levels[1].tables {
-			for (key, _) in table.iter(false, None) {
+			for item in table.iter(false, None) {
+				let (key, _) = item.unwrap();
 				match key.kind() {
 					InternalKeyKind::SoftDelete => soft_deletes += 1,
 					InternalKeyKind::Delete => regular_deletes += 1,
@@ -2300,7 +2309,8 @@ mod tests {
 		// Verify that values are the latest and correct
 		let mut found_keys = HashSet::new();
 		for table in &levels[1].tables {
-			for (key, value) in table.iter(false, None) {
+			for item in table.iter(false, None) {
+				let (key, value) = item.unwrap();
 				match key.kind() {
 					InternalKeyKind::Set => {
 						let key_str = String::from_utf8(key.user_key.clone()).unwrap();
@@ -2424,7 +2434,8 @@ mod tests {
 		let mut sets = 0;
 
 		for table in &levels[1].tables {
-			for (key, _) in table.iter(false, None) {
+			for item in table.iter(false, None) {
+				let (key, _) = item.unwrap();
 				match key.kind() {
 					InternalKeyKind::SoftDelete => soft_deletes += 1,
 					InternalKeyKind::Set => sets += 1,

@@ -13,7 +13,7 @@ use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
-use crate::error::Result;
+use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
@@ -52,6 +52,9 @@ pub trait CompactionOperations: Send + Sync {
 	/// Compaction merges SSTables to reduce read amplification and remove
 	/// tombstones.
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()>;
+
+	/// Returns a reference to the background error handler
+	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -121,6 +124,9 @@ pub(crate) struct CoreInner {
 
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
+
+	/// Background error handler
+	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
 }
 
 impl CoreInner {
@@ -187,6 +193,7 @@ impl CoreInner {
 			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
+			error_handler: Arc::new(BackgroundErrorHandler::new()),
 		})
 	}
 
@@ -294,12 +301,14 @@ impl CoreInner {
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
 		manifest.apply_changeset(&changeset)?;
-		write_manifest_to_disk(&manifest).map_err(|e| {
-			Error::Other(format!(
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
 				table_id, changeset.log_number, e
-			))
-		})?;
+			));
+			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			return Err(error);
+		}
 
 		memtable_lock.remove(table_id);
 		drop(manifest);
@@ -436,12 +445,14 @@ impl CoreInner {
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
 		manifest.apply_changeset(&changeset)?;
-		write_manifest_to_disk(&manifest).map_err(|e| {
-			Error::Other(format!(
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
 				table_id, changeset.log_number, e
-			))
-		})?;
+			));
+			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			return Err(error);
+		}
 
 		// Remove successfully flushed memtable from tracking
 		memtable_lock.remove(table_id);
@@ -520,12 +531,14 @@ impl CoreInner {
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
 		manifest.apply_changeset(&changeset)?;
-		write_manifest_to_disk(&manifest).map_err(|e| {
-			Error::Other(format!(
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			let error = Error::Other(format!(
 				"Failed to update manifest for immutable memtable: table_id={}: {}",
 				table_id, e
-			))
-		})?;
+			));
+			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			return Err(error);
+		}
 
 		// Remove successfully flushed memtable from tracking
 		memtable_lock.remove(table_id);
@@ -652,12 +665,15 @@ impl CoreInner {
 
 				let mut manifest = self.level_manifest.write()?;
 				manifest.apply_changeset(&changeset)?;
-				write_manifest_to_disk(&manifest).map_err(|e| {
-					Error::Other(format!(
+				if let Err(e) = write_manifest_to_disk(&manifest) {
+					let error = Error::Other(format!(
 						"Failed to update manifest log_number after immutable flush: {}",
 						e
-					))
-				})?;
+					));
+					self.error_handler
+						.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+					return Err(error);
+				}
 
 				log::debug!(
 					"Updated manifest log_number to {} after immutable flushes",
@@ -764,6 +780,11 @@ impl CompactionOperations for CoreInner {
 		// self.clean_expired_versions()?;
 
 		Ok(())
+	}
+
+	/// Returns a reference to the background error handler
+	fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
+		Arc::clone(&self.error_handler)
 	}
 }
 
@@ -934,6 +955,11 @@ impl CommitEnv for LsmCommitEnv {
 		active_memtable.add(batch)?;
 
 		Ok(())
+	}
+
+	// Check for background errors before committing
+	fn check_background_error(&self) -> Result<()> {
+		self.core.error_handler.check_error()
 	}
 }
 
@@ -1187,8 +1213,11 @@ impl Core {
 
 		// Initialize VLog GC manager only if VLog is enabled
 		if let Some(ref vlog) = inner.vlog {
-			let vlog_gc_manager =
-				VLogGCManager::new(Arc::clone(vlog), Arc::clone(&commit_pipeline));
+			let vlog_gc_manager = VLogGCManager::new(
+				Arc::clone(vlog),
+				Arc::clone(&commit_pipeline),
+				Arc::clone(&inner.error_handler),
+			);
 			vlog_gc_manager.start();
 			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
 			log::debug!("VLog GC manager started");
