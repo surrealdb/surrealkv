@@ -7,12 +7,11 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
-use crate::transaction::Transaction;
-use crate::Key;
+use crate::{Transaction, UserKey};
 
 /// Entry used for tracking transaction operations in the commit queue
 struct CommitEntry {
-	keys: Arc<Vec<Key>>,
+	keys: Arc<Vec<UserKey>>,
 }
 
 impl CommitEntry {
@@ -108,7 +107,7 @@ impl Oracle {
 	pub(crate) fn prepare_commit(&self, txn: &Transaction) -> Result<u64> {
 		// Extract only the keys from the transaction's writeset
 		// Keys are already sorted in the BTreeMap, so we maintain sort order
-		let keys: Vec<Key> = txn.write_set.keys().cloned().collect();
+		let keys: Vec<UserKey> = txn.write_set.keys().cloned().collect();
 
 		// Create commit entry
 		let commit_entry = Arc::new(CommitEntry {

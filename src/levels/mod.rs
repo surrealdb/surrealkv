@@ -143,12 +143,12 @@ impl LevelManifest {
 	}
 
 	/// Returns the minimum WAL number that contains unflushed data
-	pub(crate) fn get_log_number(&self) -> u64 {
+	pub(crate) const fn get_log_number(&self) -> u64 {
 		self.log_number
 	}
 
 	/// Returns the last sequence number persisted in the manifest
-	pub(crate) fn get_last_sequence(&self) -> u64 {
+	pub(crate) const fn get_last_sequence(&self) -> u64 {
 		self.last_sequence
 	}
 
@@ -529,7 +529,7 @@ mod tests {
 			let value = format!("value_{i:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+				InternalKey::encode(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -886,7 +886,7 @@ mod tests {
 			let value = format!("value_{seq_num:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+				InternalKey::encode(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}

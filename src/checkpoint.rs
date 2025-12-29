@@ -51,7 +51,7 @@ pub struct CheckpointMetadata {
 
 impl CheckpointMetadata {
 	/// Creates new checkpoint metadata with current version
-	pub fn new(
+	pub const fn new(
 		timestamp: u64,
 		sequence_number: u64,
 		sstable_count: usize,
@@ -68,14 +68,20 @@ impl CheckpointMetadata {
 
 	/// Checks if this metadata version is compatible with current
 	/// implementation
-	pub fn is_compatible(&self) -> bool {
+	pub const fn is_compatible(&self) -> bool {
 		// For now, we only support version 1
 		self.version == CHECKPOINT_VERSION
 	}
 
 	/// Serializes the metadata to binary format
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
-		let mut buf = Vec::new();
+		let mut buf = Vec::with_capacity(
+			4 + // version
+			8 + // timestamp
+			8 + // sequence number
+			8 + // sstable count
+			8, // total size
+		);
 
 		// Write version first for compatibility checking
 		buf.write_u32::<BigEndian>(self.version).map_err(|e| Error::Io(Arc::new(e)))?;
@@ -148,7 +154,7 @@ pub(crate) struct DatabaseCheckpoint {
 
 impl DatabaseCheckpoint {
 	/// Creates a new database checkpoint manager
-	pub fn new(core: Arc<CoreInner>) -> Self {
+	pub const fn new(core: Arc<CoreInner>) -> Self {
 		Self {
 			core,
 		}

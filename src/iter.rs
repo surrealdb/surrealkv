@@ -6,7 +6,7 @@ use crate::clock::LogicalClock;
 use crate::error::Result;
 use crate::sstable::InternalKey;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::{Key, Value};
+use crate::{UserKey, Value};
 
 pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
 
@@ -34,7 +34,7 @@ impl Ord for HeapItem {
 impl HeapItem {
 	fn cmp_internal(&self, other: &Self) -> Ordering {
 		// First compare by user key
-		match self.key.user_key.cmp(&other.key.user_key) {
+		match self.key.user_key().cmp(other.key.user_key()) {
 			Ordering::Equal => {
 				// Same user key, compare by sequence number in DESCENDING order
 				// (higher sequence number = more recent)
@@ -77,7 +77,7 @@ pub(crate) struct CompactionIterator<'a> {
 	is_bottom_level: bool,
 
 	// Track the current key being processed
-	current_user_key: Option<Key>,
+	current_user_key: Option<UserKey>,
 
 	// Buffer for accumulating all versions of the current key
 	accumulated_versions: Vec<(InternalKey, Value)>,
@@ -215,7 +215,7 @@ impl<'a> CompactionIterator<'a> {
 				if self.enable_versioning && self.retention_period_ns > 0 {
 					// Get current time for retention period check
 					let current_time = self.clock.now();
-					let key_timestamp = key.timestamp;
+					let key_timestamp = key.timestamp();
 					let age = current_time - key_timestamp;
 					let is_within_retention = age <= self.retention_period_ns;
 					// Mark as stale only if NOT within retention period
@@ -230,7 +230,7 @@ impl<'a> CompactionIterator<'a> {
 			if should_mark_stale && self.vlog.is_some() {
 				if key.is_tombstone() {
 					// Hard Delete: add key size to delete list
-					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
+					self.delete_list_batch.push((key.seq_num(), key.len() as u64));
 				} else {
 					let location = ValueLocation::decode(value).unwrap();
 					if location.is_value_pointer() {
@@ -312,12 +312,12 @@ impl Iterator for CompactionIterator<'_> {
 				});
 			}
 
-			let user_key = heap_item.key.user_key.clone();
+			let user_key = heap_item.key.user_key();
 
 			// Check if this is a new user key
 			let is_new_key = match &self.current_user_key {
 				None => true,
-				Some(current) => user_key != *current,
+				Some(current) => user_key != current,
 			};
 
 			if is_new_key {
@@ -326,7 +326,7 @@ impl Iterator for CompactionIterator<'_> {
 					self.process_accumulated_versions();
 
 					// Start accumulating the new key
-					self.current_user_key = Some(user_key);
+					self.current_user_key = Some(user_key.to_vec());
 					self.accumulated_versions.push((heap_item.key, heap_item.value));
 
 					// Return first output version from processed key if any
@@ -335,7 +335,7 @@ impl Iterator for CompactionIterator<'_> {
 					}
 				} else {
 					// First key - start accumulating
-					self.current_user_key = Some(user_key);
+					self.current_user_key = Some(user_key.to_vec());
 					self.accumulated_versions.push((heap_item.key, heap_item.value));
 				}
 			} else {
@@ -358,7 +358,7 @@ mod tests {
 	use crate::{Options, VLogChecksumLevel, Value};
 
 	fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
+		InternalKey::encode(user_key.as_bytes().to_vec(), sequence, kind, 0)
 	}
 
 	fn create_internal_key_with_timestamp(
@@ -367,7 +367,7 @@ mod tests {
 		kind: InternalKeyKind,
 		timestamp: u64,
 	) -> InternalKey {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
+		InternalKey::encode(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {

@@ -26,7 +26,7 @@ pub struct DefaultReporter {
 
 impl DefaultReporter {
 	/// Creates a new DefaultReporter for the specified log number.
-	pub fn new(log_number: u64) -> Self {
+	pub const fn new(log_number: u64) -> Self {
 		Self {
 			log_number,
 			corruption_count: 0,
@@ -189,7 +189,7 @@ pub(crate) fn replay_wal(
 					);
 
 					// Apply the batch to the memtable
-					memtable.add(&batch)?;
+					memtable.add(batch)?;
 				}
 				Err(WalError::Corruption(err)) => {
 					// Corruption detected - stop immediately and don't process further segments

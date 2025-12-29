@@ -14,7 +14,7 @@ use crate::bplustree::tree::DiskBPlusTree;
 use crate::commit::CommitPipeline;
 use crate::discard::DiscardStats;
 use crate::error::{Error, Result};
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
 
 /// VLog format version
@@ -178,7 +178,7 @@ impl VLogFileHeader {
 		})
 	}
 
-	pub(crate) fn is_compatible(&self) -> bool {
+	pub(crate) const fn is_compatible(&self) -> bool {
 		self.version == VLOG_FORMAT_VERSION
 	}
 
@@ -207,7 +207,7 @@ pub(crate) struct ValueLocation {
 
 impl ValueLocation {
 	/// Creates a new ValueLocation
-	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
+	pub(crate) const fn new(meta: u8, value: Value, version: u8) -> Self {
 		Self {
 			meta,
 			value,
@@ -222,17 +222,17 @@ impl ValueLocation {
 	}
 
 	/// Creates a ValueLocation with inline value
-	pub(crate) fn with_inline_value(value: Value) -> Self {
+	pub(crate) const fn with_inline_value(value: Value) -> Self {
 		Self::new(0, value, VALUE_LOCATION_VERSION)
 	}
 
 	/// Checks if the value is a pointer to VLog
-	pub(crate) fn is_value_pointer(&self) -> bool {
+	pub(crate) const fn is_value_pointer(&self) -> bool {
 		(self.meta & BIT_VALUE_POINTER) != 0
 	}
 
 	/// Calculates the encoded size of this ValueLocation
-	pub(crate) fn encoded_size(&self) -> usize {
+	pub(crate) const fn encoded_size(&self) -> usize {
 		// meta (1 byte) + version (1 byte) + value length
 		1 + 1 + self.value.len()
 	}
@@ -315,7 +315,7 @@ pub(crate) struct ValuePointer {
 
 impl ValuePointer {
 	/// Creates a new ValuePointer
-	pub(crate) fn new(
+	pub(crate) const fn new(
 		file_id: u32,
 		offset: u64,
 		key_size: u32,
@@ -332,16 +332,20 @@ impl ValuePointer {
 		}
 	}
 
-	/// Encodes the pointer as bytes for storage
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut encoded = Vec::with_capacity(VALUE_POINTER_SIZE);
+		self.encode_into(&mut encoded);
+		encoded
+	}
+
+	/// Encodes the pointer as bytes for storage
+	pub(crate) fn encode_into(&self, encoded: &mut Vec<u8>) {
 		encoded.push(self.version);
 		encoded.extend_from_slice(&self.file_id.to_be_bytes());
 		encoded.extend_from_slice(&self.offset.to_be_bytes());
 		encoded.extend_from_slice(&self.key_size.to_be_bytes());
 		encoded.extend_from_slice(&self.value_size.to_be_bytes());
 		encoded.extend_from_slice(&self.checksum.to_be_bytes());
-		encoded
 	}
 
 	/// Decodes a pointer from bytes
@@ -370,7 +374,7 @@ impl ValuePointer {
 	}
 
 	/// Calculates the total entry size (header + key + value + crc32)
-	pub(crate) fn total_entry_size(&self) -> u64 {
+	pub(crate) const fn total_entry_size(&self) -> u64 {
 		8 + self.key_size as u64 + self.value_size as u64 + 4
 	}
 }
@@ -383,7 +387,7 @@ pub(crate) struct VLogFile {
 }
 
 impl VLogFile {
-	fn new(_id: u32, path: PathBuf, _size: u64) -> Self {
+	const fn new(path: PathBuf) -> Self {
 		Self {
 			path,
 		}
@@ -438,14 +442,14 @@ impl VLogWriter {
 	/// Layout: +--------+-----+-------+-------+
 	///         | header  | key | value | crc32 |
 	///         +--------+-----+-------+--------+
-	fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+	fn append(&mut self, key: &InternalKey, value: &[u8]) -> Result<ValuePointer> {
 		let key_len = key.len() as u32;
 		let value_len = value.len() as u32;
 		let offset = self.current_offset;
 
 		// Calculate CRC32 of key + value
 		let mut hasher = Hasher::new();
-		hasher.update(key);
+		hasher.update(&key[..]);
 		hasher.update(value);
 		let crc32 = hasher.finalize();
 
@@ -454,7 +458,7 @@ impl VLogWriter {
 		self.writer.write_all(&value_len.to_be_bytes())?;
 
 		// Write key
-		self.writer.write_all(key)?;
+		self.writer.write_all(&key[..])?;
 
 		// Write value
 		self.writer.write_all(value)?;
@@ -482,7 +486,7 @@ impl VLogWriter {
 	}
 
 	/// Gets the current size of the file
-	fn size(&self) -> u64 {
+	const fn size(&self) -> u64 {
 		self.current_offset
 	}
 }
@@ -588,7 +592,7 @@ impl VLog {
 	}
 
 	/// Appends a key+value pair to the log and returns a ValuePointer
-	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+	pub(crate) fn append(&self, key: &InternalKey, value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
 			let mut writer = self.writer.write();
@@ -605,7 +609,7 @@ impl VLog {
 				)?;
 
 				// Register the new file for GC safety
-				self.register_vlog_file(file_id, file_path, 0); // Start with size 0
+				self.register_vlog_file(file_id, file_path);
 
 				// Update the active writer ID
 				self.active_writer_id.store(file_id, Ordering::SeqCst);
@@ -669,10 +673,7 @@ impl VLog {
 						file_handles.insert(file_id, handle);
 
 						// Also register in files_map
-						files_map.insert(
-							file_id,
-							Arc::new(VLogFile::new(file_id, file_path, file_size)),
-						);
+						files_map.insert(file_id, Arc::new(VLogFile::new(file_path)));
 					}
 					Err(e) => {
 						log::error!("Failed to pre-open VLog file {file_name_str}: {e}");
@@ -1017,11 +1018,15 @@ impl VLog {
 		const MAX_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB batch size limit
 		const MAX_BATCH_COUNT: usize = 1000; // Maximum entries per batch
 
+		let mut key_len_buf = [0u8; 4];
+		let mut value_len_buf = [0u8; 4];
+
+		let mut crc32_buf = [0u8; 4];
+
 		// Read the file and process entries
 		loop {
 			// Try to read header: [key_len: 4 bytes][value_len: 4 bytes]
 			source_file.seek(SeekFrom::Start(offset))?;
-			let mut key_len_buf = [0u8; 4];
 			match source_file.read_exact(&mut key_len_buf) {
 				Ok(()) => {}
 				Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1032,7 +1037,6 @@ impl VLog {
 
 			let key_len = u32::from_be_bytes(key_len_buf);
 
-			let mut value_len_buf = [0u8; 4];
 			source_file.read_exact(&mut value_len_buf)?;
 			let value_len = u32::from_be_bytes(value_len_buf);
 
@@ -1045,19 +1049,18 @@ impl VLog {
 			source_file.read_exact(&mut value)?;
 
 			// Read CRC32
-			let mut crc32_buf = [0u8; 4];
 			source_file.read_exact(&mut crc32_buf)?;
 			let _crc32 = u32::from_be_bytes(crc32_buf);
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-			let internal_key = InternalKey::decode(&key);
+			let internal_key = InternalKey::new(key);
 
 			// Check if this user key is stale using the global delete list
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
-					let user_key = internal_key.user_key.clone();
+					let user_key = internal_key.user_key();
 					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
 					return Err(e);
 				}
@@ -1074,19 +1077,14 @@ impl VLog {
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
 
-				let size = internal_key.user_key.len() + value.len();
+				let size = internal_key.user_key().len() + value.len();
 				let val = if value.is_empty() {
 					None
 				} else {
 					Some(value.clone())
 				};
 
-				batch.add_record(
-					internal_key.kind(),
-					internal_key.user_key,
-					val,
-					internal_key.timestamp,
-				)?;
+				batch.add_record(internal_key, val)?;
 
 				// Update batch size tracking
 				batch_size += size;
@@ -1188,9 +1186,9 @@ impl VLog {
 	}
 
 	/// Registers a VLog file in the files map for tracking
-	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
+	fn register_vlog_file(&self, file_id: u32, path: PathBuf) {
 		let mut files_map = self.files_map.write();
-		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
+		files_map.insert(file_id, Arc::new(VLogFile::new(path)));
 	}
 
 	/// Cleans up any leftover temporary files from interrupted compactions
@@ -1280,10 +1278,7 @@ impl VLog {
 			let mut total_deleted = 0;
 
 			for internal_key in deleted_keys {
-				// Encode the specific internal key to delete
-				let encoded_key = internal_key.encode();
-
-				if let Err(e) = write_index.delete(&encoded_key) {
+				if let Err(e) = write_index.delete(internal_key) {
 					log::error!("Failed to delete versioned key: {}", e);
 					return Err(e.into());
 				} else {
@@ -1456,13 +1451,11 @@ impl DeleteList {
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
-			let seq_key = seq_num.to_be_bytes().to_vec();
+			let seq_key = seq_num.to_be_bytes();
 			// Store sequence number -> value_size mapping
 			batch.add_record(
-				crate::sstable::InternalKeyKind::Set,
-				seq_key,
+				InternalKey::encode(&seq_key, seq_num, InternalKeyKind::Set, 0),
 				Some(value_size.to_be_bytes().to_vec()),
-				0,
 			)?;
 		}
 
@@ -1502,8 +1495,11 @@ impl DeleteList {
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
-			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
+			let seq_key = seq_num.to_be_bytes();
+			batch.add_record(
+				InternalKey::encode(&seq_key, seq_num, InternalKeyKind::Delete, 0),
+				None,
+			)?;
 		}
 
 		// Commit the batch to the LSM tree using sync commit

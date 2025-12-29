@@ -10,8 +10,8 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
-use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
+use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::{IntoBytes, IterResult, KeysResult, RangeResult, UserKey, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -27,7 +27,7 @@ pub enum Mode {
 
 impl Mode {
 	/// Checks if this transaction mode permits mutations
-	pub(crate) fn mutable(self) -> bool {
+	pub(crate) const fn mutable(self) -> bool {
 		match self {
 			Self::ReadWrite => true,
 			Self::ReadOnly => false,
@@ -36,12 +36,12 @@ impl Mode {
 	}
 
 	/// Checks if this is a write-only transaction
-	pub(crate) fn is_write_only(self) -> bool {
+	pub(crate) const fn is_write_only(self) -> bool {
 		matches!(self, Self::WriteOnly)
 	}
 
 	/// Checks if this is a read-only transaction
-	pub(crate) fn is_read_only(self) -> bool {
+	pub(crate) const fn is_read_only(self) -> bool {
 		matches!(self, Self::ReadOnly)
 	}
 }
@@ -86,13 +86,13 @@ impl WriteOptions {
 	}
 
 	/// Sets the durability level for write operations
-	pub fn with_durability(mut self, durability: Durability) -> Self {
+	pub const fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
 		self
 	}
 
 	/// Sets the timestamp for write operations
-	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+	pub const fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
 		self.timestamp = timestamp;
 		self
 	}
@@ -121,7 +121,7 @@ impl ReadOptions {
 	}
 
 	/// Sets whether to return only keys without values
-	pub fn with_keys_only(mut self, keys_only: bool) -> Self {
+	pub const fn with_keys_only(mut self, keys_only: bool) -> Self {
 		self.keys_only = keys_only;
 		self
 	}
@@ -142,7 +142,7 @@ impl ReadOptions {
 	}
 
 	/// Sets the timestamp for point-in-time reads
-	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+	pub const fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
 		self.timestamp = timestamp;
 		self
 	}
@@ -171,7 +171,7 @@ pub struct Transaction {
 	/// These are the changes that the transaction intends to make to the data.
 	/// The entries vec is used to keep different values for the same key for
 	/// savepoints and rollbacks.
-	pub(crate) write_set: BTreeMap<Key, Vec<Entry>>,
+	pub(crate) write_set: BTreeMap<UserKey, Vec<Entry>>,
 
 	/// `closed` indicates if the transaction is closed. A closed transaction
 	/// cannot make any more changes to the data.
@@ -191,18 +191,18 @@ pub struct Transaction {
 
 impl Transaction {
 	/// Bump the write sequence number and return it.
-	fn next_write_seqno(&mut self) -> u32 {
+	const fn next_write_seqno(&mut self) -> u32 {
 		self.write_seqno += 1;
 		self.write_seqno
 	}
 
 	/// Sets the durability level for this transaction
-	pub fn set_durability(&mut self, durability: Durability) {
+	pub const fn set_durability(&mut self, durability: Durability) {
 		self.durability = durability;
 	}
 
 	/// Sets the durability level for this transaction
-	pub fn with_durability(mut self, durability: Durability) -> Self {
+	pub const fn with_durability(mut self, durability: Durability) -> Self {
 		self.durability = durability;
 		self
 	}
@@ -264,16 +264,22 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				Some(value),
-				InternalKeyKind::Set,
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Set,
+					timestamp,
+				),
+				Some(value.into_bytes()),
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
+			Entry::new(
+				InternalKey::encode(key.as_slice(), write_seqno as u64, InternalKeyKind::Set, 0),
+				Some(value.into_bytes()),
+				self.savepoints,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -295,16 +301,22 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::Delete,
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Delete,
+					timestamp,
+				),
+				None,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
-			Entry::new(key, None::<&[u8]>, InternalKeyKind::Delete, self.savepoints, write_seqno)
+			Entry::new(
+				InternalKey::encode(key.as_slice(), write_seqno as u64, InternalKeyKind::Delete, 0),
+				None,
+				self.savepoints,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -335,21 +347,26 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::SoftDelete,
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::SoftDelete,
+					timestamp,
+				),
+				None,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
 			Entry::new(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::SoftDelete,
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::SoftDelete,
+					0,
+				),
+				None,
 				self.savepoints,
-				write_seqno,
 			)
 		};
 		self.write_with_options(entry, options)?;
@@ -379,16 +396,27 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				Some(value),
-				InternalKeyKind::Replace,
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Replace,
+					timestamp,
+				),
+				Some(value.into_bytes()),
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Replace,
+					0,
+				),
+				Some(value.into_bytes()),
+				self.savepoints,
+			)
 		};
 		self.write_with_options(entry, options)?;
 		Ok(())
@@ -399,7 +427,7 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_with_options(key, &ReadOptions::default())
+		self.get_with_options(key, ReadOptions::default())
 	}
 
 	/// Gets a value for a key at a specific timestamp.
@@ -407,11 +435,11 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
+		self.get_with_options(key, ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key, with custom read options.
-	pub fn get_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
+	pub fn get_with_options<K>(&self, key: K, options: ReadOptions) -> Result<Option<Value>>
 	where
 		K: IntoBytes,
 	{
@@ -419,6 +447,7 @@ impl Transaction {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
+
 		// If the key is empty, return an error.
 		if key.as_slice().is_empty() {
 			return Err(Error::EmptyKey);
@@ -484,7 +513,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default();
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
+		self.count_with_options(options)
 	}
 
 	/// Counts keys in a range at a specific timestamp.
@@ -500,7 +529,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
+		self.count_with_options(options)
 	}
 
 	/// Counts keys with custom read options.
@@ -516,7 +545,7 @@ impl Transaction {
 	/// This method is optimized to avoid creating full iterators and resolving
 	/// values from the value log, making it much faster than manually counting
 	/// iterator results.
-	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
+	pub fn count_with_options(&self, options: ReadOptions) -> Result<usize> {
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
@@ -531,8 +560,8 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.unwrap_or_default();
+			let end_key = options.upper_bound.unwrap_or_default();
 			let keys_iter = self.keys_at_version(start_key, end_key, timestamp)?;
 			return Ok(keys_iter.count());
 		}
@@ -601,7 +630,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_keys_only(true);
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
+		self.keys_with_options(options)
 	}
 
 	/// Gets keys in a key range at a specific timestamp.
@@ -627,7 +656,7 @@ impl Transaction {
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
+		self.keys_with_options(options)
 	}
 
 	/// Gets keys in a key range, with custom read options.
@@ -643,7 +672,7 @@ impl Transaction {
 	/// fetch or resolve values from disk.
 	pub fn keys_with_options(
 		&self,
-		options: &ReadOptions,
+		options: ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
@@ -653,23 +682,23 @@ impl Transaction {
 			}
 
 			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let start_key = options.lower_bound.unwrap_or_default();
+			let end_key = options.upper_bound.unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => {
-					Ok(Box::new(snapshot.keys_at_version(start_key, end_key, timestamp)?.map(Ok)))
-				}
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.keys_at_version(start_key.as_slice(), end_key.as_slice(), timestamp)?
+						.map(Ok),
+				)),
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
 			// Force keys_only to true for this method
-			let options = options.clone().with_keys_only(true);
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let options = options.with_keys_only(true);
 			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+				TransactionRangeIterator::new_with_options(self, options)?
 					.map(|result| result.map(|(key, _)| key)),
 			))
 		}
@@ -693,7 +722,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default();
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_with_options(&options)
+		self.range_with_options(options)
 	}
 
 	/// Gets keys and values in a range, at a specific timestamp.
@@ -715,7 +744,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_with_options(&options)
+		self.range_with_options(options)
 	}
 
 	/// Gets keys and values in a range, with custom read options.
@@ -728,7 +757,7 @@ impl Transaction {
 	/// range, inclusive of the start key, but not the end key.
 	pub fn range_with_options(
 		&self,
-		options: &ReadOptions,
+		options: ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
 		// If timestamp is specified, use versioned query
 		if let Some(timestamp) = options.timestamp {
@@ -737,32 +766,32 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
-			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
+			let ReadOptions {
+				lower_bound: start_key,
+				upper_bound: end_key,
+				timestamp: _,
+				keys_only: _,
+			} = options;
+
+			let start_key = start_key.unwrap_or_default();
+			let end_key = end_key.unwrap_or_default();
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
 				Some(snapshot) => {
-					Ok(Box::new(snapshot.range_at_version(start_key, end_key, timestamp)?))
+					Ok(Box::new(snapshot.range_at_version(&start_key, &end_key, timestamp)?))
 				}
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
-					|result| {
-						result.and_then(|(k, v)| {
-							v.ok_or_else(|| {
-								Error::InvalidArgument("Expected value for range query".to_string())
-							})
-							.map(|value| (k, value))
-						})
-					},
-				),
-			))
+			Ok(Box::new(TransactionRangeIterator::new_with_options(self, options)?.map(|result| {
+				result.and_then(|(k, v)| {
+					v.ok_or_else(|| {
+						Error::InvalidArgument("Expected value for range query".to_string())
+					})
+					.map(|value| (k, value))
+				})
+			})))
 		}
 	}
 
@@ -780,12 +809,13 @@ impl Transaction {
 	/// # Returns
 	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
 	/// each version found.
-	pub fn scan_all_versions<K>(
+	#[allow(dead_code)]
+	pub(crate) fn scan_all_versions<K>(
 		&self,
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<Vec<(Key, Value, Version, bool)>>
+	) -> Result<Vec<(InternalKey, Value)>>
 	where
 		K: IntoBytes,
 	{
@@ -803,7 +833,7 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
+			Some(snapshot) => snapshot.scan_all_versions(start.as_slice(), end.as_slice(), limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -830,7 +860,7 @@ impl Transaction {
 		// Add the entry to the write set
 		let key = e.key.clone();
 
-		match self.write_set.entry(key) {
+		match self.write_set.entry(key.take_user_key()) {
 			BTreeEntry::Occupied(mut oe) => {
 				let entries = oe.get_mut();
 				// If the latest existing value for this key belongs to the same
@@ -888,21 +918,19 @@ impl Transaction {
 		// respecting the insertion order recorded with Entry::seqno.
 		let mut latest_writes: Vec<Entry> =
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
-		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+		latest_writes.sort_by(|a, b| a.key.seq_num().cmp(&b.key.seq_num()));
 
 		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();
 
 		// Add all entries to the batch
-		for entry in latest_writes {
+		for mut entry in latest_writes {
 			// Use the entry's timestamp if it was explicitly set (via set_at_version),
 			// otherwise use the commit timestamp
-			let timestamp = if entry.timestamp != 0 {
-				entry.timestamp
-			} else {
-				commit_timestamp
+			if entry.key.timestamp() == 0 {
+				entry.key.set_timestamp(commit_timestamp);
 			};
-			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
+			batch.add_record(entry.key, entry.value)?;
 		}
 
 		// Write the batch to storage
@@ -935,7 +963,7 @@ impl Transaction {
 	/// corresponding calls to [`rollback_to_savepoint`].
 	///
 	/// [`rollback_to_savepoint`]: Transaction::rollback_to_savepoint
-	pub fn set_savepoint(&mut self) -> Result<()> {
+	pub const fn set_savepoint(&mut self) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an
 		// error.
 		if !self.mode.mutable() {
@@ -999,71 +1027,38 @@ impl Drop for Transaction {
 #[derive(Clone)]
 pub(crate) struct Entry {
 	/// The key being written
-	pub(crate) key: Key,
+	pub(crate) key: InternalKey,
 
 	/// The value (None for deletes)
 	pub(crate) value: Option<Value>,
 
-	/// Type of operation (Set, Delete, etc.)
-	pub(crate) kind: InternalKeyKind,
-
 	/// Savepoint number when this entry was created
 	pub(crate) savepoint_no: u32,
-
-	/// Sequence number for ordering writes within a transaction
-	pub(crate) seqno: u32,
-
-	/// Timestamp for versioned queries
-	pub(crate) timestamp: u64,
 }
 
 impl Entry {
-	fn new<K: IntoBytes, V: IntoBytes>(
-		key: K,
-		value: Option<V>,
-		kind: InternalKeyKind,
-		savepoint_no: u32,
-		seqno: u32,
-	) -> Entry {
+	const fn new(key: InternalKey, value: Option<Value>, savepoint_no: u32) -> Entry {
 		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
-			kind,
+			key,
+			value,
 			savepoint_no,
-			seqno,
-			timestamp: 0, // Will be set at commit time
-		}
-	}
-
-	fn new_with_timestamp<K: IntoBytes, V: IntoBytes>(
-		key: K,
-		value: Option<V>,
-		kind: InternalKeyKind,
-		savepoint_no: u32,
-		seqno: u32,
-		timestamp: u64,
-	) -> Entry {
-		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
-			kind,
-			savepoint_no,
-			seqno,
-			timestamp,
 		}
 	}
 
 	/// Checks if this entry represents a deletion (tombstone)
-	fn is_tombstone(&self) -> bool {
-		let kind = self.kind;
-		if kind == InternalKeyKind::Delete
-			|| kind == InternalKeyKind::SoftDelete
-			|| kind == InternalKeyKind::RangeDelete
-		{
-			return true;
+	const fn is_tombstone(&self) -> bool {
+		match self.key.kind() {
+			InternalKeyKind::Delete
+			| InternalKeyKind::SoftDelete
+			| InternalKeyKind::RangeDelete => true,
+			InternalKeyKind::Set
+			| InternalKeyKind::Merge
+			| InternalKeyKind::LogData
+			| InternalKeyKind::Replace
+			| InternalKeyKind::Separator
+			| InternalKeyKind::Max
+			| InternalKeyKind::Invalid => false,
 		}
-
-		false
 	}
 }
 
@@ -1074,7 +1069,7 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
-	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Key, Vec<Entry>>>,
+	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, UserKey, Vec<Entry>>>,
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
@@ -1084,9 +1079,12 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
-		start_key: Vec<u8>,
-		end_key: Vec<u8>,
-		options: &ReadOptions,
+		ReadOptions {
+			lower_bound: start_key,
+			upper_bound: end_key,
+			timestamp: _,
+			keys_only,
+		}: ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
 		if tx.closed {
@@ -1097,6 +1095,9 @@ impl<'a> TransactionRangeIterator<'a> {
 			return Err(Error::TransactionWriteOnly);
 		}
 
+		let start_key = start_key.unwrap_or_default();
+		let end_key = end_key.unwrap_or_default();
+
 		// Get snapshot
 		let snapshot = match &tx.snapshot {
 			Some(snap) => snap,
@@ -1104,11 +1105,8 @@ impl<'a> TransactionRangeIterator<'a> {
 		};
 
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(
-			Some(start_key.as_slice()),
-			Some(end_key.as_slice()),
-			options.keys_only,
-		)?;
+		let iter =
+			snapshot.range(Some(start_key.as_slice()), Some(end_key.as_slice()), keys_only)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)
@@ -1118,7 +1116,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		Ok(Self {
 			snapshot_iter: boxed_iter.double_ended_peekable(),
 			write_set_iter: write_set_iter.double_ended_peekable(),
-			keys_only: options.keys_only,
+			keys_only,
 		})
 	}
 
@@ -1282,7 +1280,7 @@ mod tests {
 	/// Type alias for a map of keys to their version information
 	/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
 	#[allow(dead_code)]
-	type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
+	type KeyVersionsMap = HashMap<UserKey, Vec<(Vec<u8>, u64, bool)>>;
 
 	// Common setup logic for creating a store
 	fn create_store() -> (Tree, TempDir) {
@@ -3377,7 +3375,7 @@ mod tests {
 		let value = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+				ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value, Some(Vec::from(b"value1")));
@@ -3398,7 +3396,7 @@ mod tests {
 		let value_before = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+				ReadOptions::default().with_timestamp(Some(custom_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value_before, Some(Vec::from(b"value1")));
@@ -3406,7 +3404,7 @@ mod tests {
 		let value_after = tx
 			.get_with_options(
 				b"key1",
-				&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
+				ReadOptions::default().with_timestamp(Some(delete_timestamp)),
 			)
 			.unwrap();
 		assert_eq!(value_after, None);
@@ -3904,7 +3902,7 @@ mod tests {
 			let tx = store.begin().unwrap();
 			let mut options = ReadOptions::default();
 			options.set_iterate_bounds(Some(b"key2".to_vec()), Some(b"key4".to_vec()));
-			let count = tx.count_with_options(&options).unwrap();
+			let count = tx.count_with_options(options).unwrap();
 			assert_eq!(count, 2); // key2, key3 (key4 is exclusive)
 		}
 	}
@@ -4592,7 +4590,7 @@ mod tests {
 			fn scan_in_batches(
 				store: &Tree,
 				batch_size: usize,
-			) -> Vec<Vec<(Key, Value, u64, bool)>> {
+			) -> Vec<Vec<(UserKey, Value, u64, bool)>> {
 				let mut all_results = Vec::new();
 				let mut last_key = Vec::new();
 				let mut first_iteration = true;

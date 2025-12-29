@@ -137,6 +137,10 @@ large_types_passed_by_value = "warn"
 # https://rust-lang.github.io/rust-clippy/master/#lossy_float_literal
 lossy_float_literal = "warn"
 
+# Suggests the use of const in functions and methods where possible.
+# https://rust-lang.github.io/rust-clippy/master/#missing_const_for_fn
+missing_const_for_fn = "warn"
+
 # Checks for usage of `.as_ref().cloned()` and suggests `.cloned()` instead.
 # Using `.cloned()` directly is more concise and easier to read.
 # https://rust-lang.github.io/rust-clippy/master/#option_as_ref_cloned

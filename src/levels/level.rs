@@ -58,7 +58,7 @@ impl Level {
 		let insert_pos = self.tables.partition_point(|existing| {
 			match (&existing.meta.smallest_point, &table.meta.smallest_point) {
 				(Some(existing_smallest), Some(new_smallest)) => {
-					existing_smallest.user_key < new_smallest.user_key
+					existing_smallest.user_key() < new_smallest.user_key()
 				}
 				_ => true,
 			}
@@ -164,12 +164,12 @@ impl Levels {
 	}
 
 	/// Returns a reference to all levels
-	pub(crate) fn get_levels(&self) -> &Vec<Arc<Level>> {
+	pub(crate) const fn get_levels(&self) -> &Vec<Arc<Level>> {
 		&self.0
 	}
 
 	/// Returns a mutable reference to all levels
-	pub(crate) fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level>> {
+	pub(crate) const fn get_levels_mut(&mut self) -> &mut Vec<Arc<Level>> {
 		&mut self.0
 	}
 }

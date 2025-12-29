@@ -46,7 +46,7 @@ pub(crate) struct LevelDBBloomFilter {
 }
 
 impl LevelDBBloomFilter {
-	pub(crate) fn new(bits_per_key: usize) -> Self {
+	pub(crate) const fn new(bits_per_key: usize) -> Self {
 		Self {
 			bits_per_key,
 		}

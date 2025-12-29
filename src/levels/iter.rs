@@ -12,7 +12,7 @@ pub(crate) struct LevelManifestIterator<'a> {
 
 impl<'a> LevelManifestIterator<'a> {
 	#[must_use]
-	pub(crate) fn new(level_manifest: &'a LevelManifest) -> Self {
+	pub(crate) const fn new(level_manifest: &'a LevelManifest) -> Self {
 		Self {
 			level_manifest,
 			current_idx: 0,

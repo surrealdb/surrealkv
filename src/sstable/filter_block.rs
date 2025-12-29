@@ -269,7 +269,7 @@ mod tests {
 		for i in 0..num_items {
 			// Create internal key
 			let user_key = format!("key_{i:05}");
-			let internal_key = InternalKey::new(
+			let internal_key = InternalKey::encode(
 				user_key.as_bytes().to_vec(),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
@@ -301,8 +301,12 @@ mod tests {
 		for i in 0..num_samples {
 			// Use values outside the range of existing keys
 			let user_key = format!("nonexistent_{:05}", i + num_items);
-			let internal_key =
-				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::encode(
+				user_key.as_bytes().to_vec(),
+				i as u64,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			let encoded_key = internal_key.encode();
 

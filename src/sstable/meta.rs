@@ -47,7 +47,7 @@ pub(crate) struct Properties {
 }
 
 impl Properties {
-	pub(crate) fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		Properties {
 			id: 0,
 			table_format: TableFormat::LSMV1,
@@ -178,7 +178,7 @@ pub(crate) struct TableMetadata {
 }
 
 impl TableMetadata {
-	pub(crate) fn new() -> Self {
+	pub(crate) const fn new() -> Self {
 		TableMetadata {
 			smallest_point: None,
 			largest_point: None,
@@ -199,7 +199,7 @@ impl TableMetadata {
 		self.has_point_keys = Some(true);
 	}
 
-	pub(crate) fn update_seq_num(&mut self, seq_num: u64) {
+	pub(crate) const fn update_seq_num(&mut self, seq_num: u64) {
 		// Handle first sequence number specially
 		if self.largest_seq_num == 0 && self.smallest_seq_num == 0 {
 			self.smallest_seq_num = seq_num;
@@ -238,9 +238,8 @@ impl TableMetadata {
 			None => buf.put_u8(0),
 			Some(key) => {
 				buf.put_u8(1);
-				let key_encoded = key.encode();
-				buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-				buf.extend_from_slice(&key_encoded); // Write the encoded key itself
+				buf.put_u64(key.len() as u64); // Write the size of the encoded key
+				buf.extend_from_slice(&key[..]); // Write the encoded key itself
 			}
 		}
 
@@ -248,9 +247,8 @@ impl TableMetadata {
 			None => buf.put_u8(0),
 			Some(key) => {
 				buf.put_u8(1);
-				let key_encoded = key.encode();
-				buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-				buf.extend_from_slice(&key_encoded); // Write the encoded key itself
+				buf.put_u64(key.len() as u64); // Write the size of the encoded key
+				buf.extend_from_slice(&key[..]); // Write the encoded key itself
 			}
 		}
 
@@ -285,7 +283,7 @@ impl TableMetadata {
 				let key_len: usize = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				Some(InternalKey::decode(&key_bytes))
+				Some(InternalKey::new(key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
 		};
@@ -297,7 +295,7 @@ impl TableMetadata {
 				let key_len = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				Some(InternalKey::decode(&key_bytes))
+				Some(InternalKey::new(key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
 		};
