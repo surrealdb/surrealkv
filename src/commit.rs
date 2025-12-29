@@ -16,10 +16,10 @@ const DEQUEUE_BITS: u32 = 32;
 pub trait CommitEnv: Send + Sync + 'static {
 	// Write batch to WAL and process VLog entries (synchronous operation)
 	// Returns a new batch with VLog pointers applied
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
+	fn write(&self, batch: Batch, seq_num: u64, sync: bool) -> Result<Batch>;
 
 	// Apply processed batch to memtable
-	fn apply(&self, batch: &Batch) -> Result<()>;
+	fn apply(&self, batch: Batch) -> Result<()>;
 }
 
 // Lock-free commit queue entry
@@ -225,10 +225,10 @@ impl CommitPipeline {
 		batch.set_starting_seq_num(seq_num);
 
 		// Write to WAL and get processed batch
-		let processed_batch = self.env.write(&batch, seq_num, sync_wal)?;
+		let processed_batch = self.env.write(batch, seq_num, sync_wal)?;
 
 		// Apply processed batch to memtable
-		self.env.apply(&processed_batch)?;
+		self.env.apply(processed_batch)?;
 
 		// Update visible sequence number
 		let new_visible = seq_num + count - 1;
@@ -248,7 +248,7 @@ impl CommitPipeline {
 		Ok(())
 	}
 
-	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool) -> Result<()> {
+	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -263,12 +263,12 @@ impl CommitPipeline {
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
 		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
+		let processed_batch = self.prepare(batch, Arc::clone(&commit_batch), sync)?;
 
 		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
 			let env = Arc::clone(&self.env);
-			env.apply(&processed_batch)
+			env.apply(processed_batch)
 		};
 
 		match apply_result {
@@ -290,7 +290,7 @@ impl CommitPipeline {
 
 	fn prepare(
 		&self,
-		batch: &mut Batch,
+		mut batch: Batch,
 		commit_batch: Arc<CommitBatch>,
 		sync: bool,
 	) -> Result<Batch> {
@@ -377,26 +377,21 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use crate::sstable::InternalKeyKind;
+	use crate::sstable::{InternalKey, InternalKeyKind};
 
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(&self, batch: Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
 			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
+			let mut new_batch = Batch::new(seq_num);
 			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
+				new_batch.add_record(entry.key.clone(), entry.value.clone())?;
 			}
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: Batch) -> Result<()> {
 			Ok(())
 		}
 	}
@@ -407,7 +402,10 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(
+				InternalKey::encode(b"key1".to_vec(), 0, InternalKeyKind::Set, 0),
+				Some(b"value1".to_vec()),
+			)
 			.unwrap();
 
 		let result = pipeline.commit(batch, false).await;
@@ -431,10 +429,8 @@ mod tests {
 			let mut batch = Batch::new(0);
 			batch
 				.add_record(
-					InternalKeyKind::Set,
-					format!("key{i}").into_bytes(),
+					InternalKey::encode(format!("key{i}").into_bytes(), 0, InternalKeyKind::Set, 0),
 					Some(vec![1, 2, 3]),
-					i,
 				)
 				.unwrap();
 			let result = pipeline.commit(batch, false).await;
@@ -457,10 +453,13 @@ mod tests {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
-						InternalKeyKind::Set,
-						format!("key{i}").into_bytes(),
+						InternalKey::encode(
+							format!("key{i}").into_bytes(),
+							0,
+							InternalKeyKind::Set,
+							0,
+						),
 						Some(vec![1, 2, 3]),
-						i,
 					)
 					.unwrap();
 				pipeline.commit(batch, false).await
@@ -489,7 +488,7 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(&self, batch: Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
@@ -497,17 +496,12 @@ mod tests {
 			// Create a copy of the batch for testing
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
+				new_batch.add_record(entry.key.clone(), entry.value.clone())?;
 			}
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: Batch) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
@@ -527,10 +521,13 @@ mod tests {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
-						InternalKeyKind::Set,
-						format!("key{i}").into_bytes(),
+						InternalKey::encode(
+							format!("key{i}").into_bytes(),
+							0,
+							InternalKeyKind::Set,
+							0,
+						),
 						Some(vec![1, 2, 3]),
-						i,
 					)
 					.unwrap();
 				pipeline.commit(batch, false).await
@@ -699,24 +696,19 @@ mod tests {
 	}
 
 	impl CommitEnv for TrackingMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, sync_wal: bool) -> Result<Batch> {
+		fn write(&self, batch: Batch, _seq_num: u64, sync_wal: bool) -> Result<Batch> {
 			self.write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			self.last_sync_wal.store(sync_wal, std::sync::atomic::Ordering::Relaxed);
 
 			// Create a copy of the batch for testing (like MockEnv does)
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
+				new_batch.add_record(entry.key.clone(), entry.value.clone())?;
 			}
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: Batch) -> Result<()> {
 			self.apply_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			Ok(())
 		}
@@ -757,10 +749,8 @@ mod tests {
 			let mut batch = Batch::new(0);
 			batch
 				.add_record(
-					InternalKeyKind::Set,
-					format!("key{i}").into_bytes(),
+					InternalKey::encode(format!("key{i}").into_bytes(), 0, InternalKeyKind::Set, 0),
 					Some(vec![1, 2, 3]),
-					i as u64,
 				)
 				.unwrap();
 
@@ -794,10 +784,13 @@ mod tests {
 					let mut batch = Batch::new(0);
 					batch
 						.add_record(
-							InternalKeyKind::Set,
-							format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
+							InternalKey::encode(
+								format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
+								0,
+								InternalKeyKind::Set,
+								0,
+							),
 							Some(vec![thread_id as u8, batch_id as u8]),
-							batch_id,
 						)
 						.unwrap();
 

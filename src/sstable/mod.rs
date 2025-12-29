@@ -7,9 +7,9 @@ pub(crate) mod table;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
-use std::ops::Deref;
+use std::ops::{Index, Range, RangeFrom, RangeFull, RangeTo};
 
-use crate::Key;
+use crate::UserKey;
 
 // This is the maximum valid sequence number that can be stored in the upper 56
 // bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
@@ -28,6 +28,7 @@ const fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
 
 /// Converts a trailer byte to InternalKeyKind
 /// This centralizes the kind conversion logic to avoid duplication and errors
+#[inline(always)]
 const fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 	let kind_byte = trailer as u8;
 	match kind_byte {
@@ -72,8 +73,8 @@ const fn is_replace_kind(kind: InternalKeyKind) -> bool {
 	matches!(kind, InternalKeyKind::Replace)
 }
 
-#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum InternalKeyKind {
 	Delete = 0,
 	SoftDelete = 1,
@@ -95,133 +96,106 @@ impl From<u8> for InternalKeyKind {
 
 /// InternalKey is the main key type used throughout the LSM tree
 /// It includes a timestamp field for versioned queries
+///
+/// An internal key contains the user key, timestamp, and trailer.
+/// The user key is the key that is used to identify the data.
+/// The timestamp is the system time in nanoseconds since epoch.
+/// The trailer is the sequence number and kind of the key `(seq_num << 8) | kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct InternalKey {
-	pub(crate) user_key: Key,
-	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
-	pub(crate) trailer: u64,   // (seq_num << 8) | kind
-}
+#[repr(transparent)]
+pub(crate) struct InternalKey(Vec<u8>);
 
 impl InternalKey {
-	pub(crate) const fn new(
-		user_key: Key,
+	/// Returns a zeroed internal key.
+	///
+	/// Zero means vec![] user key, 0 seq_num, Separator kind `Separator`, 0 timestamp.
+	///
+	/// TODO(STU): Check this.
+	pub(crate) fn none() -> Self {
+		Self::encode(&[], 0, InternalKeyKind::Separator, 0)
+	}
+
+	pub(crate) fn encode(
+		user_key: &[u8],
 		seq_num: u64,
 		kind: InternalKeyKind,
 		timestamp: u64,
 	) -> Self {
-		Self {
-			user_key,
-			timestamp,
-			trailer: (seq_num << 8) | kind as u64,
-		}
+		let mut buf = Vec::with_capacity(user_key.len() + 16);
+		buf.extend_from_slice(&user_key);
+		buf.extend_from_slice(&((seq_num << 8) | kind as u64).to_be_bytes());
+		buf.extend_from_slice(&timestamp.to_be_bytes());
+		Self(buf)
 	}
 
-	pub(crate) fn size(&self) -> usize {
-		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
+	pub(crate) const fn len(&self) -> usize {
+		self.0.len()
 	}
 
-	pub(crate) fn decode(mut encoded_key: Vec<u8>) -> Self {
-		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
-		let trailer = read_u64_be(&encoded_key, n);
-		let timestamp = read_u64_be(&encoded_key, n + 8);
-		encoded_key.truncate(n);
-
-		Self {
-			user_key: encoded_key,
-			timestamp,
-			trailer,
-		}
+	pub(crate) fn new(encoded_key: Vec<u8>) -> Self {
+		assert!(encoded_key.len() >= 16);
+		Self(encoded_key)
 	}
 
-	/// Extract user key slice without allocation
-	#[inline]
-	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
-		&encoded[..encoded.len() - 16]
-	}
-
-	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = Vec::with_capacity(self.user_key.len() + 16);
-		buf.extend_from_slice(&self.user_key);
-		buf.extend_from_slice(&self.trailer.to_be_bytes());
-		buf.extend_from_slice(&self.timestamp.to_be_bytes());
-		buf
-	}
-
-	#[inline]
-	pub(crate) const fn seq_num(&self) -> u64 {
-		trailer_to_seq_num(self.trailer)
-	}
-
-	pub(crate) const fn kind(&self) -> InternalKeyKind {
-		trailer_to_kind(self.trailer)
-	}
-
-	#[inline]
-	pub(crate) const fn is_tombstone(&self) -> bool {
-		is_delete_kind(self.kind())
-	}
-
-	pub(crate) const fn is_hard_delete_marker(&self) -> bool {
-		is_hard_delete_marker(self.kind())
-	}
-
-	pub(crate) const fn is_replace(&self) -> bool {
-		is_replace_kind(self.kind())
-	}
-}
-
-// Used only by memtable, sstable uses internal key comparator
-impl Ord for InternalKey {
-	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with
-		// timestamp as final tiebreaker First compare by user key (ascending)
-		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by sequence number (descending)
-			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
-			ordering => ordering,
-		}
-	}
-}
-
-impl PartialOrd for InternalKey {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.cmp(other))
-	}
-}
-
-/// InternalKey is the main key type used throughout the LSM tree
-/// It includes a timestamp field for versioned queries
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub(crate) struct InternalKeyRef<'key>(pub(crate) &'key [u8]);
-
-impl<'key> InternalKeyRef<'key> {
-	#[inline]
-	pub(crate) fn user_key(&self) -> &'key [u8] {
+	#[inline(always)]
+	pub(crate) fn user_key(&self) -> &[u8] {
 		&self.0[..self.0.len() - 16]
 	}
 
 	#[inline]
-	pub(crate) const fn timestamp(&self) -> u64 {
-		read_u64_be(self.0, self.0.len() - 8)
+	pub(crate) fn take_user_key(mut self) -> UserKey {
+		self.0.truncate(self.0.len() - 16);
+		self.0
 	}
 
-	#[inline]
-	const fn trailer(&self) -> u64 {
-		read_u64_be(self.0, self.0.len() - 16)
-	}
-
-	#[inline]
+	#[inline(always)]
 	pub(crate) const fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer())
 	}
 
 	#[inline]
+	pub(crate) fn with_seq_num(mut self, seq_num: u64) -> Self {
+		let new_trailer = (seq_num << 8) | self.kind() as u64;
+		let new_trailer_bytes = new_trailer.to_be_bytes();
+
+		let start = self.0.len() - 16;
+		self.0[start..start + 8].copy_from_slice(&new_trailer_bytes);
+		self
+	}
+
+	#[inline(always)]
+	pub(crate) const fn timestamp(&self) -> u64 {
+		read_u64_be(self.0.as_slice(), self.0.len() - 8)
+	}
+
+	#[inline]
+	pub(crate) fn set_timestamp(&mut self, timestamp: u64) {
+		let start = self.0.len() - 8;
+		let timestamp_bytes = timestamp.to_be_bytes();
+		self.0[start..start + 8].copy_from_slice(&timestamp_bytes);
+	}
+
+	#[inline(always)]
+	const fn trailer(&self) -> u64 {
+		read_u64_be(self.0.as_slice(), self.0.len() - 16)
+	}
+
+	#[inline(always)]
 	pub(crate) const fn kind(&self) -> InternalKeyKind {
 		trailer_to_kind(self.trailer())
 	}
 
-	#[inline]
+	#[inline(always)]
+	pub(crate) const fn is_tombstone(&self) -> bool {
+		is_delete_kind(self.kind())
+	}
+
+	#[inline(always)]
+	pub(crate) const fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	#[inline(always)]
 	pub(crate) const fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
 	}
@@ -237,17 +211,71 @@ impl<'key> InternalKeyRef<'key> {
 			ordering => ordering,
 		}
 	}
-}
 
-impl<'key> Deref for InternalKeyRef<'key> {
-	type Target = [u8];
+	#[inline]
+	pub(crate) fn clear(&mut self) {
+		self.0.clear();
+	}
 
-	fn deref(&self) -> &Self::Target {
-		self.0
+	#[inline]
+	pub(crate) fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	#[inline]
+	pub(crate) fn replace(&mut self, other: &Self) {
+		self.0.clone_from(&other.0);
+	}
+
+	#[inline]
+	pub(crate) fn truncate(&mut self, len: usize) {
+		self.0.truncate(len);
+	}
+
+	#[inline]
+	pub(crate) fn extend_from_slice(&mut self, slice: &[u8]) {
+		self.0.extend_from_slice(slice);
+	}
+
+	pub(crate) fn iter(&self) -> impl Iterator<Item = &u8> {
+		self.0.iter()
 	}
 }
 
-impl<'key> Ord for InternalKeyRef<'key> {
+impl Index<Range<usize>> for InternalKey {
+	type Output = [u8];
+
+	fn index(&self, index: Range<usize>) -> &Self::Output {
+		&self.0[index]
+	}
+}
+
+impl Index<RangeFrom<usize>> for InternalKey {
+	type Output = [u8];
+
+	fn index(&self, index: RangeFrom<usize>) -> &Self::Output {
+		&self.0[index]
+	}
+}
+
+impl Index<RangeTo<usize>> for InternalKey {
+	type Output = [u8];
+
+	fn index(&self, index: RangeTo<usize>) -> &Self::Output {
+		&self.0[index]
+	}
+}
+
+impl Index<RangeFull> for InternalKey {
+	type Output = [u8];
+
+	fn index(&self, index: RangeFull) -> &Self::Output {
+		&self.0[index]
+	}
+}
+
+// Used only by memtable, sstable uses internal key comparator
+impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Same as InternalKey: user key, then sequence number, then kind, with
 		// timestamp as final tiebreaker First compare by user key (ascending)
@@ -259,7 +287,7 @@ impl<'key> Ord for InternalKeyRef<'key> {
 	}
 }
 
-impl<'key> PartialOrd for InternalKeyRef<'key> {
+impl PartialOrd for InternalKey {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}

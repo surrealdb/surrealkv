@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
+use crate::comparator::Comparator;
 use crate::error::{Error, Result};
-use crate::sstable::{InternalKey, InternalKeyRef};
-use crate::{Comparator, InternalKeyComparator, Key, Value};
+use crate::sstable::InternalKey;
+use crate::{InternalKeyComparator, Value};
 
 pub(crate) type BlockData = Vec<u8>;
 
@@ -113,7 +114,7 @@ pub(crate) struct BlockWriter {
 	restart_points: Vec<u32>,
 	// Number of entries since last restart
 	restart_counter: usize,
-	pub(crate) last_key: Vec<u8>,
+	pub(crate) last_key: InternalKey,
 	num_entries: usize,
 	/// internal key comparator
 	internal_cmp: Arc<InternalKeyComparator>,
@@ -182,25 +183,24 @@ impl BlockWriter {
 			buffer: Vec::with_capacity(size),
 			restart_interval,
 			restart_points: vec![0],
-			last_key: Vec::new(),
+			last_key: InternalKey::none(),
 			restart_counter: 0,
 			num_entries: 0,
 		}
 	}
 
 	// Adds a key-value pair to the block
-	pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: &InternalKey, value: &[u8]) -> Result<()> {
 		// println!("key: {:?}", key);
 		// Ensure the restart counter is within the interval limit
 		assert!(self.restart_counter <= self.restart_interval);
 
 		// Ensure keys are added in sorted order
 		if !self.buffer.is_empty() {
-			let cmp_result = self.internal_cmp.compare(self.last_key.as_slice(), key);
+			let cmp_result = self.internal_cmp.compare(&self.last_key, key);
 			if cmp_result != Ordering::Less {
 				// Decode both keys for detailed logging
-				let last_internal_key = InternalKeyRef(self.last_key.as_slice());
-				let current_internal_key = InternalKeyRef(key);
+				let last_internal_key = &self.last_key;
 
 				log::error!(
 					"[BLOCK] Key ordering violation detected!\n\
@@ -227,12 +227,12 @@ impl BlockWriter {
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
 					last_internal_key.timestamp(),
-					self.last_key.as_slice(),
-					String::from_utf8_lossy(current_internal_key.user_key()),
-					current_internal_key.user_key(),
-					current_internal_key.seq_num(),
-					current_internal_key.kind(),
-					current_internal_key.timestamp(),
+					&self.last_key,
+					String::from_utf8_lossy(key.user_key()),
+					key.user_key(),
+					key.seq_num(),
+					key.kind(),
+					key.timestamp(),
 					key,
 					cmp_result,
 					self.num_entries,
@@ -256,8 +256,7 @@ impl BlockWriter {
 		self.write_key_value_pair_to_buffer(shared_prefix_length, key, value)?;
 
 		// Update previous key to current key
-		self.last_key.clear();
-		self.last_key.extend_from_slice(key);
+		self.last_key.replace(key);
 
 		// Update counters
 		self.restart_counter += 1;
@@ -267,7 +266,7 @@ impl BlockWriter {
 	}
 
 	// Calculates the number of shared bytes between the last key and the new key
-	fn calculate_shared_prefix_length(&self, a: &[u8], b: &[u8]) -> usize {
+	fn calculate_shared_prefix_length(&self, a: &InternalKey, b: &InternalKey) -> usize {
 		a.iter().zip(b.iter()).take_while(|&(a, b)| a == b).count()
 	}
 
@@ -275,7 +274,7 @@ impl BlockWriter {
 	fn write_key_value_pair_to_buffer(
 		&mut self,
 		shared_prefix_length: usize,
-		key: &[u8],
+		key: &InternalKey,
 		value: &[u8],
 	) -> Result<()> {
 		let non_shared_key_length = key.len() - shared_prefix_length;
@@ -320,7 +319,7 @@ pub(crate) struct BlockIterator {
 	block: BlockData,
 	restart_points: Vec<u32>,
 	offset: usize,
-	current_key: Vec<u8>,
+	current_key: InternalKey,
 	/// offset of the current entry used for prev iteration
 	current_entry_offset: usize,
 	current_restart_index: usize,
@@ -354,7 +353,7 @@ impl BlockIterator {
 		BlockIterator {
 			block,
 			restart_points,
-			current_key: Vec::new(),
+			current_key: InternalKey::none(),
 			offset: 0,
 			current_entry_offset: 0,
 			current_restart_index: 0,
@@ -446,7 +445,7 @@ impl BlockIterator {
 }
 
 impl Iterator for BlockIterator {
-	type Item = (Key, Value);
+	type Item = (InternalKey, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.advance() {
@@ -514,7 +513,7 @@ impl BlockIterator {
 	}
 
 	// Move to a specific key or the next larger key
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &InternalKey) -> Option<()> {
 		self.reset();
 
 		// Guard against empty blocks (corrupt or malformed)
@@ -536,10 +535,12 @@ impl BlockIterator {
 			let mid = (left + right).div_ceil(2);
 			self.seek_to_restart_point(mid);
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let current_key =
-				&self.block[self.offset + i..self.offset + i + shared_prefix + non_shared_key];
+			let current_key = InternalKey::new(
+				self.block[self.offset + i..self.offset + i + shared_prefix + non_shared_key]
+					.to_vec(),
+			);
 
-			match self.internal_cmp.compare(current_key, target) {
+			match self.internal_cmp.compare(&current_key, target) {
 				Ordering::Less => left = mid,
 				_ => right = mid - 1,
 			}
@@ -609,8 +610,14 @@ impl BlockIterator {
 
 	// Get the current key
 	#[inline]
-	pub(crate) fn key(&self) -> InternalKeyRef<'_> {
-		InternalKeyRef(&self.current_key)
+	pub(crate) const fn key(&self) -> &InternalKey {
+		&self.current_key
+	}
+
+	/// Returns the raw encoded key bytes without allocation
+	#[inline]
+	pub(crate) fn key_bytes(&self) -> &[u8] {
+		&self.current_key[..]
 	}
 
 	// Get the current value
@@ -623,12 +630,6 @@ impl BlockIterator {
 		}
 	}
 
-	/// Returns the raw encoded key bytes without allocation
-	#[inline]
-	pub(crate) fn key_bytes(&self) -> &[u8] {
-		&self.current_key
-	}
-
 	/// Returns the raw value bytes without allocation
 	#[inline]
 	pub(crate) fn value_bytes(&self) -> &[u8] {
@@ -638,7 +639,7 @@ impl BlockIterator {
 	/// Returns user key slice from current key without allocation
 	#[inline]
 	pub(crate) fn user_key(&self) -> &[u8] {
-		InternalKey::user_key_from_encoded(&self.current_key)
+		self.current_key.user_key()
 	}
 }
 
@@ -670,7 +671,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
+		InternalKey::encode(key.to_vec(), 0, kind, 0).encode()
 	}
 
 	#[test]
@@ -778,7 +779,7 @@ mod tests {
 
 		let mut block_iter = Block::new(block_contents, o.internal_comparator.clone()).iter(false);
 
-		let key = InternalKey::new(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::encode(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -786,7 +787,7 @@ mod tests {
 			Some(("pkey2".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::encode(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -794,7 +795,7 @@ mod tests {
 			Some(("pkey1".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::encode(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -802,7 +803,7 @@ mod tests {
 			Some(("key1".as_bytes(), "value1".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::encode(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(
@@ -810,7 +811,7 @@ mod tests {
 			Some(("pkey3".as_bytes(), "value".as_bytes().to_vec()))
 		);
 
-		let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::encode(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode());
 		assert!(!block_iter.valid());
 	}
@@ -927,7 +928,7 @@ mod tests {
 			Block::new(block_contents.clone(), o.internal_comparator.clone()).iter(false);
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
-			let internal_key = InternalKey::decode(item.0);
+			let internal_key = InternalKey::new(item.0);
 			forward_keys.push(String::from_utf8(internal_key.user_key.clone()).unwrap());
 		}
 		assert_eq!(
@@ -976,7 +977,7 @@ mod tests {
 			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		// Seek to "pkey1"
-		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::encode(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
@@ -1019,7 +1020,7 @@ mod tests {
 			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false);
 
 		// Position at "pkey1"
-		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::encode(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode());
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
@@ -1113,7 +1114,7 @@ mod tests {
 		let mut iter = block.iter(false);
 
 		// Seek for a key that is greater than all keys
-		let target = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 
 		assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
@@ -1140,7 +1141,7 @@ mod tests {
 		let mut iter = block.iter(false);
 
 		// Seek for a key that is less than all keys
-		let target = InternalKey::new(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 
 		assert!(iter.valid(), "Iterator should be valid");
@@ -1168,7 +1169,7 @@ mod tests {
 		let mut iter = block.iter(false);
 
 		// Seek for key_05 which exists
-		let target = InternalKey::new(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 
 		assert!(iter.valid());
@@ -1192,7 +1193,7 @@ mod tests {
 		let mut iter = block.iter(false);
 
 		// Seek for "banana" which is between "apple" and "cherry"
-		let target = InternalKey::new(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 
 		assert!(iter.valid());
@@ -1215,7 +1216,7 @@ mod tests {
 		// Add same user key with descending seq_nums (as stored in SSTable)
 		// In InternalKey ordering: (foo, 100) < (foo, 50) < (foo, 1)
 		for seq in [100u64, 75, 50, 25, 1] {
-			let key = InternalKey::new(b"foo".to_vec(), seq, InternalKeyKind::Set, 0);
+			let key = InternalKey::encode(b"foo".to_vec(), seq, InternalKeyKind::Set, 0);
 			let value = format!("value_seq_{}", seq);
 			builder.add(&key.encode(), value.as_bytes()).unwrap();
 		}
@@ -1224,7 +1225,7 @@ mod tests {
 
 		// Test 1: Seek for seq=80, should find seq=75 (first key >= (foo, 80))
 		let mut iter = block.iter(false);
-		let target = InternalKey::new(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 		assert!(iter.valid());
 		let found = iter.key();
@@ -1236,12 +1237,12 @@ mod tests {
 		);
 
 		// Test 2: Seek for seq=50, should find exactly seq=50
-		iter.seek(&InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode());
+		iter.seek(&InternalKey::encode(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode());
 		assert!(iter.valid());
 		assert_eq!(iter.key().seq_num(), 50);
 
 		// Test 3: Seek for seq=200 (newer than all), should find seq=100
-		iter.seek(&InternalKey::new(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode());
+		iter.seek(&InternalKey::encode(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode());
 		assert!(iter.valid());
 		assert_eq!(iter.key().seq_num(), 100, "Should find newest version seq=100");
 	}
@@ -1260,18 +1261,18 @@ mod tests {
 		let mut iter = block.iter(false);
 
 		// Seek for the exact key
-		let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::encode(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
 
 		// Seek for key before
-		iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode());
+		iter.seek(&InternalKey::encode(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
 
 		// Seek for key after
-		iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode());
+		iter.seek(&InternalKey::encode(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode());
 		assert!(!iter.valid(), "Should be invalid when seeking past single entry");
 	}
 
@@ -1297,7 +1298,7 @@ mod tests {
 		for i in [0, 2, 4] {
 			let target_key = format!("key_{:02}", i);
 			let target =
-				InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+				InternalKey::encode(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&target.encode());
 			assert!(iter.valid(), "Should find key at restart point {}", i);
 			assert_eq!(iter.key().user_key(), target_key.as_bytes());
@@ -1358,8 +1359,12 @@ mod tests {
 			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
 
 		for i in 0..5 {
-			let key =
-				InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set, 0);
+			let key = InternalKey::encode(
+				format!("key_{:02}", i).into_bytes(),
+				1,
+				InternalKeyKind::Set,
+				0,
+			);
 			builder.add(&key.encode(), b"value").unwrap();
 		}
 

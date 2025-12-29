@@ -29,10 +29,11 @@ mod test;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
+pub use comparator::{BytewiseComparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
+use crate::comparator::UserComparator;
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
@@ -118,10 +119,10 @@ impl IntoBytes for Box<[u8]> {
 /// Type alias for iterator results containing key-value pairs
 /// Value is optional to support keys-only iteration without allocating empty
 /// values
-pub type IterResult = Result<(Key, Option<Value>)>;
+pub type IterResult = Result<(UserKey, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
-pub type Key = Vec<u8>;
+pub type UserKey = Vec<u8>;
 
 /// The Value type used throughout the LSM tree  
 pub type Value = Vec<u8>;
@@ -130,10 +131,10 @@ pub type Value = Vec<u8>;
 pub type Version = u64;
 
 /// Type alias for iterator results containing only keys
-pub type KeysResult = Result<Key>;
+pub type KeysResult = Result<UserKey>;
 
 /// Type alias for iterator results containing keys and values
-pub type RangeResult = Result<(Key, Value)>;
+pub type RangeResult = Result<(UserKey, Value)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VLogChecksumLevel {
@@ -160,7 +161,7 @@ pub struct Options {
 	pub block_size: usize,
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
-	pub comparator: Arc<dyn Comparator>,
+	pub comparator: Arc<dyn UserComparator>,
 	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
@@ -208,7 +209,7 @@ impl Default for Options {
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
 
-		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
+		let comparator: Arc<dyn UserComparator> = Arc::new(crate::BytewiseComparator {});
 		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
 
 		Self {
@@ -257,7 +258,7 @@ impl Options {
 		self
 	}
 
-	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
+	pub fn with_comparator(mut self, value: Arc<dyn UserComparator>) -> Self {
 		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
 		self
@@ -601,24 +602,24 @@ pub(crate) fn user_range_to_internal_range(
 
 	let start_bound = match lower {
 		Bound::Unbounded => Bound::Unbounded,
-		Bound::Included(key) => Bound::Included(InternalKey::new(
-			key.into_bytes(),
+		Bound::Included(key) => Bound::Included(InternalKey::encode(
+			key,
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 		Bound::Excluded(key) => {
-			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::encode(key, 0, InternalKeyKind::Set, 0))
 		}
 	};
 
 	let end_bound = match upper {
 		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => {
-			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::encode(key, 0, InternalKeyKind::Set, 0))
 		}
-		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-			key.into_bytes(),
+		Bound::Excluded(key) => Bound::Excluded(InternalKey::encode(
+			key,
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 			INTERNAL_KEY_TIMESTAMP_MAX,

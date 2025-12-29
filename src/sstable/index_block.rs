@@ -8,6 +8,7 @@ use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
+use crate::sstable::InternalKey;
 use crate::vfs::File;
 use crate::{CompressionType, Options};
 
@@ -15,7 +16,7 @@ use crate::{CompressionType, Options};
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
 	/// Full encoded separator key (internal key with seq_num)
-	pub separator_key: Vec<u8>,
+	pub separator_key: InternalKey,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -85,7 +86,7 @@ impl TopLevelIndexWriter {
 		self.top_level_index_size
 	}
 
-	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
+	pub(crate) fn add(&mut self, key: &InternalKey, handle: &[u8]) -> Result<()> {
 		if self.current_block.size_estimate() >= self.max_block_size {
 			self.finish_current_block();
 		}
@@ -216,7 +217,7 @@ impl TopLevelIndex {
 
 	pub(crate) fn find_block_handle_by_key(
 		&self,
-		target: &[u8],
+		target: &InternalKey,
 	) -> Option<(usize, &BlockHandleWithKey)> {
 		// Guard against empty/corrupt partitioned index
 		if self.blocks.is_empty() {
@@ -263,7 +264,7 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
+	pub(crate) fn get(&self, target: &InternalKey) -> Result<Arc<Block>> {
 		let Some((_index, block_handle)) = self.find_block_handle_by_key(target) else {
 			return Err(Error::BlockNotFound);
 		};
@@ -287,7 +288,7 @@ mod tests {
 	}
 
 	fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
-		InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
+		InternalKey::encode(user_key, sequence, InternalKeyKind::Set, 0).encode()
 	}
 
 	#[test]
@@ -511,7 +512,7 @@ mod tests {
 		// Partition 2: contains (foo, 19) to (foo, 1), separator = (g, MAX)
 		let sep_foo_60 = create_internal_key(b"foo".to_vec(), 60);
 		let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
-		let sep_g = InternalKey::new(
+		let sep_g = InternalKey::encode(
 			b"g".to_vec(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
@@ -553,7 +554,7 @@ mod tests {
 
 		for (query_key, expected_index) in test_cases {
 			let result = index.find_block_handle_by_key(&query_key);
-			let query_ikey = InternalKey::decode(query_key.clone());
+			let query_ikey = InternalKey::new(query_key.clone());
 			match expected_index {
 				Some(idx) => {
 					let (found_idx, _) = result.unwrap_or_else(|| {
@@ -596,21 +597,21 @@ mod tests {
 		// Partition 0: contains "apple" keys, separator = (b, MAX) [shortened from apple/banana
 		// boundary] Partition 1: contains "banana", "cherry" keys, separator = (d, MAX)
 		// Partition 2: contains "date" keys, separator = (e, MAX)
-		let sep_b = InternalKey::new(
+		let sep_b = InternalKey::encode(
 			b"b".to_vec(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode();
-		let sep_d = InternalKey::new(
+		let sep_d = InternalKey::encode(
 			b"d".to_vec(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode();
-		let sep_e = InternalKey::new(
+		let sep_e = InternalKey::encode(
 			b"e".to_vec(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
@@ -635,7 +636,7 @@ mod tests {
 			(create_internal_key(b"aardvark".to_vec(), 50), Some(0)),
 			// Key exactly at separator boundary
 			(
-				InternalKey::new(
+				InternalKey::encode(
 					b"b".to_vec(),
 					crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
@@ -656,7 +657,7 @@ mod tests {
 
 		for (query_key, expected_index) in test_cases {
 			let result = index.find_block_handle_by_key(&query_key);
-			let query_ikey = InternalKey::decode(query_key.clone());
+			let query_ikey = InternalKey::new(query_key.clone());
 			match expected_index {
 				Some(idx) => {
 					let (found_idx, _) = result.unwrap_or_else(|| {

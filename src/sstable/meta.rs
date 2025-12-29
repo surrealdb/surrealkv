@@ -238,9 +238,8 @@ impl TableMetadata {
 			None => buf.put_u8(0),
 			Some(key) => {
 				buf.put_u8(1);
-				let key_encoded = key.encode();
-				buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-				buf.extend_from_slice(&key_encoded); // Write the encoded key itself
+				buf.put_u64(key.len() as u64); // Write the size of the encoded key
+				buf.extend_from_slice(&key[..]); // Write the encoded key itself
 			}
 		}
 
@@ -248,9 +247,8 @@ impl TableMetadata {
 			None => buf.put_u8(0),
 			Some(key) => {
 				buf.put_u8(1);
-				let key_encoded = key.encode();
-				buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
-				buf.extend_from_slice(&key_encoded); // Write the encoded key itself
+				buf.put_u64(key.len() as u64); // Write the size of the encoded key
+				buf.extend_from_slice(&key[..]); // Write the encoded key itself
 			}
 		}
 
@@ -285,7 +283,7 @@ impl TableMetadata {
 				let key_len: usize = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				Some(InternalKey::decode(key_bytes))
+				Some(InternalKey::new(key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
 		};
@@ -297,7 +295,7 @@ impl TableMetadata {
 				let key_len = cursor.get_u64() as usize;
 				let mut key_bytes = vec![0u8; key_len];
 				cursor.copy_to_slice(&mut key_bytes);
-				Some(InternalKey::decode(key_bytes))
+				Some(InternalKey::new(key_bytes))
 			}
 			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
 		};

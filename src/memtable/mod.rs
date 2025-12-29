@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchEntry};
 use crate::error::Result;
 use crate::iter::CompactionIterator;
 use crate::sstable::table::{Table, TableWriter};
@@ -100,14 +100,14 @@ impl MemTable {
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = InternalKey::new(
-			key.to_vec(),
+		let range = InternalKey::encode(
+			key,
 			seq_no,
 			InternalKeyKind::Set, // This field is not checked in the comparator
 			0,                    // This field is not checked in the comparator
 		)..;
 
-		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
+		let mut iter = self.map.range(range).take_while(|entry| entry.key().user_key() == key);
 		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
 	}
 
@@ -128,7 +128,7 @@ impl MemTable {
 	/// * `batch` - The batch of operations to apply
 	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
 	///   numbers)
-	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
+	pub(crate) fn add(&self, batch: Batch) -> Result<(u32, u32)> {
 		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
 		let size_before = self.update_memtable_size(record_size);
 		self.update_latest_sequence_number(highest_seq_num);
@@ -137,31 +137,24 @@ impl MemTable {
 
 	/// Applies the batch of operations to the in-memory table (memtable).
 	/// Returns (total_record_size, highest_seq_num_used).
-	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
+	fn apply_batch_to_memtable(&self, batch: Batch) -> Result<(u32, u64)> {
 		let mut record_size = 0;
-
-		// Pre-allocate empty value Bytes for delete operations to avoid repeated
-		// allocations
-		let empty_val = Value::new();
-
-		// Process entries with pre-encoded ValueLocations
-		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
-
-			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
-			let val = if let Some(encoded_value) = &entry.value {
-				encoded_value.clone()
-			} else {
-				// For delete operations, reuse the pre-allocated empty value
-				empty_val.clone()
-			};
-
-			let entry_size = self.insert_into_memtable(&ikey, &val);
-			record_size += entry_size;
-		}
 
 		// Get the highest sequence number used from the batch
 		let highest_seq_num = batch.get_highest_seq_num();
+
+		// Process entries with pre-encoded ValueLocations
+		for BatchEntry {
+			key,
+			value,
+		} in batch.entries_with_seq_nums()?
+		{
+			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
+			let val = value.unwrap_or_default();
+
+			let entry_size = self.insert_into_memtable(&key, &val);
+			record_size += entry_size;
+		}
 
 		Ok((record_size, highest_seq_num))
 	}
@@ -169,7 +162,7 @@ impl MemTable {
 	/// Inserts a key-value pair into the memtable.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
 		self.map.insert(key.clone(), value.clone());
-		key.size() as u32 + value.len() as u32
+		key.len() as u32 + value.len() as u32
 	}
 
 	/// Updates the size of the memtable by adding the size of the newly added

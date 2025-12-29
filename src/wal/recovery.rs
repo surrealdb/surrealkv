@@ -189,7 +189,7 @@ pub(crate) fn replay_wal(
 					);
 
 					// Apply the batch to the memtable
-					memtable.add(&batch)?;
+					memtable.add(batch)?;
 				}
 				Err(WalError::Corruption(err)) => {
 					// Corruption detected - stop immediately and don't process further segments

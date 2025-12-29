@@ -10,8 +10,8 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
-use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
+use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::{IntoBytes, IterResult, KeysResult, RangeResult, UserKey, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -171,7 +171,7 @@ pub struct Transaction {
 	/// These are the changes that the transaction intends to make to the data.
 	/// The entries vec is used to keep different values for the same key for
 	/// savepoints and rollbacks.
-	pub(crate) write_set: BTreeMap<Key, Vec<Entry>>,
+	pub(crate) write_set: BTreeMap<UserKey, Vec<Entry>>,
 
 	/// `closed` indicates if the transaction is closed. A closed transaction
 	/// cannot make any more changes to the data.
@@ -264,21 +264,21 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key.into_bytes(),
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Set,
+					timestamp,
+				),
 				Some(value.into_bytes()),
-				InternalKeyKind::Set,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
 			Entry::new(
-				key.into_bytes(),
+				InternalKey::encode(key.as_slice(), write_seqno as u64, InternalKeyKind::Set, 0),
 				Some(value.into_bytes()),
-				InternalKeyKind::Set,
 				self.savepoints,
-				write_seqno,
 			)
 		};
 		self.write_with_options(entry, options)?;
@@ -301,21 +301,21 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key.into_bytes(),
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Delete,
+					timestamp,
+				),
 				None,
-				InternalKeyKind::Delete,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
 			Entry::new(
-				key.into_bytes(),
+				InternalKey::encode(key.as_slice(), write_seqno as u64, InternalKeyKind::Delete, 0),
 				None,
-				InternalKeyKind::Delete,
 				self.savepoints,
-				write_seqno,
 			)
 		};
 		self.write_with_options(entry, options)?;
@@ -347,21 +347,26 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key.into_bytes(),
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::SoftDelete,
+					timestamp,
+				),
 				None,
-				InternalKeyKind::SoftDelete,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
 			Entry::new(
-				key.into_bytes(),
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::SoftDelete,
+					0,
+				),
 				None,
-				InternalKeyKind::SoftDelete,
 				self.savepoints,
-				write_seqno,
 			)
 		};
 		self.write_with_options(entry, options)?;
@@ -391,21 +396,26 @@ impl Transaction {
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key.into_bytes(),
+			Entry::new(
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Replace,
+					timestamp,
+				),
 				Some(value.into_bytes()),
-				InternalKeyKind::Replace,
 				self.savepoints,
-				write_seqno,
-				timestamp,
 			)
 		} else {
 			Entry::new(
-				key.into_bytes(),
+				InternalKey::encode(
+					key.as_slice(),
+					write_seqno as u64,
+					InternalKeyKind::Replace,
+					0,
+				),
 				Some(value.into_bytes()),
-				InternalKeyKind::Replace,
 				self.savepoints,
-				write_seqno,
 			)
 		};
 		self.write_with_options(entry, options)?;
@@ -457,7 +467,7 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			return match &self.snapshot {
-				Some(snapshot) => snapshot.get_at_version(key.into_bytes(), timestamp),
+				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
 			};
 		}
@@ -677,9 +687,11 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => {
-					Ok(Box::new(snapshot.keys_at_version(start_key, end_key, timestamp)?.map(Ok)))
-				}
+				Some(snapshot) => Ok(Box::new(
+					snapshot
+						.keys_at_version(start_key.as_slice(), end_key.as_slice(), timestamp)?
+						.map(Ok),
+				)),
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
@@ -767,7 +779,7 @@ impl Transaction {
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
 				Some(snapshot) => {
-					Ok(Box::new(snapshot.range_at_version(start_key, end_key, timestamp)?))
+					Ok(Box::new(snapshot.range_at_version(&start_key, &end_key, timestamp)?))
 				}
 				None => Err(Error::NoSnapshot),
 			}
@@ -797,12 +809,13 @@ impl Transaction {
 	/// # Returns
 	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
 	/// each version found.
-	pub fn scan_all_versions<K>(
+	#[allow(dead_code)]
+	pub(crate) fn scan_all_versions<K>(
 		&self,
 		start: K,
 		end: K,
 		limit: Option<usize>,
-	) -> Result<Vec<(Key, Value, Version, bool)>>
+	) -> Result<Vec<(InternalKey, Value)>>
 	where
 		K: IntoBytes,
 	{
@@ -820,9 +833,7 @@ impl Transaction {
 
 		// Query the versioned index through the snapshot
 		match &self.snapshot {
-			Some(snapshot) => {
-				snapshot.scan_all_versions(start.into_bytes(), end.into_bytes(), limit)
-			}
+			Some(snapshot) => snapshot.scan_all_versions(start.as_slice(), end.as_slice(), limit),
 			None => Err(Error::NoSnapshot),
 		}
 	}
@@ -849,7 +860,7 @@ impl Transaction {
 		// Add the entry to the write set
 		let key = e.key.clone();
 
-		match self.write_set.entry(key) {
+		match self.write_set.entry(key.take_user_key()) {
 			BTreeEntry::Occupied(mut oe) => {
 				let entries = oe.get_mut();
 				// If the latest existing value for this key belongs to the same
@@ -907,21 +918,19 @@ impl Transaction {
 		// respecting the insertion order recorded with Entry::seqno.
 		let mut latest_writes: Vec<Entry> =
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
-		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+		latest_writes.sort_by(|a, b| a.key.seq_num().cmp(&b.key.seq_num()));
 
 		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();
 
 		// Add all entries to the batch
-		for entry in latest_writes {
+		for mut entry in latest_writes {
 			// Use the entry's timestamp if it was explicitly set (via set_at_version),
 			// otherwise use the commit timestamp
-			let timestamp = if entry.timestamp != 0 {
-				entry.timestamp
-			} else {
-				commit_timestamp
+			if entry.key.timestamp() == 0 {
+				entry.key.set_timestamp(commit_timestamp);
 			};
-			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
+			batch.add_record(entry.key, entry.value)?;
 		}
 
 		// Write the batch to storage
@@ -1018,71 +1027,38 @@ impl Drop for Transaction {
 #[derive(Clone)]
 pub(crate) struct Entry {
 	/// The key being written
-	pub(crate) key: Key,
+	pub(crate) key: InternalKey,
 
 	/// The value (None for deletes)
 	pub(crate) value: Option<Value>,
 
-	/// Type of operation (Set, Delete, etc.)
-	pub(crate) kind: InternalKeyKind,
-
 	/// Savepoint number when this entry was created
 	pub(crate) savepoint_no: u32,
-
-	/// Sequence number for ordering writes within a transaction
-	pub(crate) seqno: u32,
-
-	/// Timestamp for versioned queries
-	pub(crate) timestamp: u64,
 }
 
 impl Entry {
-	const fn new(
-		key: Key,
-		value: Option<Value>,
-		kind: InternalKeyKind,
-		savepoint_no: u32,
-		seqno: u32,
-	) -> Entry {
+	const fn new(key: InternalKey, value: Option<Value>, savepoint_no: u32) -> Entry {
 		Entry {
 			key,
 			value,
-			kind,
 			savepoint_no,
-			seqno,
-			timestamp: 0, // Will be set at commit time
-		}
-	}
-
-	const fn new_with_timestamp(
-		key: Key,
-		value: Option<Value>,
-		kind: InternalKeyKind,
-		savepoint_no: u32,
-		seqno: u32,
-		timestamp: u64,
-	) -> Entry {
-		Entry {
-			key,
-			value,
-			kind,
-			savepoint_no,
-			seqno,
-			timestamp,
 		}
 	}
 
 	/// Checks if this entry represents a deletion (tombstone)
-	fn is_tombstone(&self) -> bool {
-		let kind = self.kind;
-		if kind == InternalKeyKind::Delete
-			|| kind == InternalKeyKind::SoftDelete
-			|| kind == InternalKeyKind::RangeDelete
-		{
-			return true;
+	const fn is_tombstone(&self) -> bool {
+		match self.key.kind() {
+			InternalKeyKind::Delete
+			| InternalKeyKind::SoftDelete
+			| InternalKeyKind::RangeDelete => true,
+			InternalKeyKind::Set
+			| InternalKeyKind::Merge
+			| InternalKeyKind::LogData
+			| InternalKeyKind::Replace
+			| InternalKeyKind::Separator
+			| InternalKeyKind::Max
+			| InternalKeyKind::Invalid => false,
 		}
-
-		false
 	}
 }
 
@@ -1093,7 +1069,7 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
 
 	/// Iterator over the transaction's write set
-	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Key, Vec<Entry>>>,
+	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, UserKey, Vec<Entry>>>,
 
 	/// When true, only return keys without fetching values
 	keys_only: bool,
@@ -1304,7 +1280,7 @@ mod tests {
 	/// Type alias for a map of keys to their version information
 	/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
 	#[allow(dead_code)]
-	type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
+	type KeyVersionsMap = HashMap<UserKey, Vec<(Vec<u8>, u64, bool)>>;
 
 	// Common setup logic for creating a store
 	fn create_store() -> (Tree, TempDir) {
@@ -4614,7 +4590,7 @@ mod tests {
 			fn scan_in_batches(
 				store: &Tree,
 				batch_size: usize,
-			) -> Vec<Vec<(Key, Value, u64, bool)>> {
+			) -> Vec<Vec<(UserKey, Value, u64, bool)>> {
 				let mut all_results = Vec::new();
 				let mut last_key = Vec::new();
 				let mut first_iteration = true;

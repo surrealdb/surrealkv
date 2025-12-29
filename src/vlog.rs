@@ -14,7 +14,7 @@ use crate::bplustree::tree::DiskBPlusTree;
 use crate::commit::CommitPipeline;
 use crate::discard::DiscardStats;
 use crate::error::{Error, Result};
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
 
 /// VLog format version
@@ -442,14 +442,14 @@ impl VLogWriter {
 	/// Layout: +--------+-----+-------+-------+
 	///         | header  | key | value | crc32 |
 	///         +--------+-----+-------+--------+
-	fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+	fn append(&mut self, key: &InternalKey, value: &[u8]) -> Result<ValuePointer> {
 		let key_len = key.len() as u32;
 		let value_len = value.len() as u32;
 		let offset = self.current_offset;
 
 		// Calculate CRC32 of key + value
 		let mut hasher = Hasher::new();
-		hasher.update(key);
+		hasher.update(&key[..]);
 		hasher.update(value);
 		let crc32 = hasher.finalize();
 
@@ -458,7 +458,7 @@ impl VLogWriter {
 		self.writer.write_all(&value_len.to_be_bytes())?;
 
 		// Write key
-		self.writer.write_all(key)?;
+		self.writer.write_all(&key[..])?;
 
 		// Write value
 		self.writer.write_all(value)?;
@@ -592,7 +592,7 @@ impl VLog {
 	}
 
 	/// Appends a key+value pair to the log and returns a ValuePointer
-	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+	pub(crate) fn append(&self, key: &InternalKey, value: &[u8]) -> Result<ValuePointer> {
 		// Ensure we have a writer
 		let _new_file_created = {
 			let mut writer = self.writer.write();
@@ -1054,13 +1054,13 @@ impl VLog {
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
 
-			let internal_key = InternalKey::decode(key);
+			let internal_key = InternalKey::new(key);
 
 			// Check if this user key is stale using the global delete list
 			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
 				Ok(stale) => stale,
 				Err(e) => {
-					let user_key = internal_key.user_key;
+					let user_key = internal_key.user_key();
 					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
 					return Err(e);
 				}
@@ -1077,19 +1077,14 @@ impl VLog {
 				// This will cause the value to be written to the active VLog file
 				// and a new pointer to be stored in the LSM
 
-				let size = internal_key.user_key.len() + value.len();
+				let size = internal_key.user_key().len() + value.len();
 				let val = if value.is_empty() {
 					None
 				} else {
 					Some(value.clone())
 				};
 
-				batch.add_record(
-					internal_key.kind(),
-					internal_key.user_key,
-					val,
-					internal_key.timestamp,
-				)?;
+				batch.add_record(internal_key, val)?;
 
 				// Update batch size tracking
 				batch_size += size;
@@ -1283,8 +1278,7 @@ impl VLog {
 			let mut total_deleted = 0;
 
 			for internal_key in deleted_keys {
-				let encoded_key = internal_key.encode();
-				if let Err(e) = write_index.delete(&encoded_key) {
+				if let Err(e) = write_index.delete(internal_key) {
 					log::error!("Failed to delete versioned key: {}", e);
 					return Err(e.into());
 				} else {
@@ -1457,13 +1451,11 @@ impl DeleteList {
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
-			let seq_key = seq_num.to_be_bytes().to_vec();
+			let seq_key = seq_num.to_be_bytes();
 			// Store sequence number -> value_size mapping
 			batch.add_record(
-				crate::sstable::InternalKeyKind::Set,
-				seq_key,
+				InternalKey::encode(&seq_key, seq_num, InternalKeyKind::Set, 0),
 				Some(value_size.to_be_bytes().to_vec()),
-				0,
 			)?;
 		}
 
@@ -1503,8 +1495,11 @@ impl DeleteList {
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
-			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
+			let seq_key = seq_num.to_be_bytes();
+			batch.add_record(
+				InternalKey::encode(&seq_key, seq_num, InternalKeyKind::Delete, 0),
+				None,
+			)?;
 		}
 
 		// Commit the batch to the LSM tree using sync commit

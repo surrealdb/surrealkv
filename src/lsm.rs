@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchEntry};
 use crate::bplustree::tree::DiskBPlusTree;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
+use crate::comparator::UserComparator;
 use crate::error::Result;
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
@@ -20,7 +21,7 @@ use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
-use crate::sstable::{InternalKey, InternalKeyKind, InternalKeyRef, INTERNAL_KEY_TIMESTAMP_MAX};
+use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
@@ -28,7 +29,6 @@ use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::{
 	BytewiseComparator,
-	Comparator,
 	Error,
 	FilterPolicy,
 	Options,
@@ -787,7 +787,7 @@ impl LsmCommitEnv {
 impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL and process VLog entries (synchronous operation)
 	// Returns a new batch with VLog pointers, and pre-encoded ValueLocations
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
+	fn write(&self, batch: Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		let mut processed_batch = Batch::new(seq_num);
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
@@ -795,22 +795,23 @@ impl CommitEnv for LsmCommitEnv {
 		let is_versioning_enabled = self.core.opts.enable_versioning;
 		let has_vlog = self.core.vlog.is_some();
 
-		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
-			let encoded_key = ikey.encode();
-
+		for BatchEntry {
+			key,
+			value,
+		} in batch.entries_with_seq_nums()?
+		{
 			// Process value based on whether VLog is available and value size
-			let (valueptr, encoded_value) = match &entry.value {
+			let (valueptr, encoded_value) = match &value {
 				Some(value) if has_vlog && value.len() > vlog_threshold => {
 					// Large value: store in VLog and create pointer
 					let vlog = self.core.vlog.as_ref().unwrap();
-					let pointer = vlog.append(&encoded_key, value)?;
+					let pointer = vlog.append(&key, value)?;
 					let value_location = ValueLocation::with_pointer(pointer.clone());
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
 					if is_versioning_enabled {
-						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
+						timestamp_entries.push((key.clone(), encoded.clone()));
 					}
 
 					(Some(pointer), Some(encoded))
@@ -822,7 +823,7 @@ impl CommitEnv for LsmCommitEnv {
 
 					// Add to versioned index if enabled
 					if is_versioning_enabled {
-						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
+						timestamp_entries.push((key.clone(), encoded.clone()));
 					}
 
 					(None, Some(encoded))
@@ -830,20 +831,14 @@ impl CommitEnv for LsmCommitEnv {
 				None => {
 					// Delete operation: no value but may need versioned index entry
 					if is_versioning_enabled {
-						timestamp_entries.push((encoded_key.clone(), Vec::new()));
+						timestamp_entries.push((key.clone(), Vec::new()));
 					}
 					(None, None)
 				}
 			};
 
 			// Add processed entry to batch
-			processed_batch.add_record_with_valueptr(
-				entry.kind,
-				entry.key.clone(),
-				encoded_value,
-				valueptr,
-				timestamp,
-			)?;
+			processed_batch.add_record_with_valueptr(key, encoded_value, valueptr)?;
 		}
 
 		// Flush VLog if present
@@ -860,21 +855,17 @@ impl CommitEnv for LsmCommitEnv {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
 			// Single pass: process each entry individually
-			for (encoded_key, encoded_value) in timestamp_entries {
-				let ikey = InternalKeyRef(&encoded_key);
-
+			for (ikey, encoded_value) in timestamp_entries {
 				if ikey.is_replace() {
 					// For Replace: first delete all existing entries for this user key
 					let user_key = ikey.user_key();
-					let start_key =
-						InternalKey::new(user_key.to_vec(), 0, InternalKeyKind::Set, 0).encode();
-					let end_key = InternalKey::new(
-						user_key.to_vec(),
+					let start_key = InternalKey::encode(user_key, 0, InternalKeyKind::Set, 0);
+					let end_key = InternalKey::encode(
+						user_key,
 						seq_num,
 						InternalKeyKind::Max,
 						INTERNAL_KEY_TIMESTAMP_MAX,
-					)
-					.encode();
+					);
 
 					// Collect and delete all existing entries for this user key
 					let range_iter = versioned_index_guard.range(&start_key, &end_key)?;
@@ -891,7 +882,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 
 				// Insert the new entry (whether it's regular Set or SetWithDelete)
-				versioned_index_guard.insert(encoded_key, encoded_value)?;
+				versioned_index_guard.insert(ikey, encoded_value)?;
 			}
 		}
 
@@ -907,7 +898,7 @@ impl CommitEnv for LsmCommitEnv {
 	}
 
 	// Apply batch to memtable (can be called concurrently)
-	fn apply(&self, batch: &Batch) -> Result<()> {
+	fn apply(&self, batch: Batch) -> Result<()> {
 		// Writes a batch of key-value pairs to the LSM tree.
 		//
 		// Write path in LSM trees:
@@ -1614,7 +1605,7 @@ impl TreeBuilder {
 	}
 
 	/// Sets the comparator.
-	pub fn with_comparator(mut self, comparator: Arc<dyn Comparator>) -> Self {
+	pub fn with_comparator(mut self, comparator: Arc<dyn UserComparator>) -> Self {
 		self.opts = self.opts.with_comparator(comparator);
 		self
 	}

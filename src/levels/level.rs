@@ -58,7 +58,7 @@ impl Level {
 		let insert_pos = self.tables.partition_point(|existing| {
 			match (&existing.meta.smallest_point, &table.meta.smallest_point) {
 				(Some(existing_smallest), Some(new_smallest)) => {
-					existing_smallest.user_key < new_smallest.user_key
+					existing_smallest.user_key() < new_smallest.user_key()
 				}
 				_ => true,
 			}
