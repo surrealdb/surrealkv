@@ -822,8 +822,11 @@ impl VLog {
 			}
 		}
 
-		// Extract value slice from entry data
-		let value_bytes = Bytes::copy_from_slice(&entry_data_vec[value_start..crc_start]);
+		// Convert Vec to Bytes (zero-copy ownership transfer)
+		let entry_data = Bytes::from(entry_data_vec);
+		
+		// Extract value slice (zero-copy view)
+		let value_bytes = entry_data.slice(value_start..crc_start);
 
 		// Cache the value in unified block cache for future reads
 		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
