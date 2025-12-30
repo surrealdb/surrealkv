@@ -96,7 +96,7 @@ impl FilterBlockWriter {
 #[derive(Clone)]
 pub(crate) struct FilterBlockReader {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used for checking keys against filters.
-	data: Bytes,                    // The entire filter block data.
+	data: Bytes,                   // The entire filter block data.
 	filter_offsets: Vec<u32>,      // Offsets for each filter within the `data`.
 	base_lg: u32,                  // The base log2 value used to calculate block index.
 }
