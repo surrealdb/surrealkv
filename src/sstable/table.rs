@@ -11,6 +11,7 @@ use snap::raw::max_compress_len;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::TableMetadata;
@@ -89,9 +90,10 @@ impl Footer {
 
 	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
 		if file_size < TABLE_FULL_FOOTER_LENGTH {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (file size is too small: {file_size} bytes)"
-			)));
+			return Err(Error::from(SSTableError::FileTooSmall {
+				file_size,
+				min_size: TABLE_FULL_FOOTER_LENGTH,
+			}));
 		}
 
 		let mut buf = vec![0; TABLE_FULL_FOOTER_LENGTH];
@@ -106,31 +108,32 @@ impl Footer {
 
 		// Validate magic number first
 		if magic != TABLE_MAGIC_FOOTER_ENCODED {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (bad magic number: {magic:x?})"
-			)));
+			return Err(Error::from(SSTableError::BadMagicNumber {
+				magic: magic.to_vec(),
+			}));
 		}
 
 		if buf.len() < TABLE_FOOTER_LENGTH {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (footer too short): {}",
-				buf.len()
-			)));
+			return Err(Error::from(SSTableError::FooterTooShort {
+				footer_len: buf.len(),
+			}));
 		}
 
 		// Read format and checksum from footer (first 2 bytes)
 		let format = TableFormat::from_u8(buf[0])?;
 		let checksum = match buf[1] {
 			1 => ChecksumType::CRC32c,
-			_ => return Err(Error::CorruptedBlock("Invalid checksum type".into())),
+			_ => {
+				return Err(Error::from(SSTableError::InvalidChecksumType {
+					checksum_type: buf[1],
+				}))
+			}
 		};
 
 		// Read block handles (starting at offset 2)
 		let (meta_index, metalen) = BlockHandle::decode(&buf[2..])?;
 		if metalen == 0 {
-			return Err(Error::CorruptedBlock(
-				"invalid table (bad meta_index block handle)".into(),
-			));
+			return Err(Error::from(SSTableError::BadMetaIndexBlockHandle));
 		}
 
 		let (index_handle, _) = BlockHandle::decode(&buf[2 + metalen..])?;
@@ -293,7 +296,7 @@ impl<W: Write> TableWriter<W> {
 		self.prev_block_last_key.clone_from(&block.last_key);
 
 		// Finalize the current block and compress it.
-		let contents = block.finish();
+		let contents = block.finish()?;
 		let compression_type = self.compression_selector.select_compression(self.target_level);
 		let handle = self.write_compressed_block(contents, compression_type)?;
 
@@ -315,8 +318,16 @@ impl<W: Write> TableWriter<W> {
 	// footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
-		self.meta.properties.created_at =
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		self.meta.properties.created_at = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map_err(|e| {
+				let err = Error::from(SSTableError::FailedToGetSystemTime {
+					source: e.to_string(),
+				});
+				log::error!("[TABLE_WRITER] {}", err);
+				err
+			})?
+			.as_nanos();
 
 		// Copy sequence numbers from metadata to properties for table ordering
 		self.meta.properties.seqnos = (self.meta.smallest_seq_num, self.meta.largest_seq_num);
@@ -347,7 +358,7 @@ impl<W: Write> TableWriter<W> {
 				let fblock_handle =
 					self.write_compressed_block(fblock_data, CompressionType::None)?;
 
-				// Track filter size (data only, matches RocksDB)
+				// Track filter size
 				self.meta.properties.filter_size = fblock_handle.size as u64;
 
 				// Add to meta index
@@ -376,7 +387,7 @@ impl<W: Write> TableWriter<W> {
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
 		// Write meta_index block
-		let meta_block = meta_ix_block.finish();
+		let meta_block = meta_ix_block.finish()?;
 		let meta_ix_handle = self.write_compressed_block(meta_block, CompressionType::None)?;
 
 		// 6. Write footer
@@ -547,8 +558,8 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
-	let mut metaindexiter = metaix.iter(false);
-	metaindexiter.seek(&meta_key);
+	let mut metaindexiter = metaix.iter(false)?;
+	metaindexiter.seek(&meta_key)?;
 
 	if metaindexiter.valid() {
 		let k = metaindexiter.key();
@@ -579,10 +590,9 @@ pub(crate) fn read_table_block(
 	)?;
 
 	if !verify_table_block(&buf, compress[0], unmask(u32::decode_fixed(&cksum).unwrap())) {
-		return Err(Error::CorruptedBlock(format!(
-			"checksum verification failed for block at {}",
-			location.offset()
-		)));
+		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
+			block_offset: location.offset() as u64,
+		}));
 	}
 
 	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
@@ -683,8 +693,8 @@ impl Table {
 		let filter_key =
 			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
 
-		let mut metaindexiter = metaix.iter(false);
-		metaindexiter.seek(&filter_key.encode());
+		let mut metaindexiter = metaix.iter(false)?;
+		metaindexiter.seek(&filter_key.encode())?;
 
 		if metaindexiter.valid() {
 			let k = metaindexiter.key();
@@ -695,11 +705,11 @@ impl Table {
 
 			let fbl = BlockHandle::decode(&val);
 			let filter_block_location = match fbl {
-				Err(_e) => {
-					return Err(Error::CorruptedBlock(format!(
-						"Couldn't decode corrupt blockhandle {:?}",
-						&val
-					)));
+				Err(e) => {
+					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+						value_bytes: val,
+						context: format!("error: {:?}", e),
+					}));
 				}
 				Ok(res) => res.0,
 			};
@@ -756,15 +766,28 @@ impl Table {
 
 				// Then search within the partition
 				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek(&key_encoded);
+				let mut partition_iter = partition_block.iter(false)?;
+				partition_iter.seek(&key_encoded)?;
 
 				if partition_iter.valid() {
 					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes())
 						!= Ordering::Greater
 					{
 						let val = partition_iter.value_bytes();
-						Some(BlockHandle::decode(val).unwrap().0)
+						match BlockHandle::decode(val) {
+							Ok((handle, _)) => Some(handle),
+							Err(e) => {
+								let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+									value_bytes: val.to_vec(),
+									context: format!(
+										"Failed to decode BlockHandle in get(): {}",
+										e
+									),
+								});
+								log::error!("[TABLE] {}", err);
+								return Err(err);
+							}
+						}
 					} else {
 						return Ok(None);
 					}
@@ -781,10 +804,10 @@ impl Table {
 
 		// Read block (potentially from cache)
 		let tb = self.read_block(&handle)?;
-		let mut iter = tb.iter(false);
+		let mut iter = tb.iter(false)?;
 
 		// Go to entry and check if it's the wanted entry.
-		iter.seek(&key_encoded);
+		iter.seek(&key_encoded)?;
 		if iter.valid() {
 			if iter.user_key() == key.user_key.as_slice() {
 				Ok(Some((iter.key(), iter.value())))
@@ -831,7 +854,6 @@ impl Table {
 	}
 
 	/// Checks if table is completely before the query range
-	/// Uses USER KEY comparison only (like RocksDB's sstableKeyCompare)
 	pub(crate) fn is_before_range(&self, range: &InternalKeyRange) -> bool {
 		let Some(largest) = &self.meta.largest_point else {
 			return false;
@@ -893,13 +915,14 @@ impl TableIterator {
 
 		// First try to advance within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
-			if partition_iter.advance() {
+			if partition_iter.advance()? {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						return Err(Error::CorruptedBlock(format!(
-							"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
-						)));
+						return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("error: {:?}", e),
+						}));
 					}
 					Ok(res) => res,
 				};
@@ -918,16 +941,17 @@ impl TableIterator {
 		let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 		let partition_block = partitioned_index.load_block(partition_handle)?;
 		// Note: Index blocks always need full key-value pairs to decode block handles
-		let mut partition_iter = partition_block.iter(false);
-		partition_iter.seek_to_first();
+		let mut partition_iter = partition_block.iter(false)?;
+		partition_iter.seek_to_first()?;
 
 		if partition_iter.valid() {
 			let val = partition_iter.value();
 			let (handle, _) = match BlockHandle::decode(&val) {
 				Err(e) => {
-					return Err(Error::CorruptedBlock(format!(
-						"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
-					)));
+					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+						value_bytes: val,
+						context: format!("error: {:?}", e),
+					}));
 				}
 				Ok(res) => res,
 			};
@@ -946,10 +970,10 @@ impl TableIterator {
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
 		let block = self.table.read_block(handle)?;
-		let mut block_iter = block.iter(self.keys_only);
+		let mut block_iter = block.iter(self.keys_only)?;
 
 		// Position at first entry in the new block
-		block_iter.seek_to_first();
+		block_iter.seek_to_first()?;
 
 		if block_iter.valid() {
 			self.current_block = Some(block_iter);
@@ -957,7 +981,7 @@ impl TableIterator {
 			return Ok(());
 		}
 
-		Err(Error::CorruptedBlock("Empty block".to_string()))
+		Err(Error::from(SSTableError::EmptyBlock))
 	}
 
 	#[cfg(test)]
@@ -982,10 +1006,10 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
-	pub(crate) fn prev(&mut self) -> bool {
+	pub(crate) fn prev(&mut self) -> Result<bool> {
 		if let Some(ref mut block) = self.current_block {
-			if block.prev() {
-				return true;
+			if block.prev()? {
+				return Ok(true);
 			}
 		}
 
@@ -993,25 +1017,23 @@ impl TableIterator {
 
 		// Try to move to previous block within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
-			if partition_iter.prev() {
+			if partition_iter.prev()? {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						log::error!(
-							"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle. \
-							Value bytes: {:?}, Error: {:?}",
-							val,
-							e
-						);
-						return false;
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("Block corruption in prev(): failed to decode BlockHandle. Error: {:?}", e),
+						});
+						log::error!("[TABLE_ITER] {}", err);
+						return Err(err);
 					}
 					Ok(res) => res,
 				};
-				if self.load_block(&handle).is_ok() {
-					if let Some(ref mut block_iter) = self.current_block {
-						block_iter.seek_to_last();
-						return block_iter.valid();
-					}
+				self.load_block(&handle)?;
+				if let Some(ref mut block_iter) = self.current_block {
+					block_iter.seek_to_last()?;
+					return Ok(block_iter.valid());
 				}
 			}
 		}
@@ -1024,46 +1046,41 @@ impl TableIterator {
 			self.current_partition_index -= 1;
 			let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 
-			if let Ok(partition_block) = partitioned_index.load_block(partition_handle) {
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek_to_last();
+			let partition_block = partitioned_index.load_block(partition_handle)?;
+			// Note: Index blocks always need full key-value pairs to decode block handles
+			let mut partition_iter = partition_block.iter(false)?;
+			partition_iter.seek_to_last()?;
 
-				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(e) => {
-							log::error!(
-								"[TABLE_ITER] Block corruption in prev(): failed to decode BlockHandle \
-								in partition {}. Value bytes: {:?}, Error: {:?}",
-								self.current_partition_index,
-								val,
-								e
-							);
-							return false;
-						}
-						Ok(res) => res,
-					};
-					self.current_partition_iter = Some(partition_iter);
-					if self.load_block(&handle).is_ok() {
-						if let Some(ref mut block_iter) = self.current_block {
-							block_iter.seek_to_last();
-							let valid = block_iter.valid();
-							return valid;
-						}
+			if partition_iter.valid() {
+				let val = partition_iter.value();
+				let (handle, _) = match BlockHandle::decode(&val) {
+					Err(e) => {
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("Block corruption in prev(): failed to decode BlockHandle in partition {}. Error: {:?}", self.current_partition_index, e),
+						});
+						log::error!("[TABLE_ITER] {}", err);
+						return Err(err);
 					}
+					Ok(res) => res,
+				};
+				self.current_partition_iter = Some(partition_iter);
+				self.load_block(&handle)?;
+				if let Some(ref mut block_iter) = self.current_block {
+					block_iter.seek_to_last()?;
+					return Ok(block_iter.valid());
 				}
 			}
 		}
 
 		self.current_block = None;
-		false
+		Ok(false)
 	}
 
-	fn seek_to_lower_bound(&mut self, bound: &Bound<InternalKey>) {
+	fn seek_to_lower_bound(&mut self, bound: &Bound<InternalKey>) -> Result<()> {
 		match bound {
 			Bound::Included(internal_key) => {
-				self.seek(&internal_key.encode());
+				self.seek(&internal_key.encode())?;
 			}
 			Bound::Excluded(internal_key) => {
 				// For excluded bound, seek to highest version of the key, then skip all
@@ -1074,7 +1091,7 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode());
+				self.seek(&seek_key.encode())?;
 
 				// Skip ALL versions of the excluded key
 				while self.valid() {
@@ -1082,18 +1099,19 @@ impl TableIterator {
 					if current_key.user_key != internal_key.user_key {
 						break;
 					}
-					if !self.advance() {
+					if !self.advance()? {
 						break;
 					}
 				}
 			}
 			Bound::Unbounded => {
-				self.seek_to_first();
+				self.seek_to_first()?;
 			}
 		}
+		Ok(())
 	}
 
-	fn seek_to_upper_bound(&mut self, bound: &Bound<InternalKey>) {
+	fn seek_to_upper_bound(&mut self, bound: &Bound<InternalKey>) -> Result<()> {
 		match bound {
 			Bound::Included(internal_key) => {
 				// Seek to find the first key >= upper bound
@@ -1103,12 +1121,12 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode());
+				self.seek(&seek_key.encode())?;
 
 				// If seek went past table end (invalid), start from last key
 				if !self.valid() {
-					self.seek_to_last();
-					return;
+					self.seek_to_last()?;
+					return Ok(());
 				}
 
 				// Back up if we're beyond the bound (should only need a few steps)
@@ -1123,7 +1141,7 @@ impl TableIterator {
 						// Found a key <= bound, we're positioned correctly
 						break;
 					}
-					if !self.prev() {
+					if !self.prev()? {
 						// No more keys, iterator becomes invalid
 						break;
 					}
@@ -1137,11 +1155,11 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode());
+				self.seek(&seek_key.encode())?;
 
 				// If seek went past table end, start from last key
 				if !self.valid() {
-					self.seek_to_last();
+					self.seek_to_last()?;
 				}
 
 				// Move backward until we find a key < end (strictly less)
@@ -1155,15 +1173,16 @@ impl TableIterator {
 					if cmp == Ordering::Less {
 						break;
 					}
-					if !self.prev() {
+					if !self.prev()? {
 						break;
 					}
 				}
 			}
 			Bound::Unbounded => {
-				self.seek_to_last();
+				self.seek_to_last()?;
 			}
 		}
+		Ok(())
 	}
 
 	/// Check if a user key satisfies the lower bound constraint
@@ -1194,14 +1213,21 @@ impl TableIterator {
 }
 
 impl Iterator for TableIterator {
-	type Item = (InternalKey, Value);
+	type Item = Result<(InternalKey, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		// If not positioned, position appropriately based on range
 		if !self.positioned {
 			let lower_bound = self.range.0.clone();
-			self.seek_to_lower_bound(&lower_bound);
-			self.positioned = true;
+			match self.seek_to_lower_bound(&lower_bound) {
+				Ok(()) => {
+					self.positioned = true;
+				}
+				Err(e) => {
+					log::error!("[TABLE_ITER] Error in seek_to_lower_bound(): {}", e);
+					return Some(Err(e));
+				}
+			}
 		}
 
 		// If not valid, return None
@@ -1218,9 +1244,13 @@ impl Iterator for TableIterator {
 		let current_item = (block.key(), block.value());
 
 		// Advance for the next call to next()
-		self.advance();
-
-		Some(current_item)
+		match self.advance() {
+			Ok(_) => Some(Ok(current_item)),
+			Err(e) => {
+				log::error!("[TABLE_ITER] Error in advance(): {}", e);
+				Some(Err(e))
+			}
+		}
 	}
 }
 
@@ -1232,13 +1262,26 @@ impl DoubleEndedIterator for TableIterator {
 			match &self.range.1 {
 				Bound::Included(_) | Bound::Excluded(_) => {
 					let upper_bound = self.range.1.clone();
-					self.seek_to_upper_bound(&upper_bound);
-					self.positioned = true;
-					self.reverse_started = false;
+					match self.seek_to_upper_bound(&upper_bound) {
+						Ok(()) => {
+							self.positioned = true;
+							self.reverse_started = false;
+						}
+						Err(e) => {
+							log::error!("[TABLE_ITER] Error in seek_to_upper_bound(): {}", e);
+							return Some(Err(e));
+						}
+					}
 				}
-				Bound::Unbounded => {
-					self.seek_to_last();
-				}
+				Bound::Unbounded => match self.seek_to_last() {
+					Ok(()) => {
+						self.positioned = true;
+					}
+					Err(e) => {
+						log::error!("[TABLE_ITER] Error in seek_to_last(): {}", e);
+						return Some(Err(e));
+					}
+				},
 			}
 		}
 
@@ -1252,20 +1295,25 @@ impl DoubleEndedIterator for TableIterator {
 
 			let item = (block.key(), block.value());
 			self.reverse_started = true;
-			return Some(item);
+			return Some(Ok(item));
 		}
 
-		if !self.prev() {
-			return None;
-		}
+		match self.prev() {
+			Ok(true) => {
+				let block = self.current_block.as_ref().unwrap();
+				if !self.satisfies_lower_bound(block.user_key()) {
+					return None;
+				}
 
-		let block = self.current_block.as_ref().unwrap();
-		if !self.satisfies_lower_bound(block.user_key()) {
-			return None;
+				let item = (block.key(), block.value());
+				Some(Ok(item))
+			}
+			Ok(false) => None,
+			Err(e) => {
+				log::error!("[TABLE_ITER] Error in prev(): {}", e);
+				Some(Err(e))
+			}
 		}
-
-		let item = (block.key(), block.value());
-		Some(item)
 	}
 }
 
@@ -1276,7 +1324,7 @@ impl TableIterator {
 			&& self.current_block.as_ref().unwrap().valid()
 	}
 
-	pub(crate) fn seek_to_first(&mut self) {
+	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
@@ -1284,35 +1332,43 @@ impl TableIterator {
 
 		if !partitioned_index.blocks.is_empty() {
 			let partition_handle = &partitioned_index.blocks[0];
-			if let Ok(partition_block) = partitioned_index.load_block(partition_handle) {
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek_to_first();
+			let partition_block = partitioned_index.load_block(partition_handle)?;
+			// Note: Index blocks always need full key-value pairs to decode block handles
+			let mut partition_iter = partition_block.iter(false)?;
+			partition_iter.seek_to_first()?;
 
-				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => {
-							self.reset();
-							return;
-						}
-						Ok(res) => res,
-					};
-					self.current_partition_iter = Some(partition_iter);
-					if self.load_block(&handle).is_ok() {
-						self.positioned = true;
-						self.exhausted = false;
-						return;
+			if partition_iter.valid() {
+				let val = partition_iter.value();
+				let (handle, _) = match BlockHandle::decode(&val) {
+					Err(e) => {
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!(
+								"Failed to decode BlockHandle in seek_to_first(): {}",
+								e
+							),
+						});
+						log::error!("[TABLE_ITER] {}", err);
+						return Err(err);
 					}
-				}
+					Ok(res) => res,
+				};
+				self.current_partition_iter = Some(partition_iter);
+				self.load_block(&handle)?;
+				self.positioned = true;
+				self.exhausted = false;
+				return Ok(());
 			}
 		}
 
 		// If we get here, initialization failed
 		self.reset();
+		Err(Error::from(SSTableError::NoValidBlocksForSeek {
+			operation: "first".to_string(),
+		}))
 	}
 
-	pub(crate) fn seek_to_last(&mut self) {
+	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
@@ -1320,128 +1376,148 @@ impl TableIterator {
 			let last_partition_index = partitioned_index.blocks.len() - 1;
 			let last_partition_handle = &partitioned_index.blocks[last_partition_index];
 
-			if let Ok(last_partition_block) = partitioned_index.load_block(last_partition_handle) {
-				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = last_partition_block.iter(false);
-				partition_iter.seek_to_last();
+			let last_partition_block = partitioned_index.load_block(last_partition_handle)?;
+			// Note: Index blocks always need full key-value pairs to decode block handles
+			let mut partition_iter = last_partition_block.iter(false)?;
+			partition_iter.seek_to_last()?;
 
-				if partition_iter.valid() {
-					let val = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&val) {
-						Err(_) => {
-							self.reset();
-							return;
-						}
-						Ok(res) => res,
-					};
-					self.current_partition_index = last_partition_index;
-					self.current_partition_iter = Some(partition_iter);
-					if let Ok(()) = self.load_block(&handle) {
-						if let Some(ref mut block_iter) = self.current_block {
-							block_iter.seek_to_last();
-							self.positioned = true;
-							self.exhausted = false;
-							self.reverse_started = false;
-						}
-					} else {
+			if partition_iter.valid() {
+				let val = partition_iter.value();
+				let (handle, _) = match BlockHandle::decode(&val) {
+					Err(e) => {
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!(
+								"Failed to decode BlockHandle in seek_to_last(): {}",
+								e
+							),
+						});
+						log::error!("[TABLE_ITER] {}", err);
 						self.reset();
+						return Err(err);
 					}
-				} else {
-					self.reset();
+					Ok(res) => res,
+				};
+				self.current_partition_index = last_partition_index;
+				self.current_partition_iter = Some(partition_iter);
+				self.load_block(&handle)?;
+				if let Some(ref mut block_iter) = self.current_block {
+					block_iter.seek_to_last()?;
+					self.positioned = true;
+					self.exhausted = false;
+					self.reverse_started = false;
+					return Ok(());
 				}
-			} else {
-				self.reset();
 			}
-		} else {
-			self.reset();
 		}
+
+		self.reset();
+		Err(Error::from(SSTableError::NoValidBlocksForSeek {
+			operation: "last".to_string(),
+		}))
 	}
 
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, use full internal key for correct partition lookup
-		if let Some((partition_index, block_handle)) =
-			partitioned_index.find_block_handle_by_key(target)
-		{
-			self.current_partition_index = partition_index;
+		match partitioned_index.find_block_handle_by_key(target) {
+			Ok(Some((partition_index, block_handle))) => {
+				self.current_partition_index = partition_index;
 
-			if let Ok(partition_block) = partitioned_index.load_block(block_handle) {
+				let partition_block = partitioned_index.load_block(block_handle)?;
 				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false);
-				partition_iter.seek(target);
+				let mut partition_iter = partition_block.iter(false)?;
+				partition_iter.seek(target)?;
 
 				if partition_iter.valid() {
 					let v = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&v) {
-						Err(_) => {
+						Err(e) => {
+							let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+								value_bytes: v,
+								context: format!("Failed to decode BlockHandle in seek(): {}", e),
+							});
+							log::error!("[TABLE_ITER] {}", err);
 							self.positioned = true;
 							self.current_block = None;
-							return Some(());
+							return Err(err);
 						}
 						Ok(res) => res,
 					};
 					self.current_partition_iter = Some(partition_iter);
-					if let Ok(()) = self.load_block(&handle) {
-						if let Some(ref mut block_iter) = self.current_block {
-							block_iter.seek(target);
-							self.positioned = true;
-							self.exhausted = false;
+					self.load_block(&handle)?;
+					if let Some(ref mut block_iter) = self.current_block {
+						block_iter.seek(target)?;
+						self.positioned = true;
+						self.exhausted = false;
 
-							// If not valid in current block, the key might be in next block
-							if !block_iter.valid() {
-								// Try to advance to next block
-								match self.skip_to_next_entry() {
-									Ok(true) => {
-										// Successfully loaded next block and positioned at first
-										// entry
-										return Some(());
-									}
-									Ok(false) => {
-										// No more blocks - mark as positioned but invalid
-										self.positioned = true;
-										self.current_block = None;
-										return Some(());
-									}
-									Err(_) => {
-										// Error - mark as positioned but invalid
-										self.positioned = true;
-										self.current_block = None;
-										return Some(());
-									}
+						// If not valid in current block, the key might be in next block
+						if !block_iter.valid() {
+							// Try to advance to next block
+							match self.skip_to_next_entry() {
+								Ok(true) => {
+									// Successfully loaded next block and positioned at first entry
+									return Ok(Some(()));
+								}
+								Ok(false) => {
+									// No more blocks - mark as positioned but invalid
+									self.positioned = true;
+									self.current_block = None;
+									return Ok(Some(()));
+								}
+								Err(e) => {
+									log::error!(
+										"[TABLE_ITER] Error in skip_to_next_entry(): {}",
+										e
+									);
+									// Error - mark as positioned but invalid
+									self.positioned = true;
+									self.current_block = None;
+									return Err(e);
 								}
 							}
-
-							return Some(());
 						}
+
+						return Ok(Some(()));
 					}
 				}
+			}
+			Ok(None) => {
+				// Key not found in any partition
+				self.positioned = true;
+				self.current_block = None;
+				return Ok(Some(()));
+			}
+			Err(e) => {
+				log::error!("[TABLE_ITER] Error finding block handle: {}", e);
+				return Err(e);
 			}
 		}
 
 		// If we can't position in any block, mark as positioned but invalid
 		self.positioned = true;
 		self.current_block = None;
-		Some(())
+		Ok(Some(()))
 	}
 
-	pub(crate) fn advance(&mut self) -> bool {
+	pub(crate) fn advance(&mut self) -> Result<bool> {
 		// If exhausted, stay exhausted
 		if self.exhausted {
-			return false;
+			return Ok(false);
 		}
 
 		// If not positioned, position at first entry
 		if !self.positioned {
-			self.seek_to_first();
-			return self.valid();
+			self.seek_to_first()?;
+			return Ok(self.valid());
 		}
 
 		// Try to advance within the current block first
 		if let Some(ref mut block) = self.current_block {
-			if block.advance() {
+			if block.advance()? {
 				// Successfully advanced within current block
-				return true;
+				return Ok(true);
 			}
 		}
 
@@ -1449,17 +1525,18 @@ impl TableIterator {
 		match self.skip_to_next_entry() {
 			Ok(true) => {
 				// Successfully loaded next block and positioned at first entry
-				true
+				Ok(true)
 			}
 			Ok(false) => {
 				// No more blocks available - mark as exhausted
 				self.mark_exhausted();
-				false
+				Ok(false)
 			}
-			Err(_) => {
+			Err(e) => {
+				log::error!("[TABLE_ITER] Error in advance(): {}", e);
 				// Error loading next block - mark as exhausted
 				self.mark_exhausted();
-				false
+				Err(e)
 			}
 		}
 	}
@@ -1634,22 +1711,22 @@ mod tests {
 		let mut iter = table.iter(false, None);
 
 		let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&key.encode());
+		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
 		let key = InternalKey::new(Vec::from(b"abc"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&key.encode());
+		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
 		// Seek-past-last invalidates.
 		let key = InternalKey::new(Vec::from(b"{{{"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&key.encode());
+		iter.seek(&key.encode()).unwrap();
 		assert!(!iter.valid());
 
 		let key = InternalKey::new(Vec::from(b"bbb"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&key.encode());
+		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 	}
 
@@ -1661,31 +1738,31 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 		let mut iter = table.iter(false, None);
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abd"[..], &b"dee"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bsr"[..], &b"a00"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"xyz"[..], &b"xxx"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"xzz"[..], &b"yyy"[..]));
 
-		iter.advance();
+		iter.advance().unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"zzz"[..], &b"111"[..]));
 	}
@@ -1804,7 +1881,8 @@ mod tests {
 		);
 
 		let iter = table.iter(false, None);
-		for (item, (key, value)) in iter.enumerate() {
+		for (item, item_result) in iter.enumerate() {
+			let (key, value) = item_result.unwrap();
 			let expected_key = format!("key_{item:05}");
 			let expected_value = format!("value_{item:05}");
 			assert_eq!(
@@ -2436,7 +2514,8 @@ mod tests {
 		let iter = table.iter(false, None);
 		let mut collected_items = Vec::new();
 
-		for (key, value) in iter {
+		for item in iter {
+			let (key, value) = item.unwrap();
 			let key_str = std::str::from_utf8(&key.user_key).unwrap();
 			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 			collected_items.push((key_str.to_string(), value_str.to_string()));
@@ -2493,7 +2572,8 @@ mod tests {
 			}
 
 			match iter.next() {
-				Some((key, value)) => {
+				Some(item) => {
+					let (key, value) = item.unwrap();
 					let key_str = std::str::from_utf8(&key.user_key).unwrap();
 					let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 					seen_keys.push((key_str.to_string(), value_str.to_string()));
@@ -2517,7 +2597,8 @@ mod tests {
 
 		for i in 0..3 {
 			let result = iter.next();
-			if let Some((key, value)) = result {
+			if let Some(item) = result {
+				let (key, value) = item.unwrap();
 				let key_str = std::str::from_utf8(&key.user_key).unwrap();
 				let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 				panic!(
@@ -2539,7 +2620,7 @@ mod tests {
 		let mut iter = table.iter(false, None);
 
 		for expected_index in 0..data.len() {
-			let advance_result = iter.advance();
+			let advance_result = iter.advance().unwrap();
 
 			assert!(
 				advance_result,
@@ -2561,7 +2642,7 @@ mod tests {
             );
 		}
 
-		let final_advance = iter.advance();
+		let final_advance = iter.advance().unwrap();
 		assert!(
 			!final_advance,
 			"advance() should return false when trying to advance past the last item"
@@ -2569,7 +2650,7 @@ mod tests {
 		assert!(!iter.valid(), "Iterator should be invalid after advancing past the last item");
 
 		for i in 0..3 {
-			let advance_result = iter.advance();
+			let advance_result = iter.advance().unwrap();
 			assert!(
 				!advance_result,
 				"advance() should continue returning false after exhaustion (call #{})",
@@ -2591,7 +2672,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false, None).collect();
+			let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 			assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
 			let key_str = std::str::from_utf8(&collected[0].0.user_key).unwrap();
@@ -2607,7 +2688,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false, None).collect();
+			let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 			assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
 			let keys: Vec<String> = collected
@@ -2629,7 +2710,7 @@ mod tests {
 			let opts = default_opts();
 			let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-			let collected: Vec<_> = table.iter(false, None).collect();
+			let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 			assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
 			let mut seen_keys = std::collections::HashSet::new();
@@ -2669,7 +2750,7 @@ mod tests {
 
 			let internal_key =
 				InternalKey::new(Vec::from(seek_key.as_bytes()), 1, InternalKeyKind::Set, 0);
-			iter.seek(&internal_key.encode());
+			iter.seek(&internal_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to '{seek_key}'");
 
@@ -2681,7 +2762,7 @@ mod tests {
 				let value_str = std::str::from_utf8(current_value.as_ref()).unwrap();
 				remaining_items.push((key_str.to_string(), value_str.to_string()));
 
-				if !iter.advance() {
+				if !iter.advance().unwrap() {
 					break;
 				}
 			}
@@ -2729,7 +2810,7 @@ mod tests {
 		{
 			let mut iter = table.iter(false, None);
 			let seek_key = InternalKey::new(Vec::from(b"key_005"), 1, InternalKeyKind::Set, 0);
-			iter.seek(&seek_key.encode());
+			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
 			let current_key = iter.key();
@@ -2737,7 +2818,8 @@ mod tests {
 			assert_eq!(found_key, "key_005", "Should find the exact key we sought");
 
 			let remaining: Vec<_> = iter
-				.map(|(k, v)| {
+				.map(|item| {
+					let (k, v) = item.unwrap();
 					(
 						std::str::from_utf8(&k.user_key).unwrap().to_string(),
 						std::str::from_utf8(v.as_ref()).unwrap().to_string(),
@@ -2761,7 +2843,7 @@ mod tests {
 		{
 			let mut iter = table.iter(false, None);
 			let seek_key = InternalKey::new(Vec::from(b"key_003"), 1, InternalKeyKind::Set, 0);
-			iter.seek(&seek_key.encode());
+			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
 			let current_key = iter.key();
@@ -2773,7 +2855,7 @@ mod tests {
 		{
 			let mut iter = table.iter(false, None);
 			let seek_key = InternalKey::new(Vec::from(b"key_999"), 1, InternalKeyKind::Set, 0);
-			iter.seek(&seek_key.encode());
+			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(!iter.valid(), "Iterator should be invalid after seeking past end");
 		}
@@ -2808,7 +2890,7 @@ mod tests {
 			let mut iter = table.iter(false, None);
 			let seek_key =
 				InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
-			iter.seek(&seek_key.encode());
+			iter.seek(&seek_key.encode()).unwrap();
 			assert!(iter.valid(), "Seek to key_{i:06} should succeed");
 		}
 		let seek_duration = start.elapsed();
@@ -2827,13 +2909,13 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let mut iter = table.iter(false, None);
-		iter.seek_to_first();
+		iter.seek_to_first().unwrap();
 
 		while iter.valid() {
 			let _key = iter.key();
 			let _value = iter.value();
 
-			if !iter.advance() {
+			if !iter.advance().unwrap() {
 				break;
 			}
 		}
@@ -2841,7 +2923,10 @@ mod tests {
 		assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 		for _ in 0..5 {
-			assert!(!iter.advance(), "advance() should continue returning false after exhaustion");
+			assert!(
+				!iter.advance().unwrap(),
+				"advance() should continue returning false after exhaustion"
+			);
 			assert!(!iter.valid(), "Iterator should remain invalid");
 
 			let next_result = iter.next();
@@ -2862,7 +2947,7 @@ mod tests {
 
 		// Create multiple iterators and verify they work independently
 		for iteration in 0..3 {
-			let collected: Vec<_> = table.iter(false, None).collect();
+			let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 
 			assert_eq!(
 				collected.len(),
@@ -2875,16 +2960,17 @@ mod tests {
 
 			// Verify content is correct
 			for (i, (expected_key, expected_value)) in data.iter().enumerate() {
-				let actual_key = std::str::from_utf8(&collected[i].0.user_key).unwrap();
-				let actual_value = std::str::from_utf8(collected[i].1.as_ref()).unwrap();
+				let (actual_key, actual_value) = &collected[i];
+				let actual_key_str = std::str::from_utf8(&actual_key.user_key).unwrap();
+				let actual_value_str = std::str::from_utf8(actual_value.as_ref()).unwrap();
 
 				assert_eq!(
-                    actual_key, *expected_key,
-                    "Iteration #{iteration}, item {i}: expected key '{expected_key}', got '{actual_key}'"
+                    actual_key_str, *expected_key,
+                    "Iteration #{iteration}, item {i}: expected key '{expected_key}', got '{actual_key_str}'"
                 );
 				assert_eq!(
-                    actual_value, *expected_value,
-                    "Iteration #{iteration}, item {i}: expected value '{expected_value}', got '{actual_value}'"
+                    actual_value_str, *expected_value,
+                    "Iteration #{iteration}, item {i}: expected value '{expected_value}', got '{actual_value_str}'"
                 );
 			}
 		}
@@ -2902,11 +2988,10 @@ mod tests {
 			let mut iter = table.iter(false, None);
 
 			let result = iter.advance();
-			assert!(!result, "advance() on empty table should return false");
-			assert!(!iter.valid(), "Iterator should be invalid on empty table");
+			assert!(result.is_err(), "advance() on empty table should return error");
 
-			let result = iter.next();
-			assert!(result.is_none(), "next() on empty table should return None");
+			let result = iter.next().unwrap();
+			assert!(result.is_err(), "next() on empty table should return error");
 		}
 
 		// Test 2: Single item table
@@ -2918,10 +3003,10 @@ mod tests {
 
 			let mut iter = table.iter(false, None);
 
-			assert!(iter.advance(), "First advance should succeed on single-item table");
+			assert!(iter.advance().unwrap(), "First advance should succeed on single-item table");
 			assert!(iter.valid(), "Iterator should be valid after first advance");
 
-			assert!(!iter.advance(), "Second advance should fail on single-item table");
+			assert!(!iter.advance().unwrap(), "Second advance should fail on single-item table");
 			assert!(!iter.valid(), "Iterator should be invalid after second advance");
 		}
 
@@ -2935,13 +3020,13 @@ mod tests {
 			let mut iter = table.iter(false, None);
 
 			// Exhaust the iterator
-			while iter.advance() {
+			while iter.advance().unwrap() {
 				// just advance
 			}
 			assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 			// Further operations should not restart the iterator
-			assert!(!iter.advance(), "advance() after exhaustion should return false");
+			assert!(!iter.advance().unwrap(), "advance() after exhaustion should return false");
 			assert!(!iter.valid(), "Iterator should remain invalid");
 
 			let next_result = iter.next();
@@ -2958,11 +3043,11 @@ mod tests {
 
 		// Test with manual advance() loop - need to position first
 		let mut iter1 = table.iter(false, None);
-		iter1.seek_to_first();
+		iter1.seek_to_first().unwrap();
 		let mut collected_via_advance = Vec::new();
 		while iter1.valid() {
 			collected_via_advance.push((iter1.key(), iter1.value()));
-			if !iter1.advance() {
+			if !iter1.advance().unwrap() {
 				break;
 			}
 		}
@@ -2970,7 +3055,8 @@ mod tests {
 		// Test with standard iterator interface
 		let iter2 = table.iter(false, None);
 		let mut collected_via_next = Vec::new();
-		for (key, value) in iter2 {
+		for item in iter2 {
+			let (key, value) = item.unwrap();
 			collected_via_next.push((key, value));
 		}
 
@@ -3010,7 +3096,7 @@ mod tests {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let collected: Vec<_> = table.iter(false, None).collect();
+		let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 
 		assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
 
@@ -3085,7 +3171,7 @@ mod tests {
 
 		// Test full iteration
 		let iter = table.iter(false, None);
-		let collected: Vec<_> = iter.collect();
+		let collected: Vec<_> = iter.map(|r| r.unwrap()).collect();
 		assert_eq!(collected.len(), 100, "Should iterate through all entries");
 
 		// Verify iteration order and content
@@ -3666,7 +3752,7 @@ mod tests {
 			InternalKeyKind::Set,
 			0,
 		);
-		iter.seek(&lookup_key.encode());
+		iter.seek(&lookup_key.encode()).unwrap();
 
 		// Iterator behavior: seek positions at next >= key
 		assert!(iter.valid(), "Iterator should be valid (positioned at next key)");
@@ -3702,7 +3788,7 @@ mod tests {
 		// Seek to key_zzz which is past all keys
 		let mut iter = table.iter(false, None);
 		let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&lookup_key.encode());
+		iter.seek(&lookup_key.encode()).unwrap();
 
 		// Iterator should be invalid (no more keys)
 		assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
@@ -3726,7 +3812,7 @@ mod tests {
 		// Seek to key_bbb which exists
 		let mut iter = table.iter(false, None);
 		let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 2, InternalKeyKind::Set, 0);
-		iter.seek(&lookup_key.encode());
+		iter.seek(&lookup_key.encode()).unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid");
 
@@ -3769,7 +3855,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -3817,7 +3903,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -3854,7 +3940,7 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		// First test forward iteration to make sure table has data
-		let collected: Vec<_> = table.iter(false, None).collect();
+		let collected: Vec<_> = table.iter(false, None).map(|r| r.unwrap()).collect();
 		assert_eq!(collected.len(), 10, "Forward iteration should return 10 items");
 
 		let forward_keys: Vec<String> = collected
@@ -3871,11 +3957,11 @@ mod tests {
 
 		// Test unbounded reverse iteration
 		let mut iter = table.iter(false, None);
-		iter.seek_to_last(); // Position at the end for reverse iteration
+		iter.seek_to_last().unwrap(); // Position at the end for reverse iteration
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		// Should return all 10 items in reverse order
@@ -3915,7 +4001,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -3964,7 +4050,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -4003,7 +4089,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -4058,7 +4144,7 @@ mod tests {
 		let forward_iter = table.iter(false, None);
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			forward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(forward_keys.len(), 30);
@@ -4069,7 +4155,7 @@ mod tests {
 		let mut backward_iter = table.iter(false, None);
 		let mut backward_keys = Vec::new();
 		while let Some(item) = backward_iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			backward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(backward_keys.len(), 30);
@@ -4078,10 +4164,10 @@ mod tests {
 
 		// Test seeking to last and then going backward
 		let mut seek_iter = table.iter(false, None);
-		seek_iter.seek_to_last();
+		seek_iter.seek_to_last().unwrap();
 		let mut seek_backward = Vec::new();
 		while let Some(item) = seek_iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			seek_backward.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 		assert_eq!(seek_backward.len(), 30);
@@ -4135,7 +4221,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -4179,7 +4265,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -4223,7 +4309,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key.clone()).unwrap());
 		}
 
@@ -4263,7 +4349,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
@@ -4319,7 +4405,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
@@ -4453,7 +4539,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push((user_key, key.seq_num()));
 		}
@@ -4510,7 +4596,7 @@ mod tests {
 
 		let mut results = Vec::new();
 		for item in iter {
-			let (key, _) = item;
+			let (key, _) = item.unwrap();
 			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
 			results.push(user_key);
 		}
@@ -4670,13 +4756,13 @@ mod tests {
 
 		// Create iterator and position at the LAST entry
 		let mut iter = table_arc.iter(false, None);
-		iter.seek_to_last();
+		iter.seek_to_last().unwrap();
 		assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
 		// Collect all keys going backwards using the CORRECT inherent prev() method
 		let mut correct_results = Vec::new();
 		correct_results.push(iter.key().user_key);
-		while iter.prev() {
+		while iter.prev().unwrap() {
 			correct_results.push(iter.key().user_key.clone());
 		}
 		let correct_count = correct_results.len();
@@ -4686,13 +4772,13 @@ mod tests {
 		// Now test with explicit trait method call
 		// Reset iterator
 		let mut iter2 = table_arc.iter(false, None);
-		iter2.seek_to_last();
+		iter2.seek_to_last().unwrap();
 		assert!(iter2.valid(), "Iterator should be valid after seek_to_last");
 
 		// Collect all keys going backwards using the BUGGY trait prev() method
 		let mut buggy_results = Vec::new();
 		buggy_results.push(iter2.key().user_key);
-		while iter2.prev() {
+		while iter2.prev().unwrap() {
 			buggy_results.push(iter2.key().user_key.clone());
 		}
 		let buggy_count = buggy_results.len();
@@ -5072,7 +5158,8 @@ mod tests {
 
 		// Collect all items in reverse
 		let mut results = Vec::new();
-		while let Some((key, _)) = iter.next_back() {
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key).unwrap());
 		}
 
@@ -5115,7 +5202,8 @@ mod tests {
 		let mut iter = table.iter(false, None);
 		let mut results = Vec::new();
 
-		while let Some((key, _)) = iter.next_back() {
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key).unwrap());
 		}
 
@@ -5143,7 +5231,7 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 		let mut iter = table.iter(false, None);
-		iter.seek_to_last();
+		iter.seek_to_last().unwrap();
 
 		assert!(iter.valid());
 		let key = iter.key();
@@ -5181,8 +5269,12 @@ mod tests {
 			)),
 		);
 
-		let results: Vec<String> =
-			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+		let results: Vec<String> = iter
+			.map(|item| {
+				let (k, _) = item.unwrap();
+				String::from_utf8(k.user_key).unwrap()
+			})
+			.collect();
 
 		assert_eq!(results.len(), 4);
 		assert_eq!(results[0], "key_003");
@@ -5215,7 +5307,10 @@ mod tests {
 		);
 
 		let results: Vec<(String, u64)> = iter
-			.map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num()))
+			.map(|item| {
+				let (k, _) = item.unwrap();
+				(String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num())
+			})
 			.collect();
 
 		// Should have 3 versions of key_002 + 1 version of key_003 = 4 items
@@ -5255,8 +5350,12 @@ mod tests {
 			)),
 		);
 
-		let results: Vec<String> =
-			iter.map(|(k, _)| String::from_utf8(k.user_key).unwrap()).collect();
+		let results: Vec<String> = iter
+			.map(|item| {
+				let (k, _) = item.unwrap();
+				String::from_utf8(k.user_key).unwrap()
+			})
+			.collect();
 
 		// Should only have key_003
 		assert_eq!(results.len(), 1, "Expected 1 item, got {:?}", results);
@@ -5291,7 +5390,8 @@ mod tests {
 		);
 
 		let mut results = Vec::new();
-		while let Some((key, _)) = iter.next_back() {
+		while let Some(item) = iter.next_back() {
+			let (key, _) = item.unwrap();
 			results.push(String::from_utf8(key.user_key).unwrap());
 		}
 
@@ -5342,7 +5442,7 @@ mod tests {
 			)),
 		);
 
-		let results: Vec<_> = iter.collect();
+		let results: Vec<_> = iter.map(|r| r.unwrap()).collect();
 		assert_eq!(results.len(), 0, "Range before all keys should be empty");
 	}
 
@@ -5363,7 +5463,7 @@ mod tests {
 			)),
 		);
 
-		let results: Vec<_> = iter.collect();
+		let results: Vec<_> = iter.map(|r| r.unwrap()).collect();
 		assert_eq!(results.len(), 0, "Range after all keys should be empty");
 	}
 

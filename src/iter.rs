@@ -8,7 +8,7 @@ use crate::sstable::InternalKey;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Key, Value};
 
-pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = (InternalKey, Value)> + 'a>;
+pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + 'a>;
 
 // Holds a key-value pair and the iterator index
 #[derive(Eq)]
@@ -134,10 +134,11 @@ impl<'a> CompactionIterator<'a> {
 		}
 	}
 
-	fn initialize(&mut self) {
+	fn initialize(&mut self) -> Result<()> {
 		// Pull the first item from each iterator and add to heap
 		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some((key, value)) = iter.next() {
+			if let Some(item_result) = iter.next() {
+				let (key, value) = item_result?;
 				self.heap.push(HeapItem {
 					key,
 					value,
@@ -146,6 +147,7 @@ impl<'a> CompactionIterator<'a> {
 			}
 		}
 		self.initialized = true;
+		Ok(())
 	}
 
 	/// Flushes the batched delete-list entries to the VLog
@@ -272,11 +274,14 @@ impl<'a> CompactionIterator<'a> {
 }
 
 impl Iterator for CompactionIterator<'_> {
-	type Item = (InternalKey, Value);
+	type Item = Result<(InternalKey, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if !self.initialized {
-			self.initialize();
+			if let Err(e) = self.initialize() {
+				log::error!("[COMPACTION_ITER] Error initializing: {}", e);
+				return Some(Err(e));
+			}
 		}
 
 		loop {
@@ -284,7 +289,7 @@ impl Iterator for CompactionIterator<'_> {
 			if !self.output_versions.is_empty() {
 				// Remove from front to maintain sequence number order (already sorted
 				// descending)
-				return Some(self.output_versions.remove(0));
+				return Some(Ok(self.output_versions.remove(0)));
 			}
 
 			// Get the next item from the heap
@@ -296,7 +301,7 @@ impl Iterator for CompactionIterator<'_> {
 						self.process_accumulated_versions();
 						// Return first output version if any
 						if !self.output_versions.is_empty() {
-							return Some(self.output_versions.remove(0));
+							return Some(Ok(self.output_versions.remove(0)));
 						}
 					}
 					return None;
@@ -304,12 +309,24 @@ impl Iterator for CompactionIterator<'_> {
 			};
 
 			// Pull the next item from the same iterator and add back to heap
-			if let Some((key, value)) = self.iterators[heap_item.iterator_index].next() {
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: heap_item.iterator_index,
-				});
+			if let Some(item_result) = self.iterators[heap_item.iterator_index].next() {
+				match item_result {
+					Ok((key, value)) => {
+						self.heap.push(HeapItem {
+							key,
+							value,
+							iterator_index: heap_item.iterator_index,
+						});
+					}
+					Err(e) => {
+						log::error!(
+							"[COMPACTION_ITER] Error from iterator {}: {}",
+							heap_item.iterator_index,
+							e
+						);
+						return Some(Err(e));
+					}
+				}
 			}
 
 			let user_key = heap_item.key.user_key.clone();
@@ -331,7 +348,7 @@ impl Iterator for CompactionIterator<'_> {
 
 					// Return first output version from processed key if any
 					if !self.output_versions.is_empty() {
-						return Some(self.output_versions.remove(0));
+						return Some(Ok(self.output_versions.remove(0)));
 					}
 				} else {
 					// First key - start accumulating
@@ -406,13 +423,13 @@ mod tests {
 	}
 
 	impl Iterator for MockIterator {
-		type Item = (InternalKey, Value);
+		type Item = Result<(InternalKey, Value)>;
 
 		fn next(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {
 				let item = self.items[self.index].clone();
 				self.index += 1;
-				Some(item)
+				Some(Ok(item))
 			} else {
 				None
 			}
@@ -423,7 +440,7 @@ mod tests {
 		fn next_back(&mut self) -> Option<Self::Item> {
 			if self.index < self.items.len() {
 				let item = self.items.pop()?;
-				Some(item)
+				Some(Ok(item))
 			} else {
 				None
 			}
@@ -467,7 +484,8 @@ mod tests {
 
 		// Collect all items
 		let mut result = Vec::new();
-		for (key, _) in merge_iter.by_ref() {
+		for item in merge_iter.by_ref() {
+			let (key, _) = item.unwrap();
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			let seq = key.seq_num();
 			let kind = key.kind();
@@ -544,7 +562,8 @@ mod tests {
 
 		// Collect all items
 		let mut result = Vec::new();
-		for (key, _) in comp_iter.by_ref() {
+		for item in comp_iter.by_ref() {
+			let (key, _) = item.unwrap();
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			let seq = key.seq_num();
 			let kind = key.kind();
@@ -616,7 +635,8 @@ mod tests {
 
 		// Collect all items
 		let mut bottom_result = Vec::new();
-		for (key, _) in comp_iter.by_ref() {
+		for item in comp_iter.by_ref() {
+			let (key, _) = item.unwrap();
 			let key_str = String::from_utf8_lossy(&key.user_key).to_string();
 			bottom_result.push(key_str);
 		}
@@ -672,7 +692,7 @@ mod tests {
 		);
 
 		// Should return only the latest version (seq=300)
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
@@ -728,7 +748,7 @@ mod tests {
 		);
 
 		// Consume the iterator
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// Verify we get the latest version with correct value
 		assert_eq!(result.len(), 1);
@@ -786,7 +806,7 @@ mod tests {
 		);
 
 		// At bottom level, hard_delete should NOT be returned
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 		assert_eq!(result.len(), 0, "At bottom level, hard_delete should not be returned");
 
 		// Flush delete list batch
@@ -829,7 +849,7 @@ mod tests {
 		);
 
 		// At non-bottom level, hard_delete SHOULD be returned
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 		assert_eq!(result.len(), 1, "At non-bottom level, hard_delete should be returned");
 
 		let (returned_key, returned_value) = &result[0];
@@ -891,7 +911,7 @@ mod tests {
 			Arc::new(MockLogicalClock::default()),
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// Should get 3 keys back (latest version of each)
 		assert_eq!(result.len(), 3);
@@ -975,7 +995,7 @@ mod tests {
 		);
 
 		// Should still work and return latest version
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 		assert_eq!(result.len(), 1);
 
 		let (returned_key, returned_value) = &result[0];
@@ -1038,7 +1058,7 @@ mod tests {
 			Arc::new(MockLogicalClock::default()),
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// Should get 4 keys in alphabetical order
 		assert_eq!(result.len(), 4);
@@ -1192,7 +1212,7 @@ mod tests {
 			clock,
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// With versioning enabled and retention period of 5 seconds, should get 7 items
 		// total:
@@ -1373,7 +1393,7 @@ mod tests {
 			clock,
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// With versioning enabled at bottom level:
 		// - key1: 0 versions (DELETE is latest, entire key discarded)
@@ -1538,7 +1558,7 @@ mod tests {
 			clock,
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// Without versioning at non-bottom level, should get 3 items (only latest
 		// versions):
@@ -1680,7 +1700,7 @@ mod tests {
 			clock,
 		);
 
-		let result: Vec<_> = comp_iter.by_ref().collect();
+		let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
 		// Without versioning at bottom level, should get 1 item:
 		// - key1: 1 version (latest SET, seq=300)
@@ -2012,7 +2032,7 @@ mod tests {
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
-			result.push(item);
+			result.push(item.unwrap());
 		}
 
 		// Should return only the Replace version (latest)
@@ -2078,7 +2098,7 @@ mod tests {
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
-			result.push(item);
+			result.push(item.unwrap());
 		}
 
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -2136,7 +2156,7 @@ mod tests {
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
-			result.push(item);
+			result.push(item.unwrap());
 		}
 
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -2192,7 +2212,7 @@ mod tests {
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
-			result.push(item);
+			result.push(item.unwrap());
 		}
 
 		comp_iter.flush_delete_list_batch().unwrap();
@@ -2250,7 +2270,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2304,7 +2324,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2362,7 +2382,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2421,7 +2441,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2495,7 +2515,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2547,7 +2567,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2597,7 +2617,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2655,7 +2675,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2711,7 +2731,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2768,7 +2788,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2819,7 +2839,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale
@@ -2869,7 +2889,7 @@ mod tests {
 
 			let mut result = Vec::new();
 			for item in comp_iter.by_ref() {
-				result.push(item);
+				result.push(item.unwrap());
 			}
 
 			// Flush to mark entries as stale

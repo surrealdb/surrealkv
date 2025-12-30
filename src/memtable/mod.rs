@@ -214,7 +214,8 @@ impl MemTable {
 				0,                           // retention period is 0 in flush context
 				Arc::clone(&lsm_opts.clock), // clock is the system clock
 			);
-			for (key, encoded_val) in comp_iter.by_ref() {
+			for item in comp_iter.by_ref() {
+				let (key, encoded_val) = item?;
 				// The memtable already contains the correct ValueLocation encoding
 				// (either inline or with VLog pointer), so we can use it directly
 				table_writer.add(key, &encoded_val)?;
@@ -235,7 +236,7 @@ impl MemTable {
 	pub(crate) fn iter(
 		&self,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
 		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -243,7 +244,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(key, value)
+			Ok((key, value))
 		})
 	}
 
@@ -251,7 +252,7 @@ impl MemTable {
 		&self,
 		range: InternalKeyRange,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = (InternalKey, Value)> + '_ {
+	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
 		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
@@ -259,7 +260,7 @@ impl MemTable {
 			} else {
 				entry.value().clone()
 			};
-			(key, value)
+			Ok((key, value))
 		})
 	}
 }
@@ -444,7 +445,7 @@ mod tests {
 		let memtable = Arc::new(MemTable::new());
 
 		// Test that iterator is empty
-		let entries: Vec<_> = memtable.iter(false).collect();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert!(entries.is_empty());
 
 		// Test that is_empty returns true
@@ -464,7 +465,7 @@ mod tests {
 		)]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert_eq!(entries.len(), 1);
 
 		let (key, encoded_value) = &entries[0];
@@ -491,7 +492,7 @@ mod tests {
 		]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert_eq!(entries.len(), 3);
 
 		// Extract user keys for comparison
@@ -520,7 +521,7 @@ mod tests {
 		]);
 
 		// Collect all entries
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert_eq!(entries.len(), 3);
 
 		// Extract sequence numbers and values
@@ -583,7 +584,7 @@ mod tests {
 		]);
 
 		// Iterator should see all entries including tombstones
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 
 		// Count entries for each key
 		let mut key_counts = HashMap::new();
@@ -608,7 +609,7 @@ mod tests {
 		]);
 
 		// All key types should be visible in the iterator
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert_eq!(entries.len(), 4);
 
 		// Extract and verify key information
@@ -671,7 +672,8 @@ mod tests {
 				),
 				false,
 			)
-			.collect::<Vec<_>>();
+			.map(|r| r.unwrap())
+			.collect();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -691,7 +693,8 @@ mod tests {
 				),
 				false,
 			)
-			.collect::<Vec<_>>();
+			.map(|r| r.unwrap())
+			.collect();
 
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -723,7 +726,8 @@ mod tests {
 				),
 				false,
 			)
-			.collect::<Vec<_>>();
+			.map(|r| r.unwrap())
+			.collect();
 
 		// Extract user keys, sequence numbers and values
 		let mut entries_info = Vec::new();
@@ -769,7 +773,7 @@ mod tests {
 			(vec![0xFF, 0xFE, 0xFD], b"value4".to_vec(), InternalKeyKind::Set, None),
 		]);
 
-		let entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
+		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
 		assert_eq!(entries.len(), 4);
 
 		// Extract and verify user keys are in correct order

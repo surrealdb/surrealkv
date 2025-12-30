@@ -119,7 +119,7 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	let mut iter = table.iter(false, None);
 	let mut count = 0;
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		let value = iter.value();
@@ -128,14 +128,14 @@ fn test_compression_10k_pairs_roundtrip() {
 		assert_eq!(value.as_slice(), &data[count].1[..]);
 
 		count += 1;
-		iter.advance();
+		iter.advance().unwrap();
 	}
 	assert_eq!(count, 10_000, "Should iterate through all 10k entries");
 
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode());
+		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Iterator should be valid after seek");
 		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
 		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
@@ -204,16 +204,16 @@ fn test_compression_size_reduction() {
 	let mut iter_uncompressed = table_uncompressed.iter(false, None);
 	let mut iter_compressed = table_compressed.iter(false, None);
 
-	iter_uncompressed.seek_to_first();
-	iter_compressed.seek_to_first();
+	iter_uncompressed.seek_to_first().unwrap();
+	iter_compressed.seek_to_first().unwrap();
 
 	let mut count = 0;
 	while iter_uncompressed.valid() && iter_compressed.valid() {
 		assert_eq!(iter_uncompressed.key().user_key, iter_compressed.key().user_key);
 		assert_eq!(iter_uncompressed.value(), iter_compressed.value());
 		count += 1;
-		iter_uncompressed.advance();
-		iter_compressed.advance();
+		iter_uncompressed.advance().unwrap();
+		iter_compressed.advance().unwrap();
 	}
 	assert_eq!(count, 10_000, "Both tables should have identical 10k entries");
 }
@@ -262,14 +262,14 @@ fn test_compression_mixed_patterns() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	let mut iter = table.iter(false, None);
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
 	while iter.valid() {
 		assert_eq!(iter.key().user_key.as_slice(), &data[count].0[..]);
 		assert_eq!(iter.value().as_slice(), &data[count].1[..]);
 		count += 1;
-		iter.advance();
+		iter.advance().unwrap();
 	}
 
 	assert_eq!(count, 10_000, "Should have all 10k mixed pattern entries");
@@ -298,12 +298,12 @@ fn test_compression_iterator_operations() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 	let mut iter = table.iter(false, None);
 
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
 	assert_eq!(iter.value().as_slice(), &data[0].1[..]);
 
-	iter.seek_to_last();
+	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
 	assert_eq!(iter.value().as_slice(), &data[9999].1[..]);
@@ -311,59 +311,59 @@ fn test_compression_iterator_operations() {
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode());
+		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find key at index {}", idx);
 		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
 		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
 	}
 
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	let mut forward_count = 0;
 	while iter.valid() {
 		assert_eq!(iter.key().user_key.as_slice(), &data[forward_count].0[..]);
 		forward_count += 1;
-		iter.advance();
+		iter.advance().unwrap();
 	}
 	assert_eq!(forward_count, 10_000);
 
 	// TableIterator prev() has complexity with partitions, so test basic backward
 	// movement
-	iter.seek_to_last();
+	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
 
-	iter.prev();
+	iter.prev().unwrap();
 	assert!(iter.valid(), "Should be valid after first prev()");
 
 	let prev_key = iter.key().user_key;
 	assert!(prev_key < data[9999].0, "Previous key should be less than last key");
 
 	for _ in 0..10 {
-		if !iter.prev() {
+		if !iter.prev().unwrap() {
 			break;
 		}
 	}
 	assert!(iter.valid(), "Should still be valid after moving backward");
 
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
 
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	iter.advance();
+	iter.advance().unwrap();
 	assert_eq!(iter.key().user_key.as_slice(), &data[1].0[..]);
-	iter.prev();
+	iter.prev().unwrap();
 	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
 
 	let mid_key = InternalKey::new(data[5000].0.clone(), 2, InternalKeyKind::Set, 0);
-	iter.seek(&mid_key.encode());
+	iter.seek(&mid_key.encode()).unwrap();
 	assert_eq!(iter.key().user_key.as_slice(), &data[5000].0[..]);
 
-	iter.advance();
-	iter.advance();
+	iter.advance().unwrap();
+	iter.advance().unwrap();
 	assert_eq!(iter.key().user_key.as_slice(), &data[5002].0[..]);
-	iter.prev();
+	iter.prev().unwrap();
 	assert_eq!(iter.key().user_key.as_slice(), &data[5001].0[..]);
 }
 
@@ -398,7 +398,7 @@ fn test_compression_large_values() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	let mut iter = table.iter(false, None);
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
 	while iter.valid() {
@@ -415,7 +415,7 @@ fn test_compression_large_values() {
 		);
 
 		count += 1;
-		iter.advance();
+		iter.advance().unwrap();
 	}
 
 	assert_eq!(count, 1_000, "Should have all 1000 large value entries");
@@ -423,7 +423,7 @@ fn test_compression_large_values() {
 	let test_indices = [0, 100, 500, 999];
 	for &idx in &test_indices {
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode());
+		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find large value at index {}", idx);
 		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
 		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
@@ -452,7 +452,7 @@ fn test_compression_checksum_verification() {
 	let table =
 		Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer.clone()), size as u64).unwrap());
 	let mut iter = table.iter(false, None);
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Uncorrupted table should be valid");
 
 	// Corrupt data block (skip footer/metadata at end)
@@ -471,32 +471,9 @@ fn test_compression_checksum_verification() {
 			// Corruption might be in a data block - try to iterate
 			let corrupted_table = Arc::new(corrupted_table);
 			let mut corrupted_iter = corrupted_table.iter(false, None);
-			corrupted_iter.seek_to_first();
-
-			let mut corruption_detected = false;
-			let mut iterations = 0;
-
-			while corrupted_iter.valid() && iterations < 100 {
-				let _ = corrupted_iter.value();
-				iterations += 1;
-				corrupted_iter.advance();
-			}
-
-			// If we stopped before reading all 100 entries, corruption was likely detected
-			if iterations < 100 {
-				corruption_detected = true;
-			}
-
-			println!(
-				"Corruption test: iterations before stop = {}, corruption_detected = {}",
-				iterations, corruption_detected
-			);
-
-			// ASSERT: We must have detected corruption during iteration
 			assert!(
-				corruption_detected,
-				"Corruption should have been detected during iteration, but {} entries were read successfully",
-				iterations
+				corrupted_iter.seek_to_first().is_err(),
+				"seek_to_first() on corrupted table should return error"
 			);
 		}
 	}
@@ -929,7 +906,7 @@ fn test_table_writer_with_level_compression() {
 
 	// Verify the table was created successfully
 	let mut iter = table.iter(false, None);
-	iter.seek_to_first();
+	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key.as_slice(), b"key1");
 	assert_eq!(iter.value().as_slice(), b"value1");

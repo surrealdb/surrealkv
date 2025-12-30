@@ -1,5 +1,9 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{fmt, io};
+
+use parking_lot::RwLock;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;
@@ -52,6 +56,7 @@ pub enum Error {
 		offset: usize,
 		message: String,
 	},
+	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
 }
 
 // Implementation of Display trait for Error
@@ -100,6 +105,7 @@ impl fmt::Display for Error {
                 "WAL corruption in segment {} at offset {}: {}",
                 segment_id, offset, message
             ),
+            Self::SSTable(err) => write!(f, "SSTable error: {err}"),
         }
 	}
 }
@@ -150,8 +156,316 @@ impl From<crate::bplustree::tree::BPlusTreeError> for Error {
 	}
 }
 
+impl From<crate::sstable::error::SSTableError> for Error {
+	fn from(err: crate::sstable::error::SSTableError) -> Self {
+		Error::SSTable(err)
+	}
+}
+
 impl<T> From<std::sync::PoisonError<T>> for Error {
 	fn from(_err: std::sync::PoisonError<T>) -> Self {
 		Error::Other("Lock poisoned - another thread panicked while holding the lock".to_string())
+	}
+}
+
+/// Error severity levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ErrorSeverity {
+	/// Error can be ignored
+	#[allow(unused)]
+	NoError = 0,
+	/// Error is recoverable, background work continues
+	#[allow(unused)]
+	SoftError = 1,
+	/// Error requires stopping writes, may auto-recover
+	HardError = 2,
+	/// Error is fatal, database must stop
+	FatalError = 3,
+	/// Unrecoverable error (e.g., data corruption)
+	Unrecoverable = 4,
+}
+
+/// Reason for background error (for classification)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundErrorReason {
+	MemtablaFlush,
+	Compaction,
+	ManifestWrite,
+	VLogGC,
+}
+
+/// Represents a background error with its severity and context
+#[derive(Debug, Clone)]
+pub struct BackgroundError {
+	pub error: Error,
+	pub severity: ErrorSeverity,
+	pub reason: BackgroundErrorReason,
+	pub timestamp: Instant,
+}
+
+/// Handler for background errors that propagates errors to user operations
+pub struct BackgroundErrorHandler {
+	/// Current background error (None = no error)
+	bg_error: RwLock<Option<BackgroundError>>,
+	/// Fast atomic flag for write path checks
+	is_db_stopped: AtomicBool,
+	/// Stats tracking
+	error_count: AtomicU64,
+}
+
+impl BackgroundErrorHandler {
+	/// Creates a new background error handler
+	pub fn new() -> Self {
+		Self {
+			bg_error: RwLock::new(None),
+			is_db_stopped: AtomicBool::new(false),
+			error_count: AtomicU64::new(0),
+		}
+	}
+
+	/// Classify error severity based on error type and context
+	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
+		match (reason, error) {
+			// Corruption errors are unrecoverable
+			(_, Error::Corruption(_) | Error::CorruptedBlock(_)) => ErrorSeverity::Unrecoverable,
+
+			// Table ID collision is a critical consistency error
+			(_, Error::TableIDCollision(_)) => ErrorSeverity::Unrecoverable,
+
+			// Corrupted table metadata is unrecoverable
+			(_, Error::CorruptedTableMetadata(_)) => ErrorSeverity::Unrecoverable,
+
+			// I/O errors during memtable flush are fatal
+			(BackgroundErrorReason::MemtablaFlush, Error::Io(_)) => ErrorSeverity::FatalError,
+
+			// I/O errors during compaction are fatal
+			(BackgroundErrorReason::Compaction, Error::Io(_)) => ErrorSeverity::FatalError,
+
+			// Manifest write I/O is fatal
+			(BackgroundErrorReason::ManifestWrite, Error::Io(_)) => ErrorSeverity::FatalError,
+
+			// VLog GC I/O is hard error (can retry, but stops writes for safety)
+			(BackgroundErrorReason::VLogGC, Error::Io(_)) => ErrorSeverity::HardError,
+
+			// Default: treat as hard error for safety
+			_ => ErrorSeverity::HardError,
+		}
+	}
+
+	/// Set a background error. This is called by background tasks when they encounter errors.
+	pub fn set_error(&self, error: Error, reason: BackgroundErrorReason) {
+		let severity = Self::classify_error(&error, reason);
+		let bg_error = BackgroundError {
+			error: error.clone(),
+			severity,
+			reason,
+			timestamp: Instant::now(),
+		};
+
+		// Update the error (only if severity is higher than current)
+		let mut current_error = self.bg_error.write();
+		if let Some(ref existing) = *current_error {
+			// Only update if new error is more severe
+			if severity <= existing.severity {
+				log::debug!(
+					"Background error not updated: new severity {:?} <= existing {:?}, error: {:?}, reason: {:?}",
+					severity,
+					existing.severity,
+					error.to_string(),
+					reason
+				);
+				return;
+			}
+		}
+
+		*current_error = Some(bg_error.clone());
+		drop(current_error);
+
+		// Update stats
+		self.error_count.fetch_add(1, Ordering::Relaxed);
+
+		// Set stopped flag if severity is HardError or higher
+		if severity >= ErrorSeverity::HardError {
+			self.is_db_stopped.store(true, Ordering::Release);
+			log::error!(
+				"Background error (severity {:?}, reason {:?}, timestamp {:?}): {}",
+				severity,
+				bg_error.reason,
+				bg_error.timestamp,
+				error
+			);
+		} else {
+			log::warn!(
+				"Background error (severity {:?}, reason {:?}, timestamp {:?}): {}",
+				severity,
+				bg_error.reason,
+				bg_error.timestamp,
+				error
+			);
+		}
+	}
+
+	/// Check if the database is stopped due to a background error.
+	/// Returns the error if stopped, Ok(()) otherwise.
+	/// This is the fast path check used before user operations.
+	pub fn check_error(&self) -> Result<()> {
+		// Fast path: check atomic flag first
+		if !self.is_db_stopped.load(Ordering::Acquire) {
+			return Ok(());
+		}
+
+		// Slow path: get the actual error
+		let bg_error = self.bg_error.read();
+		if let Some(ref error) = *bg_error {
+			if error.severity >= ErrorSeverity::HardError {
+				return Err(error.error.clone());
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Get the current background error, if any
+	#[cfg(test)]
+	pub fn get_error(&self) -> Option<BackgroundError> {
+		self.bg_error.read().clone()
+	}
+
+	/// Check if database is stopped (fast path, lock-free)
+	#[cfg(test)]
+	pub fn is_db_stopped(&self) -> bool {
+		self.is_db_stopped.load(Ordering::Acquire)
+	}
+
+	/// Get the error count
+	#[cfg(test)]
+	pub fn error_count(&self) -> u64 {
+		self.error_count.load(Ordering::Relaxed)
+	}
+
+	/// Clear the background error (for recovery scenarios)
+	#[cfg(test)]
+	pub fn clear_error(&self) {
+		let mut error = self.bg_error.write();
+		*error = None;
+		drop(error);
+		self.is_db_stopped.store(false, Ordering::Release);
+		log::info!("Background error cleared");
+	}
+}
+
+impl Default for BackgroundErrorHandler {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+
+	use super::*;
+
+	#[test]
+	fn test_error_severity_ordering() {
+		assert!(ErrorSeverity::NoError < ErrorSeverity::SoftError);
+		assert!(ErrorSeverity::SoftError < ErrorSeverity::HardError);
+		assert!(ErrorSeverity::HardError < ErrorSeverity::FatalError);
+		assert!(ErrorSeverity::FatalError < ErrorSeverity::Unrecoverable);
+	}
+
+	#[test]
+	fn test_set_and_check_error() {
+		let handler = BackgroundErrorHandler::new();
+		assert!(!handler.is_db_stopped());
+
+		// Set a hard error
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+
+		assert!(handler.is_db_stopped());
+		assert!(handler.check_error().is_err());
+		assert_eq!(handler.error_count(), 1);
+	}
+
+	#[test]
+	fn test_soft_error_does_not_stop_db() {
+		let handler = BackgroundErrorHandler::new();
+
+		// This test is kept to verify HardError behavior.
+
+		// VLog GC I/O is HardError - stops writes but less severe than FatalError
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			BackgroundErrorReason::VLogGC,
+		);
+
+		// Hard errors stop the database
+		assert!(handler.is_db_stopped());
+		assert!(handler.check_error().is_err());
+	}
+
+	#[test]
+	fn test_error_severity_upgrade() {
+		let handler = BackgroundErrorHandler::new();
+
+		// Set a hard error first (VLog GC I/O)
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			BackgroundErrorReason::VLogGC,
+		);
+
+		assert!(handler.is_db_stopped());
+
+		// Set a fatal error - should upgrade
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "fatal error"))),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+
+		assert!(handler.is_db_stopped());
+		// Verify the error was upgraded to fatal
+		let error = handler.get_error().unwrap();
+		assert_eq!(error.severity, ErrorSeverity::FatalError);
+	}
+
+	#[test]
+	fn test_error_downgrade_prevented() {
+		let handler = BackgroundErrorHandler::new();
+
+		// Set a hard error first
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+
+		let first_error = handler.get_error().unwrap().error.clone();
+
+		// Try to set a soft error - should not downgrade
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "soft error"))),
+			BackgroundErrorReason::Compaction,
+		);
+
+		// Error should still be the hard error
+		let current_error = handler.get_error().unwrap();
+		assert_eq!(current_error.error.to_string(), first_error.to_string());
+	}
+
+	#[test]
+	fn test_clear_error() {
+		let handler = BackgroundErrorHandler::new();
+
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+
+		assert!(handler.is_db_stopped());
+		handler.clear_error();
+		assert!(!handler.is_db_stopped());
+		assert!(handler.check_error().is_ok());
 	}
 }

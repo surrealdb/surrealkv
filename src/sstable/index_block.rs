@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
+use crate::sstable::error::SSTableError;
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
 use crate::vfs::File;
 use crate::{CompressionType, Options};
@@ -149,7 +150,7 @@ impl TopLevelIndexWriter {
 		let index_blocks = std::mem::take(&mut self.index_blocks);
 		for block in index_blocks {
 			let separator_key = block.last_key.clone();
-			let block_data = block.finish();
+			let block_data = block.finish()?;
 
 			// Skip empty blocks or blocks with empty keys
 			if separator_key.is_empty() {
@@ -164,7 +165,7 @@ impl TopLevelIndexWriter {
 			top_level_index.add(&separator_key, &block_handle.encode())?;
 		}
 
-		let top_level_data = top_level_index.finish();
+		let top_level_data = top_level_index.finish()?;
 		self.top_level_index_size = top_level_data.len() as u64;
 		let (handle, final_offset) =
 			Self::write_compressed_block(writer, top_level_data, compression_type, offset)?;
@@ -196,9 +197,10 @@ impl TopLevelIndex {
 	) -> Result<Self> {
 		let block =
 			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
-		let iter = block.iter(false);
+		let iter = block.iter(false)?;
 		let mut blocks = Vec::new();
-		for (key, handle) in iter {
+		for item in iter {
+			let (key, handle) = item?;
 			// Store full encoded internal key for correct partition lookup
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
@@ -217,15 +219,14 @@ impl TopLevelIndex {
 	pub(crate) fn find_block_handle_by_key(
 		&self,
 		target: &[u8],
-	) -> Option<(usize, &BlockHandleWithKey)> {
+	) -> Result<Option<(usize, &BlockHandleWithKey)>> {
 		// Guard against empty/corrupt partitioned index
 		if self.blocks.is_empty() {
-			log::error!(
-				"[INDEX] Attempted lookup on empty/corrupt partitioned index with no blocks. \
-				Table ID: {}",
-				self.id
-			);
-			return None;
+			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
+				table_id: self.id,
+			});
+			log::error!("[INDEX] {}", err);
+			return Err(err);
 		}
 
 		let internal_cmp = &self.opts.internal_comparator;
@@ -237,10 +238,11 @@ impl TopLevelIndex {
 		});
 
 		// Attempt to retrieve the block at the found index.
-		self.blocks
+		Ok(self
+			.blocks
 			.get(index)
 			.filter(|block| internal_cmp.compare(target, &block.separator_key) != Ordering::Greater)
-			.map(|block| (index, block))
+			.map(|block| (index, block)))
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
@@ -264,12 +266,13 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
-		let Some((_index, block_handle)) = self.find_block_handle_by_key(target) else {
-			return Err(Error::BlockNotFound);
-		};
-
-		let block = self.load_block(block_handle)?;
-		Ok(block)
+		match self.find_block_handle_by_key(target)? {
+			Some((_index, block_handle)) => {
+				let block = self.load_block(block_handle)?;
+				Ok(block)
+			}
+			None => Err(Error::BlockNotFound),
+		}
 	}
 }
 
@@ -422,7 +425,7 @@ mod tests {
 		];
 
 		for (key, expected) in test_cases.iter() {
-			let result = index.find_block_handle_by_key(key);
+			let result = index.find_block_handle_by_key(key).unwrap();
 			match expected {
 				Some(expected_sep_key) => {
 					let (_index, handle) = result.expect("Expected a block handle but got None");
@@ -473,8 +476,8 @@ mod tests {
 			assert!(block.size() > 0, "Block should not be empty for key {key}");
 
 			// Verify the block contains the expected handle by checking if we can find it
-			let mut block_iter = block.iter(false);
-			block_iter.seek(&internal_key);
+			let mut block_iter = block.iter(false).unwrap();
+			block_iter.seek(&internal_key).unwrap();
 			assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
 		}
 
@@ -552,7 +555,7 @@ mod tests {
 		];
 
 		for (query_key, expected_index) in test_cases {
-			let result = index.find_block_handle_by_key(&query_key);
+			let result = index.find_block_handle_by_key(&query_key).unwrap();
 			let query_ikey = InternalKey::decode(&query_key);
 			match expected_index {
 				Some(idx) => {
@@ -655,7 +658,7 @@ mod tests {
 		];
 
 		for (query_key, expected_index) in test_cases {
-			let result = index.find_block_handle_by_key(&query_key);
+			let result = index.find_block_handle_by_key(&query_key).unwrap();
 			let query_ikey = InternalKey::decode(&query_key);
 			match expected_index {
 				Some(idx) => {
@@ -713,7 +716,7 @@ mod tests {
 
 		// Query for each separator key and verify correct index is returned
 		for (expected_idx, sep_key) in sep_keys.iter().enumerate() {
-			let result = index.find_block_handle_by_key(sep_key);
+			let result = index.find_block_handle_by_key(sep_key).unwrap();
 			assert!(result.is_some(), "Should find block for separator key");
 			let (idx, handle) = result.unwrap();
 			assert_eq!(idx, expected_idx, "Returned index should match partition index");
@@ -743,7 +746,7 @@ mod tests {
 
 		// Query for key beyond the single partition
 		let query = create_internal_key(b"zzzz_beyond".to_vec(), 1);
-		let result = index.find_block_handle_by_key(&query);
+		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_none(), "Should return None for key beyond all partitions");
 	}
 
@@ -765,20 +768,20 @@ mod tests {
 
 		// Query before the separator
 		let query = create_internal_key(b"aaa".to_vec(), 1);
-		let result = index.find_block_handle_by_key(&query);
+		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_some());
 		let (idx, _) = result.unwrap();
 		assert_eq!(idx, 0);
 
 		// Query at the separator
-		let result = index.find_block_handle_by_key(&sep);
+		let result = index.find_block_handle_by_key(&sep).unwrap();
 		assert!(result.is_some());
 		let (idx, _) = result.unwrap();
 		assert_eq!(idx, 0);
 
 		// Query after the separator
 		let query = create_internal_key(b"zzz".to_vec(), 1);
-		let result = index.find_block_handle_by_key(&query);
+		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_none());
 	}
 
@@ -805,7 +808,7 @@ mod tests {
 		};
 
 		// Query exactly "bbb" at same seq
-		let result = index.find_block_handle_by_key(&sep_b);
+		let result = index.find_block_handle_by_key(&sep_b).unwrap();
 		assert!(result.is_some());
 		let (idx, _) = result.unwrap();
 		assert_eq!(idx, 1, "Exact match should return that partition");

@@ -20,6 +20,9 @@ pub trait CommitEnv: Send + Sync + 'static {
 
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
+
+	// Check for background errors before committing
+	fn check_background_error(&self) -> Result<()>;
 }
 
 // Lock-free commit queue entry
@@ -210,6 +213,9 @@ impl CommitPipeline {
 			return Err(Error::PipelineStall);
 		}
 
+		// Check for background errors before proceeding
+		self.env.check_background_error()?;
+
 		if batch.is_empty() {
 			return Ok(());
 		}
@@ -252,6 +258,9 @@ impl CommitPipeline {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
+
+		// Check for background errors before proceeding
+		self.env.check_background_error()?;
 
 		if batch.is_empty() {
 			return Ok(());
@@ -399,6 +408,10 @@ mod tests {
 		fn apply(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	#[test(tokio::test)]
@@ -512,6 +525,10 @@ mod tests {
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
 			}
+			Ok(())
+		}
+
+		fn check_background_error(&self) -> Result<()> {
 			Ok(())
 		}
 	}
@@ -718,6 +735,10 @@ mod tests {
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
 			self.apply_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			Ok(())
+		}
+
+		fn check_background_error(&self) -> Result<()> {
 			Ok(())
 		}
 	}
