@@ -48,13 +48,53 @@ impl Batch {
 			return Err(Error::BatchTooLarge);
 		}
 		self.size += record_size;
-		self.entries.reserve(1);
-		self.valueptrs.reserve(1);
+
+		// Reserve in chunks instead of one at a time
+		let current_len = self.entries.len();
+		let current_capacity = self.entries.capacity();
+
+		if current_len >= current_capacity {
+			// Reserve at least 16 entries, or double current length
+			let reserve_amount = (current_len * 2).max(16);
+			self.entries.reserve(reserve_amount);
+			self.valueptrs.reserve(reserve_amount);
+		}
+
 		Ok(())
 	}
 
+	/// Calculate the exact encoded size of this batch
+	fn calculate_encoded_size(&self) -> usize {
+		// Header: version (1 byte) + starting_seq_num varint + count varint
+		let mut size = 1;
+		size += self.starting_seq_num.required_space();
+		size += (self.entries.len() as u32).required_space();
+
+		// Calculate size for each entry
+		for entry in &self.entries {
+			size += 1; // kind byte
+			size += (entry.key.len() as u64).required_space(); // key length varint
+			size += entry.key.len(); // key data
+			let value_len = entry.value.as_ref().map_or(0, |v| v.len());
+			size += (value_len as u64).required_space(); // value length varint
+			size += value_len; // value data
+			size += entry.timestamp.required_space(); // timestamp varint
+		}
+
+		// Value pointers: 1 byte flag + VALUE_POINTER_SIZE if Some
+		for valueptr in &self.valueptrs {
+			size += 1; // flag byte
+			if valueptr.is_some() {
+				size += VALUE_POINTER_SIZE;
+			}
+		}
+
+		size
+	}
+
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-		let mut encoded = Vec::new();
+		let capacity = self.calculate_encoded_size();
+		let mut encoded = Vec::with_capacity(capacity);
 
 		// Write version (1 byte)
 		encoded.push(self.version);
@@ -842,5 +882,105 @@ mod tests {
 		// Test that we can re-encode the decoded batch and get the same result
 		let re_encoded = decoded_batch.encode().unwrap();
 		assert_eq!(encoded, re_encoded, "Re-encoding should produce identical result");
+	}
+
+	#[test]
+	fn test_calculate_encoded_size_exact_match() {
+		// Test empty batch
+		let batch = Batch::new(0);
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"Empty batch: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
+
+		// Test single entry batch
+		let mut batch = Batch::new(100);
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"Single entry: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
+
+		// Test batch with multiple entries
+		let mut batch = Batch::new(1000);
+		batch.set(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
+		batch.delete(b"key2".to_vec(), 2).unwrap();
+		batch.set(b"key3".to_vec(), b"value3".to_vec(), 3).unwrap();
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"Multiple entries: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
+
+		// Test batch with value pointers
+		let mut batch = Batch::new(5000);
+		let valueptr1 = ValuePointer::new(100, 200, 10, 20, 30);
+		batch
+			.add_record_with_valueptr(
+				InternalKeyKind::Set,
+				b"key1".to_vec(),
+				Some(b"value1".to_vec()),
+				Some(valueptr1),
+				1,
+			)
+			.unwrap();
+		batch
+			.add_record_with_valueptr(InternalKeyKind::Delete, b"key2".to_vec(), None, None, 2)
+			.unwrap();
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"With value pointers: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
+
+		// Test batch with large keys/values
+		let large_key = vec![b'a'; 10000];
+		let large_value = vec![b'b'; 50000];
+		let mut batch = Batch::new(10000);
+		batch.set(large_key, large_value, 100).unwrap();
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"Large key/value: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
+
+		// Test batch with many entries
+		let mut batch = Batch::new(1);
+		for i in 0..1000 {
+			let key = format!("key{i}");
+			let value = format!("value{i}");
+			batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), i as u64).unwrap();
+		}
+		let calculated_size = batch.calculate_encoded_size();
+		let encoded = batch.encode().unwrap();
+		assert_eq!(
+			calculated_size,
+			encoded.len(),
+			"Many entries: calculated size {} should match encoded size {}",
+			calculated_size,
+			encoded.len()
+		);
 	}
 }
