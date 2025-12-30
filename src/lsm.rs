@@ -197,6 +197,75 @@ impl CoreInner {
 		})
 	}
 
+	/// Flushes a memtable to SST and atomically updates the manifest.
+	///
+	/// This is the core primitive used by all flush operations. It handles:
+	/// 1. Flushing the memtable to disk as an SSTable
+	/// 2. Creating a changeset with the new SST and log_number update
+	/// 3. Atomically applying the changeset to the manifest
+	/// 4. Removing the memtable from immutable_memtables tracking
+	///
+	/// # Arguments
+	/// * `memtable` - The memtable to flush
+	/// * `table_id` - Table ID for the new SST
+	/// * `wal_number` - WAL number to mark as flushed (log_number = wal_number + 1)
+	///
+	/// # Returns
+	/// The flushed SSTable
+	fn flush_and_update_manifest(
+		&self,
+		memtable: &MemTable,
+		table_id: u64,
+		wal_number: u64,
+	) -> Result<Arc<Table>> {
+		// Step 1: Flush memtable to SST
+		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
+			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
+		})?;
+
+		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
+
+		// Step 2: Prepare atomic changeset
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, Arc::clone(&table)));
+		changeset.log_number = Some(wal_number + 1);
+
+		log::debug!(
+			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
+			table_id,
+			wal_number + 1,
+			wal_number
+		);
+
+		// Step 3: Apply changeset atomically
+		let mut manifest = self.level_manifest.write()?;
+		let mut memtable_lock = self.immutable_memtables.write()?;
+
+		manifest.apply_changeset(&changeset)?;
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			let error = Error::Other(format!(
+				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
+				table_id,
+				wal_number + 1,
+				e
+			));
+			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			return Err(error);
+		}
+
+		// Remove successfully flushed memtable from tracking
+		memtable_lock.remove(table_id);
+
+		log::info!(
+			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
+			table_id,
+			wal_number + 1,
+			manifest.get_last_sequence()
+		);
+
+		Ok(table)
+	}
+
 	/// Makes room for new writes by flushing the active memtable if needed.
 	///
 	/// Triggers a flush operation to make room for new writes.
@@ -275,55 +344,14 @@ impl CoreInner {
 		drop(active_memtable);
 		drop(immutable_memtables);
 
-		// Step 4: Flush the memtable to SST (slow I/O operation, no locks held)
-		let table = flushed_memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
-			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
-		})?;
+		// Step 4: Flush the memtable to SST and update manifest (slow I/O operation, no locks held)
+		let _table =
+			self.flush_and_update_manifest(&flushed_memtable, table_id, flushed_wal_number)?;
 
-		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
-
-		// Step 5: Prepare atomic changeset with both SST and log_number
-		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, table));
-
-		// Set log_number after WAL rotation
-		changeset.log_number = Some(flushed_wal_number + 1);
-
-		log::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			flushed_wal_number + 1,
-			flushed_wal_number
-		);
-
-		// Step 6: Apply changeset atomically
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
-
-		manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			let error = Error::Other(format!(
-				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
-				table_id, changeset.log_number, e
-			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-			return Err(error);
-		}
-
-		memtable_lock.remove(table_id);
-		drop(manifest);
-		drop(memtable_lock);
-
-		log::info!(
-			"Memtable flush completed: table_id={}, log_number={:?}",
-			table_id,
-			changeset.log_number
-		);
-
-		// Step 7: Async WAL cleanup using values we already have
+		// Step 5: Async WAL cleanup using values we already have
 		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number
 		// earlier
-		let min_wal_to_keep = flushed_wal_number + 1; // Same as changeset.log_number
+		let min_wal_to_keep = flushed_wal_number + 1; // Same as log_number
 
 		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
 
@@ -405,19 +433,7 @@ impl CoreInner {
 		drop(active_memtable);
 		drop(immutable_memtables);
 
-		// Step 2: Flush the immutable memtable to disk as an SSTable
-		let table = flushed_memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
-			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
-		})?;
-
-		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
-
-		// Step 3: Prepare atomic changeset with both SST and log_number
-		// This ensures crash safety - both updates happen in a single manifest write
-		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, Arc::clone(&table)));
-
-		// Determine which WAL was flushed and set log_number atomically
+		// Step 2: Determine which WAL was flushed
 		let wal_that_was_flushed = match flushed_wal_number {
 			Some(num) => num,
 			None => {
@@ -427,130 +443,11 @@ impl CoreInner {
 			}
 		};
 
-		// Set log_number to flushed_wal + 1, meaning that WAL has been flushed
-		// log_number indicates "all WALs with number < log_number have been flushed"
-		changeset.log_number = Some(wal_that_was_flushed + 1);
-
-		log::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			wal_that_was_flushed + 1,
-			wal_that_was_flushed
-		);
-
-		// Step 4: Apply changeset and write to disk ATOMICALLY
-		// This is the critical section - both SST addition and log_number update happen
-		// together
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
-
-		manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			let error = Error::Other(format!(
-				"Failed to atomically update manifest: table_id={}, log_number={:?}: {}",
-				table_id, changeset.log_number, e
-			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-			return Err(error);
-		}
-
-		// Remove successfully flushed memtable from tracking
-		memtable_lock.remove(table_id);
-
-		log::info!(
-			"Manifest updated atomically: table_id={}, log_number={:?}, last_sequence={}",
-			table_id,
-			changeset.log_number,
-			manifest.get_last_sequence()
-		);
+		// Step 3: Flush the immutable memtable to disk and update manifest
+		let table =
+			self.flush_and_update_manifest(&flushed_memtable, table_id, wal_that_was_flushed)?;
 
 		Ok(Some(table))
-	}
-
-	/// Flushes a single immutable memtable using its pre-assigned table_id.
-	///
-	/// This is used during shutdown to flush immutable memtables that already
-	/// have their table_ids assigned (from when they were moved from active to
-	/// immutable).
-	///
-	/// # Arguments
-	///
-	/// * `table_id` - The pre-assigned table ID for this memtable
-	/// * `wal_number` - The WAL number that contains this memtable's data
-	/// * `memtable` - The immutable memtable to flush
-	///
-	/// # Returns
-	///
-	/// * `Ok(table)` - The flushed SSTable
-	/// * `Err(_)` - If flush or manifest update fails
-	///
-	/// # Important
-	///
-	/// Unlike `flush_memtable_and_update_manifest`, this method:
-	/// - Does NOT call `next_table_id()` - uses the pre-assigned ID
-	/// - Does NOT swap the active memtable
-	/// - Removes the memtable from immutable_memtables tracking after success
-	/// - Updates log_number to mark the associated WAL as flushed
-	fn flush_single_immutable_memtable(
-		&self,
-		table_id: u64,
-		wal_number: u64,
-		memtable: Arc<MemTable>,
-	) -> Result<Arc<Table>> {
-		log::debug!(
-			"Flushing immutable memtable: table_id={}, wal_number={}, size={}",
-			table_id,
-			wal_number,
-			memtable.size()
-		);
-
-		// Flush the memtable to SST using the pre-assigned table_id
-		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
-			Error::Other(format!(
-				"Failed to flush immutable memtable to SST table_id={}: {}",
-				table_id, e
-			))
-		})?;
-
-		log::debug!(
-			"Created SST from immutable memtable: table_id={}, file_size={}",
-			table.id,
-			table.file_size
-		);
-
-		// Prepare changeset - add SST to level 0 and update log_number
-		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, Arc::clone(&table)));
-
-		// Update log_number to mark this WAL as flushed
-		// log_number indicates "all WALs with number < log_number have been flushed"
-		changeset.log_number = Some(wal_number + 1);
-
-		// Apply changeset atomically
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
-
-		manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			let error = Error::Other(format!(
-				"Failed to update manifest for immutable memtable: table_id={}: {}",
-				table_id, e
-			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-			return Err(error);
-		}
-
-		// Remove successfully flushed memtable from tracking
-		memtable_lock.remove(table_id);
-
-		log::info!(
-			"Immutable memtable flushed: table_id={}, wal_number={}, log_number={}",
-			table_id,
-			wal_number,
-			wal_number + 1
-		);
-
-		Ok(table)
 	}
 
 	/// Flushes all memtables (immutable and active) during shutdown.
@@ -609,7 +506,7 @@ impl CoreInner {
 
 			// Fail-fast: return immediately on error
 			// WAL replay will recover this and subsequent memtables on restart
-			self.flush_single_immutable_memtable(entry.table_id, entry.wal_number, entry.memtable)?;
+			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
 
 			flushed_count += 1;
 			log::debug!(
