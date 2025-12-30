@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
+use crate::sstable::error::SSTableError;
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
 use crate::vfs::File;
 use crate::{CompressionType, Options};
@@ -221,10 +222,9 @@ impl TopLevelIndex {
 	) -> Result<Option<(usize, &BlockHandleWithKey)>> {
 		// Guard against empty/corrupt partitioned index
 		if self.blocks.is_empty() {
-			let err = Error::CorruptedBlock(format!(
-				"Attempted lookup on empty/corrupt partitioned index with no blocks. Table ID: {}",
-				self.id
-			));
+			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
+				table_id: self.id,
+			});
 			log::error!("[INDEX] {}", err);
 			return Err(err);
 		}

@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::Error;
+use crate::sstable::error::SSTableError;
 use crate::sstable::table::TableFormat;
 use crate::sstable::InternalKey;
 use crate::{CompressionType, Result};
@@ -265,7 +266,11 @@ impl TableMetadata {
 			0 => None,
 			1 => Some(true),
 			2 => Some(false),
-			_ => return Err(Error::CorruptedTableMetadata("Invalid has_point_keys value".into())),
+			value => {
+				return Err(Error::from(SSTableError::InvalidHasPointKeysValue {
+					value,
+				}))
+			}
 		};
 
 		// Decode smallest_seq_num and largest_seq_num
@@ -287,7 +292,11 @@ impl TableMetadata {
 				cursor.copy_to_slice(&mut key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
-			_ => return Err(Error::CorruptedTableMetadata("Invalid smallest_point value".into())),
+			value => {
+				return Err(Error::from(SSTableError::InvalidSmallestPointValue {
+					value,
+				}))
+			}
 		};
 
 		// Decode largest_point
@@ -299,7 +308,11 @@ impl TableMetadata {
 				cursor.copy_to_slice(&mut key_bytes);
 				Some(InternalKey::decode(&key_bytes))
 			}
-			_ => return Err(Error::CorruptedTableMetadata("Invalid largest_point value".into())),
+			value => {
+				return Err(Error::from(SSTableError::InvalidLargestPointValue {
+					value,
+				}))
+			}
 		};
 
 		Ok(TableMetadata {

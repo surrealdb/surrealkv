@@ -56,6 +56,7 @@ pub enum Error {
 		offset: usize,
 		message: String,
 	},
+	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
 }
 
 // Implementation of Display trait for Error
@@ -104,6 +105,7 @@ impl fmt::Display for Error {
                 "WAL corruption in segment {} at offset {}: {}",
                 segment_id, offset, message
             ),
+            Self::SSTable(err) => write!(f, "SSTable error: {err}"),
         }
 	}
 }
@@ -151,6 +153,12 @@ impl From<async_channel::RecvError> for Error {
 impl From<crate::bplustree::tree::BPlusTreeError> for Error {
 	fn from(err: crate::bplustree::tree::BPlusTreeError) -> Self {
 		Error::BPlusTree(err.to_string())
+	}
+}
+
+impl From<crate::sstable::error::SSTableError> for Error {
+	fn from(err: crate::sstable::error::SSTableError) -> Self {
+		Error::SSTable(err)
 	}
 }
 
@@ -220,14 +228,6 @@ impl BackgroundErrorHandler {
 		match (reason, error) {
 			// Corruption errors are unrecoverable
 			(_, Error::Corruption(_) | Error::CorruptedBlock(_)) => ErrorSeverity::Unrecoverable,
-
-			// WAL corruption is unrecoverable
-			(
-				_,
-				Error::WalCorruption {
-					..
-				},
-			) => ErrorSeverity::Unrecoverable,
 
 			// Table ID collision is a critical consistency error
 			(_, Error::TableIDCollision(_)) => ErrorSeverity::Unrecoverable,

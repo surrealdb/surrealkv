@@ -11,6 +11,7 @@ use snap::raw::max_compress_len;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::TableMetadata;
@@ -89,9 +90,10 @@ impl Footer {
 
 	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
 		if file_size < TABLE_FULL_FOOTER_LENGTH {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (file size is too small: {file_size} bytes)"
-			)));
+			return Err(Error::from(SSTableError::FileTooSmall {
+				file_size,
+				min_size: TABLE_FULL_FOOTER_LENGTH,
+			}));
 		}
 
 		let mut buf = vec![0; TABLE_FULL_FOOTER_LENGTH];
@@ -106,31 +108,32 @@ impl Footer {
 
 		// Validate magic number first
 		if magic != TABLE_MAGIC_FOOTER_ENCODED {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (bad magic number: {magic:x?})"
-			)));
+			return Err(Error::from(SSTableError::BadMagicNumber {
+				magic: magic.to_vec(),
+			}));
 		}
 
 		if buf.len() < TABLE_FOOTER_LENGTH {
-			return Err(Error::CorruptedBlock(format!(
-				"invalid table (footer too short): {}",
-				buf.len()
-			)));
+			return Err(Error::from(SSTableError::FooterTooShort {
+				footer_len: buf.len(),
+			}));
 		}
 
 		// Read format and checksum from footer (first 2 bytes)
 		let format = TableFormat::from_u8(buf[0])?;
 		let checksum = match buf[1] {
 			1 => ChecksumType::CRC32c,
-			_ => return Err(Error::CorruptedBlock("Invalid checksum type".into())),
+			_ => {
+				return Err(Error::from(SSTableError::InvalidChecksumType {
+					checksum_type: buf[1],
+				}))
+			}
 		};
 
 		// Read block handles (starting at offset 2)
 		let (meta_index, metalen) = BlockHandle::decode(&buf[2..])?;
 		if metalen == 0 {
-			return Err(Error::CorruptedBlock(
-				"invalid table (bad meta_index block handle)".into(),
-			));
+			return Err(Error::from(SSTableError::BadMetaIndexBlockHandle));
 		}
 
 		let (index_handle, _) = BlockHandle::decode(&buf[2 + metalen..])?;
@@ -318,7 +321,9 @@ impl<W: Write> TableWriter<W> {
 		self.meta.properties.created_at = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.map_err(|e| {
-				let err = Error::Other(format!("Failed to get system time: {}", e));
+				let err = Error::from(SSTableError::FailedToGetSystemTime {
+					source: e.to_string(),
+				});
 				log::error!("[TABLE_WRITER] {}", err);
 				err
 			})?
@@ -585,10 +590,9 @@ pub(crate) fn read_table_block(
 	)?;
 
 	if !verify_table_block(&buf, compress[0], unmask(u32::decode_fixed(&cksum).unwrap())) {
-		return Err(Error::CorruptedBlock(format!(
-			"checksum verification failed for block at {}",
-			location.offset()
-		)));
+		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
+			block_offset: location.offset() as u64,
+		}));
 	}
 
 	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
@@ -701,11 +705,11 @@ impl Table {
 
 			let fbl = BlockHandle::decode(&val);
 			let filter_block_location = match fbl {
-				Err(_e) => {
-					return Err(Error::CorruptedBlock(format!(
-						"Couldn't decode corrupt blockhandle {:?}",
-						&val
-					)));
+				Err(e) => {
+					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+						value_bytes: val,
+						context: format!("error: {:?}", e),
+					}));
 				}
 				Ok(res) => res.0,
 			};
@@ -773,10 +777,13 @@ impl Table {
 						match BlockHandle::decode(val) {
 							Ok((handle, _)) => Some(handle),
 							Err(e) => {
-								let err = Error::CorruptedBlock(format!(
-									"Failed to decode BlockHandle in get(): {}",
-									e
-								));
+								let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+									value_bytes: val.to_vec(),
+									context: format!(
+										"Failed to decode BlockHandle in get(): {}",
+										e
+									),
+								});
 								log::error!("[TABLE] {}", err);
 								return Err(err);
 							}
@@ -912,9 +919,10 @@ impl TableIterator {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						return Err(Error::CorruptedBlock(format!(
-							"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
-						)));
+						return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("error: {:?}", e),
+						}));
 					}
 					Ok(res) => res,
 				};
@@ -940,9 +948,10 @@ impl TableIterator {
 			let val = partition_iter.value();
 			let (handle, _) = match BlockHandle::decode(&val) {
 				Err(e) => {
-					return Err(Error::CorruptedBlock(format!(
-						"Couldn't decode corrupt blockhandle {val:?}: error: {e:?}"
-					)));
+					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
+						value_bytes: val,
+						context: format!("error: {:?}", e),
+					}));
 				}
 				Ok(res) => res,
 			};
@@ -972,7 +981,7 @@ impl TableIterator {
 			return Ok(());
 		}
 
-		Err(Error::CorruptedBlock("Empty block".to_string()))
+		Err(Error::from(SSTableError::EmptyBlock))
 	}
 
 	#[cfg(test)]
@@ -1012,10 +1021,10 @@ impl TableIterator {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						let err = Error::CorruptedBlock(format!(
-							"Block corruption in prev(): failed to decode BlockHandle. Value bytes: {:?}, Error: {:?}",
-							val, e
-						));
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("Block corruption in prev(): failed to decode BlockHandle. Error: {:?}", e),
+						});
 						log::error!("[TABLE_ITER] {}", err);
 						return Err(err);
 					}
@@ -1046,10 +1055,10 @@ impl TableIterator {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						let err = Error::CorruptedBlock(format!(
-							"Block corruption in prev(): failed to decode BlockHandle in partition {}. Value bytes: {:?}, Error: {:?}",
-							self.current_partition_index, val, e
-						));
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!("Block corruption in prev(): failed to decode BlockHandle in partition {}. Error: {:?}", self.current_partition_index, e),
+						});
 						log::error!("[TABLE_ITER] {}", err);
 						return Err(err);
 					}
@@ -1332,10 +1341,13 @@ impl TableIterator {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						let err = Error::CorruptedBlock(format!(
-							"Failed to decode BlockHandle in seek_to_first(): {}",
-							e
-						));
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!(
+								"Failed to decode BlockHandle in seek_to_first(): {}",
+								e
+							),
+						});
 						log::error!("[TABLE_ITER] {}", err);
 						return Err(err);
 					}
@@ -1351,7 +1363,9 @@ impl TableIterator {
 
 		// If we get here, initialization failed
 		self.reset();
-		Err(Error::CorruptedBlock("Failed to seek to first entry: no valid blocks".to_string()))
+		Err(Error::from(SSTableError::NoValidBlocksForSeek {
+			operation: "first".to_string(),
+		}))
 	}
 
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
@@ -1371,10 +1385,13 @@ impl TableIterator {
 				let val = partition_iter.value();
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
-						let err = Error::CorruptedBlock(format!(
-							"Failed to decode BlockHandle in seek_to_last(): {}",
-							e
-						));
+						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+							value_bytes: val,
+							context: format!(
+								"Failed to decode BlockHandle in seek_to_last(): {}",
+								e
+							),
+						});
 						log::error!("[TABLE_ITER] {}", err);
 						self.reset();
 						return Err(err);
@@ -1395,7 +1412,9 @@ impl TableIterator {
 		}
 
 		self.reset();
-		Err(Error::CorruptedBlock("Failed to seek to last entry: no valid blocks".to_string()))
+		Err(Error::from(SSTableError::NoValidBlocksForSeek {
+			operation: "last".to_string(),
+		}))
 	}
 
 	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
@@ -1415,10 +1434,10 @@ impl TableIterator {
 					let v = partition_iter.value();
 					let (handle, _) = match BlockHandle::decode(&v) {
 						Err(e) => {
-							let err = Error::CorruptedBlock(format!(
-								"Failed to decode BlockHandle in seek(): {}",
-								e
-							));
+							let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
+								value_bytes: v,
+								context: format!("Failed to decode BlockHandle in seek(): {}", e),
+							});
 							log::error!("[TABLE_ITER] {}", err);
 							self.positioned = true;
 							self.current_block = None;

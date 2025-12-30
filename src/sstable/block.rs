@@ -4,6 +4,7 @@ use std::sync::Arc;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
+use crate::sstable::error::SSTableError;
 use crate::sstable::InternalKey;
 use crate::{Comparator, InternalKeyComparator, Key, Value};
 
@@ -53,10 +54,9 @@ impl BlockHandle {
 	/// Decodes a block handle from `from` and returns a block handle
 	/// together with how many bytes were read from the slice.
 	pub(crate) fn decode(src: &[u8]) -> Result<(Self, usize)> {
-		let (off, offsize) = usize::decode_var(src)
-			.ok_or(Error::CorruptedBlock("corrupted block handle".to_owned()))?;
-		let (sz, szsize) = usize::decode_var(&src[offsize..])
-			.ok_or(Error::CorruptedBlock("corrupted block handle".to_owned()))?;
+		let (off, offsize) = usize::decode_var(src).ok_or(SSTableError::CorruptedBlockHandle)?;
+		let (sz, szsize) =
+			usize::decode_var(&src[offsize..]).ok_or(SSTableError::CorruptedBlockHandle)?;
 
 		Ok((
 			BlockHandle {
@@ -350,27 +350,25 @@ impl BlockIterator {
 		keys_only: bool,
 	) -> Result<Self> {
 		if block.len() < 4 {
-			let err = Error::CorruptedBlock(format!(
-				"Block too small to contain restart count: {} bytes",
-				block.len()
-			));
+			let err = Error::from(SSTableError::BlockTooSmall {
+				size: block.len(),
+				min_size: 4,
+			});
 			log::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 
 		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).ok_or_else(|| {
-			Error::CorruptedBlock(format!(
-				"Failed to decode restart count from block of size {}",
-				block.len()
-			))
+			Error::from(SSTableError::FailedToDecodeRestartCount {
+				block_size: block.len(),
+			})
 		})? as usize;
 
 		let restart_offset = block.len().checked_sub(4 * (num_restarts + 1)).ok_or_else(|| {
-			Error::CorruptedBlock(format!(
-				"Invalid restart count {} for block of size {}",
-				num_restarts,
-				block.len()
-			))
+			Error::from(SSTableError::InvalidRestartCount {
+				count: num_restarts,
+				block_size: block.len(),
+			})
 		})?;
 
 		let mut restart_points = vec![0; num_restarts];
@@ -378,21 +376,20 @@ impl BlockIterator {
 			let start_point = restart_offset + (i * 4);
 			let end_point = start_point + 4;
 			if end_point > block.len() {
-				let err = Error::CorruptedBlock(format!(
-					"Restart point {} at offset {} exceeds block size {}",
-					i,
-					start_point,
-					block.len()
-				));
+				let err = Error::from(SSTableError::RestartPointExceedsBounds {
+					index: i,
+					offset: start_point,
+					block_size: block.len(),
+				});
 				log::error!("[BLOCK] {}", err);
 				return Err(err);
 			}
 			*restart_point =
 				u32::decode_fixed(&block[start_point..end_point]).ok_or_else(|| {
-					Error::CorruptedBlock(format!(
-						"Failed to decode restart point {} at offset {}",
-						i, start_point
-					))
+					Error::from(SSTableError::FailedToDecodeRestartPoint {
+						index: i,
+						offset: start_point,
+					})
 				})?;
 		}
 
@@ -428,28 +425,25 @@ impl BlockIterator {
 		let mut i = 0;
 		let (shared_prefix_length, shared_prefix_length_size) =
 			usize::decode_var(&self.block[offset..]).ok_or_else(|| {
-				Error::CorruptedBlock(format!(
-					"Failed to decode shared prefix length at offset {}",
-					offset
-				))
+				Error::from(SSTableError::FailedToDecodeSharedPrefix {
+					offset,
+				})
 			})?;
 		i += shared_prefix_length_size;
 
 		let (non_shared_key_length, non_shared_key_length_size) =
 			usize::decode_var(&self.block[offset + i..]).ok_or_else(|| {
-				Error::CorruptedBlock(format!(
-					"Failed to decode non-shared key length at offset {}",
-					offset + i
-				))
+				Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
+					offset: offset + i,
+				})
 			})?;
 		i += non_shared_key_length_size;
 
 		let (value_size, value_size_size) = usize::decode_var(&self.block[offset + i..])
 			.ok_or_else(|| {
-				Error::CorruptedBlock(format!(
-					"Failed to decode value size at offset {}",
-					offset + i
-				))
+				Error::from(SSTableError::FailedToDecodeValueSize {
+					offset: offset + i,
+				})
 			})?;
 		i += value_size_size;
 
@@ -459,10 +453,10 @@ impl BlockIterator {
 	// Read the current entry and seek to the next entry
 	fn seek_next_entry(&mut self) -> Result<()> {
 		if self.offset >= self.restart_offset {
-			return Err(Error::CorruptedBlock(format!(
-				"Offset {} exceeds restart_offset {}",
-				self.offset, self.restart_offset
-			)));
+			return Err(Error::from(SSTableError::OffsetExceedsRestartOffset {
+				offset: self.offset,
+				restart_offset: self.restart_offset,
+			}));
 		}
 
 		let (shared_prefix, non_shared_key, value_size, i) =
@@ -472,24 +466,27 @@ impl BlockIterator {
 		let key_end =
 			self.offset.checked_add(i).and_then(|sum| sum.checked_add(non_shared_key)).ok_or_else(
 				|| {
-					Error::CorruptedBlock(format!(
-						"Integer overflow calculating key_end at offset {}",
-						self.offset
-					))
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset: self.offset,
+					})
 				},
 			)?;
 		let value_end = key_end.checked_add(value_size).ok_or_else(|| {
-			Error::CorruptedBlock(format!(
-				"Integer overflow calculating value_end at offset {}",
-				self.offset
-			))
+			Error::from(SSTableError::IntegerOverflowValueEnd {
+				offset: self.offset,
+			})
 		})?;
 
 		if key_end > self.restart_offset || value_end > self.restart_offset {
-			let err = Error::CorruptedBlock(format!(
-				"Decoded lengths exceed block bounds. offset: {}, i: {}, non_shared_key: {}, value_size: {}, key_end: {}, value_end: {}, restart_offset: {}",
-				self.offset, i, non_shared_key, value_size, key_end, value_end, self.restart_offset
-			));
+			let err = Error::from(SSTableError::DecodedLengthsExceedBounds {
+				offset: self.offset,
+				i,
+				non_shared_key,
+				value_size,
+				key_end,
+				value_end,
+				restart_offset: self.restart_offset,
+			});
 			log::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
@@ -571,7 +568,7 @@ impl BlockIterator {
 	// Move to the first entry
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
-			let err = Error::CorruptedBlock("Block has no restart points".to_string());
+			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			log::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
@@ -583,7 +580,7 @@ impl BlockIterator {
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			self.reset();
-			let err = Error::CorruptedBlock("Block has no restart points".to_string());
+			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			log::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
@@ -606,11 +603,10 @@ impl BlockIterator {
 
 		// Guard against empty blocks (corrupt or malformed)
 		if self.restart_points.is_empty() {
-			let err = Error::CorruptedBlock(format!(
-				"Attempted seek on empty/corrupt block with no restart points. Block size: {}, restart_offset: {}",
-				self.block.len(),
-				self.restart_offset
-			));
+			let err = Error::from(SSTableError::EmptyCorruptBlockSeek {
+				block_size: self.block.len(),
+				restart_offset: self.restart_offset,
+			});
 			log::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
@@ -626,12 +622,11 @@ impl BlockIterator {
 			let key_start = self.offset + i;
 			let key_end = key_start + shared_prefix + non_shared_key;
 			if key_end > self.block.len() {
-				let err = Error::CorruptedBlock(format!(
-					"Key extends beyond block bounds. offset: {}, key_end: {}, block_len: {}",
-					self.offset,
+				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {
+					offset: self.offset,
 					key_end,
-					self.block.len()
-				));
+					block_len: self.block.len(),
+				});
 				log::error!("[BLOCK] {}", err);
 				return Err(err);
 			}
