@@ -9,7 +9,7 @@ use crate::sstable::error::SSTableError;
 use crate::sstable::InternalKey;
 use crate::{Comparator, InternalKeyComparator, Key, Value};
 
-pub(crate) type BlockData = Vec<u8>;
+pub(crate) type BlockData = Bytes;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
 pub(crate) struct BlockHandle {
@@ -311,7 +311,7 @@ impl BlockWriter {
 		// 2. Append N_RESTARTS
 		self.buffer.write_fixedint(self.restart_points.len() as u32).expect("block write failed");
 
-		Ok(self.buffer)
+		Ok(Bytes::from(self.buffer))
 	}
 
 	// Estimates the current size of the block
@@ -522,9 +522,7 @@ impl Iterator for BlockIterator {
 				let value = if self.keys_only {
 					Bytes::new()
 				} else {
-					Bytes::copy_from_slice(
-						&self.block[self.current_value_offset_start..self.current_value_offset_end],
-					)
+					self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 				};
 				Some(Ok((Bytes::copy_from_slice(&self.current_key), value)))
 			}
@@ -544,9 +542,7 @@ impl DoubleEndedIterator for BlockIterator {
 				let value = if self.keys_only {
 					Bytes::new()
 				} else {
-					Bytes::copy_from_slice(
-						&self.block[self.current_value_offset_start..self.current_value_offset_end],
-					)
+					self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 				};
 				Some(Ok((Bytes::copy_from_slice(&self.current_key), value)))
 			}
@@ -740,9 +736,7 @@ impl BlockIterator {
 		if self.keys_only {
 			Bytes::new()
 		} else {
-			Bytes::copy_from_slice(
-				&self.block[self.current_value_offset_start..self.current_value_offset_end],
-			)
+			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
 		}
 	}
 

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use integer_encoding::FixedInt;
 
 use crate::FilterPolicy;
@@ -67,7 +68,7 @@ impl FilterBlockWriter {
 
 	// Finalizes the filter block, returning the complete set of filters and their
 	// offsets.
-	pub(crate) fn finish(mut self) -> Vec<u8> {
+	pub(crate) fn finish(mut self) -> Bytes {
 		if !self.keys.is_empty() {
 			self.generate_filter(); // Generate a final filter for any remaining keys.
 		};
@@ -88,14 +89,14 @@ impl FilterBlockWriter {
 		// Append the base log2 value as a single byte.
 		result[ix] = FILTER_BASE_LOG2 as u8;
 
-		result
+		Bytes::from(result)
 	}
 }
 
 #[derive(Clone)]
 pub(crate) struct FilterBlockReader {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used for checking keys against filters.
-	data: Vec<u8>,                 // The entire filter block data.
+	data: Bytes,                    // The entire filter block data.
 	filter_offsets: Vec<u32>,      // Offsets for each filter within the `data`.
 	base_lg: u32,                  // The base log2 value used to calculate block index.
 }
@@ -103,7 +104,7 @@ pub(crate) struct FilterBlockReader {
 impl FilterBlockReader {
 	// Constructs a new `FilterBlockReader` from the given filter block data and
 	// filter policy.
-	pub(crate) fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
+	pub(crate) fn new(data: Bytes, policy: Arc<dyn FilterPolicy>) -> Self {
 		let n = data.len();
 		let base_lg = data[n - 1] as u32; // The last byte is the base log2 value.
 		let num_offset = u32::decode_fixed(&data[n - FILTER_META_LENGTH..n - 1]).unwrap() as usize; // The offsets start 5 bytes from the end.

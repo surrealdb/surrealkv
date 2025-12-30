@@ -502,11 +502,11 @@ pub(crate) fn compress_block(
 		CompressionType::SnappyCompression => {
 			let mut enc = snap::raw::Encoder::new();
 			let mut buffer = vec![0; max_compress_len(raw_block.len())];
-			match enc.compress(&raw_block, buffer.as_mut_slice()) {
+			match enc.compress(raw_block.as_ref(), buffer.as_mut_slice()) {
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
 			}
-			Ok(buffer)
+			Ok(Bytes::from(buffer))
 		}
 		CompressionType::None => Ok(raw_block),
 	}
@@ -516,13 +516,15 @@ pub(crate) fn compress_block(
 pub(crate) fn decompress_block(
 	compressed_block: &[u8],
 	compression: CompressionType,
-) -> Result<Vec<u8>> {
+) -> Result<BlockData> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut dec = snap::raw::Decoder::new();
-			dec.decompress_vec(compressed_block).map_err(|e| Error::Decompression(e.to_string()))
+			dec.decompress_vec(compressed_block)
+				.map(|v| Bytes::from(v))
+				.map_err(|e| Error::Decompression(e.to_string()))
 		}
-		CompressionType::None => Ok(Vec::from(compressed_block)),
+		CompressionType::None => Ok(Bytes::copy_from_slice(compressed_block)),
 	}
 }
 
@@ -557,7 +559,7 @@ pub(crate) fn read_filter_block(
 		return Err(Error::FilterBlockEmpty);
 	}
 	let buf = read_bytes(src, location)?;
-	Ok(FilterBlockReader::new(buf, policy))
+	Ok(FilterBlockReader::new(Bytes::from(buf), policy))
 }
 
 fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
