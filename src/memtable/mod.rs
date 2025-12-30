@@ -2,6 +2,7 @@ use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::batch::Batch;
@@ -97,7 +98,7 @@ impl MemTable {
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let range = InternalKey::new(
-			key.to_vec(),
+			Bytes::copy_from_slice(key),
 			seq_no,
 			InternalKeyKind::Set, // This field is not checked in the comparator
 			0,                    // This field is not checked in the comparator
@@ -138,7 +139,7 @@ impl MemTable {
 
 		// Pre-allocate empty value Bytes for delete operations to avoid repeated
 		// allocations
-		let empty_val = Value::new();
+		let empty_val = Bytes::new();
 
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -240,7 +241,7 @@ impl MemTable {
 		self.map.iter().map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
-				Value::new()
+				Bytes::new()
 			} else {
 				entry.value().clone()
 			};
@@ -256,7 +257,7 @@ impl MemTable {
 		self.map.range(range).map(move |entry| {
 			let key = entry.key().clone();
 			let value = if keys_only {
-				Value::new()
+				Bytes::new()
 			} else {
 				entry.value().clone()
 			};

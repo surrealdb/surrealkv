@@ -375,7 +375,7 @@ mod tests {
 	use crate::{Options, VLogChecksumLevel, Value};
 
 	fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
+		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, 0)
 	}
 
 	fn create_internal_key_with_timestamp(
@@ -384,7 +384,7 @@ mod tests {
 		kind: InternalKeyKind,
 		timestamp: u64,
 	) -> InternalKey {
-		InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
+		InternalKey::new(Bytes::copy_from_slice(user_key.as_bytes()), sequence, kind, timestamp)
 	}
 
 	fn create_test_vlog() -> (Arc<VLog>, TempDir) {

@@ -4,6 +4,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
@@ -263,7 +264,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Optionally add the key to the filter block.
 		if let Some(fblock) = self.filter_block.as_mut() {
-			fblock.add_key(key.user_key.as_slice());
+			fblock.add_key(key.user_key.as_ref());
 		}
 
 		// Add the key-value pair to the data block and increment the entry count.
@@ -364,8 +365,12 @@ impl<W: Write> TableWriter<W> {
 				// Add to meta index
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
-				let filter_key =
-					InternalKey::new(Vec::from(filter_key.as_bytes()), 0, InternalKeyKind::Set, 0);
+				let filter_key = InternalKey::new(
+					Bytes::copy_from_slice(filter_key.as_bytes()),
+					0,
+					InternalKeyKind::Set,
+					0,
+				);
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
@@ -382,7 +387,8 @@ impl<W: Write> TableWriter<W> {
 		self.meta.properties.top_level_index_size = self.partitioned_index.top_level_index_size();
 
 		// 4. Write properties block
-		let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0);
+		let meta_key =
+			InternalKey::new(Bytes::copy_from_slice(b"meta"), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
@@ -555,7 +561,8 @@ pub(crate) fn read_filter_block(
 }
 
 fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
-	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0).encode();
+	let meta_key =
+		InternalKey::new(Bytes::copy_from_slice(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter(false)?;
@@ -564,7 +571,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	if metaindexiter.valid() {
 		let k = metaindexiter.key();
 		// Verify exact match to avoid using wrong entry
-		assert_eq!(k.user_key.as_slice(), b"meta");
+		assert_eq!(k.user_key.as_ref(), b"meta");
 		let buf_bytes = metaindexiter.value();
 		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
 	}
@@ -690,8 +697,12 @@ impl Table {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
 
 		// Create encoded InternalKey for seeking
-		let filter_key =
-			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
+		let filter_key = InternalKey::new(
+			Bytes::copy_from_slice(filter_name.as_bytes()),
+			0,
+			InternalKeyKind::Set,
+			0,
+		);
 
 		let mut metaindexiter = metaix.iter(false)?;
 		metaindexiter.seek(&filter_key.encode())?;
@@ -700,14 +711,14 @@ impl Table {
 			let k = metaindexiter.key();
 
 			// Verify exact match to avoid using wrong entry
-			assert_eq!(k.user_key.as_slice(), filter_name.as_bytes());
+			assert_eq!(k.user_key.as_ref(), filter_name.as_bytes());
 			let val = metaindexiter.value();
 
 			let fbl = BlockHandle::decode(&val);
 			let filter_block_location = match fbl {
 				Err(e) => {
 					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-						value_bytes: val,
+						value_bytes: val.to_vec(),
 						context: format!("error: {:?}", e),
 					}));
 				}
@@ -748,7 +759,7 @@ impl Table {
 
 		// Check filter first
 		if let Some(ref filters) = self.filter_reader {
-			let may_contain = filters.may_contain(key.user_key.as_slice(), 0);
+			let may_contain = filters.may_contain(key.user_key.as_ref(), 0);
 			if !may_contain {
 				return Ok(None);
 			}
@@ -776,7 +787,7 @@ impl Table {
 				partition_iter.seek(&key_encoded)?;
 
 				if partition_iter.valid() {
-					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes())
+					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes_slice())
 						!= Ordering::Greater
 					{
 						let val = partition_iter.value_bytes();
@@ -815,7 +826,7 @@ impl Table {
 		// Go to entry and check if it's the wanted entry.
 		iter.seek(&key_encoded)?;
 		if iter.valid() {
-			if iter.user_key() == key.user_key.as_slice() {
+			if iter.user_key() == key.user_key.as_ref() {
 				Ok(Some((iter.key(), iter.value())))
 			} else {
 				Ok(None)
@@ -854,8 +865,9 @@ impl Table {
 			return true;
 		};
 
-		self.opts.comparator.compare(key.user_key.as_slice(), &smallest.user_key) >= Ordering::Equal
-			&& self.opts.comparator.compare(key.user_key.as_slice(), &largest.user_key)
+		self.opts.comparator.compare(key.user_key.as_ref(), smallest.user_key.as_ref())
+			>= Ordering::Equal
+			&& self.opts.comparator.compare(key.user_key.as_ref(), largest.user_key.as_ref())
 				<= Ordering::Equal
 	}
 
@@ -926,7 +938,7 @@ impl TableIterator {
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
 						return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("error: {:?}", e),
 						}));
 					}
@@ -955,7 +967,7 @@ impl TableIterator {
 			let (handle, _) = match BlockHandle::decode(&val) {
 				Err(e) => {
 					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-						value_bytes: val,
+						value_bytes: val.to_vec(),
 						context: format!("error: {:?}", e),
 					}));
 				}
@@ -1028,7 +1040,7 @@ impl TableIterator {
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("Block corruption in prev(): failed to decode BlockHandle. Error: {:?}", e),
 						});
 						log::error!("[TABLE_ITER] {}", err);
@@ -1062,7 +1074,7 @@ impl TableIterator {
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("Block corruption in prev(): failed to decode BlockHandle in partition {}. Error: {:?}", self.current_partition_index, e),
 						});
 						log::error!("[TABLE_ITER] {}", err);
@@ -1142,7 +1154,7 @@ impl TableIterator {
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key.as_ref(), internal_key.user_key.as_ref());
 					if cmp != Ordering::Greater {
 						// Found a key <= bound, we're positioned correctly
 						break;
@@ -1175,7 +1187,7 @@ impl TableIterator {
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key.as_ref(), internal_key.user_key.as_ref());
 					if cmp == Ordering::Less {
 						break;
 					}
@@ -1348,7 +1360,7 @@ impl TableIterator {
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!(
 								"Failed to decode BlockHandle in seek_to_first(): {}",
 								e
@@ -1392,7 +1404,7 @@ impl TableIterator {
 				let (handle, _) = match BlockHandle::decode(&val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!(
 								"Failed to decode BlockHandle in seek_to_last(): {}",
 								e
@@ -1441,7 +1453,7 @@ impl TableIterator {
 					let (handle, _) = match BlockHandle::decode(&v) {
 						Err(e) => {
 							let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-								value_bytes: v,
+								value_bytes: v.to_vec(),
 								context: format!("Failed to decode BlockHandle in seek(): {}", e),
 							});
 							log::error!("[TABLE_ITER] {}", err);

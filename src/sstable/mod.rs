@@ -9,6 +9,8 @@ pub(crate) mod table;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
+use bytes::{Bytes, BytesMut};
+
 use crate::Key;
 
 // This is the maximum valid sequence number that can be stored in the upper 56
@@ -119,7 +121,7 @@ impl InternalKey {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = read_u64_be(encoded_key, n);
 		let timestamp = read_u64_be(encoded_key, n + 8);
-		let user_key = encoded_key[..n].to_vec();
+		let user_key = Bytes::copy_from_slice(&encoded_key[..n]);
 
 		Self {
 			user_key,
@@ -147,11 +149,12 @@ impl InternalKey {
 		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
 	}
 
-	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = self.user_key.clone();
+	pub(crate) fn encode(&self) -> Bytes {
+		let mut buf = BytesMut::with_capacity(self.user_key.len() + 16);
+		buf.extend_from_slice(&self.user_key);
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
-		buf
+		buf.freeze()
 	}
 
 	#[inline]

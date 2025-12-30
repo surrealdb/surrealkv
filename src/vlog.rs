@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use bytes::Bytes;
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock};
 
@@ -218,7 +219,7 @@ impl ValueLocation {
 	/// Creates a ValueLocation that points to a value in VLog
 	pub(crate) fn with_pointer(pointer: ValuePointer) -> Self {
 		let encoded_pointer = pointer.encode();
-		Self::new(BIT_VALUE_POINTER, encoded_pointer, VALUE_LOCATION_VERSION)
+		Self::new(BIT_VALUE_POINTER, Bytes::from(encoded_pointer), VALUE_LOCATION_VERSION)
 	}
 
 	/// Creates a ValueLocation with inline value
@@ -276,7 +277,7 @@ impl ValueLocation {
 		let mut value = Vec::new();
 		reader.read_to_end(&mut value)?;
 
-		Ok(Self::new(meta, value, version))
+		Ok(Self::new(meta, Bytes::from(value), version))
 	}
 
 	/// Resolves the actual value, handling both inline and pointer cases
@@ -822,7 +823,7 @@ impl VLog {
 		}
 
 		// Extract value slice from entry data
-		let value_bytes = entry_data_vec[value_start..crc_start].to_vec();
+		let value_bytes = Bytes::copy_from_slice(&entry_data_vec[value_start..crc_start]);
 
 		// Cache the value in unified block cache for future reads
 		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
@@ -1078,7 +1079,7 @@ impl VLog {
 				let val = if value.is_empty() {
 					None
 				} else {
-					Some(value.clone())
+					Some(Bytes::from(value))
 				};
 
 				batch.add_record(
@@ -1465,12 +1466,12 @@ impl DeleteList {
 
 		for (seq_num, value_size) in entries {
 			// Convert sequence number to a byte array key
-			let seq_key = seq_num.to_be_bytes().to_vec();
+			let seq_key = Bytes::from(seq_num.to_be_bytes().to_vec());
 			// Store sequence number -> value_size mapping
 			batch.add_record(
 				crate::sstable::InternalKeyKind::Set,
 				seq_key,
-				Some(value_size.to_be_bytes().to_vec()),
+				Some(Bytes::from(value_size.to_be_bytes().to_vec())),
 				0,
 			)?;
 		}
@@ -1511,7 +1512,7 @@ impl DeleteList {
 
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
-			let seq_key = seq_num.to_be_bytes().to_vec();
+			let seq_key = Bytes::from(seq_num.to_be_bytes().to_vec());
 			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
 		}
 

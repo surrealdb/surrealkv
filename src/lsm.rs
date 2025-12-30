@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::batch::Batch;
 use crate::bplustree::tree::DiskBPlusTree;
@@ -731,7 +732,7 @@ impl CommitEnv for LsmCommitEnv {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
-					(Some(pointer), Some(encoded))
+					(Some(pointer), Some(Bytes::from(encoded)))
 				}
 				Some(value) => {
 					// Small value or no VLog: store inline
@@ -743,7 +744,7 @@ impl CommitEnv for LsmCommitEnv {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
-					(None, Some(encoded))
+					(None, Some(Bytes::from(encoded)))
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry

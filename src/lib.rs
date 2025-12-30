@@ -29,6 +29,7 @@ mod test;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bytes::Bytes;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
@@ -51,7 +52,7 @@ impl IntoBytes for &[u8] {
 	}
 
 	fn into_bytes(self) -> Value {
-		self.to_vec()
+		Bytes::copy_from_slice(self)
 	}
 }
 
@@ -61,7 +62,7 @@ impl<const N: usize> IntoBytes for &[u8; N] {
 	}
 
 	fn into_bytes(self) -> Value {
-		self.to_vec()
+		Bytes::copy_from_slice(self)
 	}
 }
 
@@ -71,7 +72,7 @@ impl IntoBytes for Vec<u8> {
 	}
 
 	fn into_bytes(self) -> Value {
-		self
+		Bytes::from(self)
 	}
 }
 
@@ -81,7 +82,7 @@ impl IntoBytes for &Vec<u8> {
 	}
 
 	fn into_bytes(self) -> Value {
-		self.clone()
+		Bytes::copy_from_slice(self)
 	}
 }
 
@@ -91,7 +92,7 @@ impl IntoBytes for &str {
 	}
 
 	fn into_bytes(self) -> Value {
-		self.as_bytes().to_vec()
+		Bytes::copy_from_slice(self.as_bytes())
 	}
 }
 
@@ -101,7 +102,17 @@ impl IntoBytes for Box<[u8]> {
 	}
 
 	fn into_bytes(self) -> Value {
-		self.into_vec()
+		Bytes::from(self.into_vec())
+	}
+}
+
+impl IntoBytes for Bytes {
+	fn as_slice(&self) -> &[u8] {
+		self.as_ref()
+	}
+
+	fn into_bytes(self) -> Value {
+		self
 	}
 }
 
@@ -121,10 +132,10 @@ impl IntoBytes for Box<[u8]> {
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
-pub type Key = Vec<u8>;
+pub type Key = Bytes;
 
 /// The Value type used throughout the LSM tree  
-pub type Value = Vec<u8>;
+pub type Value = Bytes;
 
 /// Type alias for version/timestamp values
 pub type Version = u64;

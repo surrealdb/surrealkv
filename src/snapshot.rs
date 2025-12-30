@@ -4,6 +4,8 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::error::{Error, Result};
 use crate::iter::BoxedIterator;
 use crate::levels::Levels;
@@ -98,7 +100,7 @@ pub(crate) struct IterState {
 
 /// Query parameters for versioned range queries
 #[derive(Debug, Clone)]
-struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
+struct VersionedRangeQueryParams<'a, R: RangeBounds<Key> + 'a> {
 	key_range: &'a R,
 	start_ts: u64,
 	end_ts: u64,
@@ -246,7 +248,8 @@ impl Snapshot {
 		// Read lock on the level manifest
 		let level_manifest = self.core.level_manifest.read()?;
 
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+		let ikey =
+			InternalKey::new(Bytes::copy_from_slice(key), self.seq_num, InternalKeyKind::Set, 0);
 
 		// Check the tables in each level for the key
 		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
@@ -310,7 +313,8 @@ impl Snapshot {
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	pub(crate) fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		// Create a range that includes only the specific key
-		let key_range = key.to_vec()..=key.to_vec();
+		let key_start = Bytes::copy_from_slice(key);
+		let key_range = key_start.clone()..=key_start;
 
 		let mut versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
@@ -333,13 +337,14 @@ impl Snapshot {
 	/// Gets keys in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub(crate) fn keys_at_version<Key: AsRef<[u8]>>(
+	pub(crate) fn keys_at_version<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
-		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
+	) -> Result<impl DoubleEndedIterator<Item = crate::Key> + '_> {
+		let key_range =
+			Bytes::copy_from_slice(start.as_ref())..Bytes::copy_from_slice(end.as_ref());
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -358,13 +363,14 @@ impl Snapshot {
 	/// Scans key-value pairs in a key range at a specific timestamp
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub(crate) fn range_at_version<Key: AsRef<[u8]>>(
+	pub(crate) fn range_at_version<K: AsRef<[u8]>>(
 		&self,
-		start: Key,
-		end: Key,
+		start: K,
+		end: K,
 		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
-		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
+	) -> Result<impl DoubleEndedIterator<Item = Result<(crate::Key, Value)>> + '_> {
+		let key_range =
+			Bytes::copy_from_slice(start.as_ref())..Bytes::copy_from_slice(end.as_ref());
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -399,7 +405,8 @@ impl Snapshot {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
 
-		let key_range = start.as_slice().to_vec()..end.as_slice().to_vec();
+		let key_range =
+			Bytes::copy_from_slice(start.as_slice())..Bytes::copy_from_slice(end.as_slice());
 		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
 			key_range: &key_range,
 			start_ts: 0,
@@ -433,7 +440,7 @@ impl Snapshot {
 	/// TODO: This is a temporary solution to avoid the complexity of
 	/// implementing a proper streaming double ended iterator, which will be
 	/// fixed in the future.
-	fn versioned_range_iter<R: RangeBounds<Vec<u8>>>(
+	fn versioned_range_iter<R: RangeBounds<Key>>(
 		&self,
 		params: VersionedRangeQueryParams<'_, R>,
 	) -> Result<VersionedRangeIterator> {
@@ -457,12 +464,19 @@ impl Snapshot {
 				}
 				Bound::Excluded(key) => {
 					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
+					let mut next_key = key.as_ref().to_vec();
 					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
+					InternalKey::new(
+						Bytes::from(next_key),
+						0,
+						InternalKeyKind::Set,
+						params.start_ts,
+					)
+					.encode()
 				}
 				Bound::Unbounded => {
-					InternalKey::new(Key::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
+					InternalKey::new(Bytes::new(), 0, InternalKeyKind::Set, params.start_ts)
+						.encode()
 				}
 			};
 
@@ -480,7 +494,7 @@ impl Snapshot {
 					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode()
 				}
 				Bound::Unbounded => InternalKey::new(
-					[0xff].to_vec(),
+					Bytes::copy_from_slice(&[0xff]),
 					params.snapshot_seq_num,
 					InternalKeyKind::Max,
 					params.end_ts,
@@ -493,7 +507,7 @@ impl Snapshot {
 			// Collect all versions by key (already in timestamp order from B+tree)
 			// Store the complete InternalKey to preserve all original information
 			// Use BTreeMap to maintain keys in sorted order
-			let mut key_versions: BTreeMap<Vec<u8>, Vec<(InternalKey, Vec<u8>)>> = BTreeMap::new();
+			let mut key_versions: BTreeMap<Key, Vec<(InternalKey, Vec<u8>)>> = BTreeMap::new();
 
 			for entry in range_iter {
 				let (encoded_key, encoded_value) = entry?;
@@ -612,7 +626,7 @@ pub(crate) struct KeysAtTimestampIterator {
 }
 
 impl Iterator for KeysAtTimestampIterator {
-	type Item = Vec<u8>;
+	type Item = Key;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		self.inner.next().map(|(internal_key, _)| internal_key.user_key)
@@ -642,7 +656,7 @@ pub(crate) struct ScanAtTimestampIterator {
 }
 
 impl Iterator for ScanAtTimestampIterator {
-	type Item = Result<(Vec<u8>, Value)>;
+	type Item = Result<(Key, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		self.inner.next().map(|(internal_key, encoded_value)| {
@@ -917,7 +931,7 @@ impl SnapshotIterator<'_> {
 			snapshot_seq_num: seq_num,
 			core,
 			keys_only,
-			last_key_fwd: Vec::new(),
+			last_key_fwd: Bytes::new(),
 			buffered_back: None,
 		})
 	}

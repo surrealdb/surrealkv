@@ -106,9 +106,9 @@ pub struct ReadOptions {
 	/// Whether to return only keys without values (for range operations)
 	pub(crate) keys_only: bool,
 	/// Lower bound for iteration (inclusive), None means unbounded
-	pub(crate) lower_bound: Option<Vec<u8>>,
+	pub(crate) lower_bound: Option<Key>,
 	/// Upper bound for iteration (exclusive), None means unbounded
-	pub(crate) upper_bound: Option<Vec<u8>>,
+	pub(crate) upper_bound: Option<Key>,
 	/// Optional timestamp for point-in-time reads. If None, reads the latest
 	/// version.
 	pub(crate) timestamp: Option<u64>,
@@ -126,17 +126,17 @@ impl ReadOptions {
 		self
 	}
 
-	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
+	pub fn set_iterate_lower_bound(&mut self, bound: Option<Key>) {
 		self.lower_bound = bound;
 	}
 
 	/// Sets the upper bound for iteration (exclusive)
-	pub fn set_iterate_upper_bound(&mut self, bound: Option<Vec<u8>>) {
+	pub fn set_iterate_upper_bound(&mut self, bound: Option<Key>) {
 		self.upper_bound = bound;
 	}
 
 	/// Sets the iteration bounds
-	pub(crate) fn set_iterate_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
+	pub(crate) fn set_iterate_bounds(&mut self, lower: Option<Key>, upper: Option<Key>) {
 		self.lower_bound = lower;
 		self.upper_bound = upper;
 	}
@@ -1084,8 +1084,8 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
-		start_key: Vec<u8>,
-		end_key: Vec<u8>,
+		start_key: Key,
+		end_key: Key,
 		options: &ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
@@ -1104,11 +1104,8 @@ impl<'a> TransactionRangeIterator<'a> {
 		};
 
 		// Create a snapshot iterator for the range
-		let iter = snapshot.range(
-			Some(start_key.as_slice()),
-			Some(end_key.as_slice()),
-			options.keys_only,
-		)?;
+		let iter =
+			snapshot.range(Some(start_key.as_ref()), Some(end_key.as_ref()), options.keys_only)?;
 		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
 		// Use inclusive-exclusive range for write set: [start, end)

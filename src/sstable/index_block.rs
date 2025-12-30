@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
@@ -16,7 +18,7 @@ use crate::{CompressionType, Options};
 #[derive(Clone, Debug)]
 pub(crate) struct BlockHandleWithKey {
 	/// Full encoded separator key (internal key with seq_num)
-	pub separator_key: Vec<u8>,
+	pub separator_key: crate::Key,
 
 	/// Position of block in file
 	pub handle: BlockHandle,
@@ -24,7 +26,7 @@ pub(crate) struct BlockHandleWithKey {
 
 impl BlockHandleWithKey {
 	#[cfg(test)]
-	pub(crate) fn new(separator_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
+	pub(crate) fn new(separator_key: crate::Key, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
 			separator_key,
 			handle,
@@ -204,7 +206,7 @@ impl TopLevelIndex {
 			// Store full encoded internal key for correct partition lookup
 			let (handle, _) = BlockHandle::decode(&handle)?;
 			blocks.push(BlockHandleWithKey {
-				separator_key: key,
+				separator_key: Bytes::copy_from_slice(&key),
 				handle,
 			});
 		}

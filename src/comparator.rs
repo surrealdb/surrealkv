@@ -3,6 +3,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::sstable::{
 	InternalKey,
 	InternalKeyKind,
@@ -190,12 +192,12 @@ impl Comparator for InternalKeyComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					sep,
+					Bytes::from(sep),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				return result.encode();
+				return result.encode().to_vec();
 			}
 		}
 
@@ -214,12 +216,12 @@ impl Comparator for InternalKeyComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				user_key_succ,
+				Bytes::from(user_key_succ),
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
 			);
-			return result.encode();
+			return result.encode().to_vec();
 		}
 
 		// Fallback: Return original key unchanged
@@ -283,12 +285,12 @@ impl Comparator for TimestampComparator {
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
 				let result = InternalKey::new(
-					sep,
+					Bytes::from(sep),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				return result.encode();
+				return result.encode().to_vec();
 			}
 		}
 
@@ -308,12 +310,12 @@ impl Comparator for TimestampComparator {
 				== Ordering::Less
 		{
 			let result = InternalKey::new(
-				user_key_succ,
+				Bytes::from(user_key_succ),
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
 				INTERNAL_KEY_TIMESTAMP_MAX,
 			);
-			return result.encode();
+			return result.encode().to_vec();
 		}
 
 		// Fallback: Return original key unchanged

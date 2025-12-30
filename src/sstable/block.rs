@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
@@ -223,13 +224,13 @@ impl BlockWriter {
 					  Entries in block: {}\n\
 					  Buffer size: {} bytes",
 					String::from_utf8_lossy(&last_internal_key.user_key),
-					last_internal_key.user_key.as_slice(),
+					last_internal_key.user_key.as_ref(),
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
 					last_internal_key.timestamp,
 					self.last_key.as_slice(),
 					String::from_utf8_lossy(&current_internal_key.user_key),
-					current_internal_key.user_key.as_slice(),
+					current_internal_key.user_key.as_ref(),
 					current_internal_key.seq_num(),
 					current_internal_key.kind(),
 					current_internal_key.timestamp,
@@ -519,12 +520,13 @@ impl Iterator for BlockIterator {
 		match self.advance() {
 			Ok(true) => {
 				let value = if self.keys_only {
-					Vec::new()
+					Bytes::new()
 				} else {
-					self.block[self.current_value_offset_start..self.current_value_offset_end]
-						.to_vec()
+					Bytes::copy_from_slice(
+						&self.block[self.current_value_offset_start..self.current_value_offset_end],
+					)
 				};
-				Some(Ok((self.current_key.clone(), value)))
+				Some(Ok((Bytes::copy_from_slice(&self.current_key), value)))
 			}
 			Ok(false) => None,
 			Err(e) => {
@@ -540,12 +542,13 @@ impl DoubleEndedIterator for BlockIterator {
 		match self.prev() {
 			Ok(true) => {
 				let value = if self.keys_only {
-					Vec::new()
+					Bytes::new()
 				} else {
-					self.block[self.current_value_offset_start..self.current_value_offset_end]
-						.to_vec()
+					Bytes::copy_from_slice(
+						&self.block[self.current_value_offset_start..self.current_value_offset_end],
+					)
 				};
-				Some(Ok((self.current_key.clone(), value)))
+				Some(Ok((Bytes::copy_from_slice(&self.current_key), value)))
 			}
 			Ok(false) => None,
 			Err(e) => {
@@ -735,15 +738,17 @@ impl BlockIterator {
 	#[inline]
 	pub(crate) fn value(&self) -> Value {
 		if self.keys_only {
-			Vec::new()
+			Bytes::new()
 		} else {
-			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
+			Bytes::copy_from_slice(
+				&self.block[self.current_value_offset_start..self.current_value_offset_end],
+			)
 		}
 	}
 
 	/// Returns the raw encoded key bytes without allocation
 	#[inline]
-	pub(crate) fn key_bytes(&self) -> &[u8] {
+	pub(crate) fn key_bytes_slice(&self) -> &[u8] {
 		&self.current_key
 	}
 

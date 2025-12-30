@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
@@ -285,7 +286,7 @@ impl Batch {
 			let (key_len, bytes_read) =
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
-			let key = data[pos..pos + key_len as usize].to_vec();
+			let key = Bytes::copy_from_slice(&data[pos..pos + key_len as usize]);
 			pos += key_len as usize;
 
 			// Read value
@@ -293,7 +294,7 @@ impl Batch {
 				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let value = if value_len > 0 {
-				let value_data = data[pos..pos + value_len as usize].to_vec();
+				let value_data = Bytes::copy_from_slice(&data[pos..pos + value_len as usize]);
 				pos += value_len as usize;
 				Some(value_data)
 			} else {
