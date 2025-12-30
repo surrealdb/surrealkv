@@ -450,47 +450,6 @@ impl CoreInner {
 		Ok(Some(table))
 	}
 
-	/// Flushes a single immutable memtable using its pre-assigned table_id.
-	///
-	/// This is used during shutdown to flush immutable memtables that already
-	/// have their table_ids assigned (from when they were moved from active to
-	/// immutable).
-	///
-	/// # Arguments
-	///
-	/// * `table_id` - The pre-assigned table ID for this memtable
-	/// * `wal_number` - The WAL number that contains this memtable's data
-	/// * `memtable` - The immutable memtable to flush
-	///
-	/// # Returns
-	///
-	/// * `Ok(table)` - The flushed SSTable
-	/// * `Err(_)` - If flush or manifest update fails
-	///
-	/// # Important
-	///
-	/// Unlike `flush_memtable_and_update_manifest`, this method:
-	/// - Does NOT call `next_table_id()` - uses the pre-assigned ID
-	/// - Does NOT swap the active memtable
-	/// - Removes the memtable from immutable_memtables tracking after success
-	/// - Updates log_number to mark the associated WAL as flushed
-	fn flush_single_immutable_memtable(
-		&self,
-		table_id: u64,
-		wal_number: u64,
-		memtable: Arc<MemTable>,
-	) -> Result<Arc<Table>> {
-		log::debug!(
-			"Flushing immutable memtable: table_id={}, wal_number={}, size={}",
-			table_id,
-			wal_number,
-			memtable.size()
-		);
-
-		// Flush the memtable to SST and update manifest
-		self.flush_and_update_manifest(&memtable, table_id, wal_number)
-	}
-
 	/// Flushes all memtables (immutable and active) during shutdown.
 	///
 	/// # Critical: Flush Ordering
@@ -547,7 +506,7 @@ impl CoreInner {
 
 			// Fail-fast: return immediately on error
 			// WAL replay will recover this and subsequent memtables on restart
-			self.flush_single_immutable_memtable(entry.table_id, entry.wal_number, entry.memtable)?;
+			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
 
 			flushed_count += 1;
 			log::debug!(
