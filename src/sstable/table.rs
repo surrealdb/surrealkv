@@ -759,8 +759,14 @@ impl Table {
 				// Use internal key comparison to find the partition block
 				let partition_block = match partitioned_index.get(&key_encoded) {
 					Ok(block) => block,
-					Err(_e) => {
-						return Ok(None);
+					Err(e) => {
+						// Treat "not found" cases as key not found:
+						// - BlockNotFound: key is beyond all partitions
+						// All other errors (I/O, corruption) should be propagated
+						match &e {
+							Error::BlockNotFound => return Ok(None),
+							_ => return Err(e),
+						}
 					}
 				};
 
@@ -3336,9 +3342,8 @@ mod tests {
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		let lookup_key = InternalKey::new(Vec::from(b"any_key"), 100, InternalKeyKind::Set, 0);
-		let result = table.get(&lookup_key).unwrap();
-
-		assert!(result.is_none());
+		let result = table.get(&lookup_key);
+		assert!(result.is_err());
 	}
 
 	#[test]
