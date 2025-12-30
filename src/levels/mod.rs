@@ -513,6 +513,7 @@ mod tests {
 	use super::*;
 	use crate::sstable::table::TableWriter;
 	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::IntoBytes;
 
 	// Helper function to create a test table with direct file IO
 	fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
@@ -529,7 +530,7 @@ mod tests {
 			let value = format!("value_{i:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+				InternalKey::new(key.as_bytes().into_bytes(), i + 1, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -886,7 +887,7 @@ mod tests {
 			let value = format!("value_{seq_num:05}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+				InternalKey::new(key.as_bytes().into_bytes(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}

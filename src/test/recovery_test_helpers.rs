@@ -9,7 +9,7 @@ use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
-use crate::Tree;
+use crate::{IntoBytes, Tree};
 
 pub struct RecoveryTestHelper;
 
@@ -143,7 +143,9 @@ impl WalTestHelper {
 				for i in 0..entry_count {
 					let key = format!("seg{}_key{:04}", seg_idx, i);
 					let value = format!("seg{}_value{:04}", seg_idx, i);
-					batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+					batch
+						.set(key.as_bytes().into_bytes(), value.as_bytes().into_bytes(), 0)
+						.unwrap();
 					current_seq += 1;
 				}
 				wal.append(&batch.encode().unwrap()).unwrap();
@@ -183,7 +185,7 @@ impl WalTestHelper {
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+				batch.set(key.as_bytes().into_bytes(), value.as_bytes().into_bytes(), 0).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
@@ -197,7 +199,7 @@ impl WalTestHelper {
 			for i in 0..entry_count {
 				let key = format!("key{}", seq_start + i as u64);
 				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+				batch.set(key.as_bytes().into_bytes(), value.as_bytes().into_bytes(), 0).unwrap();
 			}
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.close().unwrap();
@@ -264,7 +266,7 @@ impl WalTestHelper {
 		for entry in memtable.iter(false) {
 			// entry is Result<(InternalKey, Bytes)>
 			let (entry_key, _) = entry.unwrap();
-			let key = String::from_utf8(entry_key.user_key.clone()).unwrap();
+			let key = String::from_utf8(entry_key.user_key.to_vec()).unwrap();
 			found_keys.push(key);
 		}
 		found_keys.sort();

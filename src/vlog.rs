@@ -1535,6 +1535,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
+	use crate::IntoBytes;
 
 	fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 		let temp_dir = TempDir::new().unwrap();
@@ -1821,7 +1822,7 @@ mod tests {
 	#[test]
 	fn test_value_location_inline_encoding() {
 		let test_data = b"hello world";
-		let location = ValueLocation::with_inline_value(test_data.to_vec());
+		let location = ValueLocation::with_inline_value(test_data.into_bytes());
 
 		// Test encode
 		let encoded = location.encode();
@@ -1863,9 +1864,9 @@ mod tests {
 	#[test]
 	fn test_value_location_encode_into_decode() {
 		let test_cases = vec![
-			ValueLocation::with_inline_value(b"small data".to_vec()),
+			ValueLocation::with_inline_value(b"small data".into_bytes()),
 			ValueLocation::with_pointer(ValuePointer::new(1, 100, 10, 50, 0xabcdef)),
-			ValueLocation::with_inline_value(Vec::new()), // empty data
+			ValueLocation::with_inline_value(Bytes::new()), // empty data
 		];
 
 		for location in test_cases {
@@ -1884,7 +1885,7 @@ mod tests {
 	fn test_value_location_size_calculation() {
 		// Test inline size
 		let inline_data = b"test data";
-		let inline_location = ValueLocation::with_inline_value(inline_data.to_vec());
+		let inline_location = ValueLocation::with_inline_value(inline_data.into_bytes());
 		assert_eq!(inline_location.encoded_size(), 1 + 1 + inline_data.len()); // meta + version + data
 
 		// Test VLog size
@@ -1898,7 +1899,7 @@ mod tests {
 		let (vlog, _temp_dir, _) = create_test_vlog(None);
 		let vlog = Arc::new(vlog);
 		let test_data = b"inline test data";
-		let location = ValueLocation::with_inline_value(test_data.to_vec());
+		let location = ValueLocation::with_inline_value(test_data.into_bytes());
 
 		let resolved = location.resolve_value(Some(&vlog)).unwrap();
 		assert_eq!(&*resolved, test_data);
@@ -1924,7 +1925,7 @@ mod tests {
 	#[test]
 	fn test_value_location_from_encoded_value_inline() {
 		let test_data = b"encoded inline data";
-		let location = ValueLocation::with_inline_value(test_data.to_vec());
+		let location = ValueLocation::with_inline_value(test_data.into_bytes());
 		let encoded = location.encode();
 
 		// Should work without VLog for inline data
@@ -1959,7 +1960,7 @@ mod tests {
 	fn test_value_location_edge_cases() {
 		// Test with maximum size inline data
 		let max_inline = vec![0xffu8; u16::MAX as usize];
-		let location = ValueLocation::with_inline_value(max_inline);
+		let location = ValueLocation::with_inline_value(max_inline.into_bytes());
 		let encoded = location.encode();
 		let decoded = ValueLocation::decode(&encoded).unwrap();
 		assert_eq!(location, decoded);
@@ -2034,7 +2035,7 @@ mod tests {
 
 		// Retrieve the value to ensure header validation works
 		let retrieved_value = vlog.get(&pointer).unwrap();
-		assert_eq!(&retrieved_value, value);
+		assert_eq!(&retrieved_value.as_ref(), value);
 	}
 
 	#[test(tokio::test)]

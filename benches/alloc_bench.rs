@@ -14,31 +14,31 @@ fn main() {
 
 const COUNTS: &[usize] = &[10_000];
 
-// #[divan::bench(args = COUNTS)]
-// pub fn seq_insert(b: divan::Bencher<'_, '_>, count: usize) {
-// 	let temp_dir = TempDir::new().unwrap();
-// 	let db_path = temp_dir.path().to_path_buf();
-// 	let rt = Runtime::new().unwrap();
-// 	let _guard = rt.enter();
+#[divan::bench(args = COUNTS)]
+pub fn seq_insert(b: divan::Bencher<'_, '_>, count: usize) {
+	let temp_dir = TempDir::new().unwrap();
+	let db_path = temp_dir.path().to_path_buf();
+	let rt = Runtime::new().unwrap();
+	let _guard = rt.enter();
 
-// 	let tree = TreeBuilder::new()
-// 		.with_comparator(Arc::new(BytewiseComparator {}))
-// 		.with_path(db_path)
-// 		.build()
-// 		.unwrap();
+	let tree = TreeBuilder::new()
+		.with_comparator(Arc::new(BytewiseComparator {}))
+		.with_path(db_path)
+		.build()
+		.unwrap();
 
-// 	let mut rng = rand::rng();
+	let mut rng = rand::rng();
 
-// 	b.counter(count).bench_local(|| {
-// 		let key: [u8; 16] = rng.random();
-// 		let value: [u8; 64] = rng.random();
-// 		let mut txn = tree.begin().unwrap();
-// 		txn.set(&key, &value).unwrap();
-// 		Handle::current().block_on(async {
-// 			txn.commit().await.unwrap();
-// 		});
-// 	});
-// }
+	b.counter(count).bench_local(|| {
+		let key: [u8; 16] = rng.random();
+		let value: [u8; 64] = rng.random();
+		let mut txn = tree.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		Handle::current().block_on(async {
+			txn.commit().await.unwrap();
+		});
+	});
+}
 
 #[divan::bench(args = COUNTS)]
 pub fn seq_get(b: divan::Bencher<'_, '_>, count: usize) {

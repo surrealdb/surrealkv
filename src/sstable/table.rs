@@ -1570,7 +1570,7 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::user_range_to_internal_range;
+	use crate::{user_range_to_internal_range, IntoBytes};
 
 	fn default_opts() -> Arc<Options> {
 		let mut opts = Options::new();
@@ -1613,12 +1613,22 @@ mod tests {
 
 		for i in 0..data.len() {
 			b.add(
-				InternalKey::new(Vec::from(data[i].0.as_bytes()), 1, InternalKeyKind::Set, 0),
+				InternalKey::new(
+					Bytes::copy_from_slice(data[i].0.as_bytes()),
+					1,
+					InternalKeyKind::Set,
+					0,
+				),
 				data[i].1.as_bytes(),
 			)
 			.unwrap();
 			b.add(
-				InternalKey::new(Vec::from(data2[i].0.as_bytes()), 1, InternalKeyKind::Set, 0),
+				InternalKey::new(
+					Bytes::copy_from_slice(data2[i].0.as_bytes()),
+					1,
+					InternalKeyKind::Set,
+					0,
+				),
 				data2[i].1.as_bytes(),
 			)
 			.unwrap();
@@ -1641,7 +1651,7 @@ mod tests {
 
 		for &(k, v) in data.iter() {
 			b.add(
-				InternalKey::new(Vec::from(k.as_bytes()), 1, InternalKeyKind::Set, 0),
+				InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, InternalKeyKind::Set, 0),
 				v.as_bytes(),
 			)
 			.unwrap();
@@ -1680,7 +1690,12 @@ mod tests {
 
 			for &(k, v) in data.iter() {
 				b.add(
-					InternalKey::new(Vec::from(k.as_bytes()), 1, InternalKeyKind::Set, 0),
+					InternalKey::new(
+						Bytes::copy_from_slice(k.as_bytes()),
+						1,
+						InternalKeyKind::Set,
+						0,
+					),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1704,7 +1719,12 @@ mod tests {
 			let mut b = TableWriter::new(&mut d, 0, opt, 0);
 			for &(k, v, seq) in data.iter() {
 				b.add(
-					InternalKey::new(Vec::from(k.as_bytes()), seq, InternalKeyKind::Set, 0),
+					InternalKey::new(
+						Bytes::copy_from_slice(k.as_bytes()),
+						seq,
+						InternalKeyKind::Set,
+						0,
+					),
 					v.as_bytes(),
 				)
 				.unwrap();
@@ -1728,22 +1748,22 @@ mod tests {
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 		let mut iter = table.iter(false, None);
 
-		let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(b"bcd"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
-		let key = InternalKey::new(Vec::from(b"abc"), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(b"abc"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 		assert_eq!((&iter.key().user_key[..], iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
 		// Seek-past-last invalidates.
-		let key = InternalKey::new(Vec::from(b"{{{"), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(b"{{{"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode()).unwrap();
 		assert!(!iter.valid());
 
-		let key = InternalKey::new(Vec::from(b"bbb"), 2, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(b"bbb"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&key.encode()).unwrap();
 		assert!(iter.valid());
 	}
@@ -1808,7 +1828,7 @@ mod tests {
 			items.push((key.clone(), value.clone()));
 
 			let internal_key = InternalKey::new(
-				Vec::from(key.as_bytes()),
+				Bytes::copy_from_slice(key.as_bytes()),
 				i + 2, // Descending sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -1832,8 +1852,12 @@ mod tests {
 
 		// Verify all items can be retrieved
 		for (key, value) in &items {
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), num_items + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				num_items + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			let result = table.get(&internal_key).unwrap();
 
@@ -1879,8 +1903,12 @@ mod tests {
 			let value = format!("value_{i:05}");
 			items.push((key.clone(), value.clone()));
 
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
@@ -1928,7 +1956,8 @@ mod tests {
 		seq: u64,
 		value: &[u8],
 	) -> Result<()> {
-		writer.add(InternalKey::new(Vec::from(key), seq, InternalKeyKind::Set, 0), value)
+		writer
+			.add(InternalKey::new(Bytes::copy_from_slice(key), seq, InternalKeyKind::Set, 0), value)
 	}
 
 	#[test]
@@ -2317,13 +2346,13 @@ mod tests {
 
 		// Also verify that we can use the range for querying
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(expected_low),
+			Bytes::copy_from_slice(expected_low),
 			1,
 			InternalKeyKind::Set,
 			0
 		)));
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(expected_high),
+			Bytes::copy_from_slice(expected_high),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2332,7 +2361,7 @@ mod tests {
 		// A key before the range should not be in the range
 		let before_range = "aaa".as_bytes();
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(before_range),
+			Bytes::copy_from_slice(before_range),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2341,7 +2370,7 @@ mod tests {
 		// A key after the range should not be in the range
 		let after_range = "zzzz".as_bytes();
 		assert!(!table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(after_range),
+			Bytes::copy_from_slice(after_range),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2350,7 +2379,7 @@ mod tests {
 		// Test a key in the middle of the range
 		let middle_key = "bsr".as_bytes(); // This is in the test data
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(middle_key),
+			Bytes::copy_from_slice(middle_key),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2392,7 +2421,7 @@ mod tests {
 		// properly
 		let in_first_gap = "ccc".as_bytes(); // Between bbb and ppp
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(in_first_gap),
+			Bytes::copy_from_slice(in_first_gap),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2400,7 +2429,7 @@ mod tests {
 
 		let in_second_gap = "xxx".as_bytes(); // Between qqq and zzz
 		assert!(table.is_key_in_key_range(&InternalKey::new(
-			Vec::from(in_second_gap),
+			Bytes::copy_from_slice(in_second_gap),
 			1,
 			InternalKeyKind::Set,
 			0
@@ -2448,7 +2477,7 @@ mod tests {
 		for idx in [0, 10, 25, 49] {
 			let key = format!("key_{idx:03}");
 			assert!(table.is_key_in_key_range(&InternalKey::new(
-				Vec::from(key.as_bytes()),
+				Bytes::copy_from_slice(key.as_bytes()),
 				1,
 				InternalKeyKind::Set,
 				0
@@ -2505,7 +2534,11 @@ mod tests {
 					InternalKeyKind::Set
 				};
 
-				b.add(InternalKey::new(Vec::from(k.as_bytes()), 1, kind, 0), v.as_bytes()).unwrap();
+				b.add(
+					InternalKey::new(Bytes::copy_from_slice(k.as_bytes()), 1, kind, 0),
+					v.as_bytes(),
+				)
+				.unwrap();
 			}
 
 			b.finish().unwrap();
@@ -2766,8 +2799,12 @@ mod tests {
 		for (seek_key, expected_start_index) in test_cases {
 			let mut iter = table.iter(false, None);
 
-			let internal_key =
-				InternalKey::new(Vec::from(seek_key.as_bytes()), 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(seek_key.as_bytes()),
+				1,
+				InternalKeyKind::Set,
+				0,
+			);
 			iter.seek(&internal_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to '{seek_key}'");
@@ -2827,7 +2864,8 @@ mod tests {
 		// Test seek to existing key
 		{
 			let mut iter = table.iter(false, None);
-			let seek_key = InternalKey::new(Vec::from(b"key_005"), 1, InternalKeyKind::Set, 0);
+			let seek_key =
+				InternalKey::new(Bytes::copy_from_slice(b"key_005"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
@@ -2860,7 +2898,8 @@ mod tests {
 		// Test seek to non-existing key (should find next key)
 		{
 			let mut iter = table.iter(false, None);
-			let seek_key = InternalKey::new(Vec::from(b"key_003"), 1, InternalKeyKind::Set, 0);
+			let seek_key =
+				InternalKey::new(Bytes::copy_from_slice(b"key_003"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
@@ -2872,7 +2911,8 @@ mod tests {
 		// Test seek past end
 		{
 			let mut iter = table.iter(false, None);
-			let seek_key = InternalKey::new(Vec::from(b"key_999"), 1, InternalKeyKind::Set, 0);
+			let seek_key =
+				InternalKey::new(Bytes::copy_from_slice(b"key_999"), 1, InternalKeyKind::Set, 0);
 			iter.seek(&seek_key.encode()).unwrap();
 
 			assert!(!iter.valid(), "Iterator should be invalid after seeking past end");
@@ -2906,8 +2946,12 @@ mod tests {
 		let start = Instant::now();
 		for i in (0..1000).step_by(100) {
 			let mut iter = table.iter(false, None);
-			let seek_key =
-				InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
+			let seek_key = InternalKey::new(
+				format!("key_{i:06}").into_bytes().into_bytes(),
+				1,
+				InternalKeyKind::Set,
+				0,
+			);
 			iter.seek(&seek_key.encode()).unwrap();
 			assert!(iter.valid(), "Seek to key_{i:06} should succeed");
 		}
@@ -3145,8 +3189,12 @@ mod tests {
 		for i in 0..100 {
 			let key = format!("key_{i:03}");
 			let value = format!("value_{i:03}");
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				i + 1,
+				InternalKeyKind::Set,
+				0,
+			);
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
@@ -3168,7 +3216,7 @@ mod tests {
 			let key = format!("key_{i:03}");
 			let expected_value = format!("value_{i:03}");
 			let internal_key = InternalKey::new(
-				Vec::from(key.as_bytes()),
+				Bytes::copy_from_slice(key.as_bytes()),
 				i + 2, // Higher seq number for lookup
 				InternalKeyKind::Set,
 				0,
@@ -3222,7 +3270,8 @@ mod tests {
 		// Add only key_bbb to the table
 		let key = b"key_bbb";
 		let value = b"value_bbb";
-		let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
 		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
@@ -3231,7 +3280,7 @@ mod tests {
 		// Try to get key_aaa which does NOT exist
 		// key_aaa < key_bbb lexicographically
 		let lookup_key = InternalKey::new(
-			Vec::from(b"key_aaa"),
+			Bytes::copy_from_slice(b"key_aaa"),
 			2, // Higher seq number for lookup
 			InternalKeyKind::Set,
 			0,
@@ -3262,39 +3311,46 @@ mod tests {
 
 		let user_key = b"my_key";
 
-		let key1 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let key1 = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
 		writer.add(key1, b"value_100").unwrap();
 
-		let key2 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
 		writer.add(key2, b"value_50").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key_higher = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		let lookup_key_higher =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key_higher).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(&found_value, b"value_100");
+		assert_eq!(&found_value.as_ref(), b"value_100");
 
-		let lookup_key_between = InternalKey::new(Vec::from(user_key), 75, InternalKeyKind::Set, 0);
+		let lookup_key_between =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 75, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key_between).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(&found_value, b"value_50");
+		assert_eq!(&found_value.as_ref(), b"value_50");
 
-		let lookup_key_exact = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let lookup_key_exact =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key_exact).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(&found_value, b"value_100");
+		assert_eq!(&found_value.as_ref(), b"value_100");
 
 		let different_user_key = b"other_key";
-		let lookup_key_different =
-			InternalKey::new(Vec::from(different_user_key), 200, InternalKeyKind::Set, 0);
+		let lookup_key_different = InternalKey::new(
+			Bytes::copy_from_slice(different_user_key),
+			200,
+			InternalKeyKind::Set,
+			0,
+		);
 		let result = table.get(&lookup_key_different).unwrap();
 		assert!(
 			result.is_none(),
@@ -3313,23 +3369,27 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
-		let key_bbb = InternalKey::new(Vec::from(b"bbb_key"), 75, InternalKeyKind::Set, 0);
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 75, InternalKeyKind::Set, 0);
 		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let user_key = b"my_key";
-		let key = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
 		writer.add(key, b"value_50").unwrap();
 
-		let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(user_key), 25, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		if result.is_some() {
@@ -3353,7 +3413,8 @@ mod tests {
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"any_key"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"any_key"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key);
 		assert!(result.is_err());
 	}
@@ -3365,37 +3426,42 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_a = InternalKey::new(Vec::from(b"key_a"), 100, InternalKeyKind::Set, 0);
+		let key_a =
+			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_a, b"value_a_100").unwrap();
 
-		let key_b = InternalKey::new(Vec::from(b"key_b"), 50, InternalKeyKind::Set, 0);
+		let key_b = InternalKey::new(Bytes::copy_from_slice(b"key_b"), 50, InternalKeyKind::Set, 0);
 		writer.add(key_b, b"value_b_50").unwrap();
 
-		let key_c = InternalKey::new(Vec::from(b"key_c"), 75, InternalKeyKind::Set, 0);
+		let key_c = InternalKey::new(Bytes::copy_from_slice(b"key_c"), 75, InternalKeyKind::Set, 0);
 		writer.add(key_c, b"value_c_75").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_b_low = InternalKey::new(Vec::from(b"key_b"), 25, InternalKeyKind::Set, 0);
+		let lookup_b_low =
+			InternalKey::new(Bytes::copy_from_slice(b"key_b"), 25, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_b_low).unwrap();
 		assert!(result.is_none());
 
-		let lookup_a_high = InternalKey::new(Vec::from(b"key_a"), 150, InternalKeyKind::Set, 0);
+		let lookup_a_high =
+			InternalKey::new(Bytes::copy_from_slice(b"key_a"), 150, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_a_high).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), b"key_a");
-		assert_eq!(&found_value, b"value_a_100");
+		assert_eq!(&found_value.as_ref(), b"value_a_100");
 
-		let lookup_c_exact = InternalKey::new(Vec::from(b"key_c"), 75, InternalKeyKind::Set, 0);
+		let lookup_c_exact =
+			InternalKey::new(Bytes::copy_from_slice(b"key_c"), 75, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_c_exact).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), b"key_c");
-		assert_eq!(&found_value, b"value_c_75");
+		assert_eq!(&found_value.as_ref(), b"value_c_75");
 
-		let lookup_key_b5 = InternalKey::new(Vec::from(b"key_b5"), 100, InternalKeyKind::Set, 0);
+		let lookup_key_b5 =
+			InternalKey::new(Bytes::copy_from_slice(b"key_b5"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key_b5).unwrap();
 		assert!(result.is_none());
 	}
@@ -3407,25 +3473,28 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
 		let user_key = b"boundary_key";
-		let key = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
 		writer.add(key, b"value_100").unwrap();
 
-		let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_min = InternalKey::new(Vec::from(user_key), 0, InternalKeyKind::Set, 0);
+		let lookup_min =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 0, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_min).unwrap();
 		assert!(result.is_none());
 
 		let lookup_max = InternalKey::new(
-			Vec::from(user_key),
+			Bytes::copy_from_slice(user_key),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Set,
 			0,
@@ -3434,9 +3503,10 @@ mod tests {
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
-		assert_eq!(&found_value, b"value_100");
+		assert_eq!(&found_value.as_ref(), b"value_100");
 
-		let lookup_one = InternalKey::new(Vec::from(user_key), 1, InternalKeyKind::Set, 0);
+		let lookup_one =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 1, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_one).unwrap();
 		assert!(result.is_none());
 	}
@@ -3452,30 +3522,34 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
-		let key_bbb = InternalKey::new(Vec::from(b"bbb_key"), 80, InternalKeyKind::Set, 0);
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"bbb_key"), 80, InternalKeyKind::Set, 0);
 		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let user_key = b"mykey";
-		let key = InternalKey::new(Vec::from(user_key), 25, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(Bytes::copy_from_slice(user_key), 25, InternalKeyKind::Set, 0);
 		writer.add(key, b"value_25").unwrap();
 
-		let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), user_key);
 		assert_eq!(found_key.seq_num(), 25);
-		assert_eq!(&found_value, b"value_25");
+		assert_eq!(&found_value.as_ref(), b"value_25");
 	}
 
 	#[test]
@@ -3488,20 +3562,29 @@ mod tests {
 		for i in 0..20 {
 			let key = format!("aaa_key_{:03}", i);
 			let value = format!("value_{}", i);
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				1000,
+				InternalKeyKind::Set,
+				0,
+			);
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
 		let target_key = b"target_key";
-		let key_500 = InternalKey::new(Vec::from(target_key), 500, InternalKeyKind::Set, 0);
+		let key_500 =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 500, InternalKeyKind::Set, 0);
 		writer.add(key_500, b"value_500").unwrap();
 
 		for i in 0..40 {
 			let key = format!("zzz_key_{:03}", i);
 			let value = format!("value_{}", i);
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				1000,
+				InternalKeyKind::Set,
+				0,
+			);
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
@@ -3510,28 +3593,32 @@ mod tests {
 
 		assert!(table.meta.properties.block_count > 1);
 
-		let lookup_high = InternalKey::new(Vec::from(target_key), 1000, InternalKeyKind::Set, 0);
+		let lookup_high =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 1000, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_high).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), target_key);
 		assert_eq!(found_key.seq_num(), 500);
-		assert_eq!(&found_value, b"value_500");
+		assert_eq!(&found_value.as_ref(), b"value_500");
 
-		let lookup_exact = InternalKey::new(Vec::from(target_key), 500, InternalKeyKind::Set, 0);
+		let lookup_exact =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 500, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_exact).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key.as_slice(), target_key);
 		assert_eq!(found_key.seq_num(), 500);
-		assert_eq!(&found_value, b"value_500");
+		assert_eq!(&found_value.as_ref(), b"value_500");
 
-		let lookup_low = InternalKey::new(Vec::from(target_key), 100, InternalKeyKind::Set, 0);
+		let lookup_low =
+			InternalKey::new(Bytes::copy_from_slice(target_key), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_low).unwrap();
 		assert!(result.is_none());
 
 		let filler_key = b"zzz_key_010";
-		let lookup_filler = InternalKey::new(Vec::from(filler_key), 1000, InternalKeyKind::Set, 0);
+		let lookup_filler =
+			InternalKey::new(Bytes::copy_from_slice(filler_key), 1000, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_filler).unwrap();
 		assert!(result.is_some());
 		let (found_key, _) = result.unwrap();
@@ -3545,19 +3632,23 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
-		let key_bbb = InternalKey::new(Vec::from(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_bbb, b"value_bbb").unwrap();
 
-		let key_ccc = InternalKey::new(Vec::from(b"key_ccc"), 100, InternalKeyKind::Set, 0);
+		let key_ccc =
+			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_ccc, b"value_ccc").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3570,19 +3661,23 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
-		let key_ccc = InternalKey::new(Vec::from(b"key_ccc"), 100, InternalKeyKind::Set, 0);
+		let key_ccc =
+			InternalKey::new(Bytes::copy_from_slice(b"key_ccc"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_ccc, b"value_ccc").unwrap();
 
-		let key_eee = InternalKey::new(Vec::from(b"key_eee"), 100, InternalKeyKind::Set, 0);
+		let key_eee =
+			InternalKey::new(Bytes::copy_from_slice(b"key_eee"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_eee, b"value_eee").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3595,20 +3690,27 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_other = InternalKey::new(Vec::from(b"key_other"), 100, InternalKeyKind::Set, 0);
+		let key_other =
+			InternalKey::new(Bytes::copy_from_slice(b"key_other"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_other, b"value_other").unwrap();
 
-		let key_target =
-			InternalKey::new(Vec::from(b"key_target"), 100, InternalKeyKind::Delete, 0);
+		let key_target = InternalKey::new(
+			Bytes::copy_from_slice(b"key_target"),
+			100,
+			InternalKeyKind::Delete,
+			0,
+		);
 		writer.add(key_target, b"").unwrap();
 
-		let key_zzz = InternalKey::new(Vec::from(b"key_zzz"), 100, InternalKeyKind::Set, 0);
+		let key_zzz =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_zzz, b"value_zzz").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"key_target"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_target"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_some());
@@ -3624,19 +3726,23 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key1 = InternalKey::new(Vec::from(b"user_data"), 100, InternalKeyKind::Set, 0);
+		let key1 =
+			InternalKey::new(Bytes::copy_from_slice(b"user_data"), 100, InternalKeyKind::Set, 0);
 		writer.add(key1, b"value1").unwrap();
 
-		let key2 = InternalKey::new(Vec::from(b"user_profile"), 100, InternalKeyKind::Set, 0);
+		let key2 =
+			InternalKey::new(Bytes::copy_from_slice(b"user_profile"), 100, InternalKeyKind::Set, 0);
 		writer.add(key2, b"value2").unwrap();
 
-		let key3 = InternalKey::new(Vec::from(b"username"), 100, InternalKeyKind::Set, 0);
+		let key3 =
+			InternalKey::new(Bytes::copy_from_slice(b"username"), 100, InternalKeyKind::Set, 0);
 		writer.add(key3, b"value3").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"user"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"user"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3649,16 +3755,19 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
+		let key_aaa =
+			InternalKey::new(Bytes::copy_from_slice(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_aaa, b"value_aaa").unwrap();
 
-		let key_bbb = InternalKey::new(Vec::from(b"key_bbb"), 100, InternalKeyKind::Set, 0);
+		let key_bbb =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_bbb, b"value_bbb").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b""), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b""), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3671,19 +3780,23 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key1 = InternalKey::new(Vec::from(b"key\x00"), 100, InternalKeyKind::Set, 0);
+		let key1 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x00"), 100, InternalKeyKind::Set, 0);
 		writer.add(key1, b"value0").unwrap();
 
-		let key2 = InternalKey::new(Vec::from(b"key\x01"), 100, InternalKeyKind::Set, 0);
+		let key2 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x01"), 100, InternalKeyKind::Set, 0);
 		writer.add(key2, b"value1").unwrap();
 
-		let key3 = InternalKey::new(Vec::from(b"key\xFF"), 100, InternalKeyKind::Set, 0);
+		let key3 =
+			InternalKey::new(Bytes::copy_from_slice(b"key\xFF"), 100, InternalKeyKind::Set, 0);
 		writer.add(key3, b"value_ff").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"key\x02"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key\x02"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3702,8 +3815,12 @@ mod tests {
 			}
 			let key = format!("key_{:03}", i);
 			let value = format!("value_{}", i);
-			let internal_key =
-				InternalKey::new(Vec::from(key.as_bytes()), 100, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(
+				Bytes::copy_from_slice(key.as_bytes()),
+				100,
+				InternalKeyKind::Set,
+				0,
+			);
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
@@ -3712,7 +3829,8 @@ mod tests {
 
 		assert!(table.meta.properties.block_count > 1);
 
-		let lookup_key = InternalKey::new(Vec::from(b"key_050"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_050"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3725,19 +3843,23 @@ mod tests {
 		let mut buffer = Vec::new();
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
-		let key_a = InternalKey::new(Vec::from(b"prefix_a"), 100, InternalKeyKind::Set, 0);
+		let key_a =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_a"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_a, b"value_a").unwrap();
 
-		let key_b = InternalKey::new(Vec::from(b"prefix_b"), 100, InternalKeyKind::Set, 0);
+		let key_b =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_b"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_b, b"value_b").unwrap();
 
-		let key_c = InternalKey::new(Vec::from(b"prefix_c"), 100, InternalKeyKind::Set, 0);
+		let key_c =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_c"), 100, InternalKeyKind::Set, 0);
 		writer.add(key_c, b"value_c").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
-		let lookup_key = InternalKey::new(Vec::from(b"prefix_d"), 100, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"prefix_d"), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key).unwrap();
 
 		assert!(result.is_none());
@@ -3754,7 +3876,8 @@ mod tests {
 		// Add only key_bbb to the table
 		let key = b"key_bbb";
 		let value = b"value_bbb";
-		let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
 		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
@@ -3764,7 +3887,7 @@ mod tests {
 		// key_aaa < key_bbb lexicographically
 		let mut iter = table.iter(false, None);
 		let lookup_key = InternalKey::new(
-			Vec::from(b"key_aaa"),
+			Bytes::copy_from_slice(b"key_aaa"),
 			2, // Higher seq number for lookup
 			InternalKeyKind::Set,
 			0,
@@ -3796,7 +3919,8 @@ mod tests {
 
 		let key = b"key_bbb";
 		let value = b"value_bbb";
-		let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
 		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
@@ -3804,7 +3928,8 @@ mod tests {
 
 		// Seek to key_zzz which is past all keys
 		let mut iter = table.iter(false, None);
-		let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 2, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_zzz"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode()).unwrap();
 
 		// Iterator should be invalid (no more keys)
@@ -3820,7 +3945,8 @@ mod tests {
 
 		let key = b"key_bbb";
 		let value = b"value_bbb";
-		let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
+		let internal_key =
+			InternalKey::new(Bytes::copy_from_slice(key), 1, InternalKeyKind::Set, 0);
 		writer.add(internal_key, value).unwrap();
 
 		let size = writer.finish().unwrap();
@@ -3828,7 +3954,8 @@ mod tests {
 
 		// Seek to key_bbb which exists
 		let mut iter = table.iter(false, None);
-		let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 2, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(Bytes::copy_from_slice(b"key_bbb"), 2, InternalKeyKind::Set, 0);
 		iter.seek(&lookup_key.encode()).unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid");
@@ -3873,7 +4000,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items key_000 through key_005 (6 items)
@@ -3921,7 +4048,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items key_000 through key_004 (5 items)
@@ -3979,7 +4106,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 		// Should return all 10 items in reverse order
 		assert_eq!(results.len(), 10, "Should return exactly 10 items");
@@ -4019,7 +4146,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items in reverse: key_009, key_008, ..., key_003 (7 items)
@@ -4068,7 +4195,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items key_002, key_003, key_004, key_005, key_006 (5 items)
@@ -4107,7 +4234,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return all 10 items
@@ -4162,7 +4289,7 @@ mod tests {
 		let mut forward_keys = Vec::new();
 		for item in forward_iter {
 			let (key, _) = item.unwrap();
-			forward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
+			forward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 		assert_eq!(forward_keys.len(), 30);
 		assert_eq!(forward_keys[0], "key_000");
@@ -4173,7 +4300,7 @@ mod tests {
 		let mut backward_keys = Vec::new();
 		while let Some(item) = backward_iter.next_back() {
 			let (key, _) = item.unwrap();
-			backward_keys.push(String::from_utf8(key.user_key.clone()).unwrap());
+			backward_keys.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 		assert_eq!(backward_keys.len(), 30);
 		assert_eq!(backward_keys[0], "key_029");
@@ -4185,7 +4312,7 @@ mod tests {
 		let mut seek_backward = Vec::new();
 		while let Some(item) = seek_iter.next_back() {
 			let (key, _) = item.unwrap();
-			seek_backward.push(String::from_utf8(key.user_key.clone()).unwrap());
+			seek_backward.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 		assert_eq!(seek_backward.len(), 30);
 		assert_eq!(seek_backward[0], "key_029");
@@ -4239,7 +4366,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, key_002, key_001, key_000
@@ -4283,7 +4410,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should return items in reverse: key_004, key_003, ..., key_000 (5 items)
@@ -4327,7 +4454,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key.clone()).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should start at key_004, NOT any version of key_003
@@ -4367,7 +4494,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4423,7 +4550,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4557,7 +4684,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
 			results.push((user_key, key.seq_num()));
 		}
 
@@ -4614,7 +4741,7 @@ mod tests {
 		let mut results = Vec::new();
 		for item in iter {
 			let (key, _) = item.unwrap();
-			let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+			let user_key = String::from_utf8(key.user_key.to_vec()).unwrap();
 			results.push(user_key);
 		}
 
@@ -4660,16 +4787,16 @@ mod tests {
 		// (required ordering: user_key ASC, seq_num DESC)
 		// Block 1 will contain: seq 300, 200 (last_key = ("test", 200))
 		// Block 2 will contain: seq 100, 50
-		let key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		let key1 = InternalKey::new(Bytes::copy_from_slice(user_key), 300, InternalKeyKind::Set, 0);
 		writer.add(key1, b"v").unwrap();
 
-		let key2 = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(Bytes::copy_from_slice(user_key), 200, InternalKeyKind::Set, 0);
 		writer.add(key2, b"v").unwrap();
 
-		let key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let key3 = InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
 		writer.add(key3, b"v").unwrap();
 
-		let key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let key4 = InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
 		writer.add(key4, b"v").unwrap();
 
 		let size = writer.finish().unwrap();
@@ -4688,7 +4815,7 @@ mod tests {
 		// (because same user_key causes separator to fall back to original key)
 		// With block_size=32, the boundary key is ("test", 200)
 		let lookup_boundary_key =
-			InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
+			InternalKey::new(Bytes::copy_from_slice(user_key), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_boundary_key).unwrap();
 
 		// This assertion will FAIL with the current buggy code
@@ -4706,15 +4833,18 @@ mod tests {
 		assert_eq!(found_value.as_slice(), b"v");
 
 		// Also verify other keys still work correctly
-		let lookup_key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
+		let lookup_key1 =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 300, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key1).unwrap();
 		assert!(result.is_some(), "seq=300 should be found");
 
-		let lookup_key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
+		let lookup_key3 =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 100, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key3).unwrap();
 		assert!(result.is_some(), "seq=100 should be found");
 
-		let lookup_key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
+		let lookup_key4 =
+			InternalKey::new(Bytes::copy_from_slice(user_key), 50, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup_key4).unwrap();
 		assert!(result.is_some(), "seq=50 should be found");
 	}
@@ -4748,7 +4878,7 @@ mod tests {
 		let num_keys = 100;
 		for i in 0..num_keys {
 			let key = InternalKey::new(
-				format!("key_{:05}", i).into_bytes(),
+				format!("key_{:05}", i).into_bytes().into(),
 				1000 - i as u64, // Decreasing seq for same ordering
 				InternalKeyKind::Set,
 				0,
@@ -4851,12 +4981,12 @@ mod tests {
 
 		for seq in (1..=num_versions).rev() {
 			// Entries are added in internal key order (descending seq_num first)
-			let key = InternalKey::new(user_key.to_vec(), seq as u64, InternalKeyKind::Set, 0);
+			let key = InternalKey::new(user_key.into_bytes(), seq as u64, InternalKeyKind::Set, 0);
 			writer.add(key, format!("value_at_seq_{}", seq).as_bytes()).unwrap();
 		}
 
 		// Add a different user key at the end to ensure we have a partition boundary after "foo"
-		let key = InternalKey::new(b"goo".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"goo".into_bytes(), 1, InternalKeyKind::Set, 0);
 		writer.add(key, b"value_goo").unwrap();
 
 		let size = writer.finish().unwrap();
@@ -4890,7 +5020,7 @@ mod tests {
 			.blocks
 			.iter()
 			.enumerate()
-			.filter(|(_, b)| InternalKey::decode(&b.separator_key).user_key == b"foo")
+			.filter(|(_, b)| InternalKey::decode(&b.separator_key).user_key.as_ref() == b"foo")
 			.collect();
 
 		println!(
@@ -4905,7 +5035,8 @@ mod tests {
 		//
 		// Query at seq_num 30: should find (foo, 30) or latest version visible at seq 30
 		let query_seq = 30u64;
-		let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+		let lookup_key =
+			InternalKey::new(user_key.into_bytes(), query_seq, InternalKeyKind::Set, 0);
 
 		let result = table.get(&lookup_key.clone()).unwrap();
 
@@ -4938,7 +5069,8 @@ mod tests {
 
 		// Test multiple query points to ensure correctness across partition boundaries
 		for query_seq in [10, 25, 50, 75, 99] {
-			let lookup = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
+			let lookup =
+				InternalKey::new(user_key.into_bytes(), query_seq, InternalKeyKind::Set, 0);
 
 			let result = table.get(&lookup).unwrap();
 			assert!(
@@ -4969,7 +5101,7 @@ mod tests {
 
 		// Add versions: seq 100, 75, 50, 25 (stored in this order)
 		for seq in [100u64, 75, 50, 25] {
-			let key = InternalKey::new(user_key.to_vec(), seq, InternalKeyKind::Set, 0);
+			let key = InternalKey::new(user_key.into_bytes(), seq, InternalKeyKind::Set, 0);
 			let value = format!("value_at_seq_{}", seq);
 			writer.add(key, value.as_bytes()).unwrap();
 		}
@@ -4978,29 +5110,29 @@ mod tests {
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		// Query at seq=200: should find seq=100 (newest visible)
-		let lookup = InternalKey::new(user_key.to_vec(), 200, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(user_key.into_bytes(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_some());
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.seq_num(), 100);
-		assert_eq!(&found_value, b"value_at_seq_100");
+		assert_eq!(&found_value.as_ref(), b"value_at_seq_100");
 
 		// Query at seq=80: should find seq=75
-		let lookup = InternalKey::new(user_key.to_vec(), 80, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(user_key.into_bytes(), 80, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_some());
 		let (found_key, _) = result.unwrap();
 		assert_eq!(found_key.seq_num(), 75);
 
 		// Query at seq=50: should find seq=50 exactly
-		let lookup = InternalKey::new(user_key.to_vec(), 50, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(user_key.into_bytes(), 50, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_some());
 		let (found_key, _) = result.unwrap();
 		assert_eq!(found_key.seq_num(), 50);
 
 		// Query at seq=10: should return None (no visible version)
-		let lookup = InternalKey::new(user_key.to_vec(), 10, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(user_key.into_bytes(), 10, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_none(), "No version should be visible at seq=10");
 	}
@@ -5014,14 +5146,14 @@ mod tests {
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Key only has version at seq=100
-		let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"future_key".into_bytes(), 100, InternalKeyKind::Set, 0);
 		writer.add(key, b"future_value").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		// Query at seq=50: version at seq=100 is in the "future"
-		let lookup = InternalKey::new(b"future_key".to_vec(), 50, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(b"future_key".into_bytes(), 50, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(
 			result.is_none(),
@@ -5039,7 +5171,7 @@ mod tests {
 
 		let keys = ["apple", "banana", "cherry", "date"];
 		for key in &keys {
-			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			let ikey = InternalKey::new(key.as_bytes().into_bytes(), 100, InternalKeyKind::Set, 0);
 			let value = format!("value_for_{}", key);
 			writer.add(ikey, value.as_bytes()).unwrap();
 		}
@@ -5049,7 +5181,8 @@ mod tests {
 
 		// Each key should return its own value
 		for key in &keys {
-			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let lookup =
+				InternalKey::new(key.as_bytes().into_bytes(), 200, InternalKeyKind::Set, 0);
 			let result = table.get(&lookup).unwrap();
 			assert!(result.is_some(), "Should find key {}", key);
 			let (found_key, found_value) = result.unwrap();
@@ -5058,7 +5191,7 @@ mod tests {
 		}
 
 		// Non-existent keys should return None
-		let lookup = InternalKey::new(b"nonexistent".to_vec(), 200, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(b"nonexistent".into_bytes(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_none());
 	}
@@ -5077,7 +5210,7 @@ mod tests {
 		for i in 0..20 {
 			let key = format!("key_{:04}", i);
 			let value = format!("value_{:04}", i);
-			let ikey = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+			let ikey = InternalKey::new(key.as_bytes().into_bytes(), 100, InternalKeyKind::Set, 0);
 			writer.add(ikey, value.as_bytes()).unwrap();
 		}
 
@@ -5094,11 +5227,16 @@ mod tests {
 		// Query for each key
 		for i in 0..20 {
 			let key = format!("key_{:04}", i);
-			let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
+			let lookup = InternalKey::new(
+				key.clone().into_bytes().into_bytes(),
+				200,
+				InternalKeyKind::Set,
+				0,
+			);
 			let result = table.get(&lookup).unwrap();
 			assert!(result.is_some(), "Should find key {}", key);
 			let (found_key, _) = result.unwrap();
-			assert_eq!(found_key.user_key, key.as_bytes().to_vec());
+			assert_eq!(found_key.user_key, key.into_bytes());
 		}
 	}
 
@@ -5111,17 +5249,17 @@ mod tests {
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Add a set followed by a delete
-		let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
+		let set_key = InternalKey::new(b"my_key".into_bytes(), 100, InternalKeyKind::Set, 0);
 		writer.add(set_key, b"original_value").unwrap();
 
-		let delete_key = InternalKey::new(b"my_key".to_vec(), 50, InternalKeyKind::Delete, 0);
+		let delete_key = InternalKey::new(b"my_key".into_bytes(), 50, InternalKeyKind::Delete, 0);
 		writer.add(delete_key, b"").unwrap();
 
 		let size = writer.finish().unwrap();
 		let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 		// Query at seq=200: should get the Set at seq=100
-		let lookup = InternalKey::new(b"my_key".to_vec(), 200, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(b"my_key".into_bytes(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_some());
 		let (found_key, _) = result.unwrap();
@@ -5129,7 +5267,7 @@ mod tests {
 		assert!(!found_key.is_tombstone());
 
 		// Query at seq=75: should get the Delete at seq=50
-		let lookup = InternalKey::new(b"my_key".to_vec(), 75, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(b"my_key".into_bytes(), 75, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_some());
 		let (found_key, _) = result.unwrap();
@@ -5146,10 +5284,10 @@ mod tests {
 		let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
 
 		// Only add "apple" and "cherry", not "banana"
-		let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
+		let key1 = InternalKey::new(b"apple".into_bytes(), 100, InternalKeyKind::Set, 0);
 		writer.add(key1, b"apple_value").unwrap();
 
-		let key2 = InternalKey::new(b"cherry".to_vec(), 100, InternalKeyKind::Set, 0);
+		let key2 = InternalKey::new(b"cherry".into_bytes(), 100, InternalKeyKind::Set, 0);
 		writer.add(key2, b"cherry_value").unwrap();
 
 		let size = writer.finish().unwrap();
@@ -5157,7 +5295,7 @@ mod tests {
 
 		// Query for "banana" which doesn't exist
 		// Seek will land on "cherry", but user_key doesn't match
-		let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
+		let lookup = InternalKey::new(b"banana".into_bytes(), 200, InternalKeyKind::Set, 0);
 		let result = table.get(&lookup).unwrap();
 		assert!(result.is_none(), "Should return None when user_key doesn't match");
 	}
@@ -5177,7 +5315,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		assert_eq!(results.len(), 3);
@@ -5221,7 +5359,7 @@ mod tests {
 
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		assert_eq!(results.len(), 20);
@@ -5289,7 +5427,7 @@ mod tests {
 		let results: Vec<String> = iter
 			.map(|item| {
 				let (k, _) = item.unwrap();
-				String::from_utf8(k.user_key).unwrap()
+				String::from_utf8(k.user_key.to_vec()).unwrap()
 			})
 			.collect();
 
@@ -5326,7 +5464,7 @@ mod tests {
 		let results: Vec<(String, u64)> = iter
 			.map(|item| {
 				let (k, _) = item.unwrap();
-				(String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num())
+				(String::from_utf8(k.user_key.to_vec()).unwrap(), k.seq_num())
 			})
 			.collect();
 
@@ -5370,7 +5508,7 @@ mod tests {
 		let results: Vec<String> = iter
 			.map(|item| {
 				let (k, _) = item.unwrap();
-				String::from_utf8(k.user_key).unwrap()
+				String::from_utf8(k.user_key.to_vec()).unwrap()
 			})
 			.collect();
 
@@ -5409,7 +5547,7 @@ mod tests {
 		let mut results = Vec::new();
 		while let Some(item) = iter.next_back() {
 			let (key, _) = item.unwrap();
-			results.push(String::from_utf8(key.user_key).unwrap());
+			results.push(String::from_utf8(key.user_key.to_vec()).unwrap());
 		}
 
 		// Should get key_002 (both versions) and key_001, NOT key_003 or key_004

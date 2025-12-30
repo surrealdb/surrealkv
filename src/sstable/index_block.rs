@@ -286,12 +286,13 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::{IntoBytes, Key};
 
 	fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 		Arc::new(src)
 	}
 
-	fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
+	fn create_internal_key(user_key: Key, sequence: u64) -> Key {
 		InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
 	}
 
@@ -301,7 +302,7 @@ mod tests {
 		let max_block_size = 100;
 		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
 
-		let key1 = create_internal_key(b"key1".to_vec(), 1);
+		let key1 = create_internal_key(b"key1".into_bytes(), 1);
 		let handle1 = vec![1, 2, 3];
 		writer.add(&key1, &handle1).unwrap();
 
@@ -317,7 +318,8 @@ mod tests {
 		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
 
 		for i in 0..10 {
-			let key = create_internal_key(format!("key{i}").as_bytes().to_vec(), i as u64);
+			let key =
+				create_internal_key(format!("key{i}").as_bytes().to_vec().into_bytes(), i as u64);
 			let handle = vec![i as u8; 10]; // 10-byte handle
 			writer.add(&key, &handle).unwrap();
 		}
@@ -345,7 +347,7 @@ mod tests {
 		let max_block_size = 1000;
 		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
 
-		let large_key = create_internal_key(vec![b'a'; 500], 1);
+		let large_key = create_internal_key(vec![b'a'; 500].into_bytes(), 1);
 		let large_handle = vec![b'b'; 500];
 		writer.add(&large_key, &large_handle).unwrap();
 
@@ -361,7 +363,7 @@ mod tests {
 		let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
 
 		// Add entries that exactly fill up one block
-		let key = create_internal_key(b"key".to_vec(), 1);
+		let key = create_internal_key(b"key".into_bytes(), 1);
 		let handle = vec![0; 90];
 		writer.add(&key, &handle).unwrap();
 
@@ -397,9 +399,9 @@ mod tests {
 		let f = wrap_buffer(d);
 
 		// Create separator keys as full encoded internal keys
-		let sep_c = create_internal_key(b"c".to_vec(), 1);
-		let sep_f = create_internal_key(b"f".to_vec(), 1);
-		let sep_j = create_internal_key(b"j".to_vec(), 1);
+		let sep_c = create_internal_key(b"c".into_bytes(), 1);
+		let sep_f = create_internal_key(b"f".into_bytes(), 1);
+		let sep_j = create_internal_key(b"j".into_bytes(), 1);
 
 		// Initialize TopLevelIndex with predefined blocks using encoded internal keys
 		let index = TopLevelIndex {
@@ -415,15 +417,15 @@ mod tests {
 
 		// A list of tuples where the first element is the encoded internal key to find,
 		// and the second element is the expected separator key result.
-		let test_cases: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
-			(create_internal_key(b"a".to_vec(), 1), Some(sep_c.clone())),
-			(create_internal_key(b"c".to_vec(), 1), Some(sep_c.clone())),
-			(create_internal_key(b"d".to_vec(), 1), Some(sep_f.clone())),
-			(create_internal_key(b"e".to_vec(), 1), Some(sep_f.clone())),
-			(create_internal_key(b"f".to_vec(), 1), Some(sep_f.clone())),
-			(create_internal_key(b"g".to_vec(), 1), Some(sep_j.clone())),
-			(create_internal_key(b"j".to_vec(), 1), Some(sep_j.clone())),
-			(create_internal_key(b"z".to_vec(), 1), None),
+		let test_cases: Vec<(Bytes, Option<Bytes>)> = vec![
+			(create_internal_key(b"a".into_bytes(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"c".into_bytes(), 1), Some(sep_c.clone())),
+			(create_internal_key(b"d".into_bytes(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"e".into_bytes(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"f".into_bytes(), 1), Some(sep_f.clone())),
+			(create_internal_key(b"g".into_bytes(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"j".into_bytes(), 1), Some(sep_j.clone())),
+			(create_internal_key(b"z".into_bytes(), 1), None),
 		];
 
 		for (key, expected) in test_cases.iter() {
@@ -459,7 +461,7 @@ mod tests {
 		];
 
 		for (key, handle) in &entries {
-			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
+			let internal_key = create_internal_key(key.into_bytes(), 1);
 			writer.add(&internal_key, handle.as_bytes()).unwrap();
 		}
 
@@ -473,7 +475,7 @@ mod tests {
 
 		// Test lookups for various keys using encoded internal keys
 		for (key, _) in &entries {
-			let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
+			let internal_key = create_internal_key(key.into_bytes(), 1);
 			let block = index.get(&internal_key).unwrap();
 			assert!(block.size() > 0, "Block should not be empty for key {key}");
 
@@ -484,12 +486,12 @@ mod tests {
 		}
 
 		// Test lookup for non-existent key before range
-		let key_before = create_internal_key(b"key_000".to_vec(), 1);
+		let key_before = create_internal_key(b"key_000".into_bytes(), 1);
 		let block = index.get(&key_before).unwrap();
 		assert!(block.size() > 0, "Should find first block for key before range");
 
 		// Test lookup for non-existent key after range
-		let key_after = create_internal_key(b"key_999".to_vec(), 1);
+		let key_after = create_internal_key(b"key_999".into_bytes(), 1);
 		match index.get(&key_after) {
 			Ok(_) => {
 				// This is acceptable - might find the last block
@@ -514,10 +516,10 @@ mod tests {
 		// Partition 0: contains (foo, 100) to (foo, 60), separator = (foo, 60)
 		// Partition 1: contains (foo, 59) to (foo, 20), separator = (foo, 20)
 		// Partition 2: contains (foo, 19) to (foo, 1), separator = (g, MAX)
-		let sep_foo_60 = create_internal_key(b"foo".to_vec(), 60);
-		let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
+		let sep_foo_60 = create_internal_key(b"foo".into_bytes(), 60);
+		let sep_foo_20 = create_internal_key(b"foo".into_bytes(), 20);
 		let sep_g = InternalKey::new(
-			b"g".to_vec(),
+			b"g".into_bytes(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
@@ -539,21 +541,21 @@ mod tests {
 		let test_cases = vec![
 			// Query for (foo, 75): should find partition 0 (75 > 60 in seq, so (foo,75) <
 			// (foo,60))
-			(create_internal_key(b"foo".to_vec(), 75), Some(0)),
+			(create_internal_key(b"foo".into_bytes(), 75), Some(0)),
 			// Query for (foo, 60): should find partition 0 (exact match with separator)
-			(create_internal_key(b"foo".to_vec(), 60), Some(0)),
+			(create_internal_key(b"foo".into_bytes(), 60), Some(0)),
 			// Query for (foo, 50): should find partition 1 (50 < 60, so (foo,50) > (foo,60))
-			(create_internal_key(b"foo".to_vec(), 50), Some(1)),
+			(create_internal_key(b"foo".into_bytes(), 50), Some(1)),
 			// Query for (foo, 20): should find partition 1 (exact match with separator)
-			(create_internal_key(b"foo".to_vec(), 20), Some(1)),
+			(create_internal_key(b"foo".into_bytes(), 20), Some(1)),
 			// Query for (foo, 10): should find partition 2 (10 < 20, so (foo,10) > (foo,20))
-			(create_internal_key(b"foo".to_vec(), 10), Some(2)),
+			(create_internal_key(b"foo".into_bytes(), 10), Some(2)),
 			// Query for (banana, 50): should find partition 0 ("banana" < "foo" lexicographically)
-			(create_internal_key(b"banana".to_vec(), 50), Some(0)),
+			(create_internal_key(b"banana".into_bytes(), 50), Some(0)),
 			// Query for (fz, 50): should find partition 2 ("foo" < "fz" < "g")
-			(create_internal_key(b"fz".to_vec(), 50), Some(2)),
+			(create_internal_key(b"fz".into_bytes(), 50), Some(2)),
 			// Query for (zebra, 1): should return None ("zebra" > "g")
-			(create_internal_key(b"zebra".to_vec(), 1), None),
+			(create_internal_key(b"zebra".into_bytes(), 1), None),
 		];
 
 		for (query_key, expected_index) in test_cases {
@@ -602,21 +604,21 @@ mod tests {
 		// boundary] Partition 1: contains "banana", "cherry" keys, separator = (d, MAX)
 		// Partition 2: contains "date" keys, separator = (e, MAX)
 		let sep_b = InternalKey::new(
-			b"b".to_vec(),
+			b"b".into_bytes(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode();
 		let sep_d = InternalKey::new(
-			b"d".to_vec(),
+			b"d".into_bytes(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode();
 		let sep_e = InternalKey::new(
-			b"e".to_vec(),
+			b"e".into_bytes(),
 			crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
@@ -636,12 +638,12 @@ mod tests {
 
 		let test_cases = vec![
 			// Keys in first partition (< "b")
-			(create_internal_key(b"apple".to_vec(), 100), Some(0)),
-			(create_internal_key(b"aardvark".to_vec(), 50), Some(0)),
+			(create_internal_key(b"apple".into_bytes(), 100), Some(0)),
+			(create_internal_key(b"aardvark".into_bytes(), 50), Some(0)),
 			// Key exactly at separator boundary
 			(
 				InternalKey::new(
-					b"b".to_vec(),
+					b"b".into_bytes(),
 					crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
 					crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
@@ -650,13 +652,13 @@ mod tests {
 				Some(0),
 			),
 			// Keys in second partition ("b" < key <= "d")
-			(create_internal_key(b"banana".to_vec(), 100), Some(1)),
-			(create_internal_key(b"cherry".to_vec(), 50), Some(1)),
+			(create_internal_key(b"banana".into_bytes(), 100), Some(1)),
+			(create_internal_key(b"cherry".into_bytes(), 50), Some(1)),
 			// Keys in third partition ("d" < key <= "e")
-			(create_internal_key(b"date".to_vec(), 100), Some(2)),
+			(create_internal_key(b"date".into_bytes(), 100), Some(2)),
 			// Keys beyond all partitions (> "e")
-			(create_internal_key(b"fig".to_vec(), 100), None),
-			(create_internal_key(b"zebra".to_vec(), 1), None),
+			(create_internal_key(b"fig".into_bytes(), 100), None),
+			(create_internal_key(b"zebra".into_bytes(), 1), None),
 		];
 
 		for (query_key, expected_index) in test_cases {
@@ -700,7 +702,7 @@ mod tests {
 		let f = wrap_buffer(d);
 
 		let sep_keys: Vec<_> = (0..5)
-			.map(|i| create_internal_key(format!("key_{:02}", i).into_bytes(), 100))
+			.map(|i| create_internal_key(format!("key_{:02}", i).as_bytes().into_bytes(), 100))
 			.collect();
 
 		let index = TopLevelIndex {
@@ -737,7 +739,7 @@ mod tests {
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
-		let sep = create_internal_key(b"zzz".to_vec(), 1);
+		let sep = create_internal_key(b"zzz".into_bytes(), 1);
 
 		let index = TopLevelIndex {
 			id: 0,
@@ -747,7 +749,7 @@ mod tests {
 		};
 
 		// Query for key beyond the single partition
-		let query = create_internal_key(b"zzzz_beyond".to_vec(), 1);
+		let query = create_internal_key(b"zzzz_beyond".into_bytes(), 1);
 		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_none(), "Should return None for key beyond all partitions");
 	}
@@ -759,7 +761,7 @@ mod tests {
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
-		let sep = create_internal_key(b"middle".to_vec(), 1);
+		let sep = create_internal_key(b"middle".into_bytes(), 1);
 
 		let index = TopLevelIndex {
 			id: 0,
@@ -769,7 +771,7 @@ mod tests {
 		};
 
 		// Query before the separator
-		let query = create_internal_key(b"aaa".to_vec(), 1);
+		let query = create_internal_key(b"aaa".into_bytes(), 1);
 		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_some());
 		let (idx, _) = result.unwrap();
@@ -782,7 +784,7 @@ mod tests {
 		assert_eq!(idx, 0);
 
 		// Query after the separator
-		let query = create_internal_key(b"zzz".to_vec(), 1);
+		let query = create_internal_key(b"zzz".into_bytes(), 1);
 		let result = index.find_block_handle_by_key(&query).unwrap();
 		assert!(result.is_none());
 	}
@@ -794,9 +796,9 @@ mod tests {
 		let d = Vec::new();
 		let f = wrap_buffer(d);
 
-		let sep_a = create_internal_key(b"aaa".to_vec(), 50);
-		let sep_b = create_internal_key(b"bbb".to_vec(), 50);
-		let sep_c = create_internal_key(b"ccc".to_vec(), 50);
+		let sep_a = create_internal_key(b"aaa".into_bytes(), 50);
+		let sep_b = create_internal_key(b"bbb".into_bytes(), 50);
+		let sep_c = create_internal_key(b"ccc".into_bytes(), 50);
 
 		let index = TopLevelIndex {
 			id: 0,

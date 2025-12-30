@@ -165,6 +165,7 @@ mod tests {
 	use super::*;
 	use crate::sstable::bloom::LevelDBBloomFilter;
 	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::IntoBytes;
 
 	#[test]
 	fn test_empty() {
@@ -270,7 +271,7 @@ mod tests {
 			// Create internal key
 			let user_key = format!("key_{i:05}");
 			let internal_key = InternalKey::new(
-				user_key.as_bytes().to_vec(),
+				user_key.as_bytes().into_bytes(),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
 				0,
@@ -300,9 +301,9 @@ mod tests {
 		let mut false_positives = 0;
 		for i in 0..num_samples {
 			// Use values outside the range of existing keys
-			let user_key = format!("nonexistent_{:05}", i + num_items);
+			let user_key = format!("nonexistent_{:05}", i + num_items).into_bytes();
 			let internal_key =
-				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
+				InternalKey::new(user_key.into_bytes(), i as u64, InternalKeyKind::Set, 0);
 
 			let encoded_key = internal_key.encode();
 

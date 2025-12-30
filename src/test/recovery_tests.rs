@@ -14,6 +14,7 @@ use crate::test::recovery_test_helpers::{CorruptionType, WalTestHelper};
 use crate::wal::manager::Wal;
 use crate::wal::recovery::replay_wal;
 use crate::wal::Options;
+use crate::IntoBytes;
 
 // ============================================================================
 // Category 1: Basic Multi-Segment Recovery (6 tests)
@@ -203,8 +204,8 @@ fn test_crash_immediately_after_rotation() {
 	for i in 0..50 {
 		batch
 			.set(
-				format!("key{}", i).as_bytes().to_vec(),
-				format!("value{}", i).as_bytes().to_vec(),
+				format!("key{}", i).as_bytes().into_bytes(),
+				format!("value{}", i).as_bytes().into_bytes(),
 				0,
 			)
 			.unwrap();
@@ -242,8 +243,8 @@ fn test_crash_after_multiple_rapid_rotations() {
 		let mut batch = Batch::new(100 + i * 10);
 		batch
 			.set(
-				format!("key{}", i).as_bytes().to_vec(),
-				format!("val{}", i).as_bytes().to_vec(),
+				format!("key{}", i).as_bytes().into_bytes(),
+				format!("val{}", i).as_bytes().into_bytes(),
 				0,
 			)
 			.unwrap();
@@ -275,8 +276,8 @@ fn test_crash_during_wal_write_mid_batch() {
 	for i in 0..10 {
 		batch1
 			.set(
-				format!("key{}", i).as_bytes().to_vec(),
-				format!("val{}", i).as_bytes().to_vec(),
+				format!("key{}", i).as_bytes().into_bytes(),
+				format!("val{}", i).as_bytes().into_bytes(),
 				0,
 			)
 			.unwrap();
@@ -291,8 +292,8 @@ fn test_crash_during_wal_write_mid_batch() {
 	for i in 0..10 {
 		batch2
 			.set(
-				format!("key2_{}", i).as_bytes().to_vec(),
-				format!("val2_{}", i).as_bytes().to_vec(),
+				format!("key2_{}", i).as_bytes().into_bytes(),
+				format!("val2_{}", i).as_bytes().into_bytes(),
 				0,
 			)
 			.unwrap();
@@ -371,8 +372,8 @@ fn test_partial_batch_at_segment_end() {
 	for i in 0..20 {
 		batch
 			.set(
-				format!("key{}", i).as_bytes().to_vec(),
-				format!("val{}", i).as_bytes().to_vec(),
+				format!("key{}", i).as_bytes().into_bytes(),
+				format!("val{}", i).as_bytes().into_bytes(),
 				0,
 			)
 			.unwrap();
@@ -1240,7 +1241,7 @@ fn test_very_large_values_across_segments() {
 		let mut batch = Batch::new(13000 + seg_idx * 10);
 		for i in 0..5 {
 			let key = format!("large_seg{}_key{}", seg_idx, i);
-			batch.set(key.as_bytes().to_vec(), large_value.clone(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), large_value.clone().into_bytes(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1274,7 +1275,7 @@ fn test_many_small_batches() {
 		for batch_idx in 0..100 {
 			let mut batch = Batch::new(14000 + entry_count);
 			let key = format!("s{}_b{}_k", seg_idx, batch_idx);
-			batch.set(key.as_bytes().to_vec(), b"value".to_vec(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), b"value".into_bytes(), 0).unwrap();
 			wal.append(&batch.encode().unwrap()).unwrap();
 			entry_count += 1;
 		}
@@ -1311,7 +1312,7 @@ fn test_few_large_batches() {
 		let mut batch = Batch::new(15000 + seg_idx * 200);
 		for i in 0..200 {
 			let key = format!("seg{}_key{:04}", seg_idx, i);
-			batch.set(key.as_bytes().to_vec(), b"value".to_vec(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), b"value".into_bytes(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1594,7 +1595,7 @@ fn test_compressed_wal_segments() {
 		for i in 0..50 {
 			let key = format!("compressed_seg{}_k{}", seg_idx, i);
 			let value = format!("compressed_value_{}_{}", seg_idx, i);
-			batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), value.as_bytes().into_bytes(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -1628,7 +1629,7 @@ fn test_mixed_compression_segments() {
 		let mut batch = Batch::new(26000 + seg_idx * 40);
 		for i in 0..40 {
 			let key = format!("uncomp_seg{}_k{}", seg_idx, i);
-			batch.set(key.as_bytes().to_vec(), b"uncompressed_value".to_vec(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), b"uncompressed_value".into_bytes(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
@@ -1646,7 +1647,7 @@ fn test_mixed_compression_segments() {
 		let mut batch = Batch::new(26080 + seg_idx * 40);
 		for i in 0..40 {
 			let key = format!("comp_seg{}_k{}", seg_idx, i);
-			batch.set(key.as_bytes().to_vec(), b"compressed_value".to_vec(), 0).unwrap();
+			batch.set(key.as_bytes().into_bytes(), b"compressed_value".into_bytes(), 0).unwrap();
 		}
 		wal.append(&batch.encode().unwrap()).unwrap();
 		if seg_idx < 1 {
@@ -1682,7 +1683,7 @@ fn test_compressed_data_corruption() {
 	let mut batch = Batch::new(27000);
 	for i in 0..60 {
 		let key = format!("key{}", i);
-		batch.set(key.as_bytes().to_vec(), b"compressed_value_data".to_vec(), 0).unwrap();
+		batch.set(key.as_bytes().into_bytes(), b"compressed_value_data".into_bytes(), 0).unwrap();
 	}
 	wal.append(&batch.encode().unwrap()).unwrap();
 	wal.close().unwrap();

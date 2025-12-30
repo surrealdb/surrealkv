@@ -1086,7 +1086,7 @@ mod tests {
 	use crate::sstable::table::{Table, TableWriter};
 	use crate::sstable::{InternalKey, InternalKeyKind};
 	use crate::vfs::File;
-	use crate::{Options, Tree, TreeBuilder};
+	use crate::{IntoBytes, Options, Tree, TreeBuilder};
 
 	fn create_temp_directory() -> TempDir {
 		TempDir::new("test").unwrap()
@@ -1142,8 +1142,8 @@ mod tests {
 			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].0, b"key1");
-		assert_eq!(range[1].0, b"key2");
+		assert_eq!(range[0].0.as_ref(), b"key1");
+		assert_eq!(range[1].0.as_ref(), b"key2");
 	}
 
 	#[test(tokio::test)]
@@ -1174,8 +1174,8 @@ mod tests {
 			read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1, b"value1_v1");
-		assert_eq!(range[1].1, b"value2_v1");
+		assert_eq!(range[0].1.as_ref(), b"value1_v1");
+		assert_eq!(range[1].1.as_ref(), b"value2_v1");
 
 		// A new transaction should see the updated values
 		let new_tx = store.begin().unwrap();
@@ -1183,8 +1183,8 @@ mod tests {
 			new_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].1, b"value1_v2");
-		assert_eq!(range[1].1, b"value2_v2");
+		assert_eq!(range[0].1.as_ref(), b"value1_v2");
+		assert_eq!(range[1].1.as_ref(), b"value2_v2");
 	}
 
 	#[test(tokio::test)]
@@ -1215,9 +1215,9 @@ mod tests {
 			read_tx1.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 3);
-		assert_eq!(range[0].0, b"key1");
-		assert_eq!(range[1].0, b"key2");
-		assert_eq!(range[2].0, b"key3");
+		assert_eq!(range[0].0.as_ref(), b"key1");
+		assert_eq!(range[1].0.as_ref(), b"key2");
+		assert_eq!(range[2].0.as_ref(), b"key3");
 
 		// A new transaction should not see the deleted key
 		let read_tx2 = store.begin().unwrap();
@@ -1225,8 +1225,8 @@ mod tests {
 			read_tx2.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(range.len(), 2);
-		assert_eq!(range[0].0, b"key1");
-		assert_eq!(range[1].0, b"key3");
+		assert_eq!(range[0].0.as_ref(), b"key1");
+		assert_eq!(range[1].0.as_ref(), b"key3");
 	}
 
 	#[test(tokio::test)]
@@ -1260,13 +1260,13 @@ mod tests {
 
 		// Each snapshot should see its corresponding version
 		let value1 = tx1.get(b"key1").unwrap().unwrap();
-		assert_eq!(value1, b"version1");
+		assert_eq!(value1.as_ref(), b"version1");
 
 		let value2 = tx2.get(b"key1").unwrap().unwrap();
-		assert_eq!(value2, b"version2");
+		assert_eq!(value2.as_ref(), b"version2");
 
 		let value3 = tx3.get(b"key1").unwrap().unwrap();
-		assert_eq!(value3, b"version3");
+		assert_eq!(value3.as_ref(), b"version3");
 	}
 
 	#[test(tokio::test)]
@@ -1512,7 +1512,7 @@ mod tests {
 			{
 				let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
 				for (k, v) in data {
-					let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
+					let ikey = InternalKey::new(k.into_bytes(), 1, InternalKeyKind::Set, 0);
 					w.add(ikey, v).unwrap();
 				}
 				w.finish().unwrap();
@@ -1576,8 +1576,8 @@ mod tests {
 		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(forward_items.len(), 5);
-		assert_eq!(&forward_items[0].0, b"key1");
-		assert_eq!(&forward_items[4].0, b"key5");
+		assert_eq!(&forward_items[0].0.as_ref(), b"key1");
+		assert_eq!(&forward_items[4].0.as_ref(), b"key5");
 
 		// Test backward iteration ([key1, key6) to include key5)
 		let backward_iter =
@@ -1585,8 +1585,8 @@ mod tests {
 		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 		assert_eq!(backward_items.len(), 5);
-		assert_eq!(&backward_items[0].0, b"key5");
-		assert_eq!(&backward_items[4].0, b"key1");
+		assert_eq!(&backward_items[0].0.as_ref(), b"key5");
+		assert_eq!(&backward_items[4].0.as_ref(), b"key1");
 
 		// Verify both iterations produce the same items in reverse order
 		for i in 0..5 {
@@ -1679,13 +1679,13 @@ mod tests {
 
 		// First snapshot should see both keys
 		{
-			assert_eq!(&tx1.get(b"key1").unwrap().unwrap(), b"value1");
-			assert_eq!(&tx1.get(b"key2").unwrap().unwrap(), b"value2");
+			assert_eq!(&tx1.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
+			assert_eq!(&tx1.get(b"key2").unwrap().unwrap().as_ref(), b"value2");
 		}
 
 		// Second snapshot should not see the soft deleted key
 		{
-			assert_eq!(&tx2.get(b"key1").unwrap().unwrap(), b"value1");
+			assert_eq!(&tx2.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
 			assert!(tx2.get(b"key2").unwrap().is_none());
 		}
 	}
@@ -1725,9 +1725,9 @@ mod tests {
 			let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
 
 			assert_eq!(forward_items.len(), 3); // key1, key3, key5
-			assert_eq!(&forward_items[0].0, b"key1");
-			assert_eq!(&forward_items[1].0, b"key3");
-			assert_eq!(&forward_items[2].0, b"key5");
+			assert_eq!(&forward_items[0].0.as_ref(), b"key1");
+			assert_eq!(&forward_items[1].0.as_ref(), b"key3");
+			assert_eq!(&forward_items[2].0.as_ref(), b"key5");
 		}
 
 		// Test backward iteration
@@ -1740,9 +1740,9 @@ mod tests {
 				backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
 
 			assert_eq!(backward_items.len(), 3); // key5, key3, key1
-			assert_eq!(&backward_items[0].0, b"key5");
-			assert_eq!(&backward_items[1].0, b"key3");
-			assert_eq!(&backward_items[2].0, b"key1");
+			assert_eq!(&backward_items[0].0.as_ref(), b"key5");
+			assert_eq!(&backward_items[1].0.as_ref(), b"key3");
+			assert_eq!(&backward_items[2].0.as_ref(), b"key1");
 		}
 	}
 
@@ -1794,8 +1794,8 @@ mod tests {
 				.collect::<Result<Vec<_>, _>>()
 				.unwrap();
 			assert_eq!(range.len(), 2); // Only key3 and key4
-			assert_eq!(&range[0].0, b"key3");
-			assert_eq!(&range[1].0, b"key4");
+			assert_eq!(&range[0].0.as_ref(), b"key3");
+			assert_eq!(&range[1].0.as_ref(), b"key4");
 		}
 	}
 
@@ -1891,7 +1891,7 @@ mod tests {
 			let value = format!("value_{seq_num}");
 
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+				InternalKey::new(key.as_bytes().into_bytes(), seq_num, InternalKeyKind::Set, 0);
 
 			writer.add(internal_key, value.as_bytes())?;
 		}
@@ -2571,7 +2571,7 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
-			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
 			assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"value1_v1");
 		}
 
@@ -2585,8 +2585,8 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key2");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
 		}
 
 		// Test snapshot3 - should see key1, key2, and key3
@@ -2599,9 +2599,9 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key2");
-			assert_eq!(&range[2].0, b"key3");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
+			assert_eq!(&range[2].0.as_ref(), b"key3");
 		}
 
 		// Test snapshot4 - should see all 4 keys
@@ -2614,10 +2614,10 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key2");
-			assert_eq!(&range[2].0, b"key3");
-			assert_eq!(&range[3].0, b"key4");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
+			assert_eq!(&range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[3].0.as_ref(), b"key4");
 		}
 
 		// Test backward iteration on snapshot2
@@ -2631,8 +2631,8 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
-			assert_eq!(&range[0].0, b"key2");
-			assert_eq!(&range[1].0, b"key1");
+			assert_eq!(&range[0].0.as_ref(), b"key2");
+			assert_eq!(&range[1].0.as_ref(), b"key1");
 		}
 	}
 
@@ -2744,9 +2744,9 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 3, "Before deletion: should see all 3 keys");
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key2");
-			assert_eq!(&range[2].0, b"key3");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
+			assert_eq!(&range[2].0.as_ref(), b"key3");
 		}
 
 		// Snapshot after should not see deleted key2
@@ -2759,8 +2759,8 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 2, "After deletion: should see only 2 keys");
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key3");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key3");
 			// key2 should not be present
 		}
 
@@ -2775,8 +2775,8 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 2, "Backward: should see only 2 keys");
-			assert_eq!(&range[0].0, b"key3");
-			assert_eq!(&range[1].0, b"key1");
+			assert_eq!(&range[0].0.as_ref(), b"key3");
+			assert_eq!(&range[1].0.as_ref(), b"key1");
 		}
 	}
 
@@ -2820,11 +2820,11 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 3);
-			assert_eq!(&range[0].0, b"key1");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
 			assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"v1");
-			assert_eq!(&range[1].0, b"key2");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
 			assert_eq!(range[1].1.as_ref().unwrap().as_slice(), b"v2");
-			assert_eq!(&range[2].0, b"key3");
+			assert_eq!(&range[2].0.as_ref(), b"key3");
 		}
 
 		// Verify snap2: Should see key1(v1), key2(v2_updated), key3(v3), key4(v4)
@@ -2837,11 +2837,11 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 4);
-			assert_eq!(&range[0].0, b"key1");
-			assert_eq!(&range[1].0, b"key2");
+			assert_eq!(&range[0].0.as_ref(), b"key1");
+			assert_eq!(&range[1].0.as_ref(), b"key2");
 			assert_eq!(range[1].1.as_ref().unwrap().as_slice(), b"v2_updated"); // Updated value
-			assert_eq!(&range[2].0, b"key3");
-			assert_eq!(&range[3].0, b"key4");
+			assert_eq!(&range[2].0.as_ref(), b"key3");
+			assert_eq!(&range[3].0.as_ref(), b"key4");
 		}
 
 		// Verify snap3: Should see key2(v2_updated), key3(v3), key4(v4), key5(v5)
@@ -2856,11 +2856,11 @@ mod tests {
 
 			assert_eq!(range.len(), 4);
 			// key1 should NOT be present (deleted)
-			assert_eq!(&range[0].0, b"key2");
+			assert_eq!(&range[0].0.as_ref(), b"key2");
 			assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"v2_updated");
-			assert_eq!(&range[1].0, b"key3");
-			assert_eq!(&range[2].0, b"key4");
-			assert_eq!(&range[3].0, b"key5");
+			assert_eq!(&range[1].0.as_ref(), b"key3");
+			assert_eq!(&range[2].0.as_ref(), b"key4");
+			assert_eq!(&range[3].0.as_ref(), b"key5");
 		}
 
 		// Verify backward iteration on snap2
@@ -2874,11 +2874,11 @@ mod tests {
 				.unwrap();
 
 			assert_eq!(range.len(), 4);
-			assert_eq!(&range[0].0, b"key4");
-			assert_eq!(&range[1].0, b"key3");
-			assert_eq!(&range[2].0, b"key2");
+			assert_eq!(&range[0].0.as_ref(), b"key4");
+			assert_eq!(&range[1].0.as_ref(), b"key3");
+			assert_eq!(&range[2].0.as_ref(), b"key2");
 			assert_eq!(range[2].1.as_ref().unwrap().as_slice(), b"v2_updated");
-			assert_eq!(&range[3].0, b"key1");
+			assert_eq!(&range[3].0.as_ref(), b"key1");
 		}
 	}
 }

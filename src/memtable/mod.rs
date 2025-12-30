@@ -273,7 +273,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use crate::user_range_to_internal_range;
+	use crate::{user_range_to_internal_range, IntoBytes, Key};
 
 	fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
 		// Skip the tag byte (first byte) and compare the actual value content
@@ -284,8 +284,8 @@ mod tests {
 	#[test]
 	fn memtable_get() {
 		let memtable = MemTable::new();
-		let key = b"foo".to_vec();
-		let value = b"value".to_vec();
+		let key = b"foo".into_bytes();
+		let value = b"value".into_bytes();
 
 		let mut batch = Batch::new(1);
 		batch.set(key, value.clone(), 0).unwrap();
@@ -299,8 +299,8 @@ mod tests {
 	#[test]
 	fn memtable_size() {
 		let memtable = MemTable::new();
-		let key = b"foo".to_vec();
-		let value = b"value".to_vec();
+		let key = b"foo".into_bytes();
+		let value = b"value".into_bytes();
 
 		let mut batch = Batch::new(1);
 		batch.set(key, value, 0).unwrap();
@@ -313,8 +313,8 @@ mod tests {
 	#[test]
 	fn memtable_lsn() {
 		let memtable = MemTable::new();
-		let key = b"foo".to_vec();
-		let value = b"value".to_vec();
+		let key = b"foo".into_bytes();
+		let value = b"value".into_bytes();
 		let seq_num = 100;
 
 		let mut batch = Batch::new(seq_num);
@@ -328,16 +328,16 @@ mod tests {
 	#[test]
 	fn memtable_add_and_get() {
 		let memtable = MemTable::new();
-		let key1 = b"key1".to_vec();
-		let value1 = b"value1".to_vec();
+		let key1 = b"key1".into_bytes();
+		let value1 = b"value1".into_bytes();
 
 		let mut batch1 = Batch::new(1);
 		batch1.set(key1, value1.clone(), 0).unwrap();
 
 		memtable.add(&batch1).unwrap();
 
-		let key2 = b"key2".to_vec();
-		let value2 = b"value2".to_vec();
+		let key2 = b"key2".into_bytes();
+		let value2 = b"value2".into_bytes();
 
 		let mut batch2 = Batch::new(2);
 		batch2.set(key2, value2.clone(), 0).unwrap();
@@ -354,10 +354,10 @@ mod tests {
 	#[test]
 	fn memtable_get_latest_seq_no() {
 		let memtable = MemTable::new();
-		let key1 = b"key1".to_vec();
-		let value1 = b"value1".to_vec();
-		let value2 = b"value2".to_vec();
-		let value3 = b"value3".to_vec();
+		let key1 = b"key1".into_bytes();
+		let value1 = b"value1".into_bytes();
+		let value2 = b"value2".into_bytes();
+		let value3 = b"value3".into_bytes();
 
 		let mut batch1 = Batch::new(1);
 		batch1.set(key1.clone(), value1, 0).unwrap();
@@ -378,11 +378,11 @@ mod tests {
 	#[test]
 	fn memtable_prefix() {
 		let memtable = MemTable::new();
-		let key1 = b"foo".to_vec();
-		let value1 = b"value1".to_vec();
+		let key1 = b"foo".into_bytes();
+		let value1 = b"value1".into_bytes();
 
-		let key2 = b"foo1".to_vec();
-		let value2 = b"value2".to_vec();
+		let key2 = b"foo1".into_bytes();
+		let value2 = b"value2".into_bytes();
 
 		let mut batch1 = Batch::new(0);
 		batch1.set(key1, value1.clone(), 0).unwrap();
@@ -399,7 +399,7 @@ mod tests {
 		assert_value(&res.1, &value2);
 	}
 
-	type TestEntry = (Vec<u8>, Vec<u8>, InternalKeyKind, Option<u64>);
+	type TestEntry = (Key, Value, InternalKeyKind, Option<u64>);
 
 	fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
 		let memtable = Arc::new(MemTable::new());
@@ -459,8 +459,8 @@ mod tests {
 	#[test]
 	fn test_single_key() {
 		let (memtable, _) = create_test_memtable(vec![(
-			b"key1".to_vec(),
-			b"value1".to_vec(),
+			b"key1".into_bytes(),
+			b"value1".into_bytes(),
 			InternalKeyKind::Set,
 			None,
 		)]);
@@ -471,7 +471,7 @@ mod tests {
 
 		let (key, encoded_value) = &entries[0];
 		let user_key = &key.user_key;
-		assert_eq!(user_key, b"key1");
+		assert_eq!(user_key.as_ref(), b"key1");
 
 		assert_value(encoded_value, &b"value1"[..]);
 
@@ -479,7 +479,7 @@ mod tests {
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
-		assert_eq!(&ikey.user_key, b"key1");
+		assert_eq!(&ikey.user_key.as_ref(), b"key1");
 
 		assert_value(&encoded_val, b"value1");
 	}
@@ -487,9 +487,9 @@ mod tests {
 	#[test]
 	fn test_multiple_keys() {
 		let (memtable, _) = create_test_memtable(vec![
-			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, None),
-			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, None),
-			(b"key5".to_vec(), b"value5".to_vec(), InternalKeyKind::Set, None),
+			(b"key1".into_bytes(), b"value1".into_bytes(), InternalKeyKind::Set, None),
+			(b"key3".into_bytes(), b"value3".into_bytes(), InternalKeyKind::Set, None),
+			(b"key5".into_bytes(), b"value5".into_bytes(), InternalKeyKind::Set, None),
 		]);
 
 		// Collect all entries
@@ -500,9 +500,9 @@ mod tests {
 		let user_keys: Vec<_> = entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		// Keys should be in lexicographic order
-		assert_eq!(&user_keys[0], b"key1");
-		assert_eq!(&user_keys[1], b"key3");
-		assert_eq!(&user_keys[2], b"key5");
+		assert_eq!(&user_keys[0].as_ref(), b"key1");
+		assert_eq!(&user_keys[1].as_ref(), b"key3");
+		assert_eq!(&user_keys[2].as_ref(), b"key5");
 
 		// Test individual gets
 		assert!(memtable.get(b"key1", None).is_some());
@@ -516,9 +516,9 @@ mod tests {
 	fn test_sequence_number_ordering() {
 		// Create test with multiple sequence numbers for the same key
 		let (memtable, _) = create_test_memtable(vec![
-			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
-			(b"key1".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(20)), /* Higher sequence number */
-			(b"key1".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(5)), /* Lower sequence number */
+			(b"key1".into_bytes(), b"value1".into_bytes(), InternalKeyKind::Set, Some(10)),
+			(b"key1".into_bytes(), b"value2".into_bytes(), InternalKeyKind::Set, Some(20)), /* Higher sequence number */
+			(b"key1".into_bytes(), b"value3".into_bytes(), InternalKeyKind::Set, Some(5)), /* Lower sequence number */
 		]);
 
 		// Collect all entries
@@ -529,7 +529,7 @@ mod tests {
 		let mut key1_entries = Vec::new();
 		for (key, encoded_value) in &entries {
 			let (user_key, seq_num, _) = (key.user_key.clone(), key.seq_num(), key.kind());
-			if &user_key == b"key1" {
+			if &user_key.as_ref() == b"key1" {
 				key1_entries.push((seq_num, encoded_value));
 			}
 		}
@@ -537,27 +537,27 @@ mod tests {
 		// Verify ordering - higher sequence numbers should come first
 		assert_eq!(key1_entries.len(), 3);
 		assert_eq!(key1_entries[0].0, 20);
-		assert_eq!(key1_entries[0].1, b"value2");
+		assert_eq!(key1_entries[0].1.as_ref(), b"value2");
 		assert_eq!(key1_entries[1].0, 10);
-		assert_eq!(key1_entries[1].1, b"value1");
+		assert_eq!(key1_entries[1].1.as_ref(), b"value1");
 		assert_eq!(key1_entries[2].0, 5);
-		assert_eq!(key1_entries[2].1, b"value3");
+		assert_eq!(key1_entries[2].1.as_ref(), b"value3");
 
 		// Test get method - should return the highest sequence number
 		let result = memtable.get(b"key1", None);
 		assert!(result.is_some());
 		let (ikey, encoded_val) = result.unwrap();
 		assert_eq!(ikey.seq_num(), 20);
-		assert_eq!(&encoded_val, b"value2");
+		assert_eq!(&encoded_val.as_ref(), b"value2");
 	}
 
 	#[test]
 	fn test_key_updates_with_sequence_numbers() {
 		// Create test with key updates
 		let (memtable, _) = create_test_memtable(vec![
-			(b"key1".to_vec(), b"old_value".to_vec(), InternalKeyKind::Set, Some(5)),
-			(b"key1".to_vec(), b"new_value".to_vec(), InternalKeyKind::Set, Some(10)),
-			(b"key2".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(7)),
+			(b"key1".into_bytes(), b"old_value".into_bytes(), InternalKeyKind::Set, Some(5)),
+			(b"key1".into_bytes(), b"new_value".into_bytes(), InternalKeyKind::Set, Some(10)),
+			(b"key2".into_bytes(), b"value2".into_bytes(), InternalKeyKind::Set, Some(7)),
 		]);
 
 		// Test get returns the latest value
@@ -578,10 +578,10 @@ mod tests {
 	fn test_tombstones() {
 		// Create test with deleted entries
 		let (memtable, _) = create_test_memtable(vec![
-			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(1)),
-			(b"key2".to_vec(), b"value2".to_vec(), InternalKeyKind::Set, Some(2)),
-			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(3)),
-			(b"key2".to_vec(), vec![], InternalKeyKind::Delete, Some(4)), // Delete key2
+			(b"key1".into_bytes(), b"value1".into_bytes(), InternalKeyKind::Set, Some(1)),
+			(b"key2".into_bytes(), b"value2".into_bytes(), InternalKeyKind::Set, Some(2)),
+			(b"key3".into_bytes(), b"value3".into_bytes(), InternalKeyKind::Set, Some(3)),
+			(b"key2".into_bytes(), vec![].into_bytes(), InternalKeyKind::Delete, Some(4)), /* Delete key2 */
 		]);
 
 		// Iterator should see all entries including tombstones
@@ -594,19 +594,19 @@ mod tests {
 			*key_counts.entry(user_key).or_insert(0) += 1;
 		}
 
-		assert_eq!(key_counts[&b"key1".to_vec()], 1);
-		assert_eq!(key_counts[&b"key2".to_vec()], 2); // Original + tombstone
-		assert_eq!(key_counts[&b"key3".to_vec()], 1);
+		assert_eq!(key_counts[&b"key1".into_bytes()], 1);
+		assert_eq!(key_counts[&b"key2".into_bytes()], 2); // Original + tombstone
+		assert_eq!(key_counts[&b"key3".into_bytes()], 1);
 	}
 
 	#[test]
 	fn test_key_kinds() {
 		// Test different key kinds
 		let (memtable, _) = create_test_memtable(vec![
-			(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
-			(b"key2".to_vec(), vec![], InternalKeyKind::Delete, Some(20)),
-			(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, Some(30)),
-			(b"key4".to_vec(), vec![], InternalKeyKind::Delete, Some(40)),
+			(b"key1".into_bytes(), b"value1".into_bytes(), InternalKeyKind::Set, Some(10)),
+			(b"key2".into_bytes(), vec![].into_bytes(), InternalKeyKind::Delete, Some(20)),
+			(b"key3".into_bytes(), b"value3".into_bytes(), InternalKeyKind::Set, Some(30)),
+			(b"key4".into_bytes(), vec![].into_bytes(), InternalKeyKind::Delete, Some(40)),
 		]);
 
 		// All key types should be visible in the iterator
@@ -621,19 +621,19 @@ mod tests {
 		}
 
 		// Verify all keys are present with correct kinds
-		assert_eq!(&key_info[0].0, b"key1");
+		assert_eq!(&key_info[0].0.as_ref(), b"key1");
 		assert_eq!(key_info[0].2, InternalKeyKind::Set);
 		assert!(key_info[0].3 > 0); // Has value
 
-		assert_eq!(&key_info[1].0, b"key2");
+		assert_eq!(&key_info[1].0.as_ref(), b"key2");
 		assert_eq!(key_info[1].2, InternalKeyKind::Delete);
 		assert_eq!(key_info[1].3, 0); // No value for delete
 
-		assert_eq!(&key_info[2].0, b"key3");
+		assert_eq!(&key_info[2].0.as_ref(), b"key3");
 		assert_eq!(key_info[2].2, InternalKeyKind::Set);
 		assert!(key_info[2].3 > 0); // Has value
 
-		assert_eq!(&key_info[3].0, b"key4");
+		assert_eq!(&key_info[3].0.as_ref(), b"key4");
 		assert_eq!(key_info[3].2, InternalKeyKind::Delete);
 		assert_eq!(key_info[3].3, 0); // No value for delete
 
@@ -654,13 +654,13 @@ mod tests {
 	fn test_range_query() {
 		// Create a memtable with many keys
 		let (memtable, _) = create_test_memtable(vec![
-			(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, None),
-			(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, None),
-			(b"e".to_vec(), b"value-e".to_vec(), InternalKeyKind::Set, None),
-			(b"g".to_vec(), b"value-g".to_vec(), InternalKeyKind::Set, None),
-			(b"i".to_vec(), b"value-i".to_vec(), InternalKeyKind::Set, None),
-			(b"k".to_vec(), b"value-k".to_vec(), InternalKeyKind::Set, None),
-			(b"m".to_vec(), b"value-m".to_vec(), InternalKeyKind::Set, None),
+			(b"a".into_bytes(), b"value-a".into_bytes(), InternalKeyKind::Set, None),
+			(b"c".into_bytes(), b"value-c".into_bytes(), InternalKeyKind::Set, None),
+			(b"e".into_bytes(), b"value-e".into_bytes(), InternalKeyKind::Set, None),
+			(b"g".into_bytes(), b"value-g".into_bytes(), InternalKeyKind::Set, None),
+			(b"i".into_bytes(), b"value-i".into_bytes(), InternalKeyKind::Set, None),
+			(b"k".into_bytes(), b"value-k".into_bytes(), InternalKeyKind::Set, None),
+			(b"m".into_bytes(), b"value-m".into_bytes(), InternalKeyKind::Set, None),
 		]);
 
 		// Test inclusive range
@@ -679,11 +679,11 @@ mod tests {
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		assert_eq!(user_keys.len(), 5);
-		assert_eq!(&user_keys[0], b"c");
-		assert_eq!(&user_keys[1], b"e");
-		assert_eq!(&user_keys[2], b"g");
-		assert_eq!(&user_keys[3], b"i");
-		assert_eq!(&user_keys[4], b"k");
+		assert_eq!(&user_keys[0].as_ref(), b"c");
+		assert_eq!(&user_keys[1].as_ref(), b"e");
+		assert_eq!(&user_keys[2].as_ref(), b"g");
+		assert_eq!(&user_keys[3].as_ref(), b"i");
+		assert_eq!(&user_keys[4].as_ref(), b"k");
 
 		// Test exclusive range
 		let range_entries: Vec<_> = memtable
@@ -700,21 +700,21 @@ mod tests {
 		let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
 		assert_eq!(user_keys.len(), 4); // Excludes "k"
-		assert_eq!(&user_keys[0], b"c");
-		assert_eq!(&user_keys[1], b"e");
-		assert_eq!(&user_keys[2], b"g");
-		assert_eq!(&user_keys[3], b"i");
+		assert_eq!(&user_keys[0].as_ref(), b"c");
+		assert_eq!(&user_keys[1].as_ref(), b"e");
+		assert_eq!(&user_keys[2].as_ref(), b"g");
+		assert_eq!(&user_keys[3].as_ref(), b"i");
 	}
 
 	#[test]
 	fn test_range_query_with_sequence_numbers() {
 		// Create a memtable with overlapping sequence numbers
 		let (memtable, _) = create_test_memtable(vec![
-			(b"a".to_vec(), b"value-a1".to_vec(), InternalKeyKind::Set, Some(10)),
-			(b"a".to_vec(), b"value-a2".to_vec(), InternalKeyKind::Set, Some(20)), // Updated value
-			(b"c".to_vec(), b"value-c1".to_vec(), InternalKeyKind::Set, Some(15)),
-			(b"e".to_vec(), b"value-e1".to_vec(), InternalKeyKind::Set, Some(25)),
-			(b"e".to_vec(), b"value-e2".to_vec(), InternalKeyKind::Set, Some(15)), // Older version
+			(b"a".into_bytes(), b"value-a1".into_bytes(), InternalKeyKind::Set, Some(10)),
+			(b"a".into_bytes(), b"value-a2".into_bytes(), InternalKeyKind::Set, Some(20)), /* Updated value */
+			(b"c".into_bytes(), b"value-c1".into_bytes(), InternalKeyKind::Set, Some(15)),
+			(b"e".into_bytes(), b"value-e1".into_bytes(), InternalKeyKind::Set, Some(25)),
+			(b"e".into_bytes(), b"value-e2".into_bytes(), InternalKeyKind::Set, Some(15)), /* Older version */
 		]);
 
 		// Perform a range query from "a" to "f"
@@ -741,37 +741,42 @@ mod tests {
 		assert_eq!(entries_info.len(), 5);
 
 		// Key "a" entries (seq 20 then seq 10)
-		assert_eq!(&entries_info[0].0, b"a");
+		assert_eq!(&entries_info[0].0.as_ref(), b"a");
 		assert_eq!(entries_info[0].1, 20);
-		assert_eq!(entries_info[0].2, b"value-a2");
+		assert_eq!(entries_info[0].2.as_ref(), b"value-a2");
 
-		assert_eq!(entries_info[1].0, b"a");
+		assert_eq!(entries_info[1].0.as_ref(), b"a");
 		assert_eq!(entries_info[1].1, 10);
-		assert_eq!(entries_info[1].2, b"value-a1");
+		assert_eq!(entries_info[1].2.as_ref(), b"value-a1");
 
 		// Key "c" entry
-		assert_eq!(entries_info[2].0, b"c");
+		assert_eq!(entries_info[2].0.as_ref(), b"c");
 		assert_eq!(entries_info[2].1, 15);
-		assert_eq!(entries_info[2].2, b"value-c1");
+		assert_eq!(entries_info[2].2.as_ref(), b"value-c1");
 
 		// Key "e" entries (seq 25 then seq 15)
-		assert_eq!(entries_info[3].0, b"e");
+		assert_eq!(entries_info[3].0.as_ref(), b"e");
 		assert_eq!(entries_info[3].1, 25);
-		assert_eq!(entries_info[3].2, b"value-e1");
+		assert_eq!(entries_info[3].2.as_ref(), b"value-e1");
 
-		assert_eq!(entries_info[4].0, b"e");
+		assert_eq!(entries_info[4].0.as_ref(), b"e");
 		assert_eq!(entries_info[4].1, 15);
-		assert_eq!(entries_info[4].2, b"value-e2");
+		assert_eq!(entries_info[4].2.as_ref(), b"value-e2");
 	}
 
 	#[test]
 	fn test_binary_keys() {
 		// Test with binary keys containing nulls and various byte values
 		let (memtable, _) = create_test_memtable(vec![
-			(vec![0, 0, 1], b"value1".to_vec(), InternalKeyKind::Set, None),
-			(vec![0, 1, 0], b"value2".to_vec(), InternalKeyKind::Set, None),
-			(vec![1, 0, 0], b"value3".to_vec(), InternalKeyKind::Set, None),
-			(vec![0xFF, 0xFE, 0xFD], b"value4".to_vec(), InternalKeyKind::Set, None),
+			(vec![0, 0, 1].into_bytes(), b"value1".into_bytes(), InternalKeyKind::Set, None),
+			(vec![0, 1, 0].into_bytes(), b"value2".into_bytes(), InternalKeyKind::Set, None),
+			(vec![1, 0, 0].into_bytes(), b"value3".into_bytes(), InternalKeyKind::Set, None),
+			(
+				vec![0xFF, 0xFE, 0xFD].into_bytes(),
+				b"value4".into_bytes(),
+				InternalKeyKind::Set,
+				None,
+			),
 		]);
 
 		let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
@@ -791,8 +796,8 @@ mod tests {
 		// Create a larger dataset to test performance and correctness
 		let mut entries = Vec::new();
 		for i in 0..1000 {
-			let key = format!("key{i:04}").as_bytes().to_vec();
-			let value = format!("value{i:04}").as_bytes().to_vec();
+			let key = format!("key{i:04}").as_bytes().into_bytes();
+			let value = format!("value{i:04}").as_bytes().into_bytes();
 			entries.push((key, value, InternalKeyKind::Set, None));
 		}
 
@@ -832,8 +837,8 @@ mod tests {
 
 		// Add some data
 		let mut batch = Batch::new(1);
-		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-		batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		batch.set(b"key1".into_bytes(), b"value1".into_bytes(), 0).unwrap();
+		batch.set(b"key2".into_bytes(), b"value2".into_bytes(), 0).unwrap();
 
 		let (record_size, total_size) = memtable.add(&batch).unwrap();
 		assert!(record_size > 0);
@@ -842,7 +847,7 @@ mod tests {
 
 		// Add more data
 		let mut batch2 = Batch::new(2);
-		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
+		batch2.set(b"key3".into_bytes(), b"value3".into_bytes(), 0).unwrap();
 
 		let (record_size2, total_size2) = memtable.add(&batch2).unwrap();
 		assert!(record_size2 > 0);
@@ -859,19 +864,19 @@ mod tests {
 
 		// Add batch with seq_num 10
 		let mut batch1 = Batch::new(10);
-		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+		batch1.set(b"key1".into_bytes(), b"value1".into_bytes(), 0).unwrap();
 		memtable.add(&batch1).unwrap();
 		assert_eq!(memtable.lsn(), 10);
 
 		// Add batch with lower seq_num - should not update
 		let mut batch2 = Batch::new(5);
-		batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+		batch2.set(b"key2".into_bytes(), b"value2".into_bytes(), 0).unwrap();
 		memtable.add(&batch2).unwrap();
 		assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 		// Add batch with higher seq_num
 		let mut batch3 = Batch::new(20);
-		batch3.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
+		batch3.set(b"key3".into_bytes(), b"value3".into_bytes(), 0).unwrap();
 		memtable.add(&batch3).unwrap();
 		assert_eq!(memtable.lsn(), 20);
 	}
@@ -880,11 +885,11 @@ mod tests {
 	fn test_get_highest_seq_num() {
 		// Add a batch with 5 entries
 		let mut batch = Batch::new(10);
-		batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-		batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
-		batch.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
-		batch.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap();
-		batch.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap();
+		batch.set(b"key1".into_bytes(), b"value1".into_bytes(), 0).unwrap();
+		batch.set(b"key2".into_bytes(), b"value2".into_bytes(), 0).unwrap();
+		batch.set(b"key3".into_bytes(), b"value3".into_bytes(), 0).unwrap();
+		batch.set(b"key4".into_bytes(), b"value4".into_bytes(), 0).unwrap();
+		batch.set(b"key5".into_bytes(), b"value5".into_bytes(), 0).unwrap();
 
 		assert_eq!(batch.get_highest_seq_num(), 14);
 	}

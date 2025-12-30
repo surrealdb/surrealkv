@@ -387,6 +387,7 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::InternalKeyKind;
+	use crate::IntoBytes;
 
 	struct MockEnv;
 
@@ -420,7 +421,7 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		let result = pipeline.commit(batch, false).await;
@@ -445,8 +446,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					format!("key{i}").into_bytes(),
-					Some(vec![1, 2, 3]),
+					format!("key{i}").into_bytes().into_bytes(),
+					Some(vec![1, 2, 3].into_bytes()),
 					i,
 				)
 				.unwrap();
@@ -471,8 +472,8 @@ mod tests {
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						format!("key{i}").into_bytes(),
-						Some(vec![1, 2, 3]),
+						format!("key{i}").into_bytes().into_bytes(),
+						Some(vec![1, 2, 3].into_bytes()),
 						i,
 					)
 					.unwrap();
@@ -545,8 +546,8 @@ mod tests {
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						format!("key{i}").into_bytes(),
-						Some(vec![1, 2, 3]),
+						format!("key{i}").into_bytes().into_bytes(),
+						Some(vec![1, 2, 3].into_bytes()),
 						i,
 					)
 					.unwrap();
@@ -574,7 +575,7 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
@@ -596,8 +597,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					format!("key{i}").into_bytes(),
-					Some(vec![1, 2, 3]),
+					format!("key{i}").into_bytes().into_bytes(),
+					Some(vec![1, 2, 3].into_bytes()),
 					i as u64,
 				)
 				.unwrap();
@@ -632,7 +633,7 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		let result = pipeline.sync_commit(batch, true); // sync_wal = true
@@ -650,15 +651,15 @@ mod tests {
 
 		let mut batch1 = Batch::new(0);
 		batch1
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		let mut batch2 = Batch::new(0);
 		batch2
-			.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(b"value2".to_vec()), 1)
+			.add_record(InternalKeyKind::Set, b"key2".into_bytes(), Some(b"value2".into_bytes()), 1)
 			.unwrap();
 		batch2
-			.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(b"value3".to_vec()), 2)
+			.add_record(InternalKeyKind::Set, b"key3".into_bytes(), Some(b"value3".into_bytes()), 2)
 			.unwrap();
 
 		// Commit first batch
@@ -679,7 +680,7 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
@@ -750,7 +751,7 @@ mod tests {
 
 		let mut batch = Batch::new(0);
 		batch
-			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.add_record(InternalKeyKind::Set, b"key1".into_bytes(), Some(b"value1".into_bytes()), 0)
 			.unwrap();
 
 		// Verify initial state
@@ -779,8 +780,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					format!("key{i}").into_bytes(),
-					Some(vec![1, 2, 3]),
+					format!("key{i}").into_bytes().into_bytes(),
+					Some(vec![1, 2, 3].into_bytes()),
 					i as u64,
 				)
 				.unwrap();
@@ -816,8 +817,10 @@ mod tests {
 					batch
 						.add_record(
 							InternalKeyKind::Set,
-							format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
-							Some(vec![thread_id as u8, batch_id as u8]),
+							format!("thread_{thread_id}_batch_{batch_id}")
+								.into_bytes()
+								.into_bytes(),
+							Some(vec![thread_id as u8, batch_id as u8].into_bytes()),
 							batch_id,
 						)
 						.unwrap();

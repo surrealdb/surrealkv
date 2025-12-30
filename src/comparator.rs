@@ -328,6 +328,7 @@ mod tests {
 	use rand::{Rng, SeedableRng};
 
 	use super::*;
+	use crate::IntoBytes;
 
 	// ============================================================================
 	// Basic Separator Tests
@@ -648,15 +649,15 @@ mod tests {
 	use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
 
 	/// Helper to create an encoded internal key for testing
-	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(user_key.to_vec(), seq, kind, 0).encode()
+	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Bytes {
+		InternalKey::new(user_key.into_bytes(), seq, kind, 0).encode()
 	}
 
 	/// Helper to create an encoded internal key with max seq num (for expected
 	/// separator results)
-	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
+	fn ikey_max_seq(user_key: &[u8]) -> Bytes {
 		InternalKey::new(
-			user_key.to_vec(),
+			user_key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
@@ -883,7 +884,7 @@ mod tests {
 
 		// (foo, MAX) should come BEFORE all other (foo, *) keys
 		let key_max = InternalKey::new(
-			b"foo".to_vec(),
+			b"foo".into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
 			INTERNAL_KEY_TIMESTAMP_MAX,

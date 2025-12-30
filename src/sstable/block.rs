@@ -771,7 +771,7 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::{InternalKey, InternalKeyKind};
-	use crate::Options;
+	use crate::{IntoBytes, Options};
 
 	fn generate_data() -> Vec<(&'static [u8], &'static [u8])> {
 		vec![
@@ -793,7 +793,7 @@ mod tests {
 	}
 
 	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(key.to_vec(), 0, kind, 0).encode()
+		InternalKey::new(key.into_bytes(), 0, kind, 0).encode().to_vec()
 	}
 
 	#[test]
@@ -840,8 +840,8 @@ mod tests {
 
 		let mut i = 0;
 		while block_iter.advance().unwrap() {
-			assert_eq!(block_iter.key().user_key.as_slice(), data[i].0);
-			assert_eq!(block_iter.value(), data[i].1.to_vec());
+			assert_eq!(block_iter.key().user_key.as_ref(), data[i].0);
+			assert_eq!(block_iter.value().as_ref(), data[i].1);
 			i += 1;
 		}
 
@@ -903,39 +903,39 @@ mod tests {
 		let mut block_iter =
 			Block::new(block_contents, o.internal_comparator.clone()).iter(false).unwrap();
 
-		let key = InternalKey::new(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"pkey2".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key.as_ref(), block_iter.value().as_ref())),
+			Some(("pkey2".as_bytes(), "value".as_bytes()))
 		);
 
-		let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"pkey0".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key.as_ref(), block_iter.value().as_ref())),
+			Some(("pkey1".as_bytes(), "value".as_bytes()))
 		);
 
-		let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"key1".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
+			Some((block_iter.key().user_key.as_ref(), block_iter.value().as_ref())),
+			Some(("key1".as_bytes(), "value1".as_bytes()))
 		);
 
-		let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"pkey3".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(
-			Some((block_iter.key().user_key, block_iter.value(),)),
-			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+			Some((block_iter.key().user_key.as_ref(), block_iter.value().as_ref())),
+			Some(("pkey3".as_bytes(), "value".as_bytes()))
 		);
 
-		let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
+		let key = InternalKey::new(b"pkey8".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&key.encode()).unwrap();
 		assert!(!block_iter.valid());
 	}
@@ -1055,7 +1055,7 @@ mod tests {
 		for item in forward_iter {
 			let (key, _) = item.unwrap();
 			let internal_key = InternalKey::decode(&key);
-			forward_keys.push(String::from_utf8(internal_key.user_key.clone()).unwrap());
+			forward_keys.push(String::from_utf8(internal_key.user_key.to_vec()).unwrap());
 		}
 		assert_eq!(
 			forward_keys,
@@ -1069,7 +1069,7 @@ mod tests {
 		let mut backward_keys = Vec::new();
 		while backward_iter.valid() {
 			let key = backward_iter.key().user_key.clone();
-			backward_keys.push(String::from_utf8(key.clone()).unwrap());
+			backward_keys.push(String::from_utf8(key.to_vec()).unwrap());
 			if !backward_iter.prev().unwrap() {
 				break;
 			}
@@ -1103,7 +1103,7 @@ mod tests {
 			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
 
 		// Seek to "pkey1"
-		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(b"pkey1".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
@@ -1146,7 +1146,7 @@ mod tests {
 			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
 
 		// Position at "pkey1"
-		let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(b"pkey1".into_bytes(), 1, InternalKeyKind::Set, 0);
 		block_iter.seek(&seek_key.encode()).unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
@@ -1241,7 +1241,7 @@ mod tests {
 		let mut iter = block.iter(false).unwrap();
 
 		// Seek for a key that is greater than all keys
-		let target = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"zzz_past_end".into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 
 		assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
@@ -1268,12 +1268,12 @@ mod tests {
 		let mut iter = block.iter(false).unwrap();
 
 		// Seek for a key that is less than all keys
-		let target = InternalKey::new(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"aaa_before_all".into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid");
 		let found_key = iter.key();
-		assert_eq!(found_key.user_key, b"key_00".to_vec(), "Should land on first key");
+		assert_eq!(found_key.user_key.as_ref(), b"key_00", "Should land on first key");
 	}
 
 	#[test]
@@ -1296,12 +1296,12 @@ mod tests {
 		let mut iter = block.iter(false).unwrap();
 
 		// Seek for key_05 which exists
-		let target = InternalKey::new(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"key_05".into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 
 		assert!(iter.valid());
 		let found_key = iter.key();
-		assert_eq!(found_key.user_key, b"key_05".to_vec());
+		assert_eq!(found_key.user_key.as_ref(), b"key_05");
 	}
 
 	#[test]
@@ -1320,14 +1320,14 @@ mod tests {
 		let mut iter = block.iter(false).unwrap();
 
 		// Seek for "banana" which is between "apple" and "cherry"
-		let target = InternalKey::new(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"banana".into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 
 		assert!(iter.valid());
 		let found_key = iter.key();
 		assert_eq!(
-			found_key.user_key,
-			b"cherry".to_vec(),
+			found_key.user_key.as_ref(),
+			b"cherry",
 			"Should land on 'cherry' which is first key >= 'banana'"
 		);
 	}
@@ -1343,7 +1343,7 @@ mod tests {
 		// Add same user key with descending seq_nums (as stored in SSTable)
 		// In InternalKey ordering: (foo, 100) < (foo, 50) < (foo, 1)
 		for seq in [100u64, 75, 50, 25, 1] {
-			let key = InternalKey::new(b"foo".to_vec(), seq, InternalKeyKind::Set, 0);
+			let key = InternalKey::new(b"foo".into_bytes(), seq, InternalKeyKind::Set, 0);
 			let value = format!("value_seq_{}", seq);
 			builder.add(&key.encode(), value.as_bytes()).unwrap();
 		}
@@ -1352,11 +1352,11 @@ mod tests {
 
 		// Test 1: Seek for seq=80, should find seq=75 (first key >= (foo, 80))
 		let mut iter = block.iter(false).unwrap();
-		let target = InternalKey::new(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"foo".into_bytes(), 80, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 		assert!(iter.valid());
 		let found = iter.key();
-		assert_eq!(found.user_key, b"foo".to_vec());
+		assert_eq!(found.user_key.as_ref(), b"foo");
 		assert_eq!(
 			found.seq_num(),
 			75,
@@ -1364,13 +1364,13 @@ mod tests {
 		);
 
 		// Test 2: Seek for seq=50, should find exactly seq=50
-		iter.seek(&InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode())
+		iter.seek(&InternalKey::new(b"foo".into_bytes(), 50, InternalKeyKind::Set, 0).encode())
 			.unwrap();
 		assert!(iter.valid());
 		assert_eq!(iter.key().seq_num(), 50);
 
 		// Test 3: Seek for seq=200 (newer than all), should find seq=100
-		iter.seek(&InternalKey::new(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode())
+		iter.seek(&InternalKey::new(b"foo".into_bytes(), 200, InternalKeyKind::Set, 0).encode())
 			.unwrap();
 		assert!(iter.valid());
 		assert_eq!(iter.key().seq_num(), 100, "Should find newest version seq=100");
@@ -1390,18 +1390,20 @@ mod tests {
 		let mut iter = block.iter(false).unwrap();
 
 		// Seek for the exact key
-		let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
+		let target = InternalKey::new(b"only_key".into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+		assert_eq!(iter.key().user_key, b"only_key".into_bytes());
 
 		// Seek for key before
-		iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
+		iter.seek(&InternalKey::new(b"aaa".into_bytes(), 1, InternalKeyKind::Set, 0).encode())
+			.unwrap();
 		assert!(iter.valid());
-		assert_eq!(iter.key().user_key, b"only_key".to_vec());
+		assert_eq!(iter.key().user_key, b"only_key".into_bytes());
 
 		// Seek for key after
-		iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
+		iter.seek(&InternalKey::new(b"zzz".into_bytes(), 1, InternalKeyKind::Set, 0).encode())
+			.unwrap();
 		assert!(!iter.valid(), "Should be invalid when seeking past single entry");
 	}
 
@@ -1427,10 +1429,10 @@ mod tests {
 		for i in [0, 2, 4] {
 			let target_key = format!("key_{:02}", i);
 			let target =
-				InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
+				InternalKey::new(target_key.as_bytes().into_bytes(), 1, InternalKeyKind::Set, 0);
 			iter.seek(&target.encode()).unwrap();
 			assert!(iter.valid(), "Should find key at restart point {}", i);
-			assert_eq!(iter.key().user_key, target_key.as_bytes().to_vec());
+			assert_eq!(iter.key().user_key.as_ref(), target_key.as_bytes());
 		}
 	}
 
@@ -1488,8 +1490,12 @@ mod tests {
 			BlockWriter::new(o.block_size, o.block_restart_interval, o.internal_comparator.clone());
 
 		for i in 0..5 {
-			let key =
-				InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set, 0);
+			let key = InternalKey::new(
+				format!("key_{:02}", i).into_bytes().into_bytes(),
+				1,
+				InternalKeyKind::Set,
+				0,
+			);
 			builder.add(&key.encode(), b"value").unwrap();
 		}
 
@@ -1500,7 +1506,7 @@ mod tests {
 		assert!(iter.valid());
 
 		let first_key = iter.key();
-		assert_eq!(first_key.user_key, b"key_00".to_vec());
+		assert_eq!(first_key.user_key.as_ref(), b"key_00");
 
 		// prev() at first entry should return false
 		let result = iter.prev().unwrap();
