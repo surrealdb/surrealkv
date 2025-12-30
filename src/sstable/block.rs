@@ -573,6 +573,13 @@ impl BlockIterator {
 			return Err(err);
 		}
 		self.seek_to_restart_point(0);
+
+		// Check if block has any entries before trying to decode
+		if self.offset >= self.restart_offset {
+			self.reset();
+			return Ok(()); // Empty block
+		}
+
 		self.seek_next_entry()
 	}
 
@@ -688,18 +695,34 @@ impl BlockIterator {
 		self.seek_to_restart_point(self.current_restart_index);
 		// Iterate forward to find the entry just before the original position
 		let mut prev_offset = self.offset;
-		while self.seek_next_entry().is_ok() {
-			if self.offset >= original {
-				// We overshot, so the previous entry starts at prev_offset
-				// Position at the previous entry and decode it
-				self.offset = prev_offset;
-				self.current_entry_offset = prev_offset;
-				self.seek_next_entry()?; // Decode the previous entry
-				return Ok(true);
+		loop {
+			match self.seek_next_entry() {
+				Ok(()) => {
+					if self.offset >= original {
+						// We overshot, so the previous entry starts at prev_offset
+						// Position at the previous entry and decode it
+						self.offset = prev_offset;
+						self.current_entry_offset = prev_offset;
+						self.seek_next_entry()?; // Decode the previous entry
+						return Ok(true);
+					}
+					prev_offset = self.offset;
+				}
+				Err(e) => {
+					// Check if this is the expected "end of block" error
+					// vs corruption errors that should be propagated
+					if let Error::SSTable(SSTableError::OffsetExceedsRestartOffset {
+						..
+					}) = e
+					{
+						// Expected EOF - no previous entry found
+						return Ok(false);
+					}
+					// Corruption or other error - propagate it
+					return Err(e);
+				}
 			}
-			prev_offset = self.offset;
 		}
-		Ok(false)
 	}
 
 	// Get the current key

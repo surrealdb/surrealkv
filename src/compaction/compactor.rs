@@ -67,14 +67,8 @@ impl Compactor {
 		let merge_result = {
 			let tables = levels.get_all_tables();
 
-			let to_merge: Vec<_> = input
-				.tables_to_merge
-				.iter()
-				.filter_map(|&id| {
-					let table_opt = tables.get(&id);
-					table_opt.cloned()
-				})
-				.collect();
+			let to_merge: Vec<_> =
+				input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
 			let iterators: Vec<BoxedIterator<'_>> = to_merge
 				.into_iter()
@@ -89,30 +83,33 @@ impl Compactor {
 			let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
 			let new_table_path = self.get_table_path(new_table_id);
 
-			// Write merged data and collect discard statistics
-			let discard_stats =
+			// Write merged data - returns (table_created, discard_stats)
+			let (table_created, discard_stats) =
 				self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
 
-			let new_table = self.open_table(new_table_id, &new_table_path)?;
-			Ok((new_table, new_table_id, discard_stats))
+			// Open table only if one was created
+			let new_table = if table_created {
+				Some(self.open_table(new_table_id, &new_table_path)?)
+			} else {
+				None
+			};
+
+			Ok((new_table, discard_stats))
 		};
 
 		match merge_result {
-			Ok((new_table, _, discard_stats)) => {
+			Ok((new_table, discard_stats)) => {
 				self.update_manifest(input, new_table)?;
 				self.cleanup_old_tables(input);
 
-				// Update VLog discard statistics in bulk
 				if !discard_stats.is_empty() {
 					if let Some(ref vlog) = self.options.vlog {
 						vlog.update_discard_stats(&discard_stats);
 					}
 				}
-
 				Ok(())
 			}
 			Err(e) => {
-				// Restore the original state
 				let mut levels = self.options.level_manifest.write()?;
 				levels.unhide_tables(&input.tables_to_merge);
 				Err(e)
@@ -120,20 +117,22 @@ impl Compactor {
 		}
 	}
 
+	/// Returns (table_created, discard_stats)
+	/// table_created: true if a table file was created and finished, false otherwise
+	/// discard_stats: always populated (even when no table created) for VLog GC
 	fn write_merged_table(
 		&self,
 		path: &Path,
 		table_id: u64,
 		merge_iter: Vec<BoxedIterator<'_>>,
 		input: &CompactionInput,
-	) -> Result<HashMap<u32, i64>> {
+	) -> Result<(bool, HashMap<u32, i64>)> {
 		let file = SysFile::create(path)?;
 		let mut writer =
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
 		// Create a compaction iterator that filters tombstones
 		let max_level = self.options.lopts.level_count - 1;
-
 		let is_bottom_level = input.target_level >= max_level;
 		let mut comp_iter = CompactionIterator::new(
 			merge_iter,
@@ -144,36 +143,48 @@ impl Compactor {
 			Arc::clone(&self.options.lopts.clock),
 		);
 
+		let mut entries = 0;
 		for item in &mut comp_iter {
 			let (key, value) = item?;
 			writer.add(key, &value)?;
+			entries += 1;
+		}
+
+		// Always flush delete-list for VLog cleanup (critical for GC)
+		comp_iter.flush_delete_list_batch()?;
+
+		// Capture discard_stats - these are populated even when entries == 0
+		let discard_stats = comp_iter.discard_stats;
+
+		if entries == 0 {
+			// No entries - drop writer and remove empty file
+			drop(writer);
+			let _ = std::fs::remove_file(path);
+			return Ok((false, discard_stats));
 		}
 
 		writer.finish()?;
-
-		// Flush any remaining delete-list entries to VLog
-		comp_iter.flush_delete_list_batch()?;
-
-		// Return collected discard statistics
-		Ok(comp_iter.discard_stats)
+		Ok((true, discard_stats))
 	}
 
-	fn update_manifest(&self, input: &CompactionInput, new_table: Arc<Table>) -> Result<()> {
+	fn update_manifest(
+		&self,
+		input: &CompactionInput,
+		new_table: Option<Arc<Table>>,
+	) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
 
-		let new_table_id = new_table.id;
-
-		// Check for table ID collision before making any changes
-		if input.tables_to_merge.contains(&new_table_id) {
-			return Err(crate::error::Error::TableIDCollision(new_table_id));
+		// Check for table ID collision if adding a new table
+		if let Some(ref table) = new_table {
+			if input.tables_to_merge.contains(&table.id) {
+				return Err(crate::error::Error::TableIDCollision(table.id));
+			}
 		}
 
-		// Create a changeset for the compaction
 		let mut changeset = ManifestChangeSet::default();
 
-		// Add tables to delete (the ones being merged) - use the same efficient
-		// approach as original
+		// Delete old tables
 		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
 			for &table_id in &input.tables_to_merge {
 				if level.tables.iter().any(|t| t.id == table_id) {
@@ -182,13 +193,13 @@ impl Compactor {
 			}
 		}
 
-		// Add the new table to the changeset
-		changeset.new_tables.push((input.target_level, new_table));
+		// Add new table if present
+		if let Some(table) = new_table {
+			changeset.new_tables.push((input.target_level, table));
+		}
 
-		// Apply the changeset to remove old tables and add new table
 		manifest.apply_changeset(&changeset)?;
 
-		// Persist the updated manifest
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			self.options
 				.error_handler
@@ -197,7 +208,6 @@ impl Compactor {
 		}
 
 		manifest.unhide_tables(&input.tables_to_merge);
-
 		Ok(())
 	}
 
