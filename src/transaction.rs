@@ -5,13 +5,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
+use bytes::Bytes;
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::Snapshot;
 use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
+use crate::{IntoBytes, IntoBytesExt, IterResult, Key, KeysResult, RangeResult, Value, Version};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -241,8 +242,8 @@ impl Transaction {
 	/// Inserts a key-value pair into the store.
 	pub fn set<K, V>(&mut self, key: K, value: V) -> Result<()>
 	where
-		K: IntoBytes,
-		V: IntoBytes,
+		K: Into<Bytes>,
+		V: Into<Bytes>,
 	{
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
@@ -250,8 +251,8 @@ impl Transaction {
 	/// Inserts a key-value pair at with a specific timestamp.
 	pub fn set_at_version<K, V>(&mut self, key: K, value: V, timestamp: u64) -> Result<()>
 	where
-		K: IntoBytes,
-		V: IntoBytes,
+		K: Into<Bytes>,
+		V: Into<Bytes>,
 	{
 		self.set_with_options(key, value, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
@@ -259,8 +260,8 @@ impl Transaction {
 	/// Inserts a key-value pair to the store, with custom write options.
 	pub fn set_with_options<K, V>(&mut self, key: K, value: V, options: &WriteOptions) -> Result<()>
 	where
-		K: IntoBytes,
-		V: IntoBytes,
+		K: Into<Bytes>,
+		V: Into<Bytes>,
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
@@ -282,7 +283,7 @@ impl Transaction {
 	/// Delete all the versions of a key. This is a hard delete.
 	pub fn delete<K>(&mut self, key: K) -> Result<()>
 	where
-		K: IntoBytes,
+		K: Into<Bytes>,
 	{
 		self.delete_with_options(key, &WriteOptions::default())
 	}
@@ -291,7 +292,7 @@ impl Transaction {
 	/// hard delete.
 	pub fn delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
-		K: IntoBytes,
+		K: Into<Bytes>,
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
@@ -313,7 +314,7 @@ impl Transaction {
 	/// Soft delete a key. This will add a tombstone at the current timestamp.
 	pub fn soft_delete<K>(&mut self, key: K) -> Result<()>
 	where
-		K: IntoBytes,
+		K: Into<Bytes>,
 	{
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
@@ -322,7 +323,7 @@ impl Transaction {
 	/// the specified timestamp.
 	pub fn soft_delete_at_version<K>(&mut self, key: K, timestamp: u64) -> Result<()>
 	where
-		K: IntoBytes,
+		K: Into<Bytes>,
 	{
 		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
 	}
@@ -331,7 +332,7 @@ impl Transaction {
 	/// at the specified timestamp.
 	pub fn soft_delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
 	where
-		K: IntoBytes,
+		K: Into<Bytes>,
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
@@ -359,8 +360,8 @@ impl Transaction {
 	/// Inserts a key-value pairm removing all previous versions.
 	pub fn replace<K, V>(&mut self, key: K, value: V) -> Result<()>
 	where
-		K: IntoBytes,
-		V: IntoBytes,
+		K: Into<Bytes>,
+		V: Into<Bytes>,
 	{
 		self.replace_with_options(key, value, &WriteOptions::default())
 	}
@@ -374,8 +375,8 @@ impl Transaction {
 		options: &WriteOptions,
 	) -> Result<()>
 	where
-		K: IntoBytes,
-		V: IntoBytes,
+		K: Into<Bytes>,
+		V: Into<Bytes>,
 	{
 		let write_seqno = self.next_write_seqno();
 		let entry = if let Some(timestamp) = options.timestamp {
@@ -397,7 +398,7 @@ impl Transaction {
 	/// Gets a value for a key if it exists.
 	pub fn get<K>(&self, key: K) -> Result<Option<Value>>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		self.get_with_options(key, &ReadOptions::default())
 	}
@@ -405,7 +406,7 @@ impl Transaction {
 	/// Gets a value for a key at a specific timestamp.
 	pub fn get_at_version<K>(&self, key: K, timestamp: u64) -> Result<Option<Value>>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
@@ -413,14 +414,14 @@ impl Transaction {
 	/// Gets a value for a key, with custom read options.
 	pub fn get_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
 		}
 		// If the key is empty, return an error.
-		if key.as_slice().is_empty() {
+		if key.as_ref().is_empty() {
 			return Err(Error::EmptyKey);
 		}
 
@@ -438,7 +439,7 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			return match &self.snapshot {
-				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
+				Some(snapshot) => snapshot.get_at_version(key.as_ref(), timestamp),
 				None => Err(Error::NoSnapshot),
 			};
 		}
@@ -446,7 +447,7 @@ impl Transaction {
 		// RYOW semantics: Read your own writes. If the value is in the write set,
 		// return it.
 		if let Some(last_entry) =
-			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
+			self.write_set.get(key.as_ref()).and_then(|entries| entries.last())
 		{
 			// If the entry is a tombstone, return None.
 			if last_entry.is_tombstone() {
@@ -460,7 +461,7 @@ impl Transaction {
 		}
 
 		// The value is not in the write set, so attempt to get it from the snapshot.
-		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
+		match self.snapshot.as_ref().unwrap().get(key.as_ref())? {
 			Some(val) => {
 				// Resolve the value reference through VLog if needed
 				let resolved_value = self.core.resolve_value(&val.0)?;
@@ -480,10 +481,13 @@ impl Transaction {
 	/// as it doesn't need to allocate or return the actual keys.
 	pub fn count<K>(&self, start: K, end: K) -> Result<usize>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.count_with_options(&options)
 	}
 
@@ -496,10 +500,13 @@ impl Transaction {
 	/// This requires versioning to be enabled in the database options.
 	pub fn count_at_version<K>(&self, start: K, end: K, timestamp: u64) -> Result<usize>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.count_with_options(&options)
 	}
 
@@ -597,10 +604,13 @@ impl Transaction {
 		end: K,
 	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options = ReadOptions::default().with_keys_only(true);
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.keys_with_options(&options)
 	}
 
@@ -622,11 +632,14 @@ impl Transaction {
 		timestamp: u64,
 	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.keys_with_options(&options)
 	}
 
@@ -689,10 +702,13 @@ impl Transaction {
 		end: K,
 	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options = ReadOptions::default();
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.range_with_options(&options)
 	}
 
@@ -711,10 +727,13 @@ impl Transaction {
 		timestamp: u64,
 	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
 	where
-		K: IntoBytes,
+		K: AsRef<[u8]>,
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
+		options.set_iterate_bounds(
+			Some(Bytes::copy_from_slice(start.as_ref())),
+			Some(Bytes::copy_from_slice(end.as_ref())),
+		);
 		self.range_with_options(&options)
 	}
 
@@ -1018,7 +1037,7 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	fn new<K: IntoBytes, V: IntoBytes>(
+	fn new<K: Into<Bytes>, V: Into<Bytes>>(
 		key: K,
 		value: Option<V>,
 		kind: InternalKeyKind,
@@ -1026,8 +1045,8 @@ impl Entry {
 		seqno: u32,
 	) -> Entry {
 		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
+			key: key.into(),
+			value: value.map(|v| v.into()),
 			kind,
 			savepoint_no,
 			seqno,
@@ -1035,7 +1054,7 @@ impl Entry {
 		}
 	}
 
-	fn new_with_timestamp<K: IntoBytes, V: IntoBytes>(
+	fn new_with_timestamp<K: Into<Bytes>, V: Into<Bytes>>(
 		key: K,
 		value: Option<V>,
 		kind: InternalKeyKind,
@@ -1044,8 +1063,8 @@ impl Entry {
 		timestamp: u64,
 	) -> Entry {
 		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
+			key: key.into(),
+			value: value.map(|v| v.into()),
 			kind,
 			savepoint_no,
 			seqno,
@@ -1304,8 +1323,8 @@ mod tests {
 		{
 			// Start a new read-write transaction (txn1)
 			let mut txn1 = store.begin().unwrap();
-			txn1.set(&key1, &value1).unwrap();
-			txn1.set(&key2, &value1).unwrap();
+			txn1.set(key1.clone(), value1.clone()).unwrap();
+			txn1.set(key2.clone(), value1.clone()).unwrap();
 			txn1.commit().await.unwrap();
 		}
 
@@ -1319,8 +1338,8 @@ mod tests {
 		{
 			// Start another read-write transaction (txn2)
 			let mut txn2 = store.begin().unwrap();
-			txn2.set(&key1, &value2).unwrap();
-			txn2.set(&key2, &value2).unwrap();
+			txn2.set(key1.clone(), value2.clone()).unwrap();
+			txn2.set(key2.clone(), value2.clone()).unwrap();
 			txn2.commit().await.unwrap();
 		}
 
@@ -1346,11 +1365,11 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
 
-			txn1.set(&key1, &value1).unwrap();
+			txn1.set(key1.clone(), value1.clone()).unwrap();
 			txn1.commit().await.unwrap();
 
 			assert!(txn2.get(&key2).unwrap().is_none());
-			txn2.set(&key2, &value2).unwrap();
+			txn2.set(key2.clone(), value2.clone()).unwrap();
 			txn2.commit().await.unwrap();
 		}
 
@@ -1359,8 +1378,8 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
 
-			txn1.set(&key1, &value1).unwrap();
-			txn2.set(&key1, &value2).unwrap();
+			txn1.set(key1.clone(), value1.clone()).unwrap();
+			txn2.set(key1.clone(), value2.clone()).unwrap();
 
 			txn1.commit().await.unwrap();
 			assert!(match txn2.commit().await {
@@ -1380,11 +1399,11 @@ mod tests {
 			let mut txn1 = store.begin().unwrap();
 			let mut txn2 = store.begin().unwrap();
 
-			txn1.set(&key, &value1).unwrap();
+			txn1.set(key.clone(), value1.clone()).unwrap();
 			txn1.commit().await.unwrap();
 
 			assert!(txn2.get(&key).unwrap().is_none());
-			txn2.set(&key, &value1).unwrap();
+			txn2.set(key.clone(), value1.clone()).unwrap();
 			assert!(match txn2.commit().await {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
@@ -1408,8 +1427,8 @@ mod tests {
 		{
 			// Start a new read-write transaction (txn1)
 			let mut txn1 = store.begin().unwrap();
-			txn1.set(&key1, &value1).unwrap();
-			txn1.delete(&key1).unwrap();
+			txn1.set(key1.clone(), value1.clone()).unwrap();
+			txn1.delete(key1.clone()).unwrap();
 			let res = txn1.get(&key1).unwrap();
 			assert!(res.is_none());
 			txn1.commit().await.unwrap();
@@ -1417,17 +1436,17 @@ mod tests {
 
 		{
 			let mut txn = store.begin().unwrap();
-			txn.set(&key1, &value1).unwrap();
+			txn.set(key1.clone(), value1.clone()).unwrap();
 			txn.commit().await.unwrap();
 		}
 
 		{
 			// Start a new read-write transaction (txn)
 			let mut txn = store.begin().unwrap();
-			txn.set(&key1, &value2).unwrap();
+			txn.set(key1.clone(), value2.clone()).unwrap();
 			assert_eq!(&txn.get(&key1).unwrap().unwrap(), &value2);
 			assert!(txn.get(&key3).unwrap().is_none());
-			txn.set(&key2, &value1).unwrap();
+			txn.set(key2.clone(), value1.clone()).unwrap();
 			assert_eq!(&txn.get(&key2).unwrap().unwrap(), &value1);
 			txn.commit().await.unwrap();
 		}
@@ -1443,8 +1462,8 @@ mod tests {
 		let value2 = Vec::from("v2");
 		// Start a new read-write transaction (txn)
 		let mut txn = store.begin().unwrap();
-		txn.set(&key1, &value1).unwrap();
-		txn.set(&key2, &value2).unwrap();
+		txn.set(key1.clone(), value1.clone()).unwrap();
+		txn.set(key2.clone(), value2.clone()).unwrap();
 		txn.commit().await.unwrap();
 
 		store
@@ -1473,14 +1492,14 @@ mod tests {
 			assert!(txn2.get(&key1).is_ok());
 			assert!(txn2.get(&key2).is_ok());
 
-			txn1.set(&key1, &value3).unwrap();
-			txn2.set(&key1, &value4).unwrap();
+			txn1.set(key1.clone(), value3.clone()).unwrap();
+			txn2.set(key1.clone(), value4.clone()).unwrap();
 
-			txn1.set(&key2, &value5).unwrap();
+			txn1.set(key2.clone(), value5.clone()).unwrap();
 
 			txn1.commit().await.unwrap();
 
-			txn2.set(&key2, &value6).unwrap();
+			txn2.set(key2.clone(), value6.clone()).unwrap();
 			assert!(match txn2.commit().await {
 				Err(err) => {
 					matches!(err, Error::TransactionWriteConflict)
@@ -1513,8 +1532,8 @@ mod tests {
 			assert!(txn1.get(&key1).is_ok());
 			assert!(txn2.get(&key1).is_ok());
 
-			txn1.set(&key1, &value3).unwrap();
-			txn2.set(&key1, &value3).unwrap();
+			txn1.set(key1.clone(), value3.clone()).unwrap();
+			txn2.set(key1.clone(), value3.clone()).unwrap();
 
 			txn1.commit().await.unwrap();
 
@@ -1545,8 +1564,8 @@ mod tests {
 			assert_eq!(txn1.get(&key1).unwrap().unwrap(), value1);
 			assert_eq!(txn2.get(&key1).unwrap().unwrap(), value1);
 			assert_eq!(txn2.get(&key2).unwrap().unwrap(), value2);
-			txn2.set(&key1, &value3).unwrap();
-			txn2.set(&key2, &value4).unwrap();
+			txn2.set(key1.clone(), value3.clone()).unwrap();
+			txn2.set(key2.clone(), value4.clone()).unwrap();
 
 			txn2.commit().await.unwrap();
 

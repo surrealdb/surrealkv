@@ -126,6 +126,18 @@ impl IntoBytes for Bytes {
 // 	}
 // }
 
+/// Extension trait for explicit conversion from references to Bytes
+/// This makes allocation explicit when users have references instead of owned types
+pub trait IntoBytesExt {
+	fn to_bytes(&self) -> Bytes;
+}
+
+impl<T: AsRef<[u8]>> IntoBytesExt for T {
+	fn to_bytes(&self) -> Bytes {
+		Bytes::copy_from_slice(self.as_ref())
+	}
+}
+
 /// Type alias for iterator results containing key-value pairs
 /// Value is optional to support keys-only iteration without allocating empty
 /// values

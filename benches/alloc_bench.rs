@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use rand::Rng;
 use surrealkv::{BytewiseComparator, TreeBuilder};
 use tempfile::TempDir;
@@ -33,7 +34,7 @@ pub fn seq_insert(b: divan::Bencher<'_, '_>, count: usize) {
 		let key: [u8; 16] = rng.random();
 		let value: [u8; 64] = rng.random();
 		let mut txn = tree.begin().unwrap();
-		txn.set(&key, &value).unwrap();
+		txn.set(Bytes::copy_from_slice(&key), Bytes::copy_from_slice(&value)).unwrap();
 		Handle::current().block_on(async {
 			txn.commit().await.unwrap();
 		});
@@ -61,7 +62,7 @@ pub fn seq_get(b: divan::Bencher<'_, '_>, count: usize) {
 	for _ in 0..count {
 		let key: [u8; 16] = rng.random();
 		let value: [u8; 64] = rng.random();
-		txn.set(&key, &value).unwrap();
+		txn.set(Bytes::copy_from_slice(&key), Bytes::copy_from_slice(&value)).unwrap();
 		keys.push(key);
 	}
 	Handle::current().block_on(async {
@@ -97,7 +98,7 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 	for _ in 0..count {
 		let key: [u8; 16] = rng.random();
 		let value: [u8; 64] = rng.random();
-		txn.set(&key, &value).unwrap();
+		txn.set(Bytes::copy_from_slice(&key), Bytes::copy_from_slice(&value)).unwrap();
 		keys.push(key);
 	}
 	Handle::current().block_on(async {

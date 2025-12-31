@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
@@ -47,7 +48,7 @@ pub(crate) struct Oracle {
 	transaction_commit_queue: Arc<SkipMap<u64, Arc<CommitEntry>>>,
 
 	/// Track active transaction start points
-	active_txn_starts: Arc<SkipMap<u64, AtomicUsize>>,
+	active_txn_starts: Arc<DashMap<u64, AtomicUsize>>,
 
 	/// Logical clock for time-based operations
 	clock: Arc<dyn LogicalClock>,
@@ -70,7 +71,7 @@ impl Oracle {
 		let oracle = Self {
 			transaction_commit_id: Arc::new(AtomicU64::new(0)),
 			transaction_commit_queue: Arc::new(SkipMap::new()),
-			active_txn_starts: Arc::new(SkipMap::new()),
+			active_txn_starts: Arc::new(DashMap::new()),
 			clock,
 			cleanup_enabled: Arc::new(AtomicBool::new(true)),
 			cleanup_handle: Mutex::new(None),
@@ -83,20 +84,22 @@ impl Oracle {
 
 	/// Register a new transaction start
 	pub(crate) fn register_txn_start(&self, start_commit_id: u64) {
-		let entry =
-			self.active_txn_starts.get_or_insert_with(start_commit_id, || AtomicUsize::new(0));
-		entry.value().fetch_add(1, Ordering::Relaxed);
+		self.active_txn_starts
+			.entry(start_commit_id)
+			.or_insert_with(|| AtomicUsize::new(0))
+			.fetch_add(1, Ordering::Relaxed);
 	}
 
 	/// Unregister a transaction when it commits or aborts
 	pub(crate) fn unregister_txn_start(&self, start_commit_id: u64) {
-		if let Some(entry) = self.active_txn_starts.get(&start_commit_id) {
-			let prev_count = entry.value().fetch_sub(1, Ordering::Relaxed);
+		if let Some(entry) = self.active_txn_starts.get_mut(&start_commit_id) {
+			let prev_count = entry.fetch_sub(1, Ordering::Relaxed);
 
 			// Only remove if we decremented from 1 to 0
 			if prev_count == 1 {
 				// Double-check by trying to remove only if counter is 0
-				if entry.value().load(Ordering::Relaxed) == 0 {
+				if entry.load(Ordering::Relaxed) == 0 {
+					drop(entry); // Release the lock before remove
 					self.active_txn_starts.remove(&start_commit_id);
 				}
 			}
@@ -211,10 +214,11 @@ impl Oracle {
 				std::thread::park_timeout(interval);
 
 				// Find the oldest active transaction start point
-				let oldest_active = match active_txn_starts.iter().next() {
-					Some(entry) => *entry.key(),
-					None => transaction_commit_id.load(Ordering::Acquire),
-				};
+				let oldest_active = active_txn_starts
+					.iter()
+					.min_by_key(|e| *e.key())
+					.map(|e| *e.key())
+					.unwrap_or_else(|| transaction_commit_id.load(Ordering::Acquire));
 
 				// Only remove entries that are not needed for conflict detection
 				let keys_to_remove: Vec<u64> =
