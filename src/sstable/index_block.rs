@@ -1,6 +1,7 @@
 // Note: Needs to be tested if a top-level index improves performance as such.
 // TODO: Replace the current non-partitioned index block writer with this
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -183,9 +184,7 @@ pub(crate) struct TopLevelIndex {
 	pub(crate) id: u64,
 	pub(crate) opts: Arc<Options>,
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
-	// TODO: Fix this, as this could be problematic if the file is being shared across without any
-	// mutex
-	pub(crate) file: Arc<dyn File>,
+	pub(crate) partition_map: HashMap<u64, Arc<Block>>,
 }
 
 impl TopLevelIndex {
@@ -199,20 +198,29 @@ impl TopLevelIndex {
 			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
 		let iter = block.iter(false)?;
 		let mut blocks = Vec::new();
+		let mut partition_map = HashMap::new();
 		for item in iter {
 			let (key, handle) = item?;
 			// Store full encoded internal key for correct partition lookup
 			let (handle, _) = BlockHandle::decode(&handle)?;
-			blocks.push(BlockHandleWithKey {
+			let block_handle = BlockHandleWithKey {
 				separator_key: key,
 				handle,
-			});
+			};
+			let block = Arc::new(read_table_block(
+				Arc::clone(&opt.internal_comparator),
+				Arc::clone(&f),
+				&block_handle.handle,
+			)?);
+
+			partition_map.insert(block_handle.offset(), block);
+			blocks.push(block_handle);
 		}
 		Ok(TopLevelIndex {
 			id,
 			opts: opt,
 			blocks,
-			file: Arc::clone(&f),
+			partition_map,
 		})
 	}
 
@@ -246,23 +254,11 @@ impl TopLevelIndex {
 	}
 
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
-		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
-			return Ok(block);
+		if let Some(block) = self.partition_map.get(&block_handle.offset()) {
+			return Ok(Arc::clone(block));
 		}
 
-		let block_data = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
-			&block_handle.handle,
-		)?;
-		let block = Arc::new(block_data);
-		self.opts.block_cache.insert_index_block(
-			self.id,
-			block_handle.offset(),
-			Arc::clone(&block),
-		);
-
-		Ok(block)
+		Err(Error::PartitionBlockExpectedButNotFound)
 	}
 
 	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
@@ -272,6 +268,117 @@ impl TopLevelIndex {
 				Ok(block)
 			}
 			None => Err(Error::BlockNotFound),
+		}
+	}
+}
+
+/// Handles readahead for sequential block access patterns.
+pub(crate) struct BlockPrefetcher {
+	// Current readahead size for FS prefetching
+	pub(crate) readahead_size: usize,
+	// Readahead limit for tracking what has been prefetched
+	readahead_limit: u64,
+	// Initial auto readahead size for internal prefetch buffer
+	initial_auto_readahead_size: usize,
+	// Maximum auto readahead size to cap exponential growth
+	max_auto_readahead_size: usize,
+	// Number of sequential file reads for auto readahead
+	num_sequential_reads: usize,
+	// Previous access pattern for sequential detection
+	prev_offset: u64,
+	prev_len: usize,
+}
+
+impl BlockPrefetcher {
+	pub(crate) fn new(initial_auto_readahead_size: usize, max_auto_readahead_size: usize) -> Self {
+		let sanitized_initial = if initial_auto_readahead_size > max_auto_readahead_size {
+			max_auto_readahead_size
+		} else {
+			initial_auto_readahead_size
+		};
+
+		Self {
+			readahead_size: sanitized_initial,
+			readahead_limit: 0,
+			initial_auto_readahead_size: sanitized_initial,
+			max_auto_readahead_size,
+			num_sequential_reads: 0,
+			prev_offset: 0,
+			prev_len: 0,
+		}
+	}
+
+	/// Update read pattern for sequential detection
+	pub(crate) fn update_read_pattern(&mut self, offset: u64, len: usize) {
+		self.prev_offset = offset;
+		self.prev_len = len;
+	}
+
+	/// Check if block access is sequential
+	pub(crate) fn is_block_sequential(&self, offset: u64) -> bool {
+		self.prev_len == 0 || (self.prev_offset + self.prev_len as u64 == offset)
+	}
+
+	pub(crate) fn reset_values(&mut self, initial_auto_readahead_size: usize) {
+		self.num_sequential_reads = 1;
+		// Sanitize the initial size against max_auto_readahead_size
+		let sanitized_initial = initial_auto_readahead_size.min(self.max_auto_readahead_size);
+		self.initial_auto_readahead_size = sanitized_initial;
+		self.readahead_size = sanitized_initial;
+		self.readahead_limit = 0;
+	}
+
+	pub(crate) fn prefetch_if_needed(
+		&mut self,
+		handle: &BlockHandle,
+		file: &dyn crate::vfs::File,
+	) -> bool {
+		let len = handle.size() as u64;
+		let offset = handle.offset() as u64;
+
+		// Check if already prefetched
+		if offset + len <= self.readahead_limit {
+			self.update_read_pattern(offset, len as usize);
+			return false;
+		}
+
+		// Check if access is sequential
+		if !self.is_block_sequential(offset) {
+			self.update_read_pattern(offset, len as usize);
+			self.reset_values(self.initial_auto_readahead_size);
+			return false;
+		}
+
+		self.update_read_pattern(offset, len as usize);
+
+		// Auto readahead logic - try FS prefetch
+		// Disable prefetching if either initial or max readahead size is 0
+		if self.initial_auto_readahead_size == 0 || self.max_auto_readahead_size == 0 {
+			return false;
+		}
+
+		self.num_sequential_reads += 1;
+		if self.num_sequential_reads <= 2 {
+			// Default num_sequential_reads_for_auto_readahead
+			return false;
+		}
+
+		// Try FS-level prefetch for auto readahead
+		if file.supports_prefetch() {
+			let prefetch_result = file.prefetch(offset, len as usize + self.readahead_size);
+			if prefetch_result.is_ok() {
+				self.readahead_limit = offset + len + self.readahead_size as u64;
+				self.grow_readahead_size();
+				return false; // FS prefetch succeeded
+			}
+		}
+
+		true
+	}
+
+	pub(crate) fn grow_readahead_size(&mut self) {
+		if self.readahead_size < self.max_auto_readahead_size {
+			self.readahead_size = (self.readahead_size * 2).min(self.max_auto_readahead_size);
 		}
 	}
 }

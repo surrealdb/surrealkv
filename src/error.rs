@@ -57,6 +57,7 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	PartitionBlockExpectedButNotFound,
 }
 
 // Implementation of Display trait for Error
@@ -106,6 +107,7 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+			Self::PartitionBlockExpectedButNotFound => write!(f, "Partition block expected but not found"),
         }
 	}
 }

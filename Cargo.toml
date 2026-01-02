@@ -41,6 +41,7 @@ memmap2 = "0.9.5"
 interval-heap = "0.0.5"
 log = "0.4.28"
 lz4_flex = "0.12"
+libc = "0.2.177"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fs2 = "0.4.3"
